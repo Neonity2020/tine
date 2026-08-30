@@ -351,7 +351,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::oplog::object_store::{ensure_directory_nofollow, open_dir_nofollow};
+    use crate::oplog::object_store::{
+        ensure_reconstructible_directory_nofollow, open_dir_nofollow,
+    };
     use crate::oplog::{CausalPeerId, DeviceId};
 
     fn store(name: &str) -> (std::path::PathBuf, PortablePathIndexStore) {
@@ -359,7 +361,7 @@ mod tests {
             std::env::temp_dir().join(format!("tine-portable-index-{name}-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         let root = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
-        ensure_directory_nofollow(&root, "nodes").unwrap();
+        ensure_reconstructible_directory_nofollow(&root, "nodes").unwrap();
         let nodes = open_dir_nofollow(&root, "nodes").unwrap();
         (
             path,

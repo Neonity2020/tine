@@ -262,6 +262,26 @@ struct AndroidReceiptBarrierState {
 
 #[cfg(any(test, target_os = "android"))]
 impl AndroidReceiptBarrierState {
+    fn begin_mutation(&self, identity: AndroidReceiptDirectoryIdentity) {
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&identity);
+    }
+
+    fn finish_mutation_barrier<E>(
+        &self,
+        identity: AndroidReceiptDirectoryIdentity,
+        barrier: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        barrier()?;
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity);
+        Ok(())
+    }
+
     fn record_mutation_barrier<E>(
         &self,
         identity: AndroidReceiptDirectoryIdentity,
@@ -271,16 +291,8 @@ impl AndroidReceiptBarrierState {
         // barrier runs. If the barrier refuses or panics, this process and a
         // future process both have to verify the parent before accepting an
         // exact existing name.
-        self.verified_parents
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&identity);
-        barrier()?;
-        self.verified_parents
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(identity);
-        Ok(())
+        self.begin_mutation(identity);
+        self.finish_mutation_barrier(identity, barrier)
     }
 
     fn verify_existing<E>(
@@ -319,15 +331,25 @@ fn android_receipt_directory_identity(
     Ok((metadata.dev(), metadata.ino()))
 }
 
-/// A strict receipt barrier can refuse after the namespace mutation became
-/// visible. Remember that exact parent within this process so only its next
-/// idempotent retry re-establishes durability; ordinary existing-name reads do
-/// not pay an extra device round trip. See storage-sync-contract.md §2.10c.
+/// Invalidate this process's positive parent proof before a namespace mutation.
+/// Identity acquisition therefore cannot fail after the mutation and preserve
+/// stale positive state. See storage-sync-contract.md §2.10c.
 #[cfg(target_os = "android")]
-fn sync_promoted_receipt_directory(directory: &Dir) -> Result<(), StoreError> {
+fn begin_promoted_receipt_directory_mutation(
+    directory: &Dir,
+) -> Result<AndroidReceiptDirectoryIdentity, StoreError> {
     let identity = android_receipt_directory_identity(directory)?;
+    android_receipt_barrier_state().begin_mutation(identity);
+    Ok(identity)
+}
+
+#[cfg(target_os = "android")]
+fn sync_promoted_receipt_directory(
+    directory: &Dir,
+    identity: AndroidReceiptDirectoryIdentity,
+) -> Result<(), StoreError> {
     android_receipt_barrier_state()
-        .record_mutation_barrier(identity, || sync_dir_required(directory))
+        .finish_mutation_barrier(identity, || sync_dir_required(directory))
 }
 
 #[cfg(target_os = "android")]
@@ -358,6 +380,12 @@ fn ensure_directory_nofollow_with_durability(
         // directory open below. cap-std's create_dir adds Linux capability
         // preflights which some physical app-private filesystems reject even
         // though mkdirat/openat themselves are permitted.
+        let promoted_parent_identity = match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => None,
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                Some(begin_promoted_receipt_directory_mutation(root)?)
+            }
+        };
         let created =
             unsafe { libc::mkdirat(root.as_fd().as_raw_fd(), component.as_ptr(), libc::S_IRWXU) };
         if created < 0 {
@@ -375,7 +403,10 @@ fn ensure_directory_nofollow_with_durability(
                 crate::filesystem_durability::sync_reconstructible_directory(root)?;
             }
             ReceiptDirectoryDurability::PromotedAuthority => {
-                sync_promoted_receipt_directory(root)?;
+                sync_promoted_receipt_directory(
+                    root,
+                    promoted_parent_identity.expect("promoted parent identity was retained"),
+                )?;
             }
         }
         return Ok(());
@@ -615,6 +646,12 @@ fn publish_android_private_immutable(
             return Ok(());
         }
 
+        let promoted_parent_identity = match durability {
+            ReceiptDirectoryDurability::PrePromotionBootstrap => None,
+            ReceiptDirectoryDurability::PromotedAuthority => {
+                Some(begin_promoted_receipt_directory_mutation(dir)?)
+            }
+        };
         let renamed = unsafe {
             libc::renameat(
                 dir.as_fd().as_raw_fd(),
@@ -631,7 +668,10 @@ fn publish_android_private_immutable(
                 crate::filesystem_durability::sync_reconstructible_directory(dir)?;
             }
             ReceiptDirectoryDurability::PromotedAuthority => {
-                sync_promoted_receipt_directory(dir)?;
+                sync_promoted_receipt_directory(
+                    dir,
+                    promoted_parent_identity.expect("promoted parent identity was retained"),
+                )?;
             }
         }
         if !verify_existing()? {
@@ -5321,6 +5361,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(barriers.load(Ordering::SeqCst), 3);
+
+        // Identity lookup is deliberately completed before a namespace
+        // mutation. Once mutation begins, any later fallible step must leave
+        // the old positive proof invalid even if no barrier can run.
+        state.begin_mutation(identity);
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 4);
     }
 
     struct Fixture {

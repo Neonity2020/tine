@@ -2893,7 +2893,7 @@ impl ObjectStore {
     pub(crate) fn open_logseq_claim_index(
         &self,
     ) -> Result<super::uuid_claim_index::LogseqClaimIndexStore, StoreError> {
-        ensure_directory_nofollow(&self.capability, LOGSEQ_CLAIM_INDEX_DIR)?;
+        ensure_reconstructible_directory_nofollow(&self.capability, LOGSEQ_CLAIM_INDEX_DIR)?;
         Ok(super::uuid_claim_index::LogseqClaimIndexStore::new(
             open_dir_nofollow(&self.capability, LOGSEQ_CLAIM_INDEX_DIR)?,
         ))
@@ -2902,7 +2902,7 @@ impl ObjectStore {
     pub(crate) fn open_portable_path_index(
         &self,
     ) -> Result<super::portable_path_index::PortablePathIndexStore, StoreError> {
-        ensure_directory_nofollow(&self.capability, PORTABLE_PATH_INDEX_DIR)?;
+        ensure_reconstructible_directory_nofollow(&self.capability, PORTABLE_PATH_INDEX_DIR)?;
         Ok(super::portable_path_index::PortablePathIndexStore::new(
             super::content_patricia::PatriciaIndexStore::new(open_dir_nofollow(
                 &self.capability,
@@ -2914,7 +2914,7 @@ impl ObjectStore {
     pub(crate) fn open_page_name_ownership_index(
         &self,
     ) -> Result<super::page_name_index::PageNameOwnershipStore, StoreError> {
-        ensure_directory_nofollow(&self.capability, PAGE_NAME_OWNERSHIP_INDEX_DIR)?;
+        ensure_reconstructible_directory_nofollow(&self.capability, PAGE_NAME_OWNERSHIP_INDEX_DIR)?;
         let index = open_dir_nofollow(&self.capability, PAGE_NAME_OWNERSHIP_INDEX_DIR)?;
         super::page_name_index::PageNameOwnershipStore::open(index)
     }
@@ -3431,12 +3431,12 @@ impl ObjectStore {
 
     fn bootstrap_namespace(&self, name: &'static str, create: bool) -> Result<Dir, StoreError> {
         if create {
-            ensure_directory_nofollow(&self.capability, BOOTSTRAP_DIR)?;
+            ensure_reconstructible_directory_nofollow(&self.capability, BOOTSTRAP_DIR)?;
         }
         let bootstrap = open_existing_dir_nofollow(&self.capability, BOOTSTRAP_DIR)?
             .ok_or(StoreError::MissingBootstrapArtifact("bootstrap namespace"))?;
         if create {
-            ensure_directory_nofollow(&bootstrap, name)?;
+            ensure_reconstructible_directory_nofollow(&bootstrap, name)?;
         }
         open_existing_dir_nofollow(&bootstrap, name)?
             .ok_or(StoreError::MissingBootstrapArtifact(name))
@@ -3458,7 +3458,7 @@ impl ObjectStore {
         let directory = self.bootstrap_namespace(namespace, create)?;
         let root_name = hex_bytes(root);
         if create {
-            ensure_directory_nofollow(&directory, &root_name)?;
+            ensure_reconstructible_directory_nofollow(&directory, &root_name)?;
         }
         open_existing_dir_nofollow(&directory, &root_name)?
             .ok_or(StoreError::MissingBootstrapArtifact(namespace))
@@ -6673,7 +6673,17 @@ pub(crate) fn control_directory_identity(
     )))
 }
 
-pub(crate) fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), StoreError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateDirectoryDurability {
+    StrictAuthority,
+    Reconstructible,
+}
+
+fn ensure_directory_nofollow_with_durability(
+    root: &Dir,
+    name: &str,
+    durability: PrivateDirectoryDurability,
+) -> Result<(), StoreError> {
     #[cfg(target_os = "android")]
     {
         let component = Path::new(name);
@@ -6690,7 +6700,12 @@ pub(crate) fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), St
                     "managed private directory is not a real no-follow directory: {name}"
                 )));
             }
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                if durability == PrivateDirectoryDurability::StrictAuthority {
+                    sync_dir_required(root)?;
+                }
+                return Ok(());
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => match root.create_dir(component) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
@@ -6704,18 +6719,46 @@ pub(crate) fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), St
                 "managed private directory is not a real no-follow directory: {name}"
             )));
         }
-        // The object store lives in Android's app-private area. Some devices
-        // permit the create and every file fsync but reject directory fsync.
-        // Before promotion the whole tree is reconstructible from Markdown;
-        // accepting only that platform capability refusal avoids treating a
-        // missing filesystem primitive as a permission/ownership failure.
-        crate::filesystem_durability::sync_reconstructible_directory(root)
-            .map_err(StoreError::Io)?;
+        match durability {
+            PrivateDirectoryDurability::StrictAuthority => sync_dir_required(root)?,
+            PrivateDirectoryDurability::Reconstructible => {
+                crate::filesystem_durability::sync_reconstructible_directory(root)
+                    .map_err(StoreError::Io)?;
+            }
+        }
         return Ok(());
     }
 
     #[cfg(not(target_os = "android"))]
-    tine_storage::ensure_directory_nofollow(root, name).map_err(filesystem_error_without_collision)
+    {
+        let _ = durability;
+        tine_storage::ensure_directory_nofollow(root, name)
+            .map_err(filesystem_error_without_collision)
+    }
+}
+
+/// Create or reopen a directory whose descendants can carry private durable
+/// authority. Android must prove the parent namespace durable even when the
+/// exact directory already exists after an earlier refused barrier or restart.
+pub(crate) fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), StoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        PrivateDirectoryDurability::StrictAuthority,
+    )
+}
+
+/// Create or reopen a directory whose complete contents are disposable or
+/// reconstructible from accepted authority elsewhere.
+pub(crate) fn ensure_reconstructible_directory_nofollow(
+    root: &Dir,
+    name: &str,
+) -> Result<(), StoreError> {
+    ensure_directory_nofollow_with_durability(
+        root,
+        name,
+        PrivateDirectoryDurability::Reconstructible,
+    )
 }
 
 /// Create only the immediate parent of an explicitly bound object-store root.
@@ -7218,7 +7261,7 @@ impl ArchiveBatchPublication {
     /// exact file durability. Keep the branch host-executable so its selection
     /// and exact staged-file fallback are unit-tested rather than merely
     /// cross-compiled.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "android", all(test, target_os = "linux")))]
     fn finish_android_staged_data_barrier(&self, result: io::Result<()>) -> Result<(), StoreError> {
         match result {
             Ok(()) => Ok(()),

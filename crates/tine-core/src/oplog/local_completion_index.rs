@@ -11,8 +11,8 @@ use super::absence_decision::{
     frontier_strictly_dominates, AbsenceCompletionAnchor, AbsenceDecisionKey,
 };
 use super::object_store::{
-    ensure_directory_nofollow, open_dir_nofollow, read_optional_regular, require_regular_entry,
-    sync_dir_required,
+    ensure_reconstructible_directory_nofollow, open_dir_nofollow, read_optional_regular,
+    require_regular_entry, sync_dir_required,
 };
 use super::{
     ContentDigest, FrontierV2, ManagedPath, ObjectStore, PageId, ProjectionEndpointId,
@@ -193,9 +193,9 @@ impl LocalCompletionIndex {
         endpoint_id: ProjectionEndpointId,
     ) -> Result<Self, LocalCompletionError> {
         let root = store.private_derived_root_capability()?;
-        ensure_directory_nofollow(&root, ABSENCE_NAMESPACE)?;
+        ensure_reconstructible_directory_nofollow(&root, ABSENCE_NAMESPACE)?;
         let absence = open_dir_nofollow(&root, ABSENCE_NAMESPACE)?;
-        ensure_directory_nofollow(&absence, LOCAL_COMPLETION_NAMESPACE)?;
+        ensure_reconstructible_directory_nofollow(&absence, LOCAL_COMPLETION_NAMESPACE)?;
         let directory = open_dir_nofollow(&absence, LOCAL_COMPLETION_NAMESPACE)?;
         let store = store.duplicate_retained_capability()?;
         let workspace_id = store.workspace_id();

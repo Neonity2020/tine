@@ -36586,7 +36586,18 @@ mod tests {
             .expect("end of Android receipt publisher");
         let publisher = &source[publisher_start..publisher_end];
         assert!(publisher.contains("ReceiptDirectoryDurability::PromotedAuthority"));
-        assert!(publisher.contains("sync_promoted_receipt_directory(dir)"));
+        assert!(publisher.contains("begin_promoted_receipt_directory_mutation(dir)"));
+        assert!(publisher.contains("sync_promoted_receipt_directory("));
+        let invalidation = publisher
+            .find("begin_promoted_receipt_directory_mutation(dir)")
+            .expect("promoted parent invalidation");
+        let rename = publisher
+            .find("let renamed =")
+            .expect("receipt namespace mutation");
+        assert!(
+            invalidation < rename,
+            "parent verification must be invalidated before rename can make a name visible"
+        );
         let existing_retry_start = publisher
             .find("let accept_existing =")
             .expect("idempotent publication retry policy");
@@ -36624,7 +36635,7 @@ mod tests {
             .expect("end of receipt barrier verification helpers");
         let recorder = &source[verification_sync_start..verification_existing_start];
         assert!(recorder.contains("sync_dir_required(directory)"));
-        assert!(recorder.contains("record_mutation_barrier"));
+        assert!(recorder.contains("finish_mutation_barrier"));
         let verifier = &source[verification_existing_start..helper_end];
         assert!(verifier.contains("verify_existing"));
         assert!(verifier.contains("sync_dir_required(directory)"));
@@ -36654,6 +36665,97 @@ mod tests {
         assert!(cleanup_initialization.contains("ensure_directory_nofollow_with_durability("));
         assert!(cleanup_initialization.contains("publish_immutable_exact_with_durability("));
         assert!(cleanup_initialization.contains("durability,"));
+    }
+
+    /// Android private directory creation must make every reconstructible
+    /// exception visible at the call site. The ordinary helper is strict and
+    /// is used by journals, provider retry authority, sweep dispositions,
+    /// move episodes, recovery trash, and the archive. Only the named derived
+    /// caches and detached/bootstrap construction may select the exception.
+    #[test]
+    fn android_private_directory_durability_is_explicit_at_every_exception() {
+        let object_store = include_str!("oplog/object_store.rs");
+        let strict_start = object_store
+            .find("pub(crate) fn ensure_directory_nofollow(")
+            .expect("strict private directory helper");
+        let reconstructible_start = object_store
+            .find("pub(crate) fn ensure_reconstructible_directory_nofollow(")
+            .expect("reconstructible private directory helper");
+        assert!(object_store[strict_start..reconstructible_start]
+            .contains("PrivateDirectoryDurability::StrictAuthority"));
+        assert!(object_store[reconstructible_start..]
+            .contains("PrivateDirectoryDurability::Reconstructible"));
+
+        let runtime = include_str!("sync_runtime.rs");
+        for strict_call in [
+            "ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE)",
+            "ensure_directory_nofollow(&namespace, &workspace_name)",
+            "ensure_directory_nofollow(&application_runtime_directory, \"move-episodes\")",
+        ] {
+            assert!(
+                runtime.contains(strict_call),
+                "managed runtime authority lost its strict directory call: {strict_call}"
+            );
+        }
+
+        for source in [
+            include_str!("oplog/projection_turn_journal.rs"),
+            include_str!("oplog/absence_sweep.rs"),
+            include_str!("oplog/wire.rs"),
+            include_str!("model.rs"),
+        ] {
+            assert!(source.contains("ensure_directory_nofollow("));
+            assert!(
+                !source.contains("ensure_reconstructible_directory_nofollow("),
+                "durable-authority module selected the reconstructible directory helper"
+            );
+        }
+
+        fn rust_sources(directory: &std::path::Path, output: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("read Rust source directory") {
+                let path = entry.expect("read Rust source entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, output);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    output.push(path);
+                }
+            }
+        }
+
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rust_sources(&source_root, &mut sources);
+        let mut actual = BTreeMap::new();
+        for path in sources {
+            let source = std::fs::read_to_string(&path).expect("read Rust source");
+            let production = source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .expect("production source prefix");
+            let count = production
+                .matches("ensure_reconstructible_directory_nofollow")
+                .count();
+            if count != 0 {
+                actual.insert(
+                    path.strip_prefix(&source_root)
+                        .expect("source below crate root")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    count,
+                );
+            }
+        }
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                ("oplog/hot_engine.rs".to_owned(), 1),
+                ("oplog/local_completion_index.rs".to_owned(), 3),
+                ("oplog/object_store.rs".to_owned(), 7),
+                ("oplog/page_name_index.rs".to_owned(), 3),
+                ("oplog/receiver_absence_summary.rs".to_owned(), 5),
+            ]),
+            "every reconstructible private-directory exception must remain in the audited census"
+        );
     }
 
     #[test]

@@ -567,7 +567,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::oplog::object_store::{ensure_directory_nofollow, open_dir_nofollow};
+    use crate::oplog::object_store::{
+        ensure_reconstructible_directory_nofollow, open_dir_nofollow,
+    };
 
     struct ExactStoragePublisher;
 
@@ -591,7 +593,7 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         let root_dir = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
-        ensure_directory_nofollow(&root_dir, "nodes").unwrap();
+        ensure_reconstructible_directory_nofollow(&root_dir, "nodes").unwrap();
 
         let facade = PatriciaIndexStore::new(open_dir_nofollow(&root_dir, "nodes").unwrap());
         let root = facade

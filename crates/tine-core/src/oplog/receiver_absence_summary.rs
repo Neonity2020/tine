@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 
 use super::absence_decision::{AbsenceDecisionMap, ReceiverAbsenceSummaryEntry};
 use super::object_store::{
-    ensure_directory_nofollow, open_dir_nofollow, read_optional_regular, require_regular_entry,
-    sync_dir_required,
+    ensure_reconstructible_directory_nofollow, open_dir_nofollow, read_optional_regular,
+    require_regular_entry, sync_dir_required,
 };
 use super::projection_store::ProjectionCatalogEntry;
 use super::{
@@ -266,10 +266,11 @@ impl ReceiverAbsenceSummary {
         let root = store
             .private_derived_root_capability()
             .map_err(|error| error.to_string())?;
-        ensure_directory_nofollow(&root, ABSENCE_NAMESPACE).map_err(|error| error.to_string())?;
+        ensure_reconstructible_directory_nofollow(&root, ABSENCE_NAMESPACE)
+            .map_err(|error| error.to_string())?;
         let absence =
             open_dir_nofollow(&root, ABSENCE_NAMESPACE).map_err(|error| error.to_string())?;
-        ensure_directory_nofollow(&absence, SUMMARY_NAMESPACE)
+        ensure_reconstructible_directory_nofollow(&absence, SUMMARY_NAMESPACE)
             .map_err(|error| error.to_string())?;
         let directory =
             open_dir_nofollow(&absence, SUMMARY_NAMESPACE).map_err(|error| error.to_string())?;
@@ -337,10 +338,11 @@ impl ReceiverAbsenceSummary {
         let root = store
             .private_derived_root_capability()
             .map_err(|error| error.to_string())?;
-        ensure_directory_nofollow(&root, ABSENCE_NAMESPACE).map_err(|error| error.to_string())?;
+        ensure_reconstructible_directory_nofollow(&root, ABSENCE_NAMESPACE)
+            .map_err(|error| error.to_string())?;
         let absence =
             open_dir_nofollow(&root, ABSENCE_NAMESPACE).map_err(|error| error.to_string())?;
-        ensure_directory_nofollow(&absence, SUMMARY_NAMESPACE)
+        ensure_reconstructible_directory_nofollow(&absence, SUMMARY_NAMESPACE)
             .map_err(|error| error.to_string())?;
         let directory =
             open_dir_nofollow(&absence, SUMMARY_NAMESPACE).map_err(|error| error.to_string())?;

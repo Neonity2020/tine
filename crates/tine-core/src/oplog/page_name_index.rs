@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use super::content_patricia::{PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore};
 use super::object_store::{
-    ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, read_optional_regular,
-    DetachedBootstrapImmutablePublisher, StoreError,
+    ensure_reconstructible_directory_nofollow, open_dir_nofollow, publish_immutable_exact,
+    read_optional_regular, DetachedBootstrapImmutablePublisher, StoreError,
 };
 use super::scratch_store::{ScratchLsmRoot, ScratchPageKind, ScratchStore};
 use super::sync_layout::{
@@ -1712,8 +1712,8 @@ impl PageNameOwnershipStore {
                 )?;
             }
         }
-        ensure_directory_nofollow(&index, NODES_DIR)?;
-        ensure_directory_nofollow(&index, EXACT_NAMES_DIR)?;
+        ensure_reconstructible_directory_nofollow(&index, NODES_DIR)?;
+        ensure_reconstructible_directory_nofollow(&index, EXACT_NAMES_DIR)?;
         Ok(Self {
             patricia: PatriciaIndexStore::new(open_dir_nofollow(&index, NODES_DIR)?),
             exact_names: open_dir_nofollow(&index, EXACT_NAMES_DIR)?,

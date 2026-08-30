@@ -2146,12 +2146,17 @@ starts empty in every process. Consequently an exact name left visible by a
 refused barrier is never accepted after restart merely because the in-memory
 record of that refusal disappeared; its parent is synchronized first.
 
-The analogous Android early returns in `object_store::ensure_directory_nofollow`
-and `enrollment::open_component` do not carry this promoted-receipt policy.
-Object-store uses are fixed bootstrap namespaces or explicitly disposable
-indexes, and enrollment creates its component chain before promotion while its
-promoted reader uses `create=false`. They therefore retain the reconstructible
-bootstrap policy rather than acquiring receipt authority semantics.
+The analogous Android early returns are classified explicitly rather than
+sharing one object-store default. `object_store::ensure_directory_nofollow` is
+strict: an existing parent is synchronized before it may carry a private local
+journal, projection-turn journal, move episode, provider retry journal, absence
+disposition record, recovery-trash name, archive namespace, or other durable
+authority. `ensure_reconstructible_directory_nofollow` is the narrow exception
+for detached bootstrap scratch, retired bootstrap/index construction, and the
+local-completion and receiver-summary caches whose authoritative inputs remain
+elsewhere. Call-site source guards pin that split. `enrollment::open_component`
+creates its component chain before promotion, while promoted readers use
+`create=false`, so it retains the pre-promotion policy.
 
 Before an enrollment binding exists, the empty receipt store's initialization
 artifacts are reconstructible bootstrap state rather than authority; no

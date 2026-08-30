@@ -2423,7 +2423,7 @@ impl DetachedBootstrapScratchRoot {
         let parent = Dir::open_ambient_dir(std::env::temp_dir(), ambient_authority())
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         let name = format!("tine-detached-bootstrap-{}", Uuid::new_v4());
-        super::object_store::ensure_directory_nofollow(&parent, &name)
+        super::object_store::ensure_reconstructible_directory_nofollow(&parent, &name)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         let root = super::object_store::open_dir_nofollow(&parent, &name)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
