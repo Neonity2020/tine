@@ -7218,7 +7218,7 @@ impl ArchiveBatchPublication {
     /// exact file durability. Keep the branch host-executable so its selection
     /// and exact staged-file fallback are unit-tested rather than merely
     /// cross-compiled.
-    #[cfg(any(test, target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn finish_android_staged_data_barrier(&self, result: io::Result<()>) -> Result<(), StoreError> {
         match result {
             Ok(()) => Ok(()),
@@ -7271,7 +7271,7 @@ impl Drop for ArchiveBatchPublication {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod archive_batch_android_fallback_tests {
     use super::*;
     use crate::durability_counters::{Barrier, BarrierSession};
