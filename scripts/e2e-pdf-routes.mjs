@@ -158,7 +158,9 @@ async function openPdfNotes() {
   }
 
   await browser.$('button[aria-label="More settings"]').click();
-  const overflowNotes = await browser.$(".pdf-settings-overflow button=Notes");
+  const overflowNotes = await browser.$(
+    "//div[contains(concat(' ', normalize-space(@class), ' '), ' pdf-settings-overflow ')]//button[normalize-space(.)='Notes']",
+  );
   await overflowNotes.waitForClickable({ timeout: 10_000 });
   await overflowNotes.click();
 }
