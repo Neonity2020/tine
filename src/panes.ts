@@ -637,6 +637,22 @@ export function openPdfNotes(
     else router.openPage(notesPage, "page");
     return sourcePaneId;
   }
+
+  const targetPaneId = companionPane(layoutRoot(), sourcePaneId);
+  if (targetPaneId) {
+    const router = paneRouter(targetPaneId);
+    const existing = router.tabs().find((tab) => {
+      const route = tabRoute(tab);
+      return route.kind === "page" && route.name === notesPage && route.pageKind === "page";
+    });
+    if (existing) {
+      router.setActiveTab(existing.id);
+      if (block) router.openPageAtBlock(notesPage, "page", block);
+      setFocusedPaneId(sourcePaneId);
+      return targetPaneId;
+    }
+  }
+
   return openRouteInOtherPane({
     kind: "page",
     name: notesPage,

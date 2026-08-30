@@ -6,6 +6,7 @@ import {
   focusPane,
   openRouteInOtherPane,
   openPdf,
+  openPdfNotes,
   layoutPaneIds,
   layoutRoot,
   focusedPaneId,
@@ -790,5 +791,19 @@ describe("PDF pane routes", () => {
     expect(openPdf("assets/alpha.pdf", "Alpha", undefined, undefined, {
       sourcePaneId: "main", anotherView: true,
     })).toBeNull();
+  });
+
+  it("focuses an existing notes tab in the structural companion instead of duplicating it", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    openPdf("assets/alpha.pdf", "Alpha", undefined, undefined, { sourcePaneId: "main" });
+    const pdfPane = focusedPaneId();
+    const notesPane = splitPane(pdfPane, "row", { focusNew: false })!;
+    paneRouter(notesPane).openPage("hls__alpha", "page");
+    const before = paneRouter(notesPane).tabs().length;
+
+    expect(openPdfNotes(pdfPane, "hls__alpha")).toBe(notesPane);
+    expect(paneRouter(notesPane).tabs()).toHaveLength(before);
+    expect(paneRouter(notesPane).route()).toMatchObject({ kind: "page", name: "hls__alpha" });
+    expect(focusedPaneId()).toBe(pdfPane);
   });
 });
