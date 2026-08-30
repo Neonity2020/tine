@@ -1115,7 +1115,11 @@ publish the current managed store. The Direct Files selector durably records
 that this is a pending blank-slate rebuild before private state is moved, so a
 crash at any later cut or a failed first reconstruction retries automatically
 on the next open. If reconstruction itself fails, Direct Files remains serving
-and the failure is retained in diagnostics. An explicit or emergency Direct
+and the failure is retained in diagnostics. The original unrecognized private
+root is archived once behind a durable completion marker. Later failed
+reconstruction candidates are reconstructible and rotate through one bounded
+recovery slot rather than minting an unbounded archive on every launch. An
+explicit or emergency Direct
 Files selection does not request this retry. This is one current format, not a
 compatibility reader or migration.
 

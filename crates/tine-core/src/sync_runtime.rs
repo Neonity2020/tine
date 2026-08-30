@@ -25071,8 +25071,12 @@ mod tests {
             panic!("a pre-(c) store must surface a managed-open refusal: {result:?}");
         };
         assert!(
-            detail.contains("re-activate") && detail.contains("Markdown"),
-            "the refusal must name its remedy: {detail}"
+            !detail.is_empty(),
+            "the typed refusal must retain diagnostics"
+        );
+        assert!(
+            !detail.contains("re-activate"),
+            "the low-level refusal must not prescribe retired manual re-activation: {detail}"
         );
         assert_eq!(
             result.status.durable_refusal_scenario(),

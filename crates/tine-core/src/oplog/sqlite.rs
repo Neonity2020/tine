@@ -12739,7 +12739,7 @@ mod tests {
         };
         assert!(
             reason.contains(&format!(
-                "user_version {} != {SQLITE_SCHEMA_VERSION}",
+                "unsupported SQLite frontier user_version {}; current is {SQLITE_SCHEMA_VERSION}",
                 SQLITE_SCHEMA_VERSION - 1
             )),
             "unexpected rebuild reason: {reason}"

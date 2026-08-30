@@ -1641,10 +1641,11 @@ mod tests {
         let start = source
             .find("pub(crate) fn load_graph_for_label")
             .expect("graph load function");
-        let body = &source[start..source[start..]
-            .find("#[tauri::command]")
-            .map(|offset| start + offset)
-            .expect("end of graph load function")];
+        let body = &source[start
+            ..source[start..]
+                .find("#[tauri::command]")
+                .map(|offset| start + offset)
+                .expect("end of graph load function")];
         let classification = body
             .find("unrecognized_binding_file")
             .expect("unrecognized private binding classification");

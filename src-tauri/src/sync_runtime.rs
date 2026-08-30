@@ -44,6 +44,8 @@ const DIRECT_SELECTION_SCHEMA_VERSION: u32 = 1;
 const DIRECT_SELECTION_DIR: &str = "storage-mode-selections";
 const DIRECT_SELECTION_FILE_SUFFIX: &str = ".direct-v1.json";
 const BLANK_SLATE_REBUILD_REASON: &str = "pre_0_7_blank_slate_rebuild_pending";
+const BLANK_SLATE_BACKUP_COMPLETE_SUFFIX: &str = "-blank-slate-original-preserved";
+const BLANK_SLATE_FAILED_CANDIDATE_SUFFIX: &str = "-blank-slate-failed-candidate";
 static DIRECT_SELECTION_WRITE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -1249,7 +1251,13 @@ impl SyncRuntimeFacade {
         let Ok(private) = sparse_private_root(app, graph_root) else {
             return false;
         };
-        std::fs::read(private.join(SPARSE_BINDING_FILE)).is_ok()
+        let Ok(bytes) = std::fs::read(private.join(SPARSE_BINDING_FILE)) else {
+            return false;
+        };
+        match serde_json::from_slice::<SparseV2ActivationRecord>(&bytes) {
+            Ok(record) => record.validate_for(graph_root).is_err(),
+            Err(_) => true,
+        }
     }
 
     /// Pre-0.7 policy: experimental state is not migrated. Archive the whole
@@ -1263,6 +1271,7 @@ impl SyncRuntimeFacade {
     ) -> Result<(), String> {
         let private = sparse_private_root(app, graph_root)?;
         let recovery = sparse_recovery_root(app)?;
+        clear_blank_slate_backup_complete(&private, &recovery)?;
         // Publish the durable reconstruction intent before moving private
         // state. A crash at any later cut therefore reopens the Markdown/Org
         // tree in Direct Files and retries the automatic rebuild.
@@ -1270,6 +1279,7 @@ impl SyncRuntimeFacade {
         let archived = archive_private_root(&private, &recovery).map_err(|error| {
             format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
         })?;
+        mark_blank_slate_backup_complete(&private, &recovery)?;
         crate::debug::diag(format!(
             "unrecognized pre-0.7 managed state archived: archived={}",
             archived
@@ -1287,6 +1297,7 @@ impl SyncRuntimeFacade {
         graph_meta: GraphMeta,
     ) -> Result<SparseV2ActivationRecord, String> {
         let direct_selected = direct_selection_is_active(app, graph_root)?;
+        let blank_slate_rebuild = self.blank_slate_rebuild_pending(app, graph_root)?;
         if !direct_selected {
             if let Some(record) = self.binding_record(app, graph_root)? {
                 return Ok(record);
@@ -1299,7 +1310,11 @@ impl SyncRuntimeFacade {
             graph_meta,
             DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
         );
-        prepare_fresh_authority_at_paths(&private, &recovery, record, "fresh activation")
+        if blank_slate_rebuild {
+            prepare_blank_slate_retry_at_paths(&private, &recovery, record)
+        } else {
+            prepare_fresh_authority_at_paths(&private, &recovery, record, "fresh activation")
+        }
     }
 
     pub(crate) fn prepare_shared_binding_record(
@@ -2376,6 +2391,136 @@ fn archive_private_root(
         format!("Couldn't preserve Tine-managed storage recovery state: {error}")
     })?;
     Ok(Some(destination))
+}
+
+fn blank_slate_recovery_key(private_root: &Path) -> Result<&str, String> {
+    private_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Tine-managed storage recovery state has no valid local key.".into())
+}
+
+fn blank_slate_backup_complete_path(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<PathBuf, String> {
+    Ok(recovery_root.join(format!(
+        "{}{BLANK_SLATE_BACKUP_COMPLETE_SUFFIX}",
+        blank_slate_recovery_key(private_root)?
+    )))
+}
+
+fn blank_slate_backup_is_complete(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<bool, String> {
+    let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
+    match std::fs::read(&marker) {
+        Ok(bytes) => Ok(bytes == b"complete\n"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Couldn't inspect the pre-0.7 managed-storage backup marker: {error}"
+        )),
+    }
+}
+
+fn clear_blank_slate_backup_complete(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<(), String> {
+    let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Couldn't reset the pre-0.7 managed-storage backup marker: {error}"
+        )),
+    }
+}
+
+fn mark_blank_slate_backup_complete(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(recovery_root).map_err(|error| {
+        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+    })?;
+    let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
+    tine_core::model::atomic_update(&marker, &DIRECT_SELECTION_WRITE, |_| {
+        Ok("complete\n".to_owned())
+    })
+    .map_err(|error| format!("Couldn't record the pre-0.7 managed-storage backup: {error}"))
+}
+
+/// Retain at most one disposable failed rebuild candidate. The original
+/// unrecognized private state has its own immutable archive and completion
+/// marker; retry products are reconstructed from Markdown/Org and must not
+/// create an unbounded recovery directory on every launch.
+fn replace_failed_blank_slate_candidate(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let metadata = match std::fs::symlink_metadata(private_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Couldn't inspect the failed managed-storage rebuild: {error}"
+            ));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("The failed managed-storage rebuild is not a safe local directory.".into());
+    }
+    std::fs::create_dir_all(recovery_root).map_err(|error| {
+        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+    })?;
+    let destination = recovery_root.join(format!(
+        "{}{BLANK_SLATE_FAILED_CANDIDATE_SUFFIX}",
+        blank_slate_recovery_key(private_root)?
+    ));
+    match std::fs::symlink_metadata(&destination) {
+        Ok(existing) if existing.is_dir() && !existing.file_type().is_symlink() => {
+            std::fs::remove_dir_all(&destination).map_err(|error| {
+                format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+            })?;
+        }
+        Ok(_) => {
+            std::fs::remove_file(&destination).map_err(|error| {
+                format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Couldn't inspect the prior failed managed-storage rebuild: {error}"
+            ));
+        }
+    }
+    std::fs::rename(private_root, &destination).map_err(|error| {
+        format!("Couldn't set aside the failed managed-storage rebuild: {error}")
+    })?;
+    Ok(Some(destination))
+}
+
+fn prepare_blank_slate_retry_at_paths(
+    private_root: &Path,
+    recovery_root: &Path,
+    record: SparseV2ActivationRecord,
+) -> Result<SparseV2ActivationRecord, String> {
+    if blank_slate_backup_is_complete(private_root, recovery_root)? {
+        replace_failed_blank_slate_candidate(private_root, recovery_root)?;
+    } else {
+        // The durable Direct intent may have been published just before a
+        // crash or archive failure. Preserve the original bytes before any
+        // current-format reconstruction begins. If the prior rename already
+        // succeeded, absence is sufficient and the marker closes the gap.
+        archive_private_root(private_root, recovery_root).map_err(|error| {
+            format!("Couldn't preserve the original pre-0.7 managed-storage state: {error}")
+        })?;
+        mark_blank_slate_backup_complete(private_root, recovery_root)?;
+    }
+    Ok(record)
 }
 
 fn prepare_shared_binding_record_at_paths(
@@ -6341,6 +6486,66 @@ mod tests {
         assert_eq!(
             std::fs::read(archived.join("nested/evidence.bin")).unwrap(),
             b"\0\x01retained evidence"
+        );
+    }
+
+    #[test]
+    fn blank_slate_retry_preserves_original_once_and_bounds_failed_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let graph = root.path().join("graph");
+        std::fs::create_dir_all(graph.join("pages")).unwrap();
+        let private = root.path().join("private/current");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("original.bin"), b"unrecognized original").unwrap();
+        let record =
+            SparseV2ActivationRecord::new(&graph, Graph::open(&graph).meta(), DeviceId::new());
+
+        prepare_blank_slate_retry_at_paths(&private, &recovery, record.clone()).unwrap();
+        assert!(blank_slate_backup_is_complete(&private, &recovery).unwrap());
+
+        for attempt in [
+            b"first failed candidate".as_slice(),
+            b"latest failed candidate",
+        ] {
+            std::fs::create_dir_all(&private).unwrap();
+            std::fs::write(private.join("attempt.bin"), attempt).unwrap();
+            prepare_blank_slate_retry_at_paths(&private, &recovery, record.clone()).unwrap();
+        }
+
+        let entries = std::fs::read_dir(&recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let failed = entries
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(BLANK_SLATE_FAILED_CANDIDATE_SUFFIX)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            std::fs::read(failed[0].join("attempt.bin")).unwrap(),
+            b"latest failed candidate"
+        );
+        let originals = entries
+            .iter()
+            .filter(|path| {
+                path.is_dir()
+                    && !path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .ends_with(BLANK_SLATE_FAILED_CANDIDATE_SUFFIX)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 1);
+        assert_eq!(
+            std::fs::read(originals[0].join("original.bin")).unwrap(),
+            b"unrecognized original"
         );
     }
 

@@ -1504,7 +1504,17 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
-            2,
+            1,
+        ),
+        (
+            "crates/tine-core/src/oplog/local_journal_v2_anchor.rs",
+            "journal.fast_append",
+            1,
+        ),
+        (
+            "crates/tine-core/src/oplog/local_journal_v2_anchor.rs",
+            "journal.managed_append",
+            1,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",

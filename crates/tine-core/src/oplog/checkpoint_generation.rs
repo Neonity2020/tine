@@ -262,5 +262,40 @@ mod tests {
                 "R1a adapter gained a production authoring primitive: {forbidden}"
             );
         }
+
+        fn visit(directory: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, files);
+                } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        visit(&source_root, &mut files);
+        for forbidden in [
+            "SealedAcceptedIndexWriter",
+            "initialize_checkpoint_candidate_schema",
+        ] {
+            let production_callers = files
+                .iter()
+                .filter(|path| {
+                    std::fs::read_to_string(path)
+                        .unwrap()
+                        .split("\n#[cfg(test)]")
+                        .next()
+                        .unwrap()
+                        .contains(forbidden)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                production_callers.is_empty(),
+                "R1a gained a production checkpoint authoring caller for {forbidden}: {production_callers:?}"
+            );
+        }
     }
 }
