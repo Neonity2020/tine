@@ -574,6 +574,58 @@ fn archive(message: impl Into<String>) -> EngineError {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct SealedMemoryStore {
+        objects: Vec<(
+            tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+            ContentDigest,
+            Vec<u8>,
+        )>,
+    }
+
+    impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore for SealedMemoryStore {
+        fn read_sealed_accepted_object(
+            &self,
+            kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+            address: ContentDigest,
+        ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
+        {
+            Ok(self
+                .objects
+                .iter()
+                .find(|(stored_kind, stored_address, _)| {
+                    *stored_kind == kind && *stored_address == address
+                })
+                .map(|(_, _, bytes)| bytes.clone()))
+        }
+
+        fn publish_sealed_accepted_object(
+            &mut self,
+            kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+            address: ContentDigest,
+            bytes: &[u8],
+        ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
+            if let Some((_, _, existing)) =
+                self.objects
+                    .iter()
+                    .find(|(stored_kind, stored_address, _)| {
+                        *stored_kind == kind && *stored_address == address
+                    })
+            {
+                if existing != bytes {
+                    return Err(
+                        tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Corrupt(
+                            "same address has different test bytes".into(),
+                        ),
+                    );
+                }
+                return Ok(());
+            }
+            self.objects.push((kind, address, bytes.to_vec()));
+            Ok(())
+        }
+    }
+
     fn digest(byte: u8) -> ContentDigest {
         ContentDigest::from_bytes([byte; 32])
     }
@@ -805,6 +857,86 @@ mod tests {
             engine_address.to_string(),
             "7f4986b2491f46879adadfd66a4f7c3f516006c123868ad7ecff6d5791b80756"
         );
+    }
+
+    #[test]
+    fn tine_decoder_completes_the_shared_membership_proof() {
+        use tine_storage::sealed_accepted_index::{
+            AcceptedSequenceEntryV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
+            AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
+            SealedAcceptedIndexReader, SealedAcceptedIndexRootsV2, SealedAcceptedIndexWriter,
+        };
+
+        let batch_id = BatchId::from_uuid(uuid::Uuid::from_bytes([0x51; 16]));
+        let evidence = AcceptedBatchEvidenceV2 {
+            batch_id,
+            manifest_fingerprint: digest(0x61),
+            event_binding_digest: digest(0x71),
+            acceptance_sequence: 1,
+            prior_frontier_root: frontier(0),
+            post_frontier_root: frontier(1),
+            affected_documents: Vec::new(),
+        };
+        let causal = SealedAcceptedCausalRecordV2 {
+            batch_id: [0x51; 16],
+            manifest_fingerprint: digest(0x61),
+            event_binding_digest: digest(0x71),
+            causal_peer_id: [0x44; 16],
+            causal_counter: 7,
+            canonical_causal_clock: vec![SealedAcceptedCausalClockEntryV2 {
+                peer_id: [0x44; 16],
+                counter: 7,
+            }],
+        };
+        let mut store = SealedMemoryStore::default();
+        let (batch_map, status_map, sequence);
+        {
+            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+            let causal_address = writer.publish_causal(&causal).unwrap();
+            let status = AcceptedStatusRecordV2 {
+                batch_id: [0x51; 16],
+                no_op: false,
+                evidence_schema: ACCEPTED_EVIDENCE_V2_SCHEMA_VERSION,
+                exact_evidence_bytes: evidence.encode_canonical().unwrap(),
+                accepted_causal_record_digest: causal_address,
+            };
+            let status_address = writer.publish_status(&status).unwrap();
+            batch_map = writer
+                .upsert_map(AuthenticatedMapRootV1::empty(), [0x51; 16], causal_address)
+                .unwrap();
+            status_map = writer
+                .upsert_map(AuthenticatedMapRootV1::empty(), [0x51; 16], status_address)
+                .unwrap();
+            sequence = writer
+                .append_sequence(
+                    AcceptedSequenceRootV2::empty(),
+                    AcceptedSequenceEntryV2 {
+                        sequence: 1,
+                        batch_id: [0x51; 16],
+                        accepted_status_value_digest: status_address,
+                    },
+                )
+                .unwrap();
+        }
+        let proof = SealedAcceptedIndexReader::new(&store)
+            .prove_membership(
+                SealedAcceptedIndexRootsV2 {
+                    batch_map,
+                    status_map,
+                    sequence,
+                },
+                1,
+                [0x51; 16],
+                &TineAcceptedEvidenceDecoder,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.sequence.sequence, 1);
+        assert_eq!(
+            proof.status.exact_evidence_bytes,
+            evidence.encode_canonical().unwrap()
+        );
+        assert_eq!(proof.causal, causal);
     }
 
     #[test]
