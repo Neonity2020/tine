@@ -1725,20 +1725,32 @@ fn materialize_accepted_event_with_stats(
     let mut replacements = Vec::new();
     let mut deletions = Vec::new();
     let mut instrumentation = EventMaterializationInstrumentation::default();
-    let mut materializer = (!affected_pages.is_empty())
-        .then(|| engine.accepted_root_materializer(event.post_frontier_root()))
-        .transpose()
-        .map_err(ProjectionError::materialization_from_engine)?;
-    if materializer.is_some() {
-        instrumentation.accepted_root_authentications = 1;
-    }
+    let mut materializer = None;
     for page_id in affected_pages {
-        match materializer
-            .as_mut()
-            .expect("nonempty affected pages construct a materializer")
-            .materialize_page(page_id)
-            .map_err(ProjectionError::materialization_from_engine)?
-        {
+        let retained = engine.accepted_author_projection_outcome(
+            event.batch_id(),
+            event.post_frontier_root().state_digest(),
+            page_id,
+        );
+        let outcome = match retained {
+            Some(outcome) => outcome,
+            None => {
+                if materializer.is_none() {
+                    materializer = Some(
+                        engine
+                            .accepted_root_materializer(event.post_frontier_root())
+                            .map_err(ProjectionError::materialization_from_engine)?,
+                    );
+                    instrumentation.accepted_root_authentications = 1;
+                }
+                materializer
+                    .as_mut()
+                    .expect("missing retained outcome constructs a materializer")
+                    .materialize_page(page_id)
+                    .map_err(ProjectionError::materialization_from_engine)?
+            }
+        };
+        match outcome {
             Some(mut page) => {
                 if let Some(transition) = effective_transitions.get(&page_id) {
                     transition
@@ -5146,18 +5158,36 @@ impl SqliteFrontier {
         self.physical.quick_check()?;
         let (applied_rows, document_rows) = self.physical.diagnostic_row_counts()?;
         let root = read_frontier_root(&self.physical)?;
-        if applied_rows != root.acceptance_sequence() || document_rows != root.document_count() {
+        let sparse_lazy_genesis = root.genesis().is_some();
+        if applied_rows != root.acceptance_sequence()
+            || if sparse_lazy_genesis {
+                document_rows > root.document_count()
+            } else {
+                document_rows != root.document_count()
+            }
+        {
             return Err(ProjectionError::Corrupt(
                 "SQLite diagnostic row counts differ from the authenticated frontier".into(),
             ));
         }
-        let (history_root, history_count) = validate_stored_history(&self.physical)?;
+        let history_baseline = root
+            .genesis()
+            .map(super::hot_engine::accepted_frontier_root_for_lazy_genesis_binding)
+            .transpose()
+            .map_err(|error| ProjectionError::Corrupt(error.to_string()))?
+            .unwrap_or_else(AcceptedFrontierRoot::empty);
+        let (history_root, history_count) =
+            validate_stored_history(&self.physical, history_baseline)?;
         if history_count != root.acceptance_sequence() || history_root != root {
             return Err(ProjectionError::Corrupt(
                 "SQLite diagnostic history scan differs from the authenticated frontier".into(),
             ));
         }
-        let _ = read_frontier_documents(&self.physical)?;
+        let _ = if sparse_lazy_genesis {
+            read_frontier_documents_with_expected_count(&self.physical, &root, document_rows)?
+        } else {
+            read_frontier_documents(&self.physical)?
+        };
         Ok(())
     }
 
@@ -7347,8 +7377,8 @@ impl StoredBatch {
 
 fn validate_stored_history(
     physical: &PhysicalSqliteDatabase,
+    mut prior: AcceptedFrontierRoot,
 ) -> Result<(AcceptedFrontierRoot, u64), ProjectionError> {
-    let mut prior = AcceptedFrontierRoot::empty();
     let mut count = 0_u64;
     for physical_batch in physical.load_all_batches()? {
         let record = stored_batch_from_storage(physical_batch)?;
@@ -7571,7 +7601,16 @@ fn read_frontier_documents(
     physical: &PhysicalSqliteDatabase,
 ) -> Result<FrontierV2, ProjectionError> {
     let root = read_frontier_root(physical)?;
-    let physical_root = lower_physical_frontier_root(&root)?;
+    read_frontier_documents_with_expected_count(physical, &root, root.document_count())
+}
+
+fn read_frontier_documents_with_expected_count(
+    physical: &PhysicalSqliteDatabase,
+    root: &AcceptedFrontierRoot,
+    expected_count: u64,
+) -> Result<FrontierV2, ProjectionError> {
+    let mut physical_root = lower_physical_frontier_root(root)?;
+    physical_root.document_count = expected_count;
     let documents = physical
         .read_frontier_documents(&physical_root)?
         .into_iter()
@@ -7582,7 +7621,7 @@ fn read_frontier_documents(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    return FrontierV2::new(documents).map_err(|error| ProjectionError::Corrupt(error.to_string()));
+    FrontierV2::new(documents).map_err(|error| ProjectionError::Corrupt(error.to_string()))
 }
 
 fn document_frontier_contains(

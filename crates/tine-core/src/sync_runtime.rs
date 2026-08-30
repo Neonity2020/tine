@@ -46633,6 +46633,84 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release benchmark: 20-page live-save and crash-reopen history curve"]
+    fn managed_twenty_page_history_curve_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release --lib managed_twenty_page_history_curve_manual_benchmark -- --ignored --nocapture"
+        );
+        let rounds = std::env::var("TINE_MANAGED_HISTORY_CURVE_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
+        // nested_unicode contributes exactly three page files; add seventeen
+        // more so graph size remains fixed while only accepted history grows.
+        let fixture = ActivationFixture::scaled("managed-history-curve-20", 0xa0e6, 17);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("20-page graph activates");
+        drive_initial_feed(&handle);
+
+        let pages = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("managed page inventory did not load: {other:?}"),
+        };
+        assert_eq!(pages.len(), 20, "fixture must remain exactly 20 pages");
+        let mut editable = pages
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .filter(|path| !load_application_exact(&handle, path).0.blocks.is_empty())
+            .collect::<Vec<_>>();
+        editable.sort();
+        assert!(!editable.is_empty(), "20-page fixture has no editable page");
+
+        let mut save_ms = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let path = &editable[round % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let started = Instant::now();
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("20-page history curve edit {round}"),
+            );
+            drain_managed_local(&handle);
+            save_ms.push(startup_ms(started.elapsed()));
+        }
+
+        let pending_path = editable[rounds % editable.len()].clone();
+        let (page, revision) = load_application_exact(&handle, &pending_path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "20-page history curve pending edit",
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drop(handle);
+
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let reopen_ms = startup_ms(started.elapsed());
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("20-page aged history reopens");
+        let (page, _) = load_application_exact(&reopened, &pending_path);
+        assert_eq!(page.blocks[0].raw, "20-page history curve pending edit");
+        let tail = save_ms.len().min(10);
+        let tail_mean_ms = save_ms[save_ms.len() - tail..].iter().sum::<f64>() / tail as f64;
+        eprintln!(
+            "managed_twenty_page_history_curve rounds={rounds} last_save_ms={:.3} tail10_mean_ms={tail_mean_ms:.3} reopen_ms={reopen_ms:.3}",
+            save_ms[save_ms.len() - 1],
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
     fn managed_crash_reopen_aged_history_manual_benchmark() {
         assert!(

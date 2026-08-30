@@ -2,7 +2,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -270,6 +269,21 @@ pub(crate) fn reset_local_mutation_detail_timings() {
 #[cfg(test)]
 pub(crate) fn last_local_mutation_detail_timings() -> LocalMutationDetailTimings {
     LAST_LOCAL_MUTATION_DETAIL_TIMINGS.get()
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECONSTRUCT_FRONTIER_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_reconstruct_frontier_calls() {
+    RECONSTRUCT_FRONTIER_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn reconstruct_frontier_calls() -> usize {
+    RECONSTRUCT_FRONTIER_CALLS.get()
 }
 
 #[cfg(test)]
@@ -603,6 +617,13 @@ struct PendingAuthorDocuments {
     mutation_token: u64,
     documents: BTreeMap<DocumentId, LoroDoc>,
     projection_pages: BTreeMap<PageId, ProjectionPageState>,
+    projection_outcomes: BTreeMap<PageId, Option<ProjectionPageState>>,
+}
+
+struct AcceptedAuthorProjectionPages {
+    batch_id: BatchId,
+    post_frontier_state_digest: ContentDigest,
+    outcomes: BTreeMap<PageId, Option<ProjectionPageState>>,
 }
 
 struct PreparedTransactionParts {
@@ -8617,6 +8638,10 @@ pub struct ShardedHotEngine {
     // preparing the next bounded edit never snapshots accumulated CRDT history.
     spare_documents: RefCell<BTreeMap<DocumentId, LoroDoc>>,
     pending_author_documents: RefCell<Option<PendingAuthorDocuments>>,
+    /// One just-accepted local author's already validated page outcomes.
+    /// SQLite consumes these as a current-head optimization; immutable history
+    /// remains the fallback after restart or any cache miss.
+    accepted_author_projection_pages: RefCell<Option<AcceptedAuthorProjectionPages>>,
     visible_document_lru: VecDeque<DocumentId>,
     visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     /// Durable-local commits that are visible before their archive acceptance.
@@ -8838,6 +8863,7 @@ impl ShardedHotEngine {
             deferred_catalog_checkpoint: None,
             spare_documents: RefCell::new(BTreeMap::new()),
             pending_author_documents: RefCell::new(None),
+            accepted_author_projection_pages: RefCell::new(None),
             visible_document_lru: VecDeque::new(),
             visible_document_heads: BTreeMap::new(),
             local_overlay: CommittedLocalOverlay::default(),
@@ -11820,6 +11846,29 @@ impl ShardedHotEngine {
             .map(Some)
     }
 
+    /// Return the already validated page outcome retained by the immediately
+    /// preceding local author commit. This is a bounded current-head cache,
+    /// never authority: restart, a different batch/root, or a missing page
+    /// falls back to immutable accepted-history materialization.
+    pub(crate) fn accepted_author_projection_outcome(
+        &self,
+        batch_id: BatchId,
+        post_frontier_state_digest: ContentDigest,
+        page_id: PageId,
+    ) -> Option<Option<MaterializedPage>> {
+        let retained = self.accepted_author_projection_pages.borrow();
+        let retained = retained.as_ref()?;
+        if retained.batch_id != batch_id
+            || retained.post_frontier_state_digest != post_frontier_state_digest
+        {
+            return None;
+        }
+        retained
+            .outcomes
+            .get(&page_id)
+            .map(|outcome| outcome.as_ref().map(|state| state.page.clone()))
+    }
+
     pub(crate) fn accepted_root_materializer(
         &self,
         root: &AcceptedFrontierRoot,
@@ -13771,7 +13820,14 @@ impl ShardedHotEngine {
             .borrow_mut()
             .take()
             .expect("matching pending author documents exist");
-        drop(pending);
+        if matches!(disposition, BatchDisposition::Accepted { .. }) {
+            *self.accepted_author_projection_pages.borrow_mut() =
+                Some(AcceptedAuthorProjectionPages {
+                    batch_id,
+                    post_frontier_state_digest: self.accepted_frontier_root.state_digest(),
+                    outcomes: pending.projection_outcomes,
+                });
+        }
     }
 
     fn stage_ready_internal(
@@ -18450,6 +18506,11 @@ impl ShardedHotEngine {
         )?;
         let prepared = PreparedBatch::new(manifest, objects)?;
         if draft.origin == BatchOrigin::LocalMutation {
+            let projection_outcomes = draft
+                .pages
+                .iter()
+                .map(|(page_id, draft_page)| (*page_id, draft_page.after.clone()))
+                .collect();
             let projection_pages = draft
                 .pages
                 .iter()
@@ -18464,6 +18525,7 @@ impl ShardedHotEngine {
                 mutation_token: draft.mutation_token,
                 documents: draft.prospective_documents,
                 projection_pages,
+                projection_outcomes,
             });
         }
         let _ = draft.semantic_effect;
@@ -19052,6 +19114,7 @@ impl ShardedHotEngine {
                             })
                             .collect(),
                         projection_pages: BTreeMap::new(),
+                        projection_outcomes: BTreeMap::new(),
                     });
                 }
                 (BTreeMap::new(), None, None)
@@ -27569,6 +27632,10 @@ impl ShardedHotEngine {
         &self,
         frontier: &FrontierV2,
     ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
+        #[cfg(test)]
+        {
+            RECONSTRUCT_FRONTIER_CALLS.set(RECONSTRUCT_FRONTIER_CALLS.get().saturating_add(1));
+        }
         let direct_heads = declared_batch_heads(frontier);
         let ancestry = self.collect_batch_ancestry(&direct_heads, self.is_blocked())?;
         validate_maximal_document_heads(frontier, &ancestry)?;
@@ -31002,6 +31069,15 @@ fn lazy_genesis_accepted_frontier_root(
             "lazy genesis frontier document count differs from its binding".into(),
         ));
     }
+    accepted_frontier_root_for_lazy_genesis_binding(binding)
+}
+
+pub(crate) fn accepted_frontier_root_for_lazy_genesis_binding(
+    binding: LazyGenesisFrontierBindingV1,
+) -> Result<AcceptedFrontierRoot, EngineError> {
+    binding
+        .validate()
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
     // The immutable genesis manifest already authenticates every baseline
     // dependency row. The accepted document map is therefore an overlay for
     // documents changed after genesis, and starts empty instead of copying the
@@ -31010,14 +31086,14 @@ fn lazy_genesis_accepted_frontier_root(
     let document_map_root_digest = super::scratch_store::authenticated_map_empty_digest();
     let state_digest = lazy_genesis_frontier_state_digest(
         binding,
-        documents.len() as u64,
+        binding.document_count(),
         document_map_root_key,
         document_map_root_digest,
     )?;
     let root = AcceptedFrontierRoot {
         schema_version: ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION,
         acceptance_sequence: 0,
-        document_count: documents.len() as u64,
+        document_count: binding.document_count(),
         retained_bytes_total: 0,
         document_map_root_key,
         document_map_root_digest,

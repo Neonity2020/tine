@@ -357,6 +357,10 @@ impl AuthorityFixture {
             content: content.into(),
         }])
         .unwrap();
+        self.execute_transaction(&transaction);
+    }
+
+    fn execute_transaction(&mut self, transaction: &OperationTransaction) {
         let mut projection_turns =
             crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
                 self.engine.0.engine(),
@@ -366,7 +370,7 @@ impl AuthorityFixture {
             &mut session,
             &self.graph,
             &self.receipts,
-            &transaction,
+            transaction,
             &mut projection_turns,
         )
         .unwrap()
@@ -409,6 +413,88 @@ impl AuthorityFixture {
 fn blocked_reasons(plan: &ImportPlan) -> Vec<ImportBlockReason> {
     assert_eq!(plan.status(), ImportPlanStatus::Blocked, "{plan:?}");
     plan.blocks().iter().map(|block| block.reason).collect()
+}
+
+#[test]
+fn lazy_genesis_full_integrity_accepts_a_sparse_frontier_overlay() {
+    let mut fixture = AuthorityFixture::new(
+        "lazy-genesis-sparse-integrity",
+        vec![
+            PageSpec {
+                path: "pages/alpha.md".into(),
+                blocks: vec![BlockSpec::root("alpha", "a")],
+                name: Some("Alpha".into()),
+                preamble: None,
+            },
+            PageSpec {
+                path: "pages/beta.md".into(),
+                blocks: vec![BlockSpec::root("beta", "a")],
+                name: Some("Beta".into()),
+                preamble: None,
+            },
+        ],
+    );
+
+    fixture.append_local_tail(0, 0, "alpha changed", 0x1400);
+
+    let root = fixture.engine.0.database().frontier_root().unwrap();
+    assert_eq!(root.document_count(), 3, "two pages plus the catalog");
+    fixture
+        .engine
+        .0
+        .database()
+        .diagnose_full_integrity()
+        .unwrap();
+}
+
+#[test]
+fn ordinary_clean_save_and_move_never_reconstruct_the_accepted_frontier() {
+    let mut fixture = AuthorityFixture::new(
+        "ordinary-save-move-no-frontier-reconstruction",
+        vec![
+            PageSpec {
+                path: "pages/source.md".into(),
+                blocks: vec![BlockSpec::root("move me", "a")],
+                name: Some("Source".into()),
+                preamble: None,
+            },
+            PageSpec {
+                path: "pages/destination.md".into(),
+                blocks: vec![BlockSpec::root("destination", "a")],
+                name: Some("Destination".into()),
+                preamble: None,
+            },
+        ],
+    );
+
+    crate::oplog::hot_engine::reset_reconstruct_frontier_calls();
+    fixture.append_local_tail(0, 0, "save without replay", 0x1401);
+    assert_eq!(
+        crate::oplog::hot_engine::reconstruct_frontier_calls(),
+        0,
+        "an ordinary save must use the current accepted state"
+    );
+
+    crate::oplog::hot_engine::reset_reconstruct_frontier_calls();
+    let source = &fixture.pages[0];
+    let destination = &fixture.pages[1];
+    let moved = OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+        root: BlockLocation {
+            block_id: source.block_ids[0],
+            home_document_id: source.home_document_id,
+        },
+        from_page_id: source.page_id,
+        to_page_id: destination.page_id,
+        parent: None,
+        order: "b".into(),
+    }])
+    .unwrap();
+    fixture.execute_transaction(&moved);
+    assert_eq!(
+        crate::oplog::hot_engine::reconstruct_frontier_calls(),
+        0,
+        "an ordinary cross-page move must use the current accepted state"
+    );
 }
 
 /// Paired bootstrap/steady-state fixture constructor. The exact source bytes

@@ -5473,6 +5473,30 @@
     "failBefore": "proven on the MS-08 packet base: rebuilding a missing disposable SQLite projection reparsed both pages in a two-page healthy baseline; the permanent budget requires zero source parses for already-receipted pages"
    },
    "notes": "Internal MS-08 cost-model correction. New page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Receiptless capsule v4 remains dual-decodable. Any absent, stale, invalid, or capsule-inconsistent receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save census now counts the whole-document outline parser primitive rather than selected Graph callers. A bounded three-entry exact-source cache covers the accepted base, requested target, and clean render base, while parser-owned heading event facts avoid per-block outline reparses. The first and steady post-drain one-block saves both remain within two whole-document outline parser invocations, and both drain legs assert zero."
+  },
+  {
+   "id": "REG-MANAGED-MS14-R0-CURRENT-HEAD-AND-SPARSE-INTEGRITY",
+   "title": "Lazy-genesis integrity accepts sparse overlays and ordinary local mutations do not replay accepted history",
+   "family": "managed-storage-performance-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/import_integration_tests.rs::lazy_genesis_full_integrity_accepts_a_sparse_frontier_overlay",
+     "crates/tine-core/src/oplog/import_integration_tests.rs::ordinary_clean_save_and_move_never_reconstruct_the_accepted_frontier",
+     "crates/tine-core/src/sync_runtime.rs::tests::managed_twenty_page_history_curve_manual_benchmark"
+    ],
+    "scenario": "managed-storage.ms14-r0-current-head-and-history-curve",
+    "failBefore": "The sparse-overlay fixture was falsely diagnosed as corrupt because physical frontier rows were compared with total baseline-plus-overlay document count. The save/move counter observed two reconstruct_frontier calls during one ordinary local save because SQLite rematerialized the just-validated accepted event from immutable history."
+   },
+   "notes": "MS-14 R0 isolates two independently releasable V1 corrections before any durable checkpoint format work. Full integrity now starts history validation from the authenticated lazy-genesis baseline and authenticates the sparse physical overlay at its actual row count, without weakening ordinary full-frontier equality. A one-batch, root-keyed local-author cache lets SQLite consume page outcomes already validated during the same accepted mutation; restart, another batch/root, or any miss still uses immutable history. The permanent counter pins zero reconstruct_frontier calls for ordinary save and cross-page move. The ignored fixed-20-page release harness measures both tail save latency and unsafe-reopen history growth with content-free open-stage attribution."
   }
  ]
 }
