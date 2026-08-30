@@ -44,8 +44,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **PDF rendering now uses PDF.js's maintained page-view lifecycle under one
   window-wide admission and canvas-memory budget.** Visible/focused pages win
   scheduling, stale work is cancelled, evicted views synchronously release
-  their backing stores, and a tab cannot multiply the old per-view resource
-  ceilings. This is the substrate for tile-aware high-zoom rendering (GH #393).
+  their backing stores, and zoom above 300% sharpens only visible clipped tiles
+  while retaining an aligned lower-resolution fallback. Area highlights use a
+  dedicated clipped capture, and a tab cannot multiply the old per-view
+  resource ceilings. (GH #393)
 
 ### Fixed
 

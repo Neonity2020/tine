@@ -1946,7 +1946,10 @@
     "commits": [
      "400f4989",
      "9c15daf7",
-     "391c443e"
+     "391c443e",
+     "2b16bd3c",
+     "c398275e",
+     "466eabd0"
     ]
    },
    "platforms": [
@@ -1956,15 +1959,17 @@
    "status": "fixing",
    "coverage": {
     "tests": [
-     "src/pdfjsContract.test.ts",
-     "src/pdfRenderCoordinator.test.ts",
-     "src/components/PdfViewer.test.tsx",
+      "src/pdfjsContract.test.ts",
+      "src/pdfRenderCoordinator.test.ts",
+      "src/pdfTileRenderer.test.ts",
+      "src/pdfRendererBoundary.test.ts",
+      "src/components/PdfViewer.test.tsx",
      "scripts/e2e-pdf-scroll-resources.mjs"
     ],
     "scenario": "pdf.tile-aware-high-zoom-rendering",
     "failBefore": "proven"
    },
-   "notes": "PDF.js 4.10.38 is pinned and characterized. Tine owns cross-view admission and measured backing-store eviction; exact pixels, tile dimensions, thresholds, frame timing, and DOM nesting are non-requirements."
+   "notes": "PDF.js 4.10.38 is pinned and characterized. Tine owns cross-view admission and measured backing-store eviction. Above the bounded 300% PDFPageView fallback, only visible page/scale/rectangle tiles are rendered; completed lower-resolution tiles remain aligned until the sharper set completes, stale work is cancelled, and area capture uses a dedicated clipped render. Exact pixels, tile dimensions, thresholds, frame timing, and DOM nesting are non-requirements. Native high-zoom interaction remains the final exact-candidate proof."
   },
   {
    "id": "UI-PDF-ROUTE-PANE-SESSION-20260830",
