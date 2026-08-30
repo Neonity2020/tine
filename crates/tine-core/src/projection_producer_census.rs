@@ -6,9 +6,13 @@
 //! primitive, caller, native writer, process handoff, or user-selected writer
 //! must update the census and this guard in the same change.
 
+use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
 
 #[derive(Debug)]
 struct ProductionFile {
@@ -31,6 +35,21 @@ fn visit_rs(directory: &Path, files: &mut Vec<PathBuf>) {
         if path.is_dir() {
             visit_rs(&path, files);
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn visit_source_extensions(directory: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory).expect("native source directory is readable") {
+        let path = entry.expect("native source entry is readable").path();
+        if path.is_dir() {
+            visit_source_extensions(&path, extensions, files);
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extensions.contains(&extension))
+        {
             files.push(path);
         }
     }
@@ -235,57 +254,237 @@ fn matching_brace(mask: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn without_test_items(source: &str) -> String {
-    let mut production = source.to_owned();
-    loop {
-        let mask = code_mask(&production);
-        let candidate = [
-            "#[cfg(test)]",
-            "#[cfg(all(test,",
-            "#[test]",
-            "#[tokio::test]",
-        ]
-        .into_iter()
-        .filter_map(|attribute| mask.find(attribute))
-        .min();
-        let Some(attribute) = candidate else {
-            break;
-        };
-        let attribute_len = mask[attribute..]
-            .find(']')
-            .map(|end| end + 1)
-            .expect("test-only cfg attribute is complete");
-
-        let mut item = attribute + attribute_len;
-        loop {
-            item += mask[item..]
-                .find(|character: char| !character.is_whitespace())
-                .unwrap_or(mask.len() - item);
-            if !mask[item..].starts_with("#[") {
-                break;
-            }
-            let Some(end) = mask[item..].find(']') else {
-                break;
-            };
-            item += end + 1;
+fn is_test_only(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        if attribute.path().is_ident("test") {
+            return true;
         }
-        let tail = mask[item..].trim_start();
-        item += mask[item..].len() - tail.len();
-        let semicolon = mask[item..].find(';').map(|offset| item + offset + 1);
-        let open = mask[item..].find('{').map(|offset| item + offset);
-        let semicolon_item = ["use ", "type ", "const ", "static "]
-            .iter()
-            .any(|prefix| mask[item..].starts_with(prefix))
-            || semicolon.is_some_and(|end| open.is_none_or(|brace| end < brace));
-        let end = if semicolon_item {
-            semicolon.expect("test-only declaration terminates with a semicolon")
-        } else {
-            matching_brace(&mask, open.expect("test-only item has a body"))
-                .expect("test-only item has balanced braces")
+        if attribute.path().segments.len() == 2
+            && attribute.path().segments[0].ident == "tokio"
+            && attribute.path().segments[1].ident == "test"
+        {
+            return true;
+        }
+        if !attribute.path().is_ident("cfg") {
+            return false;
+        }
+        let syn::Meta::List(list) = &attribute.meta else {
+            return false;
         };
-        production.replace_range(attribute..end, "");
+        let predicate = list.tokens.to_string().replace(' ', "");
+        predicate == "test" || predicate.starts_with("all(test,")
+    })
+}
+
+#[derive(Default)]
+struct TestOnlyRanges {
+    ranges: Vec<(proc_macro2::LineColumn, proc_macro2::LineColumn)>,
+}
+
+impl TestOnlyRanges {
+    fn omit<T: Spanned>(&mut self, node: &T, attributes: &[syn::Attribute]) -> bool {
+        if !is_test_only(attributes) {
+            return false;
+        }
+        let start = attributes
+            .first()
+            .map_or_else(|| node.span().start(), |attribute| attribute.span().start());
+        self.ranges.push((start, node.span().end()));
+        true
     }
-    production
+}
+
+fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        syn::Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn impl_item_attributes(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn trait_item_attributes(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn foreign_item_attributes(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn expr_attributes(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(expr) => &expr.attrs,
+        syn::Expr::Assign(expr) => &expr.attrs,
+        syn::Expr::Async(expr) => &expr.attrs,
+        syn::Expr::Await(expr) => &expr.attrs,
+        syn::Expr::Binary(expr) => &expr.attrs,
+        syn::Expr::Block(expr) => &expr.attrs,
+        syn::Expr::Break(expr) => &expr.attrs,
+        syn::Expr::Call(expr) => &expr.attrs,
+        syn::Expr::Cast(expr) => &expr.attrs,
+        syn::Expr::Closure(expr) => &expr.attrs,
+        syn::Expr::Const(expr) => &expr.attrs,
+        syn::Expr::Continue(expr) => &expr.attrs,
+        syn::Expr::Field(expr) => &expr.attrs,
+        syn::Expr::ForLoop(expr) => &expr.attrs,
+        syn::Expr::Group(expr) => &expr.attrs,
+        syn::Expr::If(expr) => &expr.attrs,
+        syn::Expr::Index(expr) => &expr.attrs,
+        syn::Expr::Infer(expr) => &expr.attrs,
+        syn::Expr::Let(expr) => &expr.attrs,
+        syn::Expr::Lit(expr) => &expr.attrs,
+        syn::Expr::Loop(expr) => &expr.attrs,
+        syn::Expr::Macro(expr) => &expr.attrs,
+        syn::Expr::Match(expr) => &expr.attrs,
+        syn::Expr::MethodCall(expr) => &expr.attrs,
+        syn::Expr::Paren(expr) => &expr.attrs,
+        syn::Expr::Path(expr) => &expr.attrs,
+        syn::Expr::Range(expr) => &expr.attrs,
+        syn::Expr::RawAddr(expr) => &expr.attrs,
+        syn::Expr::Reference(expr) => &expr.attrs,
+        syn::Expr::Repeat(expr) => &expr.attrs,
+        syn::Expr::Return(expr) => &expr.attrs,
+        syn::Expr::Struct(expr) => &expr.attrs,
+        syn::Expr::Try(expr) => &expr.attrs,
+        syn::Expr::TryBlock(expr) => &expr.attrs,
+        syn::Expr::Tuple(expr) => &expr.attrs,
+        syn::Expr::Unary(expr) => &expr.attrs,
+        syn::Expr::Unsafe(expr) => &expr.attrs,
+        syn::Expr::Verbatim(_) => &[],
+        syn::Expr::While(expr) => &expr.attrs,
+        syn::Expr::Yield(expr) => &expr.attrs,
+        _ => &[],
+    }
+}
+
+impl<'ast> Visit<'ast> for TestOnlyRanges {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if !self.omit(node, item_attributes(node)) {
+            visit::visit_item(self, node);
+        }
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if !self.omit(node, impl_item_attributes(node)) {
+            visit::visit_impl_item(self, node);
+        }
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        if !self.omit(node, trait_item_attributes(node)) {
+            visit::visit_trait_item(self, node);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        if !self.omit(node, foreign_item_attributes(node)) {
+            visit::visit_foreign_item(self, node);
+        }
+    }
+
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        if !self.omit(node, &node.attrs) {
+            visit::visit_field(self, node);
+        }
+    }
+
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        if !self.omit(node, &node.attrs) {
+            visit::visit_variant(self, node);
+        }
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if !self.omit(node, &node.attrs) {
+            visit::visit_local(self, node);
+        }
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        if !self.omit(node, &node.attrs) {
+            visit::visit_stmt_macro(self, node);
+        }
+    }
+
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        if !self.omit(node, &node.attrs) {
+            visit::visit_arm(self, node);
+        }
+    }
+
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        if !self.omit(node, expr_attributes(node)) {
+            visit::visit_expr(self, node);
+        }
+    }
+}
+
+fn byte_offset(line_starts: &[usize], location: proc_macro2::LineColumn) -> usize {
+    line_starts[location.line - 1] + location.column
+}
+
+/// Blank syntax nodes disabled in tests while preserving byte offsets and lines.
+/// A syntax-aware walk matters: cfg(test) is legal on fields, match arms, local
+/// declarations, and expressions as well as whole items.
+fn without_test_items(source: &str) -> String {
+    let parsed = syn::parse_file(source).expect("production Rust source parses");
+    let mut omitted = TestOnlyRanges::default();
+    omitted.visit_file(&parsed);
+    let mut line_starts = vec![0];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(index + 1);
+        }
+    }
+    let mut bytes = source.as_bytes().to_vec();
+    for (start, end) in omitted.ranges {
+        let start = byte_offset(&line_starts, start);
+        let end = byte_offset(&line_starts, end);
+        for byte in &mut bytes[start..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).expect("blanking preserves UTF-8")
 }
 
 fn production_rust() -> Vec<ProductionFile> {
@@ -315,7 +514,6 @@ fn production_rust() -> Vec<ProductionFile> {
             let relative = path.strip_prefix(&repo).unwrap().to_string_lossy();
             !relative.contains("/tests/")
                 && !relative.contains("/benches/")
-                && !relative.contains("/bin/")
                 && !relative.ends_with("_tests.rs")
         })
         .map(|path| {
@@ -354,6 +552,59 @@ fn token_inventory(
     }
     inventory.sort();
     inventory
+}
+
+fn tine_storage_surface_inventory(files: &[ProductionFile]) -> Vec<(String, String, usize)> {
+    let direct_call =
+        Regex::new(r"tine_storage(?:::[A-Za-z_][A-Za-z0-9_]*)+\(").expect("static regex");
+    let mut inventory = Vec::new();
+    for file in files {
+        for matched in direct_call.find_iter(&file.compact) {
+            let token = matched.as_str().to_owned();
+            if let Some((_, _, count)) = inventory
+                .iter_mut()
+                .find(|(path, existing, _)| path == &file.relative && existing == &token)
+            {
+                *count += 1;
+            } else {
+                inventory.push((file.relative.clone(), token, 1));
+            }
+        }
+        let mut offset = 0;
+        while let Some(relative) = file.compact[offset..].find("usetine_storage") {
+            let start = offset + relative;
+            let end = start
+                + file.compact[start..]
+                    .find(';')
+                    .expect("use declaration ends with semicolon")
+                + 1;
+            inventory.push((
+                file.relative.clone(),
+                file.compact[start..end].to_owned(),
+                1,
+            ));
+            offset = end;
+        }
+    }
+    inventory.sort();
+    inventory
+}
+
+fn inventory_digest(inventory: &[(String, String, usize)]) -> String {
+    let mut hasher = Sha256::new();
+    for (path, token, count) in inventory {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(token.as_bytes());
+        hasher.update([0]);
+        hasher.update(count.to_le_bytes());
+        hasher.update([b'\n']);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn call_count(files: &[ProductionFile], name: &str) -> usize {
@@ -401,6 +652,25 @@ fn function_process_handoffs(files: &[ProductionFile], name: &str) -> usize {
     total
 }
 
+fn function_bodies<'a>(files: &'a [ProductionFile], name: &str) -> Vec<&'a str> {
+    let definition = format!("fn{name}(");
+    let mut bodies = Vec::new();
+    for file in files {
+        let mut offset = 0;
+        while let Some(relative) = file.compact[offset..].find(&definition) {
+            let start = offset + relative;
+            let open = start
+                + file.compact[start..]
+                    .find('{')
+                    .expect("function definition has a body");
+            let end = matching_brace(&file.compact, open).expect("function body is balanced");
+            bodies.push(&file.compact[open..end]);
+            offset = end;
+        }
+    }
+    bodies
+}
+
 #[test]
 fn g_a_mutation_primitive_counts_are_pinned_per_file() {
     let actual = token_inventory(
@@ -442,6 +712,11 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ],
     );
     let expected = [
+        (
+            "crates/tine-core/src/bin/export-block-raws.rs",
+            "fs.write",
+            1,
+        ),
         (
             "crates/tine-core/src/concord_ledger.rs",
             "fs.create_dir_all",
@@ -610,6 +885,11 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             6,
         ),
         (
+            "crates/tine-core/src/oplog/local_completion_index.rs",
+            "cap.remove_file",
+            1,
+        ),
+        (
             "crates/tine-core/src/oplog/object_store.rs",
             "cap.create_dir",
             6,
@@ -751,11 +1031,11 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/sync_runtime.rs",
             "fs.remove_dir_all",
-            4,
+            6,
         ),
-        ("crates/tine-core/src/sync_runtime.rs", "fs.rename", 1),
+        ("crates/tine-core/src/sync_runtime.rs", "fs.rename", 11),
         ("crates/tine-core/src/sync_runtime.rs", "open.create_new", 1),
-        ("src-tauri/src/backup.rs", "cap.create_dir", 1),
+        ("src-tauri/src/backup.rs", "cap.create_dir", 2),
         ("src-tauri/src/backup.rs", "cap.hard_link", 1),
         ("src-tauri/src/backup.rs", "cap.remove_file", 2),
         ("src-tauri/src/backup.rs", "cap.rename", 1),
@@ -838,6 +1118,8 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         "managed_atomic_create_with_proof",
         "managed_atomic_write_validated",
         "managed_atomic_replace_bound",
+        "rename_projection_noreplace_platform",
+        "rename_managed_noreplace",
         "atomic_publish",
         "atomic_write",
         "atomic_write_new",
@@ -849,8 +1131,10 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         "move_to_trash",
         "write_page_projection_with_attempts",
         "preserve_and_restore_projection_recovery",
+        "retire_stable_projection_quarantine",
         "reserve_and_rename",
         "create_projection_chain_component",
+        "empty_asset_trash",
         "reserve_publish_stage",
         "reserve_publish_recovery",
         "commit_publish_stage",
@@ -861,16 +1145,27 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         "replace_mutation_authority_if_exact_inner",
         "move_pending_cleanup_marker_noreplace",
         "acquire_mutation_lease",
+        "publish_immutable_exact_with_durability",
+        "publish_android_private_immutable",
+        "publish_pending_cleanup_marker",
+        "flip_pending_cleanup_round",
         "stage_object_bytes",
         "stage_manifest_bytes",
+        "stage",
+        "commit",
+        "publish_immutable",
         "install_staged_artifact",
+        "replace_head",
         "ensure_shared_provider_directory",
+        "put_complete",
         "provider_retire_original_into_placeholder",
         "write_config",
         "atomic_update",
         "create_graph",
         "create_demo_graph",
         "reserve_restore_recovery",
+        "open_or_create_real_parent",
+        "rename_noreplace_between",
         "publish_temp_noreplace",
         "atomic_copy_new_into_live",
         "move_live_to_recovery",
@@ -885,6 +1180,8 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("managed_atomic_create_with_proof", 2),
         ("managed_atomic_write_validated", 2),
         ("managed_atomic_replace_bound", 1),
+        ("rename_projection_noreplace_platform", 1),
+        ("rename_managed_noreplace", 3),
         ("atomic_publish", 2),
         ("atomic_write", 6),
         ("atomic_write_new", 11),
@@ -896,8 +1193,10 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("move_to_trash", 3),
         ("write_page_projection_with_attempts", 2),
         ("preserve_and_restore_projection_recovery", 2),
+        ("retire_stable_projection_quarantine", 0),
         ("reserve_and_rename", 2),
         ("create_projection_chain_component", 2),
+        ("empty_asset_trash", 1),
         ("reserve_publish_stage", 1),
         ("reserve_publish_recovery", 2),
         ("commit_publish_stage", 1),
@@ -908,16 +1207,27 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("replace_mutation_authority_if_exact_inner", 1),
         ("move_pending_cleanup_marker_noreplace", 1),
         ("acquire_mutation_lease", 4),
+        ("publish_immutable_exact_with_durability", 4),
+        ("publish_android_private_immutable", 1),
+        ("publish_pending_cleanup_marker", 2),
+        ("flip_pending_cleanup_round", 1),
         ("stage_object_bytes", 1),
         ("stage_manifest_bytes", 1),
+        ("stage", 24),
+        ("commit", 8),
+        ("publish_immutable", 8),
         ("install_staged_artifact", 1),
+        ("replace_head", 2),
         ("ensure_shared_provider_directory", 4),
+        ("put_complete", 2),
         ("provider_retire_original_into_placeholder", 1),
         ("write_config", 9),
         ("atomic_update", 5),
         ("create_graph", 0),
         ("create_demo_graph", 1),
         ("reserve_restore_recovery", 2),
+        ("open_or_create_real_parent", 8),
+        ("rename_noreplace_between", 2),
         ("publish_temp_noreplace", 1),
         ("atomic_copy_new_into_live", 4),
         ("move_live_to_recovery", 7),
@@ -933,102 +1243,118 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
 #[test]
 fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
     let repo = repository_root();
-    let read = |relative: &str| fs::read_to_string(repo.join(relative)).unwrap();
+    let files = production_rust();
     let representatives = [
-        ("PC-1", "crates/tine-core/src/model.rs", "pub fn save_page("),
+        ("PC-1", "crates/tine-core/src/model.rs", "fnsave_page("),
         (
             "PC-2",
             "crates/tine-core/src/sync_runtime.rs",
-            "fn execute_provider(",
+            "fnexecute_provider(",
         ),
         (
             "PC-3",
             "crates/tine-core/src/oplog/operational_coordinator.rs",
-            "fn execute_clean_local(",
+            "fnexecute_clean_local(",
         ),
         (
             "PC-4",
             "crates/tine-core/src/oplog/operational_coordinator.rs",
-            "fn execute_clean_external(",
+            "fnexecute_clean_external(",
         ),
         (
             "PC-5",
             "src-tauri/src/sync_runtime.rs",
-            "open_record_with_progress",
+            "fnopen_record_with_progress(",
         ),
         (
             "PC-6",
             "src-tauri/src/sync_runtime.rs",
-            "shutdown_for_direct_files_escape",
+            "fnshutdown_for_direct_files_escape(",
         ),
         (
             "PC-7",
             "src-tauri/src/watcher.rs",
-            "observe_legacy_graph_text_event",
+            "fnobserve_legacy_graph_text_event(",
         ),
-        (
-            "PC-8",
-            "crates/tine-core/src/model.rs",
-            "pub fn publish_html(&self)",
-        ),
+        ("PC-8", "crates/tine-core/src/model.rs", "fnpublish_html("),
         (
             "PC-9",
             "src-tauri/src/commands.rs",
-            "apply_journal_filename_migrations",
+            "fnapply_journal_filename_migrations(",
         ),
         (
             "PC-10",
             "crates/tine-core/src/sync_runtime.rs",
-            "prepare_shared_clean",
+            "fnprepare_shared_clean(",
         ),
         (
             "PC-11",
             "src-tauri/src/commands.rs",
-            "set_preferred_workflow",
+            "fnset_preferred_workflow(",
         ),
-        (
-            "PC-12",
-            "src-tauri/src/graph.rs",
-            "pub(crate) fn create_graph(",
-        ),
-        (
-            "PC-13",
-            "src-tauri/src/backup.rs",
-            "pub(crate) async fn restore_backup(",
-        ),
+        ("PC-12", "src-tauri/src/graph.rs", "fncreate_graph("),
+        ("PC-13", "src-tauri/src/backup.rs", "fnrestore_backup("),
         (
             "PC-14",
             "crates/tine-core/src/graph_name_folding.rs",
-            "probe_graph_name_folding",
+            "fnprobe_graph_name_folding(",
         ),
         (
             "PC-15",
             "src-tauri/src/sync_runtime.rs",
-            "archive_graph_provider_namespace",
+            "fnarchive_graph_provider_namespace(",
         ),
         (
             "PC-16",
             "src-tauri/src/android_managed_storage_smoke.rs",
-            "runManagedActivationSmoke",
+            "fnJava_page_tine_app_ManagedStorageSmoke_runManagedActivationSmoke(",
         ),
         (
-            "PC-17",
-            "src-tauri/ios-folder-picker-native/ios/Sources/GraphFolderPickerPlugin.swift",
-            ".tine-container",
+            "PC-18",
+            "src-tauri/src/commands.rs",
+            "fnedit_asset_external(",
         ),
-        ("PC-18", "src-tauri/src/commands.rs", "edit_asset_external"),
-        ("PC-19", "src-tauri/src/debug.rs", "save_diagnostic_report"),
+        (
+            "PC-19",
+            "src-tauri/src/debug.rs",
+            "fnsave_diagnostic_report(",
+        ),
+        (
+            "PC-20",
+            "crates/tine-core/src/bin/export-block-raws.rs",
+            "fnmain(",
+        ),
     ];
     for (class, path, needle) in representatives {
+        let source = files
+            .iter()
+            .find(|file| file.relative == path)
+            .unwrap_or_else(|| panic!("{class} lost production source {path}"));
         assert!(
-            read(path).contains(needle),
+            source.compact.contains(needle),
             "{class} lost representative {path}:{needle}"
         );
     }
-    assert!(read("src-tauri/src/backup.rs").contains("legacy_graph_cloned"));
-    assert!(read("src-tauri/src/lib.rs")
-        .contains("#[cfg(all(target_os = \"android\", debug_assertions))]\nmod android_managed_storage_smoke;"));
-    let folding_callers = production_rust()
+    assert!(fs::read_to_string(
+        repo.join("src-tauri/ios-folder-picker-native/ios/Sources/GraphFolderPickerPlugin.swift")
+    )
+    .unwrap()
+    .contains(".tine-container"));
+    let restore = function_bodies(&files, "restore_backup");
+    assert_eq!(restore.len(), 1, "PC-13 restore entry remains unique");
+    assert!(
+        restore[0].contains("slot.legacy_graph_cloned("),
+        "PC-13 restore must remain gated to a Direct-Files graph"
+    );
+    let tauri_lib = fs::read_to_string(repo.join("src-tauri/src/lib.rs")).unwrap();
+    let tauri_lib_compact = tauri_lib
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(tauri_lib_compact.contains(
+        "#[cfg(all(target_os=\"android\",debug_assertions))]modandroid_managed_storage_smoke;"
+    ));
+    let folding_callers = files
         .into_iter()
         .filter_map(|file| {
             let count = identifier_occurrences(&file.code, "graph_name_folding(")
@@ -1048,8 +1374,9 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
 
 #[test]
 fn g_d_tine_storage_write_boundaries_are_pinned() {
+    let files = production_rust();
     let actual = token_inventory(
-        &production_rust(),
+        &files,
         &[
             (
                 "immutable.single_writer",
@@ -1134,34 +1461,63 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         actual, expected,
         "a new tine-storage write crossing needs a census row"
     );
+    let dependency_surface = tine_storage_surface_inventory(&files);
+    assert_eq!(
+        inventory_digest(&dependency_surface),
+        "91f0210908beff3b13adccf2a79bbf38745731d73b34197d7999b87527e9f976",
+        "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
+    );
 }
 
 #[test]
 fn g_e_shipped_native_targets_and_writers_are_pinned() {
     let repo = repository_root();
     let ios_root = repo.join("src-tauri/ios-folder-picker-native/ios/Sources");
-    let mut ios = fs::read_dir(&ios_root)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+    let mut ios = Vec::new();
+    visit_source_extensions(&ios_root, &["swift"], &mut ios);
     ios.sort();
-    assert_eq!(ios, ["GraphFolderPickerPlugin.swift"]);
-    let swift = fs::read_to_string(ios_root.join(&ios[0])).unwrap();
+    let ios_relative = ios
+        .iter()
+        .map(|path| path.strip_prefix(&ios_root).unwrap().to_string_lossy())
+        .collect::<Vec<_>>();
+    assert_eq!(ios_relative, ["GraphFolderPickerPlugin.swift"]);
+    let swift = fs::read_to_string(&ios[0]).unwrap();
+    let swift_compact = code_mask(&swift)
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let swift_mutations = [
+        ("FileManager.default.createDirectory(", 2),
+        ("Data().write(", 2),
+        (".removeItem(", 0),
+        (".moveItem(", 0),
+        (".copyItem(", 0),
+        (".replaceItemAt(", 0),
+    ];
+    for (token, expected) in swift_mutations {
+        assert_eq!(
+            swift_compact.matches(token).count(),
+            expected,
+            "iOS native mutation surface changed at {token}"
+        );
+    }
     assert_eq!(
-        swift
-            .matches("Data().write(to: marker, options: .atomic)")
+        swift_compact
+            .matches("Data().write(to:marker,options:.atomic)")
             .count(),
         2
     );
 
     let android_root = repo.join("src-tauri/gen/android/app/src/main/java/page/tine/app");
-    let mut android = fs::read_dir(&android_root)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+    let mut android = Vec::new();
+    visit_source_extensions(&android_root, &["kt", "java"], &mut android);
     android.sort();
+    let android_relative = android
+        .iter()
+        .map(|path| path.strip_prefix(&android_root).unwrap().to_string_lossy())
+        .collect::<Vec<_>>();
     assert_eq!(
-        android,
+        android_relative,
         [
             "GraphFolderPickerPlugin.kt",
             "MainActivity.kt",
@@ -1187,13 +1543,79 @@ fn g_e_shipped_native_targets_and_writers_are_pinned() {
         );
     }
     let media = fs::read_to_string(android_root.join("MediaCapturePlugin.kt")).unwrap();
-    assert_eq!(media.matches("File.createTempFile(").count(), 2);
-    assert_eq!(media.matches("activity.cacheDir").count(), 4);
+    let media_compact = media
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let native_mutations = [
+        ("File.createTempFile(", 2),
+        ("FileOutputStream(", 1),
+        (".write(", 1),
+        (".delete(", 13),
+        (".mkdir(", 0),
+        (".mkdirs(", 0),
+        (".outputStream(", 0),
+        ("setOutputFile(", 1),
+    ];
+    for (token, expected) in native_mutations {
+        let actual = android
+            .iter()
+            .map(|path| {
+                code_mask(&fs::read_to_string(path).unwrap())
+                    .matches(token)
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            actual, expected,
+            "Android native mutation surface changed at {token}"
+        );
+    }
+    assert_eq!(
+        media_compact
+            .matches("File.createTempFile(\"tine_photo_\",\".jpg\",activity.cacheDir)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        media_compact
+            .matches("File.createTempFile(\"tine_memo_\",\".m4a\",activity.cacheDir)")
+            .count(),
+        1
+    );
+    assert!(media_compact.contains("FileOutputStream(out,false)"));
+    assert!(media_compact.contains("copyPickedPhoto(uri,photo)"));
+    assert!(media_compact.contains("rec.setOutputFile(out.absolutePath)"));
 }
 
 #[test]
 fn g_f_graph_path_process_handoffs_are_pinned() {
     let files = production_rust();
+    let launch_roots = token_inventory(
+        &files,
+        &[
+            ("process.command.std", "std::process::Command::new("),
+            ("process.command.imported", "Command::new("),
+            ("process.opener", "opener_command("),
+        ],
+    );
+    let expected_launch_roots = [
+        ("src-tauri/src/commands.rs", "process.opener", 3),
+        ("src-tauri/src/lib.rs", "process.command.imported", 1),
+        ("src-tauri/src/lib.rs", "process.command.std", 1),
+        ("src-tauri/src/platform.rs", "process.command.imported", 2),
+        ("src-tauri/src/platform.rs", "process.command.std", 1),
+        ("src-tauri/src/platform.rs", "process.opener", 9),
+        ("src-tauri/src/spellcheck.rs", "process.command.imported", 1),
+        ("src-tauri/src/spellcheck.rs", "process.command.std", 1),
+    ]
+    .into_iter()
+    .map(|(path, root, count)| (path.to_owned(), root.to_owned(), count))
+    .collect::<Vec<_>>();
+    assert_eq!(
+        launch_roots, expected_launch_roots,
+        "a new production process/opener construction site must be classified as graph-derived or non-graph-derived"
+    );
     let expected = [
         ("edit_asset_external", 2),
         ("open_asset", 1),
@@ -1210,6 +1632,26 @@ fn g_f_graph_path_process_handoffs_are_pinned() {
 #[test]
 fn g_g_user_selected_report_writes_stay_on_the_atomic_family() {
     let repo = repository_root();
+    let save_dialogs = token_inventory(
+        &production_rust(),
+        &[("dialog.blocking_save_file", ".blocking_save_file(")],
+    );
+    assert_eq!(
+        save_dialogs,
+        [
+            (
+                "src-tauri/src/debug.rs".to_owned(),
+                "dialog.blocking_save_file".to_owned(),
+                1,
+            ),
+            (
+                "src-tauri/src/graph_verification.rs".to_owned(),
+                "dialog.blocking_save_file".to_owned(),
+                1,
+            ),
+        ],
+        "a new user-selected destination must be classified and use the atomic family"
+    );
     for relative in [
         "src-tauri/src/debug.rs",
         "src-tauri/src/graph_verification.rs",
@@ -1225,6 +1667,30 @@ fn g_g_user_selected_report_writes_stay_on_the_atomic_family() {
         assert_eq!(source.matches("std::fs::write(").count(), 0, "{relative}");
         assert_eq!(source.matches("fs::write(").count(), 0, "{relative}");
     }
+}
+
+#[test]
+fn syntax_aware_test_mask_handles_items_fields_locals_and_expressions() {
+    let source = r#"
+        #[cfg(test)] fn omitted_item() { fs::write("x", b"x"); }
+        #[cfg(all(test, unix))] mod omitted_module { fn nested() {} }
+        struct Example {
+            kept: u8,
+            #[cfg(test)] omitted_field: u8,
+        }
+        fn kept() {
+            #[cfg(test)] let omitted_local = fs::write("x", b"x");
+            #[cfg(test)] { fs::write("x", b"x"); }
+            fs::write("kept", b"kept");
+        }
+    "#;
+    let production = code_mask(&without_test_items(source));
+    assert!(!production.contains("omitted_item"));
+    assert!(!production.contains("omitted_module"));
+    assert!(!production.contains("omitted_field"));
+    assert!(!production.contains("omitted_local"));
+    assert_eq!(production.matches("fs::write(").count(), 1);
+    assert!(production.contains("fn kept()"));
 }
 
 #[test]

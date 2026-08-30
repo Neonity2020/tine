@@ -44,4 +44,6 @@ windows-sys = { version = "0.61.2", features = [
 
 [dev-dependencies]
 pretty_assertions = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
 tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.8.10", features = ["test-support"] }
