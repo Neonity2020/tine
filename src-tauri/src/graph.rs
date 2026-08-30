@@ -712,14 +712,13 @@ pub(crate) fn load_graph_for_label(
                 .sync_runtime
                 .archive_unrecognized_private_state(app, &root_key)
             {
-                let _ = state.storage_supervisor.finish_transition(
-                    app,
-                    lookup_id,
-                    StorageTransitionOutcome::Failed,
-                    None,
-                    Some("unrecognized_private_state_archive_failed".into()),
-                );
-                return Err(error);
+                // The archive helper published the durable Direct/rebuild
+                // intent first. Keep the Markdown/Org graph available now;
+                // automatic activation below will retry the archive, and a
+                // later open will retry again if that activation also fails.
+                crate::debug::diag(format!(
+                    "pre-0.7 managed-state archive deferred; opening Direct Files: {error}"
+                ));
             }
             rebuild_managed_after_direct = true;
             None
@@ -800,14 +799,18 @@ pub(crate) fn load_graph_for_label(
                 .sync_runtime
                 .archive_unrecognized_private_state(app, &root_key)
             {
-                let _ = state.storage_supervisor.finish_transition(
+                crate::debug::diag(format!(
+                    "pre-0.7 managed-state archive deferred; opening Direct Files: {error}"
+                ));
+                state.storage_supervisor.finish_transition(
                     app,
                     managed_id,
-                    StorageTransitionOutcome::Failed,
+                    StorageTransitionOutcome::Cancelled,
                     None,
-                    Some("unrecognized_private_state_archive_failed".into()),
-                );
-                return Err(error);
+                    Some("blank_slate_archive_deferred".into()),
+                )?;
+                rebuild_managed_after_direct = true;
+                break 'managed;
             }
             state.storage_supervisor.finish_transition(
                 app,
@@ -1638,7 +1641,10 @@ mod tests {
         let start = source
             .find("pub(crate) fn load_graph_for_label")
             .expect("graph load function");
-        let body = &source[start..];
+        let body = &source[start..source[start..]
+            .find("#[tauri::command]")
+            .map(|offset| start + offset)
+            .expect("end of graph load function")];
         let classification = body
             .find("unrecognized_binding_file")
             .expect("unrecognized private binding classification");
@@ -1646,6 +1652,23 @@ mod tests {
             .find("archive_unrecognized_private_state")
             .map(|offset| classification + offset)
             .expect("unrecognized private state archive");
+        assert!(body[archive..].contains("blank_slate_archive_deferred"));
+        assert!(body[archive..].contains("opening Direct Files"));
+        let mut archive_paths = body;
+        let mut checked_archive_paths = 0;
+        while let Some(archive_offset) = archive_paths.find("archive_unrecognized_private_state") {
+            let after_archive = &archive_paths[archive_offset..];
+            let retry_offset = after_archive
+                .find("rebuild_managed_after_direct = true")
+                .expect("archive path must schedule automatic rebuild");
+            assert!(
+                !after_archive[..retry_offset].contains("return Err(error)"),
+                "archive failure must fall through to Direct Files"
+            );
+            checked_archive_paths += 1;
+            archive_paths = &after_archive[retry_offset + 1..];
+        }
+        assert_eq!(checked_archive_paths, 2);
         let durable_retry = body[archive..]
             .find("blank_slate_rebuild_pending")
             .map(|offset| archive + offset)

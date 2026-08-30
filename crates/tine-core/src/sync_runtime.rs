@@ -160,13 +160,13 @@ use crate::oplog::{
     ContentDigest, CurrentPageAtPath, DeviceId, DocumentId, FrontierReferenceHit, LineageDigest,
     LogicalPageName, LogseqIdentityOrigin, LogseqUuid, ManagedLocalAppendError,
     ManagedLocalGenerationAnchorV2, ManagedLocalJournal, ManagedLocalJournalPayloadKind,
-    ManagedLocalJournalProtocol, ManagedLocalRecord, ManagedPath, ManagedTextKind,
-    MaterializedBlock, MaterializedBlockRow, MaterializedEntityId, MaterializedPage,
-    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
-    MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction, PageId, PageState,
-    PreparedBatch, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
-    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
-    SessionId, SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
+    ManagedLocalRecord, ManagedPath, ManagedTextKind, MaterializedBlock, MaterializedBlockRow,
+    MaterializedEntityId, MaterializedPage, MaterializedPageRow, MaterializedPropertyRow,
+    MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow, OperationBatch,
+    OperationObject, OperationTransaction, PageId, PageState, PreparedBatch, ProjectionClaim,
+    ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource, ReferenceCatalogPolicyV1,
+    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
+    SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
     MAX_MATERIALIZATION_QUERY_ROWS,
 };
 use uuid::Uuid;
@@ -10289,11 +10289,6 @@ impl ManagedLocalRuntimeState {
         if self.pending_commit.is_some() {
             return Some("committed_foreground_recovery".into());
         }
-        if self.journal.protocol() == ManagedLocalJournalProtocol::LegacyV1
-            && self.frames.is_empty()
-        {
-            return Some("schema2_rollover".into());
-        }
         self.continuation
             .as_ref()
             .map(|continuation| format!("{:?}", continuation.stage()).to_ascii_lowercase())
@@ -10373,10 +10368,7 @@ impl ManagedLocalRuntimeState {
         if suffix_frames < MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
             return Ok(false);
         }
-        let generation = self
-            .journal
-            .v2_selector_generation()
-            .ok_or_else(|| "clean foreground journal is not schema 2".to_owned())?;
+        let generation = self.journal.selector_generation();
         let successor_generation = generation
             .checked_add(1)
             .ok_or_else(|| "clean foreground selector generation overflow".to_owned())?;
@@ -10400,10 +10392,7 @@ impl ManagedLocalRuntimeState {
         if !self.cleanup_pending {
             return Ok(());
         }
-        let retained_generation = self
-            .journal
-            .v2_selector_generation()
-            .ok_or_else(|| "clean foreground cleanup journal is not schema 2".to_owned())?;
+        let retained_generation = self.journal.selector_generation();
         self.cleanup_clean_foreground_history(retained_generation)?;
         self.cleanup_pending = false;
         Ok(())
@@ -10669,7 +10658,7 @@ fn prepare_clean_foreground_journal(
             format!("cannot publish clean foreground journal anchor {anchor_name}: {error}")
         })?;
     Ok((
-        ManagedLocalJournal::from_open_v2(selector_generation, journal),
+        ManagedLocalJournal::from_open(selector_generation, journal),
         anchor,
     ))
 }
@@ -10743,7 +10732,7 @@ fn recover_clean_foreground_journal_only(
                     format!("cannot open clean foreground journal {anchor_name}: {error}")
                 })?;
             (
-                ManagedLocalJournal::from_open_v2(selector_generation, segment),
+                ManagedLocalJournal::from_open(selector_generation, segment),
                 anchor.checkpoint().clone(),
                 anchor.accepted_batch_id(),
             )

@@ -6,10 +6,9 @@
 //! reject corruption, accidental substitution, and cooperating-process
 //! split-brain. Versioned integrity checkpoints bind bounded immutable history
 //! to the exact authority identity, lease, binding, and lifecycle state, so
-//! arbitrary record bytes cannot summarize an unvalidated prefix. Legacy v1
-//! authorities retain their frozen verifier only for reopening old histories;
-//! current records make a corruption-detection claim, not a secret-holder
-//! security claim. Filesystem and directory-sync guarantees remain
+//! arbitrary record bytes cannot summarize an unvalidated prefix. The current
+//! records make a corruption-detection claim, not a secret-holder security
+//! claim. Filesystem and directory-sync guarantees remain
 //! platform/filesystem dependent.
 //! Windows authoritative handles reject reparse points after open; writable
 //! lease handles additionally deny delete/replacement sharing.
@@ -49,9 +48,6 @@ use uuid::Uuid;
 
 use super::identity::parse_digest;
 use super::import::BootstrapStreamingImportError;
-use super::legacy_enrollment_verifier::{
-    self as legacy_checkpoint, LegacyAuthorityClaimV1 as EnrollmentAuthorityClaimV1,
-};
 use super::object_store::{open_dir_nofollow, publish_immutable_exact, sync_dir_required};
 use super::sqlite::{ProjectionError, WorkspaceRuntimeProof};
 use super::sync_layout::{
@@ -92,10 +88,7 @@ pub(crate) const MAX_BLOCKED_REASON_CODE_BYTES: usize = 64;
 
 const HEAD_BYTES: usize = 65;
 const MAX_LOCAL_ACTIVATION_RESERVATION_BYTES: usize = 4 * 1024;
-const ENROLLMENT_AUTHORITY_SCHEMA_V1: u32 = 1;
 const ENROLLMENT_AUTHORITY_SCHEMA_VERSION: u32 = 2;
-const ENROLLMENT_RECORD_SCHEMA_V5: u32 = 5;
-const ENROLLMENT_CHECKPOINT_SCHEMA_V2: u32 = 2;
 const ENROLLMENT_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 const MAX_ENROLLMENT_AUTHORITY_BYTES: usize = 4 * 1024;
 
@@ -644,11 +637,10 @@ impl EnrollmentBindingV1 {
 }
 
 /// The current claim deliberately keeps the historical filename: its exact
-/// filesystem identity is bound into the lease protocol.  The schema, rather
-/// than the pathname, determines whether a legacy verifier is available.
+/// filesystem identity is bound into the lease protocol.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EnrollmentAuthorityClaimV2 {
+struct EnrollmentAuthorityClaim {
     schema_version: u32,
     authority_id: Uuid,
     lease_resource_id: ContentDigest,
@@ -657,53 +649,29 @@ struct EnrollmentAuthorityClaimV2 {
     initial_source_inventory_digest: ContentDigest,
 }
 
-#[derive(Clone)]
-enum EnrollmentAuthorityClaim {
-    LegacyV1(EnrollmentAuthorityClaimV1),
-    CurrentV2(EnrollmentAuthorityClaimV2),
-}
-
 impl EnrollmentAuthorityClaim {
     const fn schema_version(&self) -> u32 {
-        match self {
-            Self::LegacyV1(claim) => claim.schema_version,
-            Self::CurrentV2(claim) => claim.schema_version,
-        }
+        self.schema_version
     }
 
     const fn authority_id(&self) -> Uuid {
-        match self {
-            Self::LegacyV1(claim) => claim.authority_id,
-            Self::CurrentV2(claim) => claim.authority_id,
-        }
+        self.authority_id
     }
 
     const fn lease_resource_id(&self) -> ContentDigest {
-        match self {
-            Self::LegacyV1(claim) => claim.lease_resource_id,
-            Self::CurrentV2(claim) => claim.lease_resource_id,
-        }
+        self.lease_resource_id
     }
 
     fn binding(&self) -> &EnrollmentBindingV1 {
-        match self {
-            Self::LegacyV1(claim) => &claim.binding,
-            Self::CurrentV2(claim) => &claim.binding,
-        }
+        &self.binding
     }
 
     const fn initial_preparation_id(&self) -> PreparationId {
-        match self {
-            Self::LegacyV1(claim) => claim.initial_preparation_id,
-            Self::CurrentV2(claim) => claim.initial_preparation_id,
-        }
+        self.initial_preparation_id
     }
 
     const fn initial_source_inventory_digest(&self) -> ContentDigest {
-        match self {
-            Self::LegacyV1(claim) => claim.initial_source_inventory_digest,
-            Self::CurrentV2(claim) => claim.initial_source_inventory_digest,
-        }
+        self.initial_source_inventory_digest
     }
 
     fn validate_initial_intent(&self, shadow: &ShadowImportV1) -> Result<(), EnrollmentError> {
@@ -713,13 +681,6 @@ impl EnrollmentAuthorityClaim {
             return Err(EnrollmentError::InitialPreparationMismatch);
         }
         Ok(())
-    }
-
-    fn legacy_key(&self) -> Option<&[u8; legacy_checkpoint::LEGACY_AUTHORITY_KEY_BYTES]> {
-        match self {
-            Self::LegacyV1(claim) => Some(claim.legacy_key()),
-            Self::CurrentV2(_) => None,
-        }
     }
 }
 
@@ -735,10 +696,7 @@ impl EnrollmentAuthorityMaterial {
         expected_binding: &EnrollmentBindingV1,
         expected_lease_resource_id: ContentDigest,
     ) -> Result<Self, EnrollmentError> {
-        if !matches!(
-            claim.schema_version(),
-            ENROLLMENT_AUTHORITY_SCHEMA_V1 | ENROLLMENT_AUTHORITY_SCHEMA_VERSION
-        ) {
+        if claim.schema_version() != ENROLLMENT_AUTHORITY_SCHEMA_VERSION {
             return Err(EnrollmentError::UnsupportedAuthoritySchema(
                 claim.schema_version(),
             ));
@@ -769,7 +727,7 @@ impl EnrollmentAuthorityMaterial {
             binding,
             lifecycle,
         )?;
-        Ok(EnrollmentCheckpoint::CurrentV3(IntegrityCheckpointV3 {
+        Ok(EnrollmentCheckpoint::Current(IntegrityCheckpointV3 {
             schema_version: ENROLLMENT_CHECKPOINT_SCHEMA_VERSION,
             authority_id: self.claim.authority_id(),
             authority_resource_id: self.resource_id,
@@ -783,37 +741,7 @@ impl EnrollmentAuthorityMaterial {
             .as_ref()
             .ok_or(EnrollmentError::MissingAuthenticatedCheckpoint)?;
         match (record.schema_version, checkpoint) {
-            (ENROLLMENT_RECORD_SCHEMA_V5, EnrollmentCheckpoint::LegacyV2(checkpoint)) => {
-                let Some(key) = self.claim.legacy_key() else {
-                    return Err(EnrollmentError::IllegalCheckpointPair);
-                };
-                if checkpoint.schema_version != ENROLLMENT_CHECKPOINT_SCHEMA_V2 {
-                    return Err(EnrollmentError::UnsupportedCheckpointSchema(
-                        checkpoint.schema_version,
-                    ));
-                }
-                if checkpoint.authority_id != self.claim.authority_id()
-                    || checkpoint.authority_resource_id != self.resource_id
-                {
-                    return Err(EnrollmentError::AuthorityMismatch);
-                }
-                let message = legacy_checkpoint_message_bytes(
-                    checkpoint.authority_id,
-                    checkpoint.authority_resource_id,
-                    record.generation,
-                    record.previous,
-                    record.history_accumulator,
-                    record.lease_resource_id,
-                    &record.binding,
-                    &record.lifecycle,
-                )?;
-                if legacy_checkpoint::verify(key, &message, checkpoint.authentication_tag) {
-                    Ok(())
-                } else {
-                    Err(EnrollmentError::CheckpointLegacyAuthenticationFailed)
-                }
-            }
-            (ENROLLMENT_RECORD_SCHEMA_VERSION, EnrollmentCheckpoint::CurrentV3(checkpoint)) => {
+            (ENROLLMENT_RECORD_SCHEMA_VERSION, EnrollmentCheckpoint::Current(checkpoint)) => {
                 if checkpoint.schema_version != ENROLLMENT_CHECKPOINT_SCHEMA_VERSION {
                     return Err(EnrollmentError::UnsupportedCheckpointSchema(
                         checkpoint.schema_version,
@@ -842,38 +770,6 @@ impl EnrollmentAuthorityMaterial {
             }
             _ => Err(EnrollmentError::IllegalCheckpointPair),
         }
-    }
-
-    #[cfg(test)]
-    fn legacy_checkpoint_for_test(
-        &self,
-        generation: u64,
-        previous: Option<ContentDigest>,
-        history_accumulator: ContentDigest,
-        lease_resource_id: ContentDigest,
-        binding: &EnrollmentBindingV1,
-        lifecycle: &EnrollmentLifecycleV1,
-    ) -> Result<EnrollmentCheckpoint, EnrollmentError> {
-        let key = self
-            .claim
-            .legacy_key()
-            .ok_or(EnrollmentError::IllegalCheckpointPair)?;
-        let message = legacy_checkpoint_message_bytes(
-            self.claim.authority_id(),
-            self.resource_id,
-            generation,
-            previous,
-            history_accumulator,
-            lease_resource_id,
-            binding,
-            lifecycle,
-        )?;
-        Ok(EnrollmentCheckpoint::LegacyV2(AuthenticatedCheckpointV1 {
-            schema_version: ENROLLMENT_CHECKPOINT_SCHEMA_V2,
-            authority_id: self.claim.authority_id(),
-            authority_resource_id: self.resource_id,
-            authentication_tag: legacy_checkpoint::sign_for_test(key, &message),
-        }))
     }
 
     fn audit_cursor_tag(
@@ -1638,15 +1534,6 @@ fn validate_reason_code(reason: &str) -> Result<(), EnrollmentError> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AuthenticatedCheckpointV1 {
-    schema_version: u32,
-    authority_id: Uuid,
-    authority_resource_id: ContentDigest,
-    authentication_tag: ContentDigest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct IntegrityCheckpointV3 {
     schema_version: u32,
     authority_id: Uuid,
@@ -1656,45 +1543,7 @@ struct IntegrityCheckpointV3 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EnrollmentCheckpoint {
-    LegacyV2(AuthenticatedCheckpointV1),
-    CurrentV3(IntegrityCheckpointV3),
-}
-
-#[derive(Serialize)]
-struct CheckpointMessageV1<'a> {
-    domain: &'static str,
-    authority_id: Uuid,
-    authority_resource_id: ContentDigest,
-    generation: u64,
-    previous: Option<ContentDigest>,
-    history_accumulator: ContentDigest,
-    lease_resource_id: ContentDigest,
-    binding: &'a EnrollmentBindingV1,
-    lifecycle: &'a EnrollmentLifecycleV1,
-}
-
-fn legacy_checkpoint_message_bytes(
-    authority_id: Uuid,
-    authority_resource_id: ContentDigest,
-    generation: u64,
-    previous: Option<ContentDigest>,
-    history_accumulator: ContentDigest,
-    lease_resource_id: ContentDigest,
-    binding: &EnrollmentBindingV1,
-    lifecycle: &EnrollmentLifecycleV1,
-) -> Result<Vec<u8>, EnrollmentError> {
-    serde_json::to_vec(&CheckpointMessageV1 {
-        domain: legacy_checkpoint::LEGACY_CHECKPOINT_DOMAIN,
-        authority_id,
-        authority_resource_id,
-        generation,
-        previous,
-        history_accumulator,
-        lease_resource_id,
-        binding,
-        lifecycle,
-    })
-    .map_err(|error| EnrollmentError::Encode(error.to_string()))
+    Current(IntegrityCheckpointV3),
 }
 
 #[derive(Serialize)]
@@ -1827,10 +1676,7 @@ impl EnrollmentRecordV1 {
     }
 
     fn validate(&self) -> Result<(), EnrollmentError> {
-        if !matches!(
-            self.schema_version,
-            ENROLLMENT_RECORD_SCHEMA_V5 | ENROLLMENT_RECORD_SCHEMA_VERSION
-        ) {
+        if self.schema_version != ENROLLMENT_RECORD_SCHEMA_VERSION {
             return Err(EnrollmentError::UnsupportedRecordSchema(
                 self.schema_version,
             ));
@@ -1843,18 +1689,9 @@ impl EnrollmentRecordV1 {
         }
         if let Some(checkpoint) = &self.checkpoint {
             match (self.schema_version, checkpoint) {
-                (ENROLLMENT_RECORD_SCHEMA_V5, EnrollmentCheckpoint::LegacyV2(checkpoint))
-                    if checkpoint.schema_version == ENROLLMENT_CHECKPOINT_SCHEMA_V2 => {}
-                (ENROLLMENT_RECORD_SCHEMA_VERSION, EnrollmentCheckpoint::CurrentV3(checkpoint))
+                (ENROLLMENT_RECORD_SCHEMA_VERSION, EnrollmentCheckpoint::Current(checkpoint))
                     if checkpoint.schema_version == ENROLLMENT_CHECKPOINT_SCHEMA_VERSION => {}
-                (_, EnrollmentCheckpoint::LegacyV2(checkpoint))
-                    if checkpoint.schema_version != ENROLLMENT_CHECKPOINT_SCHEMA_V2 =>
-                {
-                    return Err(EnrollmentError::UnsupportedCheckpointSchema(
-                        checkpoint.schema_version,
-                    ));
-                }
-                (_, EnrollmentCheckpoint::CurrentV3(checkpoint))
+                (_, EnrollmentCheckpoint::Current(checkpoint))
                     if checkpoint.schema_version != ENROLLMENT_CHECKPOINT_SCHEMA_VERSION =>
                 {
                     return Err(EnrollmentError::UnsupportedCheckpointSchema(
@@ -2476,88 +2313,6 @@ pub(crate) fn create_discovery_enrollment_for_test(
     }
 }
 
-/// Install the frozen v1 authority / v5 generation-one bytes used by
-/// cross-version recovery and discovery tests. The historical signer is
-/// available only under `cfg(test)`; production can verify these bytes but can
-/// never mint them.
-#[cfg(test)]
-pub(crate) fn create_legacy_initial_enrollment_for_test(
-    root_path: &Path,
-    binding: EnrollmentBindingV1,
-) -> Result<(), EnrollmentError> {
-    let root = prepare_application_root(root_path)?;
-    let shadow = ShadowImportV1 {
-        preparation_id: PreparationId::from_uuid(Uuid::from_u128(8)),
-        source_inventory_digest: ContentDigest::from_bytes([9; 32]),
-    };
-    let writer = EnrollmentWriter::create(&root, binding.clone(), shadow.clone())?;
-    let lease_resource_id = writer.lease.resource_id;
-    drop(writer);
-
-    let directories = open_directories(&root, binding.graph_resource_id, false)?
-        .ok_or(EnrollmentError::AmbiguousInitialCreation)?;
-    if let Some(head) = read_head(&directories.enrollment)? {
-        directories.enrollment.remove_file(HEAD_FILE)?;
-        directories
-            .records
-            .remove_file(&format!("{head}{RECORD_SUFFIX}"))?;
-    }
-    let legacy_claim =
-        EnrollmentAuthorityClaim::LegacyV1(EnrollmentAuthorityClaimV1::new_for_test(
-            ENROLLMENT_AUTHORITY_SCHEMA_V1,
-            Uuid::from_u128(0x1e9ac),
-            lease_resource_id,
-            binding.clone(),
-            shadow.preparation_id,
-            shadow.source_inventory_digest,
-            0x5a,
-        ));
-    let authority_bytes = canonical_authority_claim_bytes(&legacy_claim)?;
-    directories.enrollment.remove_file(AUTHORITY_FILE)?;
-    let mut authority_file = create_new_regular(&directories.enrollment, AUTHORITY_FILE)?;
-    authority_file.write_all(&authority_bytes)?;
-    crate::durability_counters::sync_file(&authority_file)?;
-    let authority_identity = authoritative_file_identity(&authority_file)?;
-    let material = EnrollmentAuthorityMaterial::from_claim(
-        legacy_claim,
-        authority_resource_id(&authority_identity),
-        &binding,
-        lease_resource_id,
-    )?;
-    let lifecycle = EnrollmentLifecycleV1::ShadowImport(shadow);
-    let mut record = EnrollmentRecordV1 {
-        schema_version: ENROLLMENT_RECORD_SCHEMA_V5,
-        generation: 1,
-        previous: None,
-        history_accumulator: compute_history_accumulator(1, None, None, &binding, &lifecycle)?,
-        lease_resource_id,
-        binding,
-        lifecycle,
-        checkpoint: None,
-    };
-    record.checkpoint = Some(material.legacy_checkpoint_for_test(
-        record.generation,
-        record.previous,
-        record.history_accumulator,
-        record.lease_resource_id,
-        &record.binding,
-        &record.lifecycle,
-    )?);
-    let record_bytes = canonical_record_bytes(&record)?;
-    let digest = ContentDigest::of(&record_bytes);
-    let mut record_file =
-        create_new_regular(&directories.records, &format!("{digest}{RECORD_SUFFIX}"))?;
-    record_file.write_all(&record_bytes)?;
-    crate::durability_counters::sync_file(&record_file)?;
-    let mut head_file = create_new_regular(&directories.enrollment, HEAD_FILE)?;
-    head_file.write_all(format!("{digest}\n").as_bytes())?;
-    crate::durability_counters::sync_file(&head_file)?;
-    sync_dir_required(&directories.records)
-        .map_err(|error| EnrollmentError::Durability(error.to_string()))?;
-    sync_dir_required(&directories.enrollment)
-        .map_err(|error| EnrollmentError::Durability(error.to_string()))
-}
-
 #[derive(Debug)]
 struct EnrollmentDirectories {
     enrollment: Dir,
@@ -2773,9 +2528,8 @@ impl EnrollmentWriter {
         let lease = acquire_lease(&directories, true)?;
         let authority =
             provision_or_resume_enrollment_authority(&directories, &lease, &binding, &shadow)?;
-        let current_record =
+        let record =
             EnrollmentRecordV1::initial(binding, shadow, lease.resource_id, &authority.material)?;
-        let record = select_initial_record_for_recovery(&directories, &authority, &current_record)?;
         let snapshot =
             resume_or_persist_initial_record(&directories, &lease, &authority, &record, cut)?;
         Ok(Self {
@@ -4699,20 +4453,7 @@ fn inject_crash_cut(
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EnrollmentRecordWireV5 {
-    schema_version: u32,
-    generation: u64,
-    previous: Option<ContentDigest>,
-    history_accumulator: ContentDigest,
-    lease_resource_id: ContentDigest,
-    binding: EnrollmentBindingV1,
-    lifecycle: EnrollmentLifecycleV1,
-    checkpoint: Option<AuthenticatedCheckpointV1>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnrollmentRecordWireV6 {
+struct EnrollmentRecordWire {
     schema_version: u32,
     generation: u64,
     previous: Option<ContentDigest>,
@@ -4723,17 +4464,16 @@ struct EnrollmentRecordWireV6 {
     checkpoint: Option<IntegrityCheckpointV3>,
 }
 
-// The normalized model is deliberately not deserializable: wire decoding must
-// select exactly one strict schema before normalization.  Test mutation helpers
-// still need an unchecked canonical-shaped serializer to manufacture malformed
-// bytes for the decoder's negative cases.
+// The normalized model is deliberately not deserializable. Test mutation
+// helpers still need an unchecked canonical-shaped serializer to manufacture
+// malformed bytes for the decoder's negative cases.
 impl Serialize for EnrollmentRecordV1 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         match self.schema_version {
-            ENROLLMENT_RECORD_SCHEMA_V5 => EnrollmentRecordWireV5 {
+            ENROLLMENT_RECORD_SCHEMA_VERSION => EnrollmentRecordWire {
                 schema_version: self.schema_version,
                 generation: self.generation,
                 previous: self.previous,
@@ -4742,24 +4482,8 @@ impl Serialize for EnrollmentRecordV1 {
                 binding: self.binding.clone(),
                 lifecycle: self.lifecycle.clone(),
                 checkpoint: match &self.checkpoint {
-                    Some(EnrollmentCheckpoint::LegacyV2(checkpoint)) => Some(checkpoint.clone()),
+                    Some(EnrollmentCheckpoint::Current(checkpoint)) => Some(checkpoint.clone()),
                     None => None,
-                    _ => return Err(serde::ser::Error::custom("illegal checkpoint pair")),
-                },
-            }
-            .serialize(serializer),
-            ENROLLMENT_RECORD_SCHEMA_VERSION => EnrollmentRecordWireV6 {
-                schema_version: self.schema_version,
-                generation: self.generation,
-                previous: self.previous,
-                history_accumulator: self.history_accumulator,
-                lease_resource_id: self.lease_resource_id,
-                binding: self.binding.clone(),
-                lifecycle: self.lifecycle.clone(),
-                checkpoint: match &self.checkpoint {
-                    Some(EnrollmentCheckpoint::CurrentV3(checkpoint)) => Some(checkpoint.clone()),
-                    None => None,
-                    _ => return Err(serde::ser::Error::custom("illegal checkpoint pair")),
                 },
             }
             .serialize(serializer),
@@ -4773,30 +4497,12 @@ impl Serialize for EnrollmentRecordV1 {
 fn canonical_record_bytes(record: &EnrollmentRecordV1) -> Result<Vec<u8>, EnrollmentError> {
     record.validate()?;
     let bytes = match record.schema_version {
-        ENROLLMENT_RECORD_SCHEMA_V5 => {
-            let checkpoint = match &record.checkpoint {
-                Some(EnrollmentCheckpoint::LegacyV2(checkpoint)) => Some(checkpoint.clone()),
-                None => None,
-                _ => return Err(EnrollmentError::IllegalCheckpointPair),
-            };
-            serde_json::to_vec(&EnrollmentRecordWireV5 {
-                schema_version: record.schema_version,
-                generation: record.generation,
-                previous: record.previous,
-                history_accumulator: record.history_accumulator,
-                lease_resource_id: record.lease_resource_id,
-                binding: record.binding.clone(),
-                lifecycle: record.lifecycle.clone(),
-                checkpoint,
-            })
-        }
         ENROLLMENT_RECORD_SCHEMA_VERSION => {
             let checkpoint = match &record.checkpoint {
-                Some(EnrollmentCheckpoint::CurrentV3(checkpoint)) => Some(checkpoint.clone()),
+                Some(EnrollmentCheckpoint::Current(checkpoint)) => Some(checkpoint.clone()),
                 None => None,
-                _ => return Err(EnrollmentError::IllegalCheckpointPair),
             };
-            serde_json::to_vec(&EnrollmentRecordWireV6 {
+            serde_json::to_vec(&EnrollmentRecordWire {
                 schema_version: record.schema_version,
                 generation: record.generation,
                 previous: record.previous,
@@ -4846,22 +4552,8 @@ fn decode_record(bytes: &[u8]) -> Result<EnrollmentRecordV1, EnrollmentError> {
         ));
     }
     let record = match schema {
-        ENROLLMENT_RECORD_SCHEMA_V5 => {
-            let record: EnrollmentRecordWireV5 = serde_json::from_slice(bytes)
-                .map_err(|error| EnrollmentError::Decode(error.to_string()))?;
-            EnrollmentRecordV1 {
-                schema_version: record.schema_version,
-                generation: record.generation,
-                previous: record.previous,
-                history_accumulator: record.history_accumulator,
-                lease_resource_id: record.lease_resource_id,
-                binding: record.binding,
-                lifecycle: record.lifecycle,
-                checkpoint: record.checkpoint.map(EnrollmentCheckpoint::LegacyV2),
-            }
-        }
         ENROLLMENT_RECORD_SCHEMA_VERSION => {
-            let record: EnrollmentRecordWireV6 = serde_json::from_slice(bytes)
+            let record: EnrollmentRecordWire = serde_json::from_slice(bytes)
                 .map_err(|error| EnrollmentError::Decode(error.to_string()))?;
             EnrollmentRecordV1 {
                 schema_version: record.schema_version,
@@ -4871,7 +4563,7 @@ fn decode_record(bytes: &[u8]) -> Result<EnrollmentRecordV1, EnrollmentError> {
                 lease_resource_id: record.lease_resource_id,
                 binding: record.binding,
                 lifecycle: record.lifecycle,
-                checkpoint: record.checkpoint.map(EnrollmentCheckpoint::CurrentV3),
+                checkpoint: record.checkpoint.map(EnrollmentCheckpoint::Current),
             }
         }
         schema => return Err(EnrollmentError::UnsupportedRecordSchema(schema)),
@@ -5455,92 +5147,6 @@ fn resume_or_persist_initial_record(
     persist_record_and_head(directories, lease, record, cut)
 }
 
-/// A current binary never mints a legacy checkpoint, but it must be able to
-/// finish an old binary's initial publication after the v1 authority became
-/// durable. Select an existing v5 generation-one candidate only when its
-/// canonical bytes, deterministic name, binding, lease, initial intent, and
-/// frozen HMAC all verify. The ordinary initial-publication recovery below
-/// then applies the retained-capability and link-count rules to those exact
-/// bytes. With no valid legacy candidate, the current v6 initial record remains
-/// the only record this binary can publish.
-fn select_initial_record_for_recovery(
-    directories: &EnrollmentDirectories,
-    authority: &EnrollmentAuthority,
-    current_record: &EnrollmentRecordV1,
-) -> Result<EnrollmentRecordV1, EnrollmentError> {
-    if !matches!(
-        &authority.material.claim,
-        EnrollmentAuthorityClaim::LegacyV1(_)
-    ) {
-        return Ok(current_record.clone());
-    }
-    let EnrollmentLifecycleV1::ShadowImport(expected_shadow) = &current_record.lifecycle else {
-        unreachable!("an initial record always carries ShadowImport")
-    };
-
-    let mut candidate: Option<(ContentDigest, EnrollmentRecordV1)> = None;
-    let mut count = 0usize;
-    for entry in directories.records.entries()? {
-        let entry = entry?;
-        count += 1;
-        if count > MAX_ENROLLMENT_NAMESPACE_ENTRIES {
-            return Err(EnrollmentError::NamespaceBoundExceeded);
-        }
-        if !regular_entry(&entry)? {
-            continue;
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| EnrollmentError::UnsupportedArtifact("non-UTF-8 record name".into()))?;
-        let (bytes, _) = read_bounded_authoritative_file(
-            &directories.records,
-            &name,
-            MAX_ENROLLMENT_RECORD_BYTES,
-            "legacy initial enrollment recovery candidate",
-            true,
-        )?;
-        if bytes.is_empty() {
-            continue;
-        }
-        let Ok(record) = decode_record(&bytes) else {
-            continue;
-        };
-        if record.schema_version != ENROLLMENT_RECORD_SCHEMA_V5 {
-            continue;
-        }
-        let digest = ContentDigest::of(&bytes);
-        let target = format!("{digest}{RECORD_SUFFIX}");
-        let temp = format!("{RECORD_TEMP_PREFIX}{digest}");
-        if name != target && name != temp {
-            return Err(EnrollmentError::AmbiguousInitialCreation);
-        }
-        validate_record_authority(
-            &record,
-            &current_record.binding,
-            current_record.lease_resource_id,
-            &authority.material,
-        )?;
-        validate_initial_record(&record)?;
-        if !matches!(
-            &record.lifecycle,
-            EnrollmentLifecycleV1::ShadowImport(shadow) if shadow == expected_shadow
-        ) {
-            return Err(EnrollmentError::InitialPreparationMismatch);
-        }
-        if candidate
-            .as_ref()
-            .is_some_and(|(found_digest, _)| *found_digest != digest)
-        {
-            return Err(EnrollmentError::AmbiguousInitialCreation);
-        }
-        candidate = Some((digest, record));
-    }
-    Ok(candidate
-        .map(|(_, record)| record)
-        .unwrap_or_else(|| current_record.clone()))
-}
-
 fn reject_unsafe_head_target(directory: &Dir) -> Result<(), EnrollmentError> {
     match directory.symlink_metadata(HEAD_FILE) {
         Ok(metadata) if !cap_metadata_is_authoritative_file(&metadata) => {
@@ -5799,14 +5405,14 @@ fn provision_or_resume_enrollment_authority(
         return open_enrollment_authority(directories, binding, lease.resource_id);
     }
 
-    let claim = EnrollmentAuthorityClaim::CurrentV2(EnrollmentAuthorityClaimV2 {
+    let claim = EnrollmentAuthorityClaim {
         schema_version: ENROLLMENT_AUTHORITY_SCHEMA_VERSION,
         authority_id: Uuid::new_v4(),
         lease_resource_id: lease.resource_id,
         binding: binding.clone(),
         initial_preparation_id: shadow.preparation_id,
         initial_source_inventory_digest: shadow.source_inventory_digest,
-    });
+    };
     let bytes = canonical_authority_claim_bytes(&claim)?;
     let temp_name = format!("{AUTHORITY_TEMP_PREFIX}{}", Uuid::new_v4());
     lease.validate_current()?;
@@ -6066,11 +5672,8 @@ fn open_enrollment_authority_internal(
 fn canonical_authority_claim_bytes(
     claim: &EnrollmentAuthorityClaim,
 ) -> Result<Vec<u8>, EnrollmentError> {
-    let bytes = match claim {
-        EnrollmentAuthorityClaim::LegacyV1(claim) => serde_json::to_vec(claim),
-        EnrollmentAuthorityClaim::CurrentV2(claim) => serde_json::to_vec(claim),
-    }
-    .map_err(|error| EnrollmentError::Encode(error.to_string()))?;
+    let bytes =
+        serde_json::to_vec(claim).map_err(|error| EnrollmentError::Encode(error.to_string()))?;
     if bytes.len() > MAX_ENROLLMENT_AUTHORITY_BYTES {
         return Err(EnrollmentError::AuthorityClaimTooLarge(bytes.len()));
     }
@@ -6090,17 +5693,11 @@ fn decode_authority_claim(bytes: &[u8]) -> Result<EnrollmentAuthorityClaim, Enro
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| EnrollmentError::Decode("authority schema_version is missing".into()))?;
     let schema = u32::try_from(schema).unwrap_or(u32::MAX);
-    let claim = match schema {
-        ENROLLMENT_AUTHORITY_SCHEMA_V1 => EnrollmentAuthorityClaim::LegacyV1(
-            serde_json::from_slice(bytes)
-                .map_err(|error| EnrollmentError::Decode(error.to_string()))?,
-        ),
-        ENROLLMENT_AUTHORITY_SCHEMA_VERSION => EnrollmentAuthorityClaim::CurrentV2(
-            serde_json::from_slice(bytes)
-                .map_err(|error| EnrollmentError::Decode(error.to_string()))?,
-        ),
-        schema => return Err(EnrollmentError::UnsupportedAuthoritySchema(schema)),
-    };
+    if schema != ENROLLMENT_AUTHORITY_SCHEMA_VERSION {
+        return Err(EnrollmentError::UnsupportedAuthoritySchema(schema));
+    }
+    let claim: EnrollmentAuthorityClaim = serde_json::from_slice(bytes)
+        .map_err(|error| EnrollmentError::Decode(error.to_string()))?;
     if canonical_authority_claim_bytes(&claim)? != bytes {
         return Err(EnrollmentError::NonCanonicalAuthorityClaim);
     }
@@ -6876,40 +6473,19 @@ mod tests {
         lease_resource_id: ContentDigest,
     ) -> EnrollmentAuthorityMaterial {
         EnrollmentAuthorityMaterial::from_claim(
-            EnrollmentAuthorityClaim::LegacyV1(EnrollmentAuthorityClaimV1 {
-                schema_version: ENROLLMENT_AUTHORITY_SCHEMA_V1,
+            EnrollmentAuthorityClaim {
+                schema_version: ENROLLMENT_AUTHORITY_SCHEMA_VERSION,
                 authority_id: Uuid::from_u128(25),
                 lease_resource_id,
                 binding: binding.clone(),
                 initial_preparation_id: shadow().preparation_id,
                 initial_source_inventory_digest: shadow().source_inventory_digest,
-                key: [26; legacy_checkpoint::LEGACY_AUTHORITY_KEY_BYTES],
-            }),
+            },
             digest(27),
             &binding,
             lease_resource_id,
         )
         .unwrap()
-    }
-
-    /// Build one byte-exact old-format enrollment without exercising an old
-    /// binary.  The test-only legacy signer makes the frozen v1/v5 bytes a
-    /// compatibility fixture; production can only verify them.
-    fn install_legacy_v1_v5_enrollment(
-        root: &TestRoot,
-        binding: EnrollmentBindingV1,
-    ) -> (Vec<u8>, AuthoritativeFileIdentity) {
-        create_legacy_initial_enrollment_for_test(&root.path, binding.clone()).unwrap();
-        let enrollment = enrollment_directory(root, &binding);
-        let authority_path = enrollment.join(AUTHORITY_FILE);
-        let authority_bytes = fs::read(&authority_path).unwrap();
-        let file = open_regular_readonly(
-            &Dir::open_ambient_dir(&enrollment, ambient_authority()).unwrap(),
-            AUTHORITY_FILE,
-        )
-        .unwrap();
-        let identity = authoritative_file_identity(&file).unwrap();
-        (authority_bytes, identity)
     }
 
     fn graph_resource(byte: u8) -> CanonicalGraphResourceId {
@@ -7230,307 +6806,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_v5_reopens_byte_exactly_then_lazily_appends_v6_without_rewriting_authority() {
-        let root = TestRoot::new("legacy-v1-v5-lazy-successor");
-        let binding = test_binding();
-        let (legacy_authority_bytes, legacy_identity) =
-            install_legacy_v1_v5_enrollment(&root, binding.clone());
-
-        let mut writer =
-            expect_present(EnrollmentWriter::open_existing(&root.app(), &binding).unwrap());
-        assert_eq!(
-            writer.current().record.schema_version,
-            ENROLLMENT_RECORD_SCHEMA_V5
-        );
-        let old_head = writer.current().digest;
-        let successor = writer
-            .transition(old_head, EnrollmentLifecycleV1::VerifiedLocal(verified()))
-            .unwrap()
-            .clone();
-        assert_eq!(
-            successor.record.schema_version,
-            ENROLLMENT_RECORD_SCHEMA_VERSION
-        );
-        assert_eq!(successor.record.previous, Some(old_head));
-        assert!(
-            matches!(successor.record.checkpoint, None),
-            "generation two deliberately remains in the bounded suffix"
-        );
-        drop(writer);
-
-        let authority_path = enrollment_directory(&root, &binding).join(AUTHORITY_FILE);
-        assert_eq!(fs::read(&authority_path).unwrap(), legacy_authority_bytes);
-        let directory =
-            Dir::open_ambient_dir(enrollment_directory(&root, &binding), ambient_authority())
-                .unwrap();
-        let reopened_authority = open_regular_readonly(&directory, AUTHORITY_FILE).unwrap();
-        assert_eq!(
-            authoritative_file_identity(&reopened_authority).unwrap(),
-            legacy_identity
-        );
-
-        let reopened =
-            expect_present(EnrollmentReader::open_existing(&root.app(), &binding).unwrap());
-        assert_eq!(reopened.current().digest, successor.digest);
-        let page = reopened
-            .audit_chain_page(None, MAX_ENROLLMENT_AUDIT_PAGE)
-            .unwrap();
-        assert_eq!(page.records.len(), 2);
-        assert_eq!(
-            page.records[0].record.schema_version,
-            ENROLLMENT_RECORD_SCHEMA_VERSION
-        );
-        assert_eq!(
-            page.records[1].record.schema_version,
-            ENROLLMENT_RECORD_SCHEMA_V5
-        );
-    }
-
-    #[test]
-    fn legacy_v1_v5_mixed_suffix_opens_at_every_boundary_and_full_audit_pages_verify_both_codecs() {
-        let root = TestRoot::new("legacy-mixed-boundary-audit");
-        let binding = test_binding();
-        let (legacy_authority_bytes, legacy_identity) =
-            install_legacy_v1_v5_enrollment(&root, binding.clone());
-        let mut writer =
-            expect_present(EnrollmentWriter::open_existing(&root.app(), &binding).unwrap());
-        let initial = writer.current().digest;
-        let verified_digest = writer
-            .transition(initial, EnrollmentLifecycleV1::VerifiedLocal(verified()))
-            .unwrap()
-            .digest;
-        for ordinal in 0..(MAX_ENROLLMENT_OPEN_CHAIN_RECORDS * 2) {
-            let lifecycle = if ordinal.is_multiple_of(2) {
-                unsafe_idle(verified_digest, 0x2_000 + ordinal as u128)
-            } else {
-                safe_idle(verified_digest)
-            };
-            let head = writer.current().digest;
-            let successor = writer.transition(head, lifecycle).unwrap().clone();
-            let reopened =
-                expect_present(EnrollmentReader::open_existing(&root.app(), &binding).unwrap());
-            assert_eq!(
-                reopened.current().digest,
-                successor.digest,
-                "mixed suffix offset {ordinal} must retain a bounded open proof"
-            );
-        }
-        drop(writer);
-
-        let authority_path = enrollment_directory(&root, &binding).join(AUTHORITY_FILE);
-        assert_eq!(fs::read(&authority_path).unwrap(), legacy_authority_bytes);
-        let directory =
-            Dir::open_ambient_dir(enrollment_directory(&root, &binding), ambient_authority())
-                .unwrap();
-        assert_eq!(
-            authoritative_file_identity(
-                &open_regular_readonly(&directory, AUTHORITY_FILE).unwrap()
-            )
-            .unwrap(),
-            legacy_identity
-        );
-
-        let reader =
-            expect_present(EnrollmentReader::open_existing(&root.app(), &binding).unwrap());
-        let mut cursor = None;
-        let mut total = 0;
-        let mut saw_legacy_v5 = false;
-        let mut saw_current_v6 = false;
-        loop {
-            let page = reader
-                .audit_chain_page(cursor, MAX_ENROLLMENT_AUDIT_PAGE)
-                .unwrap();
-            for snapshot in &page.records {
-                saw_legacy_v5 |= snapshot.record.schema_version == ENROLLMENT_RECORD_SCHEMA_V5;
-                saw_current_v6 |=
-                    snapshot.record.schema_version == ENROLLMENT_RECORD_SCHEMA_VERSION;
-            }
-            total += page.records.len();
-            cursor = page.next;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        assert_eq!(total, MAX_ENROLLMENT_OPEN_CHAIN_RECORDS * 2 + 2);
-        assert!(saw_legacy_v5 && saw_current_v6);
-    }
-
-    #[test]
-    fn legacy_v1_v5_initial_publication_resumes_every_durable_cross_version_cut() {
-        for state in ["record-temp", "linked-final", "head-temp", "committed-head"] {
-            let root = TestRoot::new(state);
-            let binding = test_binding();
-            let (authority_bytes, authority_identity) =
-                install_legacy_v1_v5_enrollment(&root, binding.clone());
-            let enrollment = enrollment_directory(&root, &binding);
-            let records = enrollment.join(RECORDS_DIRECTORY);
-            let head_bytes = fs::read(enrollment.join(HEAD_FILE)).unwrap();
-            let digest = ContentDigest::from_bytes(
-                parse_digest(std::str::from_utf8(&head_bytes[..64]).unwrap()).unwrap(),
-            );
-            let target = records.join(format!("{digest}{RECORD_SUFFIX}"));
-            let record_bytes = fs::read(&target).unwrap();
-            let temp = records.join(format!("{RECORD_TEMP_PREFIX}{digest}"));
-
-            match state {
-                "record-temp" => {
-                    fs::remove_file(enrollment.join(HEAD_FILE)).unwrap();
-                    fs::rename(&target, &temp).unwrap();
-                }
-                "linked-final" => {
-                    fs::remove_file(enrollment.join(HEAD_FILE)).unwrap();
-                    fs::hard_link(&target, &temp).unwrap();
-                }
-                "head-temp" => {
-                    fs::remove_file(enrollment.join(HEAD_FILE)).unwrap();
-                    fs::write(
-                        enrollment.join(format!("{HEAD_TEMP_PREFIX}legacy")),
-                        &head_bytes,
-                    )
-                    .unwrap();
-                }
-                "committed-head" => {}
-                _ => unreachable!(),
-            }
-
-            let mut resumed =
-                EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
-            assert_eq!(resumed.current().digest, digest, "state={state}");
-            assert_eq!(
-                resumed.current().record.schema_version,
-                ENROLLMENT_RECORD_SCHEMA_V5,
-                "state={state}"
-            );
-            assert_eq!(fs::read(&target).unwrap(), record_bytes, "state={state}");
-            assert_eq!(
-                fs::read(enrollment.join(AUTHORITY_FILE)).unwrap(),
-                authority_bytes,
-                "state={state}"
-            );
-            let directory = Dir::open_ambient_dir(&enrollment, ambient_authority()).unwrap();
-            assert_eq!(
-                authoritative_file_identity(
-                    &open_regular_readonly(&directory, AUTHORITY_FILE).unwrap()
-                )
-                .unwrap(),
-                authority_identity,
-                "state={state}"
-            );
-
-            let successor = resumed
-                .transition(digest, EnrollmentLifecycleV1::VerifiedLocal(verified()))
-                .unwrap();
-            assert_eq!(
-                successor.record.schema_version, ENROLLMENT_RECORD_SCHEMA_VERSION,
-                "the first post-recovery successor must migrate lazily; state={state}"
-            );
-            assert_eq!(fs::read(&target).unwrap(), record_bytes, "state={state}");
-        }
-
-        let fresh = TestRoot::new("fresh-v2-v6-only");
-        let binding = test_binding();
-        let writer = EnrollmentWriter::create(&fresh.app(), binding, shadow()).unwrap();
-        assert!(matches!(
-            writer.reader.authority.material.claim,
-            EnrollmentAuthorityClaim::CurrentV2(_)
-        ));
-        assert_eq!(
-            writer.current().record.schema_version,
-            ENROLLMENT_RECORD_SCHEMA_VERSION
-        );
-    }
-
-    #[test]
-    fn legacy_initial_recovery_rejects_wrong_names_and_invalid_hmac_without_cleanup() {
-        let ambiguous = TestRoot::new("legacy-initial-wrong-name");
-        let binding = test_binding();
-        install_legacy_v1_v5_enrollment(&ambiguous, binding.clone());
-        let enrollment = enrollment_directory(&ambiguous, &binding);
-        let records = enrollment.join(RECORDS_DIRECTORY);
-        let head = fs::read_to_string(enrollment.join(HEAD_FILE)).unwrap();
-        let legacy_digest = ContentDigest::from_bytes(parse_digest(head.trim()).unwrap());
-        let target = records.join(format!("{legacy_digest}{RECORD_SUFFIX}"));
-        let wrong = records.join(format!("{RECORD_TEMP_PREFIX}wrong-digest"));
-        fs::remove_file(enrollment.join(HEAD_FILE)).unwrap();
-        fs::rename(&target, &wrong).unwrap();
-        let wrong_bytes = fs::read(&wrong).unwrap();
-        assert_eq!(
-            EnrollmentWriter::create(&ambiguous.app(), binding.clone(), shadow())
-                .err()
-                .unwrap(),
-            EnrollmentError::AmbiguousInitialCreation
-        );
-        assert_eq!(fs::read(&wrong).unwrap(), wrong_bytes);
-
-        let corrupt = TestRoot::new("legacy-initial-invalid-hmac");
-        install_legacy_v1_v5_enrollment(&corrupt, binding.clone());
-        let enrollment = enrollment_directory(&corrupt, &binding);
-        let records = enrollment.join(RECORDS_DIRECTORY);
-        let head = fs::read_to_string(enrollment.join(HEAD_FILE)).unwrap();
-        let legacy_digest = ContentDigest::from_bytes(parse_digest(head.trim()).unwrap());
-        let old_target = records.join(format!("{legacy_digest}{RECORD_SUFFIX}"));
-        let mut record = decode_record(&fs::read(&old_target).unwrap()).unwrap();
-        let Some(EnrollmentCheckpoint::LegacyV2(checkpoint)) = record.checkpoint.as_mut() else {
-            panic!("legacy fixture must carry its v2 HMAC checkpoint")
-        };
-        checkpoint.authentication_tag = digest(0xee);
-        let corrupt_bytes = canonical_record_bytes(&record).unwrap();
-        let corrupt_digest = ContentDigest::of(&corrupt_bytes);
-        fs::remove_file(enrollment.join(HEAD_FILE)).unwrap();
-        fs::remove_file(old_target).unwrap();
-        let corrupt_target = records.join(format!("{corrupt_digest}{RECORD_SUFFIX}"));
-        fs::write(&corrupt_target, &corrupt_bytes).unwrap();
-        assert_eq!(
-            EnrollmentWriter::create(&corrupt.app(), binding, shadow())
-                .err()
-                .unwrap(),
-            EnrollmentError::CheckpointLegacyAuthenticationFailed
-        );
-        assert_eq!(fs::read(corrupt_target).unwrap(), corrupt_bytes);
-    }
-
-    #[test]
-    fn frozen_legacy_v1_v5_codec_golden_digests_remain_exact() {
-        let binding = test_binding();
-        let material = test_authority(binding.clone(), test_lease_resource());
-        let authority_bytes = canonical_authority_claim_bytes(&material.claim).unwrap();
-        assert_eq!(
-            ContentDigest::of(&authority_bytes).to_string(),
-            "03abcb532ff1e270a5b41c6bf9d3b970cab69eb4360590bc17a006959ee586e4"
-        );
-
-        let lifecycle = EnrollmentLifecycleV1::ShadowImport(shadow());
-        let mut record = EnrollmentRecordV1 {
-            schema_version: ENROLLMENT_RECORD_SCHEMA_V5,
-            generation: 1,
-            previous: None,
-            history_accumulator: compute_history_accumulator(1, None, None, &binding, &lifecycle)
-                .unwrap(),
-            lease_resource_id: test_lease_resource(),
-            binding,
-            lifecycle,
-            checkpoint: None,
-        };
-        record.checkpoint = Some(
-            material
-                .legacy_checkpoint_for_test(
-                    record.generation,
-                    record.previous,
-                    record.history_accumulator,
-                    record.lease_resource_id,
-                    &record.binding,
-                    &record.lifecycle,
-                )
-                .unwrap(),
-        );
-        let record_bytes = canonical_record_bytes(&record).unwrap();
-        assert_eq!(
-            ContentDigest::of(&record_bytes).to_string(),
-            "b4e4b5b5b3f8b80f7fea9fb16ed5858c721f3d146b8834d3828bacc8b3d4858a"
-        );
-    }
-
-    #[test]
     fn explicit_root_discovery_authenticates_without_taking_the_writer_lease() {
         let root = TestRoot::new("readonly-discovery");
         let binding = test_binding();
@@ -7622,7 +6897,8 @@ mod tests {
         old["schema_version"] = serde_json::json!(ENROLLMENT_RECORD_SCHEMA_VERSION - 1);
         assert!(matches!(
             decode_record(&serde_json::to_vec(&old).unwrap()),
-            Err(EnrollmentError::Decode(_))
+            Err(EnrollmentError::UnsupportedRecordSchema(schema))
+                if schema == ENROLLMENT_RECORD_SCHEMA_VERSION - 1
         ));
     }
 
@@ -8946,7 +8222,7 @@ mod tests {
         let mut tampered =
             decode_record(&fs::read(record_path(&root, &binding, divergent_forged)).unwrap())
                 .unwrap();
-        let EnrollmentCheckpoint::CurrentV3(checkpoint) = tampered.checkpoint.as_mut().unwrap()
+        let EnrollmentCheckpoint::Current(checkpoint) = tampered.checkpoint.as_mut().unwrap()
         else {
             panic!("fresh records use the v3 integrity checkpoint");
         };
@@ -9766,11 +9042,10 @@ mod tests {
             EnrollmentWriter::create(&substituted_root.app(), binding.clone(), shadow()).unwrap();
         drop(writer);
         let substituted = enrollment_directory(&substituted_root, &binding).join(AUTHORITY_FILE);
-        let mut claim: EnrollmentAuthorityClaimV2 =
+        let mut claim: EnrollmentAuthorityClaim =
             serde_json::from_slice(&fs::read(&substituted).unwrap()).unwrap();
         claim.authority_id = Uuid::from_u128(0xfeed);
-        let bytes =
-            canonical_authority_claim_bytes(&EnrollmentAuthorityClaim::CurrentV2(claim)).unwrap();
+        let bytes = canonical_authority_claim_bytes(&claim).unwrap();
         fs::remove_file(&substituted).unwrap();
         fs::write(&substituted, &bytes).unwrap();
         let substituted_error = EnrollmentReader::open_existing(&substituted_root.app(), &binding)
@@ -9790,7 +9065,7 @@ mod tests {
             EnrollmentWriter::create(&incompatible_root.app(), binding.clone(), shadow()).unwrap();
         drop(writer);
         let incompatible = enrollment_directory(&incompatible_root, &binding).join(AUTHORITY_FILE);
-        let mut incompatible_claim: EnrollmentAuthorityClaimV2 =
+        let mut incompatible_claim: EnrollmentAuthorityClaim =
             serde_json::from_slice(&fs::read(&incompatible).unwrap()).unwrap();
         incompatible_claim.schema_version = ENROLLMENT_AUTHORITY_SCHEMA_VERSION + 1;
         let incompatible_bytes = serde_json::to_vec(&incompatible_claim).unwrap();
@@ -9883,8 +9158,7 @@ mod tests {
             current = writer.transition(current, next).unwrap().digest;
         }
         let mut forged = writer.current().record.clone();
-        let EnrollmentCheckpoint::CurrentV3(checkpoint) = forged.checkpoint.as_mut().unwrap()
-        else {
+        let EnrollmentCheckpoint::Current(checkpoint) = forged.checkpoint.as_mut().unwrap() else {
             panic!("fresh records use the v3 integrity checkpoint");
         };
         checkpoint.integrity_tag ^= 1;
@@ -10194,7 +9468,7 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_wire_scenarios() {
+    fn enrollment_has_one_current_schema_and_no_legacy_authenticator() {
         fn visit(directory: &Path, files: &mut Vec<PathBuf>) {
             for entry in fs::read_dir(directory).unwrap() {
                 let entry = entry.unwrap();
@@ -10225,19 +9499,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["enrollment_legacy_hmac.rs", "wire.rs"],
-            "keyed enrollment compatibility must stay isolated; wire contains the deterministic scenario format"
+            vec!["wire.rs"],
+            "enrollment must have no keyed compatibility verifier; wire contains the unrelated deterministic scenario format"
         );
-        let legacy = fs::read_to_string(root.join("enrollment_legacy_hmac.rs")).unwrap();
-        let legacy_production = legacy.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(legacy_production.matches("hmac::verify(").count(), 1);
-        assert_eq!(legacy_production.matches("hmac::sign(").count(), 0);
-        assert_eq!(legacy.matches("hmac::sign(").count(), 1);
+        assert!(!root.join("enrollment_legacy_hmac.rs").exists());
         let current = fs::read_to_string(root.join("enrollment.rs")).unwrap();
         let current = current.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(!current.contains("hmac::"));
         assert!(!current.contains("ring::rand"));
         assert!(!current.contains(" key:"));
+        for forbidden in [
+            "ENROLLMENT_AUTHORITY_SCHEMA_V1",
+            "ENROLLMENT_RECORD_SCHEMA_V5",
+            "ENROLLMENT_CHECKPOINT_SCHEMA_V2",
+            "LegacyV1",
+            "LegacyV2",
+        ] {
+            assert!(
+                !current.contains(forbidden),
+                "enrollment compatibility token remains in production: {forbidden}"
+            );
+        }
     }
 
     #[cfg(unix)]

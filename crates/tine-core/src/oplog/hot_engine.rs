@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tine_storage::{
     LocalJournalAppend, LocalJournalAppendError, LocalJournalError, LocalJournalFrame,
-    LocalJournalSegment,
 };
 use uuid::Uuid;
 
@@ -75,15 +74,14 @@ use super::{
     BatchOrigin, BlobDescription, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId,
     ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
-    ManagedLocalJournal, ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind,
-    ManifestObjectRef, ManifestProjectionPrecondition, ManifestProjectionTarget,
-    ManifestedProjectionIntent, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
-    OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
-    PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
-    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionTargetKind, ProjectionWork,
-    ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError, SessionId,
-    ValidatedBatch, WorkspaceId,
+    ManagedLocalJournal, ManagedPath, ManagedTextKind, ManifestObjectRef,
+    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
+    MembershipClaim, MembershipDelta, ObjectKind, ObjectStore, OperationBatch, OperationObject,
+    PageDelta, PageId, PageState, PortablePathKeyDigest, PreparedBatch, ProjectionClaimEvidence,
+    ProjectionClaimParticipant, ProjectionCompletedReceipt, ProjectionCompletion,
+    ProjectionEndpointId, ProjectionIntent, ProjectionIntentId, ProjectionPrecondition,
+    ProjectionReceiptStore, ProjectionTargetKind, ProjectionWork, ProjectionWorkTarget,
+    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -7367,23 +7365,13 @@ pub struct ManagedLocalPrefixState {
     pub commitment: ContentDigest,
 }
 
-/// Protocol-bound evidence that one managed-local record became durable.
-///
-/// This is crate-owned evidence: only managed-journal adapters may construct
-/// it. Keeping the physical protocol in the proof lets the v2 rollover
-/// adapter produce the same evidence without teaching the coordinator a
-/// numeric sync count.
+/// Crate-owned evidence that one current-format managed-local record became durable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedLocalAppendProof {
-    protocol: ManagedLocalJournalProtocol,
     receipt: LocalJournalAppend,
 }
 
 impl ManagedLocalAppendProof {
-    pub(crate) const fn protocol(&self) -> ManagedLocalJournalProtocol {
-        self.protocol
-    }
-
     pub(crate) const fn receipt(&self) -> &LocalJournalAppend {
         &self.receipt
     }
@@ -7395,11 +7383,8 @@ impl ManagedLocalAppendProof {
     }
 }
 
-fn managed_local_append_proof(
-    protocol: ManagedLocalJournalProtocol,
-    receipt: LocalJournalAppend,
-) -> ManagedLocalAppendProof {
-    ManagedLocalAppendProof { protocol, receipt }
+fn managed_local_append_proof(receipt: LocalJournalAppend) -> ManagedLocalAppendProof {
+    ManagedLocalAppendProof { receipt }
 }
 
 /// Whether a managed-local append is proven not to have started or may have
@@ -7435,10 +7420,8 @@ impl std::error::Error for ManagedLocalAppendError {
     }
 }
 
-/// The only physical journal shapes that may reach the managed-local append
-/// adapter. Production owns the enum form; the legacy implementation remains
-/// available only to focused lower-level fixtures that establish its retained
-/// recovery behaviour.
+/// The single current physical journal shape that may reach the managed-local
+/// append adapter.
 pub(crate) trait ManagedLocalJournalAppend {
     fn managed_local_device_id(&self) -> Uuid;
     fn managed_local_next_sequence(&self) -> u64;
@@ -7447,30 +7430,6 @@ pub(crate) trait ManagedLocalJournalAppend {
         payload_kind: ManagedLocalJournalPayloadKind,
         payload: &[u8],
     ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError>;
-}
-
-impl ManagedLocalJournalAppend for LocalJournalSegment<ManagedLocalJournalPayloadKind> {
-    fn managed_local_device_id(&self) -> Uuid {
-        self.device_id()
-    }
-
-    fn managed_local_next_sequence(&self) -> u64 {
-        self.next_sequence()
-    }
-
-    fn append_managed_local_payload(
-        &mut self,
-        payload_kind: ManagedLocalJournalPayloadKind,
-        payload: &[u8],
-    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
-        let receipt = self
-            .append(payload_kind, payload)
-            .map_err(ManagedLocalAppendError::AppendOutcomeUnknown)?;
-        Ok(managed_local_append_proof(
-            ManagedLocalJournalProtocol::LegacyV1,
-            receipt,
-        ))
-    }
 }
 
 impl ManagedLocalJournalAppend for ManagedLocalJournal<ManagedLocalJournalPayloadKind> {
@@ -7487,35 +7446,17 @@ impl ManagedLocalJournalAppend for ManagedLocalJournal<ManagedLocalJournalPayloa
         payload_kind: ManagedLocalJournalPayloadKind,
         payload: &[u8],
     ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
-        match self {
-            // The inspector deliberately has no mutating append API. A
-            // legacy journal reaching this boundary is a runtime bug; saves
-            // must be deferred until the rollover actor swaps in v2.
-            ManagedLocalJournal::LegacyV1(_) => {
-                Err(ManagedLocalAppendError::DefinitelyNotAppended(
-                    ManagedLocalRecordError::Unsupported(
-                        "managed-local legacy journal is pending schema-2 rollover".into(),
-                    ),
-                ))
-            }
-            ManagedLocalJournal::V2 { segment, .. } => {
-                let receipt =
-                    segment
-                        .append(payload_kind, payload)
-                        .map_err(|error| match error {
-                            LocalJournalAppendError::DefinitelyNotAppended(error) => {
-                                ManagedLocalAppendError::DefinitelyNotAppendedStorage(error)
-                            }
-                            LocalJournalAppendError::AppendOutcomeUnknown(error) => {
-                                ManagedLocalAppendError::AppendOutcomeUnknown(error)
-                            }
-                        })?;
-                Ok(managed_local_append_proof(
-                    ManagedLocalJournalProtocol::V2,
-                    receipt,
-                ))
-            }
-        }
+        let receipt = self
+            .append(payload_kind, payload)
+            .map_err(|error| match error {
+                LocalJournalAppendError::DefinitelyNotAppended(error) => {
+                    ManagedLocalAppendError::DefinitelyNotAppendedStorage(error)
+                }
+                LocalJournalAppendError::AppendOutcomeUnknown(error) => {
+                    ManagedLocalAppendError::AppendOutcomeUnknown(error)
+                }
+            })?;
+        Ok(managed_local_append_proof(receipt))
     }
 }
 
@@ -15715,8 +15656,7 @@ impl ShardedHotEngine {
                 .as_uuid()
             || receipt.sequence != prepared.sequence
             || receipt.payload_digest != ContentDigest::of(prepared.journal_payload())
-            || receipt.data_durability_syncs
-                != append.protocol().expected_successful_append_data_syncs()
+            || receipt.data_durability_syncs != 2
         {
             return Err(ManagedLocalRecordError::WrongDurabilityProof);
         }

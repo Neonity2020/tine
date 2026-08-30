@@ -18,10 +18,6 @@ pub(crate) mod dependency_queue;
 pub(crate) mod discovery;
 pub(crate) mod document_state;
 pub(crate) mod enrollment;
-// The only keyed enrollment compatibility code.  Current enrollment state is
-// integrity-checked, while immutable v1/v5 history remains verifiable.
-pub(crate) mod enrollment_legacy_hmac;
-pub(crate) use enrollment_legacy_hmac as legacy_enrollment_verifier;
 pub(crate) mod evidence_index;
 pub(crate) mod external_import;
 pub mod hot_engine;
@@ -142,7 +138,7 @@ pub use import::{
 pub(crate) use local_journal_v2_anchor::{
     classify_managed_local_anchor, managed_local_v2_anchor_name,
     parse_managed_local_v2_anchor_name, ManagedLocalAnchorEncoding, ManagedLocalGenerationAnchorV2,
-    ManagedLocalJournal, ManagedLocalJournalProtocol, MANAGED_LOCAL_ANCHOR_V2_BYTES,
+    ManagedLocalJournal, MANAGED_LOCAL_ANCHOR_V2_BYTES,
 };
 pub use object_store::{BatchInspection, ObjectStore, ObjectStoreStats, StoreError};
 pub use page_name_index::{
