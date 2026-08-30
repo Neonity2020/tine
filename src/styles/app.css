@@ -9533,6 +9533,8 @@ html.row-reorder-dragging * {
   display: flex;
   flex-direction: column;
   height: 100%;
+  container-type: inline-size;
+  container-name: pdfviewer;
   color: var(--pdf-local-text);
   background: var(--pdf-container-bg);
 }
@@ -9601,8 +9603,6 @@ html.row-reorder-dragging * {
   padding: 0 12px;
   border-bottom: 1px solid var(--border-color);
   background: var(--pdf-toolbar-bg);
-  container-type: inline-size;
-  container-name: pdftoolbar;
 }
 
 .pdf-title {
@@ -9738,11 +9738,11 @@ html.row-reorder-dragging * {
 /* The reader follows the topbar's container-query overflow pattern: the
    lower-priority tools remain available from the existing More menu while the
    pager, Find, zoom +/- and Close stay in the toolbar. */
-@container pdftoolbar (max-width: 520px) {
+@container pdfviewer (max-width: 520px) {
   .pdf-toolbar .pdf-overflow-action {
     display: none;
   }
-  .pdf-toolbar .pdf-settings-overflow {
+  .pdf-settings-overflow {
     display: grid;
   }
 }
