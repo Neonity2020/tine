@@ -23,6 +23,7 @@ import { mobileDrawerMode } from "../mobileDrawers";
 import { registerTransientLayer } from "../transientLayers";
 import { MobileDrawerPanel, dismissDrawerAndRestore } from "./MobileDrawerShell";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { EmojiText } from "../render/emoji";
 import { backend } from "../backend";
@@ -386,7 +387,9 @@ function PageItem(props: {
             const target = { name: props.item.name, pageKind: props.item.pageKind, path: props.item.path };
             // The shift destination (right sidebar) is meaningless for a title
             // already IN the sidebar, so it keeps the ordinary navigation.
-            if (internalLinkDest(e) === "background") openPageTargetInNewTab(target);
+            const dest = internalLinkDest(e);
+            if (dest === "background") openPageTargetInNewTab(target);
+            else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
             else openPageTarget(target);
           }}
           onAuxClick={(e) => internalLinkAuxClick(e, () =>

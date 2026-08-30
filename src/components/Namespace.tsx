@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { openPage, openPageInNewTab } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import { openPageInSidebar } from "../ui";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { allPageNames } from "../pages";
@@ -30,6 +31,7 @@ export function NamespaceCrumb(props: { name: string }): JSX.Element {
                     const dest = internalLinkDest(e);
                     if (dest === "sidebar") openPageInSidebar(prefix(), "page");
                     else if (dest === "background") openPageInNewTab(prefix(), "page");
+                    else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: prefix(), pageKind: "page" });
                     else openPage(prefix(), "page");
                   }}
                   onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(prefix(), "page"))}
@@ -106,6 +108,7 @@ function NsNodeView(props: {
             const dest = internalLinkDest(e);
             if (dest === "sidebar") openPageInSidebar(props.node.full, "page");
             else if (dest === "background") openPageInNewTab(props.node.full, "page");
+            else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: props.node.full, pageKind: "page" });
             else (openPage(props.node.full, "page"), props.onActiveNavigationComplete?.());
           }}
           onAuxClick={(e) => internalLinkAuxClick(e, () => openPageInNewTab(props.node.full, "page"))}
@@ -179,6 +182,7 @@ function NsMacroNode(props: { node: NsNode; depth: number; icons: Record<string,
             const dest = internalLinkDest(e);
             if (dest === "sidebar") openPageInSidebar(props.node.full, "page");
             else if (dest === "background") openPageInNewTab(props.node.full, "page");
+            else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: props.node.full, pageKind: "page" });
             else openPage(props.node.full, "page");
           }}
           onAuxClick={(e) => {
@@ -241,6 +245,7 @@ export function NamespaceMacro(props: { root: string }): JSX.Element {
                   const dest = internalLinkDest(e);
                   if (dest === "sidebar") openPageInSidebar(root.full, "page");
                   else if (dest === "background") openPageInNewTab(root.full, "page");
+                  else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: root.full, pageKind: "page" });
                   else openPage(root.full, "page");
                 }}
                 onAuxClick={(e) => {
@@ -328,6 +333,7 @@ export function NamespaceHierarchy(props: { name: string }): JSX.Element {
                               const dest = internalLinkDest(e);
                               if (dest === "sidebar") openPageInSidebar(full(), "page");
                               else if (dest === "background") openPageInNewTab(full(), "page");
+                              else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: full(), pageKind: "page" });
                               else openPage(full(), "page");
                             }}
                             onAuxClick={(e) => {

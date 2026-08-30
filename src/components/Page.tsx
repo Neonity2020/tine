@@ -1,7 +1,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
 import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, blockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
 import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, openInNewTab, type PaneRouter } from "../router";
-import { PaneContext, focusedRouter } from "../panes";
+import { PaneContext, focusedRouter, openRouteInOtherPane } from "../panes";
 import {
   isFavorite, toggleFavorite,
   graphEpoch, openPageInSidebar, openBlockInSidebar, openPageContextMenu, carryDays, showCarryButtons,
@@ -629,6 +629,7 @@ function ZoomedView(props: { id: string }): JSX.Element {
             const dest = internalLinkDest(e);
             if (dest === "sidebar") openPageInSidebar(pageTarget());
             else if (dest === "background") openPageTargetInNewTab(pageTarget());
+            else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...pageTarget() });
             else router.openPageTarget(pageTarget());
           }}
           onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(pageTarget()))}
@@ -650,6 +651,7 @@ function ZoomedView(props: { id: string }): JSX.Element {
                   }
                   const ref = blockRef(aid);
                   if (dest === "sidebar") openBlockInSidebar(ref);
+                  else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
                   else openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
                 }}
                 onAuxClick={(e) => internalLinkAuxClick(e, () => {
@@ -867,6 +869,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
                 const dest = internalLinkDest(e);
                 if (dest === "sidebar" && !props.page.guide) openPageInSidebar(pageTarget());
                 else if (dest === "background" && !props.page.guide) openPageTargetInNewTab(pageTarget());
+                else if (dest === "pane" && !props.page.guide) openRouteInOtherPane({ kind: "page", ...pageTarget() });
                 else router.openPageTarget(pageTarget());
               }}
               onMouseDown={internalLinkMouseDown}

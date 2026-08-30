@@ -1,6 +1,6 @@
 import { For, Show, Switch, Match, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { focusedRouter } from "../panes";
+import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
 import { openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
@@ -688,6 +688,7 @@ export function QueryMacro(props: {
                                       const dest = internalLinkDest(e);
                                       if (dest === "sidebar") openPageInSidebar(target);
                                       else if (dest === "background") openPageTargetInNewTab(target);
+                                      else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
                                       else openPageTarget(target);
                                     }}
                                     onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab({
@@ -714,6 +715,8 @@ export function QueryMacro(props: {
                                         openBlockInSidebar({ uuid, page: bh.page, pageKind: bh.kind, ...(bh.path ? { path: bh.path } : {}) });
                                       } else if (dest === "background") {
                                         openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
+                                      } else if (dest === "pane") {
+                                        openRouteInOtherPane({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
                                       } else {
                                         openPageAtBlock({
                                           name: bh.page,
@@ -833,6 +836,7 @@ export function QueryMacro(props: {
                                       const dest = internalLinkDest(e);
                                       if (dest === "sidebar") openPageInSidebar(target);
                                       else if (dest === "background") openPageTargetInNewTab(target);
+                                      else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
                                       else openPageTarget(target);
                                     }}
                                     onAuxClick={(e) => {
@@ -908,6 +912,7 @@ function QueryGroup(props: { group: () => RefGroup | undefined; flat?: boolean }
               const dest = internalLinkDest(e);
               if (dest === "sidebar") openPageInSidebar(target());
               else if (dest === "background") openPageTargetInNewTab(target());
+              else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target() });
               else openPageTarget(target());
             }}
             onAuxClick={(e) => {

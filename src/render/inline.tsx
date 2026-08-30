@@ -6,6 +6,7 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, onCl
 import { Dynamic } from "solid-js/web";
 import { extOf, mediaKind } from "../media";
 import { openPage, openPageInNewTab, openPageAtBlock, openInNewTab, focusBlock } from "../router";
+import { openRouteInOtherPane } from "../panes";
 import { refClickZoom } from "../copySettings";
 import { isJournalTitle } from "../journal";
 import { openPageInSidebar, openBlockInSidebar, openPageContextMenu, openBlockRefContextMenu, setLightbox, setAudioPlayer, dataRev, graphEpoch, graphMeta, pushToast, showBrackets } from "../ui";
@@ -324,6 +325,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
     const dest = internalLinkDest(e);
     if (dest === "sidebar" && !isGuidePageName(targetName())) openPageInSidebar(targetName(), kind());
     else if (dest === "background") openPageInNewTab(targetName(), kind());
+    else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: targetName(), pageKind: kind() });
     else openPage(targetName(), kind());
   };
 
@@ -1325,10 +1327,13 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
           // Tine scrolls + flashes the block in context (default); the OG behavior —
           // zoom into the block as its own page — is opt-in (Settings → ref-click-zoom).
           // GH #283: Ctrl/Cmd+click opens a BACKGROUND tab, matching every other
-          // internal-link surface.
+          // internal-link surface. GH #438: Alt+click opens the referenced block
+          // in the OTHER pane, matching Search / the Quick Switcher.
           if (dest === "sidebar") openBlockInSidebar(ref);
           else if (dest === "background")
             openInNewTab({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
+          else if (dest === "pane")
+            openRouteInOtherPane({ kind: "page", name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
           else if (refClickZoom()) focusBlock(props.id);
           else openPageAtBlock({ name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
         }}

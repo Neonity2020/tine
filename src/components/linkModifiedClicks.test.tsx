@@ -6,7 +6,7 @@ import { renderInlines } from "../render/inline";
 import { resetStore } from "../store";
 import { backend } from "../backend";
 import { openPage } from "../router";
-import { paneRouter, resetPaneLayoutToSingle } from "../panes";
+import { layoutPaneIds, paneRouter, resetPaneLayoutToSingle } from "../panes";
 import { rightSidebar, setRightSidebar, setRightSidebarOpen, setFavorites } from "../ui";
 import { Sidebar } from "./Sidebar";
 import { NamespaceCrumb } from "./Namespace";
@@ -20,6 +20,9 @@ import type { RefGroup } from "../types";
 //   Shift+click   → right sidebar;
 //   Ctrl/Cmd(Linux/macOS)+click → background tab;
 //   middle-click  → background tab.
+// GH #438 adds the missing fourth destination, matching the Search / Quick
+// Switcher ladder (GH #288):
+//   Alt+click     → the other pane (splitting right when there is only one).
 // Context menus still expose explicit destinations; text selection / editor
 // focus are preserved the same way they always were.
 
@@ -257,6 +260,169 @@ describe("modified-click contract on internal links (GH #283)", () => {
       expect(tabsCount()).toBe(before + 1);
       expect(activeRouteName()).toBe("Elsewhere");
       expect(newBackgroundPage()).toBe("Query Owner");
+    } finally {
+      m.dispose();
+    }
+  });
+});
+
+// GH #438: Alt+click is the mouse+modifier route to the OTHER pane on every
+// internal page/block link — the same destination Alt+click/Alt+Enter already
+// had on Search and Quick Switcher results (GH #288). The click stays at the
+// gesture/routing boundary: surfaces keep deciding from the shared
+// internalLinkDest() ladder and openRouteInOtherPane does the pane work.
+describe("Alt+click opens the link in the other pane (GH #438)", () => {
+  function otherPaneRoute(): { kind: string; name?: string; block?: string } | null {
+    const other = layoutPaneIds().find((id) => id !== "main");
+    if (!other) return null;
+    return paneRouter(other).route() as { kind: string; name?: string; block?: string };
+  }
+
+  it("Alt+click on a page ref opens the target in the other pane — origin pane and sidebars untouched", () => {
+    const { anchor, dispose } = mountPageRef();
+    try {
+      openPage("Elsewhere", "page");
+      const mainTabs = tabsCount();
+      click(anchor(), { altKey: true });
+      expect(layoutPaneIds().length).toBe(2);
+      const route = otherPaneRoute();
+      expect(route?.kind).toBe("page");
+      expect(route?.name).toBe("Target Page");
+      // The origin pane keeps its foreground: a copy, not a move.
+      expect(activeRouteName()).toBe("Elsewhere");
+      expect(tabsCount()).toBe(mainTabs);
+      expect(rightSidebar()).toHaveLength(0);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("Alt+click opens at the referenced block on block refs", async () => {
+    const group: RefGroup = {
+      page: "Anchor Page",
+      kind: "page",
+      blocks: [{ id: "ref-1", raw: "referenced content", collapsed: false, children: [] }],
+    };
+    vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map((id) => (id === "ref-1" ? group : null)));
+    const m = mount(() =>
+      renderInlines([{ k: "link", url: { type: "block_ref", v: "ref-1" }, full: "((ref-1))" }]) as JSX.Element
+    );
+    try {
+      const anchor = await vi.waitFor(() => {
+        const a = m.root.querySelector<HTMLElement>("span.block-ref");
+        expect(a?.textContent).toContain("referenced content");
+        return a!;
+      });
+      openPage("Elsewhere", "page");
+      click(anchor, { altKey: true });
+      expect(layoutPaneIds().length).toBe(2);
+      const route = otherPaneRoute();
+      expect(route?.kind).toBe("page");
+      expect(route?.name).toBe("Anchor Page");
+      // The click surface hands the block anchor to openRouteInOtherPane; the
+      // helper's own contract (a fresh split opens the page at the block, an
+      // existing pane keeps the anchor on the tab) is deliberately NOT pinned
+      // here — the frontier lane replaces it after merge (GH #438 scope).
+      expect(activeRouteName()).toBe("Elsewhere");
+    } finally {
+      m.dispose();
+    }
+  });
+
+  it("modifier precedence matches the switcher ladder (GH #288): a pure Shift/Ctrl still wins, Alt claims the rest", () => {
+    const { anchor, dispose } = mountPageRef();
+    try {
+      openPage("Elsewhere", "page");
+      // Ctrl+Alt is still a pane, like the switcher's fall-through Alt branch —
+      // never a background tab.
+      const mainTabs = tabsCount();
+      click(anchor(), { altKey: true, ctrlKey: true });
+      expect(layoutPaneIds().length).toBe(2);
+      expect(otherPaneRoute()?.name).toBe("Target Page");
+      expect(tabsCount()).toBe(mainTabs);
+      // Shift+Alt also goes to the pane, never the sidebar.
+      click(anchor(), { altKey: true, shiftKey: true });
+      expect(otherPaneRoute()?.name).toBe("Target Page");
+      expect(rightSidebar()).toHaveLength(0);
+      expect(activeRouteName()).toBe("Elsewhere");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("Alt+click on a namespace crumb opens the ancestor page in the other pane", () => {
+    const m = mount(() => <NamespaceCrumb name="a/b/c" />);
+    try {
+      const crumb = m.root.querySelector<HTMLElement>(".ns-crumb-item");
+      expect(crumb).not.toBeNull();
+      openPage("Elsewhere", "page");
+      click(crumb!, { altKey: true });
+      expect(layoutPaneIds().length).toBe(2);
+      expect(otherPaneRoute()?.name).toBe("a");
+      expect(activeRouteName()).toBe("Elsewhere");
+    } finally {
+      m.dispose();
+    }
+  });
+
+  it("Alt+click on a Favorites row opens the page in the other pane", () => {
+    setFavorites([{ name: "Fav One", kind: "page" }]);
+    const m = mount(() => <Sidebar />);
+    try {
+      const row = [...m.root.querySelectorAll<HTMLElement>("#sidebar-favorites-list .nav-page")][0];
+      expect(row).toBeTruthy();
+      openPage("Elsewhere", "page");
+      click(row, { altKey: true });
+      expect(layoutPaneIds().length).toBe(2);
+      expect(otherPaneRoute()?.name).toBe("Fav One");
+      expect(activeRouteName()).toBe("Elsewhere");
+      expect(rightSidebar()).toHaveLength(0);
+    } finally {
+      m.dispose();
+    }
+  });
+
+  it("Alt+click on a linked-reference page header opens the source page in the other pane", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([{
+      page: "Backlink Owner",
+      kind: "page",
+      blocks: [{ id: "backlink-1", raw: "mentions [[Target]]", collapsed: false, children: [] }],
+    }]);
+    const m = mount(() => <LinkedReferences name="Target" />);
+    try {
+      const header = await vi.waitFor(() => {
+        const el = m.root.querySelector<HTMLElement>(".reference-page");
+        expect(el?.textContent).toContain("Backlink Owner");
+        return el!;
+      });
+      openPage("Elsewhere", "page");
+      click(header, { altKey: true });
+      expect(layoutPaneIds().length).toBe(2);
+      expect(otherPaneRoute()?.name).toBe("Backlink Owner");
+      expect(activeRouteName()).toBe("Elsewhere");
+    } finally {
+      m.dispose();
+    }
+  });
+
+  it("Alt+click on a legacy query-table page cell opens the hit page in the other pane", async () => {
+    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+      page: "Query Owner",
+      kind: "page",
+      blocks: [{ id: "query-hit", raw: "TODO row", collapsed: false, children: [] }],
+    }]);
+    const m = mount(() => <QueryMacro body={'query (task TODO) {:table-view? true}'} />);
+    try {
+      const cell = await vi.waitFor(() => {
+        const el = m.root.querySelector<HTMLElement>(".qt-page");
+        expect(el?.textContent).toContain("Query Owner");
+        return el!;
+      });
+      openPage("Elsewhere", "page");
+      click(cell, { altKey: true });
+      expect(layoutPaneIds().length).toBe(2);
+      expect(otherPaneRoute()?.name).toBe("Query Owner");
+      expect(activeRouteName()).toBe("Elsewhere");
     } finally {
       m.dispose();
     }

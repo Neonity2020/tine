@@ -6,25 +6,36 @@
 //   plain click                     → the surface's ordinary navigation;
 //   Shift+click                     → right sidebar (Tine's convention);
 //   Ctrl(Win/Linux)/Cmd(macOS)+click → background tab;
-//   middle-click (per-surface aux)  → background tab.
+//   middle-click (per-surface aux)  → background tab;
+//   Alt+click                       → the other pane (GH #438).
 //
-// Combined modifiers deliberately keep plain-click meaning (matching
-// GH #288's switcher guard chain) and interfaces stay modifier-free: there is
-// no setting for this contract (Martin's approved product decision).
+// The Alt destination is the fourth step of GH #288's switcher ladder: Search
+// and Quick Switcher rows long opened the other pane on Alt+click/Alt+Enter,
+// and ordinary links had no mouse+modifier route to it after #283 gave
+// Ctrl/Cmd+click to background tabs. Surfaces stay at the routing boundary —
+// they open the pane through `openRouteInOtherPane`, never a layout algorithm
+// of their own — and interfaces stay modifier-free: there is no setting for
+// this contract (Martin's approved product decision).
+//
+// Modifier precedence mirrors the switcher's guard chain (GH #288): a PURE
+// Shift keeps the sidebar and a PURE Ctrl/Cmd keeps the background tab; Alt
+// claims every chord it participates in (Shift+Alt and Ctrl+Alt included), and
+// combined modifiers without Alt (shift+ctrl) keep plain-click meaning, so no
+// novel chord shadows the established ones.
 //
 // GH #207 made the two halves around the click decision equally shared:
 // `internalLinkMouseDown` (the default-suppression a gesture needs BEFORE the
 // click finishes) and `internalLinkAuxClick` (the completed middle-click).
 // Surfaces that skipped either half showed browser autoscroll / PRIMARY-paste
 // or plain-click-only behavior instead of the contract.
-export type InternalLinkDest = "default" | "sidebar" | "background";
+export type InternalLinkDest = "default" | "sidebar" | "background" | "pane";
 
 export function internalLinkDest(
   e: Pick<MouseEvent, "shiftKey" | "ctrlKey" | "metaKey" | "altKey">,
 ): InternalLinkDest {
-  if (e.altKey) return "default";
-  if (e.shiftKey && !e.ctrlKey && !e.metaKey) return "sidebar";
-  if (!e.shiftKey && (e.ctrlKey || e.metaKey)) return "background";
+  if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) return "sidebar";
+  if (!e.shiftKey && (e.ctrlKey || e.metaKey) && !e.altKey) return "background";
+  if (e.altKey) return "pane";
   return "default";
 }
 

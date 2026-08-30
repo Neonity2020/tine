@@ -9077,6 +9077,36 @@
     "failBefore": "proven"
    },
    "notes": "GH #442. renderLink treated ANY link/image destination ending in .pdf as an in-app PDF asset pointer, so a plain remote URL like [a paper](https://aclanthology.org/2025.acl-long.879.pdf) opened Tine's PDF viewer with a remote filename it cannot resolve instead of going to the default browser. The .pdf branches now exclude http(s) URLs; remote PDFs in link AND image syntax render as the ordinary external link (an <img> cannot display a remote .pdf anyway) and reach backend().openExternal exactly like other remote URLs. Graph/local asset PDF references (../assets/x.pdf incl. Windows backslash paths) and annotation/HLS routing keep entering the viewer. Fail-before: the literal rendered-markdown-link tests failed pre-fix with the remote URL producing the pdf-link viewer chip (6 red of 7; the local-asset preservation case is the control). Click-level assertions are jsdom render-layer; browser-native confirmation of openExternal on a remote PDF remains the manager smoke item."
+  },
+  {
+   "id": "UI-ALT-CLICK-OTHER-PANE-438",
+   "title": "Alt+click on an internal page/block link opens it in the other pane (splitting right from a single pane), matching the Search / Quick Switcher ladder",
+   "family": "navigation-links",
+   "sources": {
+    "issues": [
+     438
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/linkModifiedClicks.test.tsx::Alt+click opens the link in the other pane (GH #438)::Alt+click on a page ref opens the target in the other pane — origin pane and sidebars untouched",
+     "src/components/linkModifiedClicks.test.tsx::Alt+click opens at the referenced block on block refs",
+     "src/components/linkModifiedClicks.test.tsx::modifier precedence matches the switcher ladder (GH #288): a pure Shift/Ctrl still wins, Alt claims the rest",
+     "src/components/linkModifiedClicks.test.tsx::Alt+click on a namespace crumb opens the ancestor page in the other pane",
+     "src/components/linkModifiedClicks.test.tsx::Alt+click on a Favorites row opens the page in the other pane",
+     "src/components/linkModifiedClicks.test.tsx::Alt+click on a linked-reference page header opens the source page in the other pane",
+     "src/components/linkModifiedClicks.test.tsx::Alt+click on a legacy query-table page cell opens the hit page in the other pane"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #438 (follow-up to #283): giving Ctrl/Cmd+click to background tabs was the right browser convention but removed the only mouse+modifier route to the other pane. internalLinkDest now yields a fourth destination (Alt+click -> pane), with the GH #288 switcher precedence: pure Shift keeps the sidebar, pure Ctrl/Cmd keeps the background tab, Alt claims every chord it enters (Shift+Alt and Ctrl+Alt included), and combined modifiers without Alt keep plain-click meaning. Every internalLinkDest surface routes the new destination through openRouteInOtherPane — the gesture/routing call boundary — so the frontier replacement of the pane-selection helper can change its internals without touching these call sites. Context menus, middle-click, Shift/right-sidebar, guide-page guards, and the annotation-ref plain-click PDF flow are unchanged. Fail-before: all seven Alt+click surface/progression tests red pre-fix (no pane created; Alt fell through to plain-click navigation), the ten existing #283 contract tests green throughout. jsdom render-layer proof; native browser confirmation of the click matrix on a real split remains the manager smoke item."
   }
  ]
 }
