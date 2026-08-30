@@ -1186,6 +1186,23 @@ batch. The incrementally maintained root is required to be byte-identical to a
 canonical complete rebuild; the complete rebuild remains only a differential
 oracle and an explicit rebuild operation.
 
+Checkpoint-generation format support is staged without changing that V1
+authority. The canonical V1 authenticated-map priority/node algorithm now has
+one owner, `tine-storage::sealed_accepted_index`, shared by scratch, the clean
+runtime, and SQLite with pinned historical roots. The same module defines the
+additive V2 sealed batch/status/sequence/causal object formats and their bounded
+cross-checking reader; its caller-provided Tine evidence decoder validates and
+binds the preserved exact V1/V2 evidence bytes without reversing the crate
+dependency. Tine dispatches on the leading schema and canonically distinguishes
+V1 and V2 frontier and evidence bytes, but production recovery continues to accept only V1:
+the R1a/P1 codec module has no filesystem/publication capability
+and no other production
+module may name its V2 authority types. A live checkpoint-generation marker is
+therefore impossible until a later cut deliberately changes that tested
+boundary. R1a/P2 must separately freeze the versioned physical-frontier API,
+SQLite V1/V2 schema census, and sealed-reader injection before the inert R1b
+builder begins; P1 does not claim or guess that physical schema.
+
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
 Clean projection attach rebuilds an exact path-to-latest-batch map during
