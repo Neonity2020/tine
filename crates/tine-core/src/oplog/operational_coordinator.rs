@@ -4,8 +4,6 @@
 //! The managed runtime owns this crate-private coordinator and invokes it for
 //! admitted local edits, provider ingress, recovery, and derived-state drains.
 
-#![allow(dead_code)] // mixed production coordinator and fault-injection surface
-
 use std::fmt;
 #[cfg(test)]
 use std::time::{Duration, Instant};
@@ -31,31 +29,6 @@ use super::{
 use crate::oplog::projection_turn_journal::ProjectionTurnJournalState;
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
-const RESUME_OPERATION_BUDGET: usize = 256;
-
-#[cfg(test)]
-thread_local! {
-    static TEST_RESUME_OPERATION_BUDGET: std::cell::Cell<Option<usize>> = const {
-        std::cell::Cell::new(None)
-    };
-}
-
-#[cfg(test)]
-struct TestResumeOperationBudgetGuard(Option<usize>);
-
-#[cfg(test)]
-impl Drop for TestResumeOperationBudgetGuard {
-    fn drop(&mut self) {
-        TEST_RESUME_OPERATION_BUDGET.set(self.0);
-    }
-}
-
-#[cfg(test)]
-fn test_resume_operation_budget(value: usize) -> TestResumeOperationBudgetGuard {
-    let prior = TEST_RESUME_OPERATION_BUDGET.replace(Some(value));
-    TestResumeOperationBudgetGuard(prior)
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TrustedLocalPreparationStageTimings {
@@ -102,12 +75,6 @@ pub(crate) fn last_trusted_local_preparation_stage_timings() -> TrustedLocalPrep
     LAST_TRUSTED_LOCAL_PREPARATION_STAGE_TIMINGS.get()
 }
 
-struct ResumeBudget {
-    remaining: usize,
-}
-
-impl ResumeBudget {}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationalPhase {
     Bindings,
@@ -127,11 +94,8 @@ pub(crate) enum OperationalPhase {
 /// cannot turn into progress.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RetainedBlockReason {
-    Rejected(super::EngineError),
-    Quarantined,
     PublishedAuthentication,
     StableBinding,
-    GuardedProjectionConflict,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1497,11 +1461,7 @@ pub(crate) enum OperationalFaultPoint {
     AfterCapture,
     AfterFinalize,
     AfterSweepRecord,
-    AfterReservation,
     AfterManifest,
-    AfterStage,
-    BeforeTailAdmission,
-    AfterTailAdmission,
     AfterSqliteApply,
     BeforeProjection,
     AfterProjection,
@@ -1587,11 +1547,7 @@ fn operational_fault_error(point: OperationalFaultPoint) -> OperationalCoordinat
             OperationalFaultPoint::AfterCapture => OperationalPhase::Capture,
             OperationalFaultPoint::AfterFinalize => OperationalPhase::Finalize,
             OperationalFaultPoint::AfterSweepRecord => OperationalPhase::Publication,
-            OperationalFaultPoint::AfterReservation => OperationalPhase::TailReservation,
             OperationalFaultPoint::AfterManifest => OperationalPhase::Publication,
-            OperationalFaultPoint::AfterStage => OperationalPhase::ArchiveStage,
-            OperationalFaultPoint::BeforeTailAdmission => OperationalPhase::TailAdmission,
-            OperationalFaultPoint::AfterTailAdmission => OperationalPhase::TailAdmission,
             OperationalFaultPoint::AfterSqliteApply => OperationalPhase::SqliteDrain,
             OperationalFaultPoint::BeforeProjection | OperationalFaultPoint::AfterProjection => {
                 OperationalPhase::ProjectionDrain

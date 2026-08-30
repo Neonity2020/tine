@@ -3648,10 +3648,11 @@ impl ProviderRetryJournal {
     }
 }
 
+#[cfg(test)]
 struct ScenarioRoot(PathBuf);
 
+#[cfg(test)]
 impl ScenarioRoot {
-    #[cfg(test)]
     fn new() -> Result<Self, ScenarioError> {
         let path = std::env::temp_dir().join(format!("tine-oplog-simulator-{}", Uuid::new_v4()));
         fs::create_dir(&path).map_err(|error| ScenarioError::Io(error.to_string()))?;
@@ -3659,6 +3660,7 @@ impl ScenarioRoot {
     }
 }
 
+#[cfg(test)]
 impl Drop for ScenarioRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -3916,6 +3918,7 @@ enum ProviderRemoveMissingSourcePolicy {
     RequirePresent,
     /// Retirement owns the exact path already; provider-side convergence may
     /// have completed the removal before this device starts its local journal.
+    #[cfg(test)]
     SettleIfAbsent,
 }
 
@@ -3986,6 +3989,7 @@ fn run_provider_remove_with(
                     ProviderRemoveMissingSourcePolicy::RequirePresent => {
                         Err(ScenarioError::UnknownProviderPath(path.into()))
                     }
+                    #[cfg(test)]
                     ProviderRemoveMissingSourcePolicy::SettleIfAbsent => Ok(()),
                 };
             };
@@ -5913,16 +5917,9 @@ enum ProviderJournalBoundary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderPostValidationOperation {
+    #[cfg(test)]
     Rename,
     Remove,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProviderRemovalDurabilityStep {
-    DeletePending,
-    HandleDropped,
-    DirectorySyncing,
 }
 
 fn sync_provider_directory(directory: &Dir) -> Result<(), ScenarioError> {
@@ -6069,7 +6066,6 @@ std::thread_local! {
     static FAIL_PROVIDER_PUBLICATION_AFTER_PHYSICAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_PROVIDER_RENAME_AFTER_PHYSICAL_MOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROVIDER_PUBLICATION_DURABILITY_STEPS: std::cell::RefCell<Vec<ProviderPublicationDurabilityStep>> = const { std::cell::RefCell::new(Vec::new()) };
-    static PROVIDER_REMOVAL_DURABILITY_STEPS: std::cell::RefCell<Vec<ProviderRemovalDurabilityStep>> = const { std::cell::RefCell::new(Vec::new()) };
     static PROVIDER_POST_VALIDATION_HOOK: std::cell::RefCell<Option<(ProviderPostValidationOperation, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
     static PROVIDER_PUBLICATION_SOURCE_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static PROVIDER_RETIREMENT_VALIDATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -6248,12 +6244,6 @@ fn provider_rename_after_move_hook() -> Result<(), ScenarioError> {
 }
 
 #[cfg(not(test))]
-fn provider_rename_after_move_hook() -> Result<(), ScenarioError> {
-    provider_publication_durability_hook(ProviderPublicationDurabilityStep::Published);
-    Ok(())
-}
-
-#[cfg(not(test))]
 fn provider_publication_after_publish_hook() -> Result<(), ScenarioError> {
     provider_publication_durability_hook(ProviderPublicationDurabilityStep::Published);
     Ok(())
@@ -6266,14 +6256,6 @@ fn provider_publication_durability_hook(step: ProviderPublicationDurabilityStep)
 
 #[cfg(not(test))]
 fn provider_publication_durability_hook(_step: ProviderPublicationDurabilityStep) {}
-
-#[cfg(test)]
-fn provider_removal_durability_hook(step: ProviderRemovalDurabilityStep) {
-    PROVIDER_REMOVAL_DURABILITY_STEPS.with(|steps| steps.borrow_mut().push(step));
-}
-
-#[cfg(not(test))]
-fn provider_removal_durability_hook(_step: ProviderRemovalDurabilityStep) {}
 
 #[cfg(windows)]
 fn provider_rename_handle_noreplace(

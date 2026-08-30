@@ -3488,6 +3488,7 @@ impl EffectiveIdentityIndex {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct DirectCreationCensusFile {
     content_digest: [u8; 32],
     file_resource_id: ContentDigest,
@@ -10241,6 +10242,7 @@ impl Graph {
     /// and absences cross the durable confirmation boundary before admission.
     /// Bootstrap activation separately seals one initial capture and performs
     /// one complete live-source comparison immediately before promotion.
+    #[cfg(test)]
     fn capture_live_graph_text_admission_with_limits(
         &self,
         limits: InitialShadowLimits,
@@ -10326,6 +10328,7 @@ impl Graph {
         Ok((first, combined_capture_bytes))
     }
 
+    #[cfg(test)]
     fn begin_graph_text_admission_build(
         &self,
     ) -> io::Result<Option<GraphTextAdmissionFeedBinding>> {
@@ -24828,19 +24831,21 @@ fn usize_to_u64(value: usize) -> io::Result<u64> {
 const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct BlockDtoWalkFrame<'a> {
     blocks: &'a [BlockDto],
     next: usize,
     depth: usize,
 }
 
+#[cfg(test)]
 struct BlockDtoWalk<'a> {
     frames: [BlockDtoWalkFrame<'a>; MAX_MANAGED_BLOCK_DEPTH],
     len: usize,
 }
 
+#[cfg(test)]
 impl<'a> BlockDtoWalk<'a> {
-    #[cfg(test)]
     fn new(blocks: &'a [BlockDto]) -> Self {
         let empty = BlockDtoWalkFrame {
             blocks: &[],
@@ -24859,7 +24864,6 @@ impl<'a> BlockDtoWalk<'a> {
         Self { frames, len }
     }
 
-    #[cfg(test)]
     fn next(&mut self) -> io::Result<Option<(&'a BlockDto, usize)>> {
         loop {
             if self.len == 0 {

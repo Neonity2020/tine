@@ -805,27 +805,6 @@ fn before_overlay_hook() -> Result<(), ManagedLocalRecordError> {
     Ok(())
 }
 
-pub(crate) enum TrustedLocalRestartProjectionOutcome<A> {
-    Durable(TrustedLocalRestartProjectionDurable<A>),
-    CommittedPending(TrustedLocalRestartProjectionPending<A>),
-}
-
-pub(crate) struct TrustedLocalRestartProjectionDurable<A> {
-    batch_id: BatchId,
-    sequence: u64,
-    graph: DurableJournalPageProjection<A>,
-}
-
-impl<A> TrustedLocalRestartProjectionDurable<A> {}
-
-pub(crate) struct TrustedLocalRestartProjectionPending<A> {
-    batch_id: BatchId,
-    sequence: u64,
-    graph: CommittedPendingJournalPageProjection<A>,
-}
-
-impl<A> TrustedLocalRestartProjectionPending<A> {}
-
 // Pre-0.7 enrolled fast-commit corpus. The clean runtime does not call this
 // coordinator; retain the production surface only until the compiler-guided
 // retirement wave removes its remaining type references.

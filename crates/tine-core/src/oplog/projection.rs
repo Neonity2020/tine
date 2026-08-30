@@ -259,10 +259,12 @@ pub(crate) fn note_finalizer_sealed_pending_local_predecessor_use() {
 /// unwinding, so a simulator failure before graph execution cannot fault a
 /// later unrelated projection on the same thread.
 #[must_use = "the manifested-projection fault must remain scoped to its coordinator operation"]
+#[cfg(test)]
 pub(crate) struct ManifestedProjectionFaultScope {
     previously_armed: bool,
 }
 
+#[cfg(test)]
 impl Drop for ManifestedProjectionFaultScope {
     fn drop(&mut self) {
         HARNESS_FAIL_DURING_MANIFESTED_PROJECTION.with(|fail| fail.set(self.previously_armed));

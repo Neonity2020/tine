@@ -134,7 +134,6 @@ use crate::oplog::trusted_local_commit::{
     TrustedLocalCommitCoordinator, TrustedLocalCommitError, TrustedLocalCommitOutcome,
     TrustedLocalCommitted, TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
     TrustedLocalCompoundCommitted, TrustedLocalCompoundOutcome, TrustedLocalResponseEvidence,
-    TrustedLocalRestartProjectionOutcome,
 };
 #[cfg(test)]
 use crate::oplog::wire::{
