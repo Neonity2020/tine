@@ -1566,7 +1566,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.8.10\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.8.13\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
         "2f23010673a23d013608683e9ff6ebf4f4a624b926ec936590026dd0979db377",
