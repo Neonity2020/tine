@@ -676,6 +676,8 @@ fn restore_from_backup_source(
             cfg_relative
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("")),
+            &graph_recovery.directory_barriers,
+            RestoreDirectoryRoot::Live,
         )
         .map_err(|e| format!("couldn't prepare live config directory: {e}"))?;
         if cfg_dest.exists() {
@@ -791,14 +793,60 @@ struct RestoreRecovery {
     root_path: PathBuf,
     root: Dir,
     dir: Dir,
+    directory_barriers: RestoreDirectoryBarriers,
     #[cfg(test)]
     path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RestoreDirectoryRoot {
+    Live,
+    Recovery,
+}
+
+#[derive(Default)]
+struct RestoreDirectoryBarriers {
+    synced: std::sync::Mutex<std::collections::HashSet<(RestoreDirectoryRoot, std::path::PathBuf)>>,
+}
+
+impl RestoreDirectoryBarriers {
+    fn sync_once(
+        &self,
+        root: RestoreDirectoryRoot,
+        relative: &std::path::Path,
+        directory: &Dir,
+    ) -> std::io::Result<()> {
+        let mut synced = self
+            .synced
+            .lock()
+            .map_err(|_| std::io::Error::other("restore directory barrier cache is poisoned"))?;
+        let key = (root, relative.to_path_buf());
+        if synced.contains(&key) {
+            return Ok(());
+        }
+        sync_restore_directory(directory)?;
+        synced.insert(key);
+        Ok(())
+    }
+
+    fn record_changed(
+        &self,
+        root: RestoreDirectoryRoot,
+        relative: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.synced
+            .lock()
+            .map_err(|_| std::io::Error::other("restore directory barrier cache is poisoned"))?
+            .insert((root, relative.to_path_buf()));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 thread_local! {
     static RESTORE_DIRECTORY_SYNC_FAILURE: std::cell::Cell<Option<(usize, i32)>> =
         const { std::cell::Cell::new(None) };
+    static RESTORE_DIRECTORY_SYNC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -807,7 +855,19 @@ fn fail_restore_directory_sync_at(call: usize, errno: i32) {
     RESTORE_DIRECTORY_SYNC_FAILURE.with(|failure| failure.set(Some((call, errno))));
 }
 
+#[cfg(test)]
+fn reset_restore_directory_sync_count() {
+    RESTORE_DIRECTORY_SYNC_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn restore_directory_sync_count() -> usize {
+    RESTORE_DIRECTORY_SYNC_COUNT.with(std::cell::Cell::get)
+}
+
 fn sync_restore_directory(dir: &Dir) -> std::io::Result<()> {
+    #[cfg(test)]
+    RESTORE_DIRECTORY_SYNC_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     #[cfg(test)]
     RESTORE_DIRECTORY_SYNC_FAILURE.with(|failure| {
         if let Some((remaining, errno)) = failure.get() {
@@ -845,21 +905,35 @@ fn reserve_restore_recovery(
     recovery_id: &str,
 ) -> std::io::Result<RestoreRecovery> {
     let root = Dir::open_ambient_dir(root_path, ambient_authority())?;
-    let parent = open_or_create_real_parent(&root, recovery_parent)?;
+    let directory_barriers = RestoreDirectoryBarriers::default();
+    let parent = open_or_create_real_parent(
+        &root,
+        recovery_parent,
+        &directory_barriers,
+        RestoreDirectoryRoot::Live,
+    )?;
     parent.create_dir(recovery_id)?;
     sync_restore_directory(&parent)?;
+    directory_barriers.record_changed(RestoreDirectoryRoot::Live, recovery_parent)?;
     let dir = parent.open_dir(recovery_id)?;
     Ok(RestoreRecovery {
         root_path: root_path.to_path_buf(),
         root,
         dir,
+        directory_barriers,
         #[cfg(test)]
         path: root_path.join(recovery_parent).join(recovery_id),
     })
 }
 
-fn open_or_create_real_parent(root: &Dir, relative: &std::path::Path) -> std::io::Result<Dir> {
+fn open_or_create_real_parent(
+    root: &Dir,
+    relative: &std::path::Path,
+    barriers: &RestoreDirectoryBarriers,
+    root_kind: RestoreDirectoryRoot,
+) -> std::io::Result<Dir> {
     let mut current = root.try_clone()?;
+    let mut current_relative = std::path::PathBuf::new();
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             return Err(std::io::Error::new(
@@ -867,11 +941,11 @@ fn open_or_create_real_parent(root: &Dir, relative: &std::path::Path) -> std::io
                 "restore recovery path is not relative",
             ));
         };
-        match current.create_dir(name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        let created = match current.create_dir(name) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
             Err(error) => return Err(error),
-        }
+        };
         let metadata = current.symlink_metadata(name)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(std::io::Error::new(
@@ -879,10 +953,16 @@ fn open_or_create_real_parent(root: &Dir, relative: &std::path::Path) -> std::io
                 "restore recovery path contains a non-directory entry",
             ));
         }
-        // An existing entry can be residue from a prior attempt whose parent
-        // barrier failed. Re-barrier the parent before trusting the child.
-        sync_restore_directory(&current)?;
+        if created {
+            sync_restore_directory(&current)?;
+            barriers.record_changed(root_kind, &current_relative)?;
+        } else {
+            // Re-prove a possible prior-attempt residue once per restore. Later
+            // sibling files reuse this exact capability-bound proof.
+            barriers.sync_once(root_kind, &current_relative, &current)?;
+        }
         current = current.open_dir(name)?;
+        current_relative.push(name);
     }
     Ok(current)
 }
@@ -1037,6 +1117,8 @@ fn atomic_copy_new_into_live(
         relative
             .parent()
             .unwrap_or_else(|| std::path::Path::new("")),
+        &area.directory_barriers,
+        RestoreDirectoryRoot::Live,
     )?;
     let temp = format!(
         ".tine-restore-{}-{}.tmp",
@@ -1134,6 +1216,8 @@ fn move_live_to_recovery(
         recovery_relative
             .parent()
             .unwrap_or_else(|| std::path::Path::new("")),
+        &area.directory_barriers,
+        RestoreDirectoryRoot::Recovery,
     )?;
     match recovery_parent.symlink_metadata(recovery_name) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1197,7 +1281,12 @@ fn restore_md_dir(
     }
     ensure_target_within_root(&recovery.root_path, dest)?;
     let dest_relative = live_relative(recovery, dest)?;
-    open_or_create_real_parent(&recovery.root, &dest_relative)?;
+    open_or_create_real_parent(
+        &recovery.root,
+        &dest_relative,
+        &recovery.directory_barriers,
+        RestoreDirectoryRoot::Live,
+    )?;
     let mut restored: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     restore_md_copy(
@@ -1326,7 +1415,12 @@ fn restore_md_copy(
         } else if is_visible_real_dir(&e)? {
             ensure_target_within_root(&recovery.root_path, &dest.join(&rel_child))?;
             let child_relative = live_relative(recovery, &dest.join(&rel_child))?;
-            open_or_create_real_parent(&recovery.root, &child_relative)?;
+            open_or_create_real_parent(
+                &recovery.root,
+                &child_relative,
+                &recovery.directory_barriers,
+                RestoreDirectoryRoot::Live,
+            )?;
             restore_md_copy(&p, dest, &rel_child, restored, recovery, recovery_prefix)?;
         }
     }
@@ -1371,7 +1465,12 @@ fn restore_asset_sidecars_dir(
     }
     ensure_target_within_root(&recovery.root_path, dest)?;
     let dest_relative = live_relative(recovery, dest)?;
-    open_or_create_real_parent(&recovery.root, &dest_relative)?;
+    open_or_create_real_parent(
+        &recovery.root,
+        &dest_relative,
+        &recovery.directory_barriers,
+        RestoreDirectoryRoot::Live,
+    )?;
     let mut restored: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     restore_asset_sidecars_copy(
@@ -1408,7 +1507,12 @@ fn restore_asset_sidecars_copy(
         if ft.is_dir() && !is_asset_restore_recovery_entry(&e) {
             ensure_target_within_root(&recovery.root_path, &dest.join(&rel_child))?;
             let child_relative = live_relative(recovery, &dest.join(&rel_child))?;
-            open_or_create_real_parent(&recovery.root, &child_relative)?;
+            open_or_create_real_parent(
+                &recovery.root,
+                &child_relative,
+                &recovery.directory_barriers,
+                RestoreDirectoryRoot::Live,
+            )?;
             restore_asset_sidecars_copy(&p, dest, &rel_child, restored, recovery, recovery_prefix)?;
         } else if ft.is_file() && is_asset_sidecar(&p) {
             let target = dest.join(&rel_child);
@@ -1910,11 +2014,38 @@ mod tests {
         )
         .unwrap();
 
-        fail_restore_directory_sync_at(2, 5);
+        fail_restore_directory_sync_at(1, 5);
         let error = atomic_copy_new_into_live(&recovery, &source, &live)
             .expect_err("publication must fail closed when its directory barrier fails");
         assert_eq!(error.raw_os_error(), Some(5));
         assert_eq!(std::fs::read(&live).unwrap(), b"complete snapshot bytes");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_sibling_publications_do_not_repeat_ancestor_barriers() {
+        let root = scratch("restore-sibling-barriers");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        let first_source = root.join("snapshot-first.md");
+        let second_source = root.join("snapshot-second.md");
+        std::fs::write(&first_source, b"first").unwrap();
+        std::fs::write(&second_source, b"second").unwrap();
+        let recovery = reserve_restore_recovery(
+            &root,
+            std::path::Path::new("logseq/.tine-trash"),
+            "restore-siblings",
+        )
+        .unwrap();
+
+        reset_restore_directory_sync_count();
+        atomic_copy_new_into_live(&recovery, &first_source, &root.join("pages/first.md")).unwrap();
+        atomic_copy_new_into_live(&recovery, &second_source, &root.join("pages/second.md"))
+            .unwrap();
+        assert_eq!(
+            restore_directory_sync_count(),
+            2,
+            "each sibling needs its changed leaf-parent barrier, but stable ancestors are proved once per restore"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
