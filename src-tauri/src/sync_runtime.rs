@@ -553,11 +553,18 @@ pub(crate) struct SparseV2Binding {
 }
 
 impl SparseV2Binding {
-    pub(crate) fn superseded_legacy(&self) -> bool {
+    /// Pre-0.7 private state is disposable authority, but never disposable
+    /// evidence.  The graph-open boundary archives it and reconstructs the
+    /// one current format from the Markdown/Org tree.
+    pub(crate) fn requires_blank_slate_rebuild(&self) -> bool {
         matches!(
             &self.availability,
             SparseV2Availability::Refused { reason_code, .. }
                 if reason_code == SUPERSEDED_LEGACY_REASON
+        ) || matches!(
+            &self.availability,
+            SparseV2Availability::Refused { scenario_id, .. }
+                if scenario_id == ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
         )
     }
 }
@@ -1215,11 +1222,12 @@ impl SyncRuntimeFacade {
         Ok(record)
     }
 
-    /// True when a binding file exists but predates the current schema. Such
-    /// a file cannot decode into `SparseV2ActivationRecord`, so ordinary
-    /// discovery reports corruption; startup instead retires it. A current-
-    /// version file that fails to decode stays an error - that IS corruption.
-    pub(crate) fn superseded_binding_file(
+    /// True when a binding file exists and is safely readable, but ordinary
+    /// discovery could not decode it as the one current pre-0.7 format.
+    /// Startup archives the entire private root and reconstructs current state
+    /// from Markdown/Org. An I/O failure remains a loud error: it is not proof
+    /// that the format itself is unrecognized.
+    pub(crate) fn unrecognized_binding_file(
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
@@ -1227,16 +1235,14 @@ impl SyncRuntimeFacade {
         let Ok(private) = sparse_private_root(app, graph_root) else {
             return false;
         };
-        let Ok(bytes) = std::fs::read(private.join(SPARSE_BINDING_FILE)) else {
-            return false;
-        };
-        binding_bytes_are_superseded(&bytes)
+        std::fs::read(private.join(SPARSE_BINDING_FILE)).is_ok()
     }
 
-    /// Pre-0.7 policy (Martin, Aug 19): experimental state is not migrated.
-    /// Archive the whole app-private root into the recovery directory - never
-    /// hard-delete - and select Direct Files so the next open is ordinary.
-    pub(crate) fn retire_superseded_legacy(
+    /// Pre-0.7 policy: experimental state is not migrated. Archive the whole
+    /// app-private root into the recovery directory - never hard-delete - and
+    /// select Direct Files as the safe source for an automatic current-format
+    /// rebuild from Markdown/Org.
+    pub(crate) fn archive_unrecognized_private_state(
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
@@ -1247,7 +1253,7 @@ impl SyncRuntimeFacade {
             format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
         })?;
         crate::debug::diag(format!(
-            "pre-0.7 managed state retired: archived={}",
+            "unrecognized pre-0.7 managed state archived: archived={}",
             archived
                 .as_deref()
                 .map(|path| path.display().to_string())
@@ -1994,7 +2000,7 @@ pub(crate) async fn sparse_v2_status(
     .map_err(|error| error.to_string())?
 }
 
-/// Explicitly retire one legacy authority and activate/resume sparse v2.
+/// Explicitly retire one Direct authority and activate/resume managed storage.
 ///
 /// The durable opt-in record is published only after the legacy watcher,
 /// detached background work, and every in-flight legacy command have released
@@ -2016,7 +2022,7 @@ pub(crate) async fn activate_sparse_v2(
     .map_err(|error| format!("Tine-managed storage setup worker failed: {error}"))?
 }
 
-fn activate_sparse_v2_blocking(
+pub(crate) fn activate_sparse_v2_blocking(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
@@ -2307,19 +2313,6 @@ pub(crate) struct SparseV2CancelResult {
 /// in-app Direct Files return.  The caller's attempt is validated at the
 /// mutation boundary, not trusted as storage authority or reflected to the UI.
 pub(crate) type SparseV2ColdCancelResult = SparseV2CancelResult;
-
-/// A binding file from a schema before the current one is pre-0.7 state.
-/// Undecodable JSON is NOT superseded: a current-format file that fails to
-/// parse is corruption and must keep failing loudly.
-fn binding_bytes_are_superseded(bytes: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(u64::from(BINDING_SCHEMA_VERSION))
-}
 
 fn archive_private_root(
     private_root: &Path,
@@ -6240,21 +6233,65 @@ mod tests {
     }
 
     #[test]
-    fn superseded_classification_spares_current_and_corrupt_bindings() {
-        // Pre-0.7 shapes: an explicit older version, and a record from before
-        // the version field existed at all.
-        assert!(binding_bytes_are_superseded(
-            br#"{"schema_version":1,"graph_root":"/g"}"#
-        ));
-        assert!(binding_bytes_are_superseded(
-            br#"{"graph_root":"/g","workspace":"w"}"#
-        ));
-        // The current version is not superseded even when the record is
-        // otherwise incomplete - that failure must stay a loud one.
-        assert!(!binding_bytes_are_superseded(br#"{"schema_version":2}"#));
-        // Not JSON at all: corruption, not an old format.
-        assert!(!binding_bytes_are_superseded(b"\x00\x01managed"));
-        assert!(!binding_bytes_are_superseded(b""));
+    fn blank_slate_rebuild_is_only_for_unrecognized_pre_07_state() {
+        for availability in [
+            SparseV2Availability::Refused {
+                reason_code: SUPERSEDED_LEGACY_REASON.into(),
+                scenario_id: SUPERSEDED_LEGACY_REASON.into(),
+                detail: None,
+            },
+            SparseV2Availability::Refused {
+                reason_code: "open_refused".into(),
+                scenario_id: ManagedStorageRefusalScenario::ProtocolIncompatible
+                    .as_str()
+                    .into(),
+                detail: None,
+            },
+        ] {
+            assert!(SparseV2Binding {
+                availability,
+                handle: None,
+            }
+            .requires_blank_slate_rebuild());
+        }
+
+        assert!(!SparseV2Binding {
+            availability: SparseV2Availability::Refused {
+                reason_code: "open_refused".into(),
+                scenario_id: ManagedStorageRefusalScenario::DiskCorrupt.as_str().into(),
+                detail: None,
+            },
+            handle: None,
+        }
+        .requires_blank_slate_rebuild());
+    }
+
+    #[test]
+    fn blank_slate_archive_preserves_every_private_byte() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private/current");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir_all(private.join("nested")).unwrap();
+        std::fs::write(private.join("binding.json"), b"unrecognized binding bytes").unwrap();
+        std::fs::write(
+            private.join("nested/evidence.bin"),
+            b"\0\x01retained evidence",
+        )
+        .unwrap();
+
+        let archived = archive_private_root(&private, &recovery)
+            .unwrap()
+            .expect("present private state must be archived");
+
+        assert!(!private.exists());
+        assert_eq!(
+            std::fs::read(archived.join("binding.json")).unwrap(),
+            b"unrecognized binding bytes"
+        );
+        assert_eq!(
+            std::fs::read(archived.join("nested/evidence.bin")).unwrap(),
+            b"\0\x01retained evidence"
+        );
     }
 
     #[test]

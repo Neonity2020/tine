@@ -4334,15 +4334,15 @@ impl AcceptedBatchEvidence {
         validate_accepted_evidence(self)
     }
 
-    pub(crate) fn encode_canonical_v1(&self) -> Result<Vec<u8>, EngineError> {
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, EngineError> {
         self.validate()?;
         postcard::to_allocvec(self).map_err(|error| EngineError::Archive(error.to_string()))
     }
 
-    pub(crate) fn decode_canonical_v1(bytes: &[u8]) -> Result<Self, EngineError> {
+    pub(crate) fn decode_canonical(bytes: &[u8]) -> Result<Self, EngineError> {
         let (evidence, trailing): (Self, &[u8]) = postcard::take_from_bytes(bytes)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if !trailing.is_empty() || evidence.encode_canonical_v1()? != bytes {
+        if !trailing.is_empty() || evidence.encode_canonical()? != bytes {
             return Err(EngineError::Archive(
                 "non-canonical accepted sequence evidence".into(),
             ));
@@ -4430,18 +4430,18 @@ impl AcceptedFrontierRoot {
         normalized
     }
 
-    pub(crate) fn encode_canonical_v1(&self) -> Result<Vec<u8>, EngineError> {
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, EngineError> {
         let durable = self.without_scratch_root();
         validate_accepted_frontier_root(&durable)?;
         postcard::to_allocvec(&durable).map_err(|error| EngineError::Archive(error.to_string()))
     }
 
-    pub(crate) fn decode_canonical_v1(bytes: &[u8]) -> Result<Self, EngineError> {
+    pub(crate) fn decode_canonical(bytes: &[u8]) -> Result<Self, EngineError> {
         let (root, trailing): (Self, &[u8]) = postcard::take_from_bytes(bytes)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if !trailing.is_empty() || root.encode_canonical_v1()? != bytes {
+        if !trailing.is_empty() || root.encode_canonical()? != bytes {
             return Err(EngineError::Archive(
-                "non-canonical accepted-frontier V1 root".into(),
+                "non-canonical accepted-frontier root".into(),
             ));
         }
         Ok(root)
@@ -31106,14 +31106,7 @@ fn decode_archive_status(bytes: &[u8]) -> Result<ArchiveStatus, EngineError> {
 }
 
 fn decode_accepted_evidence(bytes: &[u8]) -> Result<AcceptedBatchEvidence, EngineError> {
-    match super::checkpoint_generation::decode_versioned_evidence(bytes)? {
-        super::checkpoint_generation::VersionedAcceptedBatchEvidence::V1(evidence) => Ok(evidence),
-        super::checkpoint_generation::VersionedAcceptedBatchEvidence::V2(_) => {
-            Err(EngineError::Archive(
-                "accepted-evidence V2 is not active before checkpoint-generation cutover".into(),
-            ))
-        }
-    }
+    AcceptedBatchEvidence::decode_canonical(bytes)
 }
 
 fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {

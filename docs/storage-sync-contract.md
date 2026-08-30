@@ -1048,16 +1048,20 @@ refusal that could have come from any of 131 unnamed sites.
 
 ### 3.1a The private receipt-store claim, and when it is checked
 
-`receipts/projection-receipts.claim` versions the private receipt store by
-magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**. Every
-prior magic — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — is *recognized and
-refused*, never migrated and never dually accepted.
+`receipts/projection-receipts.claim` identifies the one implemented private
+receipt-store format by magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**.
+Earlier development magics — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — are
+recognized only so the low-level opener can refuse them without mutation. They
+have no reader, compatibility implementation, or migration path.
 
 **Why the version moved to 6.** The intent and completion records now carry an
 explicit target-kind discriminant (below). Managed storage has not shipped, so
 the only stores carrying a pre-(c) claim are development stores, and the 0.7
-blank-slate policy applies: refuse with a named remedy rather than build
-migration machinery for records that exist on no user's disk.
+blank-slate policy applies: the low-level store refuses before mutation; the
+Tauri graph-open boundary preserves the entire unrecognized private root as a
+backup, opens the untouched Markdown/Org tree as the reconstruction source,
+and automatically activates a fresh store in the one current format. The user
+does not migrate or manually re-activate anything.
 
 **Why packet 2c does not move it again.** Packet 2c retires only the
 own-endpoint facet of the receipt protocol. The foreign receiver namespaces,
@@ -1076,16 +1080,15 @@ exactly this transition.
 | --- | --- |
 | current magic, current version, exactly `STORE_CLAIM_LEN` bytes, regular file | proceed to the full in-place validation |
 | current magic, any other length, or a non-regular file | `MalformedStoreClaim`, refuse, zero mutation |
-| a prior magic, or a version below the current one | `UpgradeRequired`, refuse, zero mutation, remedy named in the error: re-activate managed storage; the Markdown is intact and untouched |
+| a prior magic, or a version below the current one | `UpgradeRequired`, refuse, zero mutation; the graph-open boundary archives the private root and automatically rebuilds current state from the intact Markdown/Org tree |
 | a version above the current one | `UnknownStoreVersion`, refuse, zero mutation |
 | absent, on a populated store root | `ClaimlessNonemptyStore`, refuse, zero mutation |
 | absent, on an absent or empty store root | initialization owns it; this is a fresh store |
 
 **Refusal scenario** (§3.1 rule): `MS-REF-PROTOCOL-INCOMPATIBLE`. The in-scope
-failure is an honest pre-(c) private store meeting a (c) build — a real state on
-a developer's own devices, reachable with no attacker and no corruption. The
-recovery is re-activation, and the refusal says so in its own message rather
-than leaving the remedy to a caller's prose.
+failure is an honest pre-(c) private store meeting a (c) build — reachable with
+no attacker and no corruption. The low-level refusal is the typed signal for
+the outer blank-slate lifecycle; it is not a user-facing migration request.
 
 **Where the check runs, and why there.** The full validation has always been the
 first thing the receipt store's `open` does, and it stays there as defense in
@@ -1104,9 +1107,13 @@ envelope length. A magic-only check would pass a truncated claim, and graph
 publication recovery would then run before the in-place length check ever fired.
 
 A refusal propagates through the managed-open failure channel as a named notice
-(`OpenRefused`, carrying the scenario marker). It is never the silent
-Direct-Files fall-through, which is reserved for superseded outer Tauri
-bindings, and the (c) transition does not bump the outer Tauri binding schema.
+(`OpenRefused`, carrying the scenario marker). During startup the Tauri
+graph-open boundary treats that exact protocol-incompatible marker, and an
+unrecognized outer binding, identically: archive the whole private root,
+publish Direct Files as the intact source, and automatically construct and
+publish the current managed store. If reconstruction itself fails, Direct
+Files remains serving and the failure is retained in diagnostics. This is one
+current format, not a compatibility reader or migration.
 
 #### Explicit target kind on intent and completion records
 
@@ -1186,22 +1193,21 @@ batch. The incrementally maintained root is required to be byte-identical to a
 canonical complete rebuild; the complete rebuild remains only a differential
 oracle and an explicit rebuild operation.
 
-Checkpoint-generation format support is staged without changing that V1
-authority. The canonical V1 authenticated-map priority/node algorithm now has
-one owner, `tine-storage::sealed_accepted_index`, shared by scratch, the clean
-runtime, and SQLite with pinned historical roots. The same module defines the
-additive V2 sealed batch/status/sequence/causal object formats and their bounded
-cross-checking reader; its caller-provided Tine evidence decoder validates and
-binds the preserved exact V1/V2 evidence bytes without reversing the crate
-dependency. Tine dispatches on the leading schema and canonically distinguishes
-V1 and V2 frontier and evidence bytes, but production recovery continues to accept only V1:
-the R1a/P1 codec module has no filesystem/publication capability
-and no other production
-module may name its V2 authority types. A live checkpoint-generation marker is
-therefore impossible until a later cut deliberately changes that tested
-boundary. R1a/P2 must separately freeze the versioned physical-frontier API,
-SQLite V1/V2 schema census, and sealed-reader injection before the inert R1b
-builder begins; P1 does not claim or guess that physical schema.
+Checkpoint-generation support obeys the pre-0.7 blank-slate rule: production
+implements one current format, not old/new readers or a migration bridge. The
+canonical authenticated-map priority/node algorithm has one owner,
+`tine-storage::sealed_accepted_index`, shared by scratch, the clean runtime, and
+SQLite. The same module owns the one current sealed batch/status/sequence/causal
+encoding and its bounded cross-checking reader; its caller-provided Tine
+evidence decoder validates the one current accepted-evidence encoding without
+reversing the crate dependency. The R1a adapter has no filesystem/publication
+capability, so a live checkpoint-generation marker remains impossible until a
+later cut deliberately changes that tested boundary. The physical layer has
+one current SQLite schema for both the live disposable projection and a
+separately built checkpoint candidate, plus a read-only injected sealed-history
+reader. It has no prior-schema enum, reader, compatibility fixture, or
+migration path. An unrecognized pre-0.7 private store is preserved as a backup
+and rebuilt from the untouched Markdown/Org tree by Tine.
 
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.

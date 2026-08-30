@@ -7504,7 +7504,7 @@ fn decode_frontier(bytes: &[u8]) -> Result<FrontierV2, ProjectionError> {
 fn canonical_frontier_root_bytes(root: &AcceptedFrontierRoot) -> Result<Vec<u8>, ProjectionError> {
     let durable = root.without_scratch_root();
     let bytes = durable
-        .encode_canonical_v1()
+        .encode_canonical()
         .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
     if decode_frontier_root(&bytes)? != durable {
         return Err(ProjectionError::InvalidFrontier(
@@ -7521,16 +7521,8 @@ pub(crate) fn canonical_frontier_root_digest(
 }
 
 fn decode_frontier_root(bytes: &[u8]) -> Result<AcceptedFrontierRoot, ProjectionError> {
-    match super::checkpoint_generation::decode_versioned_frontier_root(bytes)
-        .map_err(|error| ProjectionError::Corrupt(error.to_string()))?
-    {
-        super::checkpoint_generation::VersionedAcceptedFrontierRoot::V1(root) => Ok(root),
-        super::checkpoint_generation::VersionedAcceptedFrontierRoot::V2(_) => {
-            Err(ProjectionError::Corrupt(
-                "accepted-frontier V2 is not active before checkpoint-generation cutover".into(),
-            ))
-        }
-    }
+    AcceptedFrontierRoot::decode_canonical(bytes)
+        .map_err(|error| ProjectionError::Corrupt(error.to_string()))
 }
 
 fn canonical_affected_documents_bytes(
@@ -9557,6 +9549,9 @@ impl From<storage_frontier::FrontierError> for ProjectionError {
             storage_frontier::FrontierError::Materialization(error) => Self::from(
                 super::sqlite_materialization::MaterializationError::from(error),
             ),
+            storage_frontier::FrontierError::SealedAcceptedIndex(error) => {
+                Self::Corrupt(error.to_string())
+            }
             storage_frontier::FrontierError::Schema(error) => Self::SchemaMismatch(error),
             storage_frontier::FrontierError::ClaimBytes {
                 field: "workspace_id",
