@@ -1,4 +1,4 @@
-import { AnnotationMode, PixelsPerInch } from "pdfjs-dist";
+import { AnnotationMode, PixelsPerInch, type PDFPageProxy } from "pdfjs-dist";
 import { EventBus, PDFPageView } from "pdfjs-dist/web/pdf_viewer.mjs";
 import {
   PdfRenderCoordinator,
@@ -6,6 +6,11 @@ import {
   type PdfRenderableView,
   type PdfVisiblePages,
 } from "./pdfRenderCoordinator";
+import {
+  PdfTileRenderer,
+  type PdfTilePage,
+  type PdfTileRect,
+} from "./pdfTileRenderer";
 
 export const TINE_PDF_LOADING_OPTIONS = Object.freeze({ disableAutoFetch: true } as const);
 
@@ -19,6 +24,7 @@ export interface PdfViewportLike {
 
 export interface PdfPageProxyLike {
   getViewport(options: { scale: number; rotation?: number }): PdfViewportLike;
+  render?: PDFPageProxy["render"];
 }
 
 export interface PdfDocumentProxyLike {
@@ -31,7 +37,10 @@ export interface DirectPdfPageView extends PdfRenderableView {
   height: number;
   scale: number;
   canvasPixelLimit?: number;
-  textLayer?: { div?: HTMLDivElement | null } | null;
+  textLayer?: {
+    div?: HTMLDivElement | null;
+    render?: (viewport: PdfViewportLike) => Promise<unknown> | unknown;
+  } | null;
   setPdfPage(page: PdfPageProxyLike): void;
   update(options: { scale?: number; rotation?: number; drawingDelay?: number }): void;
 }
@@ -65,9 +74,19 @@ interface PageRecord {
   token: symbol;
   displayScale: number;
   view: DirectPdfPageView | null;
+  page: PdfPageProxyLike | null;
+  container: HTMLDivElement;
+  visibleRect: PdfTileRect | null;
+  tileScale: number | null;
 }
 
 const TEXT_LAYER_ENABLED = 1;
+export const PDF_TILE_SCALE_THRESHOLD = 3;
+
+export interface PdfVisibleRegion {
+  pageNumber: number;
+  rect: PdfTileRect;
+}
 
 function defaultPageViewFactory(options: DirectPdfPageViewOptions): DirectPdfPageView {
   // PDFPageView's declaration names PDFRenderingQueue, but its runtime contract
@@ -100,7 +119,9 @@ export class PdfPageViewRenderer {
   private readonly eventBus: EventBus;
   private readonly createPageView: DirectPdfPageViewFactory;
   private readonly queue: TinePdfRenderingQueue;
+  private readonly tileRenderer: PdfTileRenderer;
   private readonly pages = new Map<number, PageRecord>();
+  private readonly visibleRegions = new Map<number, PdfTileRect>();
   private visiblePageNumbers: number[] = [];
   private scrolledDown = true;
   private disposed = false;
@@ -119,6 +140,18 @@ export class PdfPageViewRenderer {
       cachedViews: () => this.cachedViews(),
       onRenderError: (view, error) => this.handleRenderError(view.id, error),
     });
+    this.tileRenderer = new PdfTileRenderer({
+      coordinator: options.coordinator,
+      priority: options.priority,
+      maxCanvasDimension: options.maxCanvasDimension,
+      onPageReady: (pageNumber) => {
+        const view = this.pages.get(pageNumber)?.view;
+        if (!view) return;
+        this.resolveRenderWaiters(pageNumber);
+        this.options.onPageRendered?.(pageNumber, view);
+      },
+      onRenderError: (pageNumber, error) => this.handleRenderError(pageNumber, error),
+    });
     // This must happen before PDFPageView construction. Otherwise PDF.js marks
     // the page view standalone and bypasses the injected rendering queue.
     this.queue.setViewer(this);
@@ -128,7 +161,12 @@ export class PdfPageViewRenderer {
       if (event.error) {
         return;
       }
-      this.resolveRenderWaiters(view.id);
+      const record = this.pages.get(view.id);
+      if (record && record.displayScale >= PDF_TILE_SCALE_THRESHOLD) {
+        this.activateTiles(view.id, record);
+      } else {
+        this.resolveRenderWaiters(view.id);
+      }
       this.options.onPageRendered?.(view.id, view);
     };
     this.eventBus.on("pagerendered", this.pageRenderedListener);
@@ -150,17 +188,22 @@ export class PdfPageViewRenderer {
       token: Symbol(`pdf-page-${pageNumber}`),
       displayScale,
       view: null,
+      page: null,
+      container,
+      visibleRect: this.visibleRegions.get(pageNumber) ?? null,
+      tileScale: null,
     };
     this.pages.set(pageNumber, record);
 
     const page = await this.options.document.getPage(pageNumber);
     if (this.disposed || this.pages.get(pageNumber)?.token !== record.token) return null;
 
+    const initialDisplayScale = Math.min(record.displayScale, PDF_TILE_SCALE_THRESHOLD);
     const view = this.createPageView({
       container,
       eventBus: this.eventBus,
       id: pageNumber,
-      scale: tineScaleToPdfPageViewScale(record.displayScale),
+      scale: tineScaleToPdfPageViewScale(initialDisplayScale),
       defaultViewport: page.getViewport({ scale: 1 }),
       renderingQueue: this.queue,
       textLayerMode: TEXT_LAYER_ENABLED,
@@ -186,6 +229,7 @@ export class PdfPageViewRenderer {
       Math.floor(Math.min(this.options.coordinator.perPagePixelLimit, dimensionLimitedPixels)),
     );
     record.view = view;
+    record.page = page;
     if (this.visiblePageNumbers.includes(pageNumber)) this.requestVisibleRendering();
     return view;
   }
@@ -194,6 +238,7 @@ export class PdfPageViewRenderer {
     const record = this.pages.get(pageNumber);
     if (!record) return;
     this.pages.delete(pageNumber);
+    this.tileRenderer.clearPage(pageNumber);
     if (record.view) {
       record.view.reset();
       record.view.div.remove();
@@ -204,11 +249,15 @@ export class PdfPageViewRenderer {
     const record = this.pages.get(pageNumber);
     if (!record) return;
     const pageViewScale = tineScaleToPdfPageViewScale(displayScale);
+    const wasTiled = record.tileScale !== null;
     record.displayScale = displayScale;
-    record.view?.update({
-      scale: pageViewScale,
-      drawingDelay,
-    });
+    if (displayScale >= PDF_TILE_SCALE_THRESHOLD) {
+      if (record.view?.renderingState === 3 || wasTiled) this.activateTiles(pageNumber, record);
+    } else {
+      this.tileRenderer.clearPage(pageNumber);
+      record.tileScale = null;
+      record.view?.update({ scale: pageViewScale, drawingDelay });
+    }
     if (record.view && this.visiblePageNumbers.includes(pageNumber)) {
       this.requestVisibleRendering();
     }
@@ -221,11 +270,38 @@ export class PdfPageViewRenderer {
     this.requestVisibleRendering();
   }
 
+  setVisibleRegions(
+    regions: Iterable<PdfVisibleRegion>,
+    scrolledDown: boolean,
+    renderPageNumbers?: Iterable<number>,
+  ): void {
+    this.assertActive();
+    const next = [...regions];
+    const visible = new Set(next.map(({ pageNumber }) => pageNumber));
+    this.visibleRegions.clear();
+    for (const region of next) this.visibleRegions.set(region.pageNumber, region.rect);
+    for (const [pageNumber, record] of this.pages) {
+      const region = next.find((candidate) => candidate.pageNumber === pageNumber);
+      record.visibleRect = region?.rect ?? null;
+      if (!visible.has(pageNumber)) this.tileRenderer.clearPage(pageNumber);
+      else if (record.displayScale >= PDF_TILE_SCALE_THRESHOLD && record.tileScale !== null) {
+        this.requestTiles(pageNumber, record);
+      }
+    }
+    this.setVisiblePages(renderPageNumbers ?? visible, scrolledDown);
+  }
+
   renderPage(pageNumber: number, visiblePageNumbers: Iterable<number>): Promise<void> {
     this.assertActive();
     const view = this.pages.get(pageNumber)?.view;
     if (!view) return Promise.reject(new Error(`PDF page ${pageNumber} is not mounted`));
-    if (view.renderingState === 3 && view.canvas) return Promise.resolve();
+    const record = this.pages.get(pageNumber)!;
+    if (record.tileScale === record.displayScale && record.visibleRect) {
+      this.requestTiles(pageNumber, record);
+      if (this.tileRenderer.isPageReady(pageNumber)) return Promise.resolve();
+    } else if (view.renderingState === 3 && view.canvas && record.displayScale < PDF_TILE_SCALE_THRESHOLD) {
+      return Promise.resolve();
+    }
     const promise = new Promise<void>((resolve, reject) => {
       const waiters = this.renderWaiters.get(pageNumber) ?? new Set();
       waiters.add({ resolve, reject });
@@ -239,6 +315,18 @@ export class PdfPageViewRenderer {
     return this.pages.get(pageNumber)?.view ?? null;
   }
 
+  captureArea(pageNumber: number, rect: PdfTileRect): Promise<Uint8Array | null> {
+    this.assertActive();
+    const record = this.pages.get(pageNumber);
+    if (!record?.page?.render) return Promise.reject(new Error(`PDF page ${pageNumber} is not mounted`));
+    return this.tileRenderer.captureArea(
+      pageNumber,
+      record.page as unknown as PdfTilePage,
+      record.displayScale,
+      rect,
+    );
+  }
+
   getCachedPageViews(): Set<PdfRenderableView> {
     return new Set(this.cachedViews());
   }
@@ -249,7 +337,21 @@ export class PdfPageViewRenderer {
     if (!current) return false;
     const byPageNumber: PdfRenderableView[] = [];
     for (const [pageNumber, record] of this.pages) {
-      if (record.view) byPageNumber[pageNumber - 1] = record.view;
+      if (!record.view) continue;
+      if (
+        record.displayScale >= PDF_TILE_SCALE_THRESHOLD
+        && record.view.renderingState === 0
+        && !record.view.canvas
+      ) {
+        // A cold/LRU-reset tiled page reconstructs the bounded fallback first,
+        // never a full-page high-zoom backing store.
+        record.tileScale = null;
+        record.view.update({
+          scale: tineScaleToPdfPageViewScale(PDF_TILE_SCALE_THRESHOLD),
+          drawingDelay: -1,
+        });
+      }
+      byPageNumber[pageNumber - 1] = record.view;
     }
     const next = this.queue.getHighestPriority(
       current,
@@ -264,9 +366,11 @@ export class PdfPageViewRenderer {
     this.disposed = true;
     for (const pageNumber of [...this.pages.keys()]) this.unmountPage(pageNumber);
     this.visiblePageNumbers = [];
+    this.visibleRegions.clear();
     this.eventBus.off("pagerendered", this.pageRenderedListener);
     for (const pageNumber of this.renderWaiters.keys()) this.resolveRenderWaiters(pageNumber);
     this.queue.dispose();
+    this.tileRenderer.dispose();
   }
 
   private cachedViews(): DirectPdfPageView[] {
@@ -280,6 +384,40 @@ export class PdfPageViewRenderer {
   private requestVisibleRendering(): void {
     const visible = this.buildVisiblePages();
     if (visible) this.queue.renderHighestPriority(visible);
+  }
+
+  private activateTiles(pageNumber: number, record: PageRecord): void {
+    if (!record.view || !record.page) return;
+    if (record.tileScale !== record.displayScale) {
+      record.tileScale = record.displayScale;
+      // The drawing delay selects PDFPageView's CSS-only canvas path. Its own
+      // TextLayerBuilder is then asked to update the existing selectable layer
+      // to the same viewport; Tine never constructs or paints a text layer.
+      record.view.update({
+        scale: tineScaleToPdfPageViewScale(record.displayScale),
+        drawingDelay: 120,
+      });
+      const textUpdate = record.view.textLayer?.render?.(
+        record.page.getViewport({ scale: record.displayScale }),
+      );
+      if (textUpdate && typeof (textUpdate as PromiseLike<unknown>).then === "function") {
+        void Promise.resolve(textUpdate).catch((error) => this.handleRenderError(pageNumber, error));
+      }
+    }
+    this.requestTiles(pageNumber, record);
+  }
+
+  private requestTiles(pageNumber: number, record: PageRecord): void {
+    if (!record.view || !record.page?.render || !record.visibleRect) return;
+    this.tileRenderer.requestPage({
+      pageNumber,
+      page: record.page as unknown as PdfTilePage,
+      host: record.container,
+      scale: record.displayScale,
+      pageWidth: record.view.width,
+      pageHeight: record.view.height,
+      visibleRect: record.visibleRect,
+    });
   }
 
   private buildVisiblePages(): PdfVisiblePages | null {

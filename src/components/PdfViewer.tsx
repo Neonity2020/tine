@@ -697,6 +697,27 @@ export function PdfViewer(props: {
     return Math.abs((rect.top + rect.bottom) / 2 - (viewport.top + viewport.bottom) / 2);
   }
 
+  function visiblePageRegion(n: number) {
+    const page = pageEls[n];
+    if (!page || !scrollRef) return null;
+    const pageRect = page.getBoundingClientRect();
+    const viewport = scrollRef.getBoundingClientRect();
+    const left = Math.max(pageRect.left, viewport.left);
+    const top = Math.max(pageRect.top, viewport.top);
+    const right = Math.min(pageRect.right, viewport.right);
+    const bottom = Math.min(pageRect.bottom, viewport.bottom);
+    if (right <= left || bottom <= top) return null;
+    return {
+      pageNumber: n,
+      rect: {
+        left: left - pageRect.left,
+        top: top - pageRect.top,
+        width: right - left,
+        height: bottom - top,
+      },
+    };
+  }
+
   function updateRenderDiagnostics() {
     if (!scrollRef) return;
     const views = [...(pageRenderer?.getCachedPageViews() ?? [])];
@@ -723,7 +744,14 @@ export function PdfViewer(props: {
         Number(pageIsInViewport(right)) - Number(pageIsInViewport(left))
         || pageDistanceFromViewport(left) - pageDistanceFromViewport(right)
       );
-    renderer.setVisiblePages(candidates, scrollingDown);
+    renderer.setVisibleRegions(
+      candidates.flatMap((pageNumber) => {
+        const region = visiblePageRegion(pageNumber);
+        return region ? [region] : [];
+      }),
+      scrollingDown,
+      candidates,
+    );
     for (const pageNumber of candidates) void ensurePageView(pageNumber);
     updateRenderDiagnostics();
   }
@@ -793,10 +821,20 @@ export function PdfViewer(props: {
     for (const n of visible) {
       const view = pageRenderer?.getPageView(n);
       const prev = view ? pdfPageViewScaleToTineScale(view.scale) : 0;
-      const c = pageEls[n]?.querySelector("canvas") as HTMLCanvasElement | null;
-      if (c && prev) {
-        c.style.transformOrigin = "top left";
-        c.style.transform = `scale(${s / prev})`;
+      const canvases = pageEls[n]?.querySelectorAll<HTMLCanvasElement>("canvas") ?? [];
+      for (const canvas of canvases) {
+        const tileScale = Number(canvas.dataset.pdfTileScale);
+        if (tileScale) {
+          const ratio = s / tileScale;
+          canvas.style.left = `${Number(canvas.dataset.pdfTileLeft) * ratio}px`;
+          canvas.style.top = `${Number(canvas.dataset.pdfTileTop) * ratio}px`;
+          canvas.style.width = `${Number(canvas.dataset.pdfTileWidth) * ratio}px`;
+          canvas.style.height = `${Number(canvas.dataset.pdfTileHeight) * ratio}px`;
+          canvas.style.transform = "";
+        } else if (prev) {
+          canvas.style.transformOrigin = "top left";
+          canvas.style.transform = `scale(${s / prev})`;
+        }
       }
     }
   }
@@ -1271,33 +1309,18 @@ export function PdfViewer(props: {
     setAreaMode(false);
   };
 
-  // Crop the page canvas to `rect` (unscaled coords) → PNG bytes.
-  async function cropArea(page: number, wrap: HTMLElement, rect: Rect): Promise<Uint8Array | null> {
-    const s = scale();
-    let canvas = wrap.querySelector("canvas") as HTMLCanvasElement | null;
-    // The page may have been LRU-evicted (or never rendered at this scale) — render
-    // it so we crop a crisp, current bitmap.
-    const view = pageRenderer?.getPageView(page);
-    if (!canvas || !view || Math.abs(pdfPageViewScaleToTineScale(view.scale) - s) > 0.001) {
-      await renderPage(page);
-      canvas = wrap.querySelector("canvas") as HTMLCanvasElement | null;
+  // Area capture always uses a dedicated clipped PDF.js render. At high zoom
+  // there is deliberately no single full-page canvas, and choosing whichever
+  // visible tile happens to be first would make captures partial or stale.
+  async function cropArea(page: number, _wrap: HTMLElement, rect: Rect): Promise<Uint8Array | null> {
+    const renderer = pageRenderer;
+    if (!renderer) return null;
+    const view = await ensurePageView(page);
+    if (!view) return null;
+    if (Math.abs(pdfPageViewScaleToTineScale(view.scale) - scale()) > 0.001) {
+      renderer.updateScale(page, scale());
     }
-    if (!canvas) return null;
-    // The canvas backing store is `unscaledWidth * s * dpr` px wide (see renderPage),
-    // so one unscaled unit = `s * dpr` backing pixels.
-    const dpr = canvas.width / Math.max(1, dims[page].w * s);
-    const f = s * dpr;
-    const sx = Math.max(0, Math.round(rect.left * f));
-    const sy = Math.max(0, Math.round(rect.top * f));
-    const sw = Math.min(canvas.width - sx, Math.round(rect.width * f));
-    const sh = Math.min(canvas.height - sy, Math.round(rect.height * f));
-    if (sw <= 0 || sh <= 0) return null;
-    const crop = document.createElement("canvas");
-    crop.width = sw;
-    crop.height = sh;
-    crop.getContext("2d")!.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
-    const blob: Blob | null = await new Promise((res) => crop.toBlob(res, "image/png"));
-    return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+    return renderer.captureArea(page, rect);
   }
 
   const createAreaHighlightOwned = async (color: string): Promise<boolean> => {

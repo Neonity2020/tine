@@ -9565,6 +9565,10 @@ html.row-reorder-dragging * {
   filter: invert(1);
 }
 
+.pdf-viewer[data-theme="dark"] .pdf-page-view-host > canvas[data-pdf-tile-key] {
+  filter: invert(1);
+}
+
 .pdf-viewer[data-theme="dark"] .pdf-hl {
   mix-blend-mode: screen;
 }
@@ -9975,6 +9979,16 @@ html.row-reorder-dragging * {
   contain: content;
 }
 
+.pdf-page-view-host > canvas[data-pdf-tile-key] {
+  z-index: 1;
+  display: block;
+  contain: strict;
+}
+
+.pdf-page-view-host .textLayer {
+  z-index: 2;
+}
+
 .pdf-page .textLayer {
   position: absolute;
   inset: 0;
@@ -9985,7 +9999,7 @@ html.row-reorder-dragging * {
   transform-origin: 0 0;
   text-size-adjust: none;
   forced-color-adjust: none;
-  z-index: 0;
+  z-index: 2;
 }
 
 .pdf-page .textLayer :is(span, br) {
@@ -10017,6 +10031,7 @@ html.row-reorder-dragging * {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  z-index: 3;
 }
 
 .pdf-hl {

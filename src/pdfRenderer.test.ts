@@ -45,6 +45,10 @@ async function turns(count = 3): Promise<void> {
 function fakePage(): PdfPageProxyLike & { cleanup: ReturnType<typeof vi.fn> } {
   return {
     cleanup: vi.fn(),
+    render: vi.fn(() => ({
+      promise: Promise.resolve(),
+      cancel: vi.fn(),
+    })) as unknown as NonNullable<PdfPageProxyLike["render"]>,
     getViewport: vi.fn(() => ({
       width: 612,
       height: 792,
@@ -79,7 +83,9 @@ function fakeView(options: DirectPdfPageViewOptions): DirectPdfPageView & {
     destroy: vi.fn(),
     cleanup: vi.fn(),
     setPdfPage: vi.fn(),
-    update: vi.fn(),
+    update: vi.fn(function (this: DirectPdfPageView, update: { scale?: number }) {
+      if (update.scale) this.scale = update.scale;
+    }),
   };
 }
 
@@ -242,5 +248,44 @@ describe("direct PDFPageView renderer adapter", () => {
 
   it("publishes the lazy document-loading flag used by the later session owner", () => {
     expect(TINE_PDF_LOADING_OPTIONS).toEqual({ disableAutoFetch: true });
+  });
+
+  it("keeps a bounded direct PageView fallback and overlays only visible high-zoom tiles", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const page = fakePage();
+    const optionsSeen: DirectPdfPageViewOptions[] = [];
+    const renderer = new PdfPageViewRenderer({
+      document: { getPage: vi.fn(async () => page) },
+      coordinator: new PdfRenderCoordinator(5_000_000, 1_000_000),
+      createPageView: (options) => {
+        optionsSeen.push(options);
+        const view = fakeView(options);
+        view.textLayer = { div: document.createElement("div"), render: vi.fn() };
+        return view;
+      },
+    });
+    renderer.setVisibleRegions([{
+      pageNumber: 1,
+      rect: { left: 800, top: 900, width: 200, height: 150 },
+    }], true);
+    const host = document.createElement("div");
+
+    const view = await renderer.mountPage(1, host, 4);
+    await turns(12);
+
+    // Initial full-page work is capped at the tiling threshold. The target
+    // scale is then applied using PDFPageView's CSS/text-layer path, not another full draw.
+    expect(pdfPageViewScaleToTineScale(optionsSeen[0].scale)).toBe(3);
+    expect(view?.update).toHaveBeenCalledWith({
+      scale: tineScaleToPdfPageViewScale(4),
+      drawingDelay: 120,
+    });
+    expect(view?.textLayer?.render).toHaveBeenCalled();
+    expect(page.render).toHaveBeenCalled();
+    const tileRender = vi.mocked(page.render!).mock.calls[0][0] as unknown as { transform: number[] };
+    expect(tileRender.transform[4]).toBeLessThanOrEqual(-768);
+    expect(tileRender.transform[5]).toBeLessThanOrEqual(-768);
+    expect(host.querySelector("canvas[data-pdf-tile-key]")).not.toBeNull();
+    renderer.dispose();
   });
 });
