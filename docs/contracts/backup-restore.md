@@ -14,8 +14,9 @@ For each restored file:
 1. Reserve recovery on the same filesystem as the live root. A newly created
    component gets a parent-directory barrier before use. An existing component
    that could be residue from a previously refused attempt is re-barriered once
-   per restore attempt; sibling files reuse that capability-bound proof rather
-   than flushing unchanged ancestors again.
+   per exact opened directory identity in a restore attempt. Sibling files
+   reuse that capability-bound proof, while an honest concurrent replacement
+   at the same path changes identity and forces a new parent barrier.
 2. If a live name exists, atomically move it into recovery with no replacement.
    A cross-directory rename flushes the recovery parent first and the live
    parent second, so the retained copy is durable before retirement is

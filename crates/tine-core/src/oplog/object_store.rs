@@ -351,22 +351,22 @@ struct AbsentControlName {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ControlDirectoryIdentity {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ControlDirectoryIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ControlDirectoryIdentity {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ControlDirectoryIdentity {
     volume: u64,
     file_id: [u8; 16],
 }
 
 #[cfg(not(any(unix, windows)))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ControlDirectoryIdentity;
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ControlDirectoryIdentity;
 
 impl ControlDirectoryIdentity {
     pub(crate) fn binding_digest(self) -> ContentDigest {
@@ -6603,9 +6603,7 @@ pub(crate) fn open_existing_dir_nofollow(
 }
 
 #[cfg(unix)]
-pub(crate) fn control_directory_identity(
-    dir: &Dir,
-) -> Result<ControlDirectoryIdentity, StoreError> {
+pub fn control_directory_identity(dir: &Dir) -> Result<ControlDirectoryIdentity, StoreError> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = dir.try_clone()?.into_std_file().metadata()?;
@@ -6616,9 +6614,7 @@ pub(crate) fn control_directory_identity(
 }
 
 #[cfg(windows)]
-pub(crate) fn control_directory_identity(
-    dir: &Dir,
-) -> Result<ControlDirectoryIdentity, StoreError> {
+pub fn control_directory_identity(dir: &Dir) -> Result<ControlDirectoryIdentity, StoreError> {
     use windows_sys::Win32::Storage::FileSystem::{
         FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
     };
@@ -6643,9 +6639,7 @@ pub(crate) fn control_directory_identity(
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn control_directory_identity(
-    _dir: &Dir,
-) -> Result<ControlDirectoryIdentity, StoreError> {
+pub fn control_directory_identity(_dir: &Dir) -> Result<ControlDirectoryIdentity, StoreError> {
     Err(StoreError::Io(std::io::Error::new(
         ErrorKind::Unsupported,
         "directory identity is unavailable on this platform",
