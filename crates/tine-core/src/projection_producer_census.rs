@@ -639,14 +639,22 @@ fn tine_storage_imported_call_inventory(files: &[ProductionFile]) -> Vec<(String
             "SqliteFileSet",
             "StagedExactImmutablePublication",
         ]);
-        let storage_types = imported
+        let qualified_type =
+            Regex::new(r"tine_storage::([A-Z][A-Za-z0-9_]*)").expect("static regex");
+        let mut candidate_types = imported.clone();
+        candidate_types.extend(
+            qualified_type
+                .captures_iter(&file.compact)
+                .map(|captures| captures[1].to_owned()),
+        );
+        let storage_types = candidate_types
             .iter()
             .filter(|name| write_capable_types.contains(name.as_str()))
             .collect::<Vec<_>>();
         let mut receivers = BTreeSet::new();
         for storage_type in storage_types {
             let typed = Regex::new(&format!(
-                r"([a-z_][A-Za-z0-9_]*):(?:[A-Za-z_][A-Za-z0-9_]*<)*{}(?:<[^;{{}}()]*?>)?(?:[>,])",
+                r"([a-z_][A-Za-z0-9_]*):(?:&mut|&)?(?:[A-Za-z_][A-Za-z0-9_]*<)*(?:tine_storage::)?{}(?:<[^;{{}}()]*?>)?(?:[>,])",
                 regex::escape(storage_type)
             ))
             .unwrap();
@@ -654,7 +662,7 @@ fn tine_storage_imported_call_inventory(files: &[ProductionFile]) -> Vec<(String
                 receivers.insert(captures[1].to_owned());
             }
             let constructed = Regex::new(&format!(
-                r"let(?:mut)?([a-z_][A-Za-z0-9_]*)={}::[A-Za-z_][A-Za-z0-9_]*\(",
+                r"let(?:mut)?([a-z_][A-Za-z0-9_]*)=(?:tine_storage::)?{}::[A-Za-z_][A-Za-z0-9_]*\(",
                 regex::escape(storage_type)
             ))
             .unwrap();
@@ -1561,7 +1569,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.8.10\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "ebdd2ab00a033455796ea0209f4b5d706e7e3c31c7475fd51676b0eef9260f1b",
+        "2f23010673a23d013608683e9ff6ebf4f4a624b926ec936590026dd0979db377",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
