@@ -103,15 +103,15 @@
    "contracts": [
     {
      "class": "core-operation",
-     "userOutcome": "The E2E runner can discover native-driver capabilities and retain browser-specific evidence.",
+     "userOutcome": "The E2E runner can discover native-driver capabilities, retain browser-specific evidence, bound session-level calls, and reap only the orphaned native process tree owned by the same scenario and ports.",
      "blocking": true
     }
    ],
    "acceptableVariations": [
-    "Driver feature detection may vary by supported platform and browser version."
+    "Driver feature detection, timeout duration, and cleanup signal timing may vary by supported platform and browser version while session ownership remains exact."
    ],
    "nonRequirements": [
-    "Any end-user product workflow by itself."
+    "Any end-user product workflow by itself, or cleanup of processes not carrying the exact scenario-and-ports ownership token."
    ],
    "stability": "stable"
   },
@@ -308,6 +308,22 @@
     "Exact feed row height or clock display."
    ],
    "stability": "stable"
+  },
+  "scripts/e2e-managed-journal-feed.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "After managed-storage activation, the Journals surface opens the newest bounded day window, paginates backward in newest-first order, and shows a newly accepted journal edit when the feed is reopened.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Journal title formatting, feed layout, and activation duration may vary while the same days, order, and accepted content are visible."
+   ],
+   "nonRequirements": [
+    "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, or millisecond timing."
+   ],
+   "stability": "burn-in"
   },
   "scripts/e2e-media.mjs": {
    "contracts": [

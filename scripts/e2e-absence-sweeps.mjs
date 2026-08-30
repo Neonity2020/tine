@@ -13,7 +13,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
-import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import {
+  createWebdriverLifecycle,
+  tauriCapabilities,
+  webdriverServerArgs,
+} from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -27,6 +31,11 @@ const WD = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
 const XDOTOOL = process.env.E2E_XDOTOOL || "xdotool";
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4724);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4725);
+const webdriverLifecycle = createWebdriverLifecycle({
+  scenario: "absence-sweeps",
+  driverPort: DRIVER_PORT,
+  nativePort: NATIVE_PORT,
+});
 const PAGE_COUNT = 20;
 const DELETED_COUNT = 8;
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "tine-absence-sweeps-"));
@@ -66,7 +75,7 @@ const fixturePages = Array.from({ length: PAGE_COUNT }, (_, index) => {
 });
 const deletedPages = fixturePages.slice(0, DELETED_COUNT);
 
-const env = {
+const baseEnv = {
   ...process.env,
   TINE_GRAPH: GRAPH,
   TINE_DEBUG: "1",
@@ -81,6 +90,7 @@ const env = {
   LIBGL_ALWAYS_SOFTWARE: "1",
   GDK_BACKEND: "x11",
 };
+const env = webdriverLifecycle.taggedEnvironment(baseEnv);
 const xdoEnv = process.env.E2E_XDOTOOL_LIB
   ? { ...env, LD_LIBRARY_PATH: process.env.E2E_XDOTOOL_LIB }
   : env;
@@ -136,6 +146,7 @@ const receipt = {
     marker,
     content,
   })),
+  webdriverLifecycle: webdriverLifecycle.evidence,
   milestones: {},
 };
 
@@ -217,7 +228,10 @@ async function bodyText() {
 // screenshot must not fail the journey.
 async function saveEvidenceScreenshot(name) {
   try {
-    await browser.saveScreenshot(path.join(ARTIFACTS, name));
+    await webdriverLifecycle.run(
+      `screenshot:${name}`,
+      () => browser.saveScreenshot(path.join(ARTIFACTS, name)),
+    );
   } catch (error) {
     (receipt.screenshotFailures ??= []).push({ name, error: String(error).slice(0, 200) });
     writeReceipt();
@@ -421,6 +435,7 @@ async function enableManagedStorage() {
 }
 
 async function connect(label) {
+  await webdriverLifecycle.reap(`${label}:pre-connect`, { graceMs: 0 });
   driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
   driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
     env,
@@ -428,15 +443,14 @@ async function connect(label) {
     detached: true,
   });
   await waitFor(() => tcpListening(DRIVER_PORT), 30_000, `${label}: tauri-driver did not listen`);
-  browser = await remote({
+  browser = await webdriverLifecycle.run(`${label}:create-session`, () => remote({
     hostname: "127.0.0.1",
     port: DRIVER_PORT,
     path: "/",
     logLevel: "error",
-    connectionRetryCount: 0,
-    connectionRetryTimeout: 60_000,
+    ...webdriverLifecycle.remoteOptions(),
     capabilities: tauriCapabilities(APP, "absence-sweeps"),
-  });
+  }));
   await browser.waitUntil(async () => {
     const text = await bodyText();
     const startupVisible = await browser.$(".startup-recovery-overlay").isExisting();
@@ -453,18 +467,11 @@ async function connect(label) {
 }
 
 async function stopDriver() {
-  try {
-    await browser?.deleteSession();
-  } catch {}
+  const currentBrowser = browser;
+  const currentDriver = driver;
   browser = undefined;
-  const pid = driver?.pid;
-  if (pid) {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {}
-    await waitFor(() => driver.exitCode !== null || !processAlive(pid), 30_000, "tauri-driver did not stop");
-  }
   driver = undefined;
+  await webdriverLifecycle.stop({ browser: currentBrowser, driver: currentDriver, label: "stop-driver" });
   try {
     if (driverLog !== undefined) fs.closeSync(driverLog);
   } catch {}
@@ -475,12 +482,12 @@ async function cleanQuit(label) {
   const pid = appPid;
   if (!pid) return;
   try {
-    await browser.executeAsync((done) => {
+    await webdriverLifecycle.run(`${label}:tine-quit`, () => browser.executeAsync((done) => {
       globalThis.__TAURI_INTERNALS__.invoke("tine_quit").then(
         () => done({ ok: true }),
         (error) => done({ error: String(error) }),
       );
-    });
+    }));
   } catch {
     // A successful quit destroys the WebView before WebDriver returns.
   }
@@ -525,7 +532,7 @@ try {
   setPhase("window-manager");
   wmLog = fs.openSync(path.join(ARTIFACTS, "openbox.log"), "w");
   wm = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
-    env,
+    env: baseEnv,
     stdio: ["ignore", wmLog, wmLog],
     detached: true,
   });
@@ -654,12 +661,12 @@ try {
   } catch {}
   try {
     const screenshot = path.join(ARTIFACTS, "failure.png");
-    await browser?.saveScreenshot(screenshot);
+    await webdriverLifecycle.run("failure:screenshot", () => browser?.saveScreenshot(screenshot));
     evidence.push(screenshot);
   } catch {}
   try {
     const dom = path.join(ARTIFACTS, "failure-dom.html");
-    fs.writeFileSync(dom, await browser?.getPageSource());
+    fs.writeFileSync(dom, await webdriverLifecycle.run("failure:page-source", () => browser?.getPageSource()));
     evidence.push(dom);
   } catch {}
   try {

@@ -107,6 +107,9 @@ const suites = {
       E2E_SCENARIO_TIMEOUT_MS: "240000",
     }],
   ],
+  "managed-journal-feed": [
+    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
+  ],
   // Release-only local proof on a copied private corpus. This suite is kept
   // separate from hosted coverage so neither the source graph nor a derivative
   // can enter GitHub Actions artifacts.

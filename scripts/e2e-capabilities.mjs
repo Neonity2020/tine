@@ -183,6 +183,133 @@ export function webdriverServerArgs(port, nativePort, nativeDriver, platform = p
   ];
 }
 
+const WEBDRIVER_SESSION_ENV = "TINE_E2E_WEBDRIVER_SESSION";
+
+export function webdriverSessionToken(scenario, driverPort, nativePort) {
+  const label = String(scenario).replaceAll(/[^A-Za-z0-9_.-]/g, "-");
+  return `tine-e2e:${label}:${driverPort}:${nativePort}`;
+}
+
+export function findTaggedWebdriverProcesses(
+  token,
+  procRoot = "/proc",
+  readFile = fs.readFileSync,
+) {
+  if (!fs.existsSync(procRoot)) return [];
+  const needle = `${WEBDRIVER_SESSION_ENV}=${token}`;
+  const matches = [];
+  for (const entry of fs.readdirSync(procRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    if (pid === process.pid) continue;
+    try {
+      const variables = readFile(path.join(procRoot, entry.name, "environ"), "utf8").split("\0");
+      if (variables.includes(needle)) matches.push(pid);
+    } catch {
+      // Processes may exit or become unreadable while /proc is enumerated.
+    }
+  }
+  return matches.sort((a, b) => a - b);
+}
+
+/**
+ * Own one native WebDriver session across crashes and stalled HTTP calls.
+ *
+ * WebdriverIO already gives each protocol request `connectionRetryTimeout`.
+ * `run()` is the second, process-owning deadline around session-level calls:
+ * if WebKit ignores the request abort, its tagged process tree is killed and
+ * cannot consume one of WebKitWebDriver's finite session slots indefinitely.
+ */
+export function createWebdriverLifecycle({
+  scenario,
+  driverPort,
+  nativePort,
+  callTimeoutMs = 60_000,
+  cleanupGraceMs = 1_000,
+  platform = process.platform,
+  procRoot = "/proc",
+  kill = process.kill.bind(process),
+  sleepImpl = sleep,
+} = {}) {
+  const token = webdriverSessionToken(scenario, driverPort, nativePort);
+  const evidence = { token, reaped: [], timeouts: [] };
+
+  const taggedEnvironment = (base = process.env) => ({
+    ...base,
+    [WEBDRIVER_SESSION_ENV]: token,
+  });
+
+  const taggedPids = () => platform === "linux"
+    ? findTaggedWebdriverProcesses(token, procRoot)
+    : [];
+
+  const signal = (pid, name) => {
+    try {
+      kill(pid, name);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  async function reap(reason, { graceMs = cleanupGraceMs } = {}) {
+    const initial = taggedPids();
+    for (const pid of initial) signal(pid, "SIGTERM");
+    if (initial.length && graceMs > 0) await sleepImpl(graceMs);
+    const survivors = taggedPids();
+    for (const pid of survivors) signal(pid, "SIGKILL");
+    const record = { reason, term: initial, kill: survivors };
+    if (initial.length || survivors.length) evidence.reaped.push(record);
+    return record;
+  }
+
+  async function run(label, operation, timeoutMs = callTimeoutMs) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(async () => {
+        evidence.timeouts.push({ label, timeoutMs });
+        await reap(`timeout:${label}`, { graceMs: 0 });
+        reject(new Error(`WebDriver call ${JSON.stringify(label)} exceeded ${timeoutMs} ms; its owned session was reaped`));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([Promise.resolve().then(operation), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function remoteOptions() {
+    return {
+      connectionRetryCount: 0,
+      connectionRetryTimeout: callTimeoutMs,
+    };
+  }
+
+  async function stop({ browser, driver, label = "cleanup" } = {}) {
+    if (browser) {
+      try { await run(`${label}:delete-session`, () => browser.deleteSession(), 10_000); } catch {}
+    }
+    if (driver?.pid) {
+      try { kill(-driver.pid, "SIGTERM"); } catch {}
+      if (cleanupGraceMs > 0) await sleepImpl(cleanupGraceMs);
+      try { kill(-driver.pid, "SIGKILL"); } catch {}
+    }
+    return reap(label, { graceMs: 0 });
+  }
+
+  return {
+    token,
+    evidence,
+    taggedEnvironment,
+    taggedPids,
+    remoteOptions,
+    reap,
+    run,
+    stop,
+  };
+}
+
 export async function selectWebdriverWindowWithSelector(browser, selector, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   const observations = [];

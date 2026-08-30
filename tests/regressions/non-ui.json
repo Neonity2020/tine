@@ -5201,7 +5201,8 @@
      "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_open_is_not_graph_sized_and_refreshes_after_an_accepted_change",
      "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_page_matches_the_inventory_walk_across_pagination",
      "crates/tine-core/src/sync_runtime.rs::tests::inventory_walk_feed_is_graph_sized_per_request",
-     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_matches_the_inventory_walk_on_a_real_graph_copy"
+     "crates/tine-core/src/sync_runtime.rs::tests::journal_feed_matches_the_inventory_walk_on_a_real_graph_copy",
+     "scripts/e2e-managed-journal-feed.mjs"
     ],
     "scenario": "managed-storage.journal-feed-open-shares-one-inventory-scan",
     "failBefore": "proven at 34e247ac: journal_feed_page assembled the feed in the shell from the complete application_page_inventory, so every open and every scroll step walked every page in the graph. On the 1,045-file anonymized corpus that walk was 5.19 ms p50 of a 6.22 ms feed open (release, this box), and the frontend requests three days at a time. inventory_walk_feed_is_graph_sized_per_request pins that retired shape; disabling the retained index makes the budget assertion fail (2 scans observed, 1 required)."

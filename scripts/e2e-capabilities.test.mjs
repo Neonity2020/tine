@@ -3,11 +3,16 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  createWebdriverLifecycle,
+  findTaggedWebdriverProcesses,
   parseFrameExtentsOutput,
   tauriCapabilities,
   waitForHttpServer,
+  webdriverSessionToken,
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
+import fs from "node:fs";
+import os from "node:os";
 
 // DUP-12 (2026-08-25 duplication audit): these cases pin the domains where the
 // previously per-suite harness spellings disagreed — capability objects,
@@ -118,4 +123,45 @@ test("waitForHttpServer: retries through failures and reports the attempt budget
     /did not start at http:\/\/127\.0\.0\.1:9\/ after 2 attempts/,
   );
   assert.equal(calls, 2);
+});
+
+test("webdriver lifecycle finds only the exact tagged process tree", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tine-e2e-proc-"));
+  const token = webdriverSessionToken("managed feed", 4724, 4725);
+  for (const [pid, environment] of [
+    ["101", `A=1\0TINE_E2E_WEBDRIVER_SESSION=${token}\0`],
+    ["102", `TINE_E2E_WEBDRIVER_SESSION=${token}-other\0`],
+    ["103", "A=1\0"],
+  ]) {
+    fs.mkdirSync(path.join(root, pid));
+    fs.writeFileSync(path.join(root, pid, "environ"), environment);
+  }
+  assert.deepEqual(findTaggedWebdriverProcesses(token, root), [101]);
+});
+
+test("webdriver lifecycle deadline reaps its tagged session and records why", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tine-e2e-proc-"));
+  const token = webdriverSessionToken("deadline", 4824, 4825);
+  fs.mkdirSync(path.join(root, "201"));
+  fs.writeFileSync(
+    path.join(root, "201", "environ"),
+    `TINE_E2E_WEBDRIVER_SESSION=${token}\0`,
+  );
+  const signals = [];
+  const lifecycle = createWebdriverLifecycle({
+    scenario: "deadline",
+    driverPort: 4824,
+    nativePort: 4825,
+    callTimeoutMs: 5,
+    cleanupGraceMs: 0,
+    platform: "linux",
+    procRoot: root,
+    kill: (pid, signal) => signals.push([pid, signal]),
+  });
+  await assert.rejects(
+    lifecycle.run("stalled screenshot", () => new Promise(() => {})),
+    /stalled screenshot.*exceeded 5 ms.*reaped/,
+  );
+  assert.deepEqual(signals, [[201, "SIGTERM"], [201, "SIGKILL"]]);
+  assert.deepEqual(lifecycle.evidence.timeouts, [{ label: "stalled screenshot", timeoutMs: 5 }]);
 });

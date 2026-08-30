@@ -12,7 +12,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { waitForFileText as waitForPersistedFileText } from "./e2e-file-poll.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
-import { frameExtents as sharedFrameExtents, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import {
+  createWebdriverLifecycle,
+  frameExtents as sharedFrameExtents,
+  tauriCapabilities,
+  webdriverServerArgs,
+} from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
@@ -26,6 +31,11 @@ const WD = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
 const XDOTOOL = process.env.E2E_XDOTOOL || "xdotool";
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4624);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4625);
+const webdriverLifecycle = createWebdriverLifecycle({
+  scenario: "sparse-v2-recovery",
+  driverPort: DRIVER_PORT,
+  nativePort: NATIVE_PORT,
+});
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "tine-sparse-v2-recovery-"));
 const GRAPH = path.join(TMP, "graph");
 const XDG = path.join(TMP, "xdg");
@@ -66,7 +76,7 @@ const APP_DATA = path.join(XDG, "data", "page.tine.Tine");
 fs.mkdirSync(APP_DATA, { recursive: true });
 fs.writeFileSync(path.join(APP_DATA, "tine-settings.json"), '{"native_window_frame":true}\n');
 
-const env = {
+const baseEnv = {
   ...process.env,
   TINE_GRAPH: GRAPH,
   XDG_DATA_HOME: path.join(XDG, "data"),
@@ -79,6 +89,7 @@ const env = {
   LIBGL_ALWAYS_SOFTWARE: "1",
   GDK_BACKEND: "x11",
 };
+const env = webdriverLifecycle.taggedEnvironment(baseEnv);
 const xdoEnv = process.env.E2E_XDOTOOL_LIB
   ? { ...env, LD_LIBRARY_PATH: process.env.E2E_XDOTOOL_LIB }
   : env;
@@ -261,7 +272,7 @@ async function focusCurrentEditor() {
 }
 
 async function raceExistingDraftWithManagedWinner(path, retained, winner) {
-  const result = await browser.executeAsync((managedPath, retainedText, winnerText, done) => {
+  const result = await webdriverLifecycle.run("existing-page managed race", () => browser.executeAsync((managedPath, retainedText, winnerText, done) => {
     const editor = document.querySelector(".page-blocks textarea.block-editor, textarea.block-editor");
     if (!(editor instanceof HTMLTextAreaElement)) {
       done({ error: "existing-page editor was not mounted" });
@@ -289,7 +300,7 @@ async function raceExistingDraftWithManagedWinner(path, retained, winner) {
       (revision) => done({ revision }),
       (error) => done({ error: String(error) }),
     );
-  }, path, retained, winner);
+  }, path, retained, winner));
   if (result?.error || typeof result?.revision !== "string") {
     throw new Error(`existing managed race setup failed: ${JSON.stringify(result)}`);
   }
@@ -297,7 +308,7 @@ async function raceExistingDraftWithManagedWinner(path, retained, winner) {
 }
 
 async function raceNewDraftWithManagedCreator(name, retained, winner) {
-  const result = await browser.executeAsync((pageName, retainedText, winnerText, done) => {
+  const result = await webdriverLifecycle.run("new-page managed race", () => browser.executeAsync((pageName, retainedText, winnerText, done) => {
     const editor = document.querySelector(".page-blocks textarea.block-editor, textarea.block-editor");
     if (!(editor instanceof HTMLTextAreaElement)) {
       done({ error: "new-page editor was not mounted" });
@@ -331,7 +342,7 @@ async function raceNewDraftWithManagedCreator(name, retained, winner) {
       (revision) => done({ revision }),
       (error) => done({ error: String(error) }),
     );
-  }, name, retained, winner);
+  }, name, retained, winner));
   if (result?.error || typeof result?.revision !== "string") {
     throw new Error(`new-page managed race setup failed: ${JSON.stringify(result)}`);
   }
@@ -354,7 +365,7 @@ async function assertRetainedConflictDraft(text, label) {
 }
 
 async function saveManagedWinnerAndClickVisibleKeepMine(path, winner) {
-  const result = await browser.executeAsync((managedPath, winnerText, done) => {
+  const result = await webdriverLifecycle.run("newer-winner Keep mine race", () => browser.executeAsync((managedPath, winnerText, done) => {
     const invoke = globalThis.__TAURI_INTERNALS__.invoke.bind(globalThis.__TAURI_INTERNALS__);
     invoke("get_page_by_path", { path: managedPath }).then((page) => {
       if (!page?.rev || !page.blocks?.[0]) throw new Error("newer winner could not load exact page");
@@ -378,7 +389,7 @@ async function saveManagedWinnerAndClickVisibleKeepMine(path, winner) {
       (revision) => done({ revision }),
       (error) => done({ error: String(error) }),
     );
-  }, path, winner);
+  }, path, winner));
   if (result?.error || typeof result?.revision !== "string") {
     throw new Error(`newer-winner click race failed: ${JSON.stringify(result)}`);
   }
@@ -505,17 +516,16 @@ const receipt = {
   },
   nativeConfirmations: [],
   nativeCloses: [],
+  webdriverLifecycle: webdriverLifecycle.evidence,
   milestones: {},
 };
 
 async function stopDriver() {
   const current = driver;
+  const currentBrowser = browser;
   driver = undefined;
-  try { if (current?.pid) process.kill(-current.pid, "SIGKILL"); } catch {}
-  if (current?.pid) {
-    await waitFor(() => current.exitCode !== null || !processAlive(current.pid), 8_000,
-      "tauri-driver process group did not stop during cleanup");
-  }
+  browser = undefined;
+  await webdriverLifecycle.stop({ browser: currentBrowser, driver: current, label: "stop-driver" });
   try { if (driverLog !== undefined) fs.closeSync(driverLog); } catch {}
   driverLog = undefined;
 }
@@ -542,6 +552,7 @@ async function stopWindowManager() {
 }
 
 async function connect(label) {
+  await webdriverLifecycle.reap(`${label}:pre-connect`, { graceMs: 0 });
   driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
   driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, WD), {
     env,
@@ -549,15 +560,14 @@ async function connect(label) {
     detached: true,
   });
   await sleep(2500);
-  browser = await remote({
+  browser = await webdriverLifecycle.run(`${label}:create-session`, () => remote({
     hostname: "127.0.0.1",
     port: DRIVER_PORT,
     path: "/",
     logLevel: "error",
-    connectionRetryCount: 1,
-    connectionRetryTimeout: 60_000,
+    ...webdriverLifecycle.remoteOptions(),
     capabilities: tauriCapabilities(APP, "sparse-v2-recovery"),
-  });
+  }));
   await browser.$(".ls-block, .page-title, .journal-day").waitForExist({ timeout: 30_000 });
   const id = await waitFor(() => windowIds()[0], 12_000, `${label}: Tine native window did not appear`);
   const pid = Number(xdo("getwindowpid", id));
@@ -577,7 +587,7 @@ try {
   phase = "start window manager";
   wmLog = fs.openSync(path.join(ARTIFACTS, "openbox.log"), "w");
   wm = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
-    env,
+    env: baseEnv,
     stdio: ["ignore", wmLog, wmLog],
     detached: true,
   });
@@ -671,8 +681,6 @@ try {
 
   phase = "restart sparse v2 authority";
   await closeThroughTineControl("sparse-v2-restart");
-  try { await browser.deleteSession(); } catch {}
-  browser = undefined;
   await stopDriver();
   await connect("sparse-v2-restart");
   await openPageFromInventory(NESTED_PAGE);
@@ -691,8 +699,6 @@ try {
   await openPageFromInventory(NEW_PAGE);
   await editCurrentPage(STANDARD_EDIT, NEW_FILE, "new page after standard Markdown rollback");
   await closeThroughTineControl("standard-markdown-restart");
-  try { await browser.deleteSession(); } catch {}
-  browser = undefined;
   await stopDriver();
   await connect("standard-markdown-restart");
   await openPageFromInventory(NORMAL_PAGE);
@@ -716,14 +722,17 @@ try {
 
   phase = "final native close";
   await closeThroughTineControl("final-cleanup");
-  try { await browser.deleteSession(); } catch {}
-  browser = undefined;
   await stopDriver();
   receipt.result = "pass";
   fs.writeFileSync(path.join(ARTIFACTS, "sparse-v2-recovery-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
   console.log(`PASS: sparse-v2 activation, edit, native restart, rollback, and standard-Markdown continuity held: ${JSON.stringify(receipt.milestones)}`);
 } catch (error) {
-  try { await browser?.saveScreenshot(path.join(ARTIFACTS, "failure.png")); } catch {}
+  try {
+    await webdriverLifecycle.run(
+      "failure:screenshot",
+      () => browser?.saveScreenshot(path.join(ARTIFACTS, "failure.png")),
+    );
+  } catch {}
   captureRoot("native-failure.png");
   const failure = {
     testedCommit: receipt.testedCommit,
@@ -738,7 +747,6 @@ try {
   console.error(`E2E FAILURE CAPSULE ${JSON.stringify(failure)}`);
   process.exitCode = 1;
 } finally {
-  try { await browser?.deleteSession(); } catch {}
   try { await stopApp(); } catch {}
   try { await stopDriver(); } catch {}
   try { await stopWindowManager(); } catch {}
