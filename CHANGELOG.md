@@ -24,6 +24,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A remote `http:`/`https:` link whose URL ends in `.pdf` now opens in the
+  browser like every other external link, instead of being captured by Tine's
+  PDF viewer.** Only graph/local asset PDF references and their highlight
+  pages enter the viewer; an image-syntax remote PDF renders as an ordinary
+  external link as well rather than a broken image frame. (GH #442)
+
 - **Bounded managed block-referrer panels now show the same document-order
   prefix and exact result count as Direct Files.** The SQLite-backed route
   finishes generation-bound candidate discovery before applying the shared row
