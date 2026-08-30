@@ -322,11 +322,29 @@ try {
     }
     return undefined;
   }, 30_000, "today's managed journal block was absent after pagination");
-  const content = await todayBlock.$(".block-content-wrapper, .block-content");
+  const content = await todayBlock.$(":scope > .block-main > .block-content-wrapper");
   await content.click();
-  const editor = await browser.$(".journal-today textarea.block-editor, textarea.block-editor");
-  await editor.waitForDisplayed({ timeout: 30_000 });
-  await editor.setValue(`${markers[0]} ${EDIT_MARKER}`);
+  await browser.waitUntil(() => browser.execute(() => {
+    const editor = document.querySelector(".journal-today textarea.block-editor");
+    return editor instanceof HTMLTextAreaElement && document.activeElement === editor;
+  }), {
+    timeout: 30_000,
+    interval: 100,
+    timeoutMsg: "clicking today's managed journal block did not mount its active editor",
+  });
+  const edited = await browser.execute((value) => {
+    const editor = document.querySelector(".journal-today textarea.block-editor");
+    if (!(editor instanceof HTMLTextAreaElement)) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(editor, value);
+    editor.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: value,
+    }));
+    return editor.value === value;
+  }, `${markers[0]} ${EDIT_MARKER}`);
+  if (!edited) throw new Error("today's active editor rejected the managed feed edit input");
   await (await browser.$(".journal-today .journal-title")).click();
   const todayFile = path.join(GRAPH, "journals", `${stem(days[0])}.md`);
   await waitFor(
