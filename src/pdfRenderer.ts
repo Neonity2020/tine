@@ -162,7 +162,7 @@ export class PdfPageViewRenderer {
         return;
       }
       const record = this.pages.get(view.id);
-      if (record && record.displayScale >= PDF_TILE_SCALE_THRESHOLD) {
+      if (record && record.displayScale > PDF_TILE_SCALE_THRESHOLD) {
         this.activateTiles(view.id, record);
       } else {
         this.resolveRenderWaiters(view.id);
@@ -251,7 +251,7 @@ export class PdfPageViewRenderer {
     const pageViewScale = tineScaleToPdfPageViewScale(displayScale);
     const wasTiled = record.tileScale !== null;
     record.displayScale = displayScale;
-    if (displayScale >= PDF_TILE_SCALE_THRESHOLD) {
+    if (displayScale > PDF_TILE_SCALE_THRESHOLD) {
       if (record.view?.renderingState === 3 || wasTiled) this.activateTiles(pageNumber, record);
     } else {
       this.tileRenderer.clearPage(pageNumber);
@@ -284,7 +284,7 @@ export class PdfPageViewRenderer {
       const region = next.find((candidate) => candidate.pageNumber === pageNumber);
       record.visibleRect = region?.rect ?? null;
       if (!visible.has(pageNumber)) this.tileRenderer.clearPage(pageNumber);
-      else if (record.displayScale >= PDF_TILE_SCALE_THRESHOLD && record.tileScale !== null) {
+      else if (record.displayScale > PDF_TILE_SCALE_THRESHOLD && record.tileScale !== null) {
         this.requestTiles(pageNumber, record);
       }
     }
@@ -299,7 +299,7 @@ export class PdfPageViewRenderer {
     if (record.tileScale === record.displayScale && record.visibleRect) {
       this.requestTiles(pageNumber, record);
       if (this.tileRenderer.isPageReady(pageNumber)) return Promise.resolve();
-    } else if (view.renderingState === 3 && view.canvas && record.displayScale < PDF_TILE_SCALE_THRESHOLD) {
+    } else if (view.renderingState === 3 && view.canvas && record.displayScale <= PDF_TILE_SCALE_THRESHOLD) {
       return Promise.resolve();
     }
     const promise = new Promise<void>((resolve, reject) => {
@@ -339,7 +339,7 @@ export class PdfPageViewRenderer {
     for (const [pageNumber, record] of this.pages) {
       if (!record.view) continue;
       if (
-        record.displayScale >= PDF_TILE_SCALE_THRESHOLD
+        record.displayScale > PDF_TILE_SCALE_THRESHOLD
         && record.view.renderingState === 0
         && !record.view.canvas
       ) {
