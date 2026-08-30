@@ -526,43 +526,66 @@ fn ordinary_clean_save_and_move_never_reconstruct_the_accepted_frontier() {
 
 #[test]
 fn concurrent_same_page_fallback_never_publishes_the_stale_local_draft_as_current() {
-    let pages = || {
-        vec![PageSpec {
-            path: "pages/concurrent.md".into(),
-            blocks: vec![
-                BlockSpec::root("local base", "a"),
-                BlockSpec::root("remote base", "b"),
-            ],
-            name: Some("Concurrent".into()),
-            preamble: None,
-        }]
-    };
-    let mut fixture = AuthorityFixture::new("concurrent-local-author", pages());
-    let remote_fixture = AuthorityFixture::new("concurrent-remote-author", pages());
-    let page = &fixture.pages[0];
+    let mut fixture = AuthorityFixture::new(
+        "concurrent-cross-home-author",
+        vec![
+            PageSpec {
+                path: "pages/concurrent.md".into(),
+                blocks: vec![BlockSpec::root("local base", "a")],
+                name: Some("Concurrent".into()),
+                preamble: None,
+            },
+            PageSpec {
+                path: "pages/support.md".into(),
+                blocks: vec![BlockSpec::root("remote base", "a")],
+                name: Some("Support".into()),
+                preamble: None,
+            },
+        ],
+    );
+    let local_page_id = fixture.pages[0].page_id;
+    let local_home = fixture.pages[0].home_document_id;
+    let local_block = fixture.pages[0].block_ids[0];
+    let remote_page_id = fixture.pages[1].page_id;
+    let remote_home = fixture.pages[1].home_document_id;
+    let remote_block = fixture.pages[1].block_ids[0];
+    let move_remote_home_into_local_page =
+        OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+            root: BlockLocation {
+                block_id: remote_block,
+                home_document_id: remote_home,
+            },
+            from_page_id: remote_page_id,
+            to_page_id: local_page_id,
+            parent: None,
+            order: "b".into(),
+        }])
+        .unwrap();
+    fixture.execute_transaction(&move_remote_home_into_local_page);
+
     let local_transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
-            block_id: page.block_ids[0],
-            home_document_id: page.home_document_id,
+            block_id: local_block,
+            home_document_id: local_home,
         },
         content: "local winner".into(),
     }])
     .unwrap();
     let remote_transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
-            block_id: page.block_ids[1],
-            home_document_id: page.home_document_id,
+            block_id: remote_block,
+            home_document_id: remote_home,
         },
         content: "remote winner".into(),
     }])
     .unwrap();
 
-    // Finalize the local author first so its retained page outcome predates
-    // the independently authored, same-page remote acceptance.
+    // Both batches are authored against the same accepted base. Finalize the
+    // remote author first, then the local author, so the local retained page
+    // remains pending while the remote support document is accepted first.
+    let remote = fixture.prepare_transaction(&remote_transaction, 0x1451, 0x1451);
     let local = fixture.prepare_transaction(&local_transaction, 0x1450, 0x1450);
     let local_batch = local.manifest().batch_id();
-    let remote = remote_fixture.prepare_transaction(&remote_transaction, 0x1451, 0x1451);
-    let page_id = page.page_id;
 
     let mut session = fixture
         .engine
@@ -584,19 +607,19 @@ fn concurrent_same_page_fallback_never_publishes_the_stale_local_draft_as_curren
     let immutable = engine
         .accepted_root_materializer(&root)
         .unwrap()
-        .materialize_page(page_id)
+        .materialize_page(local_page_id)
         .unwrap()
         .unwrap();
     let selected = match engine.accepted_author_projection_outcome(
         local_batch,
         root.state_digest(),
-        page_id,
+        local_page_id,
     ) {
         Some(page) => page,
         None => engine
             .accepted_root_materializer(&root)
             .unwrap()
-            .materialize_page(page_id)
+            .materialize_page(local_page_id)
             .unwrap(),
     }
     .unwrap();

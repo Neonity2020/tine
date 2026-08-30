@@ -13820,32 +13820,53 @@ impl ShardedHotEngine {
             .borrow_mut()
             .take()
             .expect("matching pending author documents exist");
-        // The retained page outcomes are safe only when every prospective
-        // document is the exact causal document now named by the accepted
-        // root. A same-page concurrent acceptance adds causal counters even
-        // when this batch itself still becomes the direct head, so it cannot
-        // accidentally bind the stale author draft to the merged root.
-        let projection_matches_accepted =
-            pending.documents.iter().all(|(document_id, document)| {
-                let Ok(Some(dependencies)) =
-                    self.accepted_frontier_document(&self.accepted_frontier_root, *document_id)
-                else {
-                    return false;
-                };
-                canonical_peer_counters(&document.oplog_vv()).is_ok_and(|counters| {
-                    counters == dependencies.peer_counters()
-                        && dependencies
-                            .direct_dependency_heads()
-                            .binary_search(&batch_id)
-                            .is_ok()
+        // A rendered page can borrow blocks from several immutable home
+        // documents. Admit each retained outcome only when its complete
+        // projection frontier (catalog, membership shard, and every borrowed
+        // home) still names the exact causal documents in the accepted root.
+        // A concurrent edit to any support document therefore becomes a cache
+        // miss even when this batch's own changed document is still exact.
+        // Absent outcomes carry no projection frontier, so deletion continues
+        // through immutable accepted-root materialization.
+        let outcomes = if matches!(disposition, BatchDisposition::Accepted { .. }) {
+            pending
+                .projection_outcomes
+                .into_iter()
+                .filter_map(|(page_id, outcome)| {
+                    let state = outcome?;
+                    let frontier = state.frontier.documents();
+                    let contains_required_documents =
+                        [self.catalog_document_id, state.page.home_document_id]
+                            .into_iter()
+                            .all(|required| {
+                                frontier
+                                    .binary_search_by_key(&required, |document| {
+                                        document.document_id()
+                                    })
+                                    .is_ok()
+                            });
+                    let exact = contains_required_documents
+                        && frontier.iter().all(|expected| {
+                            matches!(
+                                self.accepted_frontier_document(
+                                    &self.accepted_frontier_root,
+                                    expected.document_id(),
+                                ),
+                                Ok(Some(actual)) if actual == *expected
+                            )
+                        });
+                    exact.then_some((page_id, Some(state)))
                 })
-            });
-        if matches!(disposition, BatchDisposition::Accepted { .. }) && projection_matches_accepted {
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        if !outcomes.is_empty() {
             *self.accepted_author_projection_pages.borrow_mut() =
                 Some(AcceptedAuthorProjectionPages {
                     batch_id,
                     post_frontier_state_digest: self.accepted_frontier_root.state_digest(),
-                    outcomes: pending.projection_outcomes,
+                    outcomes,
                 });
         }
     }
