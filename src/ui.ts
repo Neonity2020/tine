@@ -2019,5 +2019,6 @@ export interface PdfTarget {
   label: string;
   owner: PdfOwnership;
   page?: number;
+  scale?: number;
   highlightId?: string;
 }

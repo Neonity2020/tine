@@ -196,6 +196,7 @@ export function KeyedPdfViewer(props: {
   focused?: () => boolean;
   onClose?: () => void;
   onOpenNotes?: (block?: string) => void;
+  onViewState?: (state: { page: number; scale: number }) => void;
 }): JSX.Element {
   const resolvedTarget = (): PdfTarget | null => {
     const legacy = props.target?.();
@@ -209,6 +210,7 @@ export function KeyedPdfViewer(props: {
       label: route.label,
       owner,
       page: intent?.page ?? route.page,
+      ...(route.scale !== undefined ? { scale: route.scale } : {}),
       ...(intent?.highlightId ? { highlightId: intent.highlightId } : {}),
     };
   };
@@ -227,10 +229,12 @@ export function KeyedPdfViewer(props: {
             label={resolvedTarget()?.label ?? target.filename}
             owner={target.owner}
             page={resolvedTarget()?.page}
+            scale={resolvedTarget()?.scale}
             navigation={resolvedTarget}
             focused={props.focused}
             onClose={props.onClose}
             onOpenNotes={props.onOpenNotes}
+            onViewState={props.onViewState}
           />
         );
       }}
@@ -243,10 +247,12 @@ export function PdfViewer(props: {
   label: string;
   owner: PdfOwnership;
   page?: number;
+  scale?: number;
   navigation?: () => PdfTarget | null;
   focused?: () => boolean;
   onClose?: () => void;
   onOpenNotes?: (block?: string) => void;
+  onViewState?: (state: { page: number; scale: number }) => void;
 }): JSX.Element {
   const owner = props.owner;
   const instanceStem = `pdf-viewer-${createUniqueId()}`;
@@ -537,6 +543,7 @@ export function PdfViewer(props: {
     if (!isPdfOwnershipCurrent(owner)) return;
     if (!viewStateReady || !Number.isFinite(nextScale) || nextScale <= 0) return;
     if (viewStateBaseline?.page === page && viewStateBaseline?.scale === nextScale) return;
+    props.onViewState?.({ page, scale: nextScale });
     pendingViewState = { page, scale: nextScale };
     if (viewStateTimer !== undefined) clearTimeout(viewStateTimer);
     viewStateTimer = window.setTimeout(() => {
@@ -585,7 +592,7 @@ export function PdfViewer(props: {
     pageRenderer = new PdfPageViewRenderer({
       document: pdfDoc,
       coordinator: PDF_RENDER_COORDINATOR,
-      priority: () => activePane() === "pdf" ? 0 : 10,
+      priority: () => (props.focused?.() ?? !!viewerRootEl?.contains(document.activeElement)) ? 0 : 10,
       onPageRendered: (pageNumber) => {
         repaintPage(pageNumber);
         updateRenderDiagnostics();
@@ -936,7 +943,7 @@ export function PdfViewer(props: {
     dimsKnown.clear();
     dimsKnown.add(1);
     for (let n = 2; n <= doc.numPages; n++) dims[n] = { w: vp1.width, h: vp1.height };
-    setScale(restoredScale != null ? clampScale(restoredScale) : fitWidthScale());
+    setScale(props.scale != null ? clampScale(props.scale) : restoredScale != null ? clampScale(restoredScale) : fitWidthScale());
     setNumPages(doc.numPages);
     buildLayout();
     const navigation = currentNavigation();
@@ -945,6 +952,7 @@ export function PdfViewer(props: {
     if (disposed) return;
     viewStateBaseline = { page: curPage(), scale: scale() };
     viewStateReady = true;
+    props.onViewState?.(viewStateBaseline);
     setReady(true);
   });
 

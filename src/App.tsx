@@ -673,6 +673,7 @@ function PaneRouteBody(props: {
                   const current = props.router.route();
                   if (current.kind === "pdf") openPdfNotes(props.paneId, hlsPageName(current.filename), block);
                 }}
+                onViewState={(state) => props.router.updateActivePdfViewState(state)}
               />
             </Suspense>
           </div>

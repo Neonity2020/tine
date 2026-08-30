@@ -35,7 +35,9 @@ function PdfViewer(props: {
   label: string;
   owner?: PdfOwnership;
   page?: number;
+  scale?: number;
   navigation?: () => any;
+  onViewState?: (state: { page: number; scale: number }) => void;
 }) {
   return <OwnedPdfViewer {...props} owner={props.owner ?? testPdfOwner()} />;
 }
@@ -722,6 +724,42 @@ describe("PdfViewer OG state and reference behavior", () => {
       expect(writeState).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       expect(writeState).toHaveBeenCalledWith("paper.pdf", 2, 2.2);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("lets route-owned page and scale override the shared sidecar and publishes per-view changes", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [],
+      page: 2,
+      scale: 2,
+    });
+    vi.spyOn(backend(), "writePdfViewState").mockResolvedValue(undefined);
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([page(612, 792), page(612, 792)])) });
+    const states: Array<{ page: number; scale: number }> = [];
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => (
+      <PdfViewer
+        filename="paper.pdf"
+        label="Paper"
+        page={1}
+        scale={1.75}
+        onViewState={(state) => states.push(state)}
+      />
+    ), host);
+    try {
+      await flush();
+      expect((host.querySelector(".pdf-page-input") as HTMLInputElement).value).toBe("1");
+      expect(host.querySelector(".pdf-zoom-level")?.textContent).toBe("175%");
+      expect(states.at(-1)).toEqual({ page: 1, scale: 1.75 });
+
+      (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      await flush();
+      expect(states.at(-1)).toEqual({ page: 1, scale: 1.93 });
     } finally {
       dispose();
     }

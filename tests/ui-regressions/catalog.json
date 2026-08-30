@@ -1910,6 +1910,109 @@
    }
   },
   {
+   "id": "UI-PDF-TOOLBAR-CLOSE-443",
+   "title": "The PDF Close action remains directly operable at the right edge of the toolbar",
+   "family": "pdf",
+   "sources": {
+    "issues": [
+     443
+    ],
+    "commits": [
+     "05efa435"
+    ]
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/PdfViewer.test.tsx"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "The final toolbar button has the accessible name Close PDF and remains a direct visible action rather than moving behind the overflow menu. Packaged Linux pointer proof belongs to the route journey when that journey lands."
+  },
+  {
+   "id": "UI-PDF-TILE-AWARE-RENDER-393",
+   "title": "High-zoom PDF rendering stays readable and bounded without retaining arbitrary complete offscreen pages",
+   "family": "pdf",
+   "sources": {
+    "issues": [
+     393
+    ],
+    "commits": [
+     "400f4989",
+     "9c15daf7",
+     "391c443e"
+    ]
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "fixing",
+   "coverage": {
+    "tests": [
+     "src/pdfjsContract.test.ts",
+     "src/pdfRenderCoordinator.test.ts",
+     "src/components/PdfViewer.test.tsx",
+     "scripts/e2e-pdf-scroll-resources.mjs"
+    ],
+    "scenario": "pdf.tile-aware-high-zoom-rendering",
+    "failBefore": "proven"
+   },
+   "notes": "PDF.js 4.10.38 is pinned and characterized. Tine owns cross-view admission and measured backing-store eviction; exact pixels, tile dimensions, thresholds, frame timing, and DOM nesting are non-requirements."
+  },
+  {
+   "id": "UI-PDF-ROUTE-PANE-SESSION-20260830",
+   "title": "A PDF behaves as a movable restorable pane tab and legacy dedicated-pane sessions migrate without pane loss",
+   "family": "pdf",
+   "sources": {
+    "issues": [],
+    "commits": [
+     "bf2f7526",
+     "236cb528",
+     "7d3c2e91",
+     "298ede0b",
+     "5f78fde3"
+    ]
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "fixing",
+   "coverage": {
+    "tests": [],
+    "scenario": "pdf.route-pane-session-migration",
+    "failBefore": "inferred"
+   },
+   "notes": "Default open-beside preserves the source; Notes uses the structural companion; the old dedicated pane and width authority are removed in the atomic route flip. The first release permits at most one visible view per document."
+  },
+  {
+   "id": "UI-PDF-MULTIVIEW-SHARED-ANNOTATIONS-20260830",
+   "title": "Two PDF views retain independent positions while observing one ordered annotation state",
+   "family": "pdf",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "reported",
+   "coverage": {
+    "tests": [],
+    "scenario": "pdf.multiview-shared-annotations",
+    "failBefore": "inferred"
+   },
+   "notes": "Reserved but deliberately not exposed while the Managed Storage campaign owns the write_highlights actor surface. Enabling duplicate editable views requires the command to return the committed merged highlight collection."
+  },
+  {
    "id": "UI-MEDIA-BLOB-FALLBACK-BUDGET-001",
    "title": "Audio and MKV fallback cannot retain or copy unbounded whole media files",
    "family": "media",
