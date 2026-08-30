@@ -12,6 +12,7 @@ pub(crate) mod absence_sweep;
 pub mod batch;
 pub(crate) mod bootstrap_import;
 pub(crate) mod causal_index;
+pub(crate) mod checkpoint_generation;
 pub(crate) mod content_patricia;
 pub(crate) mod dependency_queue;
 pub(crate) mod discovery;

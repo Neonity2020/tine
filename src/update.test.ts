@@ -206,10 +206,12 @@ describe("update checks", () => {
       action: { label: "Install update" },
     });
     availableToast?.[2]?.action?.run();
-    await vi.waitFor(() => expect(consoleErr).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(openExternalMock).toHaveBeenCalled(), { timeout: 5_000 });
+
+    expect(consoleErr).toHaveBeenCalledWith(
       "[update] self-update failed:",
       "minisign signature verification failed",
-    ));
+    );
     expect(pushToastMock).toHaveBeenCalledWith(
       expect.stringMatching(/Couldn't apply the update/),
       "error",

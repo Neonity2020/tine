@@ -111,8 +111,8 @@ const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
 const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 14;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
-const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 8;
-const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
+pub(crate) const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 8;
+pub(crate) const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
 pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
@@ -4333,6 +4333,22 @@ impl AcceptedBatchEvidence {
     pub(crate) fn validate(&self) -> Result<(), EngineError> {
         validate_accepted_evidence(self)
     }
+
+    pub(crate) fn encode_canonical_v1(&self) -> Result<Vec<u8>, EngineError> {
+        self.validate()?;
+        postcard::to_allocvec(self).map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    pub(crate) fn decode_canonical_v1(bytes: &[u8]) -> Result<Self, EngineError> {
+        let (evidence, trailing): (Self, &[u8]) = postcard::take_from_bytes(bytes)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if !trailing.is_empty() || evidence.encode_canonical_v1()? != bytes {
+            return Err(EngineError::Archive(
+                "non-canonical accepted sequence evidence".into(),
+            ));
+        }
+        Ok(evidence)
+    }
 }
 
 impl AcceptedFrontierRoot {
@@ -4412,6 +4428,23 @@ impl AcceptedFrontierRoot {
         let mut normalized = self.clone();
         normalized.scratch_root = None;
         normalized
+    }
+
+    pub(crate) fn encode_canonical_v1(&self) -> Result<Vec<u8>, EngineError> {
+        let durable = self.without_scratch_root();
+        validate_accepted_frontier_root(&durable)?;
+        postcard::to_allocvec(&durable).map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    pub(crate) fn decode_canonical_v1(bytes: &[u8]) -> Result<Self, EngineError> {
+        let (root, trailing): (Self, &[u8]) = postcard::take_from_bytes(bytes)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if !trailing.is_empty() || root.encode_canonical_v1()? != bytes {
+            return Err(EngineError::Archive(
+                "non-canonical accepted-frontier V1 root".into(),
+            ));
+        }
+        Ok(root)
     }
 
     pub(crate) const fn has_persistent_point_index(&self) -> bool {
@@ -31073,17 +31106,14 @@ fn decode_archive_status(bytes: &[u8]) -> Result<ArchiveStatus, EngineError> {
 }
 
 fn decode_accepted_evidence(bytes: &[u8]) -> Result<AcceptedBatchEvidence, EngineError> {
-    let evidence: AcceptedBatchEvidence =
-        postcard::from_bytes(bytes).map_err(|error| EngineError::Archive(error.to_string()))?;
-    if postcard::to_allocvec(&evidence).map_err(|error| EngineError::Archive(error.to_string()))?
-        != bytes
-    {
-        return Err(EngineError::Archive(
-            "non-canonical accepted sequence evidence".into(),
-        ));
+    match super::checkpoint_generation::decode_versioned_evidence(bytes)? {
+        super::checkpoint_generation::VersionedAcceptedBatchEvidence::V1(evidence) => Ok(evidence),
+        super::checkpoint_generation::VersionedAcceptedBatchEvidence::V2(_) => {
+            Err(EngineError::Archive(
+                "accepted-evidence V2 is not active before checkpoint-generation cutover".into(),
+            ))
+        }
     }
-    validate_accepted_evidence(&evidence)?;
-    Ok(evidence)
 }
 
 fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
@@ -31372,7 +31402,7 @@ fn authenticated_document_map_root(
             ))
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
-    Ok(authenticated_map_subtree(&entries))
+    shared_authenticated_map_root(&entries)
 }
 
 fn authenticated_map_root(
@@ -31383,19 +31413,19 @@ fn authenticated_map_root(
             "authenticated batch map is not canonically ordered".into(),
         ));
     }
-    Ok(authenticated_map_subtree(
+    shared_authenticated_map_root(
         &entries
             .iter()
             .map(|(batch_id, digest)| (batch_id.as_uuid().into_bytes(), *digest))
             .collect::<Vec<_>>(),
-    ))
+    )
 }
 
 pub(crate) fn causal_clock_counter_digest(peer: CausalPeerId, counter: u64) -> ContentDigest {
-    let mut bytes = b"tine/oplog/causal-clock-entry/v1\0".to_vec();
-    bytes.extend_from_slice(peer.as_device_id().as_uuid().as_bytes());
-    bytes.extend_from_slice(&counter.to_be_bytes());
-    ContentDigest::of(&bytes)
+    tine_storage::sealed_accepted_index::causal_clock_counter_digest(
+        peer.as_device_id().as_uuid().into_bytes(),
+        counter,
+    )
 }
 
 pub(crate) fn authenticated_causal_clock_root(
@@ -31418,7 +31448,7 @@ pub(crate) fn authenticated_causal_clock_root(
             )
         })
         .collect::<Vec<_>>();
-    Ok(authenticated_map_subtree(&entries))
+    shared_authenticated_map_root(&entries)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -31430,21 +31460,19 @@ pub(crate) fn accepted_causal_record_digest(
     clock_root_key: Option<[u8; 16]>,
     clock_root_digest: ContentDigest,
 ) -> ContentDigest {
-    let mut bytes = b"tine/oplog/accepted-causal-record/v1\0".to_vec();
-    bytes.extend_from_slice(batch_id.as_uuid().as_bytes());
-    bytes.extend_from_slice(manifest_fingerprint.as_bytes());
-    bytes.extend_from_slice(event_binding_digest.as_bytes());
-    bytes.extend_from_slice(dot.peer_id().as_device_id().as_uuid().as_bytes());
-    bytes.extend_from_slice(&dot.counter().to_be_bytes());
-    match clock_root_key {
-        Some(key) => {
-            bytes.push(1);
-            bytes.extend_from_slice(&key);
-        }
-        None => bytes.push(0),
-    }
-    bytes.extend_from_slice(clock_root_digest.as_bytes());
-    ContentDigest::of(&bytes)
+    tine_storage::sealed_accepted_index::accepted_causal_record_digest(
+        batch_id.as_uuid().into_bytes(),
+        manifest_fingerprint,
+        event_binding_digest,
+        dot.peer_id().as_device_id().as_uuid().into_bytes(),
+        dot.counter(),
+        clock_root_key.map(
+            |key| tine_storage::sealed_accepted_index::AuthenticatedMapLinkV1 {
+                key,
+                digest: clock_root_digest,
+            },
+        ),
+    )
 }
 
 /// Timing-independent rejection evidence for the complete immutable canonical
@@ -31538,30 +31566,12 @@ fn bounded_finalization_work(batch: &ValidatedBatch) -> u64 {
     byte_units.saturating_add(operation_units).saturating_add(1)
 }
 
-fn authenticated_map_subtree(
+fn shared_authenticated_map_root(
     entries: &[([u8; 16], ContentDigest)],
-) -> (Option<[u8; 16]>, ContentDigest) {
-    let Some((root_index, (key, value_digest))) =
-        entries
-            .iter()
-            .enumerate()
-            .min_by(|(_, (left, _)), (_, (right, _))| {
-                super::scratch_store::authenticated_map_priority_order(*left, *right)
-            })
-    else {
-        return (None, super::scratch_store::authenticated_map_empty_digest());
-    };
-    let left = authenticated_map_subtree(&entries[..root_index]);
-    let right = authenticated_map_subtree(&entries[root_index + 1..]);
-    (
-        Some(*key),
-        super::scratch_store::authenticated_map_node_digest(
-            *key,
-            *value_digest,
-            left.0.map(|child_key| (child_key, left.1)),
-            right.0.map(|child_key| (child_key, right.1)),
-        ),
-    )
+) -> Result<(Option<[u8; 16]>, ContentDigest), EngineError> {
+    let root = tine_storage::sealed_accepted_index::authenticated_map_root(entries)
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    Ok((root.root.map(|link| link.key), root.root_digest()))
 }
 
 fn validate_accepted_evidence(evidence: &AcceptedBatchEvidence) -> Result<(), EngineError> {

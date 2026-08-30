@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{BatchId, ContentDigest, WorkspaceId};
+pub(crate) use tine_storage::sealed_accepted_index::{
+    authenticated_map_empty_digest, authenticated_map_node_digest, authenticated_map_priority,
+    authenticated_map_priority_order,
+};
 
 pub(crate) const SCRATCH_DIR: &str = tine_storage::formats::SCRATCH_DIR;
 #[cfg(test)]
@@ -3398,10 +3402,6 @@ impl ScratchAcceptedSequenceCursor<'_> {
     }
 }
 
-pub(crate) fn authenticated_map_empty_digest() -> ContentDigest {
-    ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty")
-}
-
 fn authenticated_point_empty_digest() -> ContentDigest {
     ContentDigest::of(b"tine/oplog/authenticated-point-map/v1/empty")
 }
@@ -3476,34 +3476,6 @@ fn causal_accumulator_node_digest(
     ContentDigest::of(&bytes)
 }
 
-pub(crate) fn authenticated_map_priority(key: [u8; 16]) -> ContentDigest {
-    let mut bytes = b"tine/oplog/authenticated-map/v1/priority\0".to_vec();
-    bytes.extend_from_slice(&key);
-    ContentDigest::of(&bytes)
-}
-
-pub(crate) fn authenticated_map_node_digest(
-    key: [u8; 16],
-    value_digest: ContentDigest,
-    left: Option<([u8; 16], ContentDigest)>,
-    right: Option<([u8; 16], ContentDigest)>,
-) -> ContentDigest {
-    let mut bytes = b"tine/oplog/authenticated-map/v1/node\0".to_vec();
-    bytes.extend_from_slice(&key);
-    bytes.extend_from_slice(value_digest.as_bytes());
-    for child in [left, right] {
-        match child {
-            Some((child_key, digest)) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&child_key);
-                bytes.extend_from_slice(digest.as_bytes());
-            }
-            None => bytes.push(0),
-        }
-    }
-    ContentDigest::of(&bytes)
-}
-
 fn authenticated_catalog_empty_digest() -> ContentDigest {
     ContentDigest::of(b"tine/oplog/authenticated-current-path-catalog/v2/empty")
 }
@@ -3523,16 +3495,6 @@ fn authenticated_catalog_node_digest(node: &AuthenticatedCatalogNode) -> Content
         }
     }
     ContentDigest::of(&bytes)
-}
-
-pub(crate) fn authenticated_map_priority_order(
-    left: [u8; 16],
-    right: [u8; 16],
-) -> std::cmp::Ordering {
-    authenticated_map_priority(left)
-        .as_bytes()
-        .cmp(authenticated_map_priority(right).as_bytes())
-        .then_with(|| left.cmp(&right))
 }
 
 fn accepted_sequence_leaf_capacity(height: u8) -> Option<u64> {
@@ -4114,6 +4076,41 @@ mod tests {
 
     fn workspace(value: u128) -> WorkspaceId {
         WorkspaceId::from_uuid(Uuid::from_u128(value))
+    }
+
+    #[test]
+    fn shared_authenticated_map_primitives_preserve_the_v1_tine_roots() {
+        assert_eq!(
+            authenticated_map_empty_digest().to_string(),
+            "610e8e19cb4d5cf03632e84b4278eac97c00f8b76fcf093fcca732fc5759b622"
+        );
+        assert_eq!(
+            authenticated_map_priority([0x11; 16]).to_string(),
+            "b04c72e061f87a6d015f69242d917fc0cddc0699b320805e33e92dabe097e7ad"
+        );
+        assert_eq!(
+            authenticated_map_node_digest(
+                [0x11; 16],
+                ContentDigest::from_bytes([0x22; 32]),
+                None,
+                None,
+            )
+            .to_string(),
+            "e565466183c18e6d795f150dc3294acaed8028c54880f1135ab51cf2bb1fbf23"
+        );
+
+        let entries = [
+            ([0x10; 16], ContentDigest::from_bytes([0xa0; 32])),
+            ([0x20; 16], ContentDigest::from_bytes([0xb0; 32])),
+            ([0x30; 16], ContentDigest::from_bytes([0xc0; 32])),
+        ];
+        let shared = tine_storage::sealed_accepted_index::authenticated_map_root(&entries)
+            .expect("canonical V1 map fixture");
+        assert_eq!(shared.root.map(|root| root.key), Some([0x30; 16]));
+        assert_eq!(
+            shared.root_digest().to_string(),
+            "57a8918c46769c518761d22c6d8a6087d57e0897a06f62e6ee52a2c434fbed8d"
+        );
     }
 
     fn archive(root: &Path) -> Dir {
