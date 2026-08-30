@@ -252,10 +252,8 @@ impl ImportId {
 /// the durable authority that is allowed to publish one.  It deliberately uses
 /// a full digest rather than the UUID namespace used by ordinary batch IDs.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[allow(dead_code)]
 pub(crate) struct BootstrapPartId([u8; 32]);
 
-#[allow(dead_code)]
 impl BootstrapPartId {
     pub(crate) fn derive(
         import_id: ImportId,
@@ -328,7 +326,6 @@ impl CanonicalGraphResourceId {
     /// Reconstruct a previously authenticated canonical graph-resource
     /// identity from its fixed digest representation.  Parsing callers still
     /// own the authority decision; this constructor performs no filesystem I/O.
-    #[allow(dead_code)]
     pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -865,7 +862,6 @@ impl BatchId {
     /// This is intentionally separate from `for_import`: an import transaction
     /// retains its existing singleton batch identity, while each bootstrap part
     /// has an independently bound identity.
-    #[allow(dead_code)]
     pub(crate) fn for_bootstrap_part(part_id: BootstrapPartId) -> Self {
         Self(derived_uuid(
             b"tine/bootstrap-import/part-batch-id/v1\0",

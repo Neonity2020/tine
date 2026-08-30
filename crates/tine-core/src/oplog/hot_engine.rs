@@ -283,16 +283,11 @@ fn note_local_mutation_detail(update: impl FnOnce(&mut LocalMutationDetailTiming
 
 // This is a run-local, authenticated view over the accepted catalog. It is
 // deliberately not an object-store, receipt, or projection format.
-#[allow(dead_code)]
 const CURRENT_PATH_CURSOR_SCHEMA_VERSION: u32 = 2;
 const CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION: u32 = 3;
-#[allow(dead_code)]
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PAGE_ROWS: usize = 1_024;
-#[allow(dead_code)]
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PATH_BYTES: usize = 4 * 1024;
-#[allow(dead_code)]
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PAGE_BYTES: usize = 256 * 1024;
-#[allow(dead_code)]
 pub(crate) const MAX_CURRENT_PATH_CURSORS: usize = 32;
 
 /// Thread-local causal probe for graph-sized authenticated catalog reads.
@@ -365,7 +360,6 @@ pub(crate) fn take_current_path_cursor_probe() -> CurrentPathCursorProbe {
 /// baseline or accepted manifest tail; no persistent projection-work authority
 /// participates in current-path admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct CurrentPathCatalogRow {
     page_id: PageId,
     path: ManagedPath,
@@ -373,7 +367,6 @@ pub(crate) struct CurrentPathCatalogRow {
     accepted_name_digest: ContentDigest,
 }
 
-#[allow(dead_code)]
 impl CurrentPathCatalogRow {
     pub(crate) const fn page_id(&self) -> PageId {
         self.page_id
@@ -397,7 +390,6 @@ impl CurrentPathCatalogRow {
 /// The engine-private authority capability makes this intentionally
 /// non-serializable and non-forgeable by callers. A cursor dies when its exact
 /// accepted frontier changes or when it has been consumed once.
-#[allow(dead_code)]
 pub(crate) struct CurrentPathCatalogCursor {
     runtime_authority: EngineAuthority,
     binding: CurrentPathCursorBinding,
@@ -451,13 +443,11 @@ impl CurrentPathCatalogBinding {
 }
 
 /// One bounded page from [`CurrentPathCatalogCursor`].
-#[allow(dead_code)]
 pub(crate) struct CurrentPathCatalogPage {
     rows: Vec<CurrentPathCatalogRow>,
     next: Option<CurrentPathCatalogCursor>,
 }
 
-#[allow(dead_code)]
 impl CurrentPathCatalogPage {
     pub(crate) fn rows(&self) -> &[CurrentPathCatalogRow] {
         &self.rows
@@ -2288,7 +2278,6 @@ pub(crate) struct LocalAuthorGeneration {
 /// cold-history record without re-running CRDT validation or deriving any
 /// acceptance state from caller assertions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct DetachedBootstrapAcceptedEngineMaterial {
     no_op: bool,
     accepted_evidence: AcceptedBatchEvidence,
@@ -2297,7 +2286,6 @@ pub(crate) struct DetachedBootstrapAcceptedEngineMaterial {
     reference_catalog_policy: ReferenceCatalogPolicyV1,
 }
 
-#[allow(dead_code)]
 impl DetachedBootstrapAcceptedEngineMaterial {
     pub(crate) const fn no_op(&self) -> bool {
         self.no_op
@@ -2358,13 +2346,11 @@ impl DetachedBootstrapAcceptedEngineMaterial {
 /// One fully prepared canonical bootstrap part and the exact detached engine
 /// transition it produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct DetachedBootstrapAuthoredPart {
     prepared: PreparedBatch,
     engine_material: DetachedBootstrapAcceptedEngineMaterial,
 }
 
-#[allow(dead_code)]
 impl DetachedBootstrapAuthoredPart {
     pub(crate) const fn prepared(&self) -> &PreparedBatch {
         &self.prepared
@@ -2440,7 +2426,6 @@ impl Drop for DetachedBootstrapScratchRoot {
 
 /// Completed inactive detached candidate. This remains crate-private and has no
 /// publication, projection, graph, SQLite, or enrollment capability.
-#[allow(dead_code)]
 pub(crate) struct DetachedBootstrapCandidate {
     // Even an empty engine is large in test/debug builds. Heap ownership keeps
     // nested direct replay and validation stack-bounded at maximum part width.
@@ -2560,7 +2545,6 @@ pub(crate) struct DetachedBootstrapPublicationStats {
     pub(crate) packed_peak_resident_bytes: usize,
 }
 
-#[allow(dead_code)]
 impl DetachedBootstrapCandidate {
     pub(crate) const fn part_count(&self) -> u32 {
         self.part_count
@@ -2846,7 +2830,6 @@ impl DetachedBootstrapCandidate {
 /// same durable content-addressed Patricia store the promoted runtime later opens.
 /// The caller therefore supplies an explicit
 /// [`BootstrapAuthoringCapability`] over the target archive.
-#[allow(dead_code)]
 pub(crate) struct DetachedBootstrapAuthoringSession {
     candidate: Option<Box<ShardedHotEngine>>,
     scratch_root: Option<DetachedBootstrapScratchRoot>,
@@ -2895,7 +2878,6 @@ impl DetachedBootstrapReplayIdentity {
     }
 }
 
-#[allow(dead_code)]
 impl DetachedBootstrapAuthoringSession {
     /// `indexes` must be the durable authenticated index capability of the exact
     /// archive this bootstrap will be installed into and later promoted from.
@@ -10924,7 +10906,6 @@ impl ShardedHotEngine {
     /// Start an opaque, bounded cursor over the current accepted live page
     /// paths. The cursor is run-local: it binds this exact engine capability,
     /// workspace, history identity, schema, and accepted frontier.
-    #[allow(dead_code)]
     pub(crate) fn begin_current_path_cursor(
         &self,
     ) -> Result<CurrentPathCatalogCursor, EngineError> {
@@ -11192,7 +11173,6 @@ impl ShardedHotEngine {
     /// Consume one opaque cursor and return the next bounded page. Each token
     /// is single-use, so an exact final page terminates without re-reading any
     /// previously returned row.
-    #[allow(dead_code)]
     pub(crate) fn current_path_cursor_page(
         &self,
         cursor: CurrentPathCatalogCursor,
@@ -12845,7 +12825,6 @@ impl ShardedHotEngine {
         Ok(clock.into_iter().collect())
     }
 
-    #[allow(dead_code)]
     fn accepted_document_dependencies(
         &self,
         document_id: DocumentId,
@@ -16522,7 +16501,6 @@ impl ShardedHotEngine {
     /// observation object. The object joins the core manifest before the
     /// engine applies semantic operations, so object-set validation and the
     /// prospective CRDT state are exercised as one closed draft.
-    #[allow(dead_code)]
     pub(crate) fn draft_external_import_transaction(
         &self,
         author: AuthorBatch,

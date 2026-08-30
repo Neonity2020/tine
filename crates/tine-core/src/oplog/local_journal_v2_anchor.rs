@@ -734,7 +734,6 @@ mod tests {
     }
 
     #[derive(Deserialize)]
-    #[allow(dead_code)]
     struct LegacySchema1Anchor {
         schema_version: u32,
         generation: u64,

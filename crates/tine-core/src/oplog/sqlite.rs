@@ -3932,7 +3932,6 @@ pub(crate) struct LeasedSqliteFrontier<'lease> {
 // The owning `LeasedWorkspaceProjection` is what activation uses; these two
 // accessors serve the borrowed shape, which today only the applier-slot handoff
 // regression exercises directly.
-#[allow(dead_code)]
 impl<'lease> LeasedSqliteFrontier<'lease> {
     pub(crate) const fn database(&self) -> &SqliteFrontier {
         &self.database

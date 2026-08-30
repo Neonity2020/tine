@@ -1215,14 +1215,12 @@ pub(crate) struct SyncConflictTrashCommit {
 /// describes the path and bytes whose file and parent-directory barriers have
 /// completed.
 #[derive(Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 pub(crate) struct JournalPageProjectionTarget {
     relative_path: String,
     target: Vec<u8>,
     revision: String,
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl JournalPageProjectionTarget {
     pub(crate) fn relative_path(&self) -> &str {
         &self.relative_path
@@ -1238,13 +1236,11 @@ impl JournalPageProjectionTarget {
 }
 
 /// A journal proof paired with its exact durable graph target.
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 pub(crate) struct DurableJournalPageProjection<A> {
     append_proof: A,
     target: JournalPageProjectionTarget,
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl<A> DurableJournalPageProjection<A> {
     pub(crate) fn append_proof(&self) -> &A {
         &self.append_proof
@@ -1264,14 +1260,12 @@ impl<A> DurableJournalPageProjection<A> {
 /// This state deliberately owns the caller's proof unchanged.  Retrying it
 /// never calls the append callback and can only authenticate/publish the exact
 /// path, base, and target captured before the append boundary.
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 pub(crate) struct CommittedPendingJournalPageProjection<A> {
     append_proof: A,
     recovery: JournalPageProjectionRecovery,
     last_error: io::Error,
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl<A> CommittedPendingJournalPageProjection<A> {
     pub(crate) fn append_proof(&self) -> &A {
         &self.append_proof
@@ -1290,7 +1284,6 @@ impl<A> CommittedPendingJournalPageProjection<A> {
     }
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 pub(crate) enum JournalPageProjectionOutcome<A> {
     Durable(DurableJournalPageProjection<A>),
     CommittedPending(CommittedPendingJournalPageProjection<A>),
@@ -1309,7 +1302,6 @@ pub(crate) enum JournalPageCommitError<E> {
 }
 
 impl<E> JournalPageCommitError<E> {
-    #[allow(dead_code)] // Available to crate callers that need to inspect a pre-append failure.
     pub(crate) const fn precommit(&self) -> Option<&io::Error> {
         match self {
             Self::Precommit(error) => Some(error),
@@ -1317,7 +1309,6 @@ impl<E> JournalPageCommitError<E> {
         }
     }
 
-    #[allow(dead_code)] // Available to crate callers that need to inspect an append failure.
     pub(crate) const fn append(&self) -> Option<&E> {
         match self {
             Self::Precommit(_) => None,
@@ -1344,7 +1335,6 @@ impl<E: std::error::Error + 'static> std::error::Error for JournalPageCommitErro
     }
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 enum JournalPageProjectionRecovery {
     InProcess(JournalPageProjectionPlan),
     Restart(JournalPageProjectionRestartRecord),
@@ -1368,7 +1358,6 @@ impl JournalPageProjectionRecovery {
 
 /// Authenticated journal material sufficient to reacquire runtime-only file and
 /// parent identities after process memory has been lost.
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 struct JournalPageProjectionRestartRecord {
     relative_path: String,
     expected_base: Vec<u8>,
@@ -1377,7 +1366,6 @@ struct JournalPageProjectionRestartRecord {
     revision: String,
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 struct JournalPageProjectionPlan {
     path: PathBuf,
     relative_path: String,
@@ -1392,14 +1380,12 @@ struct JournalPageProjectionPlan {
 
 /// Private pre-append typestate.  It has no graph mutation method; consuming
 /// the append callback is the only transition to the publication-capable state.
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 struct VerifiedJournalPageProjection<'a> {
     graph: &'a Graph,
     write: &'a ManagedTextWritePermit,
     plan: JournalPageProjectionPlan,
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 struct JournalCommittedPageProjection<'a, A> {
     graph: &'a Graph,
     write: &'a ManagedTextWritePermit,
@@ -1407,7 +1393,6 @@ struct JournalCommittedPageProjection<'a, A> {
     append_proof: A,
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl<'a> VerifiedJournalPageProjection<'a> {
     fn append<A, E>(
         self,
@@ -1423,7 +1408,6 @@ impl<'a> VerifiedJournalPageProjection<'a> {
     }
 }
 
-#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl<A> JournalCommittedPageProjection<'_, A> {
     fn publish(self) -> JournalPageProjectionOutcome<A> {
         #[cfg(test)]
@@ -1508,7 +1492,6 @@ pub struct GraphTextIdentityPublicationGuard<'a> {
     _identity: GraphTextIdentityMutationGuard<'a>,
 }
 
-#[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 impl ManagedTextWriteGate {
     fn new() -> Self {
         Self {
@@ -1767,7 +1750,6 @@ impl Drop for ManagedTextWritePermit {
 }
 
 /// Read-only evidence carried by a sealed external-reconciliation handoff.
-#[allow(dead_code)] // P4 evidence is consumed by the later P7 publisher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HandoffBindingEvidence {
     workspace_id: WorkspaceId,
@@ -1775,7 +1757,6 @@ pub(crate) struct HandoffBindingEvidence {
     graph_resource_id: CanonicalGraphResourceId,
 }
 
-#[allow(dead_code)] // P4 evidence is consumed by the later P7 publisher.
 impl HandoffBindingEvidence {
     pub(crate) const fn workspace_id(self) -> WorkspaceId {
         self.workspace_id
@@ -1793,14 +1774,12 @@ impl HandoffBindingEvidence {
 /// Move-only authority proving one exact graph has quiesced all managed-text
 /// writers for an external-reconciliation handoff. It is deliberately opaque
 /// outside this crate; only binding evidence can be observed.
-#[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 pub(crate) struct HandoffSafe {
     gate: Option<Arc<ManagedTextWriteGate>>,
     instance_token: Arc<HandoffGraphInstanceToken>,
     binding: HandoffBindingEvidence,
 }
 
-#[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 impl HandoffSafe {
     pub(crate) const fn binding(&self) -> HandoffBindingEvidence {
         self.binding
@@ -1855,14 +1834,12 @@ impl Drop for HandoffSafe {
 
 /// Crate-private post-consumption handoff ownership for the future publisher.
 /// It keeps the same reservation held until publication or recovery exits.
-#[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 pub(crate) struct HandoffSafeGuard {
     gate: Option<Arc<ManagedTextWriteGate>>,
     instance_token: Arc<HandoffGraphInstanceToken>,
     binding: HandoffBindingEvidence,
 }
 
-#[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 impl HandoffSafeGuard {
     pub(crate) const fn binding(&self) -> HandoffBindingEvidence {
         self.binding
@@ -2098,14 +2075,12 @@ impl Drop for HandoffSafeGuard {
 /// continuation cannot accidentally admit an ordinary managed-text writer.
 /// Deliberate operator recovery/cancellation, if added later, must be a
 /// separate authenticated consuming API.
-#[allow(dead_code)] // activated only by the later persisted-enrollment packet
 pub(crate) struct PublishedHandoffLatch {
     gate: Option<Arc<ManagedTextWriteGate>>,
     instance_token: Arc<HandoffGraphInstanceToken>,
     binding: HandoffBindingEvidence,
 }
 
-#[allow(dead_code)] // activated only by the later persisted-enrollment packet
 impl PublishedHandoffLatch {
     pub(crate) fn verify_binding(
         &self,
@@ -2336,7 +2311,6 @@ impl PublishedHandoffLatch {
     }
 }
 
-#[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 fn verify_handoff_binding(
     gate: Option<&Arc<ManagedTextWriteGate>>,
     instance_token: &Arc<HandoffGraphInstanceToken>,
@@ -3323,7 +3297,6 @@ pub enum GraphTextExactFeedPathClass {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Some evidence is consumed only by the later point-authority packet.
 struct GraphTextAdmissionRecord {
     description: BlobDescription,
     file_resource_id: ContentDigest,
@@ -3349,7 +3322,6 @@ struct GraphTextAdmissionTombstone {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // Complete-only fields stay inert until exact feed activation.
 struct CompleteGraphTextAdmissionIndex {
     instance: Arc<GraphTextAdmissionInstance>,
     scope_binding: GraphTextScopeBinding,
@@ -3371,7 +3343,6 @@ struct CompleteGraphTextAdmissionIndex {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Poison retains diagnostics without retaining authority.
 struct GraphTextAdmissionDiagnostics {
     generation: u64,
     files: usize,
@@ -3379,7 +3350,6 @@ struct GraphTextAdmissionDiagnostics {
     permanent_bytes: u64,
 }
 
-#[allow(dead_code)] // `last_good` is intentionally diagnostic-only in this packet.
 enum GraphTextAdmissionState {
     Unbuilt,
     Armed(GraphTextAdmissionFeedBinding),
@@ -4390,7 +4360,6 @@ fn count_graph_text_admission_persistent_payload_members(members: usize) {
 fn count_graph_text_admission_persistent_payload_members(_members: usize) {}
 
 #[cfg(not(test))]
-#[allow(dead_code)]
 fn count_graph_text_admission_point_query() {}
 
 #[cfg(test)]
@@ -4965,7 +4934,6 @@ fn handoff_mint_after_reservation_hook() -> io::Result<()> {
 }
 
 #[cfg(not(test))]
-#[allow(dead_code)] // P4 minting is wired by the later P7 publisher.
 fn handoff_mint_after_reservation_hook() -> io::Result<()> {
     Ok(())
 }
@@ -4980,7 +4948,6 @@ fn handoff_transfer_hook() {
 }
 
 #[cfg(not(test))]
-#[allow(dead_code)] // P4 transfer is wired by the later P7 publisher.
 fn handoff_transfer_hook() {}
 
 #[cfg(test)]
@@ -6184,7 +6151,6 @@ impl Graph {
     /// Seal this exact Graph instance for a future external-reconciliation
     /// publisher. The workspace and endpoint become immutable evidence on the
     /// capability; this method never exposes the underlying reservation.
-    #[allow(dead_code)] // P4 minting is wired by the later P7 publisher.
     pub(crate) fn mint_handoff_safe(
         &self,
         workspace_id: WorkspaceId,
@@ -6933,13 +6899,7 @@ impl Graph {
                 }
             }
             PreparedGraphTextAdmissionFinalState::Absent(prepared) => {
-                let removed = remove_graph_text_admission_path(current, &relative);
-                if let (Ok(path), Some(tombstone)) = (ManagedPath::parse(relative.clone()), removed)
-                {
-                    current.tombstones_by_exact_path.insert(path, tombstone);
-                }
-                current.permanent_bytes =
-                    checked_add_bytes(current.permanent_bytes, prepared.retained_growth)?;
+                self.apply_prepared_graph_text_file_remove(current, prepared)?;
             }
         }
         validate_graph_text_admission_delta(current, &relative)?;
@@ -10771,23 +10731,6 @@ impl Graph {
         self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)
     }
 
-    #[allow(dead_code)]
-    fn prepare_graph_text_file_upsert(
-        &self,
-        index: &CompleteGraphTextAdmissionIndex,
-        relative: String,
-        event_scratch: u64,
-    ) -> io::Result<PreparedGraphTextAdmissionUpsert> {
-        self.prepare_graph_text_file_upsert_with_batch_charges(
-            index,
-            relative,
-            event_scratch,
-            None,
-            true,
-            true,
-        )
-    }
-
     fn prepare_graph_text_file_upsert_for_batch(
         &self,
         index: &CompleteGraphTextAdmissionIndex,
@@ -11066,7 +11009,6 @@ impl Graph {
         })
     }
 
-    #[allow(dead_code)]
     fn apply_prepared_graph_text_file_upsert(
         &self,
         index: &mut CompleteGraphTextAdmissionIndex,
@@ -11140,7 +11082,6 @@ impl Graph {
         validate_graph_text_admission_delta(index, &prepared.relative)
     }
 
-    #[allow(dead_code)]
     fn prepare_graph_text_file_remove(
         &self,
         index: &CompleteGraphTextAdmissionIndex,
@@ -11215,7 +11156,6 @@ impl Graph {
         })
     }
 
-    #[allow(dead_code)]
     fn apply_prepared_graph_text_file_remove(
         &self,
         index: &mut CompleteGraphTextAdmissionIndex,
@@ -11243,7 +11183,6 @@ impl Graph {
         validate_graph_text_admission_delta(index, &relative)
     }
 
-    #[allow(dead_code)]
     fn graph_text_event_parent(&self, target: &GraphTextExactPath) -> io::Result<ProjectionParent> {
         self.graph_text_event_parent_policy(target, true)
     }
@@ -19060,7 +18999,6 @@ impl Graph {
     /// The descriptor is proof-issued, and its exact relative path/name binding
     /// prevents startup/import code from treating anonymous hidden files as
     /// recovery evidence.
-    #[allow(dead_code)] // Retained for the later importer/startup evidence reader.
     pub(crate) fn read_projection_recovery_evidence(
         &self,
         target_relative_path: &str,
@@ -20891,7 +20829,6 @@ impl Graph {
     /// as [`JournalPageProjectionOutcome::CommittedPending`] and must be retried
     /// with [`Graph::retry_committed_journal_page_projection`], never redrafted or
     /// appended again.
-    #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
     pub(crate) fn commit_existing_page_with_journal<A, E>(
         &self,
         page: &PageDto,
@@ -20999,7 +20936,6 @@ impl Graph {
     /// Resume only graph durability/cache publication for an already committed
     /// journal append.  No callback is accepted here, making a second append
     /// structurally impossible.
-    #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
     pub(crate) fn retry_committed_journal_page_projection<A>(
         &self,
         pending: CommittedPendingJournalPageProjection<A>,
@@ -21042,7 +20978,6 @@ impl Graph {
     /// accepts no append callback and cannot create another journal record.
     /// Runtime-only file and parent identities are reacquired under the managed
     /// writer, retained graph-text identity authority, and exact path lock.
-    #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
     pub(crate) fn recover_committed_journal_page_projection<A>(
         &self,
         append_proof: A,
@@ -30341,7 +30276,6 @@ fn graph_text_delta_reverse_members(
             .map_or(0, std::collections::BTreeSet::len)
 }
 
-#[allow(dead_code)]
 fn remove_graph_text_admission_path(
     index: &mut CompleteGraphTextAdmissionIndex,
     relative: &str,
@@ -30441,7 +30375,6 @@ fn validate_graph_text_single_link(file: &fs::File, relative: &str) -> io::Resul
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_graph_text_event_parent(
     index: &CompleteGraphTextAdmissionIndex,
     target: &GraphTextExactPath,
@@ -30476,7 +30409,6 @@ fn validate_graph_text_event_parent(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn poison_graph_text_admission_state(state: &mut GraphTextAdmissionState, cause: String) {
     if matches!(state, GraphTextAdmissionState::Poisoned { .. }) {
         return;

@@ -169,7 +169,6 @@ pub(crate) struct ExternalImportObservationMaterial {
 
 // Packet 4B deliberately leaves the draft/finalize adapter for the following
 // packet, so these crate-internal handoff methods have no production caller yet.
-#[allow(dead_code)]
 impl ExternalImportObservationMaterial {
     pub(crate) fn new(
         workspace_id: WorkspaceId,
@@ -246,7 +245,6 @@ impl ExternalImportObservationMaterial {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalImportObservationMaterialError {
     Observation(ExternalImportObservationError),
@@ -754,7 +752,6 @@ mod tests {
         entries: Vec<()>,
     }
 
-    #[allow(dead_code)]
     #[derive(Deserialize)]
     struct BoundedAnnotationsProbe(
         #[serde(deserialize_with = "deserialize_annotations")] Vec<AnnotatedIdentity>,

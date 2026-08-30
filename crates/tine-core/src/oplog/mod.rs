@@ -10,15 +10,12 @@
 pub(crate) mod absence_decision;
 pub(crate) mod absence_sweep;
 pub mod batch;
-#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod bootstrap_import;
 pub(crate) mod causal_index;
 pub(crate) mod content_patricia;
 pub(crate) mod dependency_queue;
-#[allow(dead_code)] // mixed live/runtime and diagnostic surface
 pub(crate) mod discovery;
 pub(crate) mod document_state;
-#[allow(dead_code)] // mixed live/runtime and retained compatibility surface
 pub(crate) mod enrollment;
 // The only keyed enrollment compatibility code.  Current enrollment state is
 // integrity-checked, while immutable v1/v5 history remains verifiable.
@@ -36,14 +33,11 @@ mod import_integration_tests;
 pub(crate) mod lazy_genesis;
 pub(crate) mod local_active;
 pub(crate) mod local_completion_index;
-#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_journal_drain;
-#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod local_journal_v2_anchor;
 pub(crate) mod loro_store;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
-#[allow(dead_code)] // mixed live/runtime and test-construction surface
 pub(crate) mod page_name_index;
 pub(crate) mod portable_path_index;
 pub mod projection;
@@ -57,7 +51,6 @@ pub mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub mod reference_catalog;
 pub mod refusal;
-#[allow(dead_code)] // retained recovery format plus test construction surface
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub mod semantic;
@@ -70,7 +63,6 @@ pub mod sync_layout;
 /// this re-export keeps `oplog::text_merge::…` naming its managed-storage
 /// classifier.
 pub use crate::text_merge;
-#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
 pub(crate) mod wire;

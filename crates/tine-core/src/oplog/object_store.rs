@@ -580,7 +580,6 @@ impl BootstrapAggregateHistoryBindingV1 {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn publication_id(self) -> BootstrapPublicationIdV1 {
         self.publication_id
     }

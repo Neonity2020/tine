@@ -1475,7 +1475,6 @@ impl LazyGenesisCandidate {
         Ok(self)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn open_sealed(directory: &Path, expected: LazyGenesisCommitV1) -> io::Result<Self> {
         let manifest_bytes = read_bounded(
             &directory.join(LAZY_GENESIS_MANIFEST_FILE),

@@ -269,7 +269,6 @@ impl PatriciaIndexStore {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn lookup_many(
         &self,
         root: PatriciaIndexRoot,

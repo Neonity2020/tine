@@ -147,7 +147,6 @@ fn activation_page_record_memory_limit() -> usize {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum InactiveBootstrapOrchestrationCut {
     AfterSourcePublication,
     AfterOnePart,
@@ -407,7 +406,6 @@ impl From<super::sqlite::ProjectionError> for BootstrapStreamingImportError {
 /// Inactive ownership of a complete, sealed bootstrap preparation. It carries
 /// no object-store, history, graph-writer, projection, SQLite, enrollment, or
 /// runtime capability.
-#[allow(dead_code)]
 pub(crate) struct InactiveBootstrapPreparedPublication {
     source_capture: BootstrapSourceCapture,
     sealed_directory: PathBuf,
@@ -425,7 +423,6 @@ pub(crate) struct InactiveBootstrapPreparedPublication {
     instrumentation: BootstrapStreamingImportInstrumentation,
 }
 
-#[allow(dead_code)]
 impl InactiveBootstrapPreparedPublication {
     pub(crate) const fn aggregate(&self) -> &BootstrapAggregateManifestV1 {
         &self.aggregate
@@ -1341,7 +1338,6 @@ pub(crate) struct TerminalBootstrapConstructionMaterial {
     lazy_genesis: Option<LazyGenesisCandidate>,
 }
 
-#[allow(dead_code)]
 impl TerminalBootstrapConstructionMaterial {
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
@@ -1397,7 +1393,6 @@ impl TerminalBootstrapConstructionMaterial {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct InactiveBootstrapPreparedPartCursor {
     ordinal: u32,
     manifest: Vec<u8>,
@@ -1406,7 +1401,6 @@ pub(crate) struct InactiveBootstrapPreparedPartCursor {
     objects: FrameReader,
 }
 
-#[allow(dead_code)]
 impl InactiveBootstrapPreparedPartCursor {
     pub(crate) const fn ordinal(&self) -> u32 {
         self.ordinal
@@ -6554,7 +6548,6 @@ impl ImportPlan {
     /// Return the sealed, non-authorizing execution material for one accepted
     /// reconciliation. The hot-engine adapter must still recapture all live
     /// predicates before it drafts or publishes a batch.
-    #[allow(dead_code)]
     pub(crate) fn execution_material(
         &self,
     ) -> Result<&ImportExecutionMaterial, ImportExecutionError> {
@@ -6580,7 +6573,6 @@ impl ImportPlan {
     /// Consume a reconciliable plan at the engine handoff boundary.  This
     /// deliberately moves the observation bytes: the execution adapter must
     /// not clone an already-bounded external observation just to author it.
-    #[allow(dead_code)]
     pub(crate) fn into_execution_material(
         mut self,
     ) -> Result<ImportExecutionMaterial, ImportExecutionError> {
@@ -6659,7 +6651,6 @@ impl ImportFormattingMaterial {
 
 // The hot-engine adapter consumes this sealed material for drafting only;
 // capability recapture and publication remain separate authority boundaries.
-#[allow(dead_code)]
 impl ImportExecutionMaterial {
     pub(crate) const fn import_id(&self) -> ImportId {
         self.import_id
@@ -6694,7 +6685,6 @@ impl ImportExecutionMaterial {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ImportExecutionError {
     RefusedStatus(ImportPlanStatus),

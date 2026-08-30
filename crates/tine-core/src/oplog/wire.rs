@@ -6509,7 +6509,6 @@ fn provider_removal_durability_hook(step: ProviderRemovalDurabilityStep) {
 }
 
 #[cfg(not(test))]
-#[allow(dead_code)]
 fn provider_removal_durability_hook(_step: ProviderRemovalDurabilityStep) {}
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -7017,33 +7016,6 @@ impl Drop for InjectedSharedProviderFlaggedRenameFailure {
         let restored = self.0;
         ARMED_SHARED_PROVIDER_FLAGGED_RENAME.with(|armed| armed.set(restored));
         crate::model::forget_flagged_rename_capabilities();
-    }
-}
-
-#[cfg(windows)]
-#[allow(dead_code)]
-fn provider_remove_open_file(file: fs::File) -> std::io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
-    };
-
-    let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: the retained handle selects the validated file object, the
-    // disposition structure is initialized for the exact call size, and the
-    // kernel retains neither pointer after the call.
-    let result = unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfo,
-            (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
-            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-        )
-    };
-    if result != 0 {
-        close_provider_delete_pending_file(file);
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
     }
 }
 
