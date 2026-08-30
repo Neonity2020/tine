@@ -271,8 +271,17 @@ async function focusCurrentEditor() {
   return editor;
 }
 
+function acceptedRevision(result, label) {
+  const first = typeof result === "string" ? result : result?.revision;
+  const revision = typeof first === "string" ? first : first?.revision;
+  if (result?.error || typeof revision !== "string") {
+    throw new Error(`${label} failed: ${JSON.stringify(result)}`);
+  }
+  return revision;
+}
+
 async function raceExistingDraftWithManagedWinner(path, retained, winner) {
-  const result = await webdriverLifecycle.run("existing-page managed race", () => browser.executeAsync((managedPath, retainedText, winnerText, done) => {
+  const result = await webdriverLifecycle.run("existing-page managed race", () => browser.executeAsync((managedPath, retainedText, winnerText, generation, done) => {
     const editor = document.querySelector(".page-blocks textarea.block-editor, textarea.block-editor");
     if (!(editor instanceof HTMLTextAreaElement)) {
       done({ error: "existing-page editor was not mounted" });
@@ -286,7 +295,7 @@ async function raceExistingDraftWithManagedWinner(path, retained, winner) {
       data: retainedText,
     }));
     const invoke = globalThis.__TAURI_INTERNALS__.invoke.bind(globalThis.__TAURI_INTERNALS__);
-    invoke("get_page_by_path", { path: managedPath }).then((page) => {
+    invoke("get_page_by_path", { path: managedPath, bindingGeneration: generation }).then((page) => {
       if (!page?.rev || !page.blocks?.[0]) throw new Error("managed winner could not load exact page");
       page.blocks[0].raw = winnerText;
       return invoke("save_page", {
@@ -295,20 +304,18 @@ async function raceExistingDraftWithManagedWinner(path, retained, winner) {
         force: false,
         conflictEpoch: null,
         managedConflictObservation: null,
+        bindingGeneration: generation,
       });
     }).then(
       (revision) => done({ revision }),
       (error) => done({ error: String(error) }),
     );
-  }, path, retained, winner));
-  if (result?.error || typeof result?.revision !== "string") {
-    throw new Error(`existing managed race setup failed: ${JSON.stringify(result)}`);
-  }
-  return result.revision;
+  }, path, retained, winner, bindingGeneration));
+  return acceptedRevision(result, "existing managed race setup");
 }
 
 async function raceNewDraftWithManagedCreator(name, retained, winner) {
-  const result = await webdriverLifecycle.run("new-page managed race", () => browser.executeAsync((pageName, retainedText, winnerText, done) => {
+  const result = await webdriverLifecycle.run("new-page managed race", () => browser.executeAsync((pageName, retainedText, winnerText, generation, done) => {
     const editor = document.querySelector(".page-blocks textarea.block-editor, textarea.block-editor");
     if (!(editor instanceof HTMLTextAreaElement)) {
       done({ error: "new-page editor was not mounted" });
@@ -321,32 +328,49 @@ async function raceNewDraftWithManagedCreator(name, retained, winner) {
       inputType: "insertText",
       data: retainedText,
     }));
-    globalThis.__TAURI_INTERNALS__.invoke("save_page", {
-      page: {
-        name: pageName,
-        kind: "page",
-        title: pageName,
-        pre_block: null,
-        blocks: [{ id: "e2e-concurrent-new", raw: winnerText, collapsed: false, children: [], properties: [] }],
-        rev: null,
-        format: "md",
-        read_only: false,
-        path: "",
-        guide: false,
-      },
-      baseRev: null,
+    const invoke = globalThis.__TAURI_INTERNALS__.invoke.bind(globalThis.__TAURI_INTERNALS__);
+    const winnerBlock = { id: "e2e-concurrent-new", raw: winnerText, collapsed: false, children: [], properties: [] };
+    const save = (page, baseRev) => invoke("save_page", {
+      page,
+      baseRev,
       force: false,
       conflictEpoch: null,
       managedConflictObservation: null,
+      bindingGeneration: generation,
+    });
+    const initial = {
+      name: pageName,
+      kind: "page",
+      title: pageName,
+      pre_block: null,
+      blocks: [winnerBlock],
+      rev: null,
+      format: "md",
+      read_only: false,
+      path: "",
+      guide: false,
+    };
+    save(initial, null).catch(async (error) => {
+      // Current Tine gives a newly opened page its path authority immediately;
+      // older builds waited for the first editor save. Both are valid. In the
+      // immediate-activation shape, race the retained draft with the next exact
+      // managed winner at that same path instead of pretending a second creator
+      // can still claim it with baseRev=null.
+      if (!String(error).includes("PageAlreadyExists")) throw error;
+      const current = await invoke("get_page", {
+        name: pageName,
+        kind: "page",
+        bindingGeneration: generation,
+      });
+      if (!current?.rev) throw new Error("activated new page exposed no revision for the competing winner");
+      current.blocks = [winnerBlock];
+      return save(current, current.rev);
     }).then(
       (revision) => done({ revision }),
       (error) => done({ error: String(error) }),
     );
-  }, name, retained, winner));
-  if (result?.error || typeof result?.revision !== "string") {
-    throw new Error(`new-page managed race setup failed: ${JSON.stringify(result)}`);
-  }
-  return result.revision;
+  }, name, retained, winner, bindingGeneration));
+  return acceptedRevision(result, "new-page managed race setup");
 }
 
 async function assertRetainedConflictDraft(text, label) {
@@ -365,9 +389,9 @@ async function assertRetainedConflictDraft(text, label) {
 }
 
 async function saveManagedWinnerAndClickVisibleKeepMine(path, winner) {
-  const result = await webdriverLifecycle.run("newer-winner Keep mine race", () => browser.executeAsync((managedPath, winnerText, done) => {
+  const result = await webdriverLifecycle.run("newer-winner Keep mine race", () => browser.executeAsync((managedPath, winnerText, generation, done) => {
     const invoke = globalThis.__TAURI_INTERNALS__.invoke.bind(globalThis.__TAURI_INTERNALS__);
-    invoke("get_page_by_path", { path: managedPath }).then((page) => {
+    invoke("get_page_by_path", { path: managedPath, bindingGeneration: generation }).then((page) => {
       if (!page?.rev || !page.blocks?.[0]) throw new Error("newer winner could not load exact page");
       page.blocks[0].raw = winnerText;
       return invoke("save_page", {
@@ -376,6 +400,7 @@ async function saveManagedWinnerAndClickVisibleKeepMine(path, winner) {
         force: false,
         conflictEpoch: null,
         managedConflictObservation: null,
+        bindingGeneration: generation,
       });
     }).then((revision) => {
       const keep = [...document.querySelectorAll("button")]
@@ -389,11 +414,8 @@ async function saveManagedWinnerAndClickVisibleKeepMine(path, winner) {
       (revision) => done({ revision }),
       (error) => done({ error: String(error) }),
     );
-  }, path, winner));
-  if (result?.error || typeof result?.revision !== "string") {
-    throw new Error(`newer-winner click race failed: ${JSON.stringify(result)}`);
-  }
-  return result.revision;
+  }, path, winner, bindingGeneration));
+  return acceptedRevision(result, "newer-winner click race");
 }
 
 async function clickKeepMine() {
@@ -503,6 +525,7 @@ let appPid;
 let wm;
 let wmLog;
 let phase = "setup";
+let bindingGeneration;
 const receipt = {
   schemaVersion: 1,
   scenario: "sparse-v2-recovery",
@@ -551,6 +574,18 @@ async function stopWindowManager() {
   wmLog = undefined;
 }
 
+async function leaseCurrentGraphBinding() {
+  const result = await webdriverLifecycle.run("lease current graph binding", () => browser.executeAsync((graph, done) => {
+    globalThis.__TAURI_INTERNALS__.invoke("load_graph", { path: graph })
+      .then(done, (error) => done({ error: String(error) }));
+  }, GRAPH));
+  if (result?.error || !Number.isInteger(result?.binding_generation)) {
+    throw new Error(`current graph binding could not be leased: ${JSON.stringify(result)}`);
+  }
+  bindingGeneration = result.binding_generation;
+  return bindingGeneration;
+}
+
 async function connect(label) {
   await webdriverLifecycle.reap(`${label}:pre-connect`, { graceMs: 0 });
   driverLog = fs.openSync(path.join(ARTIFACTS, `${label}-tauri-driver.log`), "w");
@@ -578,6 +613,7 @@ async function connect(label) {
 
 function failureClassification(error) {
   const message = String(error);
+  if (/missing-graph-binding/i.test(message)) return "harness";
   if (/HARNESS UNAVAILABLE|tauri-driver|WebKit|xdotool|Openbox|window manager|DISPLAY/i.test(message)) return "infrastructure";
   if (/native confirmation|native close control|did not open|did not durably save|was not visible|inventory did not list/i.test(message)) return "product";
   return "ambiguous";
@@ -611,6 +647,7 @@ try {
   await clickButtonAndConfirm("Enable Tine-managed storage...", "enable-tine-managed-storage");
   await assertVisible("Tine-managed storage active", "active Tine-managed storage status");
   await closeSettings();
+  await leaseCurrentGraphBinding();
 
   phase = "sparse v2 existing-page conflict resolution";
   await openPageFromInventory(NESTED_PAGE);
