@@ -378,6 +378,11 @@ describe("PdfViewer resource safety", () => {
       expect(original.isConnected).toBe(true);
 
       (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      // The visible wrapper already owns optimistic scaling because the
+      // ordinary canvas is sized to 100% of it. A second inline transform
+      // would turn a 10% step into a transient 21% overshoot.
+      expect(pageElement.style.width).toBe("673.2px");
+      expect(original.style.transform).toBe("");
       await vi.advanceTimersByTimeAsync(120);
       await flush();
       expect(visiblePage.render).toHaveBeenCalledTimes(2);

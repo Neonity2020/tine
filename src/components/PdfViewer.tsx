@@ -819,8 +819,6 @@ export function PdfViewer(props: {
   function applyZoomTransform() {
     const s = scale();
     for (const n of visible) {
-      const view = pageRenderer?.getPageView(n);
-      const prev = view ? pdfPageViewScaleToTineScale(view.scale) : 0;
       const canvases = pageEls[n]?.querySelectorAll<HTMLCanvasElement>("canvas") ?? [];
       for (const canvas of canvases) {
         const tileScale = Number(canvas.dataset.pdfTileScale);
@@ -831,9 +829,12 @@ export function PdfViewer(props: {
           canvas.style.width = `${Number(canvas.dataset.pdfTileWidth) * ratio}px`;
           canvas.style.height = `${Number(canvas.dataset.pdfTileHeight) * ratio}px`;
           canvas.style.transform = "";
-        } else if (prev) {
-          canvas.style.transformOrigin = "top left";
-          canvas.style.transform = `scale(${s / prev})`;
+        } else {
+          // Ordinary canvases are width/height:100% of the wrapper. The wrapper
+          // was already resized above, so another scale transform would square
+          // the optimistic zoom step (1.1 -> 1.21) until the settled raster.
+          canvas.style.transformOrigin = "";
+          canvas.style.transform = "";
         }
       }
     }

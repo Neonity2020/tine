@@ -77,6 +77,22 @@ describe("pane geometry", () => {
     });
   });
 
+  it("steps from an off-centre seam into its adjacent pane, not a perpendicular window edge", () => {
+    const root: LayoutNode = {
+      kind: "split",
+      dir: "row",
+      ratio: 0.4,
+      children: [
+        { kind: "pane", paneId: "left" },
+        { kind: "pane", paneId: "wide-right" },
+      ],
+    };
+
+    const seam: PaneTarget = { kind: "seam", path: [] };
+    expect(stepPaneTarget(root, { kind: "pane", paneId: "left" }, "right")).toEqual(seam);
+    expect(stepPaneTarget(root, seam, "right")).toEqual({ kind: "pane", paneId: "wide-right" });
+  });
+
   it("widens a FULL-span segment to the global edge too — nesting in the pane vs splitting the root differ (Martin's Jul 8 follow-up)", () => {
     // row [left, right]: left's LEFT segment spans the full window height,
     // yet Enter there nests a quarter-width column inside the left half while
