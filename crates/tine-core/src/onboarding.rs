@@ -1165,6 +1165,10 @@ mod tests {
         assert!(page.markdown.contains("- # Keep context visible"));
         assert!(page.markdown.contains("**Shift-click**"));
         assert!(page.markdown.contains("**Ctrl+Shift+T**"));
+        // The pane gesture is Alt+click on ordinary links (GH #438), not the
+        // pre-#283 Ctrl+click — pin the modal so the Guide can't drift back.
+        assert!(page.markdown.contains("**Alt+click**"));
+        assert!(!page.markdown.contains("**Ctrl+click**"));
         assert!(page.markdown.contains("+ New workspace"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("[[Start/Where things are]]"));
