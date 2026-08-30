@@ -1196,9 +1196,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/settings.rs", "fs.write", 1),
         ("src-tauri/src/settings.rs", "open.create_new", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 2),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.rename", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 4),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 1),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.rename", 4),
         ("src-tauri/src/sync_runtime.rs", "open.create_new", 1),
     ]
     .into_iter()
@@ -1321,7 +1322,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("put_complete", 2),
         ("provider_retire_original_into_placeholder", 1),
         ("write_config", 9),
-        ("atomic_update", 5),
+        ("atomic_update", 6),
         ("create_graph", 0),
         ("create_demo_graph", 1),
         ("reserve_restore_recovery", 2),

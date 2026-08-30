@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn r1a_adapter_cannot_author_checkpoint_markers() {
         let production = include_str!("checkpoint_generation.rs")
-            .split("\n#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
         for forbidden in [
@@ -286,7 +286,7 @@ mod tests {
                 .filter(|path| {
                     std::fs::read_to_string(path)
                         .unwrap()
-                        .split("\n#[cfg(test)]")
+                        .split("#[cfg(test)]\nmod tests")
                         .next()
                         .unwrap()
                         .contains(forbidden)
