@@ -735,6 +735,15 @@ pub(crate) fn load_graph_for_label(
             return Err(error);
         }
     };
+    if binding_record.is_none()
+        && state
+            .sync_runtime
+            .blank_slate_rebuild_pending(app, &root_key)?
+    {
+        // This includes a crash after archival and a prior automatic rebuild
+        // attempt that failed while Direct Files remained safely available.
+        rebuild_managed_after_direct = true;
+    }
     graph_load_phase(started, &mut previous, "private storage discovery");
     let mut lookup_finished = false;
     'managed: {
@@ -1637,9 +1646,13 @@ mod tests {
             .find("archive_unrecognized_private_state")
             .map(|offset| classification + offset)
             .expect("unrecognized private state archive");
-        let direct = body[archive..]
-            .find("Direct Files publish")
+        let durable_retry = body[archive..]
+            .find("blank_slate_rebuild_pending")
             .map(|offset| archive + offset)
+            .expect("durable automatic-rebuild retry intent");
+        let direct = body[durable_retry..]
+            .find("Direct Files publish")
+            .map(|offset| durable_retry + offset)
             .expect("safe Markdown/Org source publication");
         let unlock = body[direct..]
             .find("drop(_load)")
@@ -1650,7 +1663,11 @@ mod tests {
             .map(|offset| unlock + offset)
             .expect("automatic managed rebuild");
         assert!(
-            classification < archive && archive < direct && direct < unlock && unlock < rebuild
+            classification < archive
+                && archive < durable_retry
+                && durable_retry < direct
+                && direct < unlock
+                && unlock < rebuild
         );
         assert!(body[rebuild..].contains("Direct Files remains active"));
     }

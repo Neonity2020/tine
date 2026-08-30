@@ -43,6 +43,7 @@ static BINDING_WRITE: Mutex<()> = Mutex::new(());
 const DIRECT_SELECTION_SCHEMA_VERSION: u32 = 1;
 const DIRECT_SELECTION_DIR: &str = "storage-mode-selections";
 const DIRECT_SELECTION_FILE_SUFFIX: &str = ".direct-v1.json";
+const BLANK_SLATE_REBUILD_REASON: &str = "pre_0_7_blank_slate_rebuild_pending";
 static DIRECT_SELECTION_WRITE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -248,6 +249,19 @@ fn direct_selection_is_active_at(path: &Path, graph_root: &Path) -> Result<bool,
             Ok(true)
         }
     }
+}
+
+fn direct_selection_requests_blank_slate_rebuild_at(path: &Path, graph_root: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    matches!(
+        serde_json::from_slice::<DirectSelectionReceipt>(&bytes),
+        Ok(receipt)
+            if receipt.schema_version == DIRECT_SELECTION_SCHEMA_VERSION
+                && Path::new(&receipt.graph_root) == graph_root
+                && receipt.reason == BLANK_SLATE_REBUILD_REASON
+    )
 }
 
 fn publish_direct_selection(
@@ -1249,6 +1263,10 @@ impl SyncRuntimeFacade {
     ) -> Result<(), String> {
         let private = sparse_private_root(app, graph_root)?;
         let recovery = sparse_recovery_root(app)?;
+        // Publish the durable reconstruction intent before moving private
+        // state. A crash at any later cut therefore reopens the Markdown/Org
+        // tree in Direct Files and retries the automatic rebuild.
+        publish_direct_selection(app, graph_root, BLANK_SLATE_REBUILD_REASON)?;
         let archived = archive_private_root(&private, &recovery).map_err(|error| {
             format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
         })?;
@@ -1259,11 +1277,7 @@ impl SyncRuntimeFacade {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "nothing-to-archive".into())
         ));
-        publish_direct_selection(
-            app,
-            graph_root,
-            "superseded pre-0.7 managed state set aside",
-        )
+        Ok(())
     }
 
     pub(crate) fn prepare_binding_record(
@@ -1323,6 +1337,17 @@ impl SyncRuntimeFacade {
         graph_root: &Path,
     ) -> Result<bool, String> {
         direct_selection_is_active(app, graph_root)
+    }
+
+    pub(crate) fn blank_slate_rebuild_pending(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<bool, String> {
+        let path = direct_selection_path(app, graph_root)?;
+        Ok(direct_selection_requests_blank_slate_rebuild_at(
+            &path, graph_root,
+        ))
     }
 
     pub(crate) fn graph_meta(record: &SparseV2ActivationRecord) -> GraphMeta {
@@ -4030,6 +4055,31 @@ mod tests {
         let other = temp.path().join("other");
         let other_receipt = direct_selection_path_at(temp.path(), &other);
         assert!(!direct_selection_is_active_at(&other_receipt, &other).unwrap());
+    }
+
+    #[test]
+    fn blank_slate_rebuild_intent_is_durable_and_distinct_from_explicit_direct() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+
+        publish_direct_selection_at(&receipt, &graph, BLANK_SLATE_REBUILD_REASON).unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(direct_selection_requests_blank_slate_rebuild_at(
+            &receipt, &graph
+        ));
+
+        publish_direct_selection_at(&receipt, &graph, "emergency_return").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(!direct_selection_requests_blank_slate_rebuild_at(
+            &receipt, &graph
+        ));
+
+        std::fs::write(&receipt, b"{").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(!direct_selection_requests_blank_slate_rebuild_at(
+            &receipt, &graph
+        ));
     }
 
     #[test]

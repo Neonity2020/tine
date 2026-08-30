@@ -1111,9 +1111,13 @@ A refusal propagates through the managed-open failure channel as a named notice
 graph-open boundary treats that exact protocol-incompatible marker, and an
 unrecognized outer binding, identically: archive the whole private root,
 publish Direct Files as the intact source, and automatically construct and
-publish the current managed store. If reconstruction itself fails, Direct
-Files remains serving and the failure is retained in diagnostics. This is one
-current format, not a compatibility reader or migration.
+publish the current managed store. The Direct Files selector durably records
+that this is a pending blank-slate rebuild before private state is moved, so a
+crash at any later cut or a failed first reconstruction retries automatically
+on the next open. If reconstruction itself fails, Direct Files remains serving
+and the failure is retained in diagnostics. An explicit or emergency Direct
+Files selection does not request this retry. This is one current format, not a
+compatibility reader or migration.
 
 #### Explicit target kind on intent and completion records
 
