@@ -99,7 +99,7 @@ pub(crate) fn sync_filesystem_containing(directory: &Dir) -> io::Result<()> {
 /// than reporting a real I/O failure. Android vendor filesystems deny
 /// filesystem-wide flush on app-private storage even where per-file flush
 /// works; every other errno stays fatal.
-#[cfg(target_os = "android")]
+#[cfg(any(test, target_os = "android"))]
 pub(crate) fn is_capability_refusal(error: &io::Error) -> bool {
     android_filesystem_sync_may_fallback(error.kind())
 }

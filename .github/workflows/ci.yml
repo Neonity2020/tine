@@ -27,6 +27,7 @@ on:
           - full
           - windows
           - android
+          - android-compile
           - android-runtime
           - android-ui-runtime
           - android-ui-runtime-205
@@ -389,7 +390,7 @@ jobs:
 
   android-core-compile:
     name: Full CI / Android core compile
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-compile')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -408,6 +409,10 @@ jobs:
           echo "CC_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+      - name: Android durability fallback policy unit tests (host-executable seams)
+        run: |
+          cargo test -p tine-core --lib android_group_commit -- --nocapture
+          cargo test -p tine-core --lib android_promoted_receipt -- --nocapture
       - name: Android core compiles against Android libc declarations
         run: cargo check -p tine-core --target aarch64-linux-android
       # tine-core alone cannot see `#[cfg(target_os = "android")]` code in the

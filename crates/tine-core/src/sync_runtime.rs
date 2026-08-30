@@ -36596,8 +36596,8 @@ mod tests {
             .expect("temporary publication follows existing-name admission");
         assert!(
             publisher[existing_retry_start..temporary_start]
-                .contains("retry_promoted_receipt_barrier_if_needed(dir)"),
-            "an existing promoted receipt name must repay a recorded strict-barrier debt"
+                .contains("verify_promoted_receipt_parent(dir)"),
+            "a process must verify the promoted parent before accepting an existing receipt name"
         );
 
         let intent_namespace_start = source
@@ -36609,27 +36609,38 @@ mod tests {
             .expect("end of per-intent namespace opener");
         let intent_namespace = &source[intent_namespace_start..intent_namespace_end];
         assert!(intent_namespace.contains("if create"));
-        assert!(intent_namespace.contains("retry_promoted_receipt_barrier_if_needed(&parent)"));
+        assert!(intent_namespace.contains("verify_promoted_receipt_parent(&parent)"));
 
-        let debt_sync_start = source
+        let verification_sync_start = source
             .find("fn sync_promoted_receipt_directory(")
-            .expect("strict receipt barrier debt recorder");
-        let debt_retry_start = source[debt_sync_start..]
-            .find("fn retry_promoted_receipt_barrier_if_needed(")
-            .map(|offset| debt_sync_start + offset)
-            .expect("strict receipt barrier debt retry");
-        let helper_end = source[debt_retry_start..]
+            .expect("strict receipt barrier recorder");
+        let verification_existing_start = source[verification_sync_start..]
+            .find("fn verify_promoted_receipt_parent(")
+            .map(|offset| verification_sync_start + offset)
+            .expect("strict existing-parent verifier");
+        let helper_end = source[verification_existing_start..]
             .find("\nfn ensure_directory_nofollow_with_durability(")
-            .map(|offset| debt_retry_start + offset)
-            .expect("end of receipt barrier debt helpers");
-        let recorder = &source[debt_sync_start..debt_retry_start];
+            .map(|offset| verification_existing_start + offset)
+            .expect("end of receipt barrier verification helpers");
+        let recorder = &source[verification_sync_start..verification_existing_start];
         assert!(recorder.contains("sync_dir_required(directory)"));
-        assert!(recorder.contains("debts.insert(identity)"));
-        let retry = &source[debt_retry_start..helper_end];
-        assert!(retry.contains("if !debts.contains(&identity)"));
-        assert!(retry.contains("return Ok(())"));
-        assert!(retry.contains("sync_dir_required(directory)"));
-        assert!(retry.contains("debts.remove(&identity)"));
+        assert!(recorder.contains("record_mutation_barrier"));
+        let verifier = &source[verification_existing_start..helper_end];
+        assert!(verifier.contains("verify_existing"));
+        assert!(verifier.contains("sync_dir_required(directory)"));
+
+        let state_start = source
+            .find("struct AndroidReceiptBarrierState")
+            .expect("Android receipt barrier verification state");
+        let state_end = source[state_start..]
+            .find("fn android_receipt_barrier_state(")
+            .map(|offset| state_start + offset)
+            .expect("end of Android receipt barrier verification state");
+        let state = &source[state_start..state_end];
+        assert!(state.contains("verified_parents"));
+        assert!(state.contains(".remove(&identity)"));
+        assert!(state.contains("barrier()?"));
+        assert!(state.contains(".insert(identity)"));
 
         let cleanup_start = source
             .find("fn open_receipt_namespaces(")

@@ -2128,7 +2128,7 @@ boundary, not by platform or by syscall alone:
 | Receipt publication | Durability class | Android capability refusal | Required response |
 | --- | --- | --- | --- |
 | Initialization claim, top-level namespaces, pending-cleanup namespace and rounds, their initialization authority/state, and store claim while initializing an empty receipt store; these artifacts alone carry no operation authority | Reconstructible bootstrap | The exact file bytes remain synced; `PermissionDenied`/`Unsupported`/`InvalidInput` from the parent-directory barrier may degrade | During first activation, retry may archive one diagnostic tree and reconstruct it from unchanged Direct Files. A promoted reopen may recreate only this empty initialization structure; nonempty claimless state is refused. |
-| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | A crash or power loss could otherwise lose a supposedly durable receipt name. Refuse the publication and keep the accepted operation pending/recoverable. If a refusal happened after the name became visible, only that process and parent directory retain a barrier debt; an idempotent retry must repay it before reporting success, while ordinary existing-name reads pay no barrier. |
+| Base, intent, attempt, mutation authority, completion, cleanup, forensic evidence, or any operational namespace after the store is opened for use | `PrivateDurableAuthority` | Never degrade, including on Android | A crash or power loss could otherwise lose a supposedly durable receipt name. Refuse the publication and keep the accepted operation pending/recoverable. Before the first create/recovery acceptance under each promoted parent in every process, establish one strict parent barrier. A successful mutation barrier verifies that parent for later exact names in the same process; a refusal or panic removes verification. Thus a process death cannot erase debt, while read-only inspection and later same-process names pay no extra barrier. |
 
 `ProjectionReceiptStore::initialize` passes the first row's durability phase
 through both the top-level helpers and the nested pending-cleanup initializer;
@@ -2141,7 +2141,17 @@ reconstructible, but the first operational receipt refuses: managed storage is
 not usable without durability for its private authority. A promoted store that
 has lost only its nested empty pending-cleanup initialization structure also
 rebuilds that structure strictly and may refuse during open; it never discards
-or silently reconstructs operational receipt authority.
+or silently reconstructs operational receipt authority. The verification set
+starts empty in every process. Consequently an exact name left visible by a
+refused barrier is never accepted after restart merely because the in-memory
+record of that refusal disappeared; its parent is synchronized first.
+
+The analogous Android early returns in `object_store::ensure_directory_nofollow`
+and `enrollment::open_component` do not carry this promoted-receipt policy.
+Object-store uses are fixed bootstrap namespaces or explicitly disposable
+indexes, and enrollment creates its component chain before promotion while its
+promoted reader uses `create=false`. They therefore retain the reconstructible
+bootstrap policy rather than acquiring receipt authority semantics.
 
 Before an enrollment binding exists, the empty receipt store's initialization
 artifacts are reconstructible bootstrap state rather than authority; no

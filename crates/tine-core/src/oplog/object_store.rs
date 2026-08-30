@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
+#[cfg(any(test, target_os = "android"))]
+use std::io;
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
@@ -7201,7 +7203,24 @@ impl ArchiveBatchPublication {
     /// manifest install and before the journal checkpoint can advance.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn barrier_staged_data(&self) -> Result<(), StoreError> {
-        match crate::filesystem_durability::sync_filesystem_containing(&self.archive) {
+        let result = crate::filesystem_durability::sync_filesystem_containing(&self.archive);
+        #[cfg(target_os = "android")]
+        {
+            return self.finish_android_staged_data_barrier(result);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            result.map_err(Into::into)
+        }
+    }
+
+    /// Android app-private storage can deny `syncfs` while still supporting
+    /// exact file durability. Keep the branch host-executable so its selection
+    /// and exact staged-file fallback are unit-tested rather than merely
+    /// cross-compiled.
+    #[cfg(any(test, target_os = "android"))]
+    fn finish_android_staged_data_barrier(&self, result: io::Result<()>) -> Result<(), StoreError> {
+        match result {
             Ok(()) => Ok(()),
             // Android app-private storage on some vendor filesystems denies the
             // filesystem-wide flush while permitting per-file flush. Falling
@@ -7209,7 +7228,6 @@ impl ArchiveBatchPublication {
             // batch exists to avoid, but it is a correct durability point and
             // it keeps managed storage available on those devices. Every other
             // errno is a real I/O failure and stays fatal.
-            #[cfg(target_os = "android")]
             Err(error) if crate::filesystem_durability::is_capability_refusal(&error) => {
                 for artifact in &self.staged {
                     let name = match self.namespaces[artifact.namespace]
@@ -7250,6 +7268,79 @@ impl Drop for ArchiveBatchPublication {
         for artifact in &self.staged {
             let _ = self.namespaces[artifact.namespace].remove_file(&artifact.temp_name);
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_batch_android_fallback_tests {
+    use super::*;
+    use crate::durability_counters::{Barrier, BarrierSession};
+
+    #[test]
+    fn android_group_commit_capability_refusal_flushes_every_exact_staged_file() {
+        let root =
+            std::env::temp_dir().join(format!("tine-android-archive-fallback-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        let archive = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let objects = open_dir_nofollow(&archive, "objects").unwrap();
+        let mut publication = ArchiveBatchPublication::strict(&archive).unwrap();
+        let namespace = publication.namespace(&objects).unwrap();
+        publication
+            .stage(
+                namespace,
+                "first",
+                b"first exact staged object",
+                1024,
+                Collision::Exact("test object"),
+                false,
+            )
+            .unwrap();
+        publication
+            .stage(
+                namespace,
+                "second",
+                b"second exact staged object",
+                1024,
+                Collision::Exact("test object"),
+                false,
+            )
+            .unwrap();
+
+        let barriers = BarrierSession::begin();
+        publication
+            .finish_android_staged_data_barrier(Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "simulated Android syncfs capability refusal",
+            )))
+            .unwrap();
+        assert_eq!(barriers.counts().get(Barrier::File), 2);
+        BarrierSession::detach_current_thread();
+
+        assert!(objects.symlink_metadata("first").is_err());
+        assert!(objects.symlink_metadata("second").is_err());
+        drop(publication);
+        drop(objects);
+        drop(archive);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn android_group_commit_does_not_hide_a_real_io_failure() {
+        let root =
+            std::env::temp_dir().join(format!("tine-android-archive-real-io-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let archive = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let publication = ArchiveBatchPublication::strict(&archive).unwrap();
+        let error = publication
+            .finish_android_staged_data_barrier(Err(io::Error::new(
+                ErrorKind::WriteZero,
+                "simulated media failure",
+            )))
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Io(error) if error.kind() == ErrorKind::WriteZero));
+        drop(publication);
+        drop(archive);
+        crate::test_support::remove_dir_all(root);
     }
 }
 

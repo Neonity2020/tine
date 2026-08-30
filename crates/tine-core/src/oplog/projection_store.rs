@@ -13,9 +13,11 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::RwLock;
+#[cfg(any(test, target_os = "android"))]
+use std::sync::Mutex;
 #[cfg(target_os = "android")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::RwLock;
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -249,13 +251,64 @@ enum ReceiptDirectoryDurability {
     PromotedAuthority,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(test, target_os = "android"))]
 type AndroidReceiptDirectoryIdentity = (u64, u64);
 
+#[cfg(any(test, target_os = "android"))]
+#[derive(Debug, Default)]
+struct AndroidReceiptBarrierState {
+    verified_parents: Mutex<BTreeSet<AndroidReceiptDirectoryIdentity>>,
+}
+
+#[cfg(any(test, target_os = "android"))]
+impl AndroidReceiptBarrierState {
+    fn record_mutation_barrier<E>(
+        &self,
+        identity: AndroidReceiptDirectoryIdentity,
+        barrier: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        // A namespace mutation invalidates the process-local proof before the
+        // barrier runs. If the barrier refuses or panics, this process and a
+        // future process both have to verify the parent before accepting an
+        // exact existing name.
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&identity);
+        barrier()?;
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity);
+        Ok(())
+    }
+
+    fn verify_existing<E>(
+        &self,
+        identity: AndroidReceiptDirectoryIdentity,
+        barrier: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self
+            .verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&identity)
+        {
+            return Ok(());
+        }
+        barrier()?;
+        self.verified_parents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(identity);
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "android")]
-fn android_receipt_barrier_debts() -> &'static Mutex<BTreeSet<AndroidReceiptDirectoryIdentity>> {
-    static DEBTS: OnceLock<Mutex<BTreeSet<AndroidReceiptDirectoryIdentity>>> = OnceLock::new();
-    DEBTS.get_or_init(|| Mutex::new(BTreeSet::new()))
+fn android_receipt_barrier_state() -> &'static AndroidReceiptBarrierState {
+    static STATE: OnceLock<AndroidReceiptBarrierState> = OnceLock::new();
+    STATE.get_or_init(AndroidReceiptBarrierState::default)
 }
 
 #[cfg(target_os = "android")]
@@ -273,37 +326,14 @@ fn android_receipt_directory_identity(
 #[cfg(target_os = "android")]
 fn sync_promoted_receipt_directory(directory: &Dir) -> Result<(), StoreError> {
     let identity = android_receipt_directory_identity(directory)?;
-    let mut debts = android_receipt_barrier_debts()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match sync_dir_required(directory) {
-        Ok(()) => {
-            debts.remove(&identity);
-            Ok(())
-        }
-        Err(error) => {
-            debts.insert(identity);
-            Err(error)
-        }
-    }
+    android_receipt_barrier_state()
+        .record_mutation_barrier(identity, || sync_dir_required(directory))
 }
 
 #[cfg(target_os = "android")]
-fn retry_promoted_receipt_barrier_if_needed(directory: &Dir) -> Result<(), StoreError> {
+fn verify_promoted_receipt_parent(directory: &Dir) -> Result<(), StoreError> {
     let identity = android_receipt_directory_identity(directory)?;
-    let mut debts = android_receipt_barrier_debts()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !debts.contains(&identity) {
-        return Ok(());
-    }
-    match sync_dir_required(directory) {
-        Ok(()) => {
-            debts.remove(&identity);
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    android_receipt_barrier_state().verify_existing(identity, || sync_dir_required(directory))
 }
 
 fn ensure_directory_nofollow_with_durability(
@@ -537,14 +567,15 @@ fn publish_android_private_immutable(
 
     // A failed strict directory barrier may leave the exact final name in the
     // page cache and namespace even though its insertion is not crash-durable.
-    // Retry must re-establish that barrier before accepting byte-identical
-    // publication; otherwise repeated turns would eventually skip every
-    // refusal and falsely report a durable promoted receipt. Bootstrap state
-    // remains deliberately reconstructible and needs no such retry barrier.
+    // The first promoted acceptance for each parent in every process therefore
+    // establishes a barrier before accepting byte-identical publication. That
+    // closes both same-process retry and process-death windows without adding a
+    // barrier to later accepted names under the same unchanged parent.
+    // Bootstrap state remains deliberately reconstructible.
     let accept_existing = || -> Result<bool, StoreError> {
         let exists = verify_existing()?;
         if exists && matches!(durability, ReceiptDirectoryDurability::PromotedAuthority) {
-            retry_promoted_receipt_barrier_if_needed(dir)?;
+            verify_promoted_receipt_parent(dir)?;
         }
         Ok(exists)
     };
@@ -2990,13 +3021,15 @@ impl ProjectionReceiptStore {
             }
             Ok(_) => {
                 // On Android a prior strict mkdir barrier can refuse after the
-                // directory entry became visible. A create/recovery retry must
-                // complete that barrier before accepting the existing name;
-                // read-only inspection does not mutate and pays no barrier.
-                // See storage-sync-contract.md §2.10c.
+                // directory entry became visible, then the process can die
+                // before recording that refusal. The first create/recovery use
+                // of this parent in every process therefore establishes one
+                // strict barrier before accepting an existing name. Read-only
+                // inspection does not mutate and pays no barrier. See
+                // storage-sync-contract.md §2.10c.
                 #[cfg(target_os = "android")]
                 if create {
-                    retry_promoted_receipt_barrier_if_needed(&parent)?;
+                    verify_promoted_receipt_parent(&parent)?;
                 }
                 return Ok(Some(open_dir_nofollow(&parent, &name)?));
             }
@@ -5213,12 +5246,82 @@ fn endpoint_binding_bytes(binding: ProjectionEndpointBinding) -> Vec<u8> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::oplog::{
         DocumentId, FrontierV2, LineageDigest, ObjectStore, PageId, ShardedHotEngine,
     };
 
     use super::*;
+
+    #[test]
+    fn android_promoted_receipt_revalidates_an_existing_parent_after_process_restart() {
+        let identity = (17, 29);
+        let first_process = AndroidReceiptBarrierState::default();
+        first_process
+            .record_mutation_barrier(identity, || Err::<(), _>(io::Error::other("refused")))
+            .unwrap_err();
+
+        // A new process has no inherited in-memory debt. It must still prove
+        // the parent directory durable before accepting an exact visible name.
+        let next_process = AndroidReceiptBarrierState::default();
+        let barriers = AtomicUsize::new(0);
+        next_process
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 1);
+
+        next_process
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(
+            barriers.load(Ordering::SeqCst),
+            1,
+            "one successful parent barrier covers later exact names in that process"
+        );
+    }
+
+    #[test]
+    fn android_promoted_receipt_refusal_or_panic_never_marks_the_parent_verified() {
+        let identity = (31, 37);
+        let state = AndroidReceiptBarrierState::default();
+        let barriers = AtomicUsize::new(0);
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("refused"))
+            })
+            .unwrap_err();
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 2);
+
+        let panic_result = std::panic::catch_unwind(|| {
+            state
+                .record_mutation_barrier(identity, || -> Result<(), io::Error> {
+                    panic!("cut after namespace mutation and before verification insertion")
+                })
+                .unwrap();
+        });
+        assert!(panic_result.is_err());
+        state
+            .verify_existing(identity, || {
+                barriers.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        assert_eq!(barriers.load(Ordering::SeqCst), 3);
+    }
 
     struct Fixture {
         root: PathBuf,

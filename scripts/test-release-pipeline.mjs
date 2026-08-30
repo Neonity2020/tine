@@ -810,7 +810,15 @@ const performanceBench = yamlBlock(ciJobs, "bench", 2);
 assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
 assert.equal(
   yamlScalar(androidCompile, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')"
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-compile')"
+);
+assert.match(
+  yamlNamedStep(
+    androidCompile,
+    "Android durability fallback policy unit tests (host-executable seams)",
+  ).join("\n"),
+  /android_group_commit[\s\S]*android_promoted_receipt/,
+  "the focused Android compile lane must execute both host-testable durability branches",
 );
 assert.equal(
   yamlScalar(androidManagedRuntime, "name", 4),

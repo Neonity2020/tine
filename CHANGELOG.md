@@ -68,9 +68,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   for promoted managed-storage projection receipts.** Only the receipt store's
   pre-enrollment initialization remains reconstructible; bases, intents,
   attempts, mutation authority, completions, cleanup, and forensic records now
-  keep strict private-authority barriers on every platform. An idempotent retry
-  repays a recorded barrier refusal before accepting an existing receipt name
-  or operational namespace, without adding barriers to ordinary reads. Android
+  keep strict private-authority barriers on every platform. Each process now
+  verifies a promoted parent once before accepting an existing receipt name or
+  operational namespace, so a crash cannot erase knowledge of a refused
+  barrier; later same-process names and ordinary reads add no barrier. Android
   devices that cannot provide app-private directory durability may initialize
   the reconstructible empty store, but managed operations now refuse rather
   than claiming unsafe success.
