@@ -121,6 +121,8 @@ methods=(
 )
 if [[ "${TINE_ANDROID_UI_RUNTIME_ONLY:-}" == "205" ]]; then
   methods=(responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent)
+elif [[ "${TINE_ANDROID_UI_RUNTIME_ONLY:-}" == "pdf-routes" ]]; then
+  methods=(generatedDirectFilesPdfRouteHonorsHardwareBackHistory)
 fi
 
 overall=0

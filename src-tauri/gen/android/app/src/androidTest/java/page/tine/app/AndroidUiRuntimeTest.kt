@@ -380,7 +380,7 @@ class AndroidUiRuntimeTest {
       stages.put(returned)
 
       val receipt = JSONObject()
-        .put("journey", "443-route-owned-pdf-android-back")
+        .put("journey", "route-owned-pdf-android-back")
         .put("storageMode", "Direct Files")
         .put("fixtureOwner", "app-private generated demo graph")
         .put("sourceRoute", sourceRoute)
