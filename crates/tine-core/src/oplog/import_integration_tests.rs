@@ -11,13 +11,14 @@ use crate::oplog::operational_coordinator::{CleanLocalMutationState, Operational
 use crate::oplog::projection::render_requested_page_document;
 use crate::oplog::sqlite::{LeasedWorkspaceProjection, ProjectionClaim, WorkspaceRuntimeLease};
 use crate::oplog::{
-    classify_conflict_copy, inventory_affected, inventory_initial_shadow, BlobDescription, BlockId,
-    BlockLocation, BlockMatchBasis, DeviceId, DocumentId, ImportBlockReason, ImportPlan,
-    ImportPlanStatus, LineageDigest, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
-    ManagedTextKind, MaterializationStats, MaterializedBlock, MaterializedPage, ObjectStore,
-    OperationTransaction, PageId, PageMatchBasis, ProjectionEndpointBinding, ProjectionEndpointId,
-    ProjectionReceiptStore, RawObservation, ReferenceCatalogPolicyV1, RejectedRawIdReason,
-    SemanticOperation, SessionId, ShardedHotEngine, WorkspaceId,
+    classify_conflict_copy, inventory_affected, inventory_initial_shadow, AuthorBatch, BatchOrigin,
+    BlobDescription, BlockId, BlockLocation, BlockMatchBasis, CrdtPeerId, DeviceId, DocumentId,
+    ImportBlockReason, ImportPlan, ImportPlanStatus, LineageDigest, LogseqIdentityOrigin,
+    LogseqUuid, ManagedPath, ManagedTextKind, MaterializationStats, MaterializedBlock,
+    MaterializedPage, ObjectStore, OperationTransaction, PageId, PageMatchBasis, PreparedBatch,
+    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore, RawObservation,
+    ReferenceCatalogPolicyV1, RejectedRawIdReason, SemanticOperation, SessionId, ShardedHotEngine,
+    ValidatedBatch, WorkspaceId,
 };
 use crate::Graph;
 use std::ops::Deref;
@@ -382,6 +383,32 @@ impl AuthorityFixture {
         }
     }
 
+    fn prepare_transaction(
+        &self,
+        transaction: &OperationTransaction,
+        batch: u128,
+        peer: u64,
+    ) -> PreparedBatch {
+        let author = AuthorBatch {
+            batch_id: crate::oplog::BatchId::from_uuid(uuid(batch)),
+            author_device_id: DeviceId::from_uuid(uuid(101)),
+            author_session_id: SessionId::from_uuid(uuid(batch + 10_000)),
+            crdt_peer_id: CrdtPeerId::from_u64(peer),
+        };
+        let draft = self
+            .engine
+            .draft_author_transaction(author, BatchOrigin::LocalMutation, transaction)
+            .unwrap();
+        self.engine
+            .finalize_author_transaction(
+                draft,
+                &self.graph,
+                &self.receipts,
+                self.engine.0.endpoint(),
+            )
+            .unwrap()
+    }
+
     fn delete_and_project(&mut self, page: usize, _seed: u128) {
         let authority = &self.pages[page];
         let transaction = OperationTransaction::new(vec![SemanticOperation::DeletePage {
@@ -495,6 +522,88 @@ fn ordinary_clean_save_and_move_never_reconstruct_the_accepted_frontier() {
         0,
         "an ordinary cross-page move must use the current accepted state"
     );
+}
+
+#[test]
+fn concurrent_same_page_fallback_never_publishes_the_stale_local_draft_as_current() {
+    let pages = || {
+        vec![PageSpec {
+            path: "pages/concurrent.md".into(),
+            blocks: vec![
+                BlockSpec::root("local base", "a"),
+                BlockSpec::root("remote base", "b"),
+            ],
+            name: Some("Concurrent".into()),
+            preamble: None,
+        }]
+    };
+    let mut fixture = AuthorityFixture::new("concurrent-local-author", pages());
+    let remote_fixture = AuthorityFixture::new("concurrent-remote-author", pages());
+    let page = &fixture.pages[0];
+    let local_transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: page.block_ids[0],
+            home_document_id: page.home_document_id,
+        },
+        content: "local winner".into(),
+    }])
+    .unwrap();
+    let remote_transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: page.block_ids[1],
+            home_document_id: page.home_document_id,
+        },
+        content: "remote winner".into(),
+    }])
+    .unwrap();
+
+    // Finalize the local author first so its retained page outcome predates
+    // the independently authored, same-page remote acceptance.
+    let local = fixture.prepare_transaction(&local_transaction, 0x1450, 0x1450);
+    let local_batch = local.manifest().batch_id();
+    let remote = remote_fixture.prepare_transaction(&remote_transaction, 0x1451, 0x1451);
+    let page_id = page.page_id;
+
+    let mut session = fixture
+        .engine
+        .0
+        .admit_clean_mutation(&fixture.graph)
+        .unwrap();
+    let (_, engine, _) = session.parts().unwrap();
+    assert!(matches!(
+        engine
+            .stage_ready(ValidatedBatch::new(remote))
+            .disposition(),
+        crate::oplog::BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        engine.stage_ready(ValidatedBatch::new(local)).disposition(),
+        crate::oplog::BatchDisposition::Accepted { .. }
+    ));
+    let root = engine.accepted_frontier_root().unwrap();
+    let immutable = engine
+        .accepted_root_materializer(&root)
+        .unwrap()
+        .materialize_page(page_id)
+        .unwrap()
+        .unwrap();
+    let selected = match engine.accepted_author_projection_outcome(
+        local_batch,
+        root.state_digest(),
+        page_id,
+    ) {
+        Some(page) => page,
+        None => engine
+            .accepted_root_materializer(&root)
+            .unwrap()
+            .materialize_page(page_id)
+            .unwrap(),
+    }
+    .unwrap();
+
+    assert_eq!(selected, immutable);
+    assert_eq!(selected.blocks[0].content, "local winner");
+    assert_eq!(selected.blocks[1].content, "remote winner");
 }
 
 /// Paired bootstrap/steady-state fixture constructor. The exact source bytes

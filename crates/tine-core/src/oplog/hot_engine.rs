@@ -13820,7 +13820,27 @@ impl ShardedHotEngine {
             .borrow_mut()
             .take()
             .expect("matching pending author documents exist");
-        if matches!(disposition, BatchDisposition::Accepted { .. }) {
+        // The retained page outcomes are safe only when every prospective
+        // document is the exact causal document now named by the accepted
+        // root. A same-page concurrent acceptance adds causal counters even
+        // when this batch itself still becomes the direct head, so it cannot
+        // accidentally bind the stale author draft to the merged root.
+        let projection_matches_accepted =
+            pending.documents.iter().all(|(document_id, document)| {
+                let Ok(Some(dependencies)) =
+                    self.accepted_frontier_document(&self.accepted_frontier_root, *document_id)
+                else {
+                    return false;
+                };
+                canonical_peer_counters(&document.oplog_vv()).is_ok_and(|counters| {
+                    counters == dependencies.peer_counters()
+                        && dependencies
+                            .direct_dependency_heads()
+                            .binary_search(&batch_id)
+                            .is_ok()
+                })
+            });
+        if matches!(disposition, BatchDisposition::Accepted { .. }) && projection_matches_accepted {
             *self.accepted_author_projection_pages.borrow_mut() =
                 Some(AcceptedAuthorProjectionPages {
                     batch_id,
@@ -24414,6 +24434,10 @@ impl ShardedHotEngine {
         event_binding_digest: Option<ContentDigest>,
         claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<BatchApplication, EngineError> {
+        // A retained result belongs to exactly one accepted transition. Any
+        // later admission starts from a cache miss until it independently
+        // establishes another exact accepted-document match.
+        self.accepted_author_projection_pages.borrow_mut().take();
         let mut phase_started = self.replay_timing_started();
         let batch = self
             .archive
