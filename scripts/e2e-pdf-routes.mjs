@@ -231,8 +231,9 @@ try {
     notesOpenedInStructuralCompanion: true,
   };
 
-  // View position is stored by the reader sidecar; pane/tab layout is stored by
-  // the explicit route session. Wait for both debounces before a clean relaunch.
+  // Each tab's page/zoom and pane layout are stored by the explicit route
+  // session; the reader sidecar remains only the default for a newly opened
+  // view. Wait for both persistence debounces before a clean relaunch.
   await sleep(4500);
   assert(fs.existsSync(sessionPath), `route session was not persisted at ${sessionPath}`);
   await stop();

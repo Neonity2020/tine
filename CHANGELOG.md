@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **PDFs are now ordinary pane tabs instead of a separate global side pane.**
+  Opening a graph PDF on desktop preserves the source and uses one reusable
+  companion pane; the PDF tab can be moved into any existing pane, split, or
+  quadrant, and its Notes action opens the `hls__` page in the structural
+  companion. Workspaces restore the layout and each PDF tab's page/zoom, while
+  legacy dedicated-pane sessions migrate without losing their existing panes.
+  Android keeps one route surface and Back returns through Notes, PDF, and the
+  source page in order.
+
 - **Declarative themes can now shape reading presentation without running code.**
   Theme API 0.2 adds bounded Tine-owned presets for editorial serif typography,
   journal headers, and a Today task summary, while existing color-only 0.1
@@ -21,6 +30,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Re-apply, and Keep deletion map directly to the recorded backend actions;
   failed restores retain their cause and can be re-run, while dismissing the
   warning or closing the panel never records a deletion decision.
+
+### Changed
+
+- **PDF rendering now uses PDF.js's maintained page-view lifecycle under one
+  window-wide admission and canvas-memory budget.** Visible/focused pages win
+  scheduling, stale work is cancelled, evicted views synchronously release
+  their backing stores, and a tab cannot multiply the old per-view resource
+  ceilings. This is the substrate for tile-aware high-zoom rendering (GH #393).
 
 ### Fixed
 
