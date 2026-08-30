@@ -177,6 +177,31 @@ describe("high-zoom PDF tile renderer", () => {
     renderer.dispose();
   });
 
+  it("reports a failed tile once without trapping the coordinator in a RUNNING retry loop", async () => {
+    const { page, renders } = controlledPage();
+    const onRenderError = vi.fn();
+    const renderer = new PdfTileRenderer({
+      coordinator: new PdfRenderCoordinator(1_000_000, 500_000),
+      onRenderError,
+    });
+    renderer.requestPage({
+      pageNumber: 7,
+      page,
+      host: document.createElement("div"),
+      scale: 4,
+      pageWidth: 4000,
+      pageHeight: 4800,
+      visibleRect: { left: 0, top: 0, width: 200, height: 200 },
+    });
+    await turns();
+    renders[0].done.reject(new Error("broken operator list"));
+    await turns(12);
+
+    expect(onRenderError).toHaveBeenCalledOnce();
+    expect(renders).toHaveLength(1);
+    renderer.dispose();
+  });
+
   it("captures from a dedicated clipped render and tolerates a null PNG blob", async () => {
     const { page, renders } = controlledPage();
     const renderer = new PdfTileRenderer({

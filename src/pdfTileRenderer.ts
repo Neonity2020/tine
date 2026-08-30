@@ -169,7 +169,18 @@ class PdfTileView implements PdfRenderableView {
         };
       }
     };
-    await renderTask.promise;
+    try {
+      await renderTask.promise;
+    } catch (error) {
+      this.renderTask = null;
+      this.resume = null;
+      zeroCanvas(canvas);
+      if (this.canvas === canvas) this.canvas = null;
+      // A permanent failure must not leave the shared coordinator repeatedly
+      // admitting a RUNNING task whose promise has already rejected.
+      if (!this.disposed) this.renderingState = PDF_RENDERING_FINISHED;
+      throw error;
+    }
     this.renderTask = null;
     this.resume = null;
     if (this.disposed || !this.options.isCurrent()) {
@@ -354,6 +365,7 @@ export class PdfTileRenderer {
     if (!generation || !generation.requestedKeys.size) return false;
     return [...generation.requestedKeys].every((key) =>
       this.tasks.get(key)?.renderingState === PDF_RENDERING_FINISHED
+      && this.tasks.get(key)?.canvas !== null
     );
   }
 
@@ -446,7 +458,8 @@ export class PdfTileRenderer {
     const generation = this.generations.get(pageNumber);
     if (!generation) return;
     for (const key of generation.requestedKeys) {
-      if (this.tasks.get(key)?.renderingState !== PDF_RENDERING_FINISHED) return;
+      const task = this.tasks.get(key);
+      if (task?.renderingState !== PDF_RENDERING_FINISHED || !task.canvas) return;
     }
     // The sharper requested set is now complete. Only now remove lower-scale
     // and offscreen tiles, so zoom and scroll never replace content with blank.
