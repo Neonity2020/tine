@@ -575,6 +575,11 @@ assert.match(
 );
 assert.match(
   ciWorkflow,
+  /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- android-ui-runtime-pdf-routes/,
+  "manual CI does not expose the isolated PDF-route Android proof scope"
+);
+assert.match(
+  ciWorkflow,
   /pull_request:[\s\S]*?paths-ignore:[\s\S]*?"\*\*\/\*\.md"/,
   "docs-only pull requests still start app validation"
 );
@@ -853,7 +858,12 @@ assert.equal(
 );
 assert.equal(
   yamlScalar(androidUiRuntime, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205')"
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes')"
+);
+assert.match(
+  yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs").join("\n"),
+  /inputs\.scope == 'android-ui-runtime-pdf-routes'[\s\S]*?'pdf-routes'/,
+  "focused PDF-route Android proof scope must select only the native PDF Back journey"
 );
 assert.doesNotMatch(
   androidUiRuntime.join("\n"),
