@@ -122,6 +122,12 @@ Subsequent accepted operations must preserve the genesis binding. Test-only
 legacy fixtures are not an alternate activation marker or permission to admit
 a partially constructed candidate.
 
+The clean engine's resident document and document-head maps are bounded
+acceleration only. Evicting a document from either map does not turn an edited
+page back into lazy genesis: a cold point load derives its current direct heads
+from the complete accepted frontier and reconstructs the accepted suffix before
+another save or projection check.
+
 Production sharing likewise has one route: clean activation publishes a clean
 baseline descriptor and clean joining installs that exact baseline plus its
 manifest tail. The pre-0.7 share and join implementations compile only in
@@ -934,6 +940,14 @@ ambiguous baseline claims remain unresolved after reconstruction.
    Reconciliation databases, Patricia lookup indexes, and persistent
    projection-work indexes are retired formats: production neither opens nor
    rebuilds them.
+   An unsafe retained-runtime reopen after 800 accepted page edits on the
+   release corpus must finish within the manual gate's 5-second ceiling.
+   Recovery retains one coarse user-visible operation and its 10-second waiting
+   heartbeat, while native diagnostics emit ordered, content-free completion
+   boundaries for baseline authentication, receipt precheck, graph and endpoint
+   open, object-store validation, committed-tail replay, projection open,
+   indexes/sweeps, journal open/drain, terminal projection repair, and completion
+   flush. These observations confer no authority.
 4. Authoritative bytes are append-only or atomically replaced under an exact
    observed-generation/lease check. A cache cannot authorize oplog mutation or
    Markdown overwrite.

@@ -5498,6 +5498,27 @@
     "failBefore": "The sparse-overlay fixture was falsely diagnosed as corrupt because physical frontier rows were compared with total baseline-plus-overlay document count. The save/move counter observed two reconstruct_frontier calls during one ordinary local save because SQLite rematerialized the just-validated accepted event from immutable history. Independent review found that caching an original author draft after concurrent same-page reconciliation could bind stale page contents to the merged accepted root, including when a moved block retained a foreign immutable home outside the transaction's changed documents; the regression reproduced local winner plus remote base where immutable materialization contained local winner plus remote winner."
    },
    "notes": "MS-14 R0 isolates two independently releasable V1 corrections before any durable checkpoint format work. Full integrity now starts history validation from the authenticated lazy-genesis baseline and authenticates the sparse physical overlay at its actual row count, without weakening ordinary full-frontier equality. A one-batch, root-keyed local-author cache lets SQLite consume a retained page only when its complete projection frontier exactly matches the accepted root, including catalog, membership shard, and every borrowed immutable home; absent outcomes, concurrent reconciliation, restart, another batch/root, or any miss still use immutable history. The permanent counter pins zero reconstruct_frontier calls for ordinary save and cross-page move. The ignored fixed-20-page release harness measures both tail save latency and unsafe-reopen history growth with content-free open-stage attribution."
+  },
+  {
+   "id": "REG-MANAGED-SAVE-AFTER-HOT-DOCUMENT-EVICTION-20260830",
+   "title": "A managed page remains editable after unrelated pages evict its hot document",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::clean_foreground_page_can_be_saved_again_after_hot_document_eviction"
+    ],
+    "failBefore": "On the exact MS-15 base, 64 distinct page saves succeeded, but after the 65th page displaced the first document from the bounded hot set, a second save of the first page was refused during trusted-local predecessor capture because its manifested projection no longer matched the history-materialized deterministic rendering. The same second save passed when only 64 pages were involved."
+   },
+   "notes": "Discovered by the MS-15 anonymized-corpus recovery benchmark, then reduced to a content-independent 65-page synthetic fixture. The bounded cache had evicted both a CRDT document and its run-local head entry; the cold path mistook that cache miss for an untouched lazy-genesis document and omitted the accepted edit. A no-scratch clean runtime now recovers missing hot heads from its authoritative accepted frontier and reconstructs the exact accepted document tail. Projection and reconciliation checks remain unchanged. The corpus benchmark also excludes first-block replacements that would delete an externally imported id:: property: that is an intentional identity refusal, not a representative content edit."
   }
  ]
 }

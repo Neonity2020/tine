@@ -1400,6 +1400,13 @@ impl SyncRuntimeFacade {
                     managed_open_waiting_phase_name(*phase),
                     elapsed.as_millis()
                 )),
+                SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed } => {
+                    crate::debug::diag(format!(
+                        "managed storage open: recovery_stage={} elapsed_ms={}",
+                        stage.diagnostic_name(),
+                        elapsed.as_millis()
+                    ))
+                }
                 SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics } => {
                     crate::debug::diag(format!(
                             "managed storage open: recovery={} retention={} retained_runs={} resume_candidate={} detached_bootstrap_reconstruction={} full_bootstrap_replay={} manifests={} manifest_enumeration_ms={} resume_selection_ms={} bootstrap_reconstruction_attempted={} bootstrap_reconstruction_ms={} engine_open_ms={} sqlite_open_ms={} tail_construction_ms={} total_ms={}",
@@ -4410,6 +4417,7 @@ mod tests {
                 .expect("managed open diagnostic end")];
         assert!(open.contains("managed_open_phase_name(*phase)"));
         assert!(open.contains("managed_open_waiting_phase_name(*phase)"));
+        assert!(open.contains("stage.diagnostic_name()"));
         assert!(open.contains("managed_open_outcome_code(&opened.status)"));
         assert!(
             !open.contains("diagnostics.projection_reason")

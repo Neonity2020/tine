@@ -34,7 +34,10 @@ const runs = [
   {
     name: "aged-crash-reopen",
     test: "managed_crash_reopen_aged_history_manual_benchmark",
-    env: { TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY: realGraph },
+    env: {
+      TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY: realGraph,
+      TINE_MANAGED_CRASH_REOPEN_ROUNDS: "800",
+    },
   },
   {
     name: "projection-rebuild",

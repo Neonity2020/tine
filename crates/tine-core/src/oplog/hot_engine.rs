@@ -27781,11 +27781,13 @@ impl ShardedHotEngine {
         match self.visible_documents.get(&document_id) {
             Some(document) => clone_doc(document, peer),
             None => {
-                let document = if self
-                    .visible_document_heads
-                    .get(&document_id)
-                    .is_none_or(BTreeSet::is_empty)
-                {
+                // The document and its run-local head cache are evicted
+                // together, but accepted state is not. Recover the current
+                // direct heads from the authoritative accepted frontier so a
+                // cold point load cannot silently fall back to lazy genesis
+                // after this page has already been edited.
+                let heads = self.document_dependency_heads(document_id, false)?;
+                let document = if heads.is_empty() {
                     self.lazy_genesis_document(document_id, peer)?
                         .unwrap_or_else(LoroDoc::new)
                 } else {
@@ -28270,7 +28272,22 @@ impl ShardedHotEngine {
         } else {
             self.visible_document_heads.get(&document_id)
         };
-        Ok(heads.cloned().unwrap_or_default())
+        if let Some(heads) = heads {
+            return Ok(heads.clone());
+        }
+        // `visible_document_heads` is bounded acceleration. For a clean
+        // no-scratch runtime, the complete accepted frontier is the durable-
+        // history-derived authority that survives hot-document eviction.
+        if !terminal {
+            if let Some(dependencies) = self.accepted_frontier.get(&document_id) {
+                return Ok(dependencies
+                    .direct_dependency_heads()
+                    .iter()
+                    .copied()
+                    .collect());
+            }
+        }
+        Ok(BTreeSet::new())
     }
 
     fn current_document_dependencies(

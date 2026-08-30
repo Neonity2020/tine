@@ -51,6 +51,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed Storage pages remain editable after heavy use evicts them from the
+  in-memory document cache.** A cold point load now reconstructs the page from
+  its accepted history instead of mistaking the cache miss for an untouched
+  page. Retained-runtime recovery also reports content-free native sub-stages
+  and has a tighter real-corpus performance gate.
+
 - **A remote `http:`/`https:` link whose URL ends in `.pdf` now opens in the
   browser like every other external link, instead of being captured by Tine's
   PDF viewer.** Only graph/local asset PDF references and their highlight

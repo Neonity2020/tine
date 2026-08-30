@@ -1742,6 +1742,46 @@ pub enum SyncRuntimeOpenPhase {
     AssemblingActor,
 }
 
+/// Content-free completion boundaries inside clean retained-runtime recovery.
+///
+/// These stages refine [`SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime`]
+/// for diagnostics. They do not authorize recovery, expose storage details, or
+/// create a second admission state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncRuntimeCleanOpenStage {
+    AuthenticatedBaselineOpen,
+    ReceiptClaimPrecheck,
+    GraphOpen,
+    EndpointAndReceiptOpen,
+    ObjectStoreRepairAndValidation,
+    CommittedTailReplay,
+    ProjectionOpen,
+    EngineIndexesAndSweepsOpen,
+    RetainedJournalsOpen,
+    RetainedJournalsDrain,
+    TerminalProjectionRepair,
+    CompletionFlush,
+}
+
+impl SyncRuntimeCleanOpenStage {
+    pub const fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::AuthenticatedBaselineOpen => "authenticated_baseline_open",
+            Self::ReceiptClaimPrecheck => "receipt_claim_precheck",
+            Self::GraphOpen => "graph_open",
+            Self::EndpointAndReceiptOpen => "endpoint_and_receipt_open",
+            Self::ObjectStoreRepairAndValidation => "object_store_repair_and_validation",
+            Self::CommittedTailReplay => "committed_tail_replay",
+            Self::ProjectionOpen => "projection_open",
+            Self::EngineIndexesAndSweepsOpen => "engine_indexes_and_sweeps_open",
+            Self::RetainedJournalsOpen => "retained_journals_open",
+            Self::RetainedJournalsDrain => "retained_journals_drain",
+            Self::TerminalProjectionRepair => "terminal_projection_repair",
+            Self::CompletionFlush => "completion_flush",
+        }
+    }
+}
+
 /// Content-free detail for a debug-enabled promoted-runtime recovery.  It is
 /// observational only: no field grants recovery, scan, or mutation authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1796,6 +1836,10 @@ pub enum SyncRuntimeOpenProgress {
     },
     Waiting {
         phase: SyncRuntimeOpenPhase,
+        elapsed: Duration,
+    },
+    RecoveryStage {
+        stage: SyncRuntimeCleanOpenStage,
         elapsed: Duration,
     },
     RecoveryDiagnostics {
@@ -3501,7 +3545,14 @@ impl SyncRuntimeHandle {
                 elapsed: open_started.elapsed(),
             });
             let recovery_request = clean_request.clone();
-            let (recovery_sender, recovery_receiver) = mpsc::sync_channel(1);
+            enum RecoveryWorkerEvent {
+                Stage {
+                    stage: SyncRuntimeCleanOpenStage,
+                    elapsed: Duration,
+                },
+                Complete(Result<Option<CleanRuntimeResources>, String>),
+            }
+            let (recovery_sender, recovery_receiver) = mpsc::channel();
             let open_barrier_session = crate::durability_counters::current_session();
             let recovery_worker = match thread::Builder::new()
                 .name("tine-clean-runtime-open".into())
@@ -3509,7 +3560,16 @@ impl SyncRuntimeHandle {
                     if let Some(session) = open_barrier_session {
                         session.attach();
                     }
-                    let _ = recovery_sender.send(open_clean_runtime_resources(&recovery_request));
+                    let stage_sender = recovery_sender.clone();
+                    let result = open_clean_runtime_resources_with_progress(
+                        &recovery_request,
+                        &mut |_| {},
+                        &mut |stage, elapsed| {
+                            let _ =
+                                stage_sender.send(RecoveryWorkerEvent::Stage { stage, elapsed });
+                        },
+                    );
+                    let _ = recovery_sender.send(RecoveryWorkerEvent::Complete(result));
                 }) {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -3520,7 +3580,10 @@ impl SyncRuntimeHandle {
             };
             let clean_open = loop {
                 match recovery_receiver.recv_timeout(RUNTIME_OPEN_PROGRESS_HEARTBEAT) {
-                    Ok(result) => {
+                    Ok(RecoveryWorkerEvent::Stage { stage, elapsed }) => {
+                        progress(SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed });
+                    }
+                    Ok(RecoveryWorkerEvent::Complete(result)) => {
                         if recovery_worker.join().is_err() {
                             break Err("clean managed runtime recovery worker panicked".into());
                         }
@@ -3789,6 +3852,7 @@ impl SyncRuntimeHandle {
         match open_clean_runtime_resources_with_progress(
             &runtime_open_request_from_activation(&request),
             &mut progress,
+            &mut |_, _| {},
         ) {
             Ok(Some(resources)) => {
                 progress(SyncLocalActivationProgress::Phase {
@@ -6594,7 +6658,7 @@ fn activate_clean_runtime_resources_retaining_archive(
 fn open_clean_runtime_resources(
     request: &SyncRuntimeOpenRequest,
 ) -> Result<Option<CleanRuntimeResources>, String> {
-    open_clean_runtime_resources_with_progress(request, &mut |_| {})
+    open_clean_runtime_resources_with_progress(request, &mut |_| {}, &mut |_, _| {})
 }
 
 /// Own the engine and its lease together throughout cold repair. Drop flushes
@@ -6650,36 +6714,45 @@ impl Drop for ColdOpenLocalCompletionGuard {
 /// directed `TINE_DEBUG=1` performance diagnosis and never carries paths,
 /// identities, names, content, or authority.
 struct CleanOpenStageTrace {
-    started: Option<Instant>,
-    previous: Option<Instant>,
+    started: Instant,
+    previous: Instant,
+    debug_enabled: bool,
 }
 
 impl CleanOpenStageTrace {
     fn new() -> Self {
-        let started = runtime_debug_diagnostics_enabled().then(Instant::now);
+        let started = Instant::now();
         Self {
             started,
             previous: started,
+            debug_enabled: runtime_debug_diagnostics_enabled(),
         }
     }
 
-    fn phase(&mut self, phase: &'static str) {
-        let (Some(started), Some(previous)) = (self.started, self.previous) else {
-            return;
-        };
+    fn phase(
+        &mut self,
+        stage: SyncRuntimeCleanOpenStage,
+        progress: &mut dyn FnMut(SyncRuntimeCleanOpenStage, Duration),
+    ) {
         let now = Instant::now();
-        eprintln!(
-            "[tine] managed clean open stage: {phase}; phase_ms={}; total_ms={}",
-            now.duration_since(previous).as_millis(),
-            now.duration_since(started).as_millis(),
-        );
-        self.previous = Some(now);
+        let elapsed = now.duration_since(self.started);
+        progress(stage, elapsed);
+        if self.debug_enabled {
+            eprintln!(
+                "[tine] managed clean open stage: {}; phase_ms={}; total_ms={}",
+                stage.diagnostic_name(),
+                now.duration_since(self.previous).as_millis(),
+                elapsed.as_millis(),
+            );
+        }
+        self.previous = now;
     }
 }
 
 fn open_clean_runtime_resources_with_progress(
     request: &SyncRuntimeOpenRequest,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
+    stage_progress: &mut dyn FnMut(SyncRuntimeCleanOpenStage, Duration),
 ) -> Result<Option<CleanRuntimeResources>, String> {
     let mut trace = CleanOpenStageTrace::new();
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
@@ -6706,7 +6779,10 @@ fn open_clean_runtime_resources_with_progress(
     else {
         return Ok(None);
     };
-    trace.phase("authenticated baseline open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::AuthenticatedBaselineOpen,
+        stage_progress,
+    );
     // (c) §1: the claim precheck is the HEAD of the clean cold open, before
     // `Graph::open_checked` -- which is not read-only, because its publication
     // recovery renames graph files and moves artifacts to `.trash/`. Clean
@@ -6715,9 +6791,12 @@ fn open_clean_runtime_resources_with_progress(
     // fresh store never reaches this line. The full in-place validation inside
     // the receipt-store open below stays as defense in depth.
     ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root).map_err(display)?;
-    trace.phase("receipt claim precheck");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::ReceiptClaimPrecheck,
+        stage_progress,
+    );
     let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
-    trace.phase("graph open");
+    trace.phase(SyncRuntimeCleanOpenStage::GraphOpen, stage_progress);
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
         identities.endpoint_id,
@@ -6730,7 +6809,10 @@ fn open_clean_runtime_resources_with_progress(
         endpoint,
     )
     .map_err(display)?;
-    trace.phase("endpoint and receipt open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
+        stage_progress,
+    );
     if opened.marker().workspace_id() != identities.workspace_id
         || opened.marker().lineage_digest() != identities.lineage_digest
     {
@@ -6748,7 +6830,10 @@ fn open_clean_runtime_resources_with_progress(
         .repair_covered_object_mismatches(&covered)
         .map_err(display)?;
     store.validate_namespace().map_err(display)?;
-    trace.phase("object store repair and validation");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
+        stage_progress,
+    );
     engine
         .attach_clean_archive_store(store.duplicate_retained_capability().map_err(display)?)
         .map_err(display)?;
@@ -6763,7 +6848,10 @@ fn open_clean_runtime_resources_with_progress(
         .replay_clean_committed_tail(baseline_claim_source.as_ref())
         .map_err(display)?;
     drop(baseline_claim_source);
-    trace.phase("committed tail replay");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CommittedTailReplay,
+        stage_progress,
+    );
     let projection = if replayed == 0 {
         let expected = engine.accepted_frontier_root().map_err(display)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
@@ -6773,7 +6861,6 @@ fn open_clean_runtime_resources_with_progress(
             ReferenceCatalogPolicyV1::default(),
         )
         .map_err(display)?;
-        trace.phase("clean genesis projection validation");
         LeasedWorkspaceProjection::adopt_clean_genesis(
             lease,
             &request.database_path,
@@ -6802,11 +6889,7 @@ fn open_clean_runtime_resources_with_progress(
         .map(|(projection, ())| projection)
         .map_err(|(_, error)| display(error))?
     };
-    trace.phase(if replayed == 0 {
-        "clean genesis projection adoption"
-    } else {
-        "replayed projection open"
-    });
+    trace.phase(SyncRuntimeCleanOpenStage::ProjectionOpen, stage_progress);
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
         .map_err(display)?;
@@ -6824,7 +6907,10 @@ fn open_clean_runtime_resources_with_progress(
         .into_iter()
         .collect();
     let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
-    trace.phase("engine indexes and sweeps open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
+        stage_progress,
+    );
     let mut retired_own_intent_ids = engine.local_completed_projection_intent_ids();
     let endpoint = engine
         .projection_endpoint_binding()
@@ -6849,7 +6935,10 @@ fn open_clean_runtime_resources_with_progress(
         binding.device_id().as_uuid(),
     )
     .map_err(display)?;
-    trace.phase("retained journals open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
+        stage_progress,
+    );
     let retained_own_intents =
         retained_local_completion_intents(&managed_local, &projection_turns)?;
     retired_own_intent_ids.extend(retained_own_intents.iter().copied());
@@ -6879,7 +6968,10 @@ fn open_clean_runtime_resources_with_progress(
         completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
-    trace.phase("retained journals drain");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
+        stage_progress,
+    );
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
     });
@@ -6889,11 +6981,14 @@ fn open_clean_runtime_resources_with_progress(
         completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
-    trace.phase("terminal projection repair");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::TerminalProjectionRepair,
+        stage_progress,
+    );
     // Repair -> actor assembly boundary: the pre-actor window ends with zero
     // buffered entries, independent of how long actor construction takes.
     let runtime = completion_guard.finish()?;
-    trace.phase("completion flush");
+    trace.phase(SyncRuntimeCleanOpenStage::CompletionFlush, stage_progress);
     Ok(Some(CleanRuntimeResources {
         graph,
         receipts,
@@ -27312,6 +27407,57 @@ mod tests {
         ));
     }
 
+    /// The bounded hot-document cache may evict a page after unrelated pages
+    /// are edited. Re-materializing that page from accepted history must leave
+    /// its latest manifested projection usable as the predecessor of another
+    /// ordinary save. This is deliberately wider than the 64-document hot
+    /// cache; staying at or below the cache limit would never exercise the
+    /// history-backed materialization path.
+    #[test]
+    fn clean_foreground_page_can_be_saved_again_after_hot_document_eviction() {
+        const EDITED_PAGES: usize = 65;
+        let fixture = ActivationFixture::scaled_with_blocks(
+            "clean-foreground-save-after-hot-eviction",
+            0xa16f_100,
+            EDITED_PAGES,
+            1,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("hot-eviction fixture activates");
+        drive_initial_feed(&handle);
+
+        let path = |page: usize| format!("notes/規模/{}/深い/Página-{page}-計画.md", page % 8);
+        for page in 0..EDITED_PAGES {
+            let (current, revision) = load_application_exact(&handle, &path(page));
+            let _ = save_application_block_text(
+                &handle,
+                current,
+                revision,
+                &format!("first accepted edit for page {page}"),
+            );
+            drain_managed_local(&handle);
+        }
+
+        let first_path = path(0);
+        let (first, revision) = load_application_exact(&handle, &first_path);
+        let (saved, _) = save_application_block_text(
+            &handle,
+            first,
+            revision,
+            "second accepted edit after hot-document eviction",
+        );
+        assert_eq!(
+            saved.blocks[0].raw,
+            "second accepted edit after hot-document eviction"
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
     /// Repeated keyboard movement can save the same journal page several
     /// times before the derivative worker drains its first durable frame. A
     /// later cross-day move first waits for that prefix, so every already
@@ -33156,10 +33302,16 @@ mod tests {
         drop(resources);
 
         let mut phases = Vec::new();
+        let mut recovery_stages = Vec::new();
         let opened =
             SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
-                if let SyncRuntimeOpenProgress::Phase { phase, .. } = progress {
-                    phases.push(phase);
+                match progress {
+                    SyncRuntimeOpenProgress::Phase { phase, .. } => phases.push(phase),
+                    SyncRuntimeOpenProgress::RecoveryStage { stage, .. } => {
+                        recovery_stages.push(stage)
+                    }
+                    SyncRuntimeOpenProgress::Waiting { .. }
+                    | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
                 }
             });
         assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
@@ -33172,6 +33324,24 @@ mod tests {
         assert!(
             !phases.contains(&SyncRuntimeOpenPhase::DiscoveringEnrollment),
             "clean marker must not enter legacy enrollment discovery"
+        );
+        assert_eq!(
+            recovery_stages,
+            vec![
+                SyncRuntimeCleanOpenStage::AuthenticatedBaselineOpen,
+                SyncRuntimeCleanOpenStage::ReceiptClaimPrecheck,
+                SyncRuntimeCleanOpenStage::GraphOpen,
+                SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
+                SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
+                SyncRuntimeCleanOpenStage::CommittedTailReplay,
+                SyncRuntimeCleanOpenStage::ProjectionOpen,
+                SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
+                SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
+                SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
+                SyncRuntimeCleanOpenStage::TerminalProjectionRepair,
+                SyncRuntimeCleanOpenStage::CompletionFlush,
+            ],
+            "clean cold-open diagnostics must identify every bounded recovery boundary"
         );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
@@ -46703,6 +46873,24 @@ mod tests {
         ));
     }
 
+    const MANAGED_CRASH_REOPEN_GATE_ROUNDS: usize = 800;
+    const MANAGED_CRASH_REOPEN_BUDGET_SECONDS: u64 = 5;
+
+    #[test]
+    fn managed_crash_reopen_gate_and_contract_pin_the_same_scale_and_budget() {
+        let runner = include_str!("../../../scripts/run-managed-storage-perf-gates.mjs");
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        assert!(runner.contains(&format!(
+            "TINE_MANAGED_CRASH_REOPEN_ROUNDS: \"{MANAGED_CRASH_REOPEN_GATE_ROUNDS}\""
+        )));
+        assert!(contract.contains(&format!(
+            "after {MANAGED_CRASH_REOPEN_GATE_ROUNDS} accepted page edits"
+        )));
+        assert!(contract.contains(&format!(
+            "{MANAGED_CRASH_REOPEN_BUDGET_SECONDS}-second ceiling"
+        )));
+    }
+
     #[test]
     #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
     fn managed_crash_reopen_aged_history_manual_benchmark() {
@@ -46729,7 +46917,22 @@ mod tests {
         let mut editable = pages
             .into_iter()
             .map(|entry| entry.rel_path)
-            .filter(|path| !load_application_exact(&handle, path).0.blocks.is_empty())
+            .filter(|path| {
+                let page = load_application_exact(&handle, path).0;
+                let Some(first) = page.blocks.first() else {
+                    return false;
+                };
+                // This benchmark replaces the complete raw first-block text.
+                // The trusted-local application-save vocabulary declines
+                // removal of an externally imported `id::`, while this
+                // benchmark helper replaces the complete first-block text and
+                // expects a direct save. Exclude that separate identity case
+                // so this gate continues to measure history aging.
+                !first.raw.lines().any(|line| {
+                    line.split_once("::")
+                        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("id"))
+                })
+            })
             .take(rounds.max(1))
             .collect::<Vec<_>>();
         editable.sort();
@@ -46773,8 +46976,8 @@ mod tests {
             startup_ms(elapsed),
         );
         assert!(
-            elapsed < Duration::from_secs(10),
-            "aged-history crash reopen exceeded the 10-second real-corpus recovery ceiling: elapsed_ms={:.3}",
+            elapsed < Duration::from_secs(MANAGED_CRASH_REOPEN_BUDGET_SECONDS),
+            "aged-history crash reopen exceeded the 5-second real-corpus recovery ceiling: elapsed_ms={:.3}",
             startup_ms(elapsed),
         );
         assert!(matches!(
