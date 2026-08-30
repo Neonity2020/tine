@@ -49,7 +49,7 @@ const NESTED_EDIT = "sparse v2 saved existing UTF page";
 const NESTED_WINNER_A = "managed conflict winner A";
 const NESTED_WINNER_B = "managed conflict winner B before Keep mine";
 const NEW_EDIT = "sparse v2 saved newly created page";
-const NEW_WINNER = "concurrent creator won the new page race";
+const NEW_WINNER = "competing managed winner at the new page path";
 const STANDARD_EDIT = "standard Markdown saved after rollback";
 const JOURNAL_MARKER = "today canonical journal remains visible";
 const NORMAL_FILE = path.join(GRAPH, "pages", `${NORMAL_PAGE}.md`);
@@ -712,7 +712,7 @@ try {
   receipt.milestones.sparseV2NewPage = {
     createdThroughVisibleUi: true,
     retainedDraft: NEW_EDIT,
-    concurrentWinner: NEW_WINNER,
+    competingWinner: NEW_WINNER,
     saved: NEW_EDIT,
   };
 

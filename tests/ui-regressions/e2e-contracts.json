@@ -162,7 +162,7 @@
    "nonRequirements": [
     "Payload insertion behavior, exact clipboard flavor order, or clipboard-manager implementation details."
    ],
-   "stability": "burn-in"
+   "stability": "stable"
   },
   "scripts/e2e-caret.mjs": {
    "contracts": [
@@ -323,7 +323,7 @@
    "nonRequirements": [
     "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, or millisecond timing."
    ],
-   "stability": "burn-in"
+   "stability": "stable"
   },
   "scripts/e2e-media.mjs": {
    "contracts": [
@@ -810,8 +810,7 @@
    "nonRequirements": [
     "Pixels, geometry, palette, animation timing, DOM nesting, exact toast wording beyond the group-deletion label family, or generated sweep and page identifiers."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-08-28 (updated after fixes and burn-in): the journey's product assertions are sound \u2014 it found and now guards two real defects (restore closing the recovery panel via unmemoized listener-effect inputs; clean quits falsely reported unclean because mark_clean_shutdown was unreachable after tauri's never-returning run()), and on the fixed binary every run that escaped driver trouble was product-correct (pass-2 plus burn-in runs 2-8; run 1 failed only on a WebKitWebDriver screenshot stall with the correct product state captured in the failure body). Quarantine remains solely for WebKitWebDriver session stalls on the local runner: intermittent UND_ERR_HEADERS_TIMEOUT / indefinite hangs on session-level calls (burn-in runs 1 and 9, plus one 15-minute pre-fix hang) and an orphaned-session cascade ('Maximum number of active sessions', run 10). Harness debt: harden the driver lifecycle (per-call timeouts, session reaping) before this journey becomes a blocking release gate; artifact screenshots are already best-effort."
+   "stability": "stable"
   },
   "scripts/e2e-search-parity.mjs": {
    "contracts": [

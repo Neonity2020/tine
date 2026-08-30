@@ -110,6 +110,9 @@ const suites = {
   "managed-journal-feed": [
     ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
   ],
+  "absence-sweeps": [
+    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
+  ],
   // Release-only local proof on a copied private corpus. This suite is kept
   // separate from hosted coverage so neither the source graph nor a derivative
   // can enter GitHub Actions artifacts.
@@ -143,6 +146,8 @@ const suites = {
     ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["journal-format", "scripts/e2e-journal-format.mjs", {}],
     ["journal-future-feed", "scripts/e2e-journal-future-feed.mjs", {}],
+    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
+    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
     ["formula-builder", "scripts/probe-formula-builder.mjs", {}],
