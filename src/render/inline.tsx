@@ -450,16 +450,23 @@ function renderLink(
     return <BlockRefView id={url.v} label={label} spanAttrs={spanAttrs} />;
   }
   const dest = urlDest(url);
+  // GH #442: a remote http(s) URL ending in `.pdf` is an external web link —
+  // it opens in the browser like every other remote URL. Only graph/local
+  // asset PDF references enter Tine's PDF viewer.
+  const remotePdf = /^https?:\/\//i.test(dest) && /\.pdf$/i.test(dest);
   if (s.image) {
     const { width, height } = parseImageMetaBrace(s.metadata);
     const alt = s.label && s.label.length ? astText(s.label) : "";
-    if (/\.pdf$/i.test(dest)) return <PdfAssetLink dest={dest} label={alt} spanAttrs={spanAttrs} />;
+    if (!remotePdf && /\.pdf$/i.test(dest)) return <PdfAssetLink dest={dest} label={alt} spanAttrs={spanAttrs} />;
     const k = mediaKind(dest);
     if (k === "video" || k === "audio")
       return <MediaEmbed url={dest} kind={k} alt={alt} width={width} blockId={blockId} spanAttrs={spanAttrs} />;
-    return <AssetImage url={dest} alt={alt} width={width} height={height} blockId={blockId} spanAttrs={spanAttrs} />;
+    // A remote .pdf image falls through: <img> cannot display a PDF anyway, so
+    // it renders as the ordinary external link below — its click then opens
+    // the browser, exactly like every other remote URL (GH #442).
+    if (!remotePdf) return <AssetImage url={dest} alt={alt} width={width} height={height} blockId={blockId} spanAttrs={spanAttrs} />;
   }
-  if (/\.pdf$/i.test(dest)) {
+  if (!remotePdf && /\.pdf$/i.test(dest)) {
     const labelStr = s.label && s.label.length ? astText(s.label) : pdfFilenameFromDest(dest);
     return <PdfAssetLink dest={dest} label={labelStr} spanAttrs={spanAttrs} />;
   }

@@ -9047,5 +9047,36 @@
    },
    "notes": "Private UI-state/PDF queue item, 2026-08-29. Only stable filename and label cross the session boundary. Graph ownership generation, page, highlight intent, native handles, and sidecar view state remain transient and are reminted or loaded by their existing owners. Transition suspend/restore is deliberately save-free so a delayed graph-A close cannot overwrite graph B."
   }
+,
+  {
+   "id": "UI-REMOTE-PDF-LINK-EXTERNAL-442",
+   "title": "A remote http(s) link whose URL ends in .pdf opens in the browser like every other external link; only graph/local asset PDF references enter Tine's PDF viewer",
+   "family": "pdf",
+   "sources": {
+    "issues": [
+     442
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/render/assetLinkOpen.test.tsx::remote PDF URLs are external links, not the PDF viewer (GH #442)::a labeled https PDF link opens in the browser, exactly like other remote links",
+     "src/render/assetLinkOpen.test.tsx::a bare https PDF URL stays an external URL too",
+     "src/render/assetLinkOpen.test.tsx::an image-syntax remote PDF is also an external link, not an image or the viewer",
+     "src/render/assetLinkOpen.test.tsx::an Org remote PDF link follows the same external route",
+     "src/render/assetLinkOpen.test.tsx::a plain http (not https) PDF URL is just as remote",
+     "src/render/assetLinkOpen.test.tsx::an uppercase .PDF suffix on a remote URL is still external",
+     "src/render/assetLinkOpen.test.tsx::graph asset PDFs keep entering the in-app viewer (unchanged local routing)"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #442. renderLink treated ANY link/image destination ending in .pdf as an in-app PDF asset pointer, so a plain remote URL like [a paper](https://aclanthology.org/2025.acl-long.879.pdf) opened Tine's PDF viewer with a remote filename it cannot resolve instead of going to the default browser. The .pdf branches now exclude http(s) URLs; remote PDFs in link AND image syntax render as the ordinary external link (an <img> cannot display a remote .pdf anyway) and reach backend().openExternal exactly like other remote URLs. Graph/local asset PDF references (../assets/x.pdf incl. Windows backslash paths) and annotation/HLS routing keep entering the viewer. Fail-before: the literal rendered-markdown-link tests failed pre-fix with the remote URL producing the pdf-link viewer chip (6 red of 7; the local-asset preservation case is the control). Click-level assertions are jsdom render-layer; browser-native confirmation of openExternal on a remote PDF remains the manager smoke item."
+  }
  ]
 }

@@ -41,6 +41,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A remote `http:`/`https:` link whose URL ends in `.pdf` now opens in the
+  browser like every other external link, instead of being captured by Tine's
+  PDF viewer.** Only graph/local asset PDF references and their highlight
+  pages enter the viewer; an image-syntax remote PDF renders as an ordinary
+  external link as well rather than a broken image frame. (GH #442)
+
 - **The PDF reader's Close control is now the terminal toolbar action.** It
   stays at the conventional far-right edge with an explicit accessible label,
   instead of reading like another tool in the middle of the control cluster
