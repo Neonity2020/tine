@@ -49425,6 +49425,35 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_projection_baseline_cache_does_not_block_clean_cold_reopen() {
+        let fixture = ActivationFixture::scaled("corrupt-projection-baseline-cache", 0xa0eb_01, 3);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("scaled graph activates");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(handle);
+
+        let cache = crate::oplog::sqlite::projection_baseline_cache_path_for_test(
+            &fixture.request.database_path,
+        );
+        fs::write(cache, b"truncated projection baseline cache").unwrap();
+        reset_projection_open_test_observation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let observation = take_projection_open_test_observation(workspace_id);
+        assert_eq!(
+            observation.recovery, "opened-existing",
+            "cache damage rebuilt the authenticated projection: {}",
+            observation.reason
+        );
+    }
+
+    #[test]
     fn managed_projection_rebuilds_clean_genesis_from_baseline() {
         let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 3);
         let workspace_id = fixture.request.identities.workspace_id;
@@ -50710,7 +50739,13 @@ mod tests {
         body.push_str("- Target appears here\n");
         fs::write(&source, body).unwrap();
 
-        let handle = open_reopened_managed_actor(&fixture);
+        // Exercise the pre-ready fallback explicitly on the fresh lazy-FTS
+        // activation. This must not depend on cold open rebuilding the entire
+        // disposable projection: a valid projection is now intentionally
+        // reused across clean reopens.
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("large unlinked fixture activates");
         let assert_large_source_result = || {
             let outcome = handle
                 .application_navigation(SyncApplicationNavigationRequest::UnlinkedReferences {

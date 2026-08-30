@@ -109,6 +109,7 @@ pub const TAIL_MAX_BATCHES: usize = 10_000;
 
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const PROJECTION_BASELINE_CACHE_SUFFIX: &str = ".projection-baselines.sqlite";
+const PROJECTION_BASELINE_CACHE_SCHEMA_VERSION: u32 = 1;
 
 fn encode_projection_baseline(description: BlobDescription) -> [u8; 40] {
     let mut encoded = [0_u8; 40];
@@ -121,6 +122,53 @@ fn projection_baseline_cache_path(projection_path: &Path) -> PathBuf {
     let mut path = projection_path.as_os_str().to_os_string();
     path.push(PROJECTION_BASELINE_CACHE_SUFFIX);
     PathBuf::from(path)
+}
+
+fn projection_baseline_cache_sidecar_path(projection_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = projection_baseline_cache_path(projection_path)
+        .as_os_str()
+        .to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn projection_baseline_cache_claim(claim: ProjectionClaim) -> Vec<u8> {
+    let product_version = env!("CARGO_PKG_VERSION").as_bytes();
+    let mut encoded = Vec::with_capacity(16 + 32 + 7 * 4 + 4 + product_version.len());
+    encoded.extend_from_slice(claim.workspace_id.as_uuid().as_bytes());
+    encoded.extend_from_slice(claim.lineage_digest.as_bytes());
+    for version in [
+        claim.oplog_protocol_version,
+        claim.operation_schema_version,
+        claim.object_envelope_schema_version,
+        claim.manifest_encoding_version,
+        claim.managed_entity_set_version,
+        SQLITE_SCHEMA_VERSION,
+        PROJECTION_CHECKPOINT_SCHEMA_VERSION,
+    ] {
+        encoded.extend_from_slice(&version.to_be_bytes());
+    }
+    encoded.extend_from_slice(&(product_version.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(product_version);
+    encoded
+}
+
+fn remove_projection_baseline_cache_files(projection_path: &Path) -> Result<(), ProjectionError> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = projection_baseline_cache_sidecar_path(projection_path, suffix);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(ProjectionError::UnsafePath(format!(
+                    "projection baseline cache {} is not a regular file",
+                    path.display()
+                )));
+            }
+            Ok(_) => fs::remove_file(&path)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn open_projection_baseline_cache(projection_path: &Path) -> Result<Connection, ProjectionError> {
@@ -142,7 +190,96 @@ fn open_projection_baseline_cache(projection_path: &Path) -> Result<Connection, 
     connection
         .busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+    connection
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
     Ok(connection)
+}
+
+fn open_prepared_projection_baseline_cache(
+    projection_path: &Path,
+    claim: ProjectionClaim,
+) -> Result<Connection, ProjectionError> {
+    let mut connection = open_projection_baseline_cache(projection_path)?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS projection_cache_metadata (\
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+                cache_schema_version INTEGER NOT NULL, \
+                projection_claim BLOB NOT NULL\
+            ) STRICT; \
+             CREATE TABLE IF NOT EXISTS projection_baselines (\
+                page_id TEXT PRIMARY KEY NOT NULL, \
+                path TEXT NOT NULL, \
+                projection_baseline_digest BLOB NOT NULL, \
+                accepted_frontier_digest BLOB NOT NULL\
+            ) STRICT;",
+        )
+        .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+    let expected_claim = projection_baseline_cache_claim(claim);
+    let stored = connection
+        .query_row(
+            "SELECT cache_schema_version, projection_claim \
+             FROM projection_cache_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+    if !matches!(
+        stored,
+        Some((version, ref stored_claim))
+            if version == i64::from(PROJECTION_BASELINE_CACHE_SCHEMA_VERSION)
+                && stored_claim == &expected_claim
+    ) {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        transaction
+            .execute("DELETE FROM projection_baselines", [])
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO projection_cache_metadata (\
+                    singleton, cache_schema_version, projection_claim\
+                 ) VALUES (1, ?1, ?2) \
+                 ON CONFLICT(singleton) DO UPDATE SET \
+                    cache_schema_version = excluded.cache_schema_version, \
+                    projection_claim = excluded.projection_claim",
+                params![PROJECTION_BASELINE_CACHE_SCHEMA_VERSION, expected_claim],
+            )
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?;
+    }
+    Ok(connection)
+}
+
+fn with_projection_baseline_cache<T>(
+    projection_path: &Path,
+    claim: ProjectionClaim,
+    mut operation: impl FnMut(&Connection) -> Result<T, ProjectionError>,
+) -> Option<T> {
+    for attempt in 0..2 {
+        let result = open_prepared_projection_baseline_cache(projection_path, claim)
+            .and_then(|connection| operation(&connection));
+        if let Ok(value) = result {
+            return Some(value);
+        }
+        if attempt == 0 && remove_projection_baseline_cache_files(projection_path).is_ok() {
+            continue;
+        }
+        break;
+    }
+    // This cache carries no authority. If its own repair is unavailable, the
+    // caller must render/compare normally rather than refuse the managed graph.
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn projection_baseline_cache_path_for_test(projection_path: &Path) -> PathBuf {
+    projection_baseline_cache_path(projection_path)
 }
 /// Bounded current-path catalog page size for terminal construction. The rows
 /// are drained into materialization chunks, so this only caps how many
@@ -4848,17 +4985,8 @@ impl SqliteFrontier {
     /// that schema. Loss or rebuild costs one render-and-bind, never authority
     /// or a graph rewrite.
     pub(crate) fn ensure_projection_baseline_digest_column(&self) -> Result<(), ProjectionError> {
-        let connection = open_projection_baseline_cache(&self.path)?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS projection_baselines (\
-                    page_id TEXT PRIMARY KEY NOT NULL, \
-                    path TEXT NOT NULL, \
-                    projection_baseline_digest BLOB NOT NULL, \
-                    accepted_frontier_digest BLOB NOT NULL\
-                ) STRICT;",
-            )
-            .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+        let _ = with_projection_baseline_cache(&self.path, self.claim, |_| Ok(()));
+        Ok(())
     }
 
     pub(crate) fn projection_baseline_matches(
@@ -4867,26 +4995,29 @@ impl SqliteFrontier {
         path: &ManagedPath,
         description: BlobDescription,
     ) -> Result<bool, ProjectionError> {
-        let connection = open_projection_baseline_cache(&self.path)?;
         let baseline = encode_projection_baseline(description);
-        let matched = connection
-            .query_row(
-                "SELECT 1 FROM projection_baselines \
-                 WHERE page_id = ?1 AND path = ?2 \
-                   AND projection_baseline_digest = ?3 \
-                   AND accepted_frontier_digest = ?4",
-                params![
-                    page_id.to_string(),
-                    path.as_str(),
-                    baseline,
-                    &self.required_frontier_digest.as_bytes()[..]
-                ],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| ProjectionError::Sqlite(error.to_string()))?
-            .is_some();
-        Ok(matched)
+        Ok(
+            with_projection_baseline_cache(&self.path, self.claim, |connection| {
+                connection
+                    .query_row(
+                        "SELECT 1 FROM projection_baselines \
+                     WHERE page_id = ?1 AND path = ?2 \
+                       AND projection_baseline_digest = ?3 \
+                       AND accepted_frontier_digest = ?4",
+                        params![
+                            page_id.to_string(),
+                            path.as_str(),
+                            baseline,
+                            &self.required_frontier_digest.as_bytes()[..]
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map(|matched| matched.is_some())
+                    .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+            })
+            .unwrap_or(false),
+        )
     }
 
     pub(crate) fn bind_projection_baseline(
@@ -4895,43 +5026,50 @@ impl SqliteFrontier {
         path: &ManagedPath,
         description: BlobDescription,
     ) -> Result<(), ProjectionError> {
-        let connection = open_projection_baseline_cache(&self.path)?;
-        connection
-            .execute(
-                "INSERT INTO projection_baselines \
-                    (page_id, path, projection_baseline_digest, accepted_frontier_digest) \
-                    VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(page_id) DO UPDATE SET \
-                    path = excluded.path, \
-                    projection_baseline_digest = excluded.projection_baseline_digest, \
-                    accepted_frontier_digest = excluded.accepted_frontier_digest",
-                params![
-                    page_id.to_string(),
-                    path.as_str(),
-                    encode_projection_baseline(description),
-                    &self.required_frontier_digest.as_bytes()[..]
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+        let _ = with_projection_baseline_cache(&self.path, self.claim, |connection| {
+            connection
+                .execute(
+                    "INSERT INTO projection_baselines \
+                        (page_id, path, projection_baseline_digest, accepted_frontier_digest) \
+                        VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(page_id) DO UPDATE SET \
+                        path = excluded.path, \
+                        projection_baseline_digest = excluded.projection_baseline_digest, \
+                        accepted_frontier_digest = excluded.accepted_frontier_digest",
+                    params![
+                        page_id.to_string(),
+                        path.as_str(),
+                        encode_projection_baseline(description),
+                        &self.required_frontier_digest.as_bytes()[..]
+                    ],
+                )
+                .map(|_| ())
+                .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+        });
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn clear_projection_baselines_for_test(&self) {
-        let connection = open_projection_baseline_cache(&self.path).unwrap();
-        connection
-            .execute("DELETE FROM projection_baselines", [])
-            .unwrap();
+        with_projection_baseline_cache(&self.path, self.claim, |connection| {
+            connection
+                .execute("DELETE FROM projection_baselines", [])
+                .map(|_| ())
+                .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+        })
+        .unwrap();
     }
 
     #[cfg(test)]
     pub(crate) fn projection_baseline_count_for_test(&self) -> u64 {
-        let connection = open_projection_baseline_cache(&self.path).unwrap();
-        connection
-            .query_row("SELECT count(*) FROM projection_baselines", [], |row| {
-                row.get(0)
-            })
-            .unwrap()
+        with_projection_baseline_cache(&self.path, self.claim, |connection| {
+            connection
+                .query_row("SELECT count(*) FROM projection_baselines", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+        })
+        .unwrap()
     }
 
     pub const fn claim(&self) -> ProjectionClaim {
@@ -10389,6 +10527,82 @@ mod tests {
 
         assert!(!projection.exists());
         assert!(cache.is_file());
+    }
+
+    #[test]
+    fn projection_baseline_cache_uses_wal_and_normal_synchronous_mode() {
+        let root = TestDir::new("projection-baseline-cache-wal");
+        let projection = root.path().join("projection.sqlite");
+        let claim = ProjectionClaim::current(
+            WorkspaceId::from_uuid(Uuid::from_u128(0xcace_0001)),
+            LineageDigest::of(b"projection-baseline-cache-wal"),
+        );
+        let connection = open_prepared_projection_baseline_cache(&projection, claim).unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(synchronous, 1, "SQLite NORMAL is numeric mode 1");
+    }
+
+    #[test]
+    fn projection_baseline_cache_self_heals_corrupt_bytes() {
+        let root = TestDir::new("projection-baseline-cache-corrupt");
+        let projection = root.path().join("projection.sqlite");
+        let cache = projection_baseline_cache_path(&projection);
+        let claim = ProjectionClaim::current(
+            WorkspaceId::from_uuid(Uuid::from_u128(0xcace_0002)),
+            LineageDigest::of(b"projection-baseline-cache-corrupt"),
+        );
+        fs::write(&cache, b"not a sqlite database").unwrap();
+
+        let count = with_projection_baseline_cache(&projection, claim, |connection| {
+            connection
+                .query_row("SELECT count(*) FROM projection_baselines", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+        });
+        assert_eq!(count, Some(0));
+        assert!(cache.is_file());
+    }
+
+    #[test]
+    fn projection_baseline_cache_discards_rows_when_its_claim_changes() {
+        let root = TestDir::new("projection-baseline-cache-claim");
+        let projection = root.path().join("projection.sqlite");
+        let claim_a = ProjectionClaim::current(
+            WorkspaceId::from_uuid(Uuid::from_u128(0xcace_0003)),
+            LineageDigest::of(b"projection-baseline-cache-claim-a"),
+        );
+        let claim_b = ProjectionClaim::current(
+            WorkspaceId::from_uuid(Uuid::from_u128(0xcace_0004)),
+            LineageDigest::of(b"projection-baseline-cache-claim-b"),
+        );
+        assert_eq!(
+            with_projection_baseline_cache(&projection, claim_a, |connection| {
+                connection
+                    .execute(
+                        "INSERT INTO projection_baselines (\
+                            page_id, path, projection_baseline_digest, accepted_frontier_digest\
+                         ) VALUES ('page', 'pages/Page.md', x'00', x'01')",
+                        [],
+                    )
+                    .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+            }),
+            Some(1)
+        );
+        let count = with_projection_baseline_cache(&projection, claim_b, |connection| {
+            connection
+                .query_row("SELECT count(*) FROM projection_baselines", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .map_err(|error| ProjectionError::Sqlite(error.to_string()))
+        });
+        assert_eq!(count, Some(0));
     }
 
     #[cfg(unix)]
