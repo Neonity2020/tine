@@ -590,6 +590,97 @@ fn tine_storage_surface_inventory(files: &[ProductionFile]) -> Vec<(String, Stri
     inventory
 }
 
+fn tine_storage_imported_call_inventory(files: &[ProductionFile]) -> Vec<(String, String, usize)> {
+    let identifier = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("static regex");
+    let mut inventory = Vec::new();
+    for file in files {
+        let imports = tine_storage_surface_inventory(std::slice::from_ref(file))
+            .into_iter()
+            .filter_map(|(_, token, _)| token.starts_with("usetine_storage").then_some(token))
+            .collect::<Vec<_>>();
+        if imports.is_empty() {
+            continue;
+        }
+        let imported = imports
+            .iter()
+            .flat_map(|declaration| identifier.find_iter(declaration))
+            .map(|matched| matched.as_str().to_owned())
+            .filter(|name| !matches!(name.as_str(), "use" | "tine_storage" | "as" | "self"))
+            .collect::<BTreeSet<_>>();
+
+        for name in &imported {
+            let direct = identifier_occurrences(&file.code, &format!("{name}("));
+            if direct != 0 {
+                inventory.push((file.relative.clone(), format!("import-call:{name}"), direct));
+            }
+            let associated = Regex::new(&format!(
+                r"{}::[A-Za-z_][A-Za-z0-9_]*\(",
+                regex::escape(name)
+            ))
+            .unwrap();
+            for matched in associated.find_iter(&file.compact) {
+                inventory.push((
+                    file.relative.clone(),
+                    format!("import-associated:{}", matched.as_str()),
+                    1,
+                ));
+            }
+        }
+
+        let write_capable_types = BTreeSet::from([
+            "DurableDirectoryPublication",
+            "ExactImmutablePublicationBatch",
+            "LocalJournalSegment",
+            "LocalJournalSegmentV2",
+            "PatriciaIndexConstruction",
+            "PatriciaIndexStore",
+            "PhysicalGraphProjectionDatabase",
+            "ScratchRun",
+            "SqliteFileSet",
+            "StagedExactImmutablePublication",
+        ]);
+        let storage_types = imported
+            .iter()
+            .filter(|name| write_capable_types.contains(name.as_str()))
+            .collect::<Vec<_>>();
+        let mut receivers = BTreeSet::new();
+        for storage_type in storage_types {
+            let typed = Regex::new(&format!(
+                r"([a-z_][A-Za-z0-9_]*):(?:[A-Za-z_][A-Za-z0-9_]*<)*{}(?:<[^;{{}}()]*?>)?(?:[>,])",
+                regex::escape(storage_type)
+            ))
+            .unwrap();
+            for captures in typed.captures_iter(&file.compact) {
+                receivers.insert(captures[1].to_owned());
+            }
+            let constructed = Regex::new(&format!(
+                r"let(?:mut)?([a-z_][A-Za-z0-9_]*)={}::[A-Za-z_][A-Za-z0-9_]*\(",
+                regex::escape(storage_type)
+            ))
+            .unwrap();
+            for captures in constructed.captures_iter(&file.compact) {
+                receivers.insert(captures[1].to_owned());
+            }
+        }
+        for receiver in receivers {
+            let methods = Regex::new(&format!(
+                r"(?:self\.)?{}\.([A-Za-z_][A-Za-z0-9_]*)\(",
+                regex::escape(&receiver)
+            ))
+            .unwrap();
+            for captures in methods.captures_iter(&file.compact) {
+                inventory.push((
+                    file.relative.clone(),
+                    format!("storage-receiver:{receiver}.{}", &captures[1]),
+                    1,
+                ));
+            }
+        }
+    }
+    inventory.sort();
+    inventory
+}
+
 fn inventory_digest(inventory: &[(String, String, usize)]) -> String {
     let mut hasher = Sha256::new();
     for (path, token, count) in inventory {
@@ -1462,9 +1553,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         "a new tine-storage write crossing needs a census row"
     );
     let dependency_surface = tine_storage_surface_inventory(&files);
+    let mut dependency_surface = dependency_surface;
+    dependency_surface.extend(tine_storage_imported_call_inventory(&files));
+    dependency_surface.sort();
+    assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
+        .unwrap()
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.8.10\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "91f0210908beff3b13adccf2a79bbf38745731d73b34197d7999b87527e9f976",
+        "ebdd2ab00a033455796ea0209f4b5d706e7e3c31c7475fd51676b0eef9260f1b",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -1597,6 +1694,8 @@ fn g_f_graph_path_process_handoffs_are_pinned() {
             ("process.command.std", "std::process::Command::new("),
             ("process.command.imported", "Command::new("),
             ("process.opener", "opener_command("),
+            ("tauri.opener", ".opener("),
+            ("tauri.open_url", ".open_url("),
         ],
     );
     let expected_launch_roots = [
@@ -1606,6 +1705,8 @@ fn g_f_graph_path_process_handoffs_are_pinned() {
         ("src-tauri/src/platform.rs", "process.command.imported", 2),
         ("src-tauri/src/platform.rs", "process.command.std", 1),
         ("src-tauri/src/platform.rs", "process.opener", 9),
+        ("src-tauri/src/platform.rs", "tauri.open_url", 2),
+        ("src-tauri/src/platform.rs", "tauri.opener", 2),
         ("src-tauri/src/spellcheck.rs", "process.command.imported", 1),
         ("src-tauri/src/spellcheck.rs", "process.command.std", 1),
     ]
@@ -1615,6 +1716,14 @@ fn g_f_graph_path_process_handoffs_are_pinned() {
     assert_eq!(
         launch_roots, expected_launch_roots,
         "a new production process/opener construction site must be classified as graph-derived or non-graph-derived"
+    );
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.compact.matches(".open_path(").count())
+            .sum::<usize>(),
+        0,
+        "a Tauri opener path handoff must be classified before it is added"
     );
     let expected = [
         ("edit_asset_external", 2),
