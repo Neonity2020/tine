@@ -144,12 +144,6 @@ pub(crate) fn note_archive_object_read() {
     });
 }
 
-pub(crate) fn note_projection_receipt_load() {
-    note_forbidden(|counters| {
-        counters.projection_receipt_loads = counters.projection_receipt_loads.saturating_add(1);
-    });
-}
-
 pub(crate) fn note_graph_wide_catalog_decode() {
     note_forbidden(|counters| {
         counters.graph_wide_catalog_decodes = counters.graph_wide_catalog_decodes.saturating_add(1);

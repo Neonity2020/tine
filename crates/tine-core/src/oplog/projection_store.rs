@@ -1485,69 +1485,6 @@ impl ProjectionReceiptStore {
         Self::open_with_binding(root, workspace_id, Some(endpoint))
     }
 
-    /// Open an enrolled receipt namespace without creating its root, claim, or
-    /// child namespaces.
-    ///
-    /// This is the runtime-host reopen boundary. The expected physical store
-    /// identity comes from the authenticated enrollment, so replacing a
-    /// missing store with a newly initialized directory cannot silently become
-    /// authority.
-    pub(crate) fn open_existing_for_endpoint(
-        root: &Path,
-        workspace_id: WorkspaceId,
-        endpoint: ProjectionEndpointBinding,
-        expected_store_id: ProjectionReceiptStoreId,
-    ) -> Result<Self, ProjectionStoreError> {
-        let name = root
-            .file_name()
-            .ok_or_else(|| ProjectionStoreError::UnsafeEntry("store root has no name".into()))?;
-        if !matches!(root.components().next_back(), Some(Component::Normal(_))) {
-            return Err(ProjectionStoreError::UnsafeEntry(
-                "store root must end in a normal path component".into(),
-            ));
-        }
-        let name = name.to_str().ok_or_else(|| {
-            ProjectionStoreError::UnsafeEntry("store root name is not UTF-8".into())
-        })?;
-        let parent = root.parent().ok_or_else(|| {
-            ProjectionStoreError::UnsafeEntry("store root has no existing parent".into())
-        })?;
-        let canonical_parent = std::fs::canonicalize(parent)?;
-        #[cfg(target_os = "android")]
-        let capability = open_android_private_directory(&canonical_parent.join(name))?;
-        #[cfg(not(target_os = "android"))]
-        let capability = {
-            let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
-            open_dir_nofollow(&parent_capability, name)?
-        };
-        let store_id = canonical_receipt_store_id(&capability)?;
-        if store_id != expected_store_id {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        let bytes = read_optional_regular(&capability, STORE_CLAIM_FILE, 512, None)?
-            .ok_or(ProjectionStoreError::MalformedStoreClaim)?;
-        let expected = validate_claim(&bytes, store_id, workspace_id, Some(endpoint))?;
-        let namespaces = open_receipt_namespaces(
-            &capability,
-            store_id,
-            ReceiptDirectoryDurability::PromotedAuthority,
-        )?;
-        if namespaces.identities() != expected {
-            return Err(ProjectionStoreError::NamespaceSubstitution(
-                "top-level receipt namespace".into(),
-            ));
-        }
-        Ok(Self {
-            root_path: canonical_parent.join(name),
-            store_id,
-            workspace_id,
-            endpoint: Some(endpoint),
-            capability,
-            namespaces,
-            retired_own_endpoint_intents: RwLock::new(BTreeSet::new()),
-        })
-    }
-
     fn open_with_binding(
         root: &Path,
         workspace_id: WorkspaceId,
@@ -2275,44 +2212,6 @@ impl ProjectionReceiptStore {
         Ok(intent)
     }
 
-    /// Load one completed receipt through an authenticated work-index row.
-    /// This performs direct immutable intent/completion reads only; it never
-    /// enumerates a receipt namespace.
-    pub(crate) fn load_completed_receipt(
-        &self,
-        completed: &ProjectionCompletedReceipt,
-    ) -> Result<(ProjectionIntent, ProjectionCompletion), ProjectionStoreError> {
-        crate::fast_commit::note_projection_receipt_load();
-        let intent =
-            self.load_intent_by_id(completed.intent_id())
-                .map_err(|error| match error {
-                    ProjectionStoreError::MissingIntent(_) => {
-                        ProjectionStoreError::MissingPriorCompletion
-                    }
-                    error => error,
-                })?;
-        let target_matches = match completed.target() {
-            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
-            ProjectionWorkTarget::Present(target) => intent.target() == target,
-        };
-        if intent.page_id() != completed.page_id()
-            || intent.path() != completed.path()
-            || intent.frontier() != completed.frontier()
-            || !target_matches
-        {
-            return Err(ProjectionStoreError::EndpointBindingMismatch);
-        }
-        let completion = self
-            .load_completion(&intent)?
-            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
-        if completion.logical_completion_id() != completed.logical_completion_id() {
-            return Err(ProjectionStoreError::PathBindingMismatch(
-                "projection completed-work mapping",
-            ));
-        }
-        Ok((intent, completion))
-    }
-
     pub fn local_forensic_evidence(
         &self,
         intent: &ProjectionIntent,
@@ -3021,14 +2920,6 @@ impl ProjectionReceiptStore {
                     hex(intent_id.as_bytes())
                 ))
             })
-    }
-
-    fn existing_intent_namespace(
-        &self,
-        namespace: &str,
-        intent_id: ProjectionIntentId,
-    ) -> Result<Option<Dir>, ProjectionStoreError> {
-        self.open_intent_namespace(namespace, intent_id, false)
     }
 
     /// The recovery form of [`Self::intent_namespace`]: a namespace that an
@@ -4823,15 +4714,6 @@ fn remove_mutation_authority_if_exact(
     directory.remove_file(name)?;
     sync_dir_required(directory)?;
     Ok(())
-}
-
-fn replace_mutation_authority_if_exact(
-    directory: &Dir,
-    name: &str,
-    expected: &[u8],
-    replacement: &[u8],
-) -> Result<(), ProjectionStoreError> {
-    replace_mutation_authority_if_exact_inner(directory, name, expected, replacement, true)
 }
 
 fn replace_mutation_authority_if_exact_inner(

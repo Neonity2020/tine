@@ -360,10 +360,6 @@ impl ProjectionPlan {
     pub fn generated_anchors(&self) -> &[PolicyGeneratedAnchor] {
         &self.generated_anchors
     }
-
-    pub(crate) fn into_intent_and_target(self) -> (ProjectionIntent, Vec<u8>) {
-        (self.intent, self.target)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

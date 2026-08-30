@@ -334,14 +334,6 @@ impl TrustedLocalCommitted {
         self.prepared.sequence()
     }
 
-    pub(crate) const fn record(&self) -> &ManagedLocalRecord {
-        self.prepared.record()
-    }
-
-    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
-        self.graph.append_proof()
-    }
-
     pub(crate) fn relative_path(&self) -> &str {
         self.graph.target().relative_path()
     }
@@ -388,24 +380,12 @@ impl TrustedLocalCommittedPendingProjection {
         self.prepared.sequence()
     }
 
-    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
-        self.graph.append_proof()
-    }
-
     pub(crate) fn relative_path(&self) -> &str {
         self.graph.relative_path()
     }
 
-    pub(crate) fn exact_target(&self) -> &[u8] {
-        self.graph.target()
-    }
-
     pub(crate) fn last_error(&self) -> &io::Error {
         self.graph.last_error()
-    }
-
-    pub(crate) const fn post_page(&self) -> &MaterializedPage {
-        &self.post_page
     }
 
     pub(crate) const fn prepared_record(&self) -> &PreparedManagedLocalRecord {
@@ -436,23 +416,8 @@ impl TrustedLocalCommittedRecovery {
         self.prepared.sequence()
     }
 
-    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
-        match &self.graph {
-            CommittedGraphState::Durable(graph) => graph.append_proof(),
-            CommittedGraphState::Pending(graph) => graph.append_proof(),
-        }
-    }
-
     pub(crate) const fn prepared_record(&self) -> &PreparedManagedLocalRecord {
         &self.prepared
-    }
-
-    pub(crate) const fn last_error(&self) -> &ManagedLocalRecordError {
-        &self.last_error
-    }
-
-    pub(crate) fn projection_is_pending(&self) -> bool {
-        matches!(self.graph, CommittedGraphState::Pending(_))
     }
 }
 
@@ -502,25 +467,6 @@ impl TrustedLocalCommitCoordinator {
                 last_error,
             }),
         }
-    }
-
-    pub(crate) fn commit<J: ManagedLocalJournalAppend>(
-        graph: &Graph,
-        journal: &mut J,
-        engine: &mut ShardedHotEngine,
-        page: &PageDto,
-        base_revision: &str,
-        prepared: PreparedLocalMutation,
-    ) -> Result<TrustedLocalCommitOutcome, TrustedLocalCommitError> {
-        Self::commit_with_response_evidence(
-            graph,
-            journal,
-            engine,
-            page,
-            None,
-            base_revision,
-            prepared,
-        )
     }
 
     pub(crate) fn commit_with_response_evidence<J: ManagedLocalJournalAppend>(
@@ -693,80 +639,6 @@ impl TrustedLocalCommitCoordinator {
         finish_committed_state(engine, prepared, graph, None)
     }
 
-    pub(crate) fn restart_projection_input(
-        record: &ManagedLocalRecord,
-    ) -> Result<TrustedLocalRestartProjectionInput, TrustedLocalCommitError> {
-        let projection = record.projection();
-        let expected_base = projection
-            .precondition_base()
-            .ok_or_else(|| {
-                TrustedLocalCommitError::InvalidPreparedInput(
-                    "existing-page projection restart has an absent precondition".into(),
-                )
-            })?
-            .bytes();
-        let exact_target = projection.intent().target().bytes().ok_or_else(|| {
-            TrustedLocalCommitError::InvalidPreparedInput(
-                "decoded managed-local record has an absent target".into(),
-            )
-        })?;
-        let base = std::str::from_utf8(expected_base).map_err(|_| {
-            TrustedLocalCommitError::InvalidPreparedInput(
-                "decoded managed-local base is not valid UTF-8".into(),
-            )
-        })?;
-        let target = std::str::from_utf8(exact_target).map_err(|_| {
-            TrustedLocalCommitError::InvalidPreparedInput(
-                "decoded managed-local target is not valid UTF-8".into(),
-            )
-        })?;
-        Ok(TrustedLocalRestartProjectionInput {
-            batch_id: record.prepared_batch().manifest().batch_id(),
-            sequence: record.sequence(),
-            relative_path: projection.intent().path().as_str().to_owned(),
-            base_revision: content_rev(base),
-            expected_base: expected_base.to_vec(),
-            exact_target: exact_target.to_vec(),
-            revision: content_rev(target),
-        })
-    }
-
-    /// Rebind one authenticated decoded journal record to the graph after
-    /// restart. The API is callback-free and cannot append or redraft.
-    pub(crate) fn recover_projection_after_restart<A>(
-        graph: &Graph,
-        append_proof: A,
-        input: TrustedLocalRestartProjectionInput,
-    ) -> TrustedLocalRestartProjectionOutcome<A> {
-        match graph.recover_committed_journal_page_projection(
-            append_proof,
-            &input.relative_path,
-            &input.base_revision,
-            &input.expected_base,
-            &input.exact_target,
-            &input.revision,
-        ) {
-            JournalPageProjectionOutcome::Durable(graph) => {
-                TrustedLocalRestartProjectionOutcome::Durable(
-                    TrustedLocalRestartProjectionDurable {
-                        batch_id: input.batch_id,
-                        sequence: input.sequence,
-                        graph,
-                    },
-                )
-            }
-            JournalPageProjectionOutcome::CommittedPending(graph) => {
-                TrustedLocalRestartProjectionOutcome::CommittedPending(
-                    TrustedLocalRestartProjectionPending {
-                        batch_id: input.batch_id,
-                        sequence: input.sequence,
-                        graph,
-                    },
-                )
-            }
-        }
-    }
-
     #[cfg(test)]
     fn inject_before_overlay_failure(error: ManagedLocalRecordError) {
         BEFORE_OVERLAY_FAILURE.with(|failure| *failure.borrow_mut() = Some(error));
@@ -933,16 +805,6 @@ fn before_overlay_hook() -> Result<(), ManagedLocalRecordError> {
     Ok(())
 }
 
-pub(crate) struct TrustedLocalRestartProjectionInput {
-    batch_id: BatchId,
-    sequence: u64,
-    relative_path: String,
-    base_revision: String,
-    expected_base: Vec<u8>,
-    exact_target: Vec<u8>,
-    revision: String,
-}
-
 pub(crate) enum TrustedLocalRestartProjectionOutcome<A> {
     Durable(TrustedLocalRestartProjectionDurable<A>),
     CommittedPending(TrustedLocalRestartProjectionPending<A>),
@@ -954,23 +816,7 @@ pub(crate) struct TrustedLocalRestartProjectionDurable<A> {
     graph: DurableJournalPageProjection<A>,
 }
 
-impl<A> TrustedLocalRestartProjectionDurable<A> {
-    pub(crate) const fn batch_id(&self) -> BatchId {
-        self.batch_id
-    }
-
-    pub(crate) const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    pub(crate) fn append_proof(&self) -> &A {
-        self.graph.append_proof()
-    }
-
-    pub(crate) fn target(&self) -> &JournalPageProjectionTarget {
-        self.graph.target()
-    }
-}
+impl<A> TrustedLocalRestartProjectionDurable<A> {}
 
 pub(crate) struct TrustedLocalRestartProjectionPending<A> {
     batch_id: BatchId,
@@ -978,31 +824,7 @@ pub(crate) struct TrustedLocalRestartProjectionPending<A> {
     graph: CommittedPendingJournalPageProjection<A>,
 }
 
-impl<A> TrustedLocalRestartProjectionPending<A> {
-    pub(crate) const fn batch_id(&self) -> BatchId {
-        self.batch_id
-    }
-
-    pub(crate) const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    pub(crate) fn append_proof(&self) -> &A {
-        self.graph.append_proof()
-    }
-
-    pub(crate) fn relative_path(&self) -> &str {
-        self.graph.relative_path()
-    }
-
-    pub(crate) fn exact_target(&self) -> &[u8] {
-        self.graph.target()
-    }
-
-    pub(crate) fn last_error(&self) -> &io::Error {
-        self.graph.last_error()
-    }
-}
+impl<A> TrustedLocalRestartProjectionPending<A> {}
 
 // Pre-0.7 enrolled fast-commit corpus. The clean runtime does not call this
 // coordinator; retain the production surface only until the compiler-guided

@@ -250,11 +250,6 @@ struct ProviderTransactionGate {
     lock_file: fs::File,
 }
 
-enum ProviderSourceTransactionGate<'a> {
-    Mailbox,
-    Tree(&'a ProviderTransactionGate),
-}
-
 impl Drop for ProviderTransactionGate {
     fn drop(&mut self) {
         provider_unlock_file(&self.lock_file);
@@ -970,8 +965,6 @@ pub(crate) enum SharedProviderObservation {
     Complete,
 }
 
-const PROVIDER_PENDING_PUBLICATION_BYTES: usize = 64;
-
 pub(crate) struct SharedProviderObservationCursor {
     phase: u8,
     entries: Option<ReadDir>,
@@ -983,15 +976,6 @@ pub(crate) struct SharedProviderObservationCursor {
 impl SharedProviderObservationCursor {
     pub(crate) fn begin_next_chunk(&mut self) {
         self.observed_entries = 0;
-    }
-
-    pub(crate) fn has_completed_authority_discovery(&self) -> bool {
-        // A head cursor is authoritative only after descriptor, frontier-head,
-        // and publication-intent discovery. A full cursor must additionally
-        // exhaust recovery evidence plus canonical manifests and objects:
-        // those later namespaces can reveal ingress that changes accepted
-        // authority.
-        self.phase > if self.full { 7 } else { 3 }
     }
 
     #[cfg(test)]
@@ -1459,72 +1443,6 @@ impl SharedProviderTransport {
             None,
             ProviderRemoveMissingSourcePolicy::SettleIfAbsent,
         )
-    }
-
-    pub(crate) fn record_pending_publication(
-        &self,
-        batch_id: super::BatchId,
-    ) -> Result<(), ScenarioError> {
-        let gate = self.journal.acquire_transaction_gate()?;
-        self.journal.require_transaction_gate(&gate)?;
-        let name = format!("{batch_id}.pending");
-        let bytes = batch_id.to_string().into_bytes();
-        if let Some(mut existing) = open_provider_regular_optional(
-            &self.pending_publication,
-            &name,
-            PROVIDER_PENDING_PUBLICATION_BYTES,
-            &name,
-        )? {
-            return validate_local_file_bytes(&mut existing.file, &bytes, &name);
-        }
-        pending_publication_marker_creation_hook()?;
-        let mut file = create_local_file_exclusive(&self.pending_publication, &name)?;
-        file.write_all(&bytes)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        crate::durability_counters::sync_file(&file)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        validate_local_file_bytes(&mut file, &bytes, &name)?;
-        sync_provider_directory(&self.pending_publication)
-    }
-
-    pub(crate) fn pending_publication_cursor(
-        &self,
-    ) -> Result<SharedProviderPublicationCursor, ScenarioError> {
-        Ok(SharedProviderPublicationCursor {
-            entries: self
-                .pending_publication
-                .entries()
-                .map_err(|error| ScenarioError::Io(error.to_string()))?,
-        })
-    }
-
-    pub(crate) fn next_pending_publication(
-        &self,
-        cursor: &mut SharedProviderPublicationCursor,
-    ) -> Result<Option<super::BatchId>, ScenarioError> {
-        let Some(entry) = cursor.entries.next() else {
-            return Ok(None);
-        };
-        let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 publication".into()))?;
-        let id = name
-            .strip_suffix(".pending")
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .map(super::BatchId::from_uuid)
-            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-        let bytes = id.to_string().into_bytes();
-        let mut opened = open_provider_regular_optional(
-            &self.pending_publication,
-            &name,
-            PROVIDER_PENDING_PUBLICATION_BYTES,
-            &name,
-        )?
-        .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-        validate_local_file_bytes(&mut opened.file, &bytes, &name)?;
-        Ok(Some(id))
     }
 
     /// Remove one provider-generated conflict name only after the retained
@@ -3295,96 +3213,6 @@ impl ProviderRetryJournal {
         sync_provider_directory(&self.completed)
     }
 
-    fn load_put_for_binding(
-        &self,
-        gate: &ProviderTransactionGate,
-        operation_binding: &str,
-    ) -> Result<Option<ProviderJournalRecord>, ScenarioError> {
-        self.require_transaction_gate(gate)?;
-        let mut found = None;
-        let mut scanned = 0_usize;
-        for entry in self
-            .records
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
-            scanned = scanned
-                .checked_add(1)
-                .ok_or(ScenarioError::ProviderJournalLimit)?;
-            if scanned > MAX_PROVIDER_JOURNAL_PENDING {
-                return Err(ScenarioError::ProviderJournalLimit);
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 entry".into()))?;
-            if !name.ends_with(".json") {
-                return Err(ScenarioError::UnsafeProviderJournal(name));
-            }
-            let opened = open_provider_regular_optional(
-                &self.records,
-                &name,
-                MAX_PROVIDER_JOURNAL_RECORD_BYTES,
-                &name,
-            )
-            .map_err(|_| ScenarioError::UnsafeProviderJournal(name.clone()))?
-            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-            let record = self.decode_record(&opened.bytes, &name)?;
-            self.validate_record_shape(gate, &record, true)?;
-            if record.operation == ProviderJournalOperation::Put
-                && record.operation_binding == operation_binding
-            {
-                if found.replace(record).is_some() {
-                    return Err(ScenarioError::UnsafeProviderJournal(
-                        operation_binding.into(),
-                    ));
-                }
-            }
-        }
-        if found.is_some() {
-            return Ok(found);
-        }
-        let mut completed_scanned = 0_usize;
-        for entry in self
-            .completed
-            .entries()
-            .map_err(|error| ScenarioError::Io(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
-            completed_scanned = completed_scanned
-                .checked_add(1)
-                .ok_or(ScenarioError::ProviderJournalLimit)?;
-            if completed_scanned > MAX_PROVIDER_JOURNAL_COMPLETED {
-                return Err(ScenarioError::ProviderJournalLimit);
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 entry".into()))?;
-            let opened = open_provider_regular_optional(
-                &self.completed,
-                &name,
-                MAX_PROVIDER_JOURNAL_RECORD_BYTES,
-                &name,
-            )
-            .map_err(|_| ScenarioError::UnsafeProviderJournal(name.clone()))?
-            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
-            let record = self.decode_record(&opened.bytes, &name)?;
-            self.validate_record_shape(gate, &record, false)?;
-            if record.operation == ProviderJournalOperation::Put
-                && record.operation_binding == operation_binding
-            {
-                if found.replace(record).is_some() {
-                    return Err(ScenarioError::UnsafeProviderJournal(
-                        operation_binding.into(),
-                    ));
-                }
-            }
-        }
-        Ok(found)
-    }
-
     fn validate_record(
         &self,
         gate: &ProviderTransactionGate,
@@ -4343,35 +4171,6 @@ fn validate_retired_file(
     Ok(())
 }
 
-fn validate_provider_name_identity_or_quarantine(
-    journal: &ProviderRetryJournal,
-    gate: &ProviderTransactionGate,
-    parent: &Dir,
-    name: &str,
-    retained: &fs::File,
-    removed: &Dir,
-    path: &str,
-) -> Result<(), ScenarioError> {
-    journal.require_transaction_gate(gate)?;
-    let named = match open_provider_regular_optional(parent, name, MAX_PROVIDER_RESCAN_BYTES, path)
-    {
-        Ok(named) => named,
-        Err(_) => {
-            quarantine_provider_name(journal, gate, parent, name, removed, "destination-race")?;
-            return Err(ScenarioError::UnsafeProviderEntry(path.into()));
-        }
-    };
-    if let Some(named) = named.as_ref() {
-        if provider_files_have_same_identity(retained, &named.file)? {
-            return Ok(());
-        }
-    }
-    if named.is_some() {
-        quarantine_provider_name(journal, gate, parent, name, removed, "destination-race")?;
-    }
-    Err(ScenarioError::UnsafeProviderEntry(path.into()))
-}
-
 fn quarantine_provider_name(
     journal: &ProviderRetryJournal,
     gate: &ProviderTransactionGate,
@@ -4857,14 +4656,6 @@ fn preserve_retirement_race(
     )
     .map_err(|error| ScenarioError::Io(error.to_string()))?;
     sync_shared_provider_publication_directories(evidence, Some(source_dir))
-}
-
-fn valid_relative_path(path: &str) -> bool {
-    !path.is_empty()
-        && Path::new(path).is_relative()
-        && !Path::new(path)
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
 }
 
 fn valid_provider_path(path: &str) -> bool {
@@ -5781,33 +5572,6 @@ fn validate_provider_file_bytes(
     Ok(())
 }
 
-enum ProviderDestinationState {
-    Absent,
-    ExactBytes,
-    ConflictingBytes,
-}
-
-/// Reconcile a destination against the exact retained bytes. This is the
-/// publication state machine's recovery point: a previous call may have made
-/// the name durable before an injected or validation error was returned.
-fn provider_destination_state(
-    destination_dir: &Dir,
-    destination_name: &str,
-    expected: &[u8],
-    destination_path: &str,
-) -> Result<ProviderDestinationState, ScenarioError> {
-    match open_provider_regular_optional(
-        destination_dir,
-        destination_name,
-        MAX_PROVIDER_RESCAN_BYTES,
-        destination_path,
-    )? {
-        None => Ok(ProviderDestinationState::Absent),
-        Some(opened) if opened.bytes == expected => Ok(ProviderDestinationState::ExactBytes),
-        Some(_) => Ok(ProviderDestinationState::ConflictingBytes),
-    }
-}
-
 fn validate_journal_staging(
     staging: &Dir,
     record: &ProviderJournalRecord,
@@ -6324,25 +6088,6 @@ fn pending_publication_marker_creation_hook() -> Result<(), ScenarioError> {
     }
 }
 
-#[cfg(not(test))]
-fn pending_publication_marker_creation_hook() -> Result<(), ScenarioError> {
-    Ok(())
-}
-
-fn provider_finish_after_gate_hook() {
-    #[cfg(test)]
-    PROVIDER_FINISH_AFTER_GATE_HOOK.with(|hook| {
-        if let Some(callback) = hook.borrow_mut().take() {
-            callback();
-        }
-    });
-}
-
-fn provider_source_inspection_visit() {
-    #[cfg(test)]
-    PROVIDER_SOURCE_INSPECTION_VISITS.with(|visits| visits.set(visits.get() + 1));
-}
-
 fn provider_post_validation_hook(_operation: ProviderPostValidationOperation) {
     #[cfg(test)]
     PROVIDER_POST_VALIDATION_HOOK.with(|hook| {
@@ -6510,13 +6255,6 @@ fn provider_removal_durability_hook(step: ProviderRemovalDurabilityStep) {
 
 #[cfg(not(test))]
 fn provider_removal_durability_hook(_step: ProviderRemovalDurabilityStep) {}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn close_provider_delete_pending_file(file: fs::File) {
-    provider_removal_durability_hook(ProviderRemovalDurabilityStep::DeletePending);
-    drop(file);
-    provider_removal_durability_hook(ProviderRemovalDurabilityStep::HandleDropped);
-}
 
 #[cfg(windows)]
 fn provider_rename_handle_noreplace(

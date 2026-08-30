@@ -688,46 +688,6 @@ fn page_property_block_parts(
     Some(block)
 }
 
-/// Parser-owned explicit page-reference targets contributed by one physical
-/// cached page. This is the projection used by the reconstructible candidate
-/// index; query-time occurrence verification still uses the full evidence
-/// engine below and remains authoritative.
-pub(crate) fn document_explicit_reference_names(entry: &PageEntry, doc: &Document) -> Vec<String> {
-    fn collect(blocks: &[DocBlock], names: &mut Vec<String>) {
-        for block in blocks {
-            names.extend(
-                block
-                    .projection()
-                    .reference_source
-                    .explicit
-                    .iter()
-                    .map(|reference| refs::page_key(&reference.name)),
-            );
-            collect(&block.children, names);
-        }
-    }
-
-    let mut names = Vec::new();
-    if let Some(block) = doc
-        .pre_block
-        .as_deref()
-        .and_then(|pre| page_property_block(entry, pre))
-    {
-        names.extend(
-            block
-                .projection()
-                .reference_source
-                .explicit
-                .iter()
-                .map(|reference| refs::page_key(&reference.name)),
-        );
-    }
-    collect(&doc.roots, &mut names);
-    names.sort_unstable();
-    names.dedup();
-    names
-}
-
 fn block_reference_evidence(
     block: &DocBlock,
     canonical: &str,

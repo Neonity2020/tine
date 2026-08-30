@@ -106,58 +106,7 @@ struct ResumeBudget {
     remaining: usize,
 }
 
-impl ResumeBudget {
-    fn new() -> Self {
-        Self {
-            remaining: Self::budget(),
-        }
-    }
-
-    /// The per-slice operation budget. The former value of 16 made fixed
-    /// reauthentication/reopen overhead dominate: a 300-file import needed 168
-    /// ~277 ms slices, and one legitimate 20,000-block page needed thousands.
-    /// 256 retains bounded yields while amortizing that fixed work; the large
-    /// page regression completes within 64 actor turns instead of remaining in
-    /// Recovering until an unrelated memory bound eventually fired (#311).
-    /// `TINE_RESUME_BUDGET` remains available for measured trade-off probes.
-    fn budget() -> usize {
-        #[cfg(test)]
-        if let Some(value) = TEST_RESUME_OPERATION_BUDGET.get() {
-            return value;
-        }
-        std::env::var("TINE_RESUME_BUDGET")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(RESUME_OPERATION_BUDGET)
-    }
-
-    /// Charge `count` units to the phase that actually performed the work.
-    ///
-    /// The phase is supplied by the call site rather than assumed, so an
-    /// exhaustion failure always names the drain that overran and phase
-    /// assertions in regressions stay meaningful.
-    fn consume(
-        &mut self,
-        count: usize,
-        phase: OperationalPhase,
-    ) -> Result<(), OperationalCoordinatorError> {
-        if count > self.remaining {
-            return Err(OperationalCoordinatorError::new(
-                phase,
-                "coordinator resume operation budget was exceeded",
-            ));
-        }
-        // The budget is charged per phase, so this is the only place that knows
-        // which phase consumes an import's work. ~36 s of a 300-file import is
-        // irreducible work (F42) and it has never been attributed to a phase.
-        if super::phase_trace_enabled() {
-            eprintln!("PHASE CHARGE {phase:?} {count}");
-        }
-        self.remaining -= count;
-        Ok(())
-    }
-}
+impl ResumeBudget {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationalPhase {
@@ -1089,10 +1038,6 @@ pub(crate) struct PreparedLocalMutation {
 }
 
 impl PreparedLocalMutation {
-    pub(crate) const fn batch_id(&self) -> BatchId {
-        self.batch_id
-    }
-
     pub(crate) const fn prepared_batch(&self) -> &PreparedBatch {
         &self.prepared
     }
@@ -1591,12 +1536,6 @@ pub(crate) fn fail_once_at(point: OperationalFaultPoint) {
 pub(crate) fn fail_repeatedly_at(point: OperationalFaultPoint, failures: u8) {
     assert!(failures > 0, "a repeated operational fault needs work");
     OPERATIONAL_REPEATED_FAULT.set(Some((point, failures)));
-}
-
-pub(crate) fn act_once_at(point: OperationalFaultPoint, action: impl FnOnce() + 'static) {
-    OPERATIONAL_ACTION.with(|slot| {
-        *slot.borrow_mut() = Some((point, Box::new(action)));
-    });
 }
 
 fn fault(point: OperationalFaultPoint) -> Result<(), OperationalCoordinatorError> {

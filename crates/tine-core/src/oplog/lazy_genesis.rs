@@ -214,10 +214,6 @@ impl CleanSharedEnrollmentDescriptorV1 {
     pub(crate) const fn initiator_device_id(&self) -> DeviceId {
         self.initiator_device_id
     }
-
-    pub(crate) const fn object_store_namespace(&self) -> ContentDigest {
-        self.object_store_namespace
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

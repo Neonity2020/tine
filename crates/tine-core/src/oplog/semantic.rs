@@ -801,15 +801,6 @@ impl SemanticEffect {
         &self.pages
     }
 
-    pub(crate) fn mark_revive_page(&mut self, page_id: PageId) -> Result<(), SemanticError> {
-        let index = self
-            .pages
-            .binary_search_by_key(&page_id, |delta| delta.page_id)
-            .map_err(|_| SemanticError::InvalidPageLifecycle)?;
-        self.pages[index].mark_revive_page()?;
-        self.validate()
-    }
-
     pub fn page_preambles(&self) -> &[PagePreambleDelta] {
         &self.page_preambles
     }

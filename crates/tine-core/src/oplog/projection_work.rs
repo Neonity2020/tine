@@ -188,26 +188,7 @@ pub(crate) struct ProjectionCompletedReceipt {
     logical_completion_id: LogicalCompletionId,
 }
 
-impl ProjectionCompletedReceipt {
-    pub(crate) const fn page_id(&self) -> PageId {
-        self.page_id
-    }
-    pub(crate) fn path(&self) -> &ManagedPath {
-        &self.path
-    }
-    pub(crate) fn frontier(&self) -> &FrontierV2 {
-        &self.frontier
-    }
-    pub(crate) const fn target(&self) -> ProjectionWorkTarget {
-        self.target
-    }
-    pub(crate) const fn intent_id(&self) -> ProjectionIntentId {
-        self.intent_id
-    }
-    pub(crate) const fn logical_completion_id(&self) -> LogicalCompletionId {
-        self.logical_completion_id
-    }
-}
+impl ProjectionCompletedReceipt {}
 
 fn work_id(
     endpoint_id: ProjectionEndpointId,

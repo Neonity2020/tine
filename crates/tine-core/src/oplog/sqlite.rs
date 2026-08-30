@@ -1048,37 +1048,12 @@ impl ApplicationRuntimeRoot {
         Ok(Self { path })
     }
 
-    /// Isolated deterministic harnesses need a caller-owned runtime root so
-    /// they never consult or mutate normal application startup state.
-    pub(crate) fn open_for_harness(path: &Path) -> Result<Self, ProjectionError> {
-        let path = prepare_application_runtime_root(path)?;
-        Ok(Self { path })
-    }
-
     /// Open an explicitly supplied private application-runtime root for the
     /// opt-in activation API.  Its caller has already established that the
     /// path is outside the graph; this constructor preserves the runtime
     /// root's own no-follow and ownership checks.
     pub(crate) fn open_explicit_private(path: &Path) -> Result<Self, ProjectionError> {
         let path = prepare_application_runtime_root(path)?;
-        Ok(Self { path })
-    }
-
-    /// Retain an already-existing private runtime root without creating it.
-    pub(crate) fn open_existing_for_runtime_host(path: &Path) -> Result<Self, ProjectionError> {
-        let direct_metadata = fs::symlink_metadata(path)?;
-        if direct_metadata.file_type().is_symlink() || !direct_metadata.is_dir() {
-            return Err(ProjectionError::UnsafePath(
-                "application runtime root is not a no-follow directory".into(),
-            ));
-        }
-        let path = fs::canonicalize(path)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ProjectionError::UnsafePath(
-                "application runtime root is not a real directory".into(),
-            ));
-        }
         Ok(Self { path })
     }
 
@@ -2358,10 +2333,6 @@ impl CleanGenesisProjectionBuilder {
         })
     }
 
-    pub(crate) const fn instrumentation(&self) -> CleanGenesisProjectionInstrumentation {
-        self.instrumentation
-    }
-
     pub(crate) fn push_page(
         &mut self,
         page: super::MaterializedPageInput,
@@ -2915,11 +2886,6 @@ fn reset_projection_open_breakdown() {
 
 fn update_projection_open_breakdown(update: impl FnOnce(&mut ProjectionOpenBreakdown)) {
     PROJECTION_OPEN_BREAKDOWN.with(|slot| update(&mut slot.borrow_mut()));
-}
-
-/// Take the breakdown recorded by the most recent projection open on this thread.
-pub(crate) fn take_projection_open_breakdown() -> ProjectionOpenBreakdown {
-    PROJECTION_OPEN_BREAKDOWN.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3568,16 +3534,6 @@ impl TailOverlay {
         Ok(reservation)
     }
 
-    pub(crate) fn reserve_bound_mutation(
-        &mut self,
-        database: &SqliteFrontier,
-        engine: &ShardedHotEngine,
-        retained_bytes: usize,
-    ) -> Result<TailReservation, TailOverlayError> {
-        self.authenticate_event_authority(database, engine)?;
-        self.reserve_mutation(retained_bytes)
-    }
-
     pub fn cancel_reservation(
         &mut self,
         reservation: TailReservation,
@@ -4083,10 +4039,6 @@ thread_local! {
     // one.
     static HARNESS_TERMINAL_CONSTRUCTION_CUT: std::cell::Cell<Option<TerminalConstructionCut>> =
         const { std::cell::Cell::new(None) };
-}
-
-pub(crate) fn fail_next_terminal_construction_at(cut: TerminalConstructionCut) {
-    HARNESS_TERMINAL_CONSTRUCTION_CUT.with(|slot| slot.set(Some(cut)));
 }
 
 fn terminal_construction_cut(cut: TerminalConstructionCut) -> Result<(), ProjectionError> {
@@ -9502,13 +9454,6 @@ impl ProjectionError {
                 Self::RetainedScratchResumeFailure(failure)
             }
             error => Self::Materialization(error.to_string()),
-        }
-    }
-
-    pub(crate) fn retained_scratch_resume_failure(&self) -> Option<&RetainedScratchResumeFailure> {
-        match self {
-            Self::RetainedScratchResumeFailure(failure) => Some(failure),
-            _ => None,
         }
     }
 }

@@ -1249,10 +1249,6 @@ impl<A> DurableJournalPageProjection<A> {
     pub(crate) fn target(&self) -> &JournalPageProjectionTarget {
         &self.target
     }
-
-    pub(crate) fn into_parts(self) -> (A, JournalPageProjectionTarget) {
-        (self.append_proof, self.target)
-    }
 }
 
 /// A durable append whose exact graph publication still needs completion.
@@ -1935,28 +1931,6 @@ impl HandoffSafeGuard {
         })
     }
 
-    pub(crate) fn remove_page_projection(
-        &self,
-        graph: &Graph,
-        relative_path: &str,
-        expected_base: &[u8],
-        authority: &mut impl ProjectionMutationEvidence,
-    ) -> io::Result<ProjectionWriteProof> {
-        #[cfg(test)]
-        count_projection_remove_call();
-        let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts, publisher| {
-            graph.remove_page_projection_with_attempts(
-                &write,
-                relative_path,
-                expected_base,
-                reservation,
-                known_attempts,
-                publisher,
-            )
-        })
-    }
-
     #[cfg(test)]
     pub(crate) fn recover_page_projection(
         &self,
@@ -1998,63 +1972,6 @@ impl HandoffSafeGuard {
                 expected_target,
                 guarded_layout,
                 attempts,
-            )
-        })
-    }
-
-    pub(crate) fn recover_removed_page_projection(
-        &self,
-        graph: &Graph,
-        relative_path: &str,
-        expected_base: &[u8],
-        authority: &mut impl ProjectionMutationEvidence,
-    ) -> io::Result<ProjectionWriteProof> {
-        #[cfg(test)]
-        count_projection_recovery_call();
-        let write = self.admit_projection_writer(graph)?;
-        authority.consume_recovery_evidence(relative_path, |attempts| {
-            graph.recover_removed_page_projection_with_attempts(
-                &write,
-                relative_path,
-                expected_base,
-                attempts,
-            )
-        })
-    }
-
-    pub(crate) fn confirm_removed_page_projection(
-        &self,
-        graph: &Graph,
-        relative_path: &str,
-        authority: &mut impl ProjectionMutationEvidence,
-    ) -> io::Result<ProjectionWriteProof> {
-        #[cfg(test)]
-        count_projection_recovery_call();
-        let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts, _| {
-            graph.confirm_removed_page_projection_with_attempts(
-                &write,
-                relative_path,
-                reservation,
-                known_attempts,
-            )
-        })
-    }
-
-    pub(crate) fn confirm_existing_page_projection(
-        &self,
-        graph: &Graph,
-        relative_path: &str,
-        expected_target: &[u8],
-        authority: &mut impl ProjectionMutationEvidence,
-    ) -> io::Result<ProjectionWriteProof> {
-        let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, _, _| {
-            graph.confirm_existing_page_projection_with_attempts(
-                &write,
-                relative_path,
-                expected_target,
-                reservation,
             )
         })
     }
@@ -4359,9 +4276,6 @@ fn count_graph_text_admission_persistent_payload_members(members: usize) {
 #[cfg(not(test))]
 fn count_graph_text_admission_persistent_payload_members(_members: usize) {}
 
-#[cfg(not(test))]
-fn count_graph_text_admission_point_query() {}
-
 #[cfg(test)]
 fn graph_text_event_revalidation_race_hook() -> io::Result<()> {
     GRAPH_TEXT_EVENT_REVALIDATION_RACE.with(|hook| {
@@ -6233,45 +6147,6 @@ impl Graph {
         })
     }
 
-    /// Reconstruct, when necessary, and consume the process-local graph-text
-    /// latch for one exact durably blocked published batch.
-    ///
-    /// A second cold reopen has no process-local gate state even though the
-    /// accepted projection row remains durably `Blocked`. The caller must first
-    /// authenticate that exact row from accepted history. Under this gate's
-    /// single-writer mutex we then reacquire the missing local latch, if and
-    /// only if it is absent, and consume it before the external feed is
-    /// admitted. This is deliberately not a general startup recovery API.
-    pub(crate) fn reconstruct_and_consume_recovered_published_handoff(
-        &self,
-        endpoint: ProjectionEndpointBinding,
-    ) -> io::Result<()> {
-        let graph_resource_id = self.canonical_resource_id()?;
-        let binding = self.managed_write_binding()?;
-        if binding.resource_id != graph_resource_id
-            || endpoint.graph_resource_id() != graph_resource_id
-        {
-            return Err(managed_write_identity_mismatch_error());
-        }
-        let mut state = binding.gate.state.lock().unwrap();
-        if state.active_writers != 0 {
-            return Err(handoff_write_blocked_error());
-        }
-        if !state.handoff_held {
-            state.handoff_held = true;
-            #[cfg(test)]
-            {
-                state.recovered_handoff_reconstructions += 1;
-            }
-        }
-        state.handoff_held = false;
-        #[cfg(test)]
-        {
-            state.handoff_releases += 1;
-        }
-        Ok(())
-    }
-
     fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
         // Every graph-text write in this file passes through here, which is why
         // the read-only view is enforced at this one point rather than trusted
@@ -7789,18 +7664,6 @@ impl Graph {
             .map_err(|_| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))
     }
 
-    /// Managed text kind for one exact path, under the same OG-compatible
-    /// loading semantics that decode its entry.
-    pub(crate) fn managed_text_kind_for_managed_path(
-        &self,
-        path: &ManagedPath,
-    ) -> Result<ManagedTextKind, ReceiptError> {
-        Ok(match self.managed_entry_for_managed_path(path)?.kind {
-            PageKind::Page => ManagedTextKind::Page,
-            PageKind::Journal => ManagedTextKind::Journal,
-        })
-    }
-
     fn managed_find_entry(
         &self,
         permit: &ManagedTextWritePermit,
@@ -8468,13 +8331,6 @@ impl Graph {
             DirectCreationProof { target, generation },
             requested_identity_elsewhere,
         ))
-    }
-
-    fn capture_direct_creation_census(
-        &self,
-        permit: &ManagedTextWritePermit,
-    ) -> io::Result<std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>> {
-        self.capture_direct_creation_census_with_limits(permit, INITIAL_SHADOW_LIMITS)
     }
 
     fn capture_direct_creation_census_with_limits(
@@ -11211,13 +11067,6 @@ impl Graph {
         Ok(ProjectionParent { chain })
     }
 
-    fn ensure_graph_text_admission_snapshot_binding(
-        &self,
-        index: &CompleteGraphTextAdmissionIndex,
-    ) -> io::Result<()> {
-        self.ensure_graph_text_admission_snapshot_binding_policy(index, true)
-    }
-
     fn ensure_graph_text_admission_snapshot_binding_policy(
         &self,
         index: &CompleteGraphTextAdmissionIndex,
@@ -11249,13 +11098,6 @@ impl Graph {
             ));
         }
         Ok(())
-    }
-
-    fn poison_graph_text_admission_error(&self, error: io::Error) -> io::Error {
-        let cause = error.to_string();
-        let mut state = self.graph_text_admission.write().unwrap();
-        poison_graph_text_admission_state(&mut state, cause);
-        error
     }
 
     fn ensure_projection_root_binding(&self) -> io::Result<()> {
@@ -17830,88 +17672,6 @@ impl Graph {
                 publisher,
             )
         })
-    }
-
-    fn confirm_existing_page_projection_with_attempts(
-        &self,
-        write: &ManagedTextWritePermit,
-        relative_path: &str,
-        expected_target: &[u8],
-        reservation: &ProjectionAttemptReservation,
-    ) -> io::Result<ProjectionWriteProof> {
-        require_projection_platform()?;
-        if usize_to_u64(expected_target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "projection target exceeds the evidence reload bound",
-            ));
-        }
-        let expected_text = std::str::from_utf8(expected_target).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "projection target is not valid UTF-8",
-            )
-        })?;
-        let target = self.projection_page_target(relative_path)?;
-        validate_projection_attempt(&target, reservation)?;
-        let lock = self.page_lock(&target.absolute_path);
-        let _guard = lock.lock().unwrap();
-        let parent = self.projection_parent(&target, false)?;
-        preflight_reconstructible_projection_chain(&parent.chain)?;
-        self.ensure_projection_target_shape(&parent, &target)?;
-        self.validate_current_graph_text_collision(
-            write,
-            &target.absolute_path,
-            self.managed_optional_file_identity(write, &target.absolute_path)?,
-        )?;
-        let (file, current) =
-            open_and_read_projection_regular_for_sync(parent.final_dir(), &target.filename)?;
-        if current != expected_target {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "existing projection target changed before confirmation",
-            ));
-        }
-        let document = parse_doc(&target.absolute_path, expected_text);
-        let (_, guarded) = self.serialize_page_document(
-            document,
-            &target.absolute_path,
-            Some(expected_text),
-            &[],
-        )?;
-        if guarded.as_bytes() != expected_target {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "existing projection differs from guarded page serialization",
-            ));
-        }
-        barrier_sync_all(&file)?;
-        sync_reconstructible_projection_chain(&parent.chain)?;
-        self.ensure_projection_parent_binding(&parent, &target)?;
-        self.ensure_projection_target_shape(&parent, &target)?;
-        self.validate_current_graph_text_collision(
-            write,
-            &target.absolute_path,
-            self.managed_optional_file_identity(write, &target.absolute_path)?,
-        )?;
-        let reread =
-            read_projection_optional(parent.final_dir(), &target.filename)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "existing projection disappeared during confirmation",
-                )
-            })?;
-        if reread != expected_target {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "existing projection changed during confirmation",
-            ));
-        }
-        Ok(ProjectionWriteProof::new(
-            target.relative_path,
-            reread,
-            Vec::new(),
-        ))
     }
 
     fn write_page_projection_with_attempts(
@@ -24864,42 +24624,6 @@ impl RetainedContentReservation {
         self.bytes = bytes;
         Ok(())
     }
-
-    /// Replace one already-accounted retained value after a separately reserved
-    /// temporary allocation has been constructed. The aggregate remains at the
-    /// real allocation peak until this call, then old storage is released and
-    /// the temporary reservation is transferred to the replacement.
-    fn replace_with_temporary(
-        &mut self,
-        mut temporary: RetainedContentReservation,
-        replacement_bytes: u64,
-    ) -> io::Result<()> {
-        assert!(
-            Rc::ptr_eq(&self.state, &temporary.state),
-            "managed content reservations belong to different budgets"
-        );
-        let retained = self.state.retained.get();
-        let represented = self
-            .bytes
-            .checked_add(temporary.bytes)
-            .expect("reservation representation overflow");
-        assert!(
-            replacement_bytes <= represented,
-            "replacement exceeded its managed construction reservation"
-        );
-        assert!(
-            retained >= represented,
-            "replacement released unreserved managed content"
-        );
-        let retained = retained
-            .checked_sub(represented)
-            .and_then(|value| value.checked_add(replacement_bytes))
-            .ok_or_else(allocation_overflow)?;
-        self.state.retained.set(retained);
-        self.bytes = replacement_bytes;
-        temporary.bytes = 0;
-        Ok(())
-    }
 }
 
 impl Drop for RetainedContentReservation {
@@ -25072,80 +24796,8 @@ fn graph_text_page_entry_retained_upper_bound(entry: &PageEntry) -> io::Result<u
     checked_add_bytes(bytes, owned_path_upper_bound(&entry.path)?)
 }
 
-fn dto_page_source_metrics(page: &PageDto) -> io::Result<(u64, u64, u64)> {
-    let mut blocks = 0_u64;
-    let mut source = page
-        .pre_block
-        .as_ref()
-        .map(|value| usize_to_u64(value.len()))
-        .transpose()?
-        .unwrap_or(0);
-    let mut largest_raw = 0_u64;
-    let mut walk = BlockDtoWalk::new(&page.blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        blocks = checked_add_bytes(blocks, 1)?;
-        let raw = usize_to_u64(block.raw.len())?;
-        source = checked_add_bytes(source, raw)?;
-        largest_raw = largest_raw.max(raw);
-    }
-    Ok((blocks, source, largest_raw))
-}
-
-fn document_source_metrics(doc: &Document) -> io::Result<(u64, u64, u64)> {
-    let mut blocks = 0_u64;
-    let mut source = doc
-        .pre_block
-        .as_ref()
-        .map(|value| usize_to_u64(value.len()))
-        .transpose()?
-        .unwrap_or(0);
-    let mut largest_raw = 0_u64;
-    let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
-        std::array::from_fn(|_| None);
-    let mut len = usize::from(!doc.roots.is_empty());
-    if len != 0 {
-        frames[0] = Some(doc.roots.iter());
-    }
-    while len != 0 {
-        let mut frame = frames[len - 1]
-            .take()
-            .expect("active document metric frame");
-        let Some(block) = frame.next() else {
-            len -= 1;
-            continue;
-        };
-        frames[len - 1] = Some(frame);
-        blocks = checked_add_bytes(blocks, 1)?;
-        let raw = usize_to_u64(block.raw.len())?;
-        source = checked_add_bytes(source, raw)?;
-        largest_raw = largest_raw.max(raw);
-        if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cached document nesting exceeds 128 levels",
-                ));
-            }
-            frames[len] = Some(block.children.iter());
-            len += 1;
-        }
-    }
-    Ok((blocks, source, largest_raw))
-}
-
 fn usize_to_u64(value: usize) -> io::Result<u64> {
     u64::try_from(value).map_err(|_| allocation_overflow())
-}
-
-fn capacity_bytes<T>(capacity: usize) -> io::Result<u64> {
-    checked_mul_bytes(
-        usize_to_u64(capacity)?,
-        usize_to_u64(std::mem::size_of::<T>())?,
-    )
-}
-
-fn string_retained_bytes(value: &String) -> io::Result<u64> {
-    usize_to_u64(value.capacity())
 }
 
 /// Managed page input is accepted only through depth 128. All operation-time
@@ -25223,121 +24875,6 @@ fn managed_block_walk_stack_upper_bound<T>() -> io::Result<u64> {
     )
 }
 
-fn page_dto_retained_bytes(page: &PageDto) -> io::Result<u64> {
-    let mut bytes = checked_add_bytes(
-        checked_add_bytes(
-            string_retained_bytes(&page.name)?,
-            string_retained_bytes(&page.title)?,
-        )?,
-        string_retained_bytes(&page.path)?,
-    )?;
-    bytes = checked_add_bytes(bytes, capacity_bytes::<BlockDto>(page.blocks.capacity())?)?;
-    for value in [&page.pre_block, &page.rev].into_iter().flatten() {
-        bytes = checked_add_bytes(bytes, string_retained_bytes(value)?)?;
-    }
-    let mut walk = BlockDtoWalk::new(&page.blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        for value in [&block.id, &block.raw] {
-            bytes = checked_add_bytes(bytes, string_retained_bytes(value)?)?;
-        }
-        bytes = checked_add_bytes(
-            bytes,
-            capacity_bytes::<BlockDto>(block.children.capacity())?,
-        )?;
-        bytes = checked_add_bytes(
-            bytes,
-            capacity_bytes::<String>(block.breadcrumb.capacity())?,
-        )?;
-        bytes = checked_add_bytes(bytes, capacity_bytes::<String>(block.tags.capacity())?)?;
-        bytes = checked_add_bytes(
-            bytes,
-            capacity_bytes::<(String, String)>(block.properties.capacity())?,
-        )?;
-        for value in block.breadcrumb.iter().chain(&block.tags) {
-            bytes = checked_add_bytes(bytes, string_retained_bytes(value)?)?;
-        }
-        for (key, value) in &block.properties {
-            bytes = checked_add_bytes(bytes, string_retained_bytes(key)?)?;
-            bytes = checked_add_bytes(bytes, string_retained_bytes(value)?)?;
-        }
-        for value in [
-            &block.marker,
-            &block.priority,
-            &block.scheduled,
-            &block.deadline,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            bytes = checked_add_bytes(bytes, string_retained_bytes(value)?)?;
-        }
-    }
-    Ok(bytes)
-}
-
-fn block_dtos_clone_upper_bound(blocks: &[BlockDto]) -> io::Result<u64> {
-    let mut bytes = 0_u64;
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        for value in [&block.id, &block.raw] {
-            bytes = checked_add_bytes(bytes, owned_string_upper_bound(value)?)?;
-        }
-        for value in [
-            &block.marker,
-            &block.priority,
-            &block.scheduled,
-            &block.deadline,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            bytes = checked_add_bytes(bytes, owned_string_upper_bound(value)?)?;
-        }
-        for values in [&block.breadcrumb, &block.tags] {
-            bytes = checked_add_bytes(
-                bytes,
-                conservative_vec_capacity_upper_bound::<String>(usize_to_u64(values.len())?)?,
-            )?;
-            for value in values {
-                bytes = checked_add_bytes(bytes, owned_string_upper_bound(value)?)?;
-            }
-        }
-        bytes = checked_add_bytes(
-            bytes,
-            conservative_vec_capacity_upper_bound::<(String, String)>(usize_to_u64(
-                block.properties.len(),
-            )?)?,
-        )?;
-        for (key, value) in &block.properties {
-            bytes = checked_add_bytes(bytes, owned_string_upper_bound(key)?)?;
-            bytes = checked_add_bytes(bytes, owned_string_upper_bound(value)?)?;
-        }
-        bytes = checked_add_bytes(
-            bytes,
-            conservative_vec_capacity_upper_bound::<BlockDto>(usize_to_u64(block.children.len())?)?,
-        )?;
-    }
-    Ok(bytes)
-}
-
-fn page_dto_clone_upper_bound(page: &PageDto) -> io::Result<u64> {
-    let mut bytes = 0_u64;
-    for value in [&page.name, &page.title, &page.path] {
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(value)?)?;
-    }
-    for value in [&page.pre_block, &page.rev].into_iter().flatten() {
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(value)?)?;
-    }
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_vec_capacity_upper_bound::<BlockDto>(
-            u64::try_from(page.blocks.len()).map_err(|_| allocation_overflow())?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(bytes, block_dtos_clone_upper_bound(&page.blocks)?)?;
-    Ok(bytes)
-}
-
 /// Source-derived upper bound for the parser, runtime-id assignment, lsdoc
 /// projections, DTO construction, and all simultaneously live parser/DTO
 /// buffers. Every term is tied to an owned lsdoc/Tine allocation class. A
@@ -25409,99 +24946,6 @@ fn managed_page_build_metrics_upper_bound(source: u64, lines: u64) -> io::Result
         bytes,
         managed_block_walk_stack_upper_bound::<(&[DocBlock], usize, Vec<BlockDto>)>()?,
     )?;
-    Ok(bytes)
-}
-
-fn page_serialized_output_upper_bound(
-    page: &PageDto,
-    existing: Option<&str>,
-) -> io::Result<(u64, u64)> {
-    let indent = existing
-        .into_iter()
-        .flat_map(str::lines)
-        .map(|line| line.len() - line.trim_start_matches([' ', '\t']).len())
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let indent = usize_to_u64(indent)?;
-    let mut bytes = page
-        .pre_block
-        .as_ref()
-        .map(|value| checked_add_bytes(usize_to_u64(value.len())?, 2))
-        .transpose()?
-        .unwrap_or(0);
-    let mut lines = page
-        .pre_block
-        .as_ref()
-        .map(|value| {
-            checked_add_bytes(
-                usize_to_u64(value.bytes().filter(|byte| *byte == b'\n').count())?,
-                1,
-            )
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let mut walk = BlockDtoWalk::new(&page.blocks);
-    while let Some((block, depth)) = walk.next()? {
-        let raw_lines = checked_add_bytes(
-            usize_to_u64(block.raw.bytes().filter(|byte| *byte == b'\n').count())?,
-            1,
-        )?;
-        let raw_bytes = usize_to_u64(block.raw.len())?;
-        let depth = usize_to_u64(depth)?;
-        let structural = match page.format {
-            Format::Md => checked_add_bytes(
-                checked_mul_bytes(raw_lines, checked_mul_bytes(depth, indent)?)?,
-                checked_mul_bytes(raw_lines, 2)?,
-            )?,
-            Format::Org => checked_add_bytes(depth, 2)?,
-        };
-        bytes = checked_add_bytes(bytes, checked_add_bytes(raw_bytes, structural)?)?;
-        lines = checked_add_bytes(lines, raw_lines)?;
-    }
-    // Newline joins/trailing bytes plus worst-case LF -> CRLF preservation.
-    bytes = checked_add_bytes(bytes, checked_mul_bytes(lines, 2)?)?;
-    if let Some(existing) = existing {
-        bytes = bytes.max(usize_to_u64(existing.len())?);
-    }
-    Ok((bytes, lines))
-}
-
-fn page_write_construction_upper_bound(page: &PageDto, existing: Option<&str>) -> io::Result<u64> {
-    let (serialized, lines) = page_serialized_output_upper_bound(page, existing)?;
-    let document_clone = page_document_clone_upper_bound(page)?;
-    let serializer_lines = checked_mul_bytes(
-        lines,
-        checked_mul_bytes(2, usize_to_u64(std::mem::size_of::<String>())?)?,
-    )?;
-    let existing_parse = match existing {
-        Some(value) => checked_mul_bytes(managed_page_build_upper_bound(value)?, 2)?,
-        None => 0,
-    };
-    checked_add_bytes(
-        checked_add_bytes(document_clone, existing_parse)?,
-        checked_add_bytes(checked_mul_bytes(serialized, 2)?, serializer_lines)?,
-    )
-}
-
-fn page_document_clone_upper_bound(page: &PageDto) -> io::Result<u64> {
-    let mut bytes = managed_block_walk_stack_upper_bound::<(&[BlockDto], usize, Vec<DocBlock>)>()?;
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_vec_capacity_upper_bound::<DocBlock>(usize_to_u64(page.blocks.len())?)?,
-    )?;
-    if let Some(pre_block) = &page.pre_block {
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(pre_block)?)?;
-    }
-    let mut walk = BlockDtoWalk::new(&page.blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(&block.raw)?)?;
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(&block.id)?)?;
-        bytes = checked_add_bytes(
-            bytes,
-            conservative_vec_capacity_upper_bound::<DocBlock>(usize_to_u64(block.children.len())?)?,
-        )?;
-    }
     Ok(bytes)
 }
 
@@ -29146,15 +28590,6 @@ fn graph_text_semantic_key(entry: &PageEntry) -> (u8, String) {
         PageKind::Journal => 1,
     };
     (kind, crate::refs::page_key(&entry.name))
-}
-
-fn graph_text_semantic_key_digest(entry: &PageEntry) -> ContentDigest {
-    let key = crate::refs::page_key(&entry.name);
-    let mut hasher = Sha256::new();
-    hasher.update(b"tine/graph-text-semantic-collision-key/v1\0");
-    hasher.update((key.len() as u64).to_be_bytes());
-    hasher.update(key.as_bytes());
-    ContentDigest::from_bytes(hasher.finalize().into())
 }
 
 fn initial_shadow_captures_match(

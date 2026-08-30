@@ -383,14 +383,6 @@ impl MaterializationChange {
         &self.deletions
     }
 
-    pub(crate) fn page_name_identity_records(&self) -> &[MaterializedIdentityRecord] {
-        &self.page_name_identity_records
-    }
-
-    pub(crate) fn portable_path_identity_records(&self) -> &[MaterializedIdentityRecord] {
-        &self.portable_path_identity_records
-    }
-
     pub(crate) fn with_derived_graph_facts(
         mut self,
         mut reference_postings: Vec<MaterializedReferencePosting>,
@@ -1016,21 +1008,6 @@ fn validate_page_name_pair(
     if crate::refs::page_key(raw_name) != normalized_name {
         return Err(MaterializationError::InvalidInput(format!(
             "{description} normalized name does not match refs::page_key"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_normalized_page_name(
-    description: &str,
-    normalized_name: &str,
-) -> Result<(), MaterializationError> {
-    if normalized_name.is_empty()
-        || normalized_name.len() > MAX_MATERIALIZATION_FIELD_BYTES
-        || crate::refs::page_key(normalized_name) != normalized_name
-    {
-        return Err(MaterializationError::InvalidInput(format!(
-            "{description} is not a canonical page key"
         )));
     }
     Ok(())

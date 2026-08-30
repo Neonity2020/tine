@@ -5679,42 +5679,6 @@ impl CleanRuntimeActorCore {
         Ok(true)
     }
 
-    fn execute_local_correlated(
-        &mut self,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        batch_id: BatchId,
-        transaction: &OperationTransaction,
-        persist_fingerprint: impl FnMut(ContentDigest) -> Result<(), String>,
-        projection_turns: &mut ProjectionTurnJournalState,
-    ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
-        if let Some(pending) = self.pending.as_ref() {
-            return Ok(CleanActorMutationOutcome::RetainedPriorPending {
-                batch_id: pending.batch_id(),
-                phase: pending.failure().phase(),
-            });
-        }
-        let state = {
-            let mut session = self.runtime.admit_clean_mutation(graph).map_err(|error| {
-                CleanActorMutationFailure {
-                    phase: OperationalPhase::Bindings,
-                    detail: error.to_string(),
-                }
-            })?;
-            OperationalCoordinator::execute_clean_local_correlated(
-                &mut session,
-                graph,
-                receipts,
-                batch_id,
-                transaction,
-                persist_fingerprint,
-                projection_turns,
-            )
-            .map_err(CleanActorMutationFailure::from)?
-        };
-        Ok(self.retain_outcome(state))
-    }
-
     fn execute_provider(
         &mut self,
         graph: &Graph,
@@ -19641,47 +19605,6 @@ impl RuntimeActor {
         self.prepare_editor_turn()
     }
 
-    /// Correlated multi-page transactions are committed directly to accepted
-    /// history. They must not be staged ahead of foreground page frames whose
-    /// exact projections they causally depend on: doing so lets accepting an
-    /// older frame also wake the speculative transaction, after which a failed
-    /// caller has already mutated the engine. Advance one bounded derivative
-    /// turn and ask the caller to retry until that prefix is settled. Ordinary
-    /// same-page saves retain the low-latency overlay path and may still queue.
-    fn prepare_exclusive_editor_turn(&mut self) -> EditorTurnReadiness {
-        if let deferred @ EditorTurnReadiness::Deferred(_) = self.prepare_editor_turn() {
-            return deferred;
-        }
-        let foreground_pending = self
-            .managed_local
-            .as_ref()
-            .is_some_and(|managed| managed.pending_commit.is_some() || !managed.frames.is_empty());
-        if !foreground_pending {
-            return EditorTurnReadiness::Ready;
-        }
-        let tick = self.tick_clean_foreground_derivative();
-        let foreground_pending = self
-            .managed_local
-            .as_ref()
-            .is_some_and(|managed| managed.pending_commit.is_some() || !managed.frames.is_empty());
-        if !foreground_pending {
-            return EditorTurnReadiness::Ready;
-        }
-        match tick {
-            Some(
-                SyncRuntimeTick::RecoveryBlocked(_)
-                | SyncRuntimeTick::Blocked(_)
-                | SyncRuntimeTick::Failed(_)
-                | SyncRuntimeTick::Terminal(_),
-            ) => EditorTurnReadiness::Deferred(SyncEditorDeferred::BlockedRecovery {
-                batch_id: None,
-                phase: SyncLocalMutationPhase::ArchiveStage,
-                retained_publication: true,
-            }),
-            _ => EditorTurnReadiness::Deferred(SyncEditorDeferred::RetryableExternalWork),
-        }
-    }
-
     fn exact_projection_read_available(&self) -> bool {
         self.local_mutation.is_none()
             && self.terminal.is_none()
@@ -22326,101 +22249,6 @@ impl RuntimeActor {
                     }
                 }
             }
-        }
-    }
-
-    fn execute_local_transaction_with_batch_id(
-        &mut self,
-        transaction: OperationTransaction,
-        correlated_batch_id: Option<BatchId>,
-        application_move_episode: Option<ApplicationMoveEpisodeDraft>,
-    ) -> SyncLocalMutationOutcome {
-        #[cfg(test)]
-        let fail_episode_publication =
-            std::mem::take(&mut self.fail_next_move_episode_publication_after_write);
-        #[cfg(not(test))]
-        let fail_episode_publication = false;
-        if self.clean.is_some() {
-            let outcome = {
-                let episode_directory = &self.move_episode_directory;
-                let clean = self.clean.as_mut().expect("clean actor remains installed");
-                let turns = self
-                    .projection_turns
-                    .as_mut()
-                    .expect("clean mutation retains its projection-turn journal");
-                match correlated_batch_id {
-                    Some(batch_id) => {
-                        let Some(episode) = application_move_episode.as_ref() else {
-                            return SyncLocalMutationOutcome::Blocked {
-                                batch_id: Some(batch_id),
-                                phase: SyncLocalMutationPhase::Bindings,
-                                reason: SyncLocalMutationBlock::Prepublication,
-                            };
-                        };
-                        clean.execute_local_correlated(
-                            &self.graph,
-                            &self.receipts,
-                            batch_id,
-                            &transaction,
-                            |manifest_fingerprint| {
-                                persist_application_move_episode(
-                                    episode_directory,
-                                    &episode.finish(manifest_fingerprint),
-                                    fail_episode_publication,
-                                )
-                            },
-                            turns,
-                        )
-                    }
-                    None => clean.execute_local(&self.graph, &self.receipts, &transaction, turns),
-                }
-            };
-            return match outcome {
-                Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
-                    self.queue_clean_provider_publication(batch_id);
-                    SyncLocalMutationOutcome::Durable { batch_id }
-                }
-                Ok(CleanActorMutationOutcome::DurablePending { batch_id, phase }) => {
-                    // This transaction's own manifest commit is durable, so
-                    // the application layer may settle the retained derived
-                    // work and report the request applied.
-                    self.clean_request_retained_batch = Some(batch_id);
-                    SyncLocalMutationOutcome::RetryableRetainedRecovery {
-                        batch_id: Some(batch_id),
-                        phase: map_local_phase(phase),
-                    }
-                }
-                Ok(
-                    CleanActorMutationOutcome::RetainedPriorPending { phase, .. }
-                    | CleanActorMutationOutcome::DurableStuck { phase, .. },
-                ) => {
-                    // An earlier retained continuation blocked this submission,
-                    // so nothing of this transaction was published. Report it
-                    // without a batch id: the application layer defers, and the
-                    // caller resubmits once the clean actor is free.
-                    SyncLocalMutationOutcome::RetryableRetainedRecovery {
-                        batch_id: None,
-                        phase: map_local_phase(phase),
-                    }
-                }
-                Err(failure) => {
-                    if runtime_debug_diagnostics_enabled() {
-                        eprintln!(
-                            "[tine] clean local transaction failed during {:?}: {}",
-                            failure.phase, failure.detail
-                        );
-                    }
-                    SyncLocalMutationOutcome::Blocked {
-                        batch_id: correlated_batch_id,
-                        phase: map_local_phase(failure.phase),
-                        reason: SyncLocalMutationBlock::Prepublication,
-                    }
-                }
-            };
-        }
-        SyncLocalMutationOutcome::Revoked {
-            batch_id: None,
-            phase: SyncLocalMutationPhase::Bindings,
         }
     }
 

@@ -244,10 +244,6 @@ impl ManagedLocalDrainCheckpoint {
         self.lineage_digest
     }
 
-    pub(crate) const fn commitment(&self) -> ContentDigest {
-        self.commitment
-    }
-
     pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
         postcard::to_allocvec(self).map_err(|error| error.to_string())
     }
@@ -454,40 +450,6 @@ fn publication_conflict(error: &StoreError) -> bool {
     )
 }
 
-fn exact_work(
-    record: &ManagedLocalRecord,
-    projection: &super::ManagedLocalProjection,
-    endpoint: ProjectionEndpointBinding,
-) -> Result<ProjectionWork, String> {
-    let batch = record.prepared_batch();
-    let intent = projection.intent();
-    let descriptor = batch
-        .manifest()
-        .required_objects()
-        .iter()
-        .find(|descriptor| {
-            descriptor.kind() == ObjectKind::ProjectionIntent
-                && descriptor.document_id() == intent.descriptor_document_id()
-        })
-        .ok_or_else(|| "journal projection descriptor is absent".to_owned())?;
-    let target = intent
-        .target()
-        .description()
-        .map_or(ProjectionWorkTarget::Absent, ProjectionWorkTarget::Present);
-    Ok(ProjectionWork::new(
-        batch.manifest().workspace_id(),
-        endpoint.endpoint_id(),
-        endpoint.graph_resource_id(),
-        batch.manifest().batch_id(),
-        intent.page_id(),
-        intent.path().clone(),
-        intent.portable_path_index_root(),
-        ManifestObjectRef::from_descriptor(descriptor),
-        intent.post_frontier().clone(),
-        target,
-    ))
-}
-
 fn checkpoint_advance(
     checkpoint: &ManagedLocalDrainCheckpoint,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
@@ -518,36 +480,6 @@ fn checkpoint_advance(
         commitment: ContentDigest::of(&bytes),
         accepted_frontier_digest,
     })
-}
-
-/// The same boundary with explicit promoted parts, retained for deterministic
-/// semantic/failure tests. Production callers use the session facade above.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_managed_local_journal_drain_with_parts(
-    admission: &LocalRuntimeAdmission<'_>,
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    engine: &mut ShardedHotEngine,
-    database: &mut SqliteFrontier,
-    tail: &mut TailOverlay,
-    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    checkpoint: &ManagedLocalDrainCheckpoint,
-    continuation: Option<&ManagedLocalDrainContinuation>,
-    publisher: &mut impl ManagedLocalDerivativePublisher,
-) -> ManagedLocalDrainOutcome {
-    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
-        admission,
-        graph,
-        receipts,
-        engine,
-        database,
-        ManagedLocalSqliteMode::Tail(tail),
-        frame,
-        None,
-        checkpoint,
-        continuation,
-        publisher,
-    )
 }
 
 /// Resume one foreground-journal record through the clean runtime's direct

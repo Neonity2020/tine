@@ -393,13 +393,6 @@ fn extract_text_facts(
     Ok(())
 }
 
-pub(crate) fn extractor_digest() -> ContentDigest {
-    let mut bytes = b"tine/reference-projection/extractor/v1\0".to_vec();
-    bytes.extend_from_slice(&REFERENCE_CATALOG_EXTRACTOR_VERSION.to_be_bytes());
-    bytes.extend_from_slice(crate::reference_evidence::ENGINE_VERSION.as_bytes());
-    ContentDigest::of(&bytes)
-}
-
 fn domain_digest(domain: &[u8], encoded: &[u8]) -> Result<ContentDigest, ReferenceCatalogError> {
     let mut bytes = Vec::with_capacity(domain.len() + 8 + encoded.len());
     bytes.extend_from_slice(domain);
