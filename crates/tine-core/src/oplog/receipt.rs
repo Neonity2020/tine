@@ -304,6 +304,7 @@ impl PortablePathKey {
     /// ASCII (U+212A KELVIN SIGN folds to `k`, U+FB01 LATIN SMALL LIGATURE FI to
     /// `fi`), so a non-ASCII name can legitimately match an ASCII one and must
     /// still go through the full fold.
+    #[cfg(test)]
     pub(crate) fn graph_text_components_match(a: &str, b: &str) -> bool {
         Self::graph_text_component_matches(a, b, Self::graph_text_component_probe(b).as_ref())
     }

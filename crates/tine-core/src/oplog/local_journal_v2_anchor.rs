@@ -42,6 +42,7 @@ pub(crate) enum ManagedLocalJournal<K> {
 }
 
 impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
+    #[cfg(test)]
     pub(crate) fn from_locked_v1(segment: LockedLocalJournalV1Segment<K>) -> Self {
         Self::LegacyV1(segment)
     }
@@ -84,6 +85,7 @@ impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn committed_bytes(&self) -> u64 {
         match self {
             Self::LegacyV1(segment) => segment.committed_bytes(),
@@ -106,6 +108,7 @@ impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn expected_successful_append_data_syncs(&self) -> u64 {
         self.protocol().expected_successful_append_data_syncs()
     }
@@ -220,6 +223,7 @@ impl ManagedLocalGenerationAnchorV2 {
     /// Verify the accepted engine batch after the runtime has opened the
     /// engine. The anchor is itself the bootstrap locator for this evidence,
     /// so structural decoding cannot require the value as prior input.
+    #[cfg(test)]
     pub(crate) fn require_accepted_batch_id(
         &self,
         accepted_batch_id: Option<BatchId>,
@@ -458,6 +462,7 @@ pub(crate) fn parse_managed_local_v2_segment_name(
         .then_some((selector_generation, segment_id))
 }
 
+#[cfg(test)]
 pub(crate) fn next_managed_local_selector_generation(
     active_generations: impl IntoIterator<Item = u64>,
 ) -> Result<u64, String> {

@@ -269,6 +269,7 @@ impl Drop for ManifestedProjectionFaultScope {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn fail_next_manifested_projection_during_write_for_harness(
 ) -> ManifestedProjectionFaultScope {
     let previously_armed =
@@ -276,6 +277,7 @@ pub(crate) fn fail_next_manifested_projection_during_write_for_harness(
     ManifestedProjectionFaultScope { previously_armed }
 }
 
+#[cfg(test)]
 pub(crate) fn fail_manifested_projection_repeatedly_for_harness(times: u32) {
     HARNESS_FAIL_MANIFESTED_PROJECTION_REPEATS.with(|fail| fail.set(times));
 }
@@ -1490,6 +1492,7 @@ fn render_dense_projection_bytes(
     Ok(serialize_document(format, &document, base_text, &[]).into_bytes())
 }
 
+#[cfg(test)]
 fn build_projection_document(
     state: &ProjectionPageState,
     format: ProjectionFormat,
@@ -2089,6 +2092,7 @@ fn receiver_clean_tombstone_plan(
 /// Execute one clean-runtime work row derived from an accepted immutable
 /// manifest. SQLite supplies only current path ownership/current-frontier
 /// evidence; it is disposable and never becomes a second work-status store.
+#[cfg(test)]
 pub(crate) fn execute_clean_manifested_projection_work(
     graph: &Graph,
     projection: &SqliteFrontier,

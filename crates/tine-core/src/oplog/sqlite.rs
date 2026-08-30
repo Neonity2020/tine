@@ -72,6 +72,7 @@ use super::import::{
     InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
 };
 
+#[cfg(test)]
 pub(crate) fn clean_genesis_materialized_read<'a>(
     physical: &'a CleanGenesisPhysicalProjection,
     root: &AcceptedFrontierRoot,
@@ -2880,6 +2881,7 @@ pub(crate) fn record_projection_open_test_observation(
 ) {
 }
 
+#[cfg(test)]
 fn reset_projection_open_breakdown() {
     PROJECTION_OPEN_BREAKDOWN.with(|slot| *slot.borrow_mut() = ProjectionOpenBreakdown::default());
 }
@@ -3889,6 +3891,7 @@ pub(crate) struct LeasedSqliteFrontier<'lease> {
 // accessors serve the borrowed shape, which today only the applier-slot handoff
 // regression exercises directly.
 impl<'lease> LeasedSqliteFrontier<'lease> {
+    #[cfg(test)]
     pub(crate) const fn database(&self) -> &SqliteFrontier {
         &self.database
     }
@@ -3900,6 +3903,7 @@ impl<'lease> LeasedSqliteFrontier<'lease> {
     /// and is never touched here, so there is no instant between closing this
     /// database and opening the next one in which another process could acquire
     /// the workspace lease.
+    #[cfg(test)]
     pub(crate) fn close_returning_applier_slot(self) -> SqliteApplierSlot<'lease> {
         let Self { database, slot } = self;
         drop(database);
@@ -3975,6 +3979,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
 pub(crate) fn fail_next_apply_during_materialization_for_harness() {
     HARNESS_FAIL_DURING_APPLY.with(|fail| fail.set(true));
 }
@@ -4013,6 +4018,7 @@ pub(crate) struct TerminalProjectionChunkSinkHandle<'a> {
 }
 
 impl<'a> TerminalProjectionChunkSinkHandle<'a> {
+    #[cfg(test)]
     pub(crate) fn new(sink: &'a mut dyn TerminalProjectionChunkSink) -> Self {
         Self {
             sink: RefCell::new(sink),
@@ -7716,6 +7722,7 @@ fn prepare_database_path(path: &Path) -> Result<PathBuf, ProjectionError> {
     Ok(canonical_path)
 }
 
+#[cfg(test)]
 fn require_existing_database_path(path: &Path) -> Result<PathBuf, ProjectionError> {
     let name = path
         .file_name()
@@ -7739,6 +7746,7 @@ fn require_existing_database_path(path: &Path) -> Result<PathBuf, ProjectionErro
     Ok(canonical_path)
 }
 
+#[cfg(test)]
 fn incomplete_forensic_recovery_exists(path: &Path) -> Result<bool, ProjectionError> {
     let parent = path
         .parent()
@@ -7798,6 +7806,7 @@ fn prepare_application_runtime_root(path: &Path) -> Result<PathBuf, ProjectionEr
     Ok(canonical)
 }
 
+#[cfg(test)]
 fn remove_projection_files(path: &Path) -> Result<(), ProjectionError> {
     SqliteFileSet::new(path).remove().map_err(Into::into)
 }
@@ -8641,6 +8650,7 @@ mod applier_lease {
         /// another process — under any app-data or XDG root — could acquire this
         /// archive's workspace lease. `local_active::InactiveBootstrapRuntimeSession::promote`
         /// is the caller: it is the bootstrap -> promoted database handoff.
+        #[cfg(test)]
         pub(crate) fn close_retaining_lease(self) -> WorkspaceRuntimeLease {
             let Self { projection, lease } = self;
             drop(projection);
@@ -8649,6 +8659,7 @@ mod applier_lease {
 
         /// Non-forgeable evidence that this process holds the archive-rooted
         /// workspace runtime lease for one exact workspace and archive right now.
+        #[cfg(test)]
         pub(crate) const fn workspace_proof(&self) -> WorkspaceRuntimeProof<'_> {
             WorkspaceRuntimeProof { lease: &self.lease }
         }
@@ -8664,6 +8675,7 @@ mod applier_lease {
             self.lease.revalidate_identity()
         }
 
+        #[cfg(test)]
         pub(crate) const fn projection(&self) -> &OpenProjection {
             &self.projection
         }

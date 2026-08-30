@@ -345,6 +345,7 @@ impl SweepManager {
         self.process_deadlines_at(now_unix_ms()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn notifications(&self) -> &[SweepNotification] {
         &self.notifications
     }
@@ -359,6 +360,7 @@ impl SweepManager {
             .filter(|record| record.tier.surfaced())
     }
 
+    #[cfg(test)]
     pub(crate) fn record(&self, sweep_id: Uuid) -> Option<&SweepRecord> {
         self.chains.get(&sweep_id).map(|chain| &chain.record)
     }

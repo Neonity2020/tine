@@ -160,6 +160,7 @@ impl OperationalCoordinatorError {
 
     /// A bounded slice completed its portion and must be resumed. Distinct from
     /// a failure so the caller can continue instead of retrying.
+    #[cfg(test)]
     fn continuation_required(phase: OperationalPhase, detail: impl Into<String>) -> Self {
         Self {
             phase,
@@ -206,10 +207,12 @@ impl OperationalCoordinatorError {
     ///
     /// This is diagnosis only. The live admission remains the sole authority,
     /// and the runtime's own latch independently refuses every later boundary.
+    #[cfg(test)]
     pub(crate) const fn revocation(&self) -> Option<&RuntimeRevocation> {
         self.revocation.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) const fn retained_block_reason(&self) -> Option<&RetainedBlockReason> {
         self.retained_block.as_ref()
     }
@@ -588,6 +591,7 @@ impl OperationalCoordinator {
     /// identity. The immutable episode record is published before the manifest
     /// commit, so a crash can distinguish a retry of the same move from an
     /// unrelated batch collision without creating a second semantic edit.
+    #[cfg(test)]
     pub(crate) fn execute_clean_local_correlated(
         session: &mut CleanRuntimeSession<'_>,
         graph: &Graph,
@@ -1528,6 +1532,7 @@ fn terminal_pipeline_origins() -> Vec<BatchOrigin> {
     TERMINAL_PIPELINE_ORIGINS.with(|origins| origins.borrow().clone())
 }
 
+#[cfg(test)]
 pub(crate) fn fail_once_at(point: OperationalFaultPoint) {
     OPERATIONAL_FAULT.set(Some(point));
 }

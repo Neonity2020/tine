@@ -329,6 +329,7 @@ impl LazyGenesisFrontierBindingV1 {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) const fn root(self) -> ContentDigest {
         self.root
     }
@@ -886,6 +887,7 @@ impl LazyGenesisActivationMarkerV1 {
         self.accepted_frontier_digest
     }
 
+    #[cfg(test)]
     pub(crate) const fn watcher_fence(self) -> u64 {
         self.watcher_fence
     }

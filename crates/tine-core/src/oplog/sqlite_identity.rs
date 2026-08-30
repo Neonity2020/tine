@@ -37,6 +37,7 @@ impl IdentityOriginV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn batch_id(self) -> Option<BatchId> {
         match self {
             Self::Baseline => None,
@@ -44,6 +45,7 @@ impl IdentityOriginV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn causal_dot(self) -> Option<BatchCausalDot> {
         match self {
             Self::Baseline => None,
@@ -124,14 +126,17 @@ impl PageNameIdentityReleasedV1 {
         self.prior_page_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_exact_name(&self) -> &LogicalPageName {
         &self.prior_exact_name
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_acquisition(&self) -> IdentityOriginV1 {
         self.prior_acquisition
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_exact_state(&self) -> IdentityOriginV1 {
         self.prior_exact_state
     }
@@ -229,6 +234,7 @@ impl PageNameIdentityRecordV1 {
     /// Patricia represents imported baseline ownership as a fabricated
     /// accepted bootstrap operation; the clean design deliberately represents
     /// the same fact as `Baseline`. No other causal mismatch is accepted.
+    #[cfg(test)]
     pub(crate) fn equivalent_to_legacy_oracle(&self, oracle: &Self) -> bool {
         self.key_digest == oracle.key_digest
             && match (&self.occupied, &oracle.occupied) {
@@ -261,6 +267,7 @@ impl PageNameIdentityRecordV1 {
     }
 }
 
+#[cfg(test)]
 fn origin_equivalent_to_legacy(clean: IdentityOriginV1, oracle: IdentityOriginV1) -> bool {
     clean == oracle
         || matches!(
@@ -334,10 +341,12 @@ impl PortablePathIdentityReleasedV1 {
         self.prior_page_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_exact_path(&self) -> &ManagedPath {
         &self.prior_exact_path
     }
 
+    #[cfg(test)]
     pub(crate) const fn prior_acquisition(&self) -> IdentityOriginV1 {
         self.prior_acquisition
     }
@@ -432,6 +441,7 @@ impl PortablePathIdentityRecordV1 {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn equivalent_to_legacy_oracle(&self, oracle: &Self) -> bool {
         self.key_digest == oracle.key_digest
             && match (&self.occupied, &oracle.occupied) {

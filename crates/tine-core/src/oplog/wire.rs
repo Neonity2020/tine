@@ -63,6 +63,7 @@ use super::{BatchId, DeviceId, LineageDigest, WorkspaceId};
 /// unbounded walk of a host filesystem.
 pub const MAX_PROVIDER_RESCAN_ENTRIES: usize = 4_096;
 pub const MAX_PROVIDER_RESCAN_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
 pub const MAX_PROVIDER_RESCAN_DEPTH: usize = 16;
 pub(crate) const SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE: &str = "clean-baselines-v1";
 pub const MAX_PROVIDER_RESIDUE_ENTRIES: usize = 512;
@@ -105,6 +106,7 @@ pub struct ProviderLocation {
     pub path: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSource {
@@ -875,15 +877,18 @@ impl SharedProviderFrontierHeadV1 {
         &self.frontier_tips
     }
 
+    #[cfg(test)]
     pub(crate) const fn manifest_recovery_coverage_root(&self) -> Option<super::ContentDigest> {
         self.manifest_recovery_coverage_root
     }
 
+    #[cfg(test)]
     pub(crate) fn has_current_manifest_recovery_coverage(&self) -> bool {
         self.manifest_recovery_format_version == SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION
             && self.manifest_recovery_coverage_root == Some(self.accepted_frontier_root)
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_manifest_audit_coverage_sequence(&self) -> Option<u64> {
         if self.accepted_manifest_audit_format_version
             == SHARED_PROVIDER_ACCEPTED_MANIFEST_AUDIT_FORMAT_VERSION
@@ -896,10 +901,12 @@ impl SharedProviderFrontierHeadV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_current_accepted_manifest_audit_coverage(&self) -> bool {
         self.accepted_manifest_audit_coverage_sequence() == Some(self.accepted_generation)
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_manifest_revalidation_next_sequence(&self) -> Option<u64> {
         let maximum = self.accepted_generation.checked_add(1)?;
         (self.accepted_manifest_revalidation_next_sequence != 0
@@ -948,12 +955,14 @@ impl SharedProviderFrontierHeadV1 {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct SharedProviderFile {
     pub(crate) path: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) kind: Option<ProviderItemKind>,
 }
 
+#[cfg(test)]
 pub(crate) struct SharedProviderScan {
     pub(crate) files: Vec<SharedProviderFile>,
 }
@@ -1032,6 +1041,7 @@ impl SharedProviderTransport {
         self.publish(SHARED_ENROLLMENT_DESCRIPTOR_PATH, bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_object(
         &mut self,
         digest: super::ContentDigest,
@@ -1249,6 +1259,7 @@ impl SharedProviderTransport {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn full_observation_cursor(
         &self,
     ) -> Result<SharedProviderObservationCursor, ScenarioError> {
@@ -1420,6 +1431,7 @@ impl SharedProviderTransport {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn retire_frontier_head(&self, path: &str) -> Result<(), ScenarioError> {
         if !path.starts_with(&format!("{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/")) {
             return Err(ScenarioError::InvalidProviderPath(path.into()));
@@ -1478,6 +1490,7 @@ impl SharedProviderTransport {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn scan(&self) -> Result<SharedProviderScan, ScenarioError> {
         let files = bounded_provider_files(
             self.runtime.tree(ProviderTree::Outbox),
@@ -3638,6 +3651,7 @@ impl ProviderRetryJournal {
 struct ScenarioRoot(PathBuf);
 
 impl ScenarioRoot {
+    #[cfg(test)]
     fn new() -> Result<Self, ScenarioError> {
         let path = std::env::temp_dir().join(format!("tine-oplog-simulator-{}", Uuid::new_v4()));
         fs::create_dir(&path).map_err(|error| ScenarioError::Io(error.to_string()))?;
@@ -3651,6 +3665,7 @@ impl Drop for ScenarioRoot {
     }
 }
 
+#[cfg(test)]
 fn provider_transaction_device_names(
     source: &ProviderSource,
     destination_device: &str,
@@ -3672,6 +3687,7 @@ fn valid_name(value: &str, max: usize) -> bool {
 /// Unix retirement uses an atomic exchange with a single-link placeholder so
 /// a racing replacement is preserved only as diagnostic residue. Windows
 /// retirement is handle-bound. No provider-visible residue authorizes retry.
+#[cfg(test)]
 fn run_provider_rename_with(
     provider: &ProviderRuntime,
     journal: &ProviderRetryJournal,
@@ -4062,6 +4078,7 @@ fn run_provider_remove_with(
     journal.complete(&gate, &record)
 }
 
+#[cfg(test)]
 fn validate_journal_destination(
     journal: &ProviderRetryJournal,
     gate: &ProviderTransactionGate,
@@ -4171,6 +4188,7 @@ fn validate_retired_file(
     Ok(())
 }
 
+#[cfg(test)]
 fn quarantine_provider_name(
     journal: &ProviderRetryJournal,
     gate: &ProviderTransactionGate,
@@ -6201,6 +6219,7 @@ fn provider_journal_boundary_hook(_boundary: ProviderJournalBoundary) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 fn provider_scan_entry_visit() {
     #[cfg(test)]
     PROVIDER_SCAN_ENTRY_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
@@ -6757,12 +6776,14 @@ impl Drop for InjectedSharedProviderFlaggedRenameFailure {
     }
 }
 
+#[cfg(test)]
 struct ProviderDiskFile {
     path: String,
     bytes: Vec<u8>,
     temporary: bool,
 }
 
+#[cfg(test)]
 fn bounded_provider_files(
     root: &Dir,
     include_temporary: bool,

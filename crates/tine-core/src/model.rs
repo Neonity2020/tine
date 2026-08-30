@@ -1271,6 +1271,7 @@ impl<A> CommittedPendingJournalPageProjection<A> {
         self.recovery.relative_path()
     }
 
+    #[cfg(test)]
     pub(crate) fn target(&self) -> &[u8] {
         self.recovery.target()
     }
@@ -1298,6 +1299,7 @@ pub(crate) enum JournalPageCommitError<E> {
 }
 
 impl<E> JournalPageCommitError<E> {
+    #[cfg(test)]
     pub(crate) const fn precommit(&self) -> Option<&io::Error> {
         match self {
             Self::Precommit(error) => Some(error),
@@ -1305,6 +1307,7 @@ impl<E> JournalPageCommitError<E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn append(&self) -> Option<&E> {
         match self {
             Self::Precommit(_) => None,
@@ -1344,6 +1347,7 @@ impl JournalPageProjectionRecovery {
         }
     }
 
+    #[cfg(test)]
     fn target(&self) -> &[u8] {
         match self {
             Self::InProcess(plan) => plan.target.as_bytes(),
@@ -1754,14 +1758,17 @@ pub(crate) struct HandoffBindingEvidence {
 }
 
 impl HandoffBindingEvidence {
+    #[cfg(test)]
     pub(crate) const fn workspace_id(self) -> WorkspaceId {
         self.workspace_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn endpoint(self) -> ProjectionEndpointBinding {
         self.endpoint
     }
 
+    #[cfg(test)]
     pub(crate) const fn graph_resource_id(self) -> CanonicalGraphResourceId {
         self.graph_resource_id
     }
@@ -1777,6 +1784,7 @@ pub(crate) struct HandoffSafe {
 }
 
 impl HandoffSafe {
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> HandoffBindingEvidence {
         self.binding
     }
@@ -1837,6 +1845,7 @@ pub(crate) struct HandoffSafeGuard {
 }
 
 impl HandoffSafeGuard {
+    #[cfg(test)]
     pub(crate) const fn binding(&self) -> HandoffBindingEvidence {
         self.binding
     }
@@ -1871,6 +1880,7 @@ impl HandoffSafeGuard {
         }
     }
 
+    #[cfg(test)]
     fn admit_projection_writer(&self, graph: &Graph) -> io::Result<ManagedTextWritePermit> {
         self.verify_binding(graph, self.binding.workspace_id, self.binding.endpoint)?;
         let binding = graph.managed_write_binding()?;
@@ -1905,6 +1915,7 @@ impl HandoffSafeGuard {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn write_page_projection_with_layout(
         &self,
         graph: &Graph,
@@ -1952,6 +1963,7 @@ impl HandoffSafeGuard {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_page_projection_with_layout(
         &self,
         graph: &Graph,
@@ -3104,6 +3116,7 @@ impl<K: Ord, V> PersistentMap<K, V> {
         self.iter().map(|(key, _)| key)
     }
 
+    #[cfg(test)]
     fn values(&self) -> impl Iterator<Item = &V> {
         self.iter().map(|(_, value)| value)
     }
@@ -7549,6 +7562,7 @@ impl Graph {
         parsed.into_exact_page_dto(path, content)
     }
 
+    #[cfg(test)]
     fn decode_present_graph_text(
         &self,
         path: &ManagedPath,
@@ -8333,6 +8347,7 @@ impl Graph {
         ))
     }
 
+    #[cfg(test)]
     fn capture_direct_creation_census_with_limits(
         &self,
         permit: &ManagedTextWritePermit,
@@ -10153,6 +10168,7 @@ impl Graph {
             .map(initial_shadow_capture_into_raw_inventory)
     }
 
+    #[cfg(test)]
     fn build_graph_text_admission_with_limits(
         &self,
         limits: InitialShadowLimits,
@@ -10363,6 +10379,7 @@ impl Graph {
         Ok(armed_feed)
     }
 
+    #[cfg(test)]
     fn finish_graph_text_admission_build(
         &self,
         index: CompleteGraphTextAdmissionIndex,
@@ -10420,6 +10437,7 @@ impl Graph {
         Ok(())
     }
 
+    #[cfg(test)]
     fn poison_graph_text_admission(&self, cause: impl Into<String>) {
         let mut state = self.graph_text_admission.write().unwrap();
         if matches!(&*state, GraphTextAdmissionState::Poisoned { .. }) {
@@ -11039,6 +11057,7 @@ impl Graph {
         validate_graph_text_admission_delta(index, &relative)
     }
 
+    #[cfg(test)]
     fn graph_text_event_parent(&self, target: &GraphTextExactPath) -> io::Result<ProjectionParent> {
         self.graph_text_event_parent_policy(target, true)
     }
@@ -18759,6 +18778,7 @@ impl Graph {
     /// The descriptor is proof-issued, and its exact relative path/name binding
     /// prevents startup/import code from treating anonymous hidden files as
     /// recovery evidence.
+    #[cfg(test)]
     pub(crate) fn read_projection_recovery_evidence(
         &self,
         target_relative_path: &str,
@@ -20589,6 +20609,7 @@ impl Graph {
     /// as [`JournalPageProjectionOutcome::CommittedPending`] and must be retried
     /// with [`Graph::retry_committed_journal_page_projection`], never redrafted or
     /// appended again.
+    #[cfg(test)]
     pub(crate) fn commit_existing_page_with_journal<A, E>(
         &self,
         page: &PageDto,
@@ -20738,6 +20759,7 @@ impl Graph {
     /// accepts no append callback and cannot create another journal record.
     /// Runtime-only file and parent identities are reacquired under the managed
     /// writer, retained graph-text identity authority, and exact path lock.
+    #[cfg(test)]
     pub(crate) fn recover_committed_journal_page_projection<A>(
         &self,
         append_proof: A,
@@ -24818,6 +24840,7 @@ struct BlockDtoWalk<'a> {
 }
 
 impl<'a> BlockDtoWalk<'a> {
+    #[cfg(test)]
     fn new(blocks: &'a [BlockDto]) -> Self {
         let empty = BlockDtoWalkFrame {
             blocks: &[],
@@ -24836,6 +24859,7 @@ impl<'a> BlockDtoWalk<'a> {
         Self { frames, len }
     }
 
+    #[cfg(test)]
     fn next(&mut self) -> io::Result<Option<(&'a BlockDto, usize)>> {
         loop {
             if self.len == 0 {
@@ -24868,6 +24892,7 @@ impl<'a> BlockDtoWalk<'a> {
     }
 }
 
+#[cfg(test)]
 fn managed_block_walk_stack_upper_bound<T>() -> io::Result<u64> {
     checked_mul_bytes(
         usize_to_u64(MAX_MANAGED_BLOCK_DEPTH)?,
@@ -24880,6 +24905,7 @@ fn managed_block_walk_stack_upper_bound<T>() -> io::Result<u64> {
 /// buffers. Every term is tied to an owned lsdoc/Tine allocation class. A
 /// source byte is also a conservative upper bound on the number of AST nodes,
 /// reference/property strings, and source ranges that the grammar can emit.
+#[cfg(test)]
 fn managed_page_build_upper_bound(content: &str) -> io::Result<u64> {
     let source = u64::try_from(content.len()).map_err(|_| allocation_overflow())?;
     let lines = if content.is_empty() {
@@ -24894,6 +24920,7 @@ fn managed_page_build_upper_bound(content: &str) -> io::Result<u64> {
     managed_page_build_metrics_upper_bound(source, lines)
 }
 
+#[cfg(test)]
 fn managed_page_build_metrics_upper_bound(source: u64, lines: u64) -> io::Result<u64> {
     let source_units = source.max(lines);
     let mut bytes = 0_u64;
@@ -28138,6 +28165,7 @@ fn bootstrap_source_capture_before_final_proof_hook() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn hash_direct_creation_census_file(
     file: &mut fs::File,
     relative: &str,
@@ -29373,6 +29401,7 @@ fn initial_graph_text_collision_group_insert<K, T>(
     map.entry(key).or_default().insert(member);
 }
 
+#[cfg(test)]
 fn initial_shadow_global_collision(index: &CompleteGraphTextAdmissionIndex) -> Option<io::Error> {
     if index
         .file_link_count_by_exact_relative
@@ -31573,6 +31602,7 @@ impl Drop for InjectedProjectionDirectoryBarrierFailure {
 /// reports it: `(device, inode)` on unix, `(volume, file id)` on Windows.
 /// Test harnesses that pin an armed injection to one graph store this, so the
 /// type must follow the platform rather than assume the unix shape.
+#[cfg(test)]
 #[cfg(unix)]
 pub(crate) type ProjectionDirIdentity = (u64, u64);
 #[cfg(windows)]

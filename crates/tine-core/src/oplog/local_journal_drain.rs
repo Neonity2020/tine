@@ -1206,6 +1206,7 @@ pub(crate) enum LocalJournalOpenRefusal {
 impl LocalJournalOpenRefusal {
     /// The contract refusal code this classification maps to, or `None` where
     /// the existing (non-corruption) refusal owns the message.
+    #[cfg(test)]
     pub(crate) const fn refusal_code(&self) -> Option<&'static str> {
         match self {
             Self::DiskCorrupt(_) => Some("MS-REF-DISK-CORRUPT"),
@@ -1213,10 +1214,12 @@ impl LocalJournalOpenRefusal {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn retains_evidence(&self) -> bool {
         matches!(self, Self::DiskCorrupt(_))
     }
 
+    #[cfg(test)]
     pub(crate) fn detail(&self) -> &str {
         match self {
             Self::DiskCorrupt(detail)
@@ -1317,6 +1320,7 @@ pub(crate) fn decode_projection_turn_frame(
 /// increase, and it is why the foreground journal needs no second record kind.
 /// `lineage_digest` is a binding input for the same reason the drain
 /// checkpoint takes one: the frame does not carry it.
+#[cfg(test)]
 pub(crate) fn projection_turn_from_managed_local_frame(
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     lineage_digest: LineageDigest,

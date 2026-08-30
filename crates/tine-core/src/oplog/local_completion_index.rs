@@ -443,10 +443,12 @@ impl LocalCompletionIndex {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_stats(&self) -> &LocalCompletionOpenStats {
         &self.open_stats
     }
 
+    #[cfg(test)]
     pub(crate) fn flush_stats(&self) -> &LocalCompletionFlushStats {
         &self.flush_stats
     }

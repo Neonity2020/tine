@@ -120,10 +120,12 @@ impl ExternalImportObservationEntry {
         &self.path
     }
 
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> ManagedTextKind {
         self.kind
     }
 
+    #[cfg(test)]
     pub(crate) const fn portable_path_key_digest(&self) -> PortablePathKeyDigest {
         self.portable_path_key_digest
     }
@@ -207,6 +209,7 @@ impl ExternalImportObservationMaterial {
         &self.entries
     }
 
+    #[cfg(test)]
     pub(crate) fn into_operation_object(
         self,
         prospective_portable_path_root: PortablePathIndexRoot,
@@ -353,10 +356,12 @@ impl ExternalImportObservation {
         self.import_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn portable_path_key_version(&self) -> u32 {
         self.portable_path_key_version
     }
 
+    #[cfg(test)]
     pub(crate) const fn prospective_portable_path_root(&self) -> PortablePathIndexRoot {
         self.prospective_portable_path_root
     }
