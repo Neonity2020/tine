@@ -226,6 +226,8 @@ export function createWebdriverLifecycle({
   nativePort,
   callTimeoutMs = 60_000,
   cleanupGraceMs = 1_000,
+  survivorTimeoutMs = 2_000,
+  survivorPollMs = 50,
   platform = process.platform,
   procRoot = "/proc",
   kill = process.kill.bind(process),
@@ -254,12 +256,28 @@ export function createWebdriverLifecycle({
 
   async function reap(reason, { graceMs = cleanupGraceMs } = {}) {
     const initial = taggedPids();
-    for (const pid of initial) signal(pid, "SIGTERM");
+    const signalFailures = [];
+    for (const pid of initial) {
+      if (!signal(pid, "SIGTERM")) signalFailures.push({ pid, signal: "SIGTERM" });
+    }
     if (initial.length && graceMs > 0) await sleepImpl(graceMs);
-    const survivors = taggedPids();
-    for (const pid of survivors) signal(pid, "SIGKILL");
-    const record = { reason, term: initial, kill: survivors };
-    if (initial.length || survivors.length) evidence.reaped.push(record);
+    const killTargets = taggedPids();
+    for (const pid of killTargets) {
+      if (!signal(pid, "SIGKILL")) signalFailures.push({ pid, signal: "SIGKILL" });
+    }
+    const deadline = Date.now() + survivorTimeoutMs;
+    let survivors = taggedPids();
+    while (survivors.length && Date.now() < deadline) {
+      await sleepImpl(survivorPollMs);
+      survivors = taggedPids();
+    }
+    const record = { reason, term: initial, kill: killTargets, signalFailures, survivors };
+    if (initial.length || killTargets.length || signalFailures.length || survivors.length) {
+      evidence.reaped.push(record);
+    }
+    if (survivors.length) {
+      throw new Error(`WebDriver cleanup ${JSON.stringify(reason)} left exact-token survivors: ${survivors.join(", ")}`);
+    }
     return record;
   }
 
@@ -268,8 +286,13 @@ export function createWebdriverLifecycle({
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(async () => {
         evidence.timeouts.push({ label, timeoutMs });
-        await reap(`timeout:${label}`, { graceMs: 0 });
-        reject(new Error(`WebDriver call ${JSON.stringify(label)} exceeded ${timeoutMs} ms; its owned session was reaped`));
+        let cleanupError;
+        try { await reap(`timeout:${label}`, { graceMs: 0 }); } catch (error) { cleanupError = error; }
+        reject(new Error(
+          `WebDriver call ${JSON.stringify(label)} exceeded ${timeoutMs} ms; ${cleanupError
+            ? `owned-session cleanup failed: ${String(cleanupError)}`
+            : "its owned session was reaped"}`,
+        ));
       }, timeoutMs);
     });
     try {
@@ -290,11 +313,9 @@ export function createWebdriverLifecycle({
     if (browser) {
       try { await run(`${label}:delete-session`, () => browser.deleteSession(), 10_000); } catch {}
     }
-    if (driver?.pid) {
-      try { kill(-driver.pid, "SIGTERM"); } catch {}
-      if (cleanupGraceMs > 0) await sleepImpl(cleanupGraceMs);
-      try { kill(-driver.pid, "SIGKILL"); } catch {}
-    }
+    // Never signal `-driver.pid` here. deleteSession may already have exited
+    // the driver, and a recycled PID/PGID is not proof of ownership. The exact
+    // inherited environment token is the sole cleanup authority.
     return reap(label, { graceMs: 0 });
   }
 

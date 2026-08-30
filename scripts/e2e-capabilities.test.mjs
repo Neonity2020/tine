@@ -156,7 +156,10 @@ test("webdriver lifecycle deadline reaps its tagged session and records why", as
     cleanupGraceMs: 0,
     platform: "linux",
     procRoot: root,
-    kill: (pid, signal) => signals.push([pid, signal]),
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === "SIGKILL") fs.rmSync(path.join(root, String(pid)), { recursive: true });
+    },
   });
   await assert.rejects(
     lifecycle.run("stalled screenshot", () => new Promise(() => {})),
@@ -164,4 +167,46 @@ test("webdriver lifecycle deadline reaps its tagged session and records why", as
   );
   assert.deepEqual(signals, [[201, "SIGTERM"], [201, "SIGKILL"]]);
   assert.deepEqual(lifecycle.evidence.timeouts, [{ label: "stalled screenshot", timeoutMs: 5 }]);
+  assert.deepEqual(lifecycle.evidence.reaped[0].survivors, []);
+});
+
+test("webdriver lifecycle never signals an unverified stored driver process group", async () => {
+  const signals = [];
+  const lifecycle = createWebdriverLifecycle({
+    scenario: "pid-reuse",
+    driverPort: 4924,
+    nativePort: 4925,
+    cleanupGraceMs: 0,
+    platform: "linux",
+    procRoot: fs.mkdtempSync(path.join(os.tmpdir(), "tine-e2e-proc-")),
+    kill: (pid, signal) => signals.push([pid, signal]),
+  });
+  await lifecycle.stop({ driver: { pid: 301 }, label: "already-exited-driver" });
+  assert.deepEqual(signals, []);
+});
+
+test("webdriver lifecycle fails closed with exact-token survivor evidence", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tine-e2e-proc-"));
+  const token = webdriverSessionToken("unkillable", 5024, 5025);
+  fs.mkdirSync(path.join(root, "401"));
+  fs.writeFileSync(
+    path.join(root, "401", "environ"),
+    `TINE_E2E_WEBDRIVER_SESSION=${token}\0`,
+  );
+  const lifecycle = createWebdriverLifecycle({
+    scenario: "unkillable",
+    driverPort: 5024,
+    nativePort: 5025,
+    cleanupGraceMs: 0,
+    survivorTimeoutMs: 5,
+    survivorPollMs: 1,
+    platform: "linux",
+    procRoot: root,
+    kill: () => true,
+  });
+  await assert.rejects(
+    lifecycle.reap("test-survivor", { graceMs: 0 }),
+    /left exact-token survivors: 401/,
+  );
+  assert.deepEqual(lifecycle.evidence.reaped[0].survivors, [401]);
 });
