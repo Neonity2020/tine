@@ -10,7 +10,7 @@ icon:: 🔗
 - ## Links and tags
   - `[[Page]]` links and `#tag` tags run on the same machinery: a tag links and collects references like any page, and a tag with no page of its own is perfectly normal. A page's `tags::` property values render as navigable links too; quoted property values stay literal text.
   - A labelled page link such as [read the welcome]([[Welcome to Tine]]) shows your words while opening the page. External `[label](https://…)` links are ordinary Markdown, bare URLs and emails autolink, and **Mod+L** wraps the selection as an external link.
-  - Click a link to follow it. While editing, **Ctrl+O** opens the link at the caret and **Ctrl+Shift+O** opens it in the right sidebar — matching Logseq's shortcuts, no mouse needed.
+  - Click a link to follow it. **Shift-click** opens it in the right sidebar, **middle-click** or **Ctrl/Cmd+click** opens a background tab, and **Alt+click** opens it in another pane — the same destinations on every link surface. While editing, **Ctrl+O** opens the link at the caret and **Ctrl+Shift+O** opens it in the right sidebar — matching Logseq's shortcuts, no mouse needed.
 - ## Aliases
   - Put `alias:: Another name, Third name` among the page properties at the top of a page — as [[Feature showcase]] does with `alias:: Kitchen sink (features)` — and links under those names land on the same page.
   - The page then shows read-only **aka** chips for every name it answers to ("Also known as — other names that link here"), and the raw `alias::` property stays out of the under-title property list.
