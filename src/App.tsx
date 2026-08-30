@@ -47,7 +47,7 @@ import { applyObservedAssetChanges } from "./assetRefresh";
 import { favoritesPageChanged } from "./favoritesStore";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
-import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type QueryRoute } from "./router";
+import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type PdfRoute, type QueryRoute } from "./router";
 import {
   theme,
   toggleTheme,
@@ -655,17 +655,17 @@ function PaneRouteBody(props: {
         </PaneScroller>
       }
     >
-      <Match when={route().kind === "pdf" ? route() : null} keyed>
+      <Match when={route().kind === "pdf" ? route() : null}>
         {(pdfRoute) => (
           <div
             class="pdf-pane pdf-route-pane"
             classList={{ "pdf-pane-mobile": isMobilePlatform }}
             data-pane-id={props.identifyPane === false ? undefined : props.paneId}
-            data-pdf-view-id={pdfRoute.kind === "pdf" ? pdfRoute.viewId : undefined}
+            data-pdf-view-id={(pdfRoute() as PdfRoute).viewId}
           >
             <Suspense fallback={<div class="pdf-loading" />}>
               <KeyedPdfViewer
-                route={() => pdfRoute as Extract<ReturnType<PaneRouter["route"]>, { kind: "pdf" }>}
+                route={() => pdfRoute() as Extract<ReturnType<PaneRouter["route"]>, { kind: "pdf" }>}
                 owner={currentPdfOwnership}
                 focused={() => focusedPaneId() === props.paneId}
                 onClose={() => { void props.router.closePdf(); }}
