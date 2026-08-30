@@ -708,7 +708,7 @@ pub(crate) async fn save_diagnostic_report(
         let path = chosen
             .into_path()
             .map_err(|_| "diagnostic save destination is not a local file".to_string())?;
-        std::fs::write(path, report.text)
+        tine_core::model::atomic_write(&path, report.text.as_bytes())
             .map_err(|error| format!("diagnostic report could not be saved: {error}"))?;
         Ok(true)
     }
@@ -802,5 +802,27 @@ mod tests {
         }
         assert!(source.contains("record_fixed_event(\"updater.failure\", fields)"));
         assert!(!source.contains("fields.insert(\"updaterError\""));
+    }
+
+    #[test]
+    fn user_selected_reports_share_the_atomic_publish_family() {
+        let diagnostic = include_str!("debug.rs");
+        let verification = include_str!("graph_verification.rs");
+        let plain_write = ["std::fs::", "write(path"].concat();
+        let atomic_write = ["tine_core::model::", "atomic_write(&path"].concat();
+
+        for (label, source) in [
+            ("diagnostic", diagnostic),
+            ("graph verification", verification),
+        ] {
+            assert!(
+                !source.contains(&plain_write),
+                "{label} report export must not truncate its destination in place"
+            );
+            assert!(
+                source.contains(&atomic_write),
+                "{label} report export must use the crash-durable atomic family"
+            );
+        }
     }
 }

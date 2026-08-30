@@ -4112,27 +4112,6 @@ impl<T> SealedControl<T> {
         absence.namespace = Some(namespace);
         Ok(true)
     }
-
-    fn release_empty_parent(&mut self, store_root: &Dir) {
-        let Self::Absent(absence) = self else {
-            return;
-        };
-        let Some(namespace) = &absence.namespace else {
-            return;
-        };
-        let Some(expected) = absence.namespace_identity else {
-            return;
-        };
-        let is_unchanged_empty = control_directory_identity(namespace).ok() == Some(expected)
-            && namespace
-                .entries()
-                .ok()
-                .is_some_and(|mut entries| entries.next().is_none());
-        if is_unchanged_empty {
-            let _ = store_root.remove_dir(absence.namespace_name);
-            let _ = sync_dir_required(store_root);
-        }
-    }
 }
 
 impl AbsentControlName {
@@ -9918,6 +9897,48 @@ mod bootstrap_store_tests {
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn durability_surface_contains_no_dead_writer_and_pins_live_call_chains() {
+        let store = include_str!("object_store.rs");
+        let wire = include_str!("wire.rs");
+        let identity = include_str!("identity.rs");
+        let lib = include_str!("../lib.rs");
+
+        for dead in [
+            ["complete", "_pending", "_publication"].concat(),
+            ["release", "_empty", "_parent"].concat(),
+        ] {
+            assert!(
+                !store.contains(&dead) && !wire.contains(&dead),
+                "dead durability writer `{dead}` must be deleted rather than left as census noise"
+            );
+        }
+
+        for live in [
+            ["open", "_absent", "_engine", "_history"].concat(),
+            ["bind", "_absent", "_parent"].concat(),
+        ] {
+            assert!(
+                store.matches(&live).count() >= 2,
+                "intentional durability helper `{live}` needs both definition and production caller"
+            );
+        }
+        let claim_definition = ["fn ", "claim(self, store_root: &Dir)"].concat();
+        let claim_caller = ["absence", ".claim(&self.capability)"].concat();
+        assert!(store.contains(&claim_definition));
+        assert!(store.contains(&claim_caller));
+        let scratch_definition = ["struct Bootstrap", "Inventory", "Scratch"].concat();
+        let scratch_caller = ["Bootstrap", "Inventory", "Scratch::new(&self.capability)"].concat();
+        assert!(store.contains(&scratch_definition));
+        assert!(store.contains(&scratch_caller));
+        let archive_claim = ["create", "_new", "_archive", "_claim"].concat();
+        assert!(identity.matches(&archive_claim).count() >= 2);
+        assert!(
+            lib.contains("#[cfg(test)]\nmod test_support;"),
+            "test_support must not compile into production"
+        );
+    }
 
     struct EmptyBootstrapFixture {
         root: PathBuf,

@@ -1527,30 +1527,6 @@ impl SharedProviderTransport {
         Ok(Some(id))
     }
 
-    pub(crate) fn complete_pending_publication(
-        &self,
-        batch_id: super::BatchId,
-    ) -> Result<(), ScenarioError> {
-        let gate = self.journal.acquire_transaction_gate()?;
-        self.journal.require_transaction_gate(&gate)?;
-        let name = format!("{batch_id}.pending");
-        let bytes = batch_id.to_string().into_bytes();
-        let Some(mut opened) = open_provider_regular_optional(
-            &self.pending_publication,
-            &name,
-            PROVIDER_PENDING_PUBLICATION_BYTES,
-            &name,
-        )?
-        else {
-            return Ok(());
-        };
-        validate_local_file_bytes(&mut opened.file, &bytes, &name)?;
-        self.pending_publication
-            .remove_file(&name)
-            .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        sync_provider_directory(&self.pending_publication)
-    }
-
     /// Remove one provider-generated conflict name only after the retained
     /// transaction proves it is byte-identical to one exact canonical path.
     ///

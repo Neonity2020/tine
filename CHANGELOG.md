@@ -24,6 +24,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Bounded managed block-referrer panels now show the same document-order
+  prefix and exact result count as Direct Files.** The SQLite-backed route
+  finishes generation-bound candidate discovery before applying the shared row
+  and byte budget, instead of truncating an internal-ID-ordered subset.
+
+- **Diagnostic and graph-verification report exports can no longer be left
+  partially written by a crash.** User-selected JSON destinations now use the
+  same temp-file, file-flush, atomic-replace, and directory-flush publication
+  family as other small durable outputs.
+
+- **Returning to Direct Files and restoring a backup now fail closed on real
+  directory durability errors.** Graph-local managed state set-aside and
+  rollback flush both changed parents in recovery-first order; the separate
+  capability-bound backup stack now durably reserves recovery directories,
+  retires live names, and publishes restored names before acknowledging them.
+
 - **Managed storage no longer reparses every baseline page when rebuilding its
   disposable SQLite projection.** New baseline capsules carry a bounded,
   versioned semantic receipt that is verified and reused during a healthy

@@ -795,6 +795,46 @@ struct RestoreRecovery {
     path: PathBuf,
 }
 
+#[cfg(test)]
+thread_local! {
+    static RESTORE_DIRECTORY_SYNC_FAILURE: std::cell::Cell<Option<(usize, i32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_restore_directory_sync_at(call: usize, errno: i32) {
+    assert!(call > 0);
+    RESTORE_DIRECTORY_SYNC_FAILURE.with(|failure| failure.set(Some((call, errno))));
+}
+
+fn sync_restore_directory(dir: &Dir) -> std::io::Result<()> {
+    #[cfg(test)]
+    RESTORE_DIRECTORY_SYNC_FAILURE.with(|failure| {
+        if let Some((remaining, errno)) = failure.get() {
+            if remaining == 1 {
+                failure.set(None);
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            failure.set(Some((remaining - 1, errno)));
+        }
+        Ok(())
+    })?;
+
+    match dir.try_clone()?.into_std_file().sync_all() {
+        Ok(()) => Ok(()),
+        Err(error) if tine_core::model::dir_fsync_error_is_unsupported(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// A cross-directory rename changes two directory entries. Persist the
+/// destination first so the retained copy becomes durable before acknowledging
+/// retirement of the only live name.
+fn sync_restore_rename_parents(destination: &Dir, source: &Dir) -> std::io::Result<()> {
+    sync_restore_directory(destination)?;
+    sync_restore_directory(source)
+}
+
 /// Reserve and bind a unique recovery directory beneath a live graph/assets
 /// capability. All later writes and moves are relative to these handles: a
 /// pre-existing symlink ancestor is rejected by cap-std, and a pathname swap
@@ -807,6 +847,7 @@ fn reserve_restore_recovery(
     let root = Dir::open_ambient_dir(root_path, ambient_authority())?;
     let parent = open_or_create_real_parent(&root, recovery_parent)?;
     parent.create_dir(recovery_id)?;
+    sync_restore_directory(&parent)?;
     let dir = parent.open_dir(recovery_id)?;
     Ok(RestoreRecovery {
         root_path: root_path.to_path_buf(),
@@ -838,6 +879,9 @@ fn open_or_create_real_parent(root: &Dir, relative: &std::path::Path) -> std::io
                 "restore recovery path contains a non-directory entry",
             ));
         }
+        // An existing entry can be residue from a prior attempt whose parent
+        // barrier failed. Re-barrier the parent before trusting the child.
+        sync_restore_directory(&current)?;
         current = current.open_dir(name)?;
     }
     Ok(current)
@@ -1012,13 +1056,7 @@ fn atomic_copy_new_into_live(
         // Same dir-fsync policy as the save path (DUP-5): tolerate
         // "unsupported here", REPORT a real EIO/ENOSPC — a restore whose
         // rename may not survive a crash must not report success.
-        if let Ok(parent_sync) = parent.try_clone() {
-            match parent_sync.into_std_file().sync_all() {
-                Ok(()) => {}
-                Err(error) if tine_core::model::dir_fsync_error_is_unsupported(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
+        sync_restore_directory(&parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -1113,7 +1151,10 @@ fn move_live_to_recovery(
         &recovery_parent,
         recovery_name,
     ) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            sync_restore_rename_parents(&recovery_parent, &live_parent)?;
+            Ok(())
+        }
         Err(rename_err) => {
             // Unexpected nested mounts can still produce EXDEV. Preserve a
             // bounded copy inside the bound recovery directory, but leave the
@@ -1126,6 +1167,7 @@ fn move_live_to_recovery(
                 .into_std();
             std::io::copy(&mut source, &mut copy)?;
             copy.sync_all()?;
+            sync_restore_directory(&recovery_parent)?;
             Err(std::io::Error::new(
                 rename_err.kind(),
                 format!(
@@ -1807,6 +1849,104 @@ mod tests {
             .path
             .starts_with(assets.join(".tine-restore-recovery")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_recovery_creation_refuses_to_ack_a_failed_directory_barrier() {
+        let root = scratch("restore-recovery-create-barrier");
+        std::fs::create_dir_all(root.join("logseq/.tine-trash")).unwrap();
+
+        fail_restore_directory_sync_at(3, 5);
+        let error = match reserve_restore_recovery(
+            &root,
+            std::path::Path::new("logseq/.tine-trash"),
+            "restore-failure",
+        ) {
+            Ok(_) => panic!("a real directory barrier failure must reject recovery reservation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert!(root.join("logseq/.tine-trash/restore-failure").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_retirement_preserves_complete_bytes_when_a_directory_barrier_fails() {
+        let root = scratch("restore-retire-barrier");
+        let live = root.join("pages/note.md");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, b"authoritative live bytes").unwrap();
+        let recovery = reserve_restore_recovery(
+            &root,
+            std::path::Path::new("logseq/.tine-trash"),
+            "restore-retire",
+        )
+        .unwrap();
+        std::fs::create_dir_all(recovery.path.join("graph")).unwrap();
+
+        fail_restore_directory_sync_at(2, 5);
+        let error = move_live_to_recovery(&recovery, &live, std::path::Path::new("graph/note.md"))
+            .expect_err("retirement must not report success before both directory barriers");
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert!(!live.exists());
+        assert_eq!(
+            std::fs::read(recovery.path.join("graph/note.md")).unwrap(),
+            b"authoritative live bytes"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_publication_never_acknowledges_an_unsynced_live_name() {
+        let root = scratch("restore-publish-barrier");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        let source = root.join("snapshot-note.md");
+        let live = root.join("pages/note.md");
+        std::fs::write(&source, b"complete snapshot bytes").unwrap();
+        let recovery = reserve_restore_recovery(
+            &root,
+            std::path::Path::new("logseq/.tine-trash"),
+            "restore-publish",
+        )
+        .unwrap();
+
+        fail_restore_directory_sync_at(2, 5);
+        let error = atomic_copy_new_into_live(&recovery, &source, &live)
+            .expect_err("publication must fail closed when its directory barrier fails");
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(std::fs::read(&live).unwrap(), b"complete snapshot bytes");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_stack_keeps_capability_bound_publication_and_orders_crash_barriers() {
+        let source = include_str!("backup.rs");
+        let shared_publish = ["tine_core::model::", "atomic_write("].concat();
+        assert!(
+            !source.contains(&shared_publish),
+            "backup restore keeps its separate capability-bound publication stack"
+        );
+
+        let reserve = function_source(source, "fn reserve_restore_recovery(");
+        assert!(reserve.contains("sync_restore_directory(&parent)?"));
+
+        let create_parent = function_source(source, "fn open_or_create_real_parent(");
+        assert!(create_parent.contains("sync_restore_directory(&current)?"));
+
+        let publish = function_source(source, "fn atomic_copy_new_into_live(");
+        assert!(publish.contains("sync_restore_directory(&parent)?"));
+
+        let retire = function_source(source, "fn move_live_to_recovery(");
+        assert!(retire.contains("sync_restore_rename_parents(&recovery_parent, &live_parent)?"));
+    }
+
+    fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source.find(signature).expect("function remains present");
+        &source[start
+            ..source[start..]
+                .find("\n}\n")
+                .map(|offset| start + offset + 3)
+                .unwrap_or(source.len())]
     }
 
     #[cfg(unix)]

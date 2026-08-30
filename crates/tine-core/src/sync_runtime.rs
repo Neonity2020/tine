@@ -13876,13 +13876,12 @@ impl RuntimeActor {
         let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let mut candidates: HashMap<PageId, HashSet<BlockId>> = HashMap::new();
-        let mut candidate_count = 0_usize;
 
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor = None;
         let mut page_paths: HashMap<PageId, ManagedPath> = HashMap::new();
-        'rows: loop {
+        loop {
             let rows = read
                 .block_referrer_candidates_after(target_uuid, cursor, BATCH)
                 .map_err(|_| {
@@ -13915,20 +13914,10 @@ impl RuntimeActor {
                 if masked_paths.contains(&path) {
                     continue;
                 }
-                if candidates
+                candidates
                     .entry(row.source_page_id)
                     .or_default()
-                    .insert(row.source_block_id)
-                {
-                    candidate_count = candidate_count.checked_add(1).ok_or(
-                        SyncApplicationPageRequestError::ActorRefusedAt(
-                            "application_block_referrers_candidate_overflow",
-                        ),
-                    )?;
-                    if candidate_count > max_rows {
-                        break 'rows;
-                    }
-                }
+                    .insert(row.source_block_id);
             }
             if len < BATCH {
                 break;
@@ -14011,7 +14000,6 @@ impl RuntimeActor {
         // content under an identical `max_bytes` admitted a different number of
         // rows on the two paths.
         let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
-        let candidate_overflow = candidate_count > max_rows;
         let mut groups: Vec<(Option<i64>, String, RefGroup)> = Vec::new();
         for (date_key, path, group) in source_groups {
             let mut admitted = Vec::new();
@@ -14053,14 +14041,10 @@ impl RuntimeActor {
             .into_iter()
             .map(|(_, _, group)| group)
             .collect::<Vec<_>>();
-        let mut total = budget.total;
-        if candidate_overflow {
-            total = total.max(max_rows.saturating_add(1));
-        }
         Ok(SyncApplicationBoundedRefGroups {
             groups,
-            total,
-            exceeded: budget.exceeded || candidate_overflow,
+            total: budget.total,
+            exceeded: budget.exceeded,
         })
     }
 
@@ -51083,60 +51067,18 @@ mod tests {
                 direct_bounded,
             );
         }
-        // Row bounds. A bound at or above the candidate count must agree
-        // exactly, and does.
-        //
-        // BELOW that, the two modes are known to disagree for a reason this
-        // work does not own and did not introduce: the managed candidate scan
-        // stops reading index rows the moment it knows the row bound is
-        // exceeded (`candidate_count > max_rows`), which is why a bounded
-        // managed panel does not walk the graph -- but its index rows arrive in
-        // `(page_id, block_id)` order, so the candidates it keeps are an
-        // arbitrary subset rather than Direct's document-order prefix, and it
-        // reports the bound plus one as `total` rather than the whole candidate
-        // count. Closing that would mean giving up the early-out, which is a
-        // performance/product decision, not an accounting one. What the shared
-        // accounting rule owns -- how many rows survive and whether truncation
-        // is reported -- must still agree, and every retained managed row must
-        // be a genuine referrer.
-        let unbounded_rows = unbounded_direct
-            .groups
-            .iter()
-            .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
-            .collect::<HashSet<_>>();
+        // Row bounds are semantic, not merely cardinality limits: managed must
+        // retain the same document-order prefix Direct Files would show. The
+        // materialized index is keyed by internal IDs rather than document
+        // order, so candidate discovery must finish before the shared
+        // path-ordered construction budget selects its prefix.
         for max_rows in 1..=(MODE_DIFFERENTIAL_PAGES * 4 + 1) {
-            let mut managed =
+            let managed =
                 managed_block_referrers(&handle, MODE_DIFFERENTIAL_ANCHOR, max_rows, MAX_BYTES);
             let direct_bounded =
                 direct.block_referrers_bounded(MODE_DIFFERENTIAL_ANCHOR, max_rows, MAX_BYTES);
             let label = format!("block referrers max_rows={max_rows}");
-            assert_eq!(managed.exceeded, direct_bounded.exceeded, "{label}");
-            let rows =
-                |groups: &[RefGroup]| groups.iter().map(|group| group.blocks.len()).sum::<usize>();
-            assert_eq!(
-                rows(&managed.groups),
-                rows(&direct_bounded.groups),
-                "{label}: the shared rule must retain the same number of rows"
-            );
-            for group in &managed.groups {
-                for block in &group.blocks {
-                    assert!(
-                        unbounded_rows.contains(&block.raw),
-                        "{label}: managed retained a row Direct does not consider a referrer"
-                    );
-                }
-            }
-            if max_rows >= unbounded_direct.total {
-                let mut direct_groups = (*direct_bounded.groups).clone();
-                canonicalize_query_groups_for_mode_differential(&mut managed.groups);
-                canonicalize_query_groups_for_mode_differential(&mut direct_groups);
-                assert_eq!(managed.total, direct_bounded.total, "{label}");
-                assert_eq!(
-                    serde_json::to_value(managed.groups).unwrap(),
-                    serde_json::to_value(direct_groups).unwrap(),
-                    "managed row-bounded referrers diverged from Direct Files: {label}"
-                );
-            }
+            assert_managed_simple_query_matches_direct(&label, managed, direct_bounded);
         }
 
         assert!(matches!(

@@ -24149,7 +24149,10 @@ fn atomic_publish(path: &Path, bytes: &[u8], mode: PublishMode) -> io::Result<()
     sync_dir(dir)
 }
 
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Atomically replace a small user-selected output and durably publish its
+/// directory entry. This does not provide graph mutation conflict semantics;
+/// callers remain responsible for choosing an appropriate destination.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_publish(path, bytes, PublishMode::Replace)
 }
 

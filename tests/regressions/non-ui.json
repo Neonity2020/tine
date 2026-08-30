@@ -2,6 +2,66 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-MANAGED-REFERRER-BOUNDED-PREFIX-001",
+   "title": "Bounded managed block referrers retain the exact Direct Files document-order prefix and result accounting",
+   "family": "managed-query-parity",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["all"],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime.rs"],
+    "scenario": "managed.block-referrers-bounded-direct-prefix",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: max_rows=1 returned an arbitrary internal-ID-ordered managed subset with total=2 while Direct reported the exact document-order prefix with total=24. Managed discovery now covers the full generation-bound candidate set before the shared path-ordered construction budget selects rows."
+  },
+  {
+   "id": "REG-REPORT-EXPORT-ATOMIC-001",
+   "title": "User-selected diagnostic and graph-verification reports publish atomically instead of truncating destinations in place",
+   "family": "data-safety",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["desktop"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/debug.rs", "src-tauri/src/graph_verification.rs", "crates/tine-core/src/model.rs"],
+    "scenario": "reports.user-selected-atomic-export",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: both savers called std::fs::write directly. They now stage and flush complete bytes, atomically replace the selected name, and flush its parent through the shared small-output publication family."
+  },
+  {
+   "id": "REG-DIRECT-RETURN-PROVIDER-ARCHIVE-DURABILITY-001",
+   "title": "Graceful Direct Files return durably sets aside and can roll back graph-local managed provider state",
+   "family": "managed-storage-data-safety",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["all"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/sync_runtime.rs"],
+    "scenario": "managed.direct-return-provider-set-aside-barriers",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: recovery creation, v2 set-aside, and rollback performed zero directory barriers. Creation now flushes .tine-sync, and both cross-directory renames flush destination before source."
+  },
+  {
+   "id": "REG-BACKUP-RESTORE-DIRECTORY-DURABILITY-001",
+   "title": "Capability-bound backup restore never acknowledges recovery reservation retirement or publication before directory entries are durable",
+   "family": "backup-recovery",
+   "sources": { "issues": [], "commits": [] },
+   "platforms": ["all"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/backup.rs"],
+    "scenario": "backup.restore-directory-barrier-crash-safety",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3e275614: recovery directory creation and cross-directory live retirement had no directory barriers, and live publication silently skipped a failed parent-handle clone. Injected EIO tests now prove each operation refuses success while retaining only complete old or new bytes; cross-directory barriers are recovery-first."
+  },
+  {
    "id": "REG-CORE-FLAGGED-RENAME-INJECTION-DETERMINISM",
    "title": "A shared-provider flagged-rename fault injected by one test never fails an unrelated test running beside it",
    "family": "release-test-honesty",

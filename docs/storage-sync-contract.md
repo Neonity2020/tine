@@ -84,6 +84,16 @@ Settings action is always graceful: if drain or projection confirmation fails,
 it leaves managed evidence selected and offers the separately named emergency
 return rather than force-stopping managed authority implicitly.
 
+The graceful return's graph-local set-aside is a durable cross-directory
+rename, not merely a pathname move. It flushes `.tine-sync` before using the
+`recovery` entry, including when that visible entry may be residue from a prior
+refused attempt. Moving `v2` into recovery (or
+rolling that move back) flushes the destination parent before the source
+parent. A real directory-barrier failure is reported even though the rename may
+already be visible; the retained name remains recovery evidence and retry must
+reinspect current state. Filesystems which genuinely do not support directory
+flush retain the shared unsupported-operation policy.
+
 The authoritative layout names live in the pinned
 `tine_storage::formats` manifest. Core code imports them through the
 definition-free compatibility surface in
@@ -362,6 +372,12 @@ candidate/name set before applying the existing parser-owned matching and
 presentation semantics. They no longer use manual whole-graph candidate scans
 or second in-memory alias, reference-candidate, block-identity, referenced-name,
 or block-ref-count semantic caches as their ordinary route.
+Bounded block-referrer results are semantically bounded, not merely count
+bounded: managed candidate discovery covers the complete generation-bound
+candidate set, groups it in the same relative-path/document order as Direct
+Files, and only then applies the shared row and byte construction budget.
+`groups`, `total`, and `exceeded` therefore describe the exact same prefix in
+both modes; an internal-ID-ordered early subset is not an allowed optimization.
 The bounded generation-keyed
 memo of already-shaped frontend result DTOs remains Tine-native: SQLite cannot
 own parser AST semantics or presentation reuse, and dropping that memo would

@@ -2468,9 +2468,17 @@ fn archive_graph_provider_namespace_with(
     if !recovery_metadata.is_dir() || recovery_metadata.file_type().is_symlink() {
         return Err("Graph-local managed-storage recovery state is not a local directory, so it could not be archived safely.".into());
     }
+    // Re-barrier an existing recovery entry too: it may be the visible residue
+    // of a prior attempt whose directory flush was refused.
+    tine_core::model::sync_dir_for_rename(tine_sync).map_err(|error| {
+        format!("Couldn't durably prepare graph-local managed-storage recovery state: {error}")
+    })?;
     let destination = recovery.join(format!("v2-{}", Uuid::new_v4()));
     std::fs::rename(&source, &destination)
         .map_err(|error| format!("Couldn't preserve graph-local managed-storage state: {error}"))?;
+    sync_provider_namespace_rename(&recovery, tine_sync).map_err(|error| {
+        format!("Couldn't durably preserve graph-local managed-storage state: {error}")
+    })?;
     Ok(ProviderNamespaceArchive::Moved {
         source,
         destination,
@@ -2504,7 +2512,29 @@ fn restore_graph_provider_namespace(archive: ProviderNamespaceArchive) -> Result
         format!(
             "Tine-managed storage could not restore graph-local provider state after preserving private recovery state failed: {error}"
         )
+    })?;
+    let destination_parent = source.parent().ok_or_else(|| {
+        "Tine-managed storage restore destination has no parent directory.".to_string()
+    })?;
+    let source_parent = destination.parent().ok_or_else(|| {
+        "Tine-managed storage recovery source has no parent directory.".to_string()
+    })?;
+    sync_provider_namespace_rename(destination_parent, source_parent).map_err(|error| {
+        format!(
+            "Tine-managed storage could not durably restore graph-local provider state: {error}"
+        )
     })
+}
+
+/// A cross-directory rename changes two directory entries. Persist the
+/// destination first so a crash cannot leave the only retained name on a
+/// source directory whose removal was acknowledged first.
+fn sync_provider_namespace_rename(
+    destination_parent: &Path,
+    source_parent: &Path,
+) -> std::io::Result<()> {
+    tine_core::model::sync_dir_for_rename(destination_parent)?;
+    tine_core::model::sync_dir_for_rename(source_parent)
 }
 
 #[derive(Debug)]
@@ -5342,6 +5372,37 @@ mod tests {
         };
         assert!(!unclaimed.join(".tine-sync/v2").exists());
         assert_eq!(snapshot_tree(&destination), before);
+    }
+
+    #[test]
+    fn provider_set_aside_and_rollback_barrier_every_changed_directory_entry() {
+        use tine_core::durability_counters::{Barrier, BarrierSession};
+
+        let root = std::env::temp_dir().join(format!("tine-provider-set-aside-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".tine-sync/v2/shared")).unwrap();
+        std::fs::write(root.join(".tine-sync/v2/shared/evidence"), b"retained").unwrap();
+
+        let barriers = BarrierSession::begin();
+        let archive = archive_graph_provider_namespace_with(&root, |_| false).unwrap();
+        assert_eq!(
+            barriers.counts().get(Barrier::Directory),
+            3,
+            "creating recovery and moving v2 across two parents requires three directory barriers"
+        );
+
+        barriers.reset();
+        restore_graph_provider_namespace(archive).unwrap();
+        assert_eq!(
+            barriers.counts().get(Barrier::Directory),
+            2,
+            "rollback changes one name in each of the source and destination parents"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".tine-sync/v2/shared/evidence")).unwrap(),
+            b"retained"
+        );
+        BarrierSession::detach_current_thread();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

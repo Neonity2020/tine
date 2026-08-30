@@ -261,7 +261,7 @@ pub(crate) async fn save_graph_verification_report(
         let path = chosen
             .into_path()
             .map_err(|_| "graph verification destination is not a local file".to_string())?;
-        std::fs::write(path, text)
+        tine_core::model::atomic_write(&path, text.as_bytes())
             .map_err(|error| format!("graph verification report could not be saved: {error}"))?;
         Ok(true)
     }
