@@ -72,7 +72,8 @@ use commands::{
 };
 use debug::{
     app_architecture, clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
-    diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, flight_init,
+    diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, diagnostic_session_active,
+    flight_init,
     install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
 };
 use graph::{
@@ -936,6 +937,7 @@ pub fn run() {
             debug_log,
             diagnostic_ipc_event,
             diagnostic_frontend_event,
+            diagnostic_session_active,
             diagnostic_report,
             save_diagnostic_report,
             clear_diagnostics,

@@ -1135,6 +1135,11 @@ mod tests {
         // second window; Shift-click alone is invisible to a new user.
         assert!(page.markdown.contains("**Open in a new window**"));
         assert!(page.markdown.contains("**Show in folder**"));
+        // GH #427: the maximized size is remembered, so the Guide must say so
+        // rather than leaving people to rediscover the control every open.
+        assert!(page
+            .markdown
+            .contains("Tine remembers which size you left it at"));
         assert!(page.markdown.contains("[[Welcome to Tine]]"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Features/Tips & shortcuts]]"));
