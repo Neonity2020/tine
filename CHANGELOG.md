@@ -51,6 +51,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Editing-toolbar buttons on mobile no longer depend on a WebView emitting a
+  click.** On iOS 27 the toolbar appeared but nothing responded to taps, while
+  the same build worked on iOS 18.5: the buttons acted only on the click a
+  browser synthesizes after a pointer press, and that press is deliberately
+  cancelled so the editor keeps focus. The tap itself now performs the action,
+  with click kept as the keyboard and assistive-technology path. (GH #434)
+
 - **Long-pressing a page link on iOS or Android no longer raises the system
   text-selection bar over Tine's menu.** The same hold that opens Tine's context
   menu is also the platform's own selection gesture, which no amount of event
