@@ -9430,6 +9430,31 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: the left sidebar's scrollbar can be grabbed and dragged with the mouse. Classification: blocking core operation (the surface is scrollable but its scrollbar is unreachable). Root cause: .sidebar-resizer is position:absolute right:0 width:7px z-index:20 inside .left-sidebar, and .left-sidebar-scroll fills that same box \u2014 so on any platform whose scrollbar consumes layout width (Windows/WebView2 is the reported one) the drag strip was painted over the outer 7px of a 10px scrollbar. Resizing worked; scrolling by mouse did not, which is exactly what two Windows reporters described. Fix: .left-sidebar-scroll reserves a transparent right border of --sidebar-resizer-width, the same token the strip's width now uses, so the scrollbar column and the drag column are disjoint and moving a few pixels left off the strip reaches the bar, as the reporter asked. The border is transparent so the sidebar background is unchanged; the mobile drawer, where the strip is hidden, sets the border back to 0 and keeps its full width. Siblings reviewed: .rs-resizer sits at the RIGHT sidebar's LEFT edge while that pane scrolls on its right, and the main pane's scrollbar ends where the right sidebar begins, so neither pair overlaps \u2014 the left sidebar was the only conflicting pair. The frameless-window .grip-e strip does overlay the rightmost 4px of whatever pane touches the window edge, but that is the ordinary window-edge resize zone every frameless app has, not this defect. Fail-before is quantitative: removing the gutter makes the guard report the strip covering 7.0px of the 10px scrollbar. EVIDENCE LIMIT: no Windows runtime was available. jsdom applies no CSS layout and this headless Chromium always draws overlay scrollbars, so scripts/check-sidebar-resizer-scrollbar.mjs reproduces the Windows condition with scrollbar-gutter:stable in the fixture; the column geometry is proven, the WebView2 bar itself is not, so confidence stays moderate."
+    },
+    {
+      "id": "UI-BULLET-FIRST-LINE-459",
+      "title": "A block's bullet sits on the vertical centre of that block's first line of text, at every heading level and under every typography theme",
+      "family": "outline-controls",
+      "sources": {
+        "issues": [
+          459
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-block-first-line-alignment.mjs"
+        ],
+        "scenario": "outline-controls.bullet-first-line-alignment",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: the bullet reads as belonging to its line, and a column of bullets lines up with the column of text. Classification: flexible presentation, accepted as a defect because a user reported it on daily use. Root cause: .block-controls carried a literal height:26px chosen to match .block-content's line-height, but .block-content also has padding:2px 0, so centring inside the shorter column put every bullet in the graph exactly 2.00px above the middle of its own first line - and 4.00px above it under the editorial-serif typography preset, which raises the line box to 30px but could not move a literal. Fix: two tokens (--ls-block-line-height, --ls-block-content-pad-y) own the first line in one place; .block-content, .block-editor and the bullet column all derive from them, and the typography preset retunes the token instead of the content rule. Fail-before is quantitative: the guard reported 71 misplaced bullets, -2.00px on every measurable journal block and -4.00px under editorial-serif; after the fix every plain block is within 0.5px. Headings keep their own taller bullet column (.bullet-h1/h2/h3, ~1.2x the heading line box) and are deliberately unchanged - h1 still sits ~2px off its line centre; the guard holds them within 3px so a change to the ordinary column cannot silently drag them. jsdom applies no CSS layout, so headless-Chromium geometry is the only layer that can observe this; the oracle is derived from each element's own computed padding-top and line-height, never from a pixel constant, so a fix that cancelled one error with one constant would fail under the serif preset."
     }
   ]
 }

@@ -25,6 +25,7 @@
     "docs:build": "node scripts/build-guide-site.mjs",
     "docs:check": "node scripts/test-guide-site-validator.mjs && node scripts/build-guide-site.mjs --check",
     "docs:check-geometry": "node scripts/check-publish-outline-geometry.mjs",
+    "ui:check-block-first-line": "node scripts/check-block-first-line-alignment.mjs",
     "ui:check-outline-guide-hitbox": "node scripts/check-outline-guide-hitbox.mjs",
     "ui:check-sidebar-resizer-scrollbar": "node scripts/check-sidebar-resizer-scrollbar.mjs",
     "ui:check-mobile-layout": "node scripts/check-mobile-layout.mjs",
