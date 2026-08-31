@@ -50541,7 +50541,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_crash_reopen_synthetic_history_sweep_with_and_without_resume_point() {
+    fn managed_crash_reopen_synthetic_history_sweep_with_and_without_projection_cache() {
         const PATH: &str = "notes/Synthetic crash history.md";
         const INITIAL: &[u8] = b"- initial synthetic history\n";
 

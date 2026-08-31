@@ -933,16 +933,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "open.create_new",
             1,
         ),
-        (
-            "crates/tine-core/src/oplog/identity.rs",
-            "libc.openat.create",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/identity.rs",
-            "open.create_new",
-            1,
-        ),
         ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
         (
             "crates/tine-core/src/oplog/import.rs",
@@ -1076,11 +1066,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "crates/tine-core/src/oplog/receiver_absence_summary.rs",
             "cap.remove_file",
             2,
-        ),
-        (
-            "crates/tine-core/src/oplog/resume_point.rs",
-            "cap.remove_file",
-            1,
         ),
         ("crates/tine-core/src/oplog/sqlite.rs", "cap.create_dir", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "fs.create_dir", 1),
@@ -1569,7 +1554,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.2\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1f1760635a82bbfbe3cfa31dad296eebf4d936acbceeb454f58cefd0a9a5adae",
+        "c0e276af5f4033b9c16eac0b136d71ef297ff0a51f397c8f24ad271e38542c84",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

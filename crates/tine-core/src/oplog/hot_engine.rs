@@ -6,7 +6,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
-use cap_std::{ambient_authority, fs::Dir};
 use loro::{
     Container, ContainerType, EncodedBlobMode, ExportMode, Frontiers, LoroDoc, LoroMap, LoroValue,
     UpdateOptions, ValueOrContainer, VersionVector,
@@ -28,7 +27,7 @@ use super::lazy_genesis::{
 #[cfg(test)]
 use super::local_completion_index::{LocalCompletionFlushStats, LocalCompletionOpenStats};
 use super::local_completion_index::{LocalCompletionIndex, LocalCompletionPruningContext};
-use super::object_store::{BlockClaimIndexRoot, BlockClaimIndexValue, ControlDirectoryIdentity};
+use super::object_store::{BlockClaimIndexRoot, BlockClaimIndexValue};
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
     extract_semantic_page_name_observations, extract_validated_catalog_page_names,
@@ -3139,11 +3138,10 @@ impl AcceptedFrontierRoot {
         empty_accepted_frontier_root()
     }
 
-    /// Test-only saturation for the resume-point byte ceiling proof.
+    /// Test-only saturation for frontier-identity coverage.
     ///
     /// Every member is fixed-size except `scratch_root`, which is one more
-    /// [`super::scratch_store::ScratchLsmRoot`]; a resume point carries two of
-    /// these frontiers, so they contribute two of the format's ten LSM roots.
+    /// [`super::scratch_store::ScratchLsmRoot`].
     #[cfg(test)]
     pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
         Self {
@@ -3613,18 +3611,6 @@ struct ColdHistoryRecord {
     logseq_claim_root: LogseqClaimIndexRoot,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
     status: ArchiveStatus,
-}
-
-/// Move-only proof of the current durable authority established by the
-/// enrolled open before recovery resets run-local state.
-///
-/// It retains exactly one decoded current record, never historical records.
-/// Exact-current resume consumes it; stale or refused resume drops it and takes
-/// the unchanged full replay path.
-struct CurrentDurableAuthorityProof {
-    history: super::object_store::EngineHistoryAuthority,
-    latest_batch_id: BatchId,
-    record: ColdHistoryRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4604,355 +4590,6 @@ pub struct EngineInstrumentation {
     pub block_claim_encode_nanos: usize,
     pub block_claim_insert_nanos: usize,
     pub store: super::ObjectStoreStats,
-    pub resume: RuntimeResumeObservation,
-}
-
-/// Cheap, always-available evidence about this engine's runtime-resume outcome.
-///
-/// Every member is set once, at startup, by the recovery path. Nothing here is
-/// touched by admission, authoring, acceptance, or projection, so the standing
-/// bounded-admission tables can assert it stays at its startup value.
-///
-/// `replay_base_generation` names the outcome precisely: zero means a full
-/// immutable-history replay, while a nonzero authenticated predecessor means
-/// only its durable tail was replayed. `adopted` remains narrower: it is true
-/// only when that predecessor was a retained runtime-resume run, never for a
-/// one-process ephemeral bootstrap predecessor. This keeps recovery work
-/// falsifiable without conflating an unpublishable ephemeral accelerator with
-/// retained-run adoption.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeResumeObservation {
-    /// The engine resumed from a retained run named by a resume snapshot.
-    pub adopted: bool,
-    /// A retained run was offered and refused. Its bytes were left untouched
-    /// and it was **not** reclaimed here; reclamation is lifecycle work.
-    ///
-    /// True for **every** refusal class, not only the ones detected after the
-    /// engine exists: an archive-boundary refusal (absent, still leased,
-    /// ephemeral or foreign marker, torn entry set, binding mismatch) sets this
-    /// in `open_enrolled_projection_resuming` before the engine is built, and a
-    /// restore-time refusal sets it in `rotate_to_fresh_retained_scratch`.
-    /// Lifecycle wiring reads this standing signal to bound retained-run
-    /// residue, so a refusal class it could not see would be a silent leak.
-    pub refused: bool,
-    /// Durable generation covered by the authenticated predecessor state.
-    pub replay_base_generation: u64,
-    /// Live durable generation this recovery finished against.
-    pub live_history_generation: u64,
-    /// Durable records this recovery actually authenticated and replayed.
-    pub replayed_generations: u64,
-}
-
-/// A recoverable read failure in the retained scratch run selected by an
-/// authenticated runtime-resume point.  Retained scratch is an accelerator,
-/// not authority: the immutable archive remains sufficient to reconstruct a
-/// fresh run.  This type deliberately preserves that distinction until the
-/// promoted-runtime boundary can make the one allowed recovery decision.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RetainedScratchFault {
-    Unreadable,
-    UnsafeEntry,
-    MalformedMarker,
-    MalformedPage,
-    MalformedBlob,
-    PageTooLarge,
-    PageDigestMismatch,
-    BlobDigestMismatch,
-    PageBindingMismatch,
-}
-
-impl fmt::Display for RetainedScratchFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unreadable => f.write_str("scratch I/O failed"),
-            Self::UnsafeEntry => f.write_str("unsafe scratch entry"),
-            Self::MalformedMarker => f.write_str("malformed scratch marker"),
-            Self::MalformedPage => f.write_str("malformed or non-canonical scratch page"),
-            Self::MalformedBlob => f.write_str("malformed scratch blob"),
-            Self::PageTooLarge => f.write_str("scratch page is too large"),
-            Self::PageDigestMismatch => f.write_str("scratch page digest mismatch"),
-            Self::BlobDigestMismatch => f.write_str("scratch blob digest mismatch"),
-            Self::PageBindingMismatch => f.write_str("scratch page reference is misbound"),
-        }
-    }
-}
-
-/// Typed provenance for a reconstructible retained-scratch failure.  The run
-/// identifier is not an authority; it only proves the error arose while this
-/// engine was reading the exact run it adopted at open.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RetainedScratchResumeFailure {
-    run_id: Uuid,
-    fault: RetainedScratchFault,
-}
-
-impl RetainedScratchResumeFailure {
-    fn from_scratch(run_id: Uuid, error: &super::scratch_store::ScratchError) -> Option<Self> {
-        use super::scratch_store::ScratchError;
-
-        let fault = match error {
-            ScratchError::Io(_) => RetainedScratchFault::Unreadable,
-            ScratchError::UnsafeEntry(_) => RetainedScratchFault::UnsafeEntry,
-            ScratchError::MalformedMarker(_) => RetainedScratchFault::MalformedMarker,
-            ScratchError::MalformedPage => RetainedScratchFault::MalformedPage,
-            ScratchError::MalformedBlob => RetainedScratchFault::MalformedBlob,
-            ScratchError::PageTooLarge(_) => RetainedScratchFault::PageTooLarge,
-            ScratchError::PageDigestMismatch(_) => RetainedScratchFault::PageDigestMismatch,
-            ScratchError::BlobDigestMismatch(_) => RetainedScratchFault::BlobDigestMismatch,
-            ScratchError::PageBindingMismatch => RetainedScratchFault::PageBindingMismatch,
-            // These are engine/programming invariants, not an untrusted
-            // retained-cache representation.  Do not turn them into an
-            // automatic replay signal.
-            ScratchError::KeyDigestCollision
-            | ScratchError::IndexCapacity
-            | ScratchError::Poisoned => return None,
-        };
-        Some(Self { run_id, fault })
-    }
-
-    pub(crate) const fn run_id(&self) -> Uuid {
-        self.run_id
-    }
-
-    pub(crate) const fn fault(&self) -> &RetainedScratchFault {
-        &self.fault
-    }
-}
-
-impl fmt::Display for RetainedScratchResumeFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "document scratch index failed: {}", self.fault)
-    }
-}
-
-/// The exact run-local engine state one cross-process resume needs.
-///
-/// **Derivation.** `reconstruct_run_local_state` is the same-process
-/// reconstruction seam, and the state it carries across (as opposed to the
-/// capabilities it reopens and the telemetry it keeps) is:
-///
-/// * run-local, bound to one scratch run and to nothing durable —
-///   `scratch_roots`, `block_claim_root`, `accepted_frontier_root`,
-///   `next_acceptance_sequence`, `current_path_catalog`. These are carried
-///   here, because no durable record commits them;
-/// * durable-derived, committed by the `ColdHistoryRecord` of every
-///   generation — `portable_path_root`, `portable_path_conflicts`,
-///   `page_name_root`, `page_name_conflicts`, `logseq_claim_root`, the
-///   reference-catalog policy/root and the terminal evidence. These are
-///   **not** carried: restoring them from the snapshot would make durable
-///   authority caller-asserted. Instead the snapshot names the durable record
-///   they belong to (`history_latest_batch_id` at `history_generation`) and
-///   adoption re-reads them from the sealed history at the live root;
-/// * process-local or observational — the runtime authority mint, hot archive
-///   caches, point caches, work counters. These are deliberately discarded,
-///   exactly as the same-process seam discards them.
-///
-/// `fatal_evidence` is the one run-local member deliberately absent: a snapshot
-/// is minted only from a quiescent, conflict-free, non-terminal engine, so it
-/// is provably `None` and its unbounded conflict map can never enter the
-/// record.
-///
-/// The catalog document and its direct heads are a fourth class: run-local,
-/// load-bearing for projection, authoring and the durable catalog-checkpoint
-/// binding, and **not** carried here. Adoption re-derives both from the adopted
-/// run's own authenticated visible document lane — a read of exactly the bytes
-/// whose integrity adoption must establish anyway — and
-/// `catalog_checkpoint_binding` binds that derivation to these roots. The
-/// same-process seam re-derives them the same way, through the same
-/// `load_run_local_catalog_hot_state` reader.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeResumeSnapshot {
-    // ---- durable-history authority the run-local roots correspond to ----
-    history_generation: u64,
-    history_index_root: ContentDigest,
-    /// The durable record at exactly `history_generation`. Adoption re-reads it
-    /// to restore every durable-derived root, so those roots stay authenticated
-    /// by the sealed history rather than transported by this record.
-    history_latest_batch_id: BatchId,
-
-    // ---- the retained run ----
-    scratch_run_id: Uuid,
-    scratch_binding_digest: ContentDigest,
-
-    // ---- run-local roots no durable record commits ----
-    scratch_roots: ScratchRoots,
-    block_claim_root: BlockClaimIndexRoot,
-    accepted_frontier_root: AcceptedFrontierRoot,
-    next_acceptance_sequence: u64,
-    current_path_catalog_root: ScratchAuthenticatedCatalogRoot,
-    current_path_catalog_available: bool,
-    current_path_catalog_frontier: AcceptedFrontierRoot,
-    /// The catalog checkpoint binding the snapshotting engine computed from
-    /// exactly these `scratch_roots` and its own catalog document heads.
-    ///
-    /// The heads themselves are not carried; adoption re-derives them from the
-    /// adopted run's authenticated document-state lane. This digest is what
-    /// binds that derivation to the recorded roots, so a run whose document lane
-    /// and LSM roots have drifted apart is refused instead of resumed.
-    catalog_checkpoint_binding: ContentDigest,
-}
-
-impl RuntimeResumeSnapshot {
-    /// Reconstruct the snapshot a live engine emitted, from a durable resume
-    /// point that already re-proved every authority of this open.
-    ///
-    /// Sealed on purpose: the argument is
-    /// [`super::resume_point::AuthenticatedResumePoint`], whose only mint is
-    /// `RuntimeResumePointV2::authenticate`. A lifecycle caller therefore
-    /// cannot hand the resuming open a snapshot assembled from a record whose
-    /// workspace, endpoint, promoted state, durable-history binding or
-    /// enrollment evidence was never checked.
-    ///
-    /// The conversion itself proves nothing further, and deliberately so.
-    /// Everything it carries is re-proved by
-    /// [`Self::restore_adopted_predecessor_state`] against the run's own bytes
-    /// and the sealed history, and any doubt there refuses into a full replay.
-    pub(super) fn from_authenticated_resume_point(
-        authenticated: &super::resume_point::AuthenticatedResumePoint<'_>,
-    ) -> Self {
-        let point = authenticated.point();
-        Self {
-            history_generation: point.history_generation(),
-            history_index_root: point.history_index_root(),
-            history_latest_batch_id: point.history_latest_batch_id(),
-            scratch_run_id: point.scratch_run_id(),
-            scratch_binding_digest: point.scratch_binding_digest(),
-            scratch_roots: point.scratch_roots().clone(),
-            block_claim_root: *point.block_claim_root(),
-            accepted_frontier_root: point.accepted_frontier_root().clone(),
-            next_acceptance_sequence: point.next_acceptance_sequence(),
-            current_path_catalog_root: point.current_path_catalog_root().clone(),
-            current_path_catalog_available: point.current_path_catalog_available(),
-            current_path_catalog_frontier: point.current_path_catalog_frontier().clone(),
-            catalog_checkpoint_binding: point.catalog_checkpoint_binding(),
-        }
-    }
-
-    pub(crate) const fn history_generation(&self) -> u64 {
-        self.history_generation
-    }
-
-    pub(crate) const fn history_index_root(&self) -> ContentDigest {
-        self.history_index_root
-    }
-
-    pub(crate) const fn history_latest_batch_id(&self) -> BatchId {
-        self.history_latest_batch_id
-    }
-
-    pub(crate) const fn scratch_run_id(&self) -> Uuid {
-        self.scratch_run_id
-    }
-
-    pub(crate) const fn scratch_binding_digest(&self) -> ContentDigest {
-        self.scratch_binding_digest
-    }
-
-    pub(crate) const fn scratch_roots(&self) -> &ScratchRoots {
-        &self.scratch_roots
-    }
-
-    pub(crate) const fn block_claim_root(&self) -> &BlockClaimIndexRoot {
-        &self.block_claim_root
-    }
-
-    pub(crate) const fn accepted_frontier_root(&self) -> &AcceptedFrontierRoot {
-        &self.accepted_frontier_root
-    }
-
-    pub(crate) const fn next_acceptance_sequence(&self) -> u64 {
-        self.next_acceptance_sequence
-    }
-
-    pub(crate) const fn current_path_catalog_root(&self) -> &ScratchAuthenticatedCatalogRoot {
-        &self.current_path_catalog_root
-    }
-
-    pub(crate) const fn current_path_catalog_available(&self) -> bool {
-        self.current_path_catalog_available
-    }
-
-    pub(crate) const fn current_path_catalog_frontier(&self) -> &AcceptedFrontierRoot {
-        &self.current_path_catalog_frontier
-    }
-
-    pub(crate) const fn catalog_checkpoint_binding(&self) -> ContentDigest {
-        self.catalog_checkpoint_binding
-    }
-
-    /// An empty-rooted snapshot for storage-layer tests that have no engine.
-    ///
-    /// `#[cfg(test)]` on purpose: in production the only mint is
-    /// [`ShardedHotEngine::runtime_resume_snapshot`], and that gate — retained,
-    /// quiescent, conflict-free, non-terminal, live head re-read, head record
-    /// adoptable — is the whole reason a sealed record can be trusted to
-    /// describe a state the engine can honour.
-    #[cfg(test)]
-    pub(crate) fn empty_rooted_for_test(
-        history: (u64, ContentDigest, BatchId),
-        scratch: (Uuid, ContentDigest),
-    ) -> Self {
-        Self {
-            history_generation: history.0,
-            history_index_root: history.1,
-            history_latest_batch_id: history.2,
-            scratch_run_id: scratch.0,
-            scratch_binding_digest: scratch.1,
-            scratch_roots: ScratchRoots::default(),
-            block_claim_root: BlockClaimIndexRoot::default(),
-            accepted_frontier_root: AcceptedFrontierRoot::empty(),
-            next_acceptance_sequence: 1,
-            current_path_catalog_root: ScratchAuthenticatedCatalogRoot::default(),
-            current_path_catalog_available: true,
-            current_path_catalog_frontier: AcceptedFrontierRoot::empty(),
-            catalog_checkpoint_binding: ContentDigest::of(b"resume-point-test-catalog-checkpoint"),
-        }
-    }
-}
-
-/// The members of an accepted frontier that are **not** run-local.
-///
-/// `retained_bytes_total`, `state_digest` (which folds it) and `scratch_root`
-/// all address one specific scratch run's bytes, so two runs that replayed the
-/// same authenticated history legitimately disagree on them. Everything below
-/// is content-addressed over accepted batches and documents, so it is the same
-/// in every run that reached the same accepted closure — which makes it the
-/// exact subset a cross-run binding may use.
-fn accepted_frontier_cross_run_facts(
-    root: &AcceptedFrontierRoot,
-) -> (
-    u64,
-    u64,
-    Option<[u8; 16]>,
-    ContentDigest,
-    Option<[u8; 16]>,
-    ContentDigest,
-) {
-    (
-        root.acceptance_sequence,
-        root.document_count,
-        root.document_map_root_key,
-        root.document_map_root_digest,
-        root.batch_map_root_key,
-        root.batch_map_root_digest,
-    )
-}
-
-/// Whether one durable history record is a state an adopted restart is allowed
-/// to resume from.
-///
-/// Checked in both directions on purpose. The restore must check it, because it
-/// is the record every durable-derived root is restored from. The mint checks it
-/// too so that an endpoint whose newest durable record is a rejection or a
-/// quarantine refuses *there*, where the reason is diagnosable, instead of
-/// minting a record that every later restore silently refuses into a full
-/// replay.
-fn record_is_adoptable_predecessor(record: &ColdHistoryRecord) -> bool {
-    record.portable_path_conflicts.is_empty()
-        && record.page_names.conflicts.is_empty()
-        && record.terminal_evidence.is_none()
-        && record.portable_path_key_version == super::PORTABLE_PATH_KEY_VERSION
-        && matches!(record.status, ArchiveStatus::Accepted { .. })
 }
 
 /// Whether one set of run-local scratch roots carries no undrained durable
@@ -5528,54 +5165,6 @@ impl CleanProjectionBulkMaterializer<'_> {
     }
 }
 
-pub(crate) enum EngineOpenRetention<'a> {
-    /// A disposable run and a full replay. Nothing is retained, so this engine
-    /// can neither be resumed from nor publish a resume point.
-    Ephemeral,
-    /// A retained run, resuming from `resume` when every authority that
-    /// snapshot records still holds. `None` is a fresh retained run.
-    Retained {
-        resume: Option<&'a RuntimeResumeSnapshot>,
-    },
-}
-
-/// The scratch construction input for one enrolled engine. This is private so
-/// only the recovery entry point can consume an ephemeral predecessor.
-enum EngineScratchOpen {
-    Fresh,
-    Retained(super::object_store::RetainedEngineScratch),
-}
-
-/// Run-local state that lets one recovery skip a revalidated prefix. The
-/// ephemeral form owns its snapshot and cannot leave this call; retained
-/// snapshots remain borrowed from their authenticated resume point.
-enum RecoveryPredecessor<'a> {
-    Retained(&'a RuntimeResumeSnapshot),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PredecessorKind {
-    Retained,
-    EphemeralBootstrap,
-}
-
-/// What one resuming open actually did, including why it refused.
-///
-/// A refusal is never an error: adoption is a pure accelerator, so the only
-/// consequence of refusing is a full replay into a fresh retained run. The
-/// refused run's identity is reported so lifecycle wiring can bound retained-run
-/// residue; **this packet never deletes or prunes any run.**
-#[derive(Clone, Debug)]
-pub(crate) struct RuntimeResumeReceipt {
-    pub(crate) observation: RuntimeResumeObservation,
-    /// The retained run the engine is now running on.
-    pub(crate) engine_run_id: Uuid,
-    /// The retained run this open declined to resume from, left byte-for-byte
-    /// intact.
-    pub(crate) refused_run_id: Option<Uuid>,
-    pub(crate) refusal: Option<EngineError>,
-}
-
 /// Test-only phase receipt for the enrolled engine portion of a promoted
 /// runtime reopen. The lifecycle receipt consumes this on the actor thread;
 /// production opens neither take clocks nor retain a receipt.
@@ -5726,12 +5315,6 @@ impl AcceptedBatchCursor<'_> {
 /// Experimental, disconnected v2 hot state. The immutable archive is retained
 /// separately from visible Loro documents. Only `ValidatedBatch` values from
 /// the object-store Ready boundary enter semantic validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DurableAuthorityMode {
-    Ephemeral,
-    EnrolledRequired,
-}
-
 struct EngineAuthorityMarker;
 
 /// Opaque identity for one live engine instance.
@@ -7187,23 +6770,7 @@ pub struct ShardedHotEngine {
     /// state-changing staging or managed-overlay application advances it.
     author_mutation_generation: Cell<u64>,
     history_failure: Option<EngineError>,
-    durable_authority_mode: DurableAuthorityMode,
     authenticated_history_replay: bool,
-    current_durable_authority: Option<CurrentDurableAuthorityProof>,
-    validated_run_local_current_authority: Option<super::object_store::EngineHistoryAuthority>,
-    adoptable_current_history_head: Option<(super::object_store::EngineHistoryAuthority, BatchId)>,
-    /// Highest durable history generation already covered by an *authenticated
-    /// predecessor state* rather than by this replay.
-    ///
-    /// Zero on every path that starts from nothing, which is every path that
-    /// existed before runtime-resume adoption, so their coverage proof is
-    /// byte-for-byte the old one. A nonzero value is installed only by
-    /// [`Self::restore_adopted_predecessor_state`], only from a durable record
-    /// authenticated at the live sealed history root, and only after the live
-    /// history has been proved an insertion-only descendant of the snapshot's
-    /// recorded authority.
-    replay_base_generation: u64,
-    resume_observation: RuntimeResumeObservation,
     authenticated_replayed_batches: BTreeSet<BatchId>,
     authenticated_replayed_generations: BTreeMap<u64, BatchId>,
     // Recovery already authenticates every durable history record before
@@ -7428,13 +6995,7 @@ impl ShardedHotEngine {
             history_root: super::object_store::EngineHistoryStore::empty_root(),
             author_mutation_generation: Cell::new(0),
             history_failure: None,
-            durable_authority_mode: DurableAuthorityMode::Ephemeral,
             authenticated_history_replay: false,
-            current_durable_authority: None,
-            validated_run_local_current_authority: None,
-            adoptable_current_history_head: None,
-            replay_base_generation: 0,
-            resume_observation: RuntimeResumeObservation::default(),
             authenticated_replayed_batches: BTreeSet::new(),
             authenticated_replayed_generations: BTreeMap::new(),
             precommit_history_publication_failure: None,
@@ -8843,11 +8404,6 @@ impl ShardedHotEngine {
         EngineError::Archive(error.to_string())
     }
 
-    /// This engine's runtime-resume observation. Set once, at startup.
-    pub(crate) const fn runtime_resume_observation(&self) -> RuntimeResumeObservation {
-        self.resume_observation
-    }
-
     fn load_run_local_catalog_hot_state(
         &self,
         roots: &ScratchRoots,
@@ -8880,33 +8436,6 @@ impl ShardedHotEngine {
             catalog_heads: state.exact_direct_heads().iter().copied().collect(),
             catalog_document: Some(document),
         })
-    }
-
-    /// Re-derive only the authenticated catalog heads, without materializing
-    /// the graph-sized catalog document.
-    ///
-    /// This is the authority needed to publish a successor resume point while
-    /// an exact-current adopted open remains catalog-cold. The full bytes stay
-    /// deferred and are still authenticated before the first mutation.
-    fn load_run_local_catalog_heads(
-        &self,
-        roots: &ScratchRoots,
-    ) -> Result<BTreeSet<BatchId>, EngineError> {
-        let scratch = self.scratch.as_ref().ok_or_else(|| {
-            EngineError::Archive("run-local catalog heads require an authenticated scratch".into())
-        })?;
-        let Some(state) = super::document_state::load_external_current_record(
-            scratch,
-            roots,
-            super::document_state::DocumentLane::Visible,
-            self.catalog_document_id,
-        )
-        .map_err(|error| self.document_state_error(error))?
-        else {
-            return Ok(BTreeSet::new());
-        };
-        self.validate_external_record_anchor(self.catalog_document_id, &state)?;
-        Ok(state.exact_direct_heads().iter().copied().collect())
     }
 
     fn lazy_catalog_hot_state(&self) -> Result<&RunLocalCatalogHotState, EngineError> {
@@ -9420,7 +8949,6 @@ impl ShardedHotEngine {
                 .as_ref()
                 .map(|store| store.instrumentation())
                 .unwrap_or_default(),
-            resume: self.resume_observation,
         }
     }
 
@@ -11462,111 +10990,6 @@ impl ShardedHotEngine {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
         Ok(self.ephemeral_page_names.resolve_current(name.key_digest()))
-    }
-
-    fn current_durable_authority_proof_is_live(&self) -> Result<bool, EngineError> {
-        let Some(proof) = &self.current_durable_authority else {
-            return Ok(false);
-        };
-        if proof.history.generation != self.history_generation
-            || proof.history.index_root != self.history_root
-        {
-            return Ok(false);
-        }
-        let live = self
-            .history_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no durable engine history".into()))?
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(live == proof.history)
-    }
-
-    fn validated_run_local_current_authority_is_live(&self) -> Result<bool, EngineError> {
-        let Some(validated) = self.validated_run_local_current_authority else {
-            return Ok(false);
-        };
-        if validated.generation != self.history_generation
-            || validated.index_root != self.history_root
-        {
-            return Ok(false);
-        }
-        let live = self
-            .history_store
-            .as_ref()
-            .ok_or_else(|| EngineError::Archive("engine has no durable engine history".into()))?
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(live == validated)
-    }
-
-    pub(crate) fn verify_current_durable_page_name_authority(&self) -> Result<(), EngineError> {
-        if self.durable_authority_mode != DurableAuthorityMode::EnrolledRequired {
-            return Err(EngineError::Archive(
-                "persistent page-name authority requires an enrolled engine".into(),
-            ));
-        }
-        if let Some(error) = &self.history_failure {
-            return Err(error.clone());
-        }
-        let store = self.history_store.as_ref().ok_or_else(|| {
-            EngineError::Archive(
-                "persistent page-name authority requires enrolled durable history".into(),
-            )
-        })?;
-        let (generation, root, latest_batch_id, binding) = store
-            .current_with_binding()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if generation != self.history_generation || root != self.history_root {
-            return Err(EngineError::Archive(
-                "run-local durable history head differs from enrolled authority".into(),
-            ));
-        }
-        binding
-            .page_names
-            .validate()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let current = super::object_store::PageNameDurableBinding {
-            ownership_root: self.page_name_root.clone(),
-            conflicts: self.page_name_conflicts.values().cloned().collect(),
-        };
-        if binding.page_names != current {
-            return Err(EngineError::Archive(
-                "run-local page-name authority differs from durable history".into(),
-            ));
-        }
-        match (generation, latest_batch_id) {
-            (0, None) => Ok(()),
-            (0, Some(_)) | (_, None) => Err(EngineError::Archive(
-                "durable page-name authority has no latest history record".into(),
-            )),
-            (_, Some(latest_batch_id)) => {
-                let bytes = store
-                    .lookup(root, latest_batch_id)
-                    .map_err(|error| EngineError::Archive(error.to_string()))?
-                    .ok_or_else(|| {
-                        EngineError::Archive(
-                            "durable page-name authority latest record is absent".into(),
-                        )
-                    })?;
-                store.note_history_decode();
-                let record = decode_history_record(latest_batch_id, &bytes)?;
-                self.validate_record_catalog_transition(&record)?;
-                if record.generation != generation || history_record_binding(&record) != binding {
-                    return Err(EngineError::Archive(
-                        "durable page-name record/root binding mismatch".into(),
-                    ));
-                }
-                if record.logseq_claim_root != self.logseq_claim_root
-                    || record.reference_catalog_policy != self.reference_catalog_policy
-                {
-                    return Err(EngineError::Archive(
-                        "durable derived-state policy record mismatch".into(),
-                    ));
-                }
-                Ok(())
-            }
-        }
     }
 
     pub fn page_name_conflicts(&self) -> Vec<PageNameConflictEvidenceV1> {
@@ -20618,12 +20041,7 @@ impl ShardedHotEngine {
         }
         let _ = logseq_claim_root;
         let Some(store) = self.history_store.as_ref().map(Arc::clone) else {
-            return match self.durable_authority_mode {
-                DurableAuthorityMode::Ephemeral => Ok(()),
-                DurableAuthorityMode::EnrolledRequired => Err(EngineError::Archive(
-                    "enrolled archive-backed engine has no authenticated durable history".into(),
-                )),
-            };
+            return Ok(());
         };
         let (generation, root) = store
             .current()
@@ -20835,23 +20253,10 @@ impl ShardedHotEngine {
         // incomplete hot state when caller enumeration order differs from
         // causal order.
         //
-        // The one exception is a batch an *authenticated predecessor state*
-        // already reproduced. `replay_base_generation` is zero on every
-        // non-adopting path, and durable generations start at one, so the
-        // filter below is unsatisfiable there and the old refusal is exactly
-        // preserved. When it is nonzero, the adopted state provably contains
-        // every effect of every record at or below it, which is precisely the
-        // condition this refusal exists to protect.
         if self.authenticated_history_replay
             && !self.authenticated_replayed_batches.contains(&batch_id)
         {
-            if self.replay_base_generation == 0 {
-                return Ok(None);
-            }
-            return Ok(self
-                .authenticated_recovery_history_record(batch_id)?
-                .filter(|record| record.generation <= self.replay_base_generation)
-                .map(|record| record.status));
+            return Ok(None);
         }
         Ok(self
             .cold_history_record(batch_id)?
@@ -30904,10 +30309,6 @@ pub enum EngineError {
     /// At least one member of the exact canonical dependency sequence bound by
     /// this commitment was rejected. Appended to preserve prior enum tags.
     RejectedDependencySet(ContentDigest),
-    /// A late read from the exact retained run adopted at open failed in a
-    /// reconstructible accelerator.  The promoted-runtime boundary may rotate
-    /// once to a fresh retained run and replay immutable history.
-    RetainedScratchResumeFailure(RetainedScratchResumeFailure),
 }
 
 impl fmt::Display for EngineError {
@@ -31056,9 +30457,6 @@ impl fmt::Display for EngineError {
                 f,
                 "at least one member of dependency set {commitment} was rejected"
             ),
-            Self::RetainedScratchResumeFailure(failure) => {
-                write!(f, "immutable archive error: {failure}")
-            }
         }
     }
 }
@@ -36392,257 +35790,6 @@ mod validation_tests {
         assert_ne!(receiver.author_mutation_generation(), staged);
     }
 
-    /// Author `batches` accepted batches of `pages_per_batch` pages, each with
-    /// `blocks_per_page` blocks, through a real store-backed engine.
-    ///
-    /// The two scale knobs are deliberately independent: `batches` is what the
-    /// run-local LSM and block-claim segment counters actually track, and
-    /// `pages_per_batch * blocks_per_page` is graph size. Holding one fixed and
-    /// moving the other is what makes the size regressions below falsifiable.
-    fn resume_size_engine(
-        seed: u128,
-        batches: usize,
-        pages_per_batch: usize,
-        blocks_per_page: usize,
-    ) -> (std::path::PathBuf, ObjectStore, ShardedHotEngine) {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(seed));
-        let lineage = LineageDigest::of(format!("rrp-size-{seed}").as_bytes());
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(seed + 1));
-        let root = std::env::temp_dir().join(format!("tine-rrp-size-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_root = root.join("archive");
-        let writer = ObjectStore::open(&archive_root, workspace).unwrap();
-        let author_store = ObjectStore::open(&archive_root, workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_clean_archive_store_for_test(author_store, lineage, catalog);
-        let mut blocks_built = 0usize;
-        for batch_index in 0..batches {
-            let author = AuthorBatch {
-                batch_id: BatchId::from_uuid(Uuid::from_u128(
-                    seed + 4_000_000 + batch_index as u128,
-                )),
-                author_device_id: DeviceId::from_uuid(Uuid::from_u128(seed + 5_000_000)),
-                author_session_id: SessionId::from_uuid(Uuid::from_u128(seed + 6_000_000)),
-                crdt_peer_id: CrdtPeerId::from_u64(batch_index as u64 + 10),
-            };
-            let mut operations = Vec::new();
-            for page_slot in 0..pages_per_batch {
-                let page_index = batch_index * pages_per_batch + page_slot;
-                let page_id =
-                    PageId::from_uuid(Uuid::from_u128(seed + 1_000_000 + page_index as u128));
-                let home =
-                    DocumentId::from_uuid(Uuid::from_u128(seed + 2_000_000 + page_index as u128));
-                operations.push(SemanticOperation::CreatePage {
-                    page_id,
-                    home_document_id: home,
-                    name: LogicalPageName::parse(format!("Size {page_index:08}")).unwrap(),
-                    path: ManagedPath::parse(format!("pages/Size {page_index:08}.md")).unwrap(),
-                    kind: ManagedTextKind::Page,
-                });
-                for order in 0..blocks_per_page {
-                    let block_id = BlockId::from_uuid(Uuid::from_u128(
-                        seed + 3_000_000 + blocks_built as u128,
-                    ));
-                    blocks_built += 1;
-                    operations.push(SemanticOperation::CreateBlock {
-                        block: BlockLocation {
-                            block_id,
-                            home_document_id: home,
-                        },
-                        page_id,
-                        parent: None,
-                        order: format!("{order:08x}"),
-                        content: format!("sized block {blocks_built:08}"),
-                    });
-                }
-            }
-            let prepared = engine
-                .prepare_fixture_transaction(
-                    author,
-                    &OperationTransaction::new(operations).unwrap(),
-                )
-                .unwrap();
-            writer.publish_prepared(&prepared).unwrap();
-            assert!(matches!(
-                engine
-                    .stage_archive_batch(author.batch_id)
-                    .unwrap()
-                    .disposition(),
-                BatchDisposition::Accepted { .. }
-            ));
-        }
-        (root, writer, engine)
-    }
-
-    /// The exact durable record this engine's run-local state would publish.
-    ///
-    /// Built from the real format rather than from a proxy sum of its parts, so
-    /// the numbers the regressions below pin are the bytes that actually land on
-    /// disk and pass through the format's own fail-closed ceiling.
-    ///
-    /// The lifecycle-owned identity fields (endpoint promotion digest,
-    /// enrollment head and generation, unsafe session, run identity) are fixed
-    /// constant-size stand-ins here. They are constant-size in production too,
-    /// so they contribute a fixed offset and cannot participate in scaling.
-    fn resume_size_record(
-        engine: &ShardedHotEngine,
-    ) -> super::super::resume_point::RuntimeResumePointV2 {
-        let snapshot = RuntimeResumeSnapshot {
-            history_generation: engine.history_generation,
-            history_index_root: engine.history_root,
-            history_latest_batch_id: BatchId::from_uuid(Uuid::from_u128(0x5125)),
-            scratch_run_id: Uuid::from_u128(0x5124),
-            scratch_binding_digest: ContentDigest::of(b"resume-size-binding"),
-            scratch_roots: engine.scratch_roots.clone(),
-            block_claim_root: engine.block_claim_root,
-            accepted_frontier_root: engine.accepted_frontier_root.clone(),
-            next_acceptance_sequence: engine.next_acceptance_sequence,
-            current_path_catalog_root: engine.current_path_catalog.root.clone(),
-            current_path_catalog_available: engine.current_path_catalog.available,
-            current_path_catalog_frontier: engine
-                .current_path_catalog
-                .accepted_frontier_root
-                .clone(),
-            catalog_checkpoint_binding: ContentDigest::of(b"resume-size-catalog-checkpoint"),
-        };
-        super::super::resume_point::RuntimeResumePointV2::seal(
-            &super::super::object_store::ResumePointEndpointBinding::for_test(
-                engine.workspace_id,
-                super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
-                ContentDigest::of(b"resume-size-promoted-state"),
-                1,
-            ),
-            super::super::enrollment::ResumePointEnrollmentBinding::unsafe_for_test(
-                1,
-                ContentDigest::of(b"resume-size-enrollment-head"),
-                SessionId::from_uuid(Uuid::from_u128(0x5123)),
-            ),
-            &snapshot,
-        )
-        .expect("a quiescent run-local state seals into a resume point")
-    }
-
-    fn resume_size_bytes(seed: u128, batches: usize, pages: usize, blocks: usize) -> usize {
-        let (root, writer, engine) = resume_size_engine(seed, batches, pages, blocks);
-        let encoded = resume_size_record(&engine)
-            .encode()
-            .expect("a quiescent run-local state encodes inside the resume-point ceiling");
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-        encoded.len()
-    }
-
-    /// R1: the durable resume-point record must not scale with graph size.
-    ///
-    /// Both sides author the same number of batches, so the run-local LSM and
-    /// block-claim segment counters — the only members whose cardinality can
-    /// move at all — are driven identically. The only difference is 1600x the
-    /// blocks. If any member ever starts carrying per-page or per-block state,
-    /// the right-hand side grows without bound and this fails.
-    ///
-    /// The band is an absolute byte count, not a ratio, because the honest
-    /// residual difference is varint widening as a handful of counters cross a
-    /// decade. A regression that reintroduced graph-size scaling would exceed it
-    /// by orders of magnitude, not by tens of bytes.
-    #[test]
-    fn a_resume_point_record_does_not_scale_with_graph_size() {
-        const GRAPH_SCALE_BAND_BYTES: usize = 256;
-        let small = resume_size_bytes(700_100, 8, 1, 4);
-        let large = resume_size_bytes(700_200, 8, 64, 100);
-        assert!(
-            large >= small,
-            "the larger graph produced a smaller record: {small} -> {large}"
-        );
-        assert!(
-            large - small <= GRAPH_SCALE_BAND_BYTES,
-            "resume-point bytes scale with graph size: 32 blocks = {small}, 51,200 blocks = {large}"
-        );
-    }
-
-    /// R1: pinned absolute sizes, and the ratio that keeps the format's own
-    /// ceiling a corruption bound instead of a capability limit.
-    ///
-    /// Measured on the reference host: empty = 3,211 bytes, and an ordinary
-    /// populated state at 8 accepted batches = 7,025 bytes. The bands below sit
-    /// just above those, so an inflation regression has to be looked at rather
-    /// than absorbed.
-    ///
-    /// The last assertion is the one that defends the R1 decision. The record
-    /// grows with how much work one retained run has absorbed, not with graph
-    /// size, and at ~1,000 accepted batches it reaches 17,349 bytes — which the
-    /// original 16 KiB ceiling refused, silently disabling adoption on exactly
-    /// the longest-lived endpoints. Requiring an order of magnitude of headroom
-    /// over an ordinary record keeps that from being reintroduced.
-    #[test]
-    fn a_resume_point_record_stays_inside_its_measured_band() {
-        const EMPTY_BAND_BYTES: usize = 4 * 1024;
-        const ORDINARY_BAND_BYTES: usize = 8 * 1024;
-        let empty = resume_size_bytes(700_300, 0, 0, 0);
-        let populated = resume_size_bytes(700_400, 8, 64, 100);
-        assert!(
-            empty < EMPTY_BAND_BYTES,
-            "an empty run-local state should encode small: {empty}"
-        );
-        assert!(
-            populated < ORDINARY_BAND_BYTES,
-            "an ordinary populated run-local state exceeded its measured band: {populated}"
-        );
-        assert!(
-            populated * 10 < super::super::resume_point::MAX_RESUME_POINT_BYTES as usize,
-            "the resume-point ceiling has lost the headroom a long-lived retained run needs: \
-             ordinary record {populated}, ceiling {}",
-            super::super::resume_point::MAX_RESUME_POINT_BYTES
-        );
-    }
-
-    /// R1 measurement lane. Not a gate: it records the sizes the report cites,
-    /// separating the two scale knobs so the format's ceiling can be argued
-    /// from the one that actually moves it.
-    ///
-    /// The graph-size knob is flat, so the interesting sweep is *batch count*:
-    /// the run-local LSM levels are a binary counter over flushes and the
-    /// block-claim levels a base-32 counter over insertions, so both grow with
-    /// how much work one retained run has absorbed over its lifetime, not with
-    /// how large the graph is. The 1M-block shape of the release replay fixture
-    /// is measured separately by
-    /// [`resume_point_size_measurement_at_one_million_blocks`], which is far
-    /// more expensive to author and adds nothing to this sweep.
-    #[test]
-    #[ignore = "runtime resume-point size measurement"]
-    fn resume_point_size_measurement() {
-        for (label, batches, pages_per_batch, blocks_per_page) in [
-            ("empty", 0usize, 0usize, 0usize),
-            ("8b x 1p x 4bl", 8, 1, 4),
-            ("8b x 64p x 100bl", 8, 64, 100),
-            ("25b x 40p x 100bl", 25, 40, 100),
-            ("128b x 1p x 4bl", 128, 1, 4),
-            ("300b x 1p x 4bl", 300, 1, 4),
-            ("600b x 1p x 4bl", 600, 1, 4),
-            ("1023b x 1p x 4bl", 1023, 1, 4),
-        ] {
-            let seed = 700_500 + (batches * 1000 + pages_per_batch) as u128;
-            let (root, writer, engine) =
-                resume_size_engine(seed, batches, pages_per_batch, blocks_per_page);
-            let record = resume_size_record(&engine);
-            let roots = postcard::to_allocvec(&engine.scratch_roots).unwrap().len();
-            let claim = postcard::to_allocvec(&engine.block_claim_root)
-                .unwrap()
-                .len();
-            let frontier = postcard::to_allocvec(&engine.accepted_frontier_root)
-                .unwrap()
-                .len();
-            let encoded = record.encode().map(|bytes| bytes.len());
-            eprintln!(
-                "resume_point_size label={label:24} blocks={:8} batches={batches:5} scratch_roots={roots:7} block_claim={claim:7} accepted_frontier={frontier:7} record={encoded:?}",
-                batches * pages_per_batch * blocks_per_page,
-            );
-            drop(engine);
-            drop(writer);
-            crate::test_support::remove_dir_all(root);
-        }
-    }
-
     /// Isolates the constructor plus its explicit re-importing oracle. The
     /// production activation builder does not pay the oracle readback; this
     /// ignored receipt remains available when changing the checkpoint format.
@@ -36746,31 +35893,6 @@ mod validation_tests {
         assert!(source.contains("#[cfg(test)]\nfn verify_lazy_genesis_page_checkpoint"));
         assert!(source.contains("verify_checkpoints: false"));
         assert!(source.contains("new_verifying(catalog_document_id"));
-    }
-
-    /// The exact 25-batch / 400-page / 100-block shape of the release 1M-block
-    /// replay fixture, measured on its own because authoring it costs tens of
-    /// minutes and several gigabytes of scratch.
-    ///
-    /// Run with:
-    /// `cargo test --release -p tine-core resume_point_size_measurement_at_one_million_blocks -- --ignored --nocapture`
-    #[test]
-    #[ignore = "one-million-block runtime resume-point size measurement"]
-    fn resume_point_size_measurement_at_one_million_blocks() {
-        let (root, writer, engine) = resume_size_engine(700_900, 25, 400, 100);
-        let record = resume_size_record(&engine);
-        eprintln!(
-            "resume_point_size label=1M blocks=1000000 batches=25 scratch_roots={} block_claim={} accepted_frontier={} record={:?}",
-            postcard::to_allocvec(&engine.scratch_roots).unwrap().len(),
-            postcard::to_allocvec(&engine.block_claim_root).unwrap().len(),
-            postcard::to_allocvec(&engine.accepted_frontier_root)
-                .unwrap()
-                .len(),
-            record.encode().map(|bytes| bytes.len()),
-        );
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
     }
 }
 

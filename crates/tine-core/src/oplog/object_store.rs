@@ -1,14 +1,13 @@
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
 #[cfg(any(test, target_os = "android"))]
 use std::io;
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 #[cfg(windows)]
@@ -27,34 +26,20 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
-use super::enrollment::{EnrollmentBindingV1, ResumePointEnrollmentBinding};
-use super::hot_engine::RuntimeResumeSnapshot;
-use super::identity::{parse_digest, ARCHIVE_INSTANCE_CLAIM_FILE};
-#[cfg(test)]
-use super::resume_point::{clear_resume_points_in, ResumePointMaintenance};
-use super::resume_point::{
-    next_resume_sequence, prune_resume_points_below, ResumeEnrollmentAdmission, ResumePointError,
-    ResumePointScan, ResumePointSet, RuntimeResumePointV2, MAX_RETAINED_RESUME_POINTS,
-    RESUME_POINT_DIR,
-};
-use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
+use super::enrollment::EnrollmentBindingV1;
+use super::identity::parse_digest;
 #[cfg(test)]
 use super::sync_layout::BLOCK_CLAIM_INDEX_DIR;
 use super::sync_layout::{
-    ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_BOOTSTRAP_DIR as BOOTSTRAP_DIR,
-    ARCHIVE_OBJECTS_DIR as OBJECTS_DIR, BLOCK_CLAIM_INDEX_FILE, BOOTSTRAP_AGGREGATES_DIR,
-    BOOTSTRAP_COMMITS_DIR, BOOTSTRAP_EVIDENCE_DIR, BOOTSTRAP_OBJECTS_DIR, BOOTSTRAP_PARTS_DIR,
-    BOOTSTRAP_PART_PACKS_DIR, BOOTSTRAP_PART_SPANS_DIR, BOOTSTRAP_SOURCE_BLOB_DIR,
-    BOOTSTRAP_SOURCE_CHUNKS_DIR, BOOTSTRAP_SOURCE_INVENTORY_DIR, ENGINE_HISTORY_CLAIM_FILE,
-    ENGINE_HISTORY_DIR, ENGINE_HISTORY_HEAD_FILE, ENGINE_HISTORY_NODES_DIR,
-    ENGINE_HISTORY_ROOTS_DIR, ENGINE_HISTORY_ROOT_SUFFIX, ENGINE_HISTORY_TRANSITION_LOCK_FILE,
-    LINEAGE_CLAIM_FILE, LOGSEQ_CLAIM_INDEX_DIR, PAGE_NAME_OWNERSHIP_INDEX_DIR,
-    PORTABLE_PATH_INDEX_DIR, PROJECTION_WORK_DIR, PROMOTED_RUNTIME_STATE_FILE,
+    ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_OBJECTS_DIR as OBJECTS_DIR, BLOCK_CLAIM_INDEX_FILE,
+    ENGINE_HISTORY_CLAIM_FILE, ENGINE_HISTORY_DIR, ENGINE_HISTORY_HEAD_FILE,
+    ENGINE_HISTORY_NODES_DIR, ENGINE_HISTORY_ROOTS_DIR, ENGINE_HISTORY_ROOT_SUFFIX,
+    ENGINE_HISTORY_TRANSITION_LOCK_FILE, LINEAGE_CLAIM_FILE,
 };
 use super::{
-    BatchError, BatchId, BatchOrigin, CanonicalArchiveResourceId, ContentDigest, DeviceId,
-    DocumentId, ImportId, LineageDigest, ObjectDescriptor, OperationBatch, OperationObject,
-    PreparedBatch, SessionId, ValidatedBatch, WorkspaceId, MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
+    BatchError, BatchId, BatchOrigin, ContentDigest, LineageDigest, ObjectDescriptor,
+    OperationBatch, OperationObject, PreparedBatch, ValidatedBatch, WorkspaceId,
+    MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
 };
 
 /// Retained, O(1)-memory enumeration of immutable manifest commit markers.
@@ -683,33 +668,6 @@ pub(crate) struct BlockClaimIndexRoot {
         [[Option<BlockClaimSegmentRef>; BLOCK_CLAIM_SEGMENTS_PER_LEVEL]; BLOCK_CLAIM_INDEX_LEVELS],
 }
 
-/// Test-only saturation of the block-claim root, for the resume-point byte
-/// ceiling proof.
-///
-/// Every member here is fixed-size — `BlockClaimPageRef` carries no key span —
-/// so the whole root's width is decided by the two fixed array dimensions and
-/// the widest encodable field values.
-#[cfg(test)]
-impl BlockClaimIndexRoot {
-    pub(crate) fn saturated_for_test() -> Self {
-        let page_ref = BlockClaimPageRef {
-            offset: u64::MAX,
-            encoded_len: u32::MAX,
-            digest: ContentDigest::of(b"saturated block claim page"),
-        };
-        Self {
-            next_generation: u64::MAX,
-            global_filter: Some(page_ref),
-            levels: [[Some(BlockClaimSegmentRef {
-                generation: u64::MAX,
-                entry_count: u64::MAX,
-                page_ref,
-                filter_ref: page_ref,
-            }); BLOCK_CLAIM_SEGMENTS_PER_LEVEL]; BLOCK_CLAIM_INDEX_LEVELS],
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct BlockClaimIndexStore {
     backing: BlockClaimIndexBacking,
@@ -740,92 +698,6 @@ impl BlockClaimIndexStore {
             backing: BlockClaimIndexBacking::Scratch(scratch),
             counters: Arc::new(StoreCounters::default()),
         })
-    }
-}
-
-/// One run-local engine scratch pair over a **retained** scratch run.
-///
-/// This type is the retention capability. It is minted only by
-/// [`ObjectStore::create_retained_engine_scratch`] and
-/// [`ObjectStore::adopt_retained_engine_scratch`], has no public constructor,
-/// no `Default`, and no `Clone`, so an engine that holds one can treat "this
-/// run survives my death and may be named by a durable resume point" as a
-/// structural fact rather than a re-read marker byte.
-pub(crate) struct RetainedEngineScratch {
-    scratch: Arc<super::scratch_store::ScratchStore>,
-    claim_index: BlockClaimIndexStore,
-    run_id: Uuid,
-    binding_digest: ContentDigest,
-}
-
-impl fmt::Debug for RetainedEngineScratch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RetainedEngineScratch")
-            .field("run_id", &self.run_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl RetainedEngineScratch {
-    fn seal(
-        store: &ObjectStore,
-        scratch: super::scratch_store::ScratchStore,
-    ) -> Result<Self, StoreError> {
-        let scratch = Arc::new(scratch);
-        let claim_index = store.engine_claim_index(Arc::clone(&scratch))?;
-        let run_id = scratch.run_id();
-        let binding_digest = scratch
-            .binding_digest()
-            .map_err(|error| StoreError::Scratch(error.to_string()))?;
-        Ok(Self {
-            scratch,
-            claim_index,
-            run_id,
-            binding_digest,
-        })
-    }
-
-    pub(crate) const fn run_id(&self) -> Uuid {
-        self.run_id
-    }
-
-    pub(crate) const fn binding_digest(&self) -> ContentDigest {
-        self.binding_digest
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Arc<super::scratch_store::ScratchStore>,
-        BlockClaimIndexStore,
-        RetainedScratchIdentity,
-    ) {
-        let identity = RetainedScratchIdentity {
-            run_id: self.run_id,
-            binding_digest: self.binding_digest,
-        };
-        (self.scratch, self.claim_index, identity)
-    }
-}
-
-/// The durable identity of the retained run an engine is running on.
-///
-/// Carried by the engine so a later quiescent snapshot can name its own run
-/// without re-deriving retention, and so observability can report which run a
-/// restart adopted or refused.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RetainedScratchIdentity {
-    run_id: Uuid,
-    binding_digest: ContentDigest,
-}
-
-impl RetainedScratchIdentity {
-    pub(crate) const fn run_id(&self) -> Uuid {
-        self.run_id
-    }
-
-    pub(crate) const fn binding_digest(&self) -> ContentDigest {
-        self.binding_digest
     }
 }
 
@@ -1714,64 +1586,6 @@ impl ObjectStore {
         control_directory_identity(&self.capability)
     }
 
-    /// Authenticate the exact persisted canonical archive-resource claim
-    /// retained inside this store's archive-root capability.
-    ///
-    /// This opens the already-enrolled archive-instance claim against the
-    /// retained no-follow directory capability and confirms it derives to
-    /// `expected`. It never derives, provisions, repairs, or overwrites the
-    /// claim; a missing, substituted, or mismatched claim fails closed. The
-    /// authenticated physical archive directory only proves its own control
-    /// identity, so the persisted resource claim must be checked separately.
-    pub(crate) fn validate_enrolled_archive_resource_id(
-        &self,
-        expected: super::CanonicalArchiveResourceId,
-    ) -> std::io::Result<()> {
-        super::CanonicalArchiveResourceId::open_enrolled_in_retained_directory(
-            &self.capability,
-            expected,
-        )
-        .map(|_| ())
-    }
-
-    /// Provision this store's canonical archive-resource claim exactly once and
-    /// return its identity.
-    ///
-    /// The explicit local activation path uses this once to bind a newly
-    /// created v2 archive to its enrollment. It goes through the same retained
-    /// no-follow capability that
-    /// [`Self::validate_enrolled_archive_resource_id`] later authenticates.
-    pub(crate) fn provision_enrolled_archive_resource_id(
-        &self,
-    ) -> std::io::Result<super::CanonicalArchiveResourceId> {
-        super::CanonicalArchiveResourceId::provision_in_retained_directory(&self.capability)
-    }
-
-    /// Publish or reopen the exact archive claim reserved in private
-    /// application data before graph-local archive construction began.
-    ///
-    /// Publication uses the object store's immutable temp+sync+no-replace
-    /// primitive. A crash may leave only a disposable temp, while retry always
-    /// republishes the same canonical claim and refuses any different final
-    /// claim instead of minting or adopting a replacement.
-    pub(crate) fn provision_or_resume_local_activation_archive_resource_id(
-        &self,
-        instance_id: Uuid,
-    ) -> Result<super::CanonicalArchiveResourceId, StoreError> {
-        let claim = super::CanonicalArchiveResourceId::claim_bytes(instance_id)?;
-        publish_immutable_exact(
-            &self.capability,
-            ARCHIVE_INSTANCE_CLAIM_FILE,
-            &claim,
-            "local activation archive claim",
-        )?;
-        super::CanonicalArchiveResourceId::open_exact_claim_in_retained_directory(
-            &self.capability,
-            &claim,
-        )
-        .map_err(StoreError::from)
-    }
-
     pub(crate) fn start_engine_scratch(
         &self,
     ) -> Result<
@@ -1815,97 +1629,6 @@ impl ObjectStore {
             backing: BlockClaimIndexBacking::Scratch(scratch),
             counters: Arc::clone(&self.counters),
         })
-    }
-
-    /// Mint a fresh **retained** engine scratch pair beneath this archive.
-    ///
-    /// The only difference from [`Self::start_engine_scratch`] is the run's own
-    /// durable retention marker, which makes the run survive its owner's death
-    /// instead of being reclaimed as disposable sibling state. Because
-    /// [`RetainedEngineScratch`] can be minted only here and by
-    /// [`Self::adopt_retained_engine_scratch`], holding one is itself the proof
-    /// that the run is retained — the engine never has to re-derive retention
-    /// from an ambient marker read.
-    pub(crate) fn create_retained_engine_scratch(
-        &self,
-    ) -> Result<RetainedEngineScratch, StoreError> {
-        let scratch = super::scratch_store::ScratchStore::create_retained(
-            &self.capability,
-            self.workspace_id,
-        )
-        .map_err(|error| StoreError::Scratch(error.to_string()))?;
-        RetainedEngineScratch::seal(self, scratch)
-    }
-
-    /// Mint a retained archive-local run containing the exact byte address
-    /// space of one live detached scratch run.
-    ///
-    /// This is the one-way same-process bootstrap migration seam. The source
-    /// remains owned and leased by its detached candidate, the destination is
-    /// freshly created beneath this exact archive capability, and no caller can
-    /// supply roots independently of the source bytes. The enrolled engine
-    /// still has to restore and authenticate a `RuntimeResumeSnapshot` against
-    /// durable history before these reconstructible bytes become usable.
-    pub(crate) fn create_retained_engine_scratch_from(
-        &self,
-        source: &super::scratch_store::ScratchStore,
-    ) -> Result<RetainedEngineScratch, StoreError> {
-        match source.clone_retained_into(&self.capability) {
-            Ok(retained) => RetainedEngineScratch::seal(self, retained),
-            Err(copy_error) => self
-                .adopt_retained_engine_scratch(
-                    source.run_id(),
-                    source
-                        .binding_digest()
-                        .map_err(|error| StoreError::Scratch(error.to_string()))?,
-                )
-                .map_err(|adoption_error| {
-                    StoreError::Scratch(format!(
-                        "retained scratch migration failed ({copy_error}); retry adoption failed ({adoption_error})"
-                    ))
-                }),
-        }
-    }
-
-    /// Adopt exactly one already-published retained run.
-    ///
-    /// Four independent facts must hold before this returns, and every one of
-    /// them is read from the run's own durable bytes rather than asserted by the
-    /// caller:
-    ///
-    /// 1. the run directory is reachable no-follow under *this* archive
-    ///    capability's scratch namespace, under the canonical `run-<uuid>`
-    ///    spelling of `run_id`;
-    /// 2. its own exclusive lease is acquired, so no live owner is mutating it;
-    /// 3. its marker authenticates as schema-current, retained, owned by this
-    ///    workspace, and carrying exactly `run_id`, with a complete regular
-    ///    entry set — all inside [`ScratchStore::adopt_retained`];
-    /// 4. its canonical marker digest equals `binding_digest`, which is what
-    ///    catches a *re-created* run that reused the same UUID: the owner nonce
-    ///    is fresh, so the digest cannot match.
-    ///
-    /// Any failure is returned as an ordinary error and **changes nothing**: no
-    /// directory, marker, lease, or data file is created, truncated, or
-    /// replaced, so the candidate run's bytes are exactly as they were. The
-    /// caller's correct response is a fresh retained run plus a full replay,
-    /// never a repair. Adoption authorizes reuse of reconstructible bytes and
-    /// nothing else.
-    pub(crate) fn adopt_retained_engine_scratch(
-        &self,
-        run_id: Uuid,
-        binding_digest: ContentDigest,
-    ) -> Result<RetainedEngineScratch, StoreError> {
-        let scratch = super::scratch_store::ScratchStore::adopt_retained(
-            &self.capability,
-            self.workspace_id,
-            run_id,
-        )
-        .map_err(|error| StoreError::Scratch(error.to_string()))?;
-        let sealed = RetainedEngineScratch::seal(self, scratch)?;
-        if sealed.run_id != run_id || sealed.binding_digest != binding_digest {
-            return Err(StoreError::RetainedScratchBindingMismatch);
-        }
-        Ok(sealed)
     }
 
     fn preflight_engine_history(
@@ -2829,249 +2552,6 @@ impl EngineHistoryStore {
     }
 }
 
-/// The authenticated endpoint facts one resume-point publication is sealed
-/// against.
-///
-/// Every field is private to this module, so the only route to a value is
-/// [`DurableEngineHistoryStore::resume_point_endpoint_binding`]. That method
-/// reads this endpoint's *durable* promoted runtime state through
-/// [`DurableEngineHistoryStore::read_promoted_runtime_state`] — itself gated by
-/// `require_promoted_state_binding`, which proves the state names this
-/// workspace, this endpoint, this graph resource, this receipt store and this
-/// exact physical archive directory — and derives the next sequence from an
-/// actual survey rather than from a caller's belief.
-///
-/// This is the compile-time half of "the lifecycle caller cannot omit facts":
-/// `RuntimeResumePointV2::seal` needs one of these, and nothing outside this
-/// module can build one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResumePointEndpointBinding {
-    workspace_id: WorkspaceId,
-    endpoint_id: super::ProjectionEndpointId,
-    promoted_state_digest: ContentDigest,
-    next_sequence: u64,
-}
-
-impl ResumePointEndpointBinding {
-    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
-        self.workspace_id
-    }
-
-    pub(crate) const fn endpoint_id(&self) -> super::ProjectionEndpointId {
-        self.endpoint_id
-    }
-
-    pub(crate) const fn promoted_state_digest(&self) -> ContentDigest {
-        self.promoted_state_digest
-    }
-
-    pub(crate) const fn next_sequence(&self) -> u64 {
-        self.next_sequence
-    }
-
-    /// Hand-built binding for format-level tests that have no live endpoint.
-    #[cfg(test)]
-    pub(crate) const fn for_test(
-        workspace_id: WorkspaceId,
-        endpoint_id: super::ProjectionEndpointId,
-        promoted_state_digest: ContentDigest,
-        next_sequence: u64,
-    ) -> Self {
-        Self {
-            workspace_id,
-            endpoint_id,
-            promoted_state_digest,
-            next_sequence,
-        }
-    }
-}
-
-/// The live-open authority a published point must re-prove before it may be
-/// offered to the engine as an adoption candidate.
-///
-/// Sealed for the same reason as [`ResumePointEndpointBinding`]: the digest, the
-/// endpoint and the durable head all come from this store's own reads, so a
-/// caller cannot weaken the comparison by supplying values it wishes were true.
-/// The one caller-supplied member is the enrollment admission, because nothing
-/// here can read the enrollment chain.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResumeAdoptionAuthority {
-    workspace_id: WorkspaceId,
-    endpoint_id: super::ProjectionEndpointId,
-    promoted_state_digest: ContentDigest,
-    history_generation: u64,
-    history_index_root: ContentDigest,
-    history_latest_batch_id: Option<BatchId>,
-    enrollment: ResumeEnrollmentAdmission,
-}
-
-impl ResumeAdoptionAuthority {
-    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
-        self.workspace_id
-    }
-
-    pub(crate) const fn endpoint_id(&self) -> super::ProjectionEndpointId {
-        self.endpoint_id
-    }
-
-    pub(crate) const fn promoted_state_digest(&self) -> ContentDigest {
-        self.promoted_state_digest
-    }
-
-    pub(crate) const fn history_generation(&self) -> u64 {
-        self.history_generation
-    }
-
-    pub(crate) const fn history_index_root(&self) -> ContentDigest {
-        self.history_index_root
-    }
-
-    pub(crate) const fn history_latest_batch_id(&self) -> Option<BatchId> {
-        self.history_latest_batch_id
-    }
-
-    pub(crate) const fn enrollment(&self) -> ResumeEnrollmentAdmission {
-        self.enrollment
-    }
-
-    /// Hand-built authority for format-level tests that have no live endpoint.
-    #[cfg(test)]
-    pub(crate) const fn for_test(
-        workspace_id: WorkspaceId,
-        endpoint_id: super::ProjectionEndpointId,
-        promoted_state_digest: ContentDigest,
-        history: (u64, ContentDigest, Option<BatchId>),
-        enrollment: ResumeEnrollmentAdmission,
-    ) -> Self {
-        Self {
-            workspace_id,
-            endpoint_id,
-            promoted_state_digest,
-            history_generation: history.0,
-            history_index_root: history.1,
-            history_latest_batch_id: history.2,
-            enrollment,
-        }
-    }
-}
-
-/// Proof that one exact replacement resume point reached durability.
-///
-/// Minted only by [`DurableEngineHistoryStore::publish_resume_point`], on its
-/// success path. Retained-run reclamation consumes one, which is how "reclaim
-/// only *after* a successful replacement publication" becomes a fact the type
-/// system carries instead of a comment a later caller can reorder past: until
-/// the replacement point is durable, the run a predecessor point names may still
-/// hold the only resumable bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PublishedResumePoint {
-    workspace_id: WorkspaceId,
-    resume_sequence: u64,
-    scratch_run_id: Uuid,
-}
-
-impl PublishedResumePoint {
-    pub(crate) const fn resume_sequence(&self) -> u64 {
-        self.resume_sequence
-    }
-
-    pub(crate) const fn scratch_run_id(&self) -> Uuid {
-        self.scratch_run_id
-    }
-}
-
-/// The adoption input one resuming open consumes.
-///
-/// `Unavailable` is never an error the caller has to recover from: it means
-/// "reuse nothing, replay everything", which is always available and always
-/// correct. It is carried as a value rather than an `Err` precisely so that a
-/// caller cannot accidentally propagate it into a startup failure with `?`.
-#[derive(Debug)]
-pub(crate) enum ResumeAdoptionCandidate {
-    /// Hand this to `ShardedHotEngine::open_enrolled_projection_resuming`. The
-    /// engine still re-proves the run, the durable descent and every run-local
-    /// root before it reuses a single byte.
-    Available(Box<RuntimeResumeSnapshot>),
-    Unavailable(ResumeAcceleratorUnavailable),
-}
-
-/// Why this open gets no accelerator. Diagnosable, never actionable.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ResumeAcceleratorUnavailable {
-    /// No point has ever been published for this endpoint.
-    NeverPublished,
-    /// The strict complete-set proof was denied: unrecognizable provider or
-    /// desktop residue, a surplus over the publication bound, a torn, renamed
-    /// or oversize point, or an entry that could not be classified at all.
-    /// Nothing was proved about reachability, so nothing is reclaimed either.
-    ProofDenied(ResumePointError),
-    /// The latest point decoded and validated but did not re-prove the live
-    /// open's authority.
-    BindingRefused(ResumePointError),
-    /// The store could not be read, or the published set does not bind this
-    /// endpoint at all.
-    Unavailable(String),
-}
-
-/// What retention the next engine scratch run may use.
-///
-/// The `Ephemeral` arm is the leak bound. Once retention is flipped on, a
-/// resuming open mints one retained run per restart, and the only pass that can
-/// collect one needs the strict resume-point proof. A directory holding one
-/// permanent `.sync-conflict-*` copy denies that proof *forever*, so without
-/// this decision every restart would leak one archive directory, silently.
-/// Choosing an ephemeral run costs exactly one full replay — always available,
-/// always correct — and converts an unbounded disk leak into a bounded loss of
-/// an accelerator.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum EngineScratchRetentionPlan {
-    /// A retained run may be minted or adopted: either reachability is
-    /// provable, so an unreachable predecessor can be collected later, or the
-    /// census is still inside [`MAX_RETAINED_SCRATCH_RUNS`].
-    Retained { retained_runs: usize },
-    /// Reachability cannot be proved *and* the census is already at its bound.
-    Ephemeral {
-        retained_runs: usize,
-        reason: ResumePointError,
-    },
-}
-
-/// What one bounded retained-run maintenance pass proved, reclaimed and
-/// preserved.
-///
-/// Maintenance is diagnosable but never a correctness or startup failure, so
-/// this type has no `Err` sibling: every failure mode is a variant of
-/// [`RetainedRunMaintenanceOutcome`] carried alongside the counts that are
-/// still known.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RetainedRunMaintenanceReport {
-    /// Retained runs whose bytes this pass removed. The only member that
-    /// describes deletion.
-    pub(crate) reclaimed: usize,
-    /// Authenticated retained runs of this workspace still on disk afterwards.
-    pub(crate) retained_runs_remaining: usize,
-    pub(crate) within_retained_run_bound: bool,
-    /// Scratch siblings that could not be authenticated or classified —
-    /// including a replicated conflict copy of a run directory. Preserved
-    /// untouched, forever, by design.
-    pub(crate) unclassified_preserved: usize,
-    /// Resume-point directory entries this pass refused to interpret or
-    /// remove. Non-empty means the strict proof is denied and retained runs are
-    /// leaking, which is the only place that becomes visible.
-    pub(crate) preserved_resume_residue: Vec<String>,
-    pub(crate) outcome: RetainedRunMaintenanceOutcome,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RetainedRunMaintenanceOutcome {
-    /// A complete strict proof authorized the pass and it ran.
-    Reclaimed,
-    /// The strict proof was denied. Every retained run was preserved.
-    ProofDenied(ResumePointError),
-    /// The pass could not run at all.
-    Unavailable(String),
-}
-
 impl DurableEngineHistoryStore {
     fn open_sealed_existing(
         workspace_id: WorkspaceId,
@@ -3812,82 +3292,6 @@ impl DurableEngineHistoryStore {
     }
 }
 
-/// Named durable boundaries of one resume-point publication, after the
-/// resume-point directory exists.
-///
-/// These are the two cuts [`DurableEngineHistoryStore::publish_resume_point`]
-/// can leave behind that no other test route can reach: the survey/publish
-/// primitives are callable directly, but the *pre-prune* is only ever executed
-/// from inside the publication, so a crash between it and the commit point —
-/// the only window in which this packet deletes a durable point *before*
-/// committing its replacement — is otherwise unobservable. Deterministic
-/// injection at each of them proves at least one fully valid point survives
-/// every cut.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResumePublishBoundary {
-    /// After step 1's pre-prune, before the immutable commit point.
-    AfterPrePrune,
-    /// After the commit point, before step 3's prune.
-    AfterCommit,
-}
-
-#[cfg(test)]
-impl ResumePublishBoundary {
-    /// Every durable boundary of the publication, in publication order.
-    pub(crate) const ALL: [Self; 2] = [Self::AfterPrePrune, Self::AfterCommit];
-}
-
-#[cfg(test)]
-thread_local! {
-    /// One-shot publication fault. Thread-local and deterministic: no
-    /// process-global resource limit or signal is involved, so parallel tests
-    /// in other threads are unaffected.
-    static RESUME_PUBLISH_FAULT: std::cell::Cell<Option<ResumePublishBoundary>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_resume_publication_at(boundary: ResumePublishBoundary) {
-    RESUME_PUBLISH_FAULT.with(|fault| fault.set(Some(boundary)));
-}
-
-#[cfg(test)]
-thread_local! {
-    static RESUME_CLEAR_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_resume_clear() {
-    RESUME_CLEAR_FAULT.with(|fault| fault.set(true));
-}
-
-#[cfg(test)]
-fn inject_resume_clear_fault() -> Result<(), StoreError> {
-    RESUME_CLEAR_FAULT.with(|fault| {
-        if fault.replace(false) {
-            Err(StoreError::Io(std::io::Error::other(
-                "injected resume-point clear failure before the first removal",
-            )))
-        } else {
-            Ok(())
-        }
-    })
-}
-
-#[cfg(test)]
-fn inject_resume_publish_fault(boundary: ResumePublishBoundary) -> Result<(), StoreError> {
-    RESUME_PUBLISH_FAULT.with(|fault| {
-        if fault.get() == Some(boundary) {
-            fault.set(None);
-            return Err(StoreError::Io(std::io::Error::other(format!(
-                "injected resume-point publication failure at {boundary:?}"
-            ))));
-        }
-        Ok(())
-    })
-}
-
 fn validate_engine_history_root(
     root: &DurableEngineHistoryRoot,
     workspace_id: WorkspaceId,
@@ -4486,20 +3890,6 @@ pub enum StoreError {
     MalformedPromotedRuntimeState,
     UnsupportedPromotedRuntimeSchema(u32),
     CompetingRuntimePromotion,
-    /// One resume point, or one complete resume-point scan, was refused. Every
-    /// shape means the same thing to a caller: do not adopt, do not prune, do
-    /// not reclaim, preserve every candidate retained run.
-    ResumePoint(String),
-    ResumePointBindingMismatch(&'static str),
-    ResumePointSequenceRegression {
-        expected: u64,
-        found: u64,
-    },
-    /// An adopted retained run authenticated as a real retained run of this
-    /// workspace, but is not the exact run the caller named: its canonical
-    /// marker digest differs, which is what a re-created run reusing the same
-    /// UUID looks like. Nothing was changed; the caller must replay instead.
-    RetainedScratchBindingMismatch,
     StoredLengthMismatch {
         path: String,
         expected: u64,
@@ -4661,17 +4051,6 @@ impl fmt::Display for StoreError {
             Self::CompetingRuntimePromotion => f.write_str(
                 "a different promoted runtime state is already committed for this archive",
             ),
-            Self::ResumePoint(error) => write!(f, "{error}"),
-            Self::ResumePointBindingMismatch(reason) => {
-                write!(f, "runtime resume-point binding mismatch: {reason}")
-            }
-            Self::ResumePointSequenceRegression { expected, found } => write!(
-                f,
-                "runtime resume point {found} does not extend the published sequence {expected}"
-            ),
-            Self::RetainedScratchBindingMismatch => f.write_str(
-                "retained scratch run does not carry the named canonical marker binding",
-            ),
             Self::StoredLengthMismatch {
                 path,
                 expected,
@@ -4711,12 +4090,6 @@ impl From<std::io::Error> for StoreError {
 impl From<BatchError> for StoreError {
     fn from(error: BatchError) -> Self {
         Self::Batch(error)
-    }
-}
-
-impl From<ResumePointError> for StoreError {
-    fn from(error: ResumePointError) -> Self {
-        Self::ResumePoint(error.to_string())
     }
 }
 

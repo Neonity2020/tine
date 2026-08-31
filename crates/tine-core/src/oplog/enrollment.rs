@@ -2807,69 +2807,6 @@ pub(crate) enum LocalActiveSync {
     Published,
 }
 
-/// Exact, freshly authenticated enrollment evidence carried by one runtime
-/// resume point.
-///
-/// The fields and lifecycle representation are private to this module. A
-/// lifecycle caller can obtain the value only from a [`CommittedLocalActive`]
-/// that this module minted after an authenticated readback; it cannot invent a
-/// generation, head, session, or a synthetic session for `Safe`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResumePointEnrollmentBinding {
-    generation: u64,
-    head: ContentDigest,
-    lifecycle: ResumePointEnrollmentLifecycle,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResumePointEnrollmentLifecycle {
-    Unsafe { session_id: SessionId },
-    Safe,
-}
-
-impl ResumePointEnrollmentBinding {
-    pub(crate) const fn generation(self) -> u64 {
-        self.generation
-    }
-
-    pub(crate) const fn head(self) -> ContentDigest {
-        self.head
-    }
-
-    pub(crate) const fn unsafe_session_id(self) -> Option<SessionId> {
-        match self.lifecycle {
-            ResumePointEnrollmentLifecycle::Unsafe { session_id } => Some(session_id),
-            ResumePointEnrollmentLifecycle::Safe => None,
-        }
-    }
-
-    pub(crate) const fn is_safe(self) -> bool {
-        matches!(self.lifecycle, ResumePointEnrollmentLifecycle::Safe)
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn unsafe_for_test(
-        generation: u64,
-        head: ContentDigest,
-        session_id: SessionId,
-    ) -> Self {
-        Self {
-            generation,
-            head,
-            lifecycle: ResumePointEnrollmentLifecycle::Unsafe { session_id },
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn safe_for_test(generation: u64, head: ContentDigest) -> Self {
-        Self {
-            generation,
-            head,
-            lifecycle: ResumePointEnrollmentLifecycle::Safe,
-        }
-    }
-}
-
 /// Freshly reopened committed `LocalActive` enrollment state.
 ///
 /// This type is minted only by this module, only after reading the committed
@@ -2914,24 +2851,6 @@ impl CommittedLocalActive {
         match self.handoff {
             LocalActiveHandoff::Unsafe { session_id } => Some(session_id),
             LocalActiveHandoff::Safe => None,
-        }
-    }
-
-    /// Bind a resume point to this exact authenticated lifecycle record.
-    ///
-    /// `Safe` has no session identity. Keeping the construction here prevents
-    /// a caller from encoding it with a sentinel or otherwise hand-building
-    /// lifecycle evidence.
-    pub(crate) const fn resume_point_binding(&self) -> ResumePointEnrollmentBinding {
-        ResumePointEnrollmentBinding {
-            generation: self.generation,
-            head: self.enrollment_head,
-            lifecycle: match self.handoff {
-                LocalActiveHandoff::Unsafe { session_id } => {
-                    ResumePointEnrollmentLifecycle::Unsafe { session_id }
-                }
-                LocalActiveHandoff::Safe => ResumePointEnrollmentLifecycle::Safe,
-            },
         }
     }
 
@@ -6493,7 +6412,7 @@ mod tests {
     }
 
     fn archive_resource(byte: u8) -> CanonicalArchiveResourceId {
-        CanonicalArchiveResourceId::from_capability_identity(b"test", &[byte])
+        CanonicalArchiveResourceId::from_bytes([byte; 32])
     }
 
     fn receipt_store(byte: u8) -> ProjectionReceiptStoreId {
@@ -8575,150 +8494,6 @@ mod tests {
         assert!(
             EnrollmentWriter::open_existing(&app, &test_binding()).is_err(),
             "replacement lease opened as independent authority"
-        );
-    }
-
-    #[test]
-    fn archive_claim_is_create_new_exact_and_detects_replacement_and_id_reuse() {
-        let root = TestRoot::new("archive-identity");
-        let first_path = root.path.join("archive-a");
-        let second_path = root.path.join("archive-b");
-        fs::create_dir_all(&first_path).unwrap();
-        fs::create_dir_all(&second_path).unwrap();
-        let first = Dir::open_ambient_dir(&first_path, ambient_authority()).unwrap();
-        let reopened = Dir::open_ambient_dir(&first_path, ambient_authority()).unwrap();
-        let second = Dir::open_ambient_dir(&second_path, ambient_authority()).unwrap();
-
-        let first_id = CanonicalArchiveResourceId::provision_in_retained_directory(&first).unwrap();
-        assert_eq!(
-            first_id,
-            CanonicalArchiveResourceId::open_enrolled_in_retained_directory(&reopened, first_id)
-                .unwrap()
-        );
-        assert_eq!(
-            CanonicalArchiveResourceId::provision_in_retained_directory(&reopened)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::AlreadyExists
-        );
-        let second_id =
-            CanonicalArchiveResourceId::provision_in_retained_directory(&second).unwrap();
-        assert_ne!(first_id, second_id);
-        assert!(
-            CanonicalArchiveResourceId::open_enrolled_in_retained_directory(&second, first_id)
-                .is_err()
-        );
-
-        let copied_path = root.path.join("archive-copy");
-        fs::create_dir_all(&copied_path).unwrap();
-        fs::copy(
-            first_path.join("archive-instance-v1.claim"),
-            copied_path.join("archive-instance-v1.claim"),
-        )
-        .unwrap();
-        let copied = Dir::open_ambient_dir(&copied_path, ambient_authority()).unwrap();
-        assert!(
-            CanonicalArchiveResourceId::open_enrolled_in_retained_directory(&copied, first_id)
-                .is_err(),
-            "a copied exact claim must not authenticate a substituted directory"
-        );
-
-        fs::remove_file(first_path.join("archive-instance-v1.claim")).unwrap();
-        let replacement =
-            CanonicalArchiveResourceId::provision_in_retained_directory(&reopened).unwrap();
-        assert_ne!(replacement, first_id);
-        assert!(
-            CanonicalArchiveResourceId::open_enrolled_in_retained_directory(&reopened, first_id)
-                .is_err()
-        );
-
-        let missing_path = root.path.join("archive-missing");
-        fs::create_dir_all(&missing_path).unwrap();
-        let missing = Dir::open_ambient_dir(&missing_path, ambient_authority()).unwrap();
-        assert_eq!(
-            CanonicalArchiveResourceId::open_enrolled_in_retained_directory(&missing, first_id)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::NotFound
-        );
-        assert!(!missing_path.join("archive-instance-v1.claim").exists());
-
-        let incompatible_bytes =
-            br#"{"schema_version":2,"instance_id":"00000000-0000-0000-0000-000000000001"}"#;
-        fs::write(
-            first_path.join("archive-instance-v1.claim"),
-            incompatible_bytes,
-        )
-        .unwrap();
-        assert!(
-            CanonicalArchiveResourceId::open_enrolled_in_retained_directory(&reopened, replacement)
-                .is_err()
-        );
-        assert_eq!(
-            fs::read(first_path.join("archive-instance-v1.claim")).unwrap(),
-            incompatible_bytes
-        );
-
-        let reused_os_identity_a =
-            CanonicalArchiveResourceId::from_test_claim_and_capability_identity(
-                b"injected-os",
-                b"same-reused-id",
-                b"claim-a",
-            );
-        let reused_os_identity_b =
-            CanonicalArchiveResourceId::from_test_claim_and_capability_identity(
-                b"injected-os",
-                b"same-reused-id",
-                b"claim-b",
-            );
-        assert_ne!(reused_os_identity_a, reused_os_identity_b);
-
-        #[cfg(unix)]
-        {
-            let metadata = first
-                .try_clone()
-                .unwrap()
-                .into_std_file()
-                .metadata()
-                .unwrap();
-            let mut identity = [0_u8; 16];
-            identity[..8].copy_from_slice(&metadata.dev().to_be_bytes());
-            identity[8..].copy_from_slice(&metadata.ino().to_be_bytes());
-            assert_ne!(
-                first_id.as_bytes(),
-                CanonicalGraphResourceId::from_capability_identity(b"unix-dev-inode", &identity)
-                    .as_bytes()
-            );
-        }
-        assert_eq!(
-            first_id
-                .to_string()
-                .parse::<CanonicalArchiveResourceId>()
-                .unwrap(),
-            first_id
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn archive_claim_reparse_is_rejected_and_preserved() {
-        use std::os::unix::fs::symlink;
-
-        let root = TestRoot::new("archive-claim-reparse");
-        let archive_path = root.path.join("archive");
-        fs::create_dir_all(&archive_path).unwrap();
-        let archive = Dir::open_ambient_dir(&archive_path, ambient_authority()).unwrap();
-        let expected = CanonicalArchiveResourceId::from_capability_identity(b"test", b"expected");
-        symlink("/dev/null", archive_path.join("archive-instance-v1.claim")).unwrap();
-        assert!(
-            CanonicalArchiveResourceId::open_enrolled_in_retained_directory(&archive, expected)
-                .is_err()
-        );
-        assert!(
-            fs::symlink_metadata(archive_path.join("archive-instance-v1.claim"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
         );
     }
 

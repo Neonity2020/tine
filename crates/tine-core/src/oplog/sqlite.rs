@@ -60,7 +60,6 @@ use uuid::Uuid;
 
 use super::hot_engine::{
     AcceptedFrontierRoot, EngineAuthority, EngineError, RebuildProjectionClaimSnapshot,
-    RetainedScratchResumeFailure,
 };
 
 pub(crate) type CleanGenesisPhysicalProjection = PhysicalSqliteDatabase;
@@ -8288,10 +8287,6 @@ pub enum ProjectionError {
     },
     FrontierRegression,
     BatchCollision(BatchId),
-    /// A selected retained scratch accelerator became unreadable while this
-    /// SQLite open was materializing the current authenticated frontier.  It
-    /// remains typed so `local_active` can take the single safe replay retry.
-    RetainedScratchResumeFailure(RetainedScratchResumeFailure),
     Materialization(String),
     Rebuild(String),
     InjectedFailure,
@@ -8369,10 +8364,6 @@ impl fmt::Display for ProjectionError {
                     "accepted batch {batch_id} collides with its SQLite record"
                 )
             }
-            Self::RetainedScratchResumeFailure(failure) => write!(
-                f,
-                "SQLite materialization failed: immutable archive error: {failure}"
-            ),
             Self::Materialization(error) => write!(f, "SQLite materialization failed: {error}"),
             Self::Rebuild(error) => write!(f, "SQLite rebuild failed: {error}"),
             Self::InjectedFailure => write!(f, "injected SQLite transaction failure"),
@@ -8381,16 +8372,8 @@ impl fmt::Display for ProjectionError {
 }
 
 impl ProjectionError {
-    /// Preserve the only typed accelerator fault that may be recovered at the
-    /// promoted-runtime open boundary.  Every other engine failure remains an
-    /// ordinary materialization failure and must fail closed.
     pub(crate) fn materialization_from_engine(error: EngineError) -> Self {
-        match error {
-            EngineError::RetainedScratchResumeFailure(failure) => {
-                Self::RetainedScratchResumeFailure(failure)
-            }
-            error => Self::Materialization(error.to_string()),
-        }
+        Self::Materialization(error.to_string())
     }
 }
 

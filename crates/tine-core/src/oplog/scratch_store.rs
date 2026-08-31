@@ -54,17 +54,8 @@ pub(crate) const AUTHENTICATED_POINT_MAX_IO_PER_MUTATION: usize =
     8 * (AUTHENTICATED_POINT_MAX_DEPTH + 1);
 const CURRENT_FILTER_WORDS: usize = 16_384;
 const MAX_COVERED_BLOB_DEDUP_ROOTS: usize = 256;
-/// Expected bound on the retained runs one workspace holds after a complete
-/// reachability pass converges.
-///
-/// Publication keeps at most two resume points at any durable cut, so at most
-/// two distinct runs can be reachable. This is an **observation**, not a quota
-/// and not a theorem about the disk: it holds only when the strict resume-point
-/// proof was available at all, and the pass deliberately reports
-/// `unclassified_preserved` runs it could not authenticate rather than counting
-/// them. A pass that refused to reclaim *because* the count was already too
-/// high would make the leak permanent, and a pass that deleted to satisfy a
-/// count would be deleting evidence it had not proved unreachable.
+/// Test fixture bound for retained-run reclamation coverage.
+#[cfg(test)]
 pub(crate) const MAX_RETAINED_SCRATCH_RUNS: usize = 2;
 const MAX_PAGE_BYTES: usize = tine_storage::formats::MAX_SCRATCH_PAGE_BYTES;
 
@@ -213,10 +204,8 @@ enum ScratchRetention {
     /// under the exclusive lease proof.
     Ephemeral,
     /// Adoptable run. Drop releases only the lease, and ordinary stale-run
-    /// reclamation never removes it. The single pass that may remove one is
-    /// [`reclaim_unreachable_retained_runs`], which requires a complete
-    /// authenticated resume-point reachability proof plus this run's own
-    /// exclusive lease; without such a proof an orphan is preserved.
+    /// reclamation never removes it. Tests exercise explicit proven-reachable
+    /// and unreachable sets through tine-storage's low-level reclamation API.
     Retained,
 }
 
@@ -1164,20 +1153,19 @@ struct CausalAccumulatorNode {
     right: Option<AuthenticatedMapChild>,
 }
 
-/// The widest key any lane carried by a runtime resume point actually stores.
+/// The widest key carried by the run-local scratch roots used in frontier
+/// identity coverage.
 ///
 /// The LSM lanes in [`ScratchRoots`] are keyed by fixed-width identities and
 /// digests, never by page names or paths: `document_state`'s widest key is one
 /// lane tag plus a `DocumentId` plus a `DocumentCausalDigest`, and the point,
 /// map and catalog roots are keyed by a 16-byte identity or a digest. Nothing in
-/// these lanes scales with graph size, which is why a resume point does not
-/// either.
+/// these lanes scales with graph size.
 #[cfg(test)]
 pub(crate) const MAX_CARRIED_SCRATCH_KEY_BYTES: usize = 1 + 16 + 32;
 
 /// Test-only builders that saturate every variable-length member of a run-local
-/// root, so the resume-point byte ceiling can be proved by encoding the widest
-/// record the format admits instead of extrapolated from measured samples.
+/// root for frontier-identity coverage.
 ///
 /// These deliberately use the widest *encodable* field values (`u64::MAX`
 /// offsets and generations encode as full 10-byte varints), not the widest
@@ -3741,6 +3729,7 @@ fn validate_causal_accumulator_node(node: &CausalAccumulatorNode) -> Result<(), 
 /// whether the population converged reads
 /// [`Self::within_retained_run_bound`]; a caller that needs to know whether the
 /// archive is accumulating residue watches `unclassified_preserved`.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RetainedRunReclamation {
     pub retained_reachable: usize,
@@ -3750,6 +3739,7 @@ pub(crate) struct RetainedRunReclamation {
     pub unclassified_preserved: usize,
 }
 
+#[cfg(test)]
 impl RetainedRunReclamation {
     /// Authenticated retained runs of this workspace still on disk afterwards.
     pub(crate) const fn retained_runs_remaining(&self) -> usize {
@@ -3768,64 +3758,13 @@ impl RetainedRunReclamation {
     }
 }
 
-/// Reclaim every retained scratch run a complete resume-point set no longer
-/// reaches.
-///
-/// This is the pass the `create_retained`/`adopt_retained` TODO was waiting
-/// for: until an authenticated runtime-resume-point format existed, an orphan
-/// retained run had to survive forever, because nothing could prove it was
-/// unreachable. [`ReachableRetainedRuns`] is that proof, and it can only be
-/// minted by a scan that classified and authenticated every entry of the
-/// resume-point directory.
-///
-/// A retained run is deleted only when all of the following hold: its own
-/// durable marker authenticates it as a retained run of exactly this
-/// workspace, its entry set is complete and regular, the supplied complete
-/// proof does not name it, and its own exclusive lease is acquired
-/// non-blocking. The lease is the only liveness oracle that survives `SIGKILL`
-/// and power loss, so it is checked even though the caller is expected to hold
-/// the archive-rooted workspace runtime lease as well.
-///
-/// A free function rather than a method: the pass must run when no
-/// `ScratchStore` for the candidate run exists, which is precisely the orphan
-/// case. It is deliberately *not* wired into `create_run`'s opportunistic
-/// reclamation, which has no reachability proof and must keep preserving every
-/// retained run.
-///
-/// Only a failure to enumerate the namespace itself is returned as an error:
-/// that means nothing was proved about any sibling. A per-sibling failure is
-/// counted as `unclassified_preserved` and never deletes, never aborts the
-/// pass, and never vetoes the reclamation it can prove.
-pub(super) fn reclaim_unreachable_retained_runs(
-    archive_capability: &Dir,
-    workspace_id: WorkspaceId,
-    reachable: &super::resume_point::ReachableRetainedRuns,
-) -> Result<RetainedRunReclamation, ScratchError> {
-    // SAFETY: `ReachableRetainedRuns` can only be minted by the complete,
-    // authenticated resume-point scan (or by this module's test-only mint).
-    // The predicate therefore represents the full reachable membership set.
-    let outcome = unsafe {
-        tine_storage::reclaim_unreachable_retained_runs(
-            archive_capability,
-            &workspace_id,
-            |run_id| reachable.contains(run_id),
-        )
-    }?;
-    Ok(RetainedRunReclamation {
-        retained_reachable: outcome.retained_reachable,
-        retained_reclaimed: outcome.retained_reclaimed,
-        retained_live_skipped: outcome.retained_live_skipped,
-        ephemeral_preserved: outcome.ephemeral_preserved,
-        unclassified_preserved: outcome.unclassified_preserved,
-    })
-}
-
 /// A read-only population count of one archive's scratch namespace.
 ///
 /// This exists so a caller can bound retained-run *minting* when the strict
 /// reachability proof is unavailable. It never opens a lease, never writes and
 /// never deletes, so it is safe to take while other owners are live: a
 /// concurrently-held run simply counts as retained.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RetainedRunCensus {
     pub(crate) retained: usize,
@@ -3839,6 +3778,7 @@ pub(crate) struct RetainedRunCensus {
 ///
 /// Only a failure to enumerate the namespace itself is an error, for the same
 /// reason as the reachability pass: that proves nothing about any sibling.
+#[cfg(test)]
 pub(super) fn census_retained_runs(
     archive_capability: &Dir,
     workspace_id: WorkspaceId,
@@ -4067,7 +4007,6 @@ impl From<tine_storage::ScratchRunError> for ScratchError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::resume_point::ReachableRetainedRuns;
     use cap_std::ambient_authority;
     use std::collections::BTreeSet;
     #[cfg(unix)]
@@ -6194,8 +6133,31 @@ mod tests {
     // asserts exactly that). These tests own the one pass that may delete one,
     // and every one of them is about what it must refuse to delete.
 
-    fn reachable(run_ids: impl IntoIterator<Item = Uuid>) -> ReachableRetainedRuns {
-        ReachableRetainedRuns::from_run_ids_for_test(run_ids)
+    fn reachable(run_ids: impl IntoIterator<Item = Uuid>) -> BTreeSet<Uuid> {
+        run_ids.into_iter().collect()
+    }
+
+    fn reclaim_unreachable_retained_runs(
+        archive_capability: &Dir,
+        workspace_id: WorkspaceId,
+        reachable: &BTreeSet<Uuid>,
+    ) -> Result<RetainedRunReclamation, ScratchError> {
+        // Test-only coverage of tine-storage's physical preservation protocol;
+        // production no longer has a resume-point reachability authority.
+        let outcome = unsafe {
+            tine_storage::reclaim_unreachable_retained_runs(
+                archive_capability,
+                &workspace_id,
+                |run_id| reachable.contains(&run_id),
+            )
+        }?;
+        Ok(RetainedRunReclamation {
+            retained_reachable: outcome.retained_reachable,
+            retained_reclaimed: outcome.retained_reclaimed,
+            retained_live_skipped: outcome.retained_live_skipped,
+            ephemeral_preserved: outcome.ephemeral_preserved,
+            unclassified_preserved: outcome.unclassified_preserved,
+        })
     }
 
     /// A retained run of another workspace, seeded directly so the pass sees a
@@ -6222,10 +6184,9 @@ mod tests {
         (run_id, path)
     }
 
-    /// The packet's central proof: a retained run's bytes are removed only when
-    /// a complete resume-point set proves nothing still reaches them, and the
-    /// run that is still reachable survives byte-identically and stays
-    /// adoptable.
+    /// A retained run's bytes are removed only when the caller's complete set
+    /// proves nothing still reaches them, and the run that is still reachable
+    /// survives byte-identically and stays adoptable.
     #[test]
     fn an_orphan_retained_run_is_reclaimed_only_under_a_complete_reachability_proof() {
         let path = scratch_root("retained-reclaim");
@@ -6320,8 +6281,7 @@ mod tests {
         crate::test_support::remove_dir_all(path);
     }
 
-    /// The `Unsafe -> Safe` drain: every resume point is cleared first, so the
-    /// complete proof reaches nothing and every retained run is collectable.
+    /// An empty complete reachability set makes every retained run collectable.
     #[test]
     fn an_empty_reachable_set_reclaims_every_orphan_retained_run() {
         let path = scratch_root("retained-drain");

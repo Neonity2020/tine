@@ -46,7 +46,6 @@ pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub(crate) mod reference_catalog;
 pub(crate) mod refusal;
-pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub(crate) mod semantic;
 pub(crate) mod sqlite;
