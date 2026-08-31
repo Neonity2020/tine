@@ -943,7 +943,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "cap.create_dir",
-            6,
+            2,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
@@ -953,27 +953,17 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "cap.remove_file",
-            3,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "cap.rename",
             2,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
-            "libc.openat.create",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "open.create",
+            "cap.rename",
             1,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "open.create_new",
-            2,
+            1,
         ),
         (
             "crates/tine-core/src/oplog/projection_store.rs",
@@ -1259,11 +1249,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("flip_pending_cleanup_round", 1),
         ("stage_object_bytes", 1),
         ("stage_manifest_bytes", 1),
-        ("stage", 18),
+        ("stage", 6),
         ("commit", 6),
-        ("publish_immutable", 7),
+        ("publish_immutable", 6),
         ("install_staged_artifact", 1),
-        ("replace_head", 1),
+        ("replace_head", 0),
         ("ensure_shared_provider_directory", 4),
         ("put_complete", 2),
         ("provider_retire_original_into_placeholder", 1),
@@ -1519,10 +1509,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.10.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.11.0\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "6619455b9ab6560048658b8bba2d07c5943532d05b4457809021b0c01c287b65",
+        "9ef9a144697760038b8d607ead9cf5c667d7883e0a54b158b59a7188943dea2c",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

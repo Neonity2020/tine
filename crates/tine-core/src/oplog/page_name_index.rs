@@ -29,34 +29,6 @@ const MAX_EPHEMERAL_PAGE_NAME_RECORDS: usize = 4_096;
 const MAX_EXACT_NAME_BLOB_BYTES: u64 = 4 * 1024 * 1024 + 1024;
 const MAX_INLINE_EXACT_NAME_BYTES: usize = 64 * 1024;
 
-/// Opaque bounded page-name view extracted from one authenticated exact
-/// catalog checkpoint.
-///
-/// Callers can request affected PageIds, but cannot supply document identity,
-/// causal digests, checkpoint bindings, content digests, or decoded states.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuthenticatedCatalogPageNameCheckpointV1 {
-    catalog_document_id: DocumentId,
-    catalog_causal_digest: DocumentCausalDigest,
-    catalog_checkpoint_binding: ContentDigest,
-    catalog_checkpoint_content_digest: ContentDigest,
-    entries: BTreeMap<PageId, Option<PageState>>,
-}
-
-impl AuthenticatedCatalogPageNameCheckpointV1 {
-    /// Reuse the bounded observations only after the caller has independently
-    /// proven that current catalog authority is exactly this authenticated
-    /// frontier. The authenticated checkpoint itself remains the persistent
-    /// transition proof.
-    pub(crate) fn observations_for_equal_current(
-        &self,
-    ) -> AuthoritativeCatalogPageNameObservationsV1 {
-        AuthoritativeCatalogPageNameObservationsV1 {
-            entries: self.entries.clone(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthoritativeCatalogPageNameObservationsV1 {
     entries: BTreeMap<PageId, Option<PageState>>,
@@ -151,75 +123,6 @@ pub(crate) fn extract_validated_catalog_page_names(
         .map(|page_id| (*page_id, validated_pages.get(page_id).cloned()))
         .collect();
     Ok(AuthoritativeCatalogPageNameObservationsV1 { entries })
-}
-
-pub(crate) fn extract_authenticated_catalog_page_names(
-    checkpoint: &super::document_state::AuthenticatedExternalExactCheckpoint,
-    archive_proof: &super::hot_engine::AuthenticatedCatalogCheckpointArchiveProof,
-    expected_catalog_document_id: DocumentId,
-    expected_dependencies: Option<&DocumentDependencies>,
-    requested_page_ids: &[PageId],
-) -> Result<AuthenticatedCatalogPageNameCheckpointV1, StoreError> {
-    if requested_page_ids.len() > MAX_PAGE_NAME_POINT_BATCH {
-        return Err(StoreError::PageNamePointBatchTooLarge {
-            actual: requested_page_ids.len(),
-            limit: MAX_PAGE_NAME_POINT_BATCH,
-        });
-    }
-    if requested_page_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(StoreError::NonCanonicalPageNamePointKeys);
-    }
-    let expected_causal_digest = expected_dependencies
-        .map(DocumentDependencies::causal_state_digest)
-        .unwrap_or_else(|| DocumentCausalDigest::of(expected_catalog_document_id, &[], &[]));
-    if checkpoint.document_id() != expected_catalog_document_id
-        || expected_dependencies
-            .is_some_and(|dependencies| checkpoint.document_id() != dependencies.document_id())
-        || checkpoint.causal_digest() != expected_causal_digest
-        || checkpoint.peer_counters()
-            != expected_dependencies
-                .map(DocumentDependencies::peer_counters)
-                .unwrap_or_default()
-        || checkpoint.exact_direct_heads()
-            != expected_dependencies
-                .map(DocumentDependencies::direct_dependency_heads)
-                .unwrap_or_default()
-        || archive_proof.catalog_document_id() != checkpoint.document_id()
-        || archive_proof.catalog_causal_digest() != checkpoint.causal_digest()
-        || archive_proof.checkpoint_binding() != checkpoint.checkpoint_binding()
-        || archive_proof.checkpoint_content_digest() != checkpoint.checkpoint_content_digest()
-    {
-        return Err(StoreError::MisboundPageNameCatalogFrontier);
-    }
-    let mut entries = BTreeMap::new();
-    for page_id in requested_page_ids {
-        let state = super::hot_engine::validate_catalog_page(
-            expected_catalog_document_id,
-            checkpoint.document(),
-            *page_id,
-        )
-        .map_err(|_| StoreError::MalformedPageNameIndex)?;
-        if entries.insert(*page_id, state).is_some() {
-            return Err(StoreError::MalformedPageNameIndex);
-        }
-    }
-    let entry_bytes = encode_canonical(&entries)?;
-    let catalog_checkpoint_binding = ContentDigest::of(
-        &[
-            b"tine/authenticated-catalog-page-names/v1\0".as_slice(),
-            checkpoint.checkpoint_binding().as_bytes(),
-            checkpoint.checkpoint_content_digest().as_bytes(),
-            ContentDigest::of(&entry_bytes).as_bytes(),
-        ]
-        .concat(),
-    );
-    Ok(AuthenticatedCatalogPageNameCheckpointV1 {
-        catalog_document_id: expected_catalog_document_id,
-        catalog_causal_digest: expected_causal_digest,
-        catalog_checkpoint_binding,
-        catalog_checkpoint_content_digest: checkpoint.checkpoint_content_digest(),
-        entries,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

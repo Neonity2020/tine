@@ -49530,24 +49530,6 @@ mod tests {
                     after_engine
                         .external_history_blob_reads
                         .saturating_sub(before_engine.external_history_blob_reads),
-                )
-                .saturating_add(
-                    after_engine
-                        .store
-                        .history_record_reads
-                        .saturating_sub(before_engine.store.history_record_reads),
-                )
-                .saturating_add(
-                    after_engine
-                        .store
-                        .history_index_reads
-                        .saturating_sub(before_engine.store.history_index_reads),
-                )
-                .saturating_add(
-                    after_engine
-                        .store
-                        .history_decodes
-                        .saturating_sub(before_engine.store.history_decodes),
                 ),
         };
         let point_bound = managed_application_save_page_local_read_bound(page_blocks);

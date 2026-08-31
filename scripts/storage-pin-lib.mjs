@@ -165,7 +165,6 @@ export function storagePinProblems(root) {
       "OBJECT_ENVELOPE_SCHEMA_VERSION",
       "MANIFEST_ENCODING_VERSION",
       "LOCAL_JOURNAL_FRAME_SCHEMA_VERSION",
-      "SCRATCH_SCHEMA_VERSION",
       "SQLITE_SCHEMA_VERSION",
     ]) {
       if (!new RegExp(`^${required}\\t`, "m").test(manifest)) problems.push(`persistent-format receipt omits ${required}`);

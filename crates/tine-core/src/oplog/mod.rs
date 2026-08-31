@@ -4,19 +4,15 @@
 //! materialization, and shared-provider synchronization are composed by
 //! `crate::sync_runtime`. Direct Files does not enter this module tree: the
 //! application selects that mutually exclusive runtime before opening a graph.
-//! Immutable operation/object bytes are authoritative; SQLite, scratch, and
+//! Immutable operation/object bytes are authoritative; SQLite and
 //! projection-work state are disposable derived data.
 
 pub(crate) mod absence_decision;
 pub(crate) mod absence_sweep;
 pub(crate) mod batch;
-pub(crate) mod causal_index;
 pub(crate) mod checkpoint_generation;
-pub(crate) mod dependency_queue;
 pub(crate) mod discovery;
-pub(crate) mod document_state;
 pub(crate) mod enrollment;
-pub(crate) mod evidence_index;
 pub(crate) mod external_import;
 pub(crate) mod hot_engine;
 #[cfg(test)]
@@ -30,7 +26,6 @@ pub(crate) mod local_active;
 pub(crate) mod local_completion_index;
 pub(crate) mod local_journal_drain;
 pub(crate) mod local_journal_v2_anchor;
-pub(crate) mod loro_store;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
 pub(crate) mod page_name_index;
@@ -46,7 +41,6 @@ pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub(crate) mod reference_catalog;
 pub(crate) mod refusal;
-pub(crate) mod scratch_store;
 pub(crate) mod semantic;
 pub(crate) mod sqlite;
 mod sqlite_identity;

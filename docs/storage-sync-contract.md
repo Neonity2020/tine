@@ -337,6 +337,17 @@ clean source selection, clean lazy-genesis materialization, and sealed accepted
 history/checkpoint bindings remain; they are semantic runtime state, not a
 reader, writer, migration, or alternate bootstrap activation route.
 
+The final MS-14b closure also removes the former scratch-backed document,
+dependency, causal, evidence, and Loro stores and the separate physical
+engine-history control. Store-backed engines retain only nonterminal staged
+payloads in hot memory; terminal payloads are reloaded exactly from the
+immutable operation archive when needed. Compact accepted statuses, event
+evidence, semantic identity/path/name maps, and their digest roots remain
+inline. Exact historical frontier questions reconstruct from that retained
+semantic accepted evidence; current-point reads remain direct. The dependency
+is certified `tine-storage v0.11.0`, whose supported-target guard includes iOS
+in the durable no-clobber rename implementation.
+
 Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
 `.authority-tmp-`) and `.staging` files have no authority until their named
 atomic publication completes. Unknown canonical-looking files are errors;

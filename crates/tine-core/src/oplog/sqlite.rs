@@ -408,7 +408,15 @@ impl AcceptedBatchEvent {
                 found: manifest_digest,
             });
         }
-        if evidence.post_frontier_root().has_persistent_point_index() {
+        // The retired run-local Patricia history no longer makes every old
+        // accepted root point-queryable. Authenticate affected documents when
+        // this event names the live root; older events remain bound by their
+        // sealed AcceptedBatchEvidence and manifest fingerprint below.
+        if evidence.post_frontier_root()
+            == &engine
+                .accepted_frontier_root()
+                .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?
+        {
             for document in evidence.affected_documents() {
                 let authenticated = engine
                     .accepted_frontier_document(
@@ -667,65 +675,30 @@ impl AcceptedBatchEvent {
             ))
         })?;
         self.effective_transitions = view.transitions().to_vec();
-        // Per-document contested classification (GH #351): a document was
-        // touched by a CONCURRENTLY accepted batch iff the author's PRE-batch
-        // dependency view of it (the manifest's dependency frontier) differs
-        // from what the receiver had actually accepted for that document just
-        // before this batch (the accepted view at the PRIOR frontier root).
-        // Pre-vs-pre keeps the batch's own contribution out of the compare,
-        // and the comparison is exact and page-scoped: an unrelated concurrent
-        // batch must not relax validation for pages it never touched, which is
-        // why no global linearity switch appears here. (The shared catalog
-        // document advancing under an unrelated batch never homes a page, so
-        // its contested-ness marks no pages — the same tolerance
-        // `projection_frontiers_match_except_catalog` encodes.)
+        // Replay of retained semantic acceptance evidence now supplies exact
+        // historical point answers without the retired Patricia store. Keep
+        // contested classification page-local: unrelated concurrency must not
+        // relax authored-effect validation for a page it never touched.
+        let authored_pre = self
+            .dependency_frontier
+            .documents()
+            .iter()
+            .map(|deps| (deps.document_id(), deps.causal_state_digest()))
+            .collect::<BTreeMap<_, _>>();
         let mut contested_documents = BTreeSet::new();
-        let mut all_documents_contested = false;
-        if self.prior_frontier_root.has_persistent_point_index() {
-            let authored_pre = self
-                .dependency_frontier
-                .documents()
-                .iter()
-                .map(|deps| (deps.document_id(), deps.causal_state_digest()))
-                .collect::<BTreeMap<_, _>>();
-            for accepted in &self.affected_documents {
-                let accepted_pre = engine
-                    .accepted_frontier_document(&self.prior_frontier_root, accepted.document_id())
-                    .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
-                if authored_pre.get(&accepted.document_id()).copied()
-                    != accepted_pre.map(|deps| deps.causal_state_digest())
-                {
-                    contested_documents.insert(accepted.document_id());
-                }
-            }
-        } else {
-            // A prior root without a run-local point index (a foreign root the
-            // live provider path reconstructs) cannot answer per-document
-            // pre-views. Fall back to the exact GLOBAL containment test: a
-            // globally non-linear batch marks ALL its documents contested.
-            // Over-marking is safe here — a contested page is validated
-            // against the merged rendering, which for a page no concurrent
-            // batch touched equals its authored state anyway; only the
-            // authored-effect cross-check narrows, never the corruption gate.
-            let containment = engine
-                .batch_causal_containment(
-                    self.batch_id,
-                    self.causal_dot,
-                    &self.causal_dependency_heads,
-                )
+        for accepted in &self.affected_documents {
+            let accepted_pre = engine
+                .accepted_frontier_document(&self.prior_frontier_root, accepted.document_id())
                 .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
-            let causal_past: u64 = containment
-                .clock()
-                .iter()
-                .map(|(_, counter)| *counter)
-                .sum();
-            all_documents_contested = causal_past != self.acceptance_sequence;
+            if authored_pre.get(&accepted.document_id()).copied()
+                != accepted_pre.map(|deps| deps.causal_state_digest())
+            {
+                contested_documents.insert(accepted.document_id());
+            }
         }
         let mut context = super::sqlite_materialization::EffectValidationContext::linear();
-        if !contested_documents.is_empty() || all_documents_contested {
-            let contested_document = |document: DocumentId| {
-                all_documents_contested || contested_documents.contains(&document)
-            };
+        if !contested_documents.is_empty() {
+            let contested_document = |document: DocumentId| contested_documents.contains(&document);
             let effective =
                 SemanticEffect::decode(&self.effective_semantic_effect).map_err(|error| {
                     ProjectionError::InvalidAcceptedEvent(format!(
@@ -1553,19 +1526,6 @@ fn materialize_accepted_event_with_stats(
         instrumentation.exact_document_loads = materializer.exact_document_loads();
         instrumentation.exact_catalog_loads = materializer.exact_catalog_loads();
         instrumentation.exact_catalog_decodes = materializer.exact_catalog_decodes();
-        let (accepted_frontier, external_exact) = materializer.lookup_session_stats();
-        instrumentation.accepted_frontier_session_hits = accepted_frontier.hits;
-        instrumentation.accepted_frontier_session_misses = accepted_frontier.misses;
-        instrumentation.accepted_frontier_session_evictions = accepted_frontier.evictions;
-        instrumentation.accepted_frontier_session_oversize = accepted_frontier.oversize;
-        instrumentation.accepted_frontier_session_peak_resident_bytes =
-            accepted_frontier.peak_resident_bytes;
-        instrumentation.external_exact_session_hits = external_exact.hits;
-        instrumentation.external_exact_session_misses = external_exact.misses;
-        instrumentation.external_exact_session_evictions = external_exact.evictions;
-        instrumentation.external_exact_session_oversize = external_exact.oversize;
-        instrumentation.external_exact_session_peak_resident_bytes =
-            external_exact.peak_resident_bytes;
     }
     let change = super::MaterializationChange::new(event.batch_id(), replacements, deletions)?;
     Ok((change, instrumentation))
@@ -2532,10 +2492,6 @@ pub(crate) struct CleanProjectionRebuildInstrumentation {
     pub(crate) terminal_insert_micros: u128,
     pub(crate) terminal_catalog_cursor_micros: u128,
     pub(crate) terminal_finish_micros: u128,
-    /// Bulk materializers, and therefore decoded-segment lookup sessions,
-    /// opened by the terminal row seed. A graph-lifetime session leaves this at
-    /// one no matter how many pages the terminal root carries.
-    pub(crate) terminal_lookup_sessions: usize,
     /// Catalog rows the terminal row seed authenticated through the paged
     /// current-path cursor.
     pub(crate) terminal_catalog_rows_authenticated: usize,
@@ -2550,19 +2506,6 @@ pub(crate) struct CleanProjectionRebuildInstrumentation {
     /// count bounded read windows (cursor pages plus materialization chunks)
     /// and never catalog rows: one proof per row is quadratic in graph pages.
     pub(crate) terminal_catalog_document_validations: usize,
-    /// Peak pages one lookup session was asked to cover before it was dropped.
-    /// This is the structural window bound: it must not grow with graph pages.
-    pub(crate) peak_terminal_session_pages: usize,
-    pub(crate) terminal_accepted_frontier_session_hits: usize,
-    pub(crate) terminal_accepted_frontier_session_misses: usize,
-    pub(crate) terminal_accepted_frontier_session_evictions: usize,
-    pub(crate) terminal_accepted_frontier_session_oversize: usize,
-    pub(crate) terminal_accepted_frontier_session_peak_resident_bytes: usize,
-    pub(crate) terminal_external_exact_session_hits: usize,
-    pub(crate) terminal_external_exact_session_misses: usize,
-    pub(crate) terminal_external_exact_session_evictions: usize,
-    pub(crate) terminal_external_exact_session_oversize: usize,
-    pub(crate) terminal_external_exact_session_peak_resident_bytes: usize,
     /// One when retained terminal material was present but refused, so this
     /// activation discarded the private candidate and replayed the archive.
     pub(crate) terminal_construction_refusals: usize,
@@ -2591,50 +2534,6 @@ impl CleanProjectionRebuildInstrumentation {
 }
 
 impl CleanProjectionRebuildInstrumentation {
-    /// Fold one finished terminal lookup session's decoded-segment counters in.
-    ///
-    /// Residency is a peak rather than a sum: it is the bound on how much
-    /// decoded state one window may hold at once.
-    fn record_terminal_lookup_session(
-        &mut self,
-        session_pages: usize,
-        accepted_frontier: super::scratch_store::ScratchLookupSessionStats,
-        external_exact: super::scratch_store::ScratchLookupSessionStats,
-    ) {
-        self.terminal_lookup_sessions = self.terminal_lookup_sessions.saturating_add(1);
-        self.peak_terminal_session_pages = self.peak_terminal_session_pages.max(session_pages);
-        self.terminal_accepted_frontier_session_hits = self
-            .terminal_accepted_frontier_session_hits
-            .saturating_add(accepted_frontier.hits);
-        self.terminal_accepted_frontier_session_misses = self
-            .terminal_accepted_frontier_session_misses
-            .saturating_add(accepted_frontier.misses);
-        self.terminal_accepted_frontier_session_evictions = self
-            .terminal_accepted_frontier_session_evictions
-            .saturating_add(accepted_frontier.evictions);
-        self.terminal_accepted_frontier_session_oversize = self
-            .terminal_accepted_frontier_session_oversize
-            .saturating_add(accepted_frontier.oversize);
-        self.terminal_accepted_frontier_session_peak_resident_bytes = self
-            .terminal_accepted_frontier_session_peak_resident_bytes
-            .max(accepted_frontier.peak_resident_bytes);
-        self.terminal_external_exact_session_hits = self
-            .terminal_external_exact_session_hits
-            .saturating_add(external_exact.hits);
-        self.terminal_external_exact_session_misses = self
-            .terminal_external_exact_session_misses
-            .saturating_add(external_exact.misses);
-        self.terminal_external_exact_session_evictions = self
-            .terminal_external_exact_session_evictions
-            .saturating_add(external_exact.evictions);
-        self.terminal_external_exact_session_oversize = self
-            .terminal_external_exact_session_oversize
-            .saturating_add(external_exact.oversize);
-        self.terminal_external_exact_session_peak_resident_bytes = self
-            .terminal_external_exact_session_peak_resident_bytes
-            .max(external_exact.peak_resident_bytes);
-    }
-
     /// The terminal builder's catalog authority must cost one document shape
     /// proof per bounded read window and never one per catalog row.
     ///
@@ -2665,21 +2564,6 @@ impl CleanProjectionRebuildInstrumentation {
             );
             assert_eq!(self.terminal_reference_index_traversals, 0);
             assert_eq!(self.terminal_reference_index_entries, 0);
-        }
-        // The one graph-lifetime decoded-segment session is measured, not
-        // assumed: it must not thrash while it covers the whole terminal root.
-        assert_eq!(self.terminal_accepted_frontier_session_evictions, 0);
-        assert_eq!(self.terminal_accepted_frontier_session_oversize, 0);
-        assert_eq!(self.terminal_external_exact_session_evictions, 0);
-        assert_eq!(self.terminal_external_exact_session_oversize, 0);
-        for peak in [
-            self.terminal_accepted_frontier_session_peak_resident_bytes,
-            self.terminal_external_exact_session_peak_resident_bytes,
-        ] {
-            assert!(
-                peak <= super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
-                "lookup session peak residency {peak} exceeds its per-root budget"
-            );
         }
     }
 }
@@ -5193,29 +5077,9 @@ impl SqliteFrontier {
             )?;
         }
         if let Some(materializer) = materializer.as_ref() {
-            let (accepted_frontier, external_exact) = materializer.lookup_session_stats();
             debug_assert_eq!(
                 instrumentation.exact_document_loads,
                 materializer.exact_document_loads()
-            );
-            instrumentation.record_materialization(EventMaterializationInstrumentation {
-                accepted_frontier_session_hits: accepted_frontier.hits,
-                accepted_frontier_session_misses: accepted_frontier.misses,
-                accepted_frontier_session_evictions: accepted_frontier.evictions,
-                accepted_frontier_session_oversize: accepted_frontier.oversize,
-                accepted_frontier_session_peak_resident_bytes: accepted_frontier
-                    .peak_resident_bytes,
-                external_exact_session_hits: external_exact.hits,
-                external_exact_session_misses: external_exact.misses,
-                external_exact_session_evictions: external_exact.evictions,
-                external_exact_session_oversize: external_exact.oversize,
-                external_exact_session_peak_resident_bytes: external_exact.peak_resident_bytes,
-                ..EventMaterializationInstrumentation::default()
-            });
-            bootstrap.record_terminal_lookup_session(
-                seen_pages.len(),
-                accepted_frontier,
-                external_exact,
             );
         }
         if let Some(binding) = binding {
@@ -6383,23 +6247,11 @@ fn decode_frontier(bytes: &[u8]) -> Result<FrontierV2, ProjectionError> {
     Ok(frontier)
 }
 
-/// The durable identity of an accepted frontier root.
-///
-/// A root's `scratch_root` is this run's address for the frontier's maps, not
-/// part of what the frontier IS -- it is deliberately absent from
-/// `state_digest`. Persisting it made every durable identity derived from these
-/// bytes (the projection checkpoint, the materialization stamp, the stored
-/// frontier row) change whenever the scratch store moved, which is exactly what
-/// reopening a graph does. The projection then failed to recognise its own
-/// up-to-date state and rebuilt the whole graph. It is stripped here, at the
-/// one boundary where a durable identity is minted, so no persisted digest can
-/// depend on where this process happened to put things.
 fn canonical_frontier_root_bytes(root: &AcceptedFrontierRoot) -> Result<Vec<u8>, ProjectionError> {
-    let durable = root.without_scratch_root();
-    let bytes = durable
+    let bytes = root
         .encode_canonical()
         .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
-    if decode_frontier_root(&bytes)? != durable {
+    if decode_frontier_root(&bytes)? != *root {
         return Err(ProjectionError::InvalidFrontier(
             "frontier root did not survive canonical round trip".into(),
         ));
@@ -9942,7 +9794,7 @@ mod tests {
                 &root_transaction(ids, "pages/crash.md", "crash"),
             )
             .unwrap();
-        store.publish_prepared(&prepared).unwrap();
+        store.publish_prepared_fixture(&prepared).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let mut accepted_engine = ShardedHotEngine::with_clean_archive_store_for_test(
             engine_store,
@@ -10104,7 +9956,7 @@ mod tests {
         )
         .unwrap();
         let prepared = PreparedBatch::new(manifest, objects).unwrap();
-        store.publish_prepared(&prepared).unwrap();
+        store.publish_prepared_fixture(&prepared).unwrap();
         match store.inspect_batch(batch_id).unwrap() {
             BatchInspection::Ready(validated) => validated,
             other => panic!("expected ready test batch, found {other:?}"),
@@ -12896,7 +12748,6 @@ mod tests {
         let evidence = engine
             .accepted_batch_evidence(edit.manifest().batch_id())
             .unwrap();
-        assert!(evidence.post_frontier_root().has_persistent_point_index());
         assert_eq!(evidence.affected_documents().len(), 1);
         let evidence_bytes = postcard::to_allocvec(&evidence).unwrap();
         assert!(
@@ -14284,21 +14135,11 @@ mod tests {
                 .unwrap();
             publish_and_stage_archive(&mut engine, &store, &edit);
         }
-        let point_before = engine.instrumentation();
         assert!(engine.accepted_batch_id_at(1).unwrap().is_some());
         assert!(engine
             .accepted_batch_id_at(batch_count as u64)
             .unwrap()
             .is_some());
-        let point_after = engine.instrumentation();
-        let point_page_reads = point_after
-            .scratch_page_reads
-            .saturating_sub(point_before.scratch_page_reads);
-        let point_page_bytes = point_after
-            .scratch_page_bytes_read
-            .saturating_sub(point_before.scratch_page_bytes_read);
-        assert!(point_page_reads <= 8);
-        assert!(point_page_bytes <= point_page_reads.saturating_mul(64 * 1024));
         let started = Instant::now();
         let path = dir.path().join("frontier.sqlite");
         let opened = open_test_projection(

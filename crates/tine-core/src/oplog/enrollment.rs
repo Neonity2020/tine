@@ -630,7 +630,7 @@ impl VerifiedLocalV1 {
         if self.bootstrap_batch_id.is_none() != zero
             || self.bootstrap_terminal_part_id.is_none() != zero
             || (self.accepted_frontier_anchor.history_root
-                == super::object_store::EngineHistoryStore::empty_root())
+                == super::object_store::empty_engine_history_root_digest())
                 != zero
             || self.accepted_frontier_anchor.acceptance_sequence != part_count
             || self.accepted_frontier_anchor.history_generation != part_count
@@ -755,7 +755,7 @@ impl LocalActiveAnchorV1 {
         let zero = self.bootstrap_part_count == 0;
         if self.bootstrap_batch_id.is_none() != zero
             || (self.accepted_frontier_anchor.history_root
-                == super::object_store::EngineHistoryStore::empty_root())
+                == super::object_store::empty_engine_history_root_digest())
                 != zero
             || self.accepted_frontier_anchor.acceptance_sequence != part_count
             || self.accepted_frontier_anchor.history_generation != part_count

@@ -1568,9 +1568,7 @@ mod tests {
         commit_clean_activation, open_clean_activation, prepare_clean_activation,
     };
     use crate::oplog::local_active::CleanLocalRuntime;
-    use crate::oplog::object_store::{
-        fail_next_engine_history_head_swap, fail_next_publish_after_objects,
-    };
+    use crate::oplog::object_store::fail_next_publish_after_objects;
     use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
         recover_incomplete_projections, AnnotatedProjectionBase, ApplicationRuntimeRoot, BlockId,

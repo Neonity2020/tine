@@ -18,7 +18,6 @@ const manifest = [
   "LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION\tidentity\tjournal v2\t2",
   "LOCAL_JOURNAL_SEGMENT_V2_MAGIC\tidentity\tjournal v2 header\tTINEJNL2",
   "LOCAL_JOURNAL_FRONTIER_V2_MAGIC\tidentity\tjournal v2 frontier\tTINEFRT2",
-  "SCRATCH_SCHEMA_VERSION\tidentity\tscratch\t13",
   "SQLITE_SCHEMA_VERSION\tidentity\tsqlite\t15",
   "LOCAL_JOURNAL_SEGMENT_HEADER_BYTES\tlayout\tjournal v2 header\t136",
   "LOCAL_JOURNAL_FRONTIER_BYTES\tlayout\tjournal v2 frontier\t240",
