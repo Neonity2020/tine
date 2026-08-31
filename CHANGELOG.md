@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **The graph menu now has a right-click menu on every graph row.** Opening a
+  graph in a second window was reachable only by Shift-clicking a row, which
+  nothing announced. Right-clicking a row now offers **Open in a new window**
+  and **Open here**, plus **Show in folder**, **Copy path**, and **Remove from
+  this list**. The row for the graph this window already has open keeps both
+  open actions visible but inert and says why, so the menu does not change
+  shape from row to row; mobile, which has neither peer windows nor a file
+  manager, shows the actions that apply to it.
+
 - **PDFs are now ordinary pane tabs instead of a separate global side pane.**
   Opening a graph PDF on desktop preserves the source and uses one reusable
   companion pane; the PDF tab can be moved into any existing pane, split, or
@@ -50,6 +59,49 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   resource ceilings. (GH #393)
 
 ### Fixed
+
+- **Links to local files and folders now open.** A link written the Logseq way
+  (`[Test](file://D:\test.txt)`) or the Obsidian way
+  (`[Test](<file:///D:\test.txt>)`) rendered as a live link but did nothing at
+  all when clicked: the backend refused every scheme but http/https/mailto, and
+  the renderer discarded the refusal so nothing was reported either. `file:`
+  links now go to the OS default application for that file or folder, matching
+  Logseq, and any link that cannot be opened — a bad URL, a path that is no
+  longer there — says so instead of failing silently. Every other scheme stays
+  refused. (GH #444)
+
+- **Editing-toolbar buttons on mobile no longer depend on a WebView emitting a
+  click.** On iOS 27 the toolbar appeared but nothing responded to taps, while
+  the same build worked on iOS 18.5: the buttons acted only on the click a
+  browser synthesizes after a pointer press, and that press is deliberately
+  cancelled so the editor keeps focus. The tap itself now performs the action,
+  with click kept as the keyboard and assistive-technology path. (GH #434)
+
+- **Long-pressing a page link on iOS or Android no longer raises the system
+  text-selection bar over Tine's menu.** The same hold that opens Tine's context
+  menu is also the platform's own selection gesture, which no amount of event
+  handling on our side can call off — so page links and tags simply decline to
+  be selected on touch. Menus themselves are now unselectable everywhere. On
+  desktop you can still drag a selection across a link's text. (GH #452)
+
+- **Dragging a block by its bullet no longer paints a blue trail behind it.**
+  On macOS the drag doubled as a text selection and highlighted every block it
+  passed over, which made the landing spot hard to read. The same guard the
+  sidebar already used now covers the outline. (GH #424)
+
+- **A wide table no longer drags its "Add row" label across the screen.** The
+  control spans the whole table, so its centred label sat at the midpoint of the
+  full table width — off to one side and travelling as you scrolled sideways.
+  The row keeps its full-width click target; only the label is now pinned to the
+  visible edge, the way the first column already is. (GH #449)
+
+- **iPad now behaves like a tablet instead of a Mac.** The on-screen editing
+  toolbar (indent, move, insert) never appeared while editing on iPad, and
+  long-press, text selection and window chrome all took their desktop branch.
+  iPadOS 13+ serves a desktop-class `Macintosh; Intel Mac OS X` user agent from
+  a stock WebView, and Tine was reading the platform out of that string; it now
+  comes from the build itself. Split panes stay available on iPad — they follow
+  the size of the screen, not the name of the operating system. (GH #446)
 
 - **A reported switch between Direct Files and Managed Storage now survives a
   crash at the selector boundary.** App-private storage-mode bindings use the

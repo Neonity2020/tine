@@ -90,8 +90,9 @@ use plugins::{
 };
 use settings::{
     forget_known_graph, get_app_bool, get_app_string, get_capture_enter_files,
-    get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, save_session,
-    set_app_bool, set_app_string, set_capture_enter_files, set_link_first_match, set_smooth_scroll,
+    get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, reveal_known_graph,
+    save_session, set_app_bool, set_app_string, set_capture_enter_files, set_link_first_match,
+    set_smooth_scroll,
 };
 use spellcheck::{
     apply_spellcheck, apply_spellcheck_all, list_spellcheck_dictionaries, parse_spellcheck_langs,
@@ -562,6 +563,18 @@ pub fn run() {
             media_protocol::respond(ctx, request)
         });
 
+    // The frontend's platform identity. It cannot be derived from the WebView's
+    // user agent: iPadOS 13+ serves a desktop-class `Macintosh; Intel Mac OS X`
+    // UA from a stock WKWebView, so UA sniffing reported an iPad as a Mac
+    // desktop and every mobile affordance stayed hidden (GH #446). The build
+    // knows the truth, so hand it over before frontend code runs — the same
+    // idiom as `__TINE_NATIVE_FRAME__`, and synchronous for the same reason:
+    // an async `app_platform` round-trip would flash desktop-only chrome.
+    let builder = builder.append_invoke_initialization_script(format!(
+        "globalThis.__TINE_PLATFORM__ = {:?};",
+        crate::graph::app_platform()
+    ));
+
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let builder = builder.append_invoke_initialization_script(format!(
         "globalThis.__TINE_NATIVE_FRAME__ = {native_frame_active};"
@@ -898,6 +911,7 @@ pub fn run() {
             save_workspaces,
             list_known_graphs,
             forget_known_graph,
+            reveal_known_graph,
             install_plugin,
             uninstall_plugin,
             list_installed_plugins,

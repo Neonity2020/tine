@@ -1,5 +1,5 @@
 import { backend } from "./backend";
-import { isMobilePlatform } from "./nativeChrome";
+import { isSinglePaneShell } from "./nativeChrome";
 import {
   installSessionPersistence,
   mintPdfViewId,
@@ -309,7 +309,7 @@ function migrateLegacyPdf(
 ): void {
   if (!target || containsEquivalentPdf(parsed.snapshots, target.filename)) return;
   const route = migratedPdfRoute(target, seenViewIds);
-  if (environment.mobile ?? isMobilePlatform) {
+  if (environment.mobile ?? isSinglePaneShell()) {
     const snapshot = parsed.snapshots.get(parsed.focusedPaneId) ?? parsed.snapshots.values().next().value;
     if (!snapshot) return;
     const tab = snapshot.tabs[snapshot.activeIndex];
@@ -355,7 +355,7 @@ export function parsePersistedSession(raw: string, environment: SessionMigration
     };
     const recent = s.recentPages === undefined ? legacyRecentPages() : sanitizeRecent(s.recentPages);
     const restoredPdfTarget = parsePersistedPdfTarget(s.pdfTarget);
-    const mobile = environment.mobile ?? isMobilePlatform;
+    const mobile = environment.mobile ?? isSinglePaneShell();
     const seenViewIds = new Set<string>();
     if (s.layout && !mobile) {
       const snapshots = new Map<string, PaneSnapshot>();

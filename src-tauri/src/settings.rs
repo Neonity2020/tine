@@ -235,6 +235,31 @@ pub(crate) fn forget_known_graph(path: String, app: tauri::AppHandle) -> Result<
     update_settings(&app, |json| forget_graph_json(json, &path))
 }
 
+/// Show a known graph's root folder in the OS file manager, for the graph
+/// switcher's per-row context menu. Unlike `open_page_file` this names a graph
+/// that is NOT bound to any window, so it cannot go through a graph slot.
+///
+/// The path is required to be one the app already remembers. The caller only
+/// ever has a row it was handed by `list_known_graphs`, so this costs nothing
+/// in practice; it keeps an arbitrary caller-chosen path out of the reveal argv.
+#[tauri::command]
+pub(crate) fn reveal_known_graph(path: String, app: tauri::AppHandle) -> Result<(), String> {
+    if !list_known_graphs(app)
+        .iter()
+        .any(|known| known.path == path)
+    {
+        return Err("that graph is not in the known-graph list".into());
+    }
+    #[cfg(desktop)]
+    {
+        crate::platform::reveal_page_source(std::path::Path::new(&path))
+    }
+    #[cfg(not(desktop))]
+    {
+        Err("showing a graph folder is available on desktop only".into())
+    }
+}
+
 pub(crate) fn last_graph_path(app: &tauri::AppHandle) -> Option<String> {
     settings_path(app)
         .and_then(|p| std::fs::read_to_string(p).ok())

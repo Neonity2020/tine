@@ -29,6 +29,8 @@
     "ui:check-mobile-drawers": "node scripts/check-mobile-drawers.mjs",
     "ui:check-mobile-safe-area": "node scripts/check-mobile-safe-area.mjs",
     "ui:check-selection-toolbar": "node scripts/check-selection-toolbar.mjs",
+    "ui:check-sheet-scroll": "node scripts/check-sheet-scroll.mjs",
+    "ui:check-touch-selection": "node scripts/check-touch-selection.mjs",
     "ui:check-devtools-detach": "node scripts/check-devtools-detach.mjs",
     "e2e:wayland-app-id": "node scripts/e2e-wayland-app-id.mjs",
     "blog:check": "node scripts/check-reddit-blog.mjs",

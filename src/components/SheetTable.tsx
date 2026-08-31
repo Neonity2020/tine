@@ -1041,8 +1041,10 @@ export function SheetTable(props: {
               title={props.addRowLabel ?? "Add row"}
               onClick={runAddRow}
             >
-              <span class="sheet-ghost-plus">+</span>
-              <span>{props.addRowLabel ?? "Add row"}</span>
+              <span class="sheet-ghost-sticky">
+                <span class="sheet-ghost-plus">+</span>
+                <span>{props.addRowLabel ?? "Add row"}</span>
+              </span>
             </button>
           </Show>
         </div>
@@ -1296,8 +1298,10 @@ export function SheetTable(props: {
               runAddRow();
             }}
           >
-            <span class="sheet-ghost-plus">+</span>
-            <span class="sheet-ghost-label">{props.addRowLabel ?? "Add row"}</span>
+            <span class="sheet-ghost-sticky">
+              <span class="sheet-ghost-plus">+</span>
+              <span class="sheet-ghost-label">{props.addRowLabel ?? "Add row"}</span>
+            </span>
           </button>
         </Show>
         <Show when={!sheetOverlay && showFooterToggle()}>

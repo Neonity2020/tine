@@ -30,6 +30,16 @@ function mockVisualViewport() {
   });
 }
 
+// jsdom has no PointerEvent in every environment; MouseEvent carries the same
+// coordinates and the handlers only read pointerId/isPrimary beyond that.
+function pointer(type: string, init: { pointerId?: number; isPrimary?: boolean } = {}): Event {
+  const Ctor = (window as { PointerEvent?: typeof PointerEvent }).PointerEvent ?? MouseEvent;
+  const event = new Ctor(type, { bubbles: true, cancelable: true, clientX: 5, clientY: 5, button: 0 });
+  Object.defineProperty(event, "pointerId", { value: init.pointerId ?? 1, configurable: true });
+  Object.defineProperty(event, "isPrimary", { value: init.isPrimary ?? true, configurable: true });
+  return event;
+}
+
 describe("MobileKeyboardToolbar", () => {
   beforeEach(() => {
     document.body.innerHTML = "";
@@ -211,6 +221,77 @@ describe("MobileKeyboardToolbar", () => {
     vi.advanceTimersByTime(800);
     expect(toolbarOf()).toBeNull();
     vi.useRealTimers();
+
+    unregister();
+    dispose();
+  });
+
+  // GH #434: on iOS 27 the toolbar painted but nothing responded. The buttons
+  // acted only on the compatibility `click` that trails a pointer sequence
+  // opened by a preventDefault()ed pointerdown — a WebKit that declines to
+  // synthesize that click left them inert. The pointer sequence is the contract
+  // now; `click` remains the mouse/keyboard/AT path, and the two never
+  // double-fire.
+  it("runs a toolbar action from the pointer sequence alone, with no trailing click", async () => {
+    platform.mobile = true;
+    const { render } = await import("solid-js/web");
+    const bridge = await import("../editorCommandBridge");
+    const { MobileKeyboardToolbar } = await import("./MobileKeyboardToolbar");
+    const calls: string[] = [];
+    const unregister = bridge.registerFocusedEditorCommandBridge({
+      blockId: "b1",
+      dispatch(command) {
+        calls.push(command);
+        return true;
+      },
+      blur() {},
+    });
+    const { div, dispose } = mount(render, MobileKeyboardToolbar);
+    const indent = div.querySelector<HTMLButtonElement>('[aria-label="Indent"]')!;
+
+    indent.dispatchEvent(pointer("pointerdown"));
+    indent.dispatchEvent(pointer("pointerup"));
+    expect(calls).toEqual(["editor/indent"]);
+
+    // The click a cooperative WebView still emits must not run it a second time.
+    indent.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    expect(calls).toEqual(["editor/indent"]);
+
+    // Keyboard and assistive technology deliver a bare click; it must still work.
+    indent.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    expect(calls).toEqual(["editor/indent", "editor/indent"]);
+
+    unregister();
+    dispose();
+  });
+
+  it("treats a press that slides off the button as a cancel", async () => {
+    platform.mobile = true;
+    const { render } = await import("solid-js/web");
+    const bridge = await import("../editorCommandBridge");
+    const { MobileKeyboardToolbar } = await import("./MobileKeyboardToolbar");
+    const calls: string[] = [];
+    const unregister = bridge.registerFocusedEditorCommandBridge({
+      blockId: "b1",
+      dispatch(command) {
+        calls.push(command);
+        return true;
+      },
+      blur() {},
+    });
+    const { div, dispose } = mount(render, MobileKeyboardToolbar);
+    const indent = div.querySelector<HTMLButtonElement>('[aria-label="Indent"]')!;
+    vi.spyOn(indent, "getBoundingClientRect").mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 40, bottom: 40, width: 40, height: 40,
+      toJSON: () => ({}),
+    });
+
+    indent.dispatchEvent(pointer("pointerdown"));
+    const away = pointer("pointerup");
+    Object.defineProperty(away, "clientX", { value: 400, configurable: true });
+    Object.defineProperty(away, "clientY", { value: 400, configurable: true });
+    indent.dispatchEvent(away);
+    expect(calls).toEqual([]);
 
     unregister();
     dispose();
