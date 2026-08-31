@@ -121,7 +121,6 @@ pub(crate) struct LocalMutationDetailTimings {
     pub(crate) move_page_home_working_hits: usize,
     pub(crate) move_page_home_hint_hits: usize,
     pub(crate) move_page_home_sqlite_hits: usize,
-    pub(crate) move_page_home_scratch_hits: usize,
     pub(crate) move_page_home_hot_catalog_hits: usize,
     pub(crate) move_source_working: std::time::Duration,
     pub(crate) move_membership_read: std::time::Duration,
@@ -191,7 +190,6 @@ thread_local! {
             move_page_home_working_hits: 0,
             move_page_home_hint_hits: 0,
             move_page_home_sqlite_hits: 0,
-            move_page_home_scratch_hits: 0,
             move_page_home_hot_catalog_hits: 0,
             move_source_working: std::time::Duration::ZERO,
             move_membership_read: std::time::Duration::ZERO,
@@ -3452,16 +3450,15 @@ impl DecodedDocumentVersion {
 
 /// The engine's single retained decoded page catalog.
 ///
-/// Decoding the catalog means reading its whole exact-state checkpoint out of
-/// scratch, hashing it, and importing it through Loro, all of which are
-/// O(total graph pages). A content-only save does not touch the catalog, so the
-/// ordinary drained save decodes a byte-identical document over and over. This
-/// retains exactly one of them.
+/// Decoding the catalog means reconstructing and importing its whole accepted
+/// semantic state through Loro, which is O(total graph pages). A content-only
+/// save does not touch the catalog, so the ordinary drained save would decode
+/// a byte-identical document over and over. This retains exactly one of them.
 ///
 /// The value's content identity is `(document_id, causal_state_digest)`: the
-/// exact-state scratch lane already keys the encoded checkpoint by that pair
-/// within one lane, and this value never outlives the [`ShardedHotEngine`] that
-/// owns the one workspace, lineage and scratch store that pair is resolved in.
+/// accepted semantic state binds the document by that pair, and this value
+/// never outlives the [`ShardedHotEngine`] that owns the one workspace and
+/// lineage in which the pair is resolved.
 ///
 /// The frontier binding is published only after the accepted-root point proof
 /// and full checkpoint load both succeed. It advances across a later accepted
@@ -4236,12 +4233,8 @@ pub struct EngineInstrumentation {
     pub store: super::ObjectStoreStats,
 }
 
-/// Which scratch run one enrolled open runs on.
-///
-/// The choice is the caller's because it is a *lifecycle* decision, not an
-/// engine one: only the lifecycle can see whether another retained run could
-/// later be proved unreachable, and an engine that mints one it can never
-/// collect is a permanent archive leak.
+/// One page and its dependency evidence retained for a bounded projection
+/// materialization chunk.
 #[derive(Debug)]
 struct CleanProjectionBulkPage {
     page: MaterializedPage,
@@ -6318,7 +6311,8 @@ pub struct ShardedHotEngine {
     ephemeral_portable_paths: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
     portable_path_conflicts: BTreeMap<PortablePathKeyDigest, PortablePathConflict>,
     // I4-I6 prepares and advances this run-local derived candidate. I7-I8 own
-    // binding it into durable engine history and restoring it at activation.
+    // binding it into durable semantic accepted history and restoring it at
+    // activation.
     page_name_root: PageNameOwnershipRootV1,
     ephemeral_page_names: EphemeralPageNameOwnershipStateV1,
     page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
@@ -6830,7 +6824,7 @@ impl ShardedHotEngine {
 
     /// Test construction for the production clean archive-attach route.
     ///
-    /// The retired constructor opened Patricia and scratch stores as an
+    /// The retired constructor opened secondary physical index stores as an
     /// alternate runtime. Tests that still need an archive now exercise the
     /// same index-free attach used by the application.
     #[cfg(test)]
@@ -7128,8 +7122,8 @@ impl ShardedHotEngine {
     /// Accept an already journal-durable, exactly archived local batch beneath
     /// the foreground overlay that made its Markdown target immediately
     /// visible. This is the background half of the clean foreground commit:
-    /// no manifest is published here, and no scratch/Patricia runtime is
-    /// required.
+    /// no manifest is published here, and no secondary physical-index runtime
+    /// is required.
     pub(crate) fn accept_clean_prepared_below_managed_local_overlay(
         &mut self,
         prepared: &PreparedBatch,
@@ -9266,8 +9260,8 @@ impl ShardedHotEngine {
     }
 
     /// Point lookup of immutable evidence bound when this batch became
-    /// accepted. Store-backed engines authenticate the record from scratch
-    /// state and cross-check its manifest fingerprint against batch history.
+    /// accepted. Store-backed engines reload the compact accepted status and
+    /// cross-check its manifest fingerprint against semantic batch history.
     pub fn accepted_batch_evidence(
         &self,
         batch_id: BatchId,
@@ -16100,7 +16094,7 @@ impl ShardedHotEngine {
     ///
     /// The immutable manifested intent supplies the historical exact path, but
     /// it grants no authority by itself. This method rebinds it to the current
-    /// durable engine history, reconstructs its exact catalog tombstone,
+    /// durable semantic accepted history, reconstructs its exact catalog tombstone,
     /// verifies every declared frontier head, and requires its release to
     /// remain the authenticated current portable-path fence. A later
     /// acquisition or release therefore invalidates this authority even when
@@ -22216,8 +22210,8 @@ impl ShardedHotEngine {
         // The application boundary already authenticated these page identities
         // and checked their exact revisions before constructing the compound
         // move.  They are therefore the strongest and cheapest authority for
-        // the two homes involved in this operation, independent of whether the
-        // engine happens to have a scratch store.
+        // the two homes involved in this operation, without consulting a
+        // second physical owner index.
         if let Some(home_document_id) =
             page_home_hints.and_then(|hints| hints.get(&page_id).copied())
         {
@@ -24993,7 +24987,7 @@ fn decode_current_path_catalog_row(
         || encode_current_path_catalog_row(&row)? != encoded
     {
         return Err(EngineError::Archive(
-            "current-path catalog row has non-canonical scratch encoding".into(),
+            "current-path catalog row has non-canonical stored encoding".into(),
         ));
     }
     Ok(row)
