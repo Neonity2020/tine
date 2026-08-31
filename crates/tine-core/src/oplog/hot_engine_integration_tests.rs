@@ -175,7 +175,8 @@ fn correction11_authenticated_document_dependency_heads_fail_closed() {
     publish_fixture(&writer, &prepared);
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut engine =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     assert!(matches!(
         engine
             .stage_archive_batch(prepared.manifest().batch_id())
@@ -1054,7 +1055,8 @@ fn page_preamble_is_authoritative_across_replay_move_and_rename() {
     assert_eq!(engine.materialize_page(ids.page_b).unwrap().blocks.len(), 1);
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut replay = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut replay =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     for batch_id in batch_ids {
         assert!(matches!(
             replay.stage_archive_batch(batch_id).unwrap().disposition,
@@ -1137,7 +1139,8 @@ fn projection_write_authorization_requires_durable_engine_derived_state() {
     ));
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut durable = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut durable =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     assert!(matches!(
         durable.stage_archive_batch(batch_id).unwrap().disposition,
         BatchDisposition::Accepted { .. }
@@ -1404,7 +1407,8 @@ fn logseq_uuid_restarts_and_replays_from_the_stable_home_shard() {
     drop(author_engine);
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut replay = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut replay =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     for batch_id in [genesis_id, assigned_id] {
         assert!(matches!(
             replay.stage_archive_batch(batch_id).unwrap().disposition,
@@ -1896,7 +1900,8 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
     );
 
     let reader = ObjectStore::open(&dir.path().join("store"), ids.workspace).unwrap();
-    let mut durable = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut durable =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     for batch_id in durable_batch_ids {
         assert!(matches!(
             durable.stage_archive_batch(batch_id).unwrap().disposition,
@@ -2046,7 +2051,8 @@ fn deleting_page_invalidates_uuid_claim_but_retains_participant_evidence() {
     ));
 
     let reader = ObjectStore::open(&dir.path().join("store"), ids.workspace).unwrap();
-    let mut replay = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut replay =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     for batch_id in [
         genesis.manifest().batch_id(),
         assign_ready.manifest().batch_id(),
@@ -2123,7 +2129,8 @@ fn store_backed_uuid_claim_lookup_stays_point_local_and_hot_memory_bounded() {
     ));
 
     let reader = ObjectStore::open(&dir.path().join("store"), ids.workspace).unwrap();
-    let mut replay = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut replay =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     for batch_id in [genesis.manifest().batch_id(), bulk.manifest().batch_id()] {
         assert!(matches!(
             replay.stage_archive_batch(batch_id).unwrap().disposition,
@@ -2452,7 +2459,8 @@ fn accepted_sparse_reload_reads_only_target_object_but_ingress_stays_fail_closed
     let prepared = genesis(ids, &fixture);
     publish_fixture(&archive, &prepared);
     let batch_id = prepared.manifest().batch_id();
-    let mut engine = ShardedHotEngine::with_archive_store(archive, ids.lineage, ids.catalog);
+    let mut engine =
+        ShardedHotEngine::with_clean_archive_store_for_test(archive, ids.lineage, ids.catalog);
     assert!(matches!(
         engine.stage_archive_batch(batch_id).unwrap().disposition,
         BatchDisposition::Accepted { .. }
@@ -2515,7 +2523,8 @@ fn accepted_sparse_reload_rejects_target_manifest_or_object_mutation_and_missing
         let object_path = archive_path
             .join("objects")
             .join(format!("{}.object", home_descriptor.content_digest()));
-        let mut engine = ShardedHotEngine::with_archive_store(archive, ids.lineage, ids.catalog);
+        let mut engine =
+            ShardedHotEngine::with_clean_archive_store_for_test(archive, ids.lineage, ids.catalog);
         assert!(matches!(
             engine.stage_archive_batch(batch_id).unwrap().disposition,
             BatchDisposition::Accepted { .. }
@@ -2554,7 +2563,8 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
     let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let mut author_engine = ShardedHotEngine::new(ids.workspace, ids.lineage, ids.catalog);
-    let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut engine =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     let mut operations = Vec::with_capacity(PAGES * 2);
     for index in 0..PAGES {
         let page_id = PageId::from_uuid(uuid(80_000 + index as u128));
@@ -2654,7 +2664,11 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
     drop(engine);
 
     let replay_reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut replay = ShardedHotEngine::with_archive_store(replay_reader, ids.lineage, ids.catalog);
+    let mut replay = ShardedHotEngine::with_clean_archive_store_for_test(
+        replay_reader,
+        ids.lineage,
+        ids.catalog,
+    );
     for batch_id in [genesis_id, edit_id] {
         assert!(matches!(
             replay.stage_archive_batch(batch_id).unwrap().disposition,
@@ -2771,8 +2785,11 @@ fn external_cold_replay_concurrent_old_base_map_and_text_edits_converge() {
         let mut snapshots = Vec::new();
         for order in [batches, [batches[1], batches[0]]] {
             let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-            let mut receiver =
-                ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+            let mut receiver = ShardedHotEngine::with_clean_archive_store_for_test(
+                reader,
+                ids.lineage,
+                ids.catalog,
+            );
             assert!(matches!(
                 receiver
                     .stage_archive_batch(baseline.manifest().batch_id())
@@ -2820,7 +2837,8 @@ fn correction11_late_block_creation_after_long_causal_chain_has_zero_ancestry_wa
     let archive_path = dir.path().join("archive");
     let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut engine =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     let initial = pages_only_genesis(ids, &engine, 84_000);
     publish_fixture(&writer, &initial);
     engine
@@ -2898,7 +2916,8 @@ fn sparse_archive_open_cost_is_independent_of_unrelated_batch_count() {
     let baseline = genesis(ids, &ids.engine());
     publish_fixture(&writer, &baseline);
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut engine =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     engine
         .stage_archive_batch(baseline.manifest().batch_id())
         .unwrap();
@@ -3290,8 +3309,11 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
         (batch_b_id, dependent_a_id, batch_a_id),
     ] {
         let replay_store = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-        let mut replay =
-            ShardedHotEngine::with_archive_store(replay_store, ids.lineage, ids.catalog);
+        let mut replay = ShardedHotEngine::with_clean_archive_store_for_test(
+            replay_store,
+            ids.lineage,
+            ids.catalog,
+        );
         assert!(matches!(
             replay.stage_archive_batch(genesis_id).unwrap().disposition,
             BatchDisposition::Accepted { .. }
@@ -3405,7 +3427,8 @@ fn crossed_concurrent_identity_collisions_converge_live_and_from_fresh_store() {
     let mut replay_evidence = Vec::new();
     for order in [[batch_a_id, batch_b_id], [batch_b_id, batch_a_id]] {
         let store = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-        let mut receiver = ShardedHotEngine::with_archive_store(store, ids.lineage, ids.catalog);
+        let mut receiver =
+            ShardedHotEngine::with_clean_archive_store_for_test(store, ids.lineage, ids.catalog);
         receiver.stage_archive_batch(genesis_id).unwrap();
         for batch_id in order {
             receiver.stage_archive_batch(batch_id).unwrap();
@@ -3481,7 +3504,8 @@ fn concurrent_same_home_duplicate_creation_converges_after_fresh_replay() {
         [claim_b.manifest().batch_id(), claim_a.manifest().batch_id()],
     ] {
         let store = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-        let mut replay = ShardedHotEngine::with_archive_store(store, ids.lineage, ids.catalog);
+        let mut replay =
+            ShardedHotEngine::with_clean_archive_store_for_test(store, ids.lineage, ids.catalog);
         assert!(matches!(
             replay
                 .stage_archive_batch(genesis.manifest().batch_id())
@@ -3683,7 +3707,8 @@ fn correction6_four_independent_claims_retain_complete_evidence_in_all_orders() 
         .collect();
     for permutation in permutations {
         let store = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-        let mut receiver = ShardedHotEngine::with_archive_store(store, ids.lineage, ids.catalog);
+        let mut receiver =
+            ShardedHotEngine::with_clean_archive_store_for_test(store, ids.lineage, ids.catalog);
         receiver.stage_archive_batch(genesis_id).unwrap();
         for index in permutation {
             receiver.stage_archive_batch(batch_ids[index]).unwrap();
@@ -3800,7 +3825,8 @@ fn correction6_blocked_frontier_validates_child_before_parent_and_finds_new_conf
     assert_eq!(receiver.fatal_evidence(), Some(&expected));
 
     let store = ObjectStore::open(&dir.path().join("store"), ids.workspace).unwrap();
-    let mut replay = ShardedHotEngine::with_archive_store(store, ids.lineage, ids.catalog);
+    let mut replay =
+        ShardedHotEngine::with_clean_archive_store_for_test(store, ids.lineage, ids.catalog);
     for batch_id in [
         genesis.manifest().batch_id(),
         BatchId::from_uuid(uuid(251)),
@@ -3965,7 +3991,8 @@ fn correction6_quarantined_parent_makes_causal_duplicate_child_reject() {
     assert_eq!(receiver.fatal_evidence().unwrap().conflicts().len(), 1);
 
     let store = ObjectStore::open(&dir.path().join("store"), ids.workspace).unwrap();
-    let mut replay = ShardedHotEngine::with_archive_store(store, ids.lineage, ids.catalog);
+    let mut replay =
+        ShardedHotEngine::with_clean_archive_store_for_test(store, ids.lineage, ids.catalog);
     for batch_id in [
         genesis.manifest().batch_id(),
         BatchId::from_uuid(uuid(281)),
@@ -5363,7 +5390,8 @@ fn store_backed_portable_index_is_affected_only_and_missing_root_fails_closed() 
     publish_fixture(&writer, &bootstrap);
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
-    let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+    let mut engine =
+        ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
     assert!(matches!(
         engine
             .stage_archive_batch(bootstrap.manifest().batch_id())

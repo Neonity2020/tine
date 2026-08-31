@@ -15850,7 +15850,7 @@ mod tests {
             .publish_bootstrap_prepared_for_test(&right)
             .unwrap();
         let make_scratch_engine = || {
-            let mut engine = ShardedHotEngine::with_archive_store(
+            let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
                 ObjectStore::open(&archive_path, workspace).unwrap(),
                 LineageDigest::of(b"canonical-activation-stream-test"),
                 DocumentId::from_uuid(Uuid::from_u128(0x5e02)),

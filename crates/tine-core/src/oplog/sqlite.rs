@@ -11152,8 +11152,11 @@ mod tests {
             .publish_bootstrap_prepared_for_test(&prepared)
             .unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut accepted_engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut accepted_engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         assert!(matches!(
             accepted_engine
                 .stage_archive_batch(prepared.manifest().batch_id())
@@ -11542,8 +11545,11 @@ mod tests {
 
         if mode == "recover" {
             let engine_store = ObjectStore::open(&root.join("objects"), ids.workspace).unwrap();
-            let mut accepted_engine =
-                ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+            let mut accepted_engine = ShardedHotEngine::with_clean_archive_store_for_test(
+                engine_store,
+                ids.lineage,
+                ids.catalog,
+            );
             for manifest in store.committed_manifests().unwrap() {
                 assert!(matches!(
                     accepted_engine
@@ -11565,8 +11571,11 @@ mod tests {
 
         let batch_id = batch(seed + 100);
         let engine_store = ObjectStore::open(&root.join("objects"), ids.workspace).unwrap();
-        let mut accepted_engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut accepted_engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         assert!(matches!(
             accepted_engine
                 .stage_archive_batch(batch_id)
@@ -11906,8 +11915,11 @@ mod tests {
         let store_path = dir.path().join("objects");
         let engine_store = ObjectStore::open(&store_path, ids.workspace).unwrap();
         let store = ObjectStore::open(&store_path, ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -12191,8 +12203,11 @@ mod tests {
         let dir = TestDir::new("frontier-reference-row-tamper");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -13015,8 +13030,11 @@ mod tests {
         let dir = TestDir::new("historical-rich-adapter");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let normal_path = dir.path().join("normal.sqlite");
         let mut normal = open_test_projection(
             &normal_path,
@@ -13294,8 +13312,11 @@ mod tests {
         let dir = TestDir::new("event-scoped-materialization");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut zero_budget_database = open_test_projection(
             &dir.path().join("zero-budget.sqlite"),
             ids.claim(),
@@ -13675,8 +13696,11 @@ mod tests {
         let dir = TestDir::new("historical-root-locality");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut operations = Vec::new();
         for index in 0..PAGE_COUNT {
             let page_id = if index == 0 {
@@ -13745,7 +13769,7 @@ mod tests {
             ObjectStore::open(&foreign_dir.path().join("objects"), foreign_ids.workspace).unwrap();
         let foreign_engine_store =
             ObjectStore::open(&foreign_dir.path().join("objects"), foreign_ids.workspace).unwrap();
-        let mut foreign_engine = ShardedHotEngine::with_archive_store(
+        let mut foreign_engine = ShardedHotEngine::with_clean_archive_store_for_test(
             foreign_engine_store,
             foreign_ids.lineage,
             foreign_ids.catalog,
@@ -14139,8 +14163,11 @@ mod tests {
         let dir = TestDir::new("historical-frontier");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let root = engine
             .prepare_bootstrap_transaction(
                 author(2_200),
@@ -14246,8 +14273,11 @@ mod tests {
         let dir = TestDir::new("compact-frontier-evidence");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut operations = Vec::with_capacity(PAGE_COUNT * 2);
         let mut target = None;
         let mut untouched_document = None;
@@ -14353,8 +14383,11 @@ mod tests {
         let dir = TestDir::new("authenticated-frontier-row-tamper");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut operations = Vec::with_capacity(PAGE_COUNT * 2);
         for index in 0..PAGE_COUNT as u128 {
             let page_id = PageId::from_uuid(uuid(30_000 + index * 3));
@@ -14690,8 +14723,11 @@ mod tests {
         let dir = TestDir::new(&format!("drain-differential-rich-{retained_catalog}"));
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         engine.set_retained_catalog_enabled_for_test(retained_catalog);
         let drained_path = dir.path().join("drained.sqlite");
         let mut database = open_test_projection(
@@ -15123,8 +15159,11 @@ mod tests {
         let dir = TestDir::new(&format!("catalog-decode-once-{unrelated_pages}"));
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -15264,8 +15303,11 @@ mod tests {
         let dir = TestDir::new("catalog-change-and-historical-root");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -15399,8 +15441,11 @@ mod tests {
         let dir = TestDir::new("sampled-interior-corruption");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut operations = vec![SemanticOperation::CreatePage {
             page_id: ids.page,
             home_document_id: ids.document,
@@ -15651,8 +15696,11 @@ mod tests {
         let dir = TestDir::new(&format!("streaming-rebuild-{batch_count}"));
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let root = engine
             .prepare_bootstrap_transaction(
                 if fresh_peers {
@@ -16051,7 +16099,7 @@ mod tests {
         let objects = dir.path().join("objects");
         let store = ObjectStore::open(&objects, same.workspace).unwrap();
         let archive_engine = || {
-            ShardedHotEngine::with_archive_store(
+            ShardedHotEngine::with_clean_archive_store_for_test(
                 ObjectStore::open(&objects, same.workspace).unwrap(),
                 same.lineage,
                 same.catalog,
@@ -16359,8 +16407,11 @@ mod tests {
         let dir = TestDir::new("overlay");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -16479,8 +16530,11 @@ mod tests {
         let store = ObjectStore::open(&dir.path().join("primary-objects"), ids.workspace).unwrap();
         let engine_store =
             ObjectStore::open(&dir.path().join("primary-objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -16510,8 +16564,11 @@ mod tests {
             .unwrap();
         let substitute_engine_store =
             ObjectStore::open(&dir.path().join("substitute-objects"), ids.workspace).unwrap();
-        let mut substitute_engine =
-            ShardedHotEngine::with_archive_store(substitute_engine_store, ids.lineage, ids.catalog);
+        let mut substitute_engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            substitute_engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         assert!(matches!(
             substitute_engine
                 .stage_archive_batch(prepared.manifest().batch_id())
@@ -16620,8 +16677,11 @@ mod tests {
         let dir = TestDir::new("authority-substitution-local");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -16656,7 +16716,7 @@ mod tests {
             substitute_ids.workspace,
         )
         .unwrap();
-        let mut substitute_engine = ShardedHotEngine::with_archive_store(
+        let mut substitute_engine = ShardedHotEngine::with_clean_archive_store_for_test(
             substitute_engine_store,
             substitute_ids.lineage,
             substitute_ids.catalog,
@@ -16773,8 +16833,11 @@ mod tests {
         let dir = TestDir::new("atomic-retained-byte-admission");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -16858,8 +16921,11 @@ mod tests {
         let dir = TestDir::new("oversized-overlay");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            engine_store,
+            ids.lineage,
+            ids.catalog,
+        );
         let mut database = open_test_projection(
             &dir.path().join("frontier.sqlite"),
             ids.claim(),
@@ -18135,7 +18201,8 @@ mod tests {
             .publish_bootstrap_prepared_for_test(&prepared)
             .unwrap();
         let reader = ObjectStore::open(&store_path, ids.workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+        let mut engine =
+            ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
         assert!(matches!(
             engine
                 .stage_archive_batch(prepared.manifest().batch_id())
@@ -18233,7 +18300,8 @@ mod tests {
             .unwrap();
         store.publish_bootstrap_prepared_for_test(&create).unwrap();
         let reader = ObjectStore::open(&store_path, ids.workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
+        let mut engine =
+            ShardedHotEngine::with_clean_archive_store_for_test(reader, ids.lineage, ids.catalog);
         assert!(matches!(
             engine
                 .stage_archive_batch(create.manifest().batch_id())

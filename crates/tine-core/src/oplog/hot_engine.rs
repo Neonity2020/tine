@@ -9147,37 +9147,22 @@ impl ShardedHotEngine {
             .count()
     }
 
-    /// Construct a sparse engine that follows compact direct heads through
-    /// immutable manifests on cold fallback. Accepted non-catalog shards are
-    /// evicted from hot memory and reconstructed from authenticated DAG
-    /// ancestry on demand.
-    pub fn with_archive_store(
+    /// Test construction for the production clean archive-attach route.
+    ///
+    /// The retired constructor opened Patricia and scratch stores as an
+    /// alternate runtime. Tests that still need an archive now exercise the
+    /// same index-free attach used by the application.
+    #[cfg(test)]
+    pub(crate) fn with_clean_archive_store_for_test(
         store: ObjectStore,
         lineage_digest: LineageDigest,
         catalog_document_id: DocumentId,
     ) -> Self {
         let workspace_id = store.workspace_id();
         let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
-        match store.open_logseq_claim_index() {
-            Ok(index) => engine.logseq_claim_index = Some(Arc::new(index)),
-            Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
-        }
-        match store.open_portable_path_index() {
-            Ok(index) => engine.portable_path_index = Some(Arc::new(index)),
-            Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
-        }
-        match store.open_page_name_ownership_index() {
-            Ok(index) => engine.page_name_index = Some(Arc::new(index)),
-            Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
-        }
-        match store.start_engine_scratch() {
-            Ok((scratch, index)) => {
-                engine.scratch = Some(scratch);
-                engine.block_claim_index = Some(Arc::new(index));
-            }
-            Err(error) => engine.history_failure = Some(EngineError::Archive(error.to_string())),
-        }
-        engine.archive_store = Some(Arc::new(store));
+        engine
+            .attach_clean_archive_store(store)
+            .expect("fresh test engine accepts its matching clean archive");
         engine
     }
 
@@ -36084,7 +36069,7 @@ mod validation_tests {
         let archive_path = root.join(replica);
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
         writer.publish_bootstrap_prepared_for_test(base).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -36117,7 +36102,7 @@ mod validation_tests {
         std::fs::create_dir_all(&root).unwrap();
         let archive_path = root.join("archive");
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let engine = ShardedHotEngine::with_archive_store(
+        let engine = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -36694,7 +36679,7 @@ mod validation_tests {
         writer
             .publish_bootstrap_prepared_for_test(&prepared)
             .unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -36725,7 +36710,7 @@ mod validation_tests {
             std::env::temp_dir().join(format!("tine-current-path-cursor-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
             store,
             LineageDigest::of(&seed.to_be_bytes()),
             catalog,
@@ -36847,7 +36832,7 @@ mod validation_tests {
         let root =
             std::env::temp_dir().join(format!("tine-current-path-policy-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&root.join("archive"), workspace).unwrap(),
             LineageDigest::of(b"current-path-policy"),
             catalog,
@@ -39695,7 +39680,8 @@ mod validation_tests {
         let archive_path = root.join("archive");
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
         let reader = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(reader, lineage, catalog);
+        let mut engine =
+            ShardedHotEngine::with_clean_archive_store_for_test(reader, lineage, catalog);
         let mut max_candidate_visits = 0;
         let mut max_status_lookups = 0;
         let mut late_manifest_sizes = Vec::new();
@@ -40435,7 +40421,8 @@ mod validation_tests {
         let archive_path = root.join("archive");
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
         let reader = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(reader, lineage, catalog);
+        let mut engine =
+            ShardedHotEngine::with_clean_archive_store_for_test(reader, lineage, catalog);
 
         let publish = |engine: &mut ShardedHotEngine,
                        author: AuthorBatch,
@@ -40647,7 +40634,7 @@ mod validation_tests {
         let archive_path = root.join("archive");
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
 
-        let mut base_author = ShardedHotEngine::with_archive_store(
+        let mut base_author = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -40706,7 +40693,7 @@ mod validation_tests {
         writer.publish_bootstrap_prepared_for_test(&right).unwrap();
 
         let deliver = |first: BatchId, second: BatchId| {
-            let mut receiver = ShardedHotEngine::with_archive_store(
+            let mut receiver = ShardedHotEngine::with_clean_archive_store_for_test(
                 ObjectStore::open(&archive_path, workspace).unwrap(),
                 lineage,
                 catalog,
@@ -40767,7 +40754,7 @@ mod validation_tests {
             2,
             "the delivery-order evidence deliberately pins the current page-name root schema"
         );
-        let reopened = ShardedHotEngine::with_archive_store(
+        let reopened = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -40795,7 +40782,7 @@ mod validation_tests {
         std::fs::create_dir_all(&root).unwrap();
         let archive_path = root.join("archive");
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut left_author = ShardedHotEngine::with_archive_store(
+        let mut left_author = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -40852,7 +40839,7 @@ mod validation_tests {
         writer.publish_bootstrap_prepared_for_test(&left).unwrap();
         writer.publish_bootstrap_prepared_for_test(&right).unwrap();
 
-        let mut receiver = ShardedHotEngine::with_archive_store(
+        let mut receiver = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -40947,7 +40934,7 @@ mod validation_tests {
         std::fs::create_dir_all(&root).unwrap();
         let archive_path = root.join("archive");
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut author = ShardedHotEngine::with_archive_store(
+        let mut author = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -41016,7 +41003,7 @@ mod validation_tests {
             children.push(prepared.manifest().batch_id());
         }
 
-        let mut receiver = ShardedHotEngine::with_archive_store(
+        let mut receiver = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
             catalog,
@@ -41155,7 +41142,8 @@ mod validation_tests {
         let archive_path = root.join("archive");
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
         let reader = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(reader, lineage, catalog);
+        let mut engine =
+            ShardedHotEngine::with_clean_archive_store_for_test(reader, lineage, catalog);
 
         let baseline = engine
             .prepare_bootstrap_transaction(
@@ -41415,7 +41403,8 @@ mod validation_tests {
         let archive_root = root.join("archive");
         let writer = ObjectStore::open(&archive_root, workspace).unwrap();
         let author_store = ObjectStore::open(&archive_root, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(author_store, lineage, catalog);
+        let mut engine =
+            ShardedHotEngine::with_clean_archive_store_for_test(author_store, lineage, catalog);
         let mut blocks_built = 0usize;
         for batch_index in 0..batches {
             let author = AuthorBatch {
@@ -41832,7 +41821,8 @@ mod replay_benchmark {
         let archive_root = fixture_root.join("archive");
         let writer = ObjectStore::open(&archive_root, workspace).unwrap();
         let author_store = ObjectStore::open(&archive_root, workspace).unwrap();
-        let mut evolving = ShardedHotEngine::with_archive_store(author_store, lineage, catalog);
+        let mut evolving =
+            ShardedHotEngine::with_clean_archive_store_for_test(author_store, lineage, catalog);
         reset_reference_evidence_parse_calls();
         let mut blocks_built = 0usize;
 
@@ -41936,7 +41926,8 @@ mod replay_benchmark {
         let mut inspection_elapsed = Duration::ZERO;
         let mut validation_elapsed = Duration::ZERO;
         let replay_store = ObjectStore::open(&archive_root, workspace).unwrap();
-        let mut replay = ShardedHotEngine::with_archive_store(replay_store, lineage, catalog);
+        let mut replay =
+            ShardedHotEngine::with_clean_archive_store_for_test(replay_store, lineage, catalog);
         replay.ensure_history_store().unwrap();
         reset_owned_semantic_snapshot_entries();
         reset_reference_evidence_parse_calls();
@@ -42183,7 +42174,7 @@ mod replay_benchmark {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let writer = ObjectStore::open(&root, workspace).unwrap();
-        let mut engine = ShardedHotEngine::with_archive_store(
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&root, workspace).unwrap(),
             LineageDigest::of(b"accepted-frontier-initial-root"),
             catalog,
