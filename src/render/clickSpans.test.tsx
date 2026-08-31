@@ -3,7 +3,7 @@ import { render } from "solid-js/web";
 import { isBuiltinHidden } from "../editor/properties";
 import { AstBody } from "./body";
 import { initParser } from "./parse";
-import { editorOffsetFromRenderedRange } from "./spans";
+import { clickBeyondRenderedEnd, editorOffsetFromRenderedRange } from "./spans";
 import { PaneContext, focusPane, paneRouter, resetPaneLayoutToSingle, splitPane } from "../panes";
 
 beforeAll(async () => {
@@ -124,6 +124,20 @@ describe("click-to-caret span mapping", () => {
       // exactly, and must not be swept to the end.
       expect(editorOffsetFromRenderedRange(root, textRange(root, "some", 2), raw, isBuiltinHidden))
         .toBe(raw.indexOf("some") + 2);
+    } finally {
+      dispose();
+    }
+  });
+
+  // Regression: the GH #465 geometric probe called Range.getClientRects, which
+  // jsdom does not implement, so it THREW out of the click handler and took the
+  // whole rendered-block edit gesture with it. With no layout engine there are
+  // no line boxes to ask about, so it must decline and let the span mapping
+  // answer, exactly as before #465.
+  it("declines instead of throwing where the environment has no layout", () => {
+    const { root, dispose } = mountedBody("*some text in italics.*");
+    try {
+      expect(clickBeyondRenderedEnd(root, 10_000, 10)).toBe(false);
     } finally {
       dispose();
     }

@@ -291,6 +291,12 @@ export function beyondFinalGlyph(boxes: ArrayLike<LineBox>, x: number, y: number
  *  width, so its own border box says nothing about where the text ends. */
 export function clickBeyondRenderedEnd(root: Element, x: number, y: number): boolean {
   const range = root.ownerDocument.createRange();
+  // An environment with no layout engine has no line boxes to ask about: jsdom
+  // does not implement Range.getClientRects at all, and calling it there threw
+  // out of the click handler and took the whole edit gesture with it. Declining
+  // is the right answer, not an approximation — the caller falls back to the
+  // ordinary span mapping, which is what ran before GH #465.
+  if (typeof range.getClientRects !== "function") return false;
   range.selectNodeContents(root);
   const boxes = range.getClientRects();
   range.detach?.();
