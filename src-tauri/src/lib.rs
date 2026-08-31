@@ -562,6 +562,18 @@ pub fn run() {
             media_protocol::respond(ctx, request)
         });
 
+    // The frontend's platform identity. It cannot be derived from the WebView's
+    // user agent: iPadOS 13+ serves a desktop-class `Macintosh; Intel Mac OS X`
+    // UA from a stock WKWebView, so UA sniffing reported an iPad as a Mac
+    // desktop and every mobile affordance stayed hidden (GH #446). The build
+    // knows the truth, so hand it over before frontend code runs — the same
+    // idiom as `__TINE_NATIVE_FRAME__`, and synchronous for the same reason:
+    // an async `app_platform` round-trip would flash desktop-only chrome.
+    let builder = builder.append_invoke_initialization_script(format!(
+        "globalThis.__TINE_PLATFORM__ = {:?};",
+        crate::graph::app_platform()
+    ));
+
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let builder = builder.append_invoke_initialization_script(format!(
         "globalThis.__TINE_NATIVE_FRAME__ = {native_frame_active};"

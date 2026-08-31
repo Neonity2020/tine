@@ -27,7 +27,7 @@ import {
   installHistoryRouteContextAdapter,
 } from "./store";
 import { journalTitle } from "./journal";
-import { isMobilePlatform } from "./nativeChrome";
+import { isSinglePaneShell } from "./nativeChrome";
 import {
   companionPane,
   nearestPaneInDirection,
@@ -267,7 +267,7 @@ export function splitPane(
   dir: "row" | "col" = "row",
   opts: { focusNew?: boolean; position?: "before" | "after"; snapshot?: PaneSnapshot } = {}
 ): string | null {
-  if (isMobilePlatform) return null;
+  if (isSinglePaneShell()) return null;
   if (!layoutPaneIds().includes(paneId)) return null;
   const newPaneId = freshPaneId();
   const source = paneRouter(paneId);
@@ -323,7 +323,7 @@ export function splitRootAtEdge(
   sourcePaneId = focusedPaneId(),
   opts: { focusNew?: boolean; snapshot?: PaneSnapshot } = {}
 ): string | null {
-  if (isMobilePlatform) return null;
+  if (isSinglePaneShell()) return null;
   const ids = layoutPaneIds();
   const sourceId = ids.includes(sourcePaneId) ? sourcePaneId : ids[0];
   if (!sourceId) return null;
@@ -436,7 +436,7 @@ export function moveTabToSplitPane(
   side: "left" | "right" | "top" | "bottom"
 ): string | null {
   const ids = layoutPaneIds();
-  if (isMobilePlatform || !ids.includes(sourcePaneId) || !ids.includes(targetPaneId)) return null;
+  if (isSinglePaneShell() || !ids.includes(sourcePaneId) || !ids.includes(targetPaneId)) return null;
   const source = paneRouter(sourcePaneId);
   if (!source.tabs().some((t) => t.id === tabId)) return null;
   const moved = source.extractTabForAdoption(tabId);
@@ -453,7 +453,7 @@ export function moveTabToSplitPane(
 export function moveTabToSeamSplit(sourcePaneId: string, tabId: string, path: number[]): string | null {
   const ids = layoutPaneIds();
   const split = nodeAtPath(layoutRoot(), path);
-  if (isMobilePlatform || !ids.includes(sourcePaneId) || !split || split.kind === "pane") return null;
+  if (isSinglePaneShell() || !ids.includes(sourcePaneId) || !split || split.kind === "pane") return null;
   const source = paneRouter(sourcePaneId);
   if (!source.tabs().some((t) => t.id === tabId)) return null;
   const moved = source.extractTabForAdoption(tabId);
@@ -472,7 +472,7 @@ export function moveTabToRootEdge(
   side: "left" | "right" | "top" | "bottom"
 ): string | null {
   const ids = layoutPaneIds();
-  if (isMobilePlatform || !ids.includes(sourcePaneId)) return null;
+  if (isSinglePaneShell() || !ids.includes(sourcePaneId)) return null;
   const source = paneRouter(sourcePaneId);
   if (!source.tabs().some((t) => t.id === tabId)) return null;
   const moved = source.extractTabForAdoption(tabId);
@@ -600,7 +600,7 @@ export function openPdf(
 
   const route = makePdfRoute(filename, label, { page });
   publishPdfNavigationIntent(route.viewId, { page, highlightId });
-  if (isMobilePlatform || options.inPlace) {
+  if (isSinglePaneShell() || options.inPlace) {
     paneRouter(sourcePaneId).openPdf(route);
     return route;
   }
@@ -631,7 +631,7 @@ export function openPdfNotes(
   notesPage: string,
   block?: string,
 ): string | null {
-  if (isMobilePlatform) {
+  if (isSinglePaneShell()) {
     const router = paneRouter(sourcePaneId);
     if (block) router.openPageAtBlock(notesPage, "page", block);
     else router.openPage(notesPage, "page");

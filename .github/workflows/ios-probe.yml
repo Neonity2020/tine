@@ -217,13 +217,18 @@ jobs:
             cp "$debug_log" "artifacts/tine-debug-$slug.log" || true
             xcrun simctl io "$udid" screenshot --type=png "artifacts/ios-smoke-$slug.png"
 
-            # The measurement this probe exists to take. Not asserted yet: the
-            # UA-keyed gate is what GH #446 is about, so record it first and let
-            # the fix add the assertion.
-            grep -o 'frontend booted (ua=.*)' "artifacts/tine-debug-$slug.log" \
-              > "artifacts/ua-$slug.txt" || echo "NO UA LINE CAPTURED" > "artifacts/ua-$slug.txt"
-            echo "-- $family user agent --"
+            # GH #446's regression gate. On iPad the `ua=` half of this line
+            # says `Macintosh; Intel Mac OS X` — iPadOS serves a desktop-class
+            # user agent from a stock WKWebView — so the assertion is on the
+            # `platform=` half, which Rust injects from the build itself
+            # (src-tauri/src/lib.rs -> __TINE_PLATFORM__). If that injection
+            # ever stops reaching the webview, the iPad silently returns to
+            # rendering as a Mac desktop, and this is where that shows up.
+            grep -o 'frontend booted (platform=.*)' "artifacts/tine-debug-$slug.log" \
+              > "artifacts/ua-$slug.txt" || echo "NO BOOT LINE CAPTURED" > "artifacts/ua-$slug.txt"
+            echo "-- $family boot identity --"
             cat "artifacts/ua-$slug.txt"
+            grep -q 'platform=ios' "artifacts/ua-$slug.txt"
 
             test -f "$app_data/Documents/.tine-container"
             test -s "$graph/journals/$journal_file"

@@ -51,6 +51,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **iPad now behaves like a tablet instead of a Mac.** The on-screen editing
+  toolbar (indent, move, insert) never appeared while editing on iPad, and
+  long-press, text selection and window chrome all took their desktop branch.
+  iPadOS 13+ serves a desktop-class `Macintosh; Intel Mac OS X` user agent from
+  a stock WebView, and Tine was reading the platform out of that string; it now
+  comes from the build itself. Split panes stay available on iPad — they follow
+  the size of the screen, not the name of the operating system. (GH #446)
+
 - **A reported switch between Direct Files and Managed Storage now survives a
   crash at the selector boundary.** App-private storage-mode bindings use the
   same certified durable create/replace/retire primitive as other authority

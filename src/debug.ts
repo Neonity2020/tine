@@ -6,6 +6,7 @@
 
 import { backend } from "./backend";
 import { openSettings, pushToast } from "./ui";
+import { platformKind } from "./nativeChrome";
 
 let enabled = false;
 let initialized = false;
@@ -58,6 +59,9 @@ export async function initDebug(): Promise<void> {
   if (!info.enabled) return;
   enabled = true;
 
-  dbg(`frontend booted (ua=${navigator.userAgent})`);
+  // platform= is the identity Rust injected, which is NOT derivable from ua=
+  // on iPadOS (GH #446). Keeping both in one line makes that divergence
+  // readable in a bug report and assertable from the iOS probe.
+  dbg(`frontend booted (platform=${platformKind} ua=${navigator.userAgent})`);
   pushToast(`Debug logging is ON → ${info.path}`, "info");
 }
