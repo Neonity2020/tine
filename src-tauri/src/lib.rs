@@ -73,8 +73,7 @@ use commands::{
 use debug::{
     app_architecture, clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
     diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, diagnostic_session_active,
-    flight_init,
-    install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
+    flight_init, install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
 };
 use graph::{
     app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
