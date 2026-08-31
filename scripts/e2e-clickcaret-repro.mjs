@@ -38,6 +38,9 @@ const PAGE = `- **bold** rest of line
 - *some text in italics.*
 - **ends in bold**
 - ends in \`code\`
+- *italics with a referrer.*
+  id:: 4d1f0a20-0000-0000-0000-000000000465
+- points at ((4d1f0a20-0000-0000-0000-000000000465))
 `;
 
 fs.rmSync(G, { recursive: true, force: true });
@@ -143,8 +146,22 @@ try {
       const content = block.querySelector(".block-content");
       if (!content) return { err: "no .block-content in block " + idx };
       const r = document.createRange();
-      r.selectNodeContents(content);
-      const rects = [...r.getClientRects()];
+      // Skip out-of-flow children — the reference-count badge floats right and
+      // is drawn against the block's right edge, so a range over the whole
+      // block would put "where the text ends" at the full content width and
+      // this probe would report no run-out at all (GH #454 x GH #465).
+      const rects = [];
+      const collect = (node) => {
+        if (node.nodeType === 1) {
+          const st = getComputedStyle(node);
+          if (st.float === "left" || st.float === "right"
+              || st.position === "absolute" || st.position === "fixed") return;
+          if (node.childElementCount > 0) { [...node.childNodes].forEach(collect); return; }
+        }
+        r.selectNode(node);
+        rects.push(...r.getClientRects());
+      };
+      [...content.childNodes].forEach(collect);
       if (rects.length === 0) return { err: "no line boxes in block " + idx };
       const bottom = Math.max(...rects.map((b) => b.bottom));
       const last = rects.filter((b) => b.bottom >= bottom - 0.5);
@@ -292,7 +309,12 @@ try {
   // this block", including when the block ends in markup the reader cannot see.
   // Before the fix the caret stopped one byte short, between the last letter and
   // the closing delimiter, so Enter split the construct instead of leaving it.
-  for (const [idx, raw] of [[6, "*some text in italics.*"], [7, "**ends in bold**"], [8, "ends in `code`"]]) {
+  // Block 9 carries a reference-count badge (block 10 references it). The badge
+  // is `float: right`, drawn hard against the block's right edge; measuring the
+  // block as one range therefore reported its text as ending at the full
+  // content width, and the past-the-end rule was silently dead on every
+  // referenced block (GH #454 x GH #465).
+  for (const [idx, raw] of [[6, "*some text in italics.*"], [7, "**ends in bold**"], [8, "ends in `code`"], [9, "*italics with a referrer.*"]]) {
     console.log(`\n=== GH #465: click past the end of ${JSON.stringify(raw)} ===`);
     const past = await pastEndPoint(idx);
     console.log("point:", JSON.stringify(past));

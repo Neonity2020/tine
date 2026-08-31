@@ -184,7 +184,7 @@
    "contracts": [
     {
      "class": "core-operation",
-     "userOutcome": "A click maps to the intended source caret, including after trailing links, inside inline code, and past the last glyph of a block that ends in markup the reader cannot see.",
+     "userOutcome": "A click maps to the intended source caret, including after trailing links, inside inline code, and past the last glyph of a block that ends in markup the reader cannot see, in a plain block and in one carrying a reference-count badge.",
      "blocking": true
     }
    ],
