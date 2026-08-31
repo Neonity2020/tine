@@ -361,8 +361,12 @@ can become live. Windows uses write-through name publication; Unix-like hosts
 use their certified exact-name move plus directory durability policy. Tine
 never acknowledges the save merely because an ordinary rename became visible.
 Successful replacement retires the displaced recovery name through a typed
-`.editor-retired` name before best-effort deletion, so a crash cannot turn an
-unflushed name transition into a reported durable save.
+`.editor-retired` name before deletion, so a crash cannot turn an unflushed
+name transition into a reported durable save. That exact producer-shaped name
+is cleanup-only: it never restores a document or becomes a conflict claimant.
+The same bounded no-follow checked-open walk removes any copy left by a crash
+or failed foreground unlink; a cleanup error fails that open without changing
+the artifact and the next checked open retries it.
 
 For an existing Direct editor save, the initial exact-file read supplies the
 serialization baseline. The late external-writer proof is the atomic

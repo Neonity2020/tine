@@ -4069,6 +4069,7 @@ thread_local! {
     static JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static EDITOR_RETIRED_CLEANUP: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
@@ -5040,6 +5041,19 @@ fn managed_write_during_rollback_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
+fn editor_retired_cleanup_hook() -> io::Result<()> {
+    EDITOR_RETIRED_CLEANUP.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn editor_retired_cleanup_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
 fn editor_commit_before_recheck_hook() -> io::Result<()> {
     EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
@@ -5327,13 +5341,16 @@ impl Graph {
     /// target stay untouched because choosing one would discard information.
     fn recover_interrupted_editor_publications(&self) -> io::Result<RecoverySummary> {
         let write = self.admit_managed_text_writer()?;
-        let claims = self.editor_publication_recovery_claims(&write)?;
+        let (claims, cleaned_retired) = self.editor_publication_recovery_claims(&write)?;
         let mut by_target = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
         for (artifact, target) in claims {
             by_target.entry(target).or_default().push(artifact);
         }
 
-        let mut summary = RecoverySummary::default();
+        let mut summary = RecoverySummary {
+            reconciled: cleaned_retired,
+            ..RecoverySummary::default()
+        };
         for (target, artifacts) in by_target {
             let target_present = self.managed_exists(&write, &target)?;
             if !target_present {
@@ -5398,7 +5415,7 @@ impl Graph {
     fn editor_publication_recovery_claims(
         &self,
         permit: &ManagedTextWritePermit,
-    ) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    ) -> io::Result<(Vec<(PathBuf, PathBuf)>, usize)> {
         struct PendingDirectory {
             directory: Dir,
             relative: String,
@@ -5412,6 +5429,7 @@ impl Graph {
             depth: 0,
         }];
         let mut claims = Vec::new();
+        let mut cleaned_retired = 0_usize;
         let mut all_entries = 0_usize;
         let mut directories = 1_usize;
         let mut path_bytes = 0_u64;
@@ -5477,6 +5495,30 @@ impl Graph {
                 if !file_type.is_file() {
                     continue;
                 }
+                if let Some(target_name) = editor_retired_target_name(&name) {
+                    let target_relative = if relative.is_empty() {
+                        target_name.to_owned()
+                    } else {
+                        format!("{relative}/{target_name}")
+                    };
+                    if !self.graph_text_scope.is_eligible(&target_relative) {
+                        continue;
+                    }
+                    // `.editor-retired` is a durable cleanup-only state emitted
+                    // after the replacement is already live and validated. It
+                    // is never a publication claimant and can never restore a
+                    // document. A failed unlink aborts checked open, leaves the
+                    // exact entry intact, and is retried on the next open.
+                    editor_retired_cleanup_hook()?;
+                    match directory.remove_file(&name) {
+                        Ok(()) => {
+                            cleaned_retired = cleaned_retired.saturating_add(1);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    continue;
+                }
                 let Some(target_name) = editor_recovery_target_name(&name) else {
                     continue;
                 };
@@ -5494,7 +5536,7 @@ impl Graph {
                 ));
             }
         }
-        Ok(claims)
+        Ok((claims, cleaned_retired))
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
@@ -30343,6 +30385,23 @@ fn editor_recovery_target_name(name: &str) -> Option<&str> {
     parse_legacy(rest)
 }
 
+/// Parse the cleanup-only name emitted after a Direct Files replacement has
+/// already published and validated its new live file. Unlike
+/// [`editor_recovery_target_name`], this grammar never confers restoration or
+/// conflict authority; checked open may only remove the exact producer shape.
+fn editor_retired_target_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix('.')?.strip_suffix(".editor-retired")?;
+    let (candidate, sequence) = rest.rsplit_once('.')?;
+    let (target, process) = candidate.rsplit_once('.')?;
+    (!target.is_empty()
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        && !process.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && text_extension_from_path(Path::new(target)).is_some())
+    .then_some(target)
+}
+
 fn create_projection_staging_file(
     dir: &Dir,
     filename: &str,
@@ -47774,6 +47833,62 @@ mod tests {
         ] {
             assert_eq!(editor_recovery_target_name(lookalike), None, "{lookalike}");
         }
+        assert_eq!(
+            editor_retired_target_name(".Note.md.4242.1.editor-retired"),
+            Some("Note.md")
+        );
+        for lookalike in [
+            ".Note.md.4242.editor-retired",
+            ".Note.md.pid.1.editor-retired",
+            ".Note.md.4242.seq.editor-retired",
+            ".Note.txt.4242.1.editor-retired",
+            "Note.md.4242.1.editor-retired",
+        ] {
+            assert_eq!(editor_retired_target_name(lookalike), None, "{lookalike}");
+        }
+    }
+
+    #[test]
+    fn checked_open_retries_editor_retired_cleanup_without_restoring_it() {
+        let dir = scratch("editor-retired-cleanup-retry");
+        let live = dir.join("pages/Note.md");
+        let retired = dir.join("pages").join(".Note.md.4242.1.editor-retired");
+        fs::write(&live, b"- published bytes\n").unwrap();
+        fs::write(&retired, b"- displaced bytes\n").unwrap();
+        EDITOR_RETIRED_CLEANUP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected retired-cleanup unlink failure",
+                ))
+            }));
+        });
+
+        let refused = match Graph::open_checked(&dir) {
+            Ok(_) => panic!("checked open ignored a retired-cleanup failure"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(fs::read(&live).unwrap(), b"- published bytes\n");
+        assert_eq!(fs::read(&retired).unwrap(), b"- displaced bytes\n");
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"- published bytes\n");
+        assert!(!retired.exists(), "the next checked open owns the retry");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editor_retired_cleanup_is_never_document_authority() {
+        let dir = scratch("editor-retired-never-authority");
+        let retired = dir.join("pages").join(".Note.md.4242.1.editor-retired");
+        fs::write(&retired, b"- displaced bytes\n").unwrap();
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+
+        assert!(!dir.join("pages/Note.md").exists());
+        assert!(!retired.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

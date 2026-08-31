@@ -5607,12 +5607,14 @@
     "tests": [
      "crates/tine-core/src/model.rs::tests::direct_files_name_publication_stays_on_the_typed_durable_boundary",
      "crates/tine-core/src/model.rs::tests::a_same_bytes_external_replace_does_not_strand_the_editor",
-     "crates/tine-core/src/model.rs::tests::a_changed_bytes_external_replace_still_conflicts"
+     "crates/tine-core/src/model.rs::tests::a_changed_bytes_external_replace_still_conflicts",
+     "crates/tine-core/src/model.rs::tests::checked_open_retries_editor_retired_cleanup_without_restoring_it",
+     "crates/tine-core/src/model.rs::tests::editor_retired_cleanup_is_never_document_authority"
     ],
     "scenario": "direct-files.windows-write-through-create-replace-retire-restore",
     "failBefore": "proven from the literal Windows path: Direct Files used raw NtSetInformationFile name changes and the following directory sync was a successful no-op"
    },
-   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.1 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed."
+   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.2 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed. A post-publication .editor-retired entry is cleanup-only, never document authority; the bounded checked-open walk retries an interrupted or failed unlink without restoring its displaced bytes."
   },
   {
    "id": "REG-STORAGE-MODE-SELECTOR-DURABILITY-001",

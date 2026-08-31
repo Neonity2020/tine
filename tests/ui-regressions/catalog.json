@@ -9133,7 +9133,7 @@
     "scenario": "managed.journal-rapid-multi-day-move",
     "failBefore": "proven"
    },
-   "notes": "Fail-before: two queued calls captured one source page; the first crossed and the second returned none. The prior deployed binary accepted 120 immediate key events but the marker reached only the preceding journal instead of the fifth loaded day. The queue now contains commands, not precomputed page-pair intents. Each command resolves after its predecessor installs the accepted actor result. The permanent native journey dispatches 120 synthetic Alt+Shift+Down events with zero inter-command delay, requires one exact marker on the fifth loaded journal and no error toast, then separately moves 20 selected roots between named pages by cut/paste and verifies both rendered and durable source/destination state. Exact timing and queue implementation are not user contracts."
+   "notes": "Fail-before: two queued calls captured one source page; the first crossed and the second returned none. The prior deployed binary accepted 120 immediate key events but the marker reached only the preceding journal instead of the fifth loaded day. The queue now contains commands, not precomputed page-pair intents. Each command resolves after its predecessor installs the accepted actor result. The permanent native journey dispatches 120 synthetic Alt+Shift+Down events uninterrupted at 5 ms spacing, requires one exact marker on the fifth loaded journal and no error toast, then separately moves 20 selected roots between named pages by cut/paste and verifies both rendered and durable source/destination state. Exact timing and queue implementation are not user contracts."
   }
  ]
 }
