@@ -9112,6 +9112,28 @@
     "failBefore": "proven"
    },
    "notes": "GH #438 (follow-up to #283): giving Ctrl/Cmd+click to background tabs was the right browser convention but removed the only mouse+modifier route to the other pane. internalLinkDest now yields a fourth destination (Alt+click -> pane), with the GH #288 switcher precedence: pure Shift keeps the sidebar, pure Ctrl/Cmd keeps the background tab, Alt claims every chord it enters (Shift+Alt and Ctrl+Alt included), and combined modifiers without Alt keep plain-click meaning. Every internalLinkDest surface routes the new destination through openRouteInOtherPane — the gesture/routing call boundary — so the frontier replacement of the pane-selection helper can change its internals without touching these call sites. Context menus, middle-click, Shift/right-sidebar, guide-page guards, and the annotation-ref plain-click PDF flow are unchanged. Fail-before: all seven Alt+click surface/progression tests red pre-fix (no pane created; Alt fell through to plain-click navigation), the ten existing #283 contract tests green throughout. jsdom render-layer proof; native browser confirmation of the click matrix on a real split remains the manager smoke item."
+  },
+  {
+   "id": "UI-MANAGED-RAPID-JOURNAL-BOUNDARY-MOVE-001",
+   "title": "Rapid uninterrupted Managed Storage commands move one block across several journal-day boundaries without losing commands or flooding errors",
+   "family": "managed-storage",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Martin physical report 2026-08-30"
+   },
+   "platforms": ["all"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result",
+     "scripts/e2e-managed-journal-feed.mjs"
+    ],
+    "scenario": "managed.journal-rapid-multi-day-move",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before: two queued calls captured one source page; the first crossed and the second returned none. The prior deployed binary accepted 120 immediate key events but the marker reached only the preceding journal instead of the fifth loaded day. The queue now contains commands, not precomputed page-pair intents. Each command resolves after its predecessor installs the accepted actor result. The permanent native journey dispatches 120 synthetic Alt+Shift+Down events with zero inter-command delay, requires one exact marker on the fifth loaded journal and no error toast, then separately moves 20 selected roots between named pages by cut/paste and verifies both rendered and durable source/destination state. Exact timing and queue implementation are not user contracts."
   }
  ]
 }

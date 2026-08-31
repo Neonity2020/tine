@@ -303,6 +303,12 @@ export interface Backend {
     bindingGeneration: number,
     request: ManagedApplicationMoveSubtreesRequest,
   ): Promise<ManagedApplicationMoveSubtreesResult>;
+  /** Retire response-replay evidence after the committed page pair is installed. */
+  acknowledgeManagedApplicationMove(
+    bindingGeneration: number,
+    episodeId: string,
+    batchId: string,
+  ): Promise<void>;
   /** Resolve one exact deferred move episode without routing a new gesture. */
   recoverManagedApplicationSubtrees(
     bindingGeneration: number,
@@ -1081,6 +1087,17 @@ class TauriBackend implements Backend {
     return this.call<ManagedApplicationMoveSubtreesResult>("move_managed_application_subtrees", {
       bindingGeneration,
       request,
+    });
+  }
+  acknowledgeManagedApplicationMove(
+    bindingGeneration: number,
+    episodeId: string,
+    batchId: string,
+  ) {
+    return this.call<void>("acknowledge_managed_application_move", {
+      bindingGeneration,
+      episodeId,
+      batchId,
     });
   }
   recoverManagedApplicationSubtrees(

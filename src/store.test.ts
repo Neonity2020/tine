@@ -2621,6 +2621,72 @@ describe("managed actor-owned cross-page moves", () => {
     }
   });
 
+  it("replays rapid journal-boundary move commands against each accepted actor result", async () => {
+    setToasts([]);
+    const moving = { id: "moving", raw: "moving", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+      page("Oldest", "journals/oldest.md", "oldest-r1", [], "journal"),
+    ]);
+    managed();
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let calls = 0;
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
+      calls++;
+      if (calls === 1) await firstMayFinish;
+      if (request.source_path === "journals/today.md") {
+        return {
+          binding_generation: binding,
+          application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+          outcome: {
+            status: "committed" as const,
+            episode_id: request.episode_id,
+            batch_id: "rapid-one",
+            recovered: false,
+            source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+            destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+          },
+        };
+      }
+      expect(request.source_path).toBe("journals/older.md");
+      expect(request.destination_path).toBe("journals/oldest.md");
+      return {
+        binding_generation: binding,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+        outcome: {
+          status: "committed" as const,
+          episode_id: request.episode_id,
+          batch_id: "rapid-two",
+          recovered: false,
+          source: { page: page("Older", "journals/older.md", "older-r3", [], "journal"), revision: "older-r3" },
+          destination: { page: page("Oldest", "journals/oldest.md", "oldest-r2", [moving], "journal"), revision: "oldest-r2" },
+        },
+      };
+    });
+    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove");
+    try {
+      const first = moveBlockFeed("moving", 1);
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      const second = moveBlockFeed("moving", 1);
+      releaseFirst();
+      await expect(Promise.all([first, second])).resolves.toEqual(["crossed", "crossed"]);
+      expect(move).toHaveBeenCalledTimes(2);
+      expect(pageByName("Today")!.roots).toEqual([]);
+      expect(pageByName("Older")!.roots).toEqual([]);
+      expect(pageByName("Oldest")!.roots).toEqual(["moving"]);
+      expect(toasts().filter((toast) => toast.kind === "error")).toEqual([]);
+      expect(acknowledge.mock.calls).toEqual([
+        [managedStorageRuntime.snapshot().applicationPageAdmission!.binding_generation, expect.any(String), "rapid-one"],
+        [managedStorageRuntime.snapshot().applicationPageAdmission!.binding_generation, expect.any(String), "rapid-two"],
+      ]);
+    } finally {
+      acknowledge.mockRestore();
+      move.mockRestore();
+    }
+  });
+
   it("routes a contiguous journal selection through one ordered actor transaction", async () => {
     const t1 = { id: "today", raw: "today", collapsed: false, children: [] };
     const o1 = { id: "older-1", raw: "older 1", collapsed: false, children: [] };

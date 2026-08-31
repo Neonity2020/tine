@@ -290,7 +290,7 @@ and manifest tail.
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
-| application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
+| application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
 | device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
 
 Emergency return publishes the sibling app-private selector
@@ -339,6 +339,16 @@ unchanged to typed conflict trash. Every move rechecks the artifact's physical
 identity and single-link status immediately before publication. A suffix
 lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
 or failed identity recheck is never deleted or selected as authority.
+
+Every Direct Files create, live-name retirement, staged publication, recovery
+restore, and recovery set-aside crosses the typed
+`DurableDirectoryPublication` boundary. The staged inode is flushed before it
+can become live. Windows uses write-through name publication; Unix-like hosts
+use their certified exact-name move plus directory durability policy. Tine
+never acknowledges the save merely because an ordinary rename became visible.
+Successful replacement retires the displaced recovery name through a typed
+`.editor-retired` name before best-effort deletion, so a crash cannot turn an
+unflushed name transition into a reported durable save.
 
 For an existing Direct editor save, the initial exact-file read supplies the
 serialization baseline. The late external-writer proof is the atomic
@@ -1197,6 +1207,15 @@ and digest postings, and uncertain move retries point-query the pending batch
 identity. The derivative may read only the affected page identities and
 materialize those pages from the retained accepted catalog proof. It must not
 decode or validate the graph-sized catalog merely to apply a bounded move.
+Rapid application commands are serialized before their source/destination
+intent is resolved, so each command observes the accepted result of its
+predecessor rather than replaying a stale page pair. Once the frontend installs
+the actor-returned source/destination DTOs, it acknowledges that exact episode
+and batch. The actor revalidates the canonical episode, its completion proof,
+workspace/lineage binding, and accepted-or-visible semantic batch before
+retiring the two response-replay sidecars. The oplog batch remains authority;
+acknowledgement can only bound private response evidence and cannot undo or
+re-run the move.
 
 Page rename discovery follows the same bounded-work rule. An ordinary rename
 may point-read the exact normalized source and target names and range-read the
@@ -1958,8 +1977,9 @@ The remaining save/move gap is no longer receipt publication or repeated
 managed graph directory barriers; it is the turn/journal, graph publication,
 archive, and coalesced completion-index work shown by the exact 10/13 ledgers.
 Direct Files' user-visible Markdown publication keeps its
-temp + fsync + rename + base-revision guard + lock and immediate directory
-barriers unchanged.
+temp + fsync + exact durable name publication + base-revision guard + lock.
+The platform-specific typed publication boundary supplies the name-durability
+guarantee, including write-through publication on Windows.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
 

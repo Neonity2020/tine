@@ -936,6 +936,7 @@ export function mockBackend(): Backend {
         },
       };
     },
+    async acknowledgeManagedApplicationMove(): Promise<void> {},
     async recoverManagedApplicationSubtrees(
       bindingGeneration: number,
       request: ManagedApplicationMoveSubtreesRequest,

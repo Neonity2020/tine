@@ -51,6 +51,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Rapid Managed Storage moves no longer reuse a stale source page and then
+  flood “missing or foreign root” errors.** Repeated cross-day commands now
+  resolve one at a time against the preceding accepted move, while the actor's
+  temporary response-replay files are retired after the committed page pair is
+  installed. A native journey drives 120 uninterrupted move commands across
+  four journal-day boundaries and compares that pressure with a durable
+  20-block cross-page cut/paste.
+
+- **Direct Files saves now use durable write-through name publication on
+  Windows.** Creating, replacing, restoring, and retiring the sole-authority
+  Markdown/Org name all cross the certified typed storage boundary, so a power
+  loss cannot be acknowledged merely because a non-write-through rename was
+  briefly visible.
+
 - **A second device can join a synchronized graph that contains an honest
   duplicate-name backup file.** A fresh scan may choose the earlier-sorting
   backup even though the shared history already owns the canonical page path.

@@ -5567,6 +5567,43 @@
     "failBefore": "The new MS-16 second-device leg copied the initiator's complete graph tree after share preparation. The initiator retained pages/Denní poznámky.md as the page owner and left the later archiv/2026 backup unowned; fresh joiner activation selected the earlier-sorting backup and refused the identical synchronized graph as local-only=1/shared-only=1."
    },
    "notes": "Join keeps fail-closed semantic comparison. It admits the duplicate-path case only for an otherwise untouched fresh activation, when the shared frontier's exact selected file is still present and parses to exactly the shared kind, preamble, outline, and externally imported ids, while the fresh local selection decodes to the same logical page identity. Policy-generated anchor ids are representation metadata and may be visible only in the disk parse. It never rewrites or deletes the duplicate. The focused unit test pins refusal after a local accepted edit, changed/absent provider-selected bytes, and the original semantic-diff diagnostic; the shared host/Android journey pins both duplicate files byte-for-byte and the exact owner path. The one Android app-UID journey proves activation, application save, crash-style reopen, external reconciliation, share, a distinct-device join and reopen, then Tauri's production graceful Return-to-Direct-Files composition."
+  },
+  {
+   "id": "REG-MANAGED-MOVE-EPISODE-ACK-001",
+   "title": "Accepted cross-page moves retire their private response-replay evidence after the frontend installs the authoritative page pair",
+   "family": "managed-storage-resource-lifecycle",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final performance audit"},
+   "platforms": ["all"],
+   "layer": "frontend-native-actor",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::acknowledged_cross_page_move_retires_only_response_replay_evidence",
+     "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result"
+    ],
+    "scenario": "managed.move-episode-ack-bounds-private-response-evidence",
+    "failBefore": "proven by complete production-source census: every cross-page move published episode-<uuid>.bin and .complete and no path retired either file"
+   },
+   "notes": "The acknowledgement is accepted only for one canonical workspace/lineage/episode/batch record with the exact completion bytes and an accepted or still-visible semantic batch. It removes response replay evidence only after the frontend has installed both committed DTOs; oplog authority remains. Failure to acknowledge does not turn a successful move into a false user-visible failure. Interrupted pre-ack and partial-cleanup residue remains a bounded-cleanup follow-up rather than being guessed away."
+  },
+  {
+   "id": "REG-DIRECT-FILES-WINDOWS-DURABLE-NAME-PUBLICATION-001",
+   "title": "A successful Direct Files save durably publishes the sole-authority Markdown or Org name on Windows",
+   "family": "direct-files-data-safety",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
+   "platforms": ["windows", "linux", "macos", "android"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::tests::direct_files_name_publication_stays_on_the_typed_durable_boundary",
+     "crates/tine-core/src/model.rs::tests::a_same_bytes_external_replace_does_not_strand_the_editor",
+     "crates/tine-core/src/model.rs::tests::a_changed_bytes_external_replace_still_conflicts"
+    ],
+    "scenario": "direct-files.windows-write-through-create-replace-retire-restore",
+    "failBefore": "proven from the literal Windows path: Direct Files used raw NtSetInformationFile name changes and the following directory sync was a successful no-op"
+   },
+   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.1 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed."
   }
  ]
 }

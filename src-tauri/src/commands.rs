@@ -1246,6 +1246,35 @@ pub(crate) async fn move_managed_application_subtrees(
     .map_err(|error| error.to_string())?
 }
 
+/// Retire one committed move's private response-replay evidence after the
+/// frontend has installed the authoritative source and destination DTOs.
+#[tauri::command]
+pub(crate) async fn acknowledge_managed_application_move(
+    binding_generation: u64,
+    episode_id: String,
+    batch_id: String,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, context_generation) = owned_graph_context(state)?;
+    if context_generation != binding_generation {
+        return Err(
+            "managed cross-page move acknowledgement belongs to a stale graph binding".into(),
+        );
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let handle = sparse_application_handle(&slot)?.ok_or_else(|| {
+            "managed cross-page move acknowledgement requires managed storage".to_owned()
+        })?;
+        handle
+            .acknowledge_application_move(&episode_id, &batch_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// X1.5 recovery handoff for one exact, already-issued managed move episode.
 /// The helper owns graph lifecycle serialization and may replace only an
 /// already-stopped retained actor with one recovered successor.

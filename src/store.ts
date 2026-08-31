@@ -6619,6 +6619,18 @@ async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Prom
       { ...result.outcome.destination.page, rev: result.outcome.destination.revision },
     );
     if (intent.history) pushManagedMoveHistory(intent.history);
+    try {
+      await backend().acknowledgeManagedApplicationMove(
+        result.binding_generation,
+        result.outcome.episode_id,
+        result.outcome.batch_id,
+      );
+    } catch (error) {
+      // The move and both authoritative page DTOs are already installed. Ack
+      // only bounds private replay evidence; an ack failure must not turn a
+      // successful user operation into a false error or trigger a second move.
+      console.warn("Could not retire managed move replay evidence", error);
+    }
     return true;
   } catch (error) {
     pushToast(`Couldn't move blocks. (${String(error)})`, "error");
@@ -6631,24 +6643,24 @@ async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Prom
   }
 }
 
-function enqueueManagedCrossPageMove(
+function prepareManagedCrossPageMoveIntent(
   sourcePage: string,
   destinationPage: string,
   roots: readonly string[],
   placement: ManagedApplicationMovePlacement,
   rewrites: Map<string, string>,
   recordHistory = true,
-): Promise<boolean> {
+): ManagedCrossPageMoveIntent | null {
   const admission = managedMoveAdmission();
   const sourceInstance = pageInstanceGeneration(sourcePage);
   const destinationInstance = pageInstanceGeneration(destinationPage);
-  if (!admission || sourceInstance === null || destinationInstance === null) return Promise.resolve(false);
+  if (!admission || sourceInstance === null || destinationInstance === null) return null;
   const nodes = roots.map((id) => doc.byId[id]);
-  if (nodes.some((node) => !node || node.page !== sourcePage)) return Promise.resolve(false);
+  if (nodes.some((node) => !node || node.page !== sourcePage)) return null;
   const originalParent = nodes[0].parent;
   if (nodes.some((node) => node.parent !== originalParent)) {
     pushToast("Managed multi-block moves require the selected roots to share one parent.", "error");
-    return Promise.resolve(false);
+    return null;
   }
   const originalSiblings = originalParent === null
     ? pageByName(sourcePage)?.roots
@@ -6658,7 +6670,7 @@ function enqueueManagedCrossPageMove(
     || originalPositions.some((position) => position < 0)
     || originalPositions.some((position, index) => index > 0 && position !== originalPositions[index - 1] + 1)) {
     pushToast("Managed multi-block moves require one contiguous selection.", "error");
-    return Promise.resolve(false);
+    return null;
   }
   const history: ManagedMoveHistorySpec | null = recordHistory ? {
     sourcePage,
@@ -6675,7 +6687,7 @@ function enqueueManagedCrossPageMove(
         .map((id) => [id, doc.byId[id].raw]),
     ),
   } : null;
-  const intent: ManagedCrossPageMoveIntent = {
+  return {
     sourcePage,
     destinationPage,
     roots: [...roots],
@@ -6700,9 +6712,32 @@ function enqueueManagedCrossPageMove(
       return node && roots.includes(node.id) ? context : null;
     })(),
   };
-  const result = managedMoveQueue.then(() => runManagedCrossPageMove(intent));
+}
+
+function enqueueManagedMove<T>(run: () => Promise<T>): Promise<T> {
+  const result = managedMoveQueue.then(run);
   managedMoveQueue = result.then(() => undefined, () => undefined);
   return result;
+}
+
+function enqueueManagedCrossPageMove(
+  sourcePage: string,
+  destinationPage: string,
+  roots: readonly string[],
+  placement: ManagedApplicationMovePlacement,
+  rewrites: Map<string, string>,
+  recordHistory = true,
+): Promise<boolean> {
+  const intent = prepareManagedCrossPageMoveIntent(
+    sourcePage,
+    destinationPage,
+    roots,
+    placement,
+    rewrites,
+    recordHistory,
+  );
+  if (!intent) return Promise.resolve(false);
+  return enqueueManagedMove(() => runManagedCrossPageMove(intent));
 }
 
 /** Before a cross-page move mutates memory, durably flush every SOURCE page while
@@ -6761,7 +6796,7 @@ export async function extendFeedForScroll(): Promise<boolean> {
 
 /** Move a single block one slot, crossing into the adjacent day at a page
  *  boundary. Returns how it moved so the caller can restore the caret. */
-export async function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
+async function moveBlockFeedNow(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
   const node = doc.byId[id];
   if (!node || !blockWritable(id)) return "none";
   if (canMoveItem(id, dir)) {
@@ -6778,19 +6813,31 @@ export async function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" |
   }
   if (admission.authority === "managed_writable") {
     const position = dir === -1 ? pageByName(target)!.roots.length : 0;
-    return (await enqueueManagedCrossPageMove(
+    const intent = prepareManagedCrossPageMoveIntent(
       node.page,
       target,
       [id],
       { placement: "root", position },
       new Map(),
-    )) ? "crossed" : "none";
+    );
+    return intent && await runManagedCrossPageMove(intent) ? "crossed" : "none";
   }
   if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
   if (!doc.byId[id]) return "none"; // vanished during the flush
   pushUndo("move-cross", [node.page, target]);
   crossMoveBlocks([id], node.page, target, dir);
   return "crossed";
+}
+
+/** Managed commands are queued before resolving their source/destination. Key
+ * repeat can otherwise capture several intents against the same pre-move page;
+ * the first commits and every later intent becomes stale (or reaches the actor
+ * as a missing/foreign root). Re-evaluating each command after its predecessor
+ * publishes preserves the user's complete rapid movement sequence. */
+export function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
+  return managedMoveAdmission()
+    ? enqueueManagedMove(() => moveBlockFeedNow(id, dir))
+    : moveBlockFeedNow(id, dir);
 }
 
 /** Move every top-level selected block up/down by one slot, preserving the

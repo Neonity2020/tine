@@ -4331,6 +4331,32 @@ impl SyncRuntimeHandle {
         self.application_request(|reply| ActorRequest::MoveApplicationSubtrees { request, reply })
     }
 
+    /// Retire the replay evidence for one move only after the caller has
+    /// installed the actor's committed page pair. The accepted semantic batch
+    /// remains authoritative; this only bounds the private response-replay
+    /// namespace during long editing sessions.
+    pub fn acknowledge_application_move(
+        &self,
+        episode_id: &str,
+        batch_id: &str,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        let episode_id = Uuid::parse_str(episode_id).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::MalformedPage,
+            )
+        })?;
+        let batch_id = batch_id.parse().map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::MalformedPage,
+            )
+        })?;
+        self.application_request(|reply| ActorRequest::AcknowledgeApplicationMove {
+            episode_id,
+            batch_id,
+            reply,
+        })
+    }
+
     /// Resubmit one exact move request and observe its outcome plus runtime
     /// status from the same actor turn. This is the only in-process recovery
     /// primitive: the durable episode digest remains the authority for replay,
@@ -9550,6 +9576,11 @@ enum ActorRequest {
             Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError>,
         >,
     },
+    AcknowledgeApplicationMove {
+        episode_id: Uuid,
+        batch_id: BatchId,
+        reply: mpsc::Sender<Result<(), SyncApplicationPageRequestError>>,
+    },
     ResolveApplicationMoveSubtrees {
         request: SyncApplicationMoveSubtreesRequest,
         reply: mpsc::Sender<
@@ -9808,6 +9839,15 @@ fn run_actor_loop(
             }
             ActorRequest::MoveApplicationSubtrees { request, reply } => {
                 let result = actor.move_application_subtrees(request);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::AcknowledgeApplicationMove {
+                episode_id,
+                batch_id,
+                reply,
+            } => {
+                let result = actor.acknowledge_application_move(episode_id, batch_id);
                 let _ = reply.send(result);
                 false
             }
@@ -16720,6 +16760,92 @@ impl RuntimeActor {
             return Err(SyncApplicationMoveConflict::BatchCollision);
         }
         Ok(true)
+    }
+
+    fn acknowledge_application_move(
+        &self,
+        episode_id: Uuid,
+        batch_id: BatchId,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        let name = format!("episode-{}.bin", episode_id.simple());
+        let retained = read_optional_regular(
+            &self.move_episode_directory,
+            &name,
+            MOVE_EPISODE_RECORD_MAX_BYTES,
+            None,
+        )
+        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_read"))?
+        .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+            "move_episode_ack_missing",
+        ))?;
+        let record: ApplicationMoveEpisodeRecord =
+            postcard::from_bytes(&retained).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_decode")
+            })?;
+        if record.encode()? != retained
+            || record.schema_version != MOVE_EPISODE_SCHEMA_VERSION
+            || record.workspace_id != self.binding.workspace_id()
+            || record.lineage_digest != self.binding.lineage_digest()
+            || record.episode_id != episode_id
+            || record.batch_id != batch_id
+        {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "move_episode_ack_binding",
+            ));
+        }
+        let completion_name = record.completion_filename();
+        let expected_completion = record.completion_bytes()?;
+        let completion = read_optional_regular(
+            &self.move_episode_directory,
+            &completion_name,
+            MOVE_EPISODE_RECORD_MAX_BYTES,
+            None,
+        )
+        .map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_complete_read")
+        })?
+        .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+            "move_episode_ack_incomplete",
+        ))?;
+        if completion != expected_completion {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "move_episode_ack_complete_collision",
+            ));
+        }
+        match self.application_move_accepted(&record) {
+            Ok(true) => {}
+            Ok(false)
+                if self
+                    .active_engine()
+                    .is_ok_and(|engine| engine.managed_local_batch_is_visible(record.batch_id)) => {
+            }
+            Ok(false) => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_uncommitted",
+                ));
+            }
+            Err(_) => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_collision",
+                ));
+            }
+        }
+
+        // The frontend now owns the committed DTO pair. The semantic batch is
+        // retained by the oplog; these two private files are only response
+        // replay evidence. Remove the record first so a partial cleanup can
+        // never make an incomplete record appear complete on a later retry.
+        self.move_episode_directory
+            .remove_file(&name)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_record_remove")
+            })?;
+        self.move_episode_directory
+            .remove_file(&completion_name)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_complete_remove")
+            })?;
+        Ok(())
     }
 
     fn move_application_subtrees(
@@ -32846,6 +32972,59 @@ mod tests {
         ));
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn acknowledged_cross_page_move_retires_only_response_replay_evidence() {
+        let fixture = ActivationFixture::nested_unicode("acknowledged-cross-page-move", 0xa17710);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("acknowledged move actor opens");
+        let request = simple_application_move_request(&handle, "Acknowledged Cross Page");
+        let destination_path = request.destination_path.clone();
+        let (episode_id, batch_id) = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id,
+                batch_id,
+                ..
+            } => (episode_id, batch_id),
+            other => panic!("acknowledged move did not commit: {other:?}"),
+        };
+        let episode = Uuid::parse_str(&episode_id).unwrap();
+        let directory = fixture
+            .request
+            .application_runtime_root
+            .join("move-episodes");
+        let record = directory.join(format!("episode-{}.bin", episode.simple()));
+        let completion = directory.join(format!("episode-{}.complete", episode.simple()));
+        assert!(record.is_file());
+        assert!(completion.is_file());
+
+        handle
+            .acknowledge_application_move(&episode_id, &batch_id)
+            .expect("installed move acknowledgement retires replay evidence");
+        assert!(!record.exists());
+        assert!(!completion.exists());
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drain_managed_local(&handle);
+        assert!(
+            fs::read_to_string(fixture.graph_root.join(destination_path))
+                .unwrap()
+                .contains("source root")
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }
