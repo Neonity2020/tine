@@ -4604,32 +4604,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn activation_heartbeat_reports_latest_detailed_part_progress() {
-        let latest = Arc::new(Mutex::new(Some(
-            SyncLocalActivationProgress::BootstrapDetachedAuthoring {
-                completed: 2,
-                total: 5,
-            },
-        )));
-        assert_eq!(
-            latest_activation_progress_name(&latest),
-            "bootstrap preparation: detached authoring 2/5 parts"
-        );
-        let event = SparseV2ActivationProgressEvent {
-            binding_generation: 17,
-            progress: latest.lock().unwrap().clone().unwrap(),
-        };
-        let serialized = serde_json::to_value(event).unwrap();
-        assert_eq!(serialized["binding_generation"], 17);
-        assert_eq!(
-            serialized["progress"]["kind"],
-            "bootstrap_detached_authoring"
-        );
-        assert_eq!(serialized["progress"]["completed"], 2);
-        assert_eq!(serialized["progress"]["total"], 5);
-    }
-
     /// A join that finds nothing must not dead-end the user. "This graph does
     /// not yet contain sync data from another device" is true and unactionable:
     /// it names neither the file it looked for nor either ordinary reason it is
@@ -4734,18 +4708,18 @@ mod tests {
         assert_eq!(
             attach_latest_progress_to_activation_result(
                 &mut binding,
-                "bootstrap preparation: sealing",
+                "source capture",
             )
             .as_deref(),
             Some(
-                "Tine-managed storage setup failed during bootstrap preparation: sealing: Permission denied (os error 13)"
+                "Tine-managed storage setup failed during source capture: Permission denied (os error 13)"
             )
         );
         assert_eq!(
             binding.availability,
             SparseV2Availability::Retryable {
                 stage: "shadow_import".into(),
-                detail: "Tine-managed storage setup failed during bootstrap preparation: sealing: Permission denied (os error 13)".into(),
+                detail: "Tine-managed storage setup failed during source capture: Permission denied (os error 13)".into(),
             }
         );
 

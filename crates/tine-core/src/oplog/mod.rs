@@ -219,6 +219,8 @@ pub use wire::SHARED_PROVIDER_TREE_NAMESPACES;
 
 #[cfg(test)]
 mod external_surface_tests {
+    use sha2::{Digest, Sha256};
+
     #[test]
     fn oplog_external_module_surface_is_exactly_the_named_consumers() {
         let production = include_str!("mod.rs")
@@ -231,5 +233,44 @@ mod external_surface_tests {
             .map(|line| line.trim_end_matches(';'))
             .collect::<Vec<_>>();
         assert_eq!(public_modules, ["object_store", "sync_layout"]);
+
+        let mut public_uses = Vec::new();
+        let mut declaration = None::<String>;
+        for line in production.lines() {
+            let trimmed = line.trim();
+            if declaration.is_none() && trimmed.starts_with("pub use ") {
+                declaration = Some(trimmed.to_owned());
+            } else if let Some(current) = declaration.as_mut() {
+                current.push_str(trimmed);
+            }
+            if trimmed.ends_with(';') {
+                if let Some(current) = declaration.take() {
+                    public_uses.push(
+                        current
+                            .chars()
+                            .filter(|character| !character.is_whitespace())
+                            .collect::<String>(),
+                    );
+                }
+            }
+        }
+        assert_eq!(public_uses.len(), 20);
+        let digest = Sha256::digest(public_uses.join("\n").as_bytes());
+        assert_eq!(
+            format!("{digest:x}"),
+            "b6d132b2ba20e79948f703faacb02dc67713dc47d88ea8b1fc7d3d6bbdad889e",
+            "the exact public oplog re-export surface changed"
+        );
+
+        let unexpected_direct_public_items = production
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("pub "))
+            .filter(|line| !line.starts_with("pub mod ") && !line.starts_with("pub use "))
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected_direct_public_items.is_empty(),
+            "unexpected direct public oplog items: {unexpected_direct_public_items:?}"
+        );
     }
 }

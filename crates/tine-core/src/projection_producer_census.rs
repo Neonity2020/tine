@@ -934,16 +934,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         (
-            "crates/tine-core/src/oplog/hot_engine.rs",
-            "cap.remove_dir",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/hot_engine.rs",
-            "cap.remove_dir_all",
-            1,
-        ),
-        (
             "crates/tine-core/src/oplog/identity.rs",
             "libc.openat.create",
             1,
@@ -959,9 +949,8 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "fs.create_dir_all",
             1,
         ),
-        ("crates/tine-core/src/oplog/import.rs", "fs.remove_file", 5),
-        ("crates/tine-core/src/oplog/import.rs", "fs.rename", 2),
-        ("crates/tine-core/src/oplog/import.rs", "open.create_new", 2),
+        ("crates/tine-core/src/oplog/import.rs", "fs.remove_file", 4),
+        ("crates/tine-core/src/oplog/import.rs", "open.create_new", 1),
         (
             "crates/tine-core/src/oplog/lazy_genesis.rs",
             "fs.create_dir",
@@ -1006,7 +995,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "cap.remove_file",
-            4,
+            3,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
@@ -1026,7 +1015,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "open.create_new",
-            3,
+            2,
         ),
         (
             "crates/tine-core/src/oplog/projection_store.rs",
@@ -1317,11 +1306,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("flip_pending_cleanup_round", 1),
         ("stage_object_bytes", 1),
         ("stage_manifest_bytes", 1),
-        ("stage", 24),
-        ("commit", 8),
+        ("stage", 18),
+        ("commit", 6),
         ("publish_immutable", 8),
         ("install_staged_artifact", 1),
-        ("replace_head", 2),
+        ("replace_head", 1),
         ("ensure_shared_provider_directory", 4),
         ("put_complete", 2),
         ("provider_retire_original_into_placeholder", 1),
@@ -1529,11 +1518,6 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
-            "immutable.batch",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
             "immutable.single_writer",
             1,
         ),
@@ -1585,7 +1569,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.2\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1ce230676551bb70c7d165a8a9f9c73939fe3e10203a97d14e81443a55828a31",
+        "1f1760635a82bbfbe3cfa31dad296eebf4d936acbceeb454f58cefd0a9a5adae",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -1886,5 +1870,10 @@ fn census_guard_itself_names_every_required_guard() {
     assert_eq!(
         prefixes,
         BTreeSet::from(["a", "b", "c", "d", "e", "f", "g"])
+    );
+    assert!(
+        include_str!("oplog/mod.rs")
+            .contains("fn oplog_external_module_surface_is_exactly_the_named_consumers()"),
+        "G-14b-a public oplog surface guard must remain present"
     );
 }

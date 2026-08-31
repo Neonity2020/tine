@@ -2359,12 +2359,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     const value = status();
     return value?.state === "refused" ? value : null;
   };
-  const activationPartProgress = () => {
-    const progress = activationProgress();
-    return progress?.kind === "bootstrap_detached_authoring" && progress.total > 0
-      ? progress
-      : null;
-  };
   const activationProgressLabel = () => {
     const progress = activationProgress();
     if (!progress) {
@@ -2372,21 +2366,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       return transition
         ? `${transition.phase.replaceAll("_", " ")}…`
         : "Preparing Tine-managed storage…";
-    }
-    if (progress.kind === "bootstrap_detached_authoring") {
-      return `Building operation history (${progress.completed} of ${progress.total} parts)…`;
-    }
-    if (progress.kind === "bootstrap_preparation_subphase") {
-      return {
-        source_protocol: "Preparing source inventory…",
-        operation_spool: "Planning graph operations…",
-        partition: "Dividing setup work into parts…",
-        detached_authoring: "Building operation history…",
-        sealing: "Sealing prepared history…",
-      }[progress.subphase];
-    }
-    if (progress.kind === "bootstrap_preparation_summary") {
-      return "Prepared graph operation history…";
     }
     if (progress.kind === "readiness_sample") {
       return "Selecting representative pages for the readiness proof…";
@@ -3025,18 +3004,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                   <Show when={enabling()}>
                     <div class="settings-activation-progress" role="status" aria-live="polite">
                       <div class="settings-hint">{activationProgressLabel()}</div>
-                      <Show
-                        when={activationPartProgress()}
-                        fallback={<progress aria-label={activationProgressLabel()} />}
-                      >
-                        {(part) => (
-                          <progress
-                            aria-label={activationProgressLabel()}
-                            value={part().completed}
-                            max={part().total}
-                          />
-                        )}
-                      </Show>
+                      <progress aria-label={activationProgressLabel()} />
                     </div>
                   </Show>
                   <Show when={current().state === "active"}>

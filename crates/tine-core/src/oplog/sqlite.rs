@@ -3726,10 +3726,8 @@ impl SqliteFrontier {
     /// it to the opened database, so the retained workspace lease is never
     /// released between this database and the next one opened from the same
     /// slot.
-    // This is the entry point `local_active::InactiveBootstrapRuntimeSession`
-    // uses, and therefore the one every activation takes. The compatibility twin
-    // above survives only for SQLite-level tests that open a bootstrap database
-    // and never promote it.
+    // Clean activation uses this handoff-aware entry point so the applier slot
+    // remains continuously owned while the physical projection is installed.
 
     /// Compatibility entry point: acquires a temporary
     /// [`WorkspaceRuntimeLease`] internally and keeps it inside the returned
@@ -4851,15 +4849,10 @@ impl SqliteFrontier {
 
     /// Close a fresh build's semantic and materialized-row proof.
     ///
-    /// Ordinary archive rebuilds have no later typed bootstrap proof, so they
-    /// retain both unpublished-candidate scans. Inactive bootstrap activation
-    /// performs its one complete proof after publication and reopen in
-    /// `open_or_rebuild_inactive_bootstrap_authorized` instead.
-    /// Rebuild a fresh inactive bootstrap from durable parts without
-    /// materializing their intentionally incomplete intermediate reference
-    /// catalogs. Every part is still loaded, authenticated, and applied to the
-    /// accepted-prefix tables in order; page/reference rows are seeded once
-    /// from the exact authenticated terminal root.
+    /// Rebuild from sealed accepted history without materializing incomplete
+    /// intermediate reference catalogs. Every record is loaded, authenticated,
+    /// and applied to the accepted-prefix tables in order; page/reference rows
+    /// are seeded once from the exact authenticated terminal root.
     fn terminal_archive_stream(
         &mut self,
         source: &RebuildSource<'_>,
@@ -7579,8 +7572,8 @@ mod applier_lease {
         /// lock and is never touched here, so there is no instant between this
         /// database and the next one opened from the returned lease in which
         /// another process — under any app-data or XDG root — could acquire this
-        /// archive's workspace lease. `local_active::InactiveBootstrapRuntimeSession::promote`
-        /// is the caller: it is the bootstrap -> promoted database handoff.
+        /// archive's workspace lease. This remains a test helper for validating
+        /// continuous ownership across a database handoff.
         #[cfg(test)]
         pub(crate) fn close_retaining_lease(self) -> WorkspaceRuntimeLease {
             let Self { projection, lease } = self;

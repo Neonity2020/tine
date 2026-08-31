@@ -584,34 +584,8 @@ export type SparseV2ActivationPhase =
   | "retained_runtime_projection_repair"
   | "retained_runtime_actor_open";
 
-export type SparseV2BootstrapPreparationSubphase =
-  | "source_protocol"
-  | "operation_spool"
-  | "partition"
-  | "detached_authoring"
-  | "sealing";
-
-export interface SparseV2BootstrapPreparationSummary {
-  source_files: number;
-  source_bytes: number;
-  parser_nodes: number;
-  operations: number;
-  parts: number;
-  prepared_bytes: number;
-  operation_builder_retained_bytes: number;
-  operation_builder_spilled: boolean;
-  source_protocol_micros: number;
-  operation_spool_micros: number;
-  partition_micros: number;
-  detached_authoring_micros: number;
-  sealing_micros: number;
-}
-
 export type SparseV2ActivationProgress =
   | { kind: "phase"; phase: SparseV2ActivationPhase }
-  | { kind: "bootstrap_preparation_subphase"; subphase: SparseV2BootstrapPreparationSubphase }
-  | { kind: "bootstrap_detached_authoring"; completed: number; total: number }
-  | { kind: "bootstrap_preparation_summary"; summary: SparseV2BootstrapPreparationSummary }
   | { kind: "readiness_sample"; largest_page_path: string | null };
 
 export interface SparseV2ActivationProgressEvent {
