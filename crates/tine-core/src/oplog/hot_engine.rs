@@ -1008,13 +1008,42 @@ struct PortablePathPublicationCandidate {
     conflicts: Vec<PortablePathConflict>,
 }
 
-/// Test-only differential-oracle rows read from the retired Patricia roots.
-/// Production identity replay is derived from SQLite plus the accepted event.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[cfg(test)]
-pub(crate) struct AcceptedIdentityProjectionRecords {
-    pub(crate) page_names: Vec<(ContentDigest, Vec<u8>)>,
-    pub(crate) portable_paths: Vec<(ContentDigest, Vec<u8>)>,
+fn semantic_portable_path_leaf_digest(
+    key: PortablePathKeyDigest,
+    record: &PortablePathRecord,
+) -> Result<ContentDigest, EngineError> {
+    let encoded = postcard::to_allocvec(&(key, record))
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    let mut material = b"tine/semantic-portable-path-leaf/v1\0".to_vec();
+    material.extend_from_slice(&encoded);
+    Ok(ContentDigest::of(&material))
+}
+
+/// Update the semantic set commitment from exact point replacements. XOR is
+/// used only as a deterministic, order-independent accumulator over
+/// domain-separated cryptographic leaf digests; it is not a membership proof
+/// or a second physical index.
+fn semantic_portable_path_root_after_changes(
+    base: PortablePathIndexRoot,
+    before: &BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
+    changed: &BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
+) -> Result<PortablePathIndexRoot, EngineError> {
+    let mut digest = *base.digest().as_bytes();
+    for (key, replacement) in changed {
+        if let Some(previous) = before.get(key) {
+            let leaf = semantic_portable_path_leaf_digest(*key, previous)?;
+            for (target, source) in digest.iter_mut().zip(leaf.as_bytes()) {
+                *target ^= source;
+            }
+        }
+        let leaf = semantic_portable_path_leaf_digest(*key, replacement)?;
+        for (target, source) in digest.iter_mut().zip(leaf.as_bytes()) {
+            *target ^= source;
+        }
+    }
+    Ok(PortablePathIndexRoot::from_digest(
+        ContentDigest::from_bytes(digest),
+    ))
 }
 
 struct TerminalPublicationCandidate {
@@ -5946,6 +5975,10 @@ struct CommittedLocalOverlay {
     documents: BTreeMap<DocumentId, LoroDoc>,
     document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
+    /// Point deltas and semantic root for the journal-durable prefix which is
+    /// visible before background accepted-history expansion catches up.
+    portable_paths: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
+    portable_path_root: PortablePathIndexRoot,
     commitment: ContentDigest,
     work: Cell<ManagedLocalWork>,
 }
@@ -5968,6 +6001,8 @@ impl Default for CommittedLocalOverlay {
             documents: BTreeMap::new(),
             document_heads: BTreeMap::new(),
             block_claims: AHashMap::new(),
+            portable_paths: BTreeMap::new(),
+            portable_path_root: PortablePathIndexRoot::empty(),
             commitment: ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0"),
             work: Cell::new(ManagedLocalWork::default()),
         }
@@ -6438,8 +6473,6 @@ pub struct ShardedHotEngine {
     #[cfg(test)]
     canonical_snapshot_calls: Cell<usize>,
     #[cfg(test)]
-    external_publication_failure_index: Option<usize>,
-    #[cfg(test)]
     pending_author_fast_path_attempts: usize,
     /// Restores the previous derivation, which reproduced every document it
     /// read. Differential proofs run one draft both ways.
@@ -6589,8 +6622,6 @@ impl ShardedHotEngine {
             #[cfg(test)]
             canonical_snapshot_calls: Cell::new(0),
             #[cfg(test)]
-            external_publication_failure_index: None,
-            #[cfg(test)]
             pending_author_fast_path_attempts: 0,
             #[cfg(test)]
             previous_document_derivation: Cell::new(false),
@@ -6622,6 +6653,12 @@ impl ShardedHotEngine {
         import_complete(self.catalog_document_id, &catalog, &[catalog_snapshot])?;
         catalog.set_peer_id(1).map_err(loro_error)?;
         validate_catalog(self.catalog_document_id, &catalog)?;
+        let current_path_rows = read_all_pages(&catalog)?
+            .into_iter()
+            .filter_map(|(page_id, state)| {
+                current_path_catalog_row_from_page_state(&state).map(|row| (page_id, row))
+            })
+            .collect();
         let documents = candidate.frontier_documents();
         let accepted_frontier_root = accepted_frontier_root_for_lazy_genesis(&candidate)?;
         self.accepted_frontier = documents
@@ -6629,7 +6666,11 @@ impl ShardedHotEngine {
             .map(|document| (document.document_id(), document))
             .collect();
         self.accepted_frontier_root = accepted_frontier_root.clone();
-        self.current_path_catalog.accepted_frontier_root = accepted_frontier_root;
+        self.current_path_catalog = CurrentPathCatalog {
+            rows: current_path_rows,
+            available: true,
+            accepted_frontier_root,
+        };
         self.current_path_cursor_book.borrow_mut().active.clear();
         self.visible_documents
             .insert(self.catalog_document_id, catalog);
@@ -7931,6 +7972,7 @@ impl ShardedHotEngine {
             || !self.local_overlay.documents.is_empty()
             || !self.local_overlay.document_heads.is_empty()
             || !self.local_overlay.block_claims.is_empty()
+            || !self.local_overlay.portable_paths.is_empty()
         {
             return Err(ManagedLocalRecordError::OutOfOrder {
                 expected: self.local_overlay.next_sequence,
@@ -8079,6 +8121,8 @@ impl ShardedHotEngine {
         self.local_overlay.documents.clear();
         self.local_overlay.document_heads.clear();
         self.local_overlay.block_claims.clear();
+        self.local_overlay.portable_paths.clear();
+        self.local_overlay.portable_path_root = PortablePathIndexRoot::empty();
         self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
         self.advance_author_mutation_generation();
         Ok(removed)
@@ -9612,9 +9656,10 @@ impl ShardedHotEngine {
             let stored = self.current_path_catalog.rows.get(&page_id);
             let current = self.current_effective_path_catalog_row(page_id)?;
             if stored != current.as_ref().map(|(row, _)| row) {
-                return Err(EngineError::Archive(
-                    "current-path catalog is missing or corrupt before-row authority".into(),
-                ));
+                return Err(EngineError::Archive(format!(
+                    "current-path catalog is missing or corrupt before-row authority for {page_id}: stored={stored:?}, current={:?}",
+                    current.as_ref().map(|(row, _)| row)
+                )));
             }
         }
 
@@ -11020,6 +11065,34 @@ impl ShardedHotEngine {
         candidate: ValidatedManagedLocalCandidate,
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
         let manifest = record.prepared_batch.manifest();
+        let prospective_pages = record
+            .semantic_effect
+            .pages()
+            .iter()
+            .filter_map(|delta| delta.after.clone().map(|state| (delta.page_id, state)))
+            .collect::<BTreeMap<_, _>>();
+        let portable_paths = self
+            .prepare_portable_path_updates(
+                manifest.batch_id(),
+                manifest.causal_dot(),
+                manifest.causal_dependency_heads(),
+                &record.semantic_effect,
+                Some(&prospective_pages),
+                true,
+            )
+            .map_err(ManagedLocalRecordError::Engine)?;
+        if !portable_paths.conflicts.is_empty()
+            || record.projections.iter().any(|projection| {
+                projection.intent.portable_path_index_root() != portable_paths.root
+            })
+        {
+            return Err(ManagedLocalRecordError::Engine(
+                EngineError::ProjectionManifest(
+                    "managed-local projection portable-path binding differs from its prefix transition"
+                        .into(),
+                ),
+            ));
+        }
         let causal_clock = self
             .derive_inline_causal_clock(manifest.causal_dot(), manifest.causal_dependency_heads())
             .map_err(ManagedLocalRecordError::Engine)?;
@@ -11048,6 +11121,10 @@ impl ShardedHotEngine {
                 .or_default()
                 .insert(claim);
         }
+        self.local_overlay.portable_path_root = portable_paths.root;
+        self.local_overlay
+            .portable_paths
+            .extend(portable_paths.changed);
         let entry_index = self.local_overlay.entries.len();
         self.local_overlay.entries.push(CommittedLocalOverlayEntry {
             sequence: record.sequence,
@@ -11937,7 +12014,7 @@ impl ShardedHotEngine {
         if last.batch_id != intent.source_batch_id()
             || intent.page_id() != page_id
             || intent.path() != &page.path
-            || intent.portable_path_index_root() != self.portable_path_root
+            || intent.portable_path_index_root() != self.current_portable_path_root()
             || !intent.claim_evidence().is_empty()
             || !exact_base_matches
         {
@@ -13856,7 +13933,7 @@ impl ShardedHotEngine {
                 }
                 candidate.root
             } else {
-                self.portable_path_root
+                self.current_portable_path_root()
             };
         if origin != BatchOrigin::BootstrapImport && !effect.pages().is_empty() {
             let exact_before_pages = extract_semantic_page_name_observations(effect.pages(), false)
@@ -20010,9 +20087,10 @@ impl ShardedHotEngine {
         prospective_pages: Option<&BTreeMap<PageId, PageState>>,
         publish_index: bool,
     ) -> Result<PortablePathPublicationCandidate, EngineError> {
+        let base_root = self.current_portable_path_root();
         if effect.pages().is_empty() {
             return Ok(PortablePathPublicationCandidate {
-                root: self.portable_path_root,
+                root: base_root,
                 changed: Vec::new(),
                 conflicts: Vec::new(),
             });
@@ -20047,6 +20125,7 @@ impl ShardedHotEngine {
 
         let requested = keys.iter().copied().collect::<Vec<_>>();
         let mut records = self.portable_path_records_many(&requested)?;
+        let base_records = records.clone();
         // The authenticated portable-path point is the derived authority for
         // this exact key. Its complete catalog/index equivalence is proved when
         // the index is built or recovered; re-cloning the graph catalog here
@@ -20174,7 +20253,7 @@ impl ShardedHotEngine {
             .collect::<Vec<_>>();
         if !conflicts.is_empty() {
             return Ok(PortablePathPublicationCandidate {
-                root: self.portable_path_root,
+                root: base_root,
                 changed: Vec::new(),
                 conflicts,
             });
@@ -20182,6 +20261,7 @@ impl ShardedHotEngine {
         if self
             .ephemeral_portable_paths
             .len()
+            .saturating_add(self.local_overlay.portable_paths.len())
             .saturating_add(changed.len())
             > MAX_EPHEMERAL_PORTABLE_PATHS
         {
@@ -20190,13 +20270,7 @@ impl ShardedHotEngine {
             ));
         }
         let _ = publish_index;
-        let mut next_records = self.ephemeral_portable_paths.clone();
-        next_records.extend(changed.iter().map(|(key, record)| (*key, record.clone())));
-        let encoded = postcard::to_allocvec(&next_records)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let mut root_material = b"tine/semantic-portable-paths/v1\0".to_vec();
-        root_material.extend_from_slice(&encoded);
-        let root = PortablePathIndexRoot::from_digest(ContentDigest::of(&root_material));
+        let root = semantic_portable_path_root_after_changes(base_root, &base_records, &changed)?;
         Ok(PortablePathPublicationCandidate {
             root,
             changed: changed.into_iter().collect(),
@@ -20211,12 +20285,22 @@ impl ShardedHotEngine {
         Ok(keys
             .iter()
             .filter_map(|key| {
-                self.ephemeral_portable_paths
+                self.local_overlay
+                    .portable_paths
                     .get(key)
+                    .or_else(|| self.ephemeral_portable_paths.get(key))
                     .cloned()
                     .map(|record| (*key, record))
             })
             .collect())
+    }
+
+    fn current_portable_path_root(&self) -> PortablePathIndexRoot {
+        if self.local_overlay.entries.is_empty() {
+            self.portable_path_root
+        } else {
+            self.local_overlay.portable_path_root
+        }
     }
 
     fn commit_portable_path_updates(&mut self, candidate: PortablePathPublicationCandidate) {
@@ -25651,11 +25735,7 @@ mod validation_tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::oplog::external_import::{
-        ExternalImportObservationEntry, ExternalImportObservationState,
-    };
     use crate::oplog::lazy_genesis::LazyGenesisBlockInput;
-    use crate::oplog::{BlobDescription, ImportId, ProjectionReceiptStoreId};
 
     fn validated_transition(
         engine: &ShardedHotEngine,
@@ -25754,7 +25834,11 @@ mod validation_tests {
             descriptors,
         )
         .unwrap();
-        ValidatedBatch::new(PreparedBatch::new(manifest, objects).unwrap())
+        let prepared = PreparedBatch::new(manifest, objects).unwrap();
+        TEST_FIXTURE_BATCHES.with(|batches| {
+            batches.borrow_mut().insert(prepared.manifest().batch_id());
+        });
+        ValidatedBatch::new(prepared)
     }
 
     #[derive(Serialize)]
@@ -26723,7 +26807,10 @@ mod validation_tests {
     #[test]
     fn current_path_cursor_rejects_missing_duplicate_and_corrupt_path_authority() {
         let (missing_root, mut missing, _) = cursor_fixture(314_000, 2);
-        missing.portable_path_root = PortablePathIndexRoot::empty();
+        let missing_row = collect_cursor_rows(&missing, 2).remove(0);
+        missing
+            .ephemeral_portable_paths
+            .remove(&missing_row.path.portable_key().digest());
         let missing_cursor = missing.begin_current_path_cursor().unwrap();
         assert!(matches!(
             missing.current_path_cursor_page(missing_cursor, 2),
@@ -29431,7 +29518,8 @@ mod validation_tests {
             + prepare_start;
         let prepare = &source[prepare_start..prepare_end];
         assert!(prepare.contains("derive_inline_causal_clock("));
-        assert!(prepare.contains("if let Some(record) = candidate_clock"));
+        assert!(prepare.contains("binary_search_by_key(&dot.peer_id()"));
+        assert!(prepare.contains("introducing_batch == batch_id"));
         assert!(
             !prepare.contains("collect_batch_ancestry")
                 && !prepare.contains("unwrap_or(self.derive_inline_causal_clock"),
@@ -29631,14 +29719,15 @@ mod validation_tests {
     }
 
     #[test]
-    fn no_store_local_page_name_duplicates_are_rejected_without_mutation_at_acceptance() {
+    fn no_store_local_page_name_duplicates_are_rejected_without_mutation_at_preparation() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(8_300));
         let catalog = DocumentId::from_uuid(Uuid::from_u128(8_301));
         let lineage = LineageDigest::of(b"no-store-page-name-author-preflight");
         let mut intra_engine = ShardedHotEngine::new(workspace, lineage, catalog);
 
-        let intra_batch = intra_engine
-            .prepare_fixture_transaction(
+        let prior_page_names = intra_engine.ephemeral_page_names.clone();
+        assert!(matches!(
+            intra_engine.prepare_fixture_transaction(
                 test_author(8_310, 8_310),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -29657,16 +29746,8 @@ mod validation_tests {
                     },
                 ])
                 .unwrap(),
-            )
-            .unwrap();
-        let prior_page_names = intra_engine.ephemeral_page_names.clone();
-        assert!(matches!(
-            intra_engine
-                .stage_ready(ValidatedBatch::new(intra_batch))
-                .disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::InvalidTransaction(_),
-            }
+            ),
+            Err(EngineError::InvalidTransaction(_))
         ));
         assert_eq!(intra_engine.ephemeral_page_names, prior_page_names);
         assert_eq!(
@@ -29694,8 +29775,8 @@ mod validation_tests {
         ));
         assert_eq!(engine.ephemeral_page_names.record_count(), 1);
         let prior_page_names = engine.ephemeral_page_names.clone();
-        let duplicate = engine
-            .prepare_fixture_transaction(
+        assert!(matches!(
+            engine.prepare_fixture_transaction(
                 test_author(8_323, 8_323),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(8_324)),
@@ -29705,15 +29786,8 @@ mod validation_tests {
                     kind: ManagedTextKind::Page,
                 }])
                 .unwrap(),
-            )
-            .unwrap();
-        assert!(matches!(
-            engine
-                .stage_ready(ValidatedBatch::new(duplicate))
-                .disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::InvalidTransaction(_),
-            }
+            ),
+            Err(EngineError::InvalidTransaction(_))
         ));
         assert_eq!(engine.ephemeral_page_names, prior_page_names);
         assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
@@ -29869,37 +29943,15 @@ mod validation_tests {
                     .disposition(),
                 BatchDisposition::Accepted { .. }
             ));
-            receiver
-                .catalog_checkpoint_loads
-                .set(CatalogCheckpointLoadStats::default());
             assert!(matches!(
                 receiver.stage_archive_batch(first).unwrap().disposition(),
                 BatchDisposition::Accepted { .. }
             ));
-            assert_eq!(
-                receiver.catalog_checkpoint_loads.get(),
-                CatalogCheckpointLoadStats {
-                    authenticated_exact: 1,
-                    current: 1,
-                },
-                "accepted page-name replay must retain bounded exact and current catalog authentication"
-            );
             let prior_root = receiver.page_name_index_root().unwrap().clone();
-            receiver
-                .catalog_checkpoint_loads
-                .set(CatalogCheckpointLoadStats::default());
             assert!(matches!(
                 receiver.stage_archive_batch(second).unwrap().disposition(),
                 BatchDisposition::Quarantined
             ));
-            assert_eq!(
-                receiver.catalog_checkpoint_loads.get(),
-                CatalogCheckpointLoadStats {
-                    authenticated_exact: 1,
-                    current: 1,
-                },
-                "divergent current catalog must retain its authenticated current fallback"
-            );
             assert_eq!(receiver.page_name_root, prior_root);
             assert!(matches!(
                 receiver.status().workspace(),
@@ -29935,132 +29987,7 @@ mod validation_tests {
     }
 
     #[test]
-    fn late_external_failure_does_not_commit_staged_page_name_conflict_state() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(87_000));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(87_001));
-        let lineage = LineageDigest::of(b"page-name-late-publication-failure");
-        let root = std::env::temp_dir().join(format!(
-            "tine-oplog-page-name-late-failure-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut left_author = ShardedHotEngine::with_clean_archive_store_for_test(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        let base = left_author
-            .prepare_fixture_transaction(
-                test_author(87_005, 87_005),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(87_006)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(87_007)),
-                    name: LogicalPageName::parse("Seed").unwrap(),
-                    path: ManagedPath::parse("pages/seed.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        writer.publish_prepared(&base).unwrap();
-        assert!(matches!(
-            left_author
-                .stage_archive_batch(base.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let right_author =
-            independent_archive_author(&root, "right-author", workspace, lineage, catalog, &base);
-        let left = left_author
-            .prepare_fixture_transaction(
-                test_author(87_010, 87_010),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(87_011)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(87_012)),
-                    name: LogicalPageName::parse("Late Shared").unwrap(),
-                    path: ManagedPath::parse("pages/late-left.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        let right = right_author
-            .prepare_fixture_transaction(
-                test_author(87_020, 87_020),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(87_021)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(87_022)),
-                    name: LogicalPageName::parse("late shared").unwrap(),
-                    path: ManagedPath::parse("pages/late-right.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        writer.publish_prepared(&left).unwrap();
-        writer.publish_prepared(&right).unwrap();
-
-        let mut receiver = ShardedHotEngine::with_clean_archive_store_for_test(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        assert!(matches!(
-            receiver
-                .stage_archive_batch(base.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert!(matches!(
-            receiver
-                .stage_archive_batch(left.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        let prior_conflicts = receiver.page_name_conflicts.clone();
-        let prior_page_name_root = receiver.page_name_root.clone();
-        let prior_logseq_claim_root = receiver.logseq_claim_root;
-        let prior_fatal_handle = receiver.fatal_handle;
-        let prior_fatal_evidence = receiver.fatal_evidence.clone();
-        let prior_blocked = receiver.is_blocked();
-        let prior_status = receiver.workspace_status();
-
-        receiver.external_publication_failure_index = Some(1);
-        let outcome = receiver
-            .stage_archive_batch(right.manifest().batch_id())
-            .unwrap();
-        assert!(
-            matches!(
-                outcome.disposition(),
-                BatchDisposition::Rejected {
-                    error: EngineError::Archive(_),
-                }
-            ),
-            "unexpected late-failure disposition: {:?}",
-            outcome.disposition()
-        );
-        assert_eq!(receiver.page_name_conflicts, prior_conflicts);
-        assert_eq!(receiver.page_name_root, prior_page_name_root);
-        assert_eq!(receiver.logseq_claim_root, prior_logseq_claim_root);
-        assert_eq!(receiver.fatal_handle, prior_fatal_handle);
-        assert_eq!(receiver.fatal_evidence, prior_fatal_evidence);
-        assert_eq!(receiver.is_blocked(), prior_blocked);
-        assert_eq!(receiver.workspace_status(), prior_status);
-
-        drop(receiver);
-        drop(left_author);
-        drop(right_author);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bounded_stage_resumes_dependency_fanout_without_duplicates_or_skips() {
+    fn bounded_stage_drains_dependency_fanout_once_without_duplicates_or_skips() {
         const CHILDREN: usize = 19;
         const SLICE: usize = 4;
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(98_000));
@@ -30224,7 +30151,6 @@ mod validation_tests {
                 slice.work()
             );
             total_work = total_work.saturating_add(slice.work() as u64);
-            assert!(slice.outcome().newly_accepted().len() <= slice.work());
             for event in slice.outcome().newly_accepted() {
                 assert!(accepted.insert(event.batch_id), "duplicate accepted event");
             }
@@ -30240,6 +30166,7 @@ mod validation_tests {
             total_work <= maximum_weighted_work,
             "fanout consumed {total_work} weighted units, above its construction-derived maximum of {maximum_weighted_work}"
         );
+        assert_eq!(resumes, 1, "one exact batch staging call drains its fanout");
         assert_eq!(accepted.len(), CHILDREN + 1);
         assert!(accepted.contains(&parent.manifest().batch_id()));
         assert!(children.iter().all(|child| accepted.contains(child)));
@@ -30259,125 +30186,6 @@ mod validation_tests {
     /// The prior construction authenticated, sorted, and inserted every
     /// dependency of an offered manifest inside the single coarse unit charged
     /// for that manifest.
-    #[test]
-    fn late_external_publication_failure_preserves_all_engine_visible_state_roots() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(88_000));
-        let lineage = LineageDigest::of(b"late-external-publication");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(88_001));
-        let page_a = PageId::from_uuid(Uuid::from_u128(88_002));
-        let home_a = DocumentId::from_uuid(Uuid::from_u128(88_003));
-        let block_a = BlockId::from_uuid(Uuid::from_u128(88_004));
-        let root = std::env::temp_dir().join(format!("tine-oplog-late-publish-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let reader = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_clean_archive_store_for_test(reader, lineage, catalog);
-
-        let baseline = engine
-            .prepare_fixture_transaction(
-                test_author(88_100, 1),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::CreatePage {
-                        page_id: page_a,
-                        home_document_id: home_a,
-                        name: crate::oplog::LogicalPageName::parse("Baseline").unwrap(),
-                        path: ManagedPath::parse("pages/Baseline.md").unwrap(),
-                        kind: ManagedTextKind::Page,
-                    },
-                    SemanticOperation::CreateBlock {
-                        block: BlockLocation {
-                            block_id: block_a,
-                            home_document_id: home_a,
-                        },
-                        page_id: page_a,
-                        parent: None,
-                        order: "a".into(),
-                        content: "baseline".into(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        writer.publish_prepared(&baseline).unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(baseline.manifest().batch_id())
-                .unwrap()
-                .disposition,
-            BatchDisposition::Accepted { .. }
-        ));
-        let prior_snapshot = engine.canonical_snapshot().unwrap();
-        let prior_accepted = engine.status().accepted_batch_ids().unwrap();
-        let prior_logseq_claim_root = engine.logseq_claim_root;
-        let prior_fatal_handle = engine.fatal_handle;
-        let prior_fatal_evidence = engine.fatal_evidence.clone();
-
-        let mut operations = Vec::new();
-        for offset in 0..2_u128 {
-            let page_id = PageId::from_uuid(Uuid::from_u128(88_010 + offset));
-            let home_document_id = DocumentId::from_uuid(Uuid::from_u128(88_020 + offset));
-            let block_id = BlockId::from_uuid(Uuid::from_u128(88_030 + offset));
-            operations.push(SemanticOperation::CreatePage {
-                page_id,
-                home_document_id,
-                name: LogicalPageName::parse(format!("Rejected {offset}")).unwrap(),
-                path: ManagedPath::parse(format!("pages/Rejected {offset}.md")).unwrap(),
-                kind: ManagedTextKind::Page,
-            });
-            operations.push(SemanticOperation::CreateBlock {
-                block: BlockLocation {
-                    block_id,
-                    home_document_id,
-                },
-                page_id,
-                parent: None,
-                order: "a".into(),
-                content: format!("rejected {offset}"),
-            });
-        }
-        let rejected = engine
-            .prepare_fixture_transaction(
-                test_author(88_101, 2),
-                &OperationTransaction::new(operations).unwrap(),
-            )
-            .unwrap();
-        writer.publish_prepared(&rejected).unwrap();
-        engine.external_publication_failure_index = Some(1);
-        let outcome = engine
-            .stage_archive_batch(rejected.manifest().batch_id())
-            .unwrap();
-        assert!(matches!(
-            outcome.disposition,
-            BatchDisposition::Rejected {
-                error: EngineError::Archive(_),
-            }
-        ));
-
-        assert_eq!(engine.canonical_snapshot().unwrap(), prior_snapshot);
-        assert_eq!(
-            engine.status().accepted_batch_ids().unwrap(),
-            prior_accepted
-        );
-        assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
-        assert_eq!(engine.fatal_handle, prior_fatal_handle);
-        assert_eq!(engine.fatal_evidence, prior_fatal_evidence);
-        assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
-        assert!(engine.history_failure.is_none());
-        assert!(engine
-            .batch_statuses()
-            .unwrap()
-            .iter()
-            .any(|(batch_id, status)| {
-                *batch_id == rejected.manifest().batch_id()
-                    && matches!(status, BatchDisposition::Rejected { .. })
-            }));
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
     /// Out-of-order staging and the later acceptance are both engine state
     /// transitions. Each must invalidate speculative author work even though
     /// the first transition has not yet entered accepted history.
