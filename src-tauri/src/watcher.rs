@@ -1884,18 +1884,25 @@ fn sparse_observations(
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
-        if relative.components().next().is_some_and(|component| {
-            component
-                .as_os_str()
-                .to_str()
-                .is_some_and(|name| name == ".tine-sync" || name.eq_ignore_ascii_case("assets"))
-        }) {
-            continue;
-        }
-        let observation = relative
+        let Some(relative) = relative
             .to_str()
             .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
-            .and_then(|relative| SyncWatcherObservation::managed_path(relative).ok());
+        else {
+            unknown = true;
+            continue;
+        };
+        // Exact native callbacks must use the same fixed graph-text exclusions
+        // as the poll/full-scan lane. Otherwise Tine's own Logseq backups (and
+        // other excluded trees) bypass the scope as exact ManagedPath events,
+        // then fail when reconciliation correctly refuses to read them.
+        if !managed_poll_scope().should_descend(&relative) {
+            continue;
+        }
+        let observation = managed_poll_relevant(root, path)
+            .then(|| SyncWatcherObservation::managed_path(relative))
+            .transpose()
+            .ok()
+            .flatten();
         match observation {
             Some(observation) => observations.push(observation),
             None => unknown = true,
@@ -3915,6 +3922,18 @@ mod tests {
         let exact = HashSet::from([root.join("assets/image.png")]);
         let ambiguous = HashSet::from([root.join("assets/nested")]);
         assert!(sparse_observations(&root, &exact, &ambiguous, false, false).is_empty());
+    }
+
+    #[test]
+    fn sparse_watcher_never_routes_logseq_backup_observation_into_the_managed_actor() {
+        let root = PathBuf::from("/graph");
+        let backup =
+            root.join("logseq/bak/journals/2026_08_31/2026-08-31T15_34_34.562Z.Desktop.md");
+        let exact = HashSet::from([backup.clone()]);
+        let ambiguous = HashSet::from([backup.parent().unwrap().to_path_buf()]);
+
+        assert!(sparse_observations(&root, &exact, &HashSet::new(), false, false).is_empty());
+        assert!(sparse_observations(&root, &HashSet::new(), &ambiguous, false, false).is_empty());
     }
 
     #[test]

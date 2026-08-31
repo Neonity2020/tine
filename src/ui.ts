@@ -1932,8 +1932,17 @@ export const [toasts, setToasts] = createSignal<Toast[]>([]);
 export function pushToast(
   message: string,
   kind: Toast["kind"] = "info",
-  opts: { sticky?: boolean; action?: { label: string; run: () => void }; onDismiss?: () => void } = {}
+  opts: {
+    sticky?: boolean;
+    dedupe?: boolean;
+    action?: { label: string; run: () => void };
+    onDismiss?: () => void;
+  } = {}
 ): number {
+  if (opts.dedupe) {
+    const existing = toasts().find((toast) => toast.kind === kind && toast.message === message);
+    if (existing) return existing.id;
+  }
   const id = ++toastSeq;
   setToasts([...toasts(), { id, message, kind, sticky: opts.sticky, action: opts.action, onDismiss: opts.onDismiss }]);
   if (!opts.sticky) setTimeout(() => dismissToast(id), 3200);

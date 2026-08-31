@@ -5652,6 +5652,25 @@
     "failBefore": "proven"
    },
    "notes": "A theme author told by `tine-theme.mjs check` that a package passes must not then have it rejected on install. The checker asked only for portedFrom.source, portedFrom.revision and a non-empty authors array, so an unsupported ecosystem, a missing relationship, name or license, an unknown provenance field, an over-long author list and non-text values all cleared intake and were refused by parseThemeManifest in the app. The checker now mirrors that parser field for field. The contract is one-directional and encoded as such: the checker may refuse more than the app (the SPDX allow-list, required screenshots and the dotted id are registry intake policy), never less. plugin-sdk/schema/theme.schema.json and docs/themes/README.md were already correct; the CLI was the single drifted authority, and the new test pins all three together."
+  },
+  {
+   "id": "REG-MANAGED-WATCHER-LOGSEQ-BACKUP-FLOOD-001",
+   "title": "Logseq backup writes cannot enter Managed Storage reconciliation or flood diagnostics",
+   "family": "managed-storage-watcher-scope",
+   "sources": {"issues": [], "commits": [], "internal": "Martin field report 2026-08-31"},
+   "platforms": ["all"],
+   "layer": "tauri-watcher-and-frontend-feedback",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/watcher.rs::tests::sparse_watcher_never_routes_logseq_backup_observation_into_the_managed_actor",
+     "src-tauri/src/watcher.rs::tests::the_managed_poll_gate_arms_on_every_shape_the_direct_gate_catches",
+     "src/ui.toast.test.ts::keeps one visible report for repeated identical runtime diagnostics"
+    ],
+    "scenario": "managed-journal-feed excludedBackupNoise plus rapidMultiDayMove",
+    "failBefore": "proven: an exact inotify path under logseq/bak became a ManagedPath observation even though poll/full-scan discovery excluded the same path"
+   },
+   "notes": "The exact-event lane now consults the same fixed GraphTextScope exclusions as managed poll/full-scan discovery before constructing a watcher observation. The release journey creates the reported logseq/bak/journals/<day>/<timestamp>.Desktop.md shape after activation and then runs the rapid multi-day move stress. As a final presentation backstop, identical visible Managed Storage diagnostic toasts are deduplicated while one remains on screen."
   }
  ]
 }
