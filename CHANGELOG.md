@@ -59,6 +59,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   resource ceilings. (GH #393)
 
 ### Fixed
+- Sidebar: the left sidebar's scrollbar can be grabbed with the mouse again. The drag-to-resize strip along the sidebar's edge was drawn on top of it, so on Windows the sidebar could be resized but never scrolled by dragging; the strip now sits beside the scrollbar rather than over it ([GH #435](https://github.com/martinkoutecky/tine/issues/435)).
+- Outline: clicking a block's fold arrow no longer folds the entire subtree. The guide line beside the children (which folds every descendant) was drawn on top of the fold arrow's leftmost pixels, so an aim that landed slightly left of centre hit the wrong control. The guide now stops at the arrow's edge ([GH #423](https://github.com/martinkoutecky/tine/issues/423)).
+- Theme packaging: `tine-theme.mjs check` no longer certifies a ported theme that Tine then refuses to install. It checked only the upstream source, revision and author list, so an unsupported `portedFrom.ecosystem`, a missing `relationship`, `name` or `license`, or an unknown provenance field passed the registry check and failed on install. The checker now holds `portedFrom` to the same vocabulary the app installs against ([GH #410](https://github.com/martinkoutecky/tine/issues/410)).
 
 - **Links to local files and folders now open.** A link written the Logseq way
   (`[Test](file://D:\test.txt)`) or the Obsidian way

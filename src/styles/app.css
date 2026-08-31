@@ -33,6 +33,9 @@ body {
    a monospace shorthand later in this file; safety must survive those rules. */
 :root {
   --tine-editable-emoji-font: "Noto Emoji Variable";
+  /* Width of the sidebar's drag-to-resize strip, and of the gutter the sidebar
+     reserves so that strip never lands on top of the scrollbar (GH #435). */
+  --sidebar-resizer-width: 7px;
   /* One named owner for system-inset gutters. Browser/iOS surfaces use CSS
      env() values. MainActivity already sizes Android's WebView inside the
      native insets, so main.tsx selects `native-viewport` before render and the
@@ -153,6 +156,21 @@ textarea {
 .left-sidebar-scroll {
   height: 100%;
   overflow-y: auto;
+  /* GH #435: the resize strip is absolutely positioned over this element's right
+     edge — which is exactly where a classic (Windows) scrollbar lives, so the
+     strip was on top of the scrollbar and the user could resize the sidebar but
+     never grab the bar. A transparent right border moves the scrollbar inboard
+     by the strip's own width, so the two occupy disjoint columns and moving a
+     few pixels left reaches the scrollbar, as the reporter asked. The border is
+     transparent, so `.left-sidebar`'s background shows through unchanged.
+     scripts/check-sidebar-resizer-scrollbar.mjs holds the two apart. */
+  border-right: var(--sidebar-resizer-width) solid transparent;
+}
+
+/* In the mobile drawer the resize strip is hidden (below), so the sidebar keeps
+   its full width. */
+.app-container[data-mobile-drawer-mode="true"] .left-sidebar-scroll {
+  border-right-width: 0;
 }
 
 /* One restrained scrollbar vocabulary for the three primary outline surfaces.
@@ -223,7 +241,9 @@ textarea {
   position: absolute;
   top: 0;
   right: 0;
-  width: 7px;
+  /* One width for the strip and for the gutter `.left-sidebar-scroll` reserves
+     for it; they must not drift apart or the strip covers the scrollbar again. */
+  width: var(--sidebar-resizer-width);
   height: 100%;
   cursor: col-resize;
   z-index: 20;
@@ -4944,14 +4964,22 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   margin-left: var(--ls-block-indent);
 }
 
+/* GH #423: this bulk "fold every descendant" target was 14px wide and, being
+   z-index:1, was painted ON TOP of the leftmost 5px of the per-block fold arrow
+   next to it — so 5 of the arrow's 18 pixels folded the whole subtree instead
+   of one block, which is what the reporter kept hitting. It now stops at the
+   arrow's edge: 5px, centred on the 1px line it draws. OG (og-1.0.0 block.css
+   .block-children-left-border) uses 4px. Spanning the full height of the
+   children block keeps it easy to hit deliberately.
+   scripts/check-outline-guide-hitbox.mjs holds this geometry. */
 .block-children-left-border {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: -9px;
+  left: -5px;
   z-index: 1;
-  width: 14px;
-  min-width: 14px;
+  width: 5px;
+  min-width: 5px;
   height: auto;
   margin: 0;
   padding: 0;

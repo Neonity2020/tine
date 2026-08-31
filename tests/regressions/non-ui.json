@@ -5634,6 +5634,24 @@
     "failBefore": "The compiler-enforced source guard failed on the MS-19 candidate: managed activation retired the Direct selector with plain remove_file and Android initial binding creation flushed the file but not its parent entry."
    },
    "notes": "Both the Direct selector and managed binding now use one app-private sole-writer wrapper over tine-storage DurableDirectoryPublication. Create and exact replace are collision-aware; retirement durably moves exact bytes outside the selector grammar before best-effort cleanup. The change does not route Direct Files through managed history and does not add a Managed Storage format or migration path."
+  },
+  {
+   "id": "REG-THEME-CHECKER-PROVENANCE-410",
+   "title": "The registry theme checker certifies a ported theme that Tine then refuses to install",
+   "family": "theme-package-intake",
+   "sources": {"issues": [410], "commits": []},
+   "platforms": ["all"],
+   "layer": "node-cli-and-frontend-parser",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/themes/themeCheckerCli.test.ts::never certifies a port record the app would refuse to install",
+     "src/themes/themeCheckerCli.test.ts::keeps the published schema, the checker and the app on one vocabulary"
+    ],
+    "scenario": "themes.ported-theme-intake",
+    "failBefore": "proven"
+   },
+   "notes": "A theme author told by `tine-theme.mjs check` that a package passes must not then have it rejected on install. The checker asked only for portedFrom.source, portedFrom.revision and a non-empty authors array, so an unsupported ecosystem, a missing relationship, name or license, an unknown provenance field, an over-long author list and non-text values all cleared intake and were refused by parseThemeManifest in the app. The checker now mirrors that parser field for field. The contract is one-directional and encoded as such: the checker may refuse more than the app (the SPDX allow-list, required screenshots and the dotted id are registry intake policy), never less. plugin-sdk/schema/theme.schema.json and docs/themes/README.md were already correct; the CLI was the single drifted authority, and the new test pins all three together."
   }
  ]
 }
