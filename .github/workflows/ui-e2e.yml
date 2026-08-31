@@ -151,6 +151,8 @@ jobs:
           E2E_MANAGED_TOTAL_FILE_COUNT: ${{ inputs.managed_total_file_count }}
           E2E_MANAGED_ASSET_LOGICAL_BYTES: ${{ inputs.managed_asset_logical_bytes }}
           E2E_MANAGED_CURRENT_ONLY: ${{ inputs.managed_current_only }}
+          E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"
+          E2E_SCENARIO_TIMEOUT_MS: "2700000"
         run: npm run e2e:windows:smoke -- --scenario=${{ matrix.scenario }}
       - name: Upload Windows E2E evidence
         if: always()

@@ -429,6 +429,19 @@ at both scales. These are diagnostic debug-build figures, not a user-facing
 latency budget; the absolute time remains material and release-filesystem
 measurements are still required before treating it as representative.
 
+The later GH #396 reporter-scale receipt uses the release profile and selects
+12,000 pages explicitly:
+
+```bash
+TINE_ACTIVATION_PAGE_COUNTS=12000 rtk cargo test -p tine-core --release --lib activation_scaled_manual_phase_receipt -- --ignored --nocapture
+```
+
+It reports activation, cold actor open, initial-feed settle, total cold-ready
+time, and paired Direct Files/Managed Storage logical page-open summaries. The
+MS-17 exact candidate measured 18.089 s activation, 345 ms actor open, 1.697 s
+feed settle, and 2.041 s total cold-ready time; logical page-open p50/p95 was
+0.081/0.090 ms in Direct Files and 0.353/0.411 ms in Managed Storage.
+
 ## Deferred
 
 - **Tab-switch** and **per-keystroke typing** metrics — dropped from this pass

@@ -194,8 +194,13 @@ assert.match(
 );
 assert.match(uiE2eWorkflow, /windows-smoke:[\s\S]*?timeout-minutes: 75/);
 assert.match(
+  uiE2eWorkflow,
+  /E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "2700000"/,
+  "the Windows managed-storage activation deadline can outrun its scenario failure capsule"
+);
+assert.match(
   windowsManagedScenario,
-  /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);[\s\S]*?managedPageSwitch/,
+  /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
   "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
 );
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
