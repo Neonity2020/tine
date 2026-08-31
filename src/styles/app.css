@@ -1480,9 +1480,30 @@ textarea {
   gap: 8px;
   padding: 5px 8px;
   border-radius: 6px;
-  cursor: pointer;
   color: var(--text-secondary);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* GH #464. A sidebar row is far wider than the page name in it, and all of that
+   width used to be the link: the hand cursor followed the pointer out over empty
+   space, and a reorder drag that ended a little short of the 4px threshold
+   navigated instead of moving the row. Only the TITLE is the link now — in the
+   cursor and in the hit test (`onLabel` in Sidebar.tsx) — and the rest of the
+   row belongs to the drag. This is also what Logseq does. `.nav-item` (Journals)
+   is one indivisible row with nothing to reorder, so it keeps the whole-row
+   link. */
+.nav-item,
+.nav-page-more {
+  cursor: pointer;
+}
+.nav-page-label {
+  cursor: pointer;
+  /* Sized to its own text, so the blank remainder of the row is genuinely blank
+     — but still the element that truncates, since the row is `overflow: hidden`
+     and a flex item will not shrink below its content without `min-width: 0`. */
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1601,6 +1622,12 @@ textarea {
   padding-top: 3px;
   padding-bottom: 3px;
   gap: 4px;
+  /* Favorites are the rows that reorder, so their spare width says so (GH #464).
+     The title inside still shows the link cursor. */
+  cursor: grab;
+}
+#sidebar-favorites-list .nav-page:active {
+  cursor: grabbing;
 }
 /* The insertion line starts where the row WOULD land, so a drop that nests is
    visibly different from one that does not before the pointer is released. A

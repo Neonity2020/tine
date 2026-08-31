@@ -199,6 +199,16 @@ export function Sidebar(props: {
   // text-selection AND middle-click autoscroll up front (GH #207 — the old
   // shift-only guard let the middle gesture leak to the browser here).
   const shiftGuard = internalLinkMouseDown;
+  // GH #464: the link is the page TITLE, not the row. A row stretches the full
+  // width of the sidebar, so most of it was blank space that still opened a
+  // page — the hand cursor followed the pointer out over nothing, and a reorder
+  // drag that fell short of the 4px threshold navigated instead of moving the
+  // row. The remainder of the row is grab space now. `closest` rather than
+  // `===`, so the ⭐ prefix and an emoji <img> inside the title still count as
+  // the title. The context menu deliberately stays on the whole row: it is not
+  // navigation, it cannot be confused with a drag, and right-clicking anywhere
+  // on a row to get that page's menu is worth keeping.
+  const onLabel = (e: Event) => !!(e.target as HTMLElement | null)?.closest(".nav-page-label");
   const openRowMenu = (e: MouseEvent, name: string, kind: PageKind) => {
     e.preventDefault();
     openPageContextMenu(e.clientX, e.clientY, name, kind);
@@ -327,7 +337,7 @@ export function Sidebar(props: {
                         onPointerDown={(e) => startFavoriteDrag(i(), e)}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
-                          if (rowReorderClickSuppressed()) return;
+                          if (rowReorderClickSuppressed() || !onLabel(e)) return;
                           const dest = internalLinkDest(e);
                           if (dest === "pane") {
                             // Alt+click (GH #438): the same other-pane route the
@@ -337,9 +347,10 @@ export function Sidebar(props: {
                             openRouteInOtherPane({ kind: "page", name: t.name, pageKind: t.kind });
                           } else openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
                         }}
-                        onAuxClick={(e) =>
-                          internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"))
-                        }
+                        onAuxClick={(e) => {
+                          if (!onLabel(e)) return;
+                          internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"));
+                        }}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           openSidebarPageTarget(name, itemKind(name), "context", { x: e.clientX, y: e.clientY });
@@ -348,8 +359,10 @@ export function Sidebar(props: {
                         {toggle}
                         {/* ⭐ + name via EmojiText: WebKitGTK's Skia COLRv1 path
                             crashes painting a raw color-emoji glyph on hardened
-                            libstdc++ (#29); Twemoji <img> never touches the font. */}
-                        <EmojiText text={`⭐ ${name}`} />
+                            libstdc++ (#29); Twemoji <img> never touches the font.
+                            Wrapped in .nav-page-label: that span IS the link, and
+                            everything beside it is grab space (GH #464). */}
+                        <span class="nav-page-label"><EmojiText text={`⭐ ${name}`} /></span>
                       </div>
                     );
                   }}
@@ -391,19 +404,23 @@ export function Sidebar(props: {
                         classList={{ active: isActive(target().name, target().path) }}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
+                          if (!onLabel(e)) return;
                           const dest = internalLinkDest(e);
                           if (dest === "sidebar") openPageInSidebar(target());
                           else if (dest === "background") openPageTargetInNewTab(target());
                           else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target() });
                           else { openPageTarget(target()); props.onActiveNavigationComplete?.(); }
                         }}
-                        onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(target()))}
+                        onAuxClick={(e) => {
+                          if (!onLabel(e)) return;
+                          internalLinkAuxClick(e, () => openPageTargetInNewTab(target()));
+                        }}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           openPageContextMenu(e.clientX, e.clientY, target());
                         }}
                       >
-                        <EmojiText text={r.name.startsWith("hls__") ? r.name.slice(5) : r.name} />
+                        <span class="nav-page-label"><EmojiText text={r.name.startsWith("hls__") ? r.name.slice(5) : r.name} /></span>
                       </div>
                     );
                   }}
@@ -432,6 +449,7 @@ export function Sidebar(props: {
                   classList={{ active: isActive(p.name, p.path) }}
                   onMouseDown={shiftGuard}
                   onClick={(e) => {
+                    if (!onLabel(e)) return;
                     const dest = internalLinkDest(e);
                     if (dest === "sidebar") openPageInSidebar({ name: p.name, pageKind: "page", path: p.path });
                     else if (dest === "background") p.path
@@ -440,18 +458,19 @@ export function Sidebar(props: {
                     else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: p.name, pageKind: "page", ...(p.path ? { path: p.path } : {}) });
                     else openEntry(p.path, p.name);
                   }}
-                  onAuxClick={(e) =>
+                  onAuxClick={(e) => {
+                    if (!onLabel(e)) return;
                     internalLinkAuxClick(e, () =>
                       p.path
                         ? openInNewTab({ kind: "page", name: p.name, pageKind: "page", path: p.path })
-                        : openPageInNewTab(p.name, "page"))
-                  }
+                        : openPageInNewTab(p.name, "page"));
+                  }}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     openPageContextMenu(e.clientX, e.clientY, { name: p.name, pageKind: "page", path: p.path });
                   }}
                 >
-                  <EmojiText text={pageLabel()(p)} />
+                  <span class="nav-page-label"><EmojiText text={pageLabel()(p)} /></span>
                 </div>
               )}
             </For>
