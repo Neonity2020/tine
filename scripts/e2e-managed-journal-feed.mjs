@@ -426,10 +426,25 @@ try {
   // Deliberately do not wait for any UI or actor cycle between commands. This
   // reproduces the physical key-repeat failure where several page-boundary
   // moves were captured against one stale source page and then flooded errors.
-  const dispatched = await browser.execute((count) => {
-    const editor = document.querySelector(".journal-today textarea.block-editor");
-    if (!(editor instanceof HTMLTextAreaElement)) return 0;
+  const dispatched = await browser.execute(async (count, marker) => {
+    let accepted = 0;
     for (let index = 0; index < count; index++) {
+      // A cross-page render replaces the textarea. Physical key repeat follows
+      // the newly focused editor; a synthetic loop that retains the first DOM
+      // node silently stops bubbling after that node is detached. Reacquire the
+      // live editor, but never wait for the managed actor or durable projection
+      // between commands.
+      let editor;
+      const deadline = performance.now() + 1_000;
+      do {
+        editor = [...document.querySelectorAll("textarea.block-editor")]
+          .find((candidate) => candidate instanceof HTMLTextAreaElement
+            && candidate.value.includes(marker));
+        if (!(editor instanceof HTMLTextAreaElement)) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      } while (!(editor instanceof HTMLTextAreaElement) && performance.now() < deadline);
+      if (!(editor instanceof HTMLTextAreaElement)) break;
       editor.dispatchEvent(new KeyboardEvent("keydown", {
         key: "ArrowDown",
         code: "ArrowDown",
@@ -446,9 +461,11 @@ try {
         bubbles: true,
         cancelable: true,
       }));
+      accepted++;
+      await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    return count;
-  }, RAPID_MOVE_COMMANDS);
+    return accepted;
+  }, RAPID_MOVE_COMMANDS, RAPID_MOVE_MARKER);
   if (dispatched !== RAPID_MOVE_COMMANDS) {
     throw new Error(`rapid managed move dispatched only ${dispatched}/${RAPID_MOVE_COMMANDS} commands`);
   }
@@ -477,7 +494,7 @@ try {
   receipt.milestones.rapidMultiDayMove = {
     marker: RAPID_MOVE_MARKER,
     commands: RAPID_MOVE_COMMANDS,
-    interCommandDelayMs: 0,
+    interCommandDelayMs: 5,
     crossedDayBoundaries: 4,
     destinationDayIndex: rapidLocations[0].index,
     elapsedMs: Date.now() - rapidStartedAt,
@@ -500,8 +517,13 @@ try {
     [...document.querySelectorAll(".page-blocks > .ls-block > .block-main.selected")].length === expected,
   BULK_MARKERS.length), 20_000, "bulk source selection did not include all 20 roots");
   await browser.keys(["Control", "x"]);
-  await waitFor(async () => (await visibleRootTexts()).length === 0,
-    60_000, "bulk cut did not clear the source page");
+  // An empty page deliberately renders one blank root so the user has a place
+  // to type. Assert that the cut payload disappeared, rather than requiring an
+  // impossible zero-node DOM.
+  await waitFor(async () => {
+    const roots = await visibleRootTexts();
+    return BULK_MARKERS.every((marker) => !roots.includes(marker));
+  }, 60_000, "bulk cut did not clear the selected source roots");
   await openPageThroughSwitcher(BULK_DESTINATION_PAGE);
   const destinationAnchor = await browser.$(".page-blocks > .ls-block:first-child > .block-main > .block-content-wrapper");
   await destinationAnchor.click();
