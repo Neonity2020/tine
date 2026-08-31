@@ -203,7 +203,8 @@ describe("modified-click contract on internal links (GH #283)", () => {
     setFavorites([{ name: "Fav One", kind: "page" }]);
     const m = mount(() => <Sidebar />);
     try {
-      const row = [...m.root.querySelectorAll<HTMLElement>("#sidebar-favorites-list .nav-page")][0];
+      // GH #464: the page TITLE is the link, not the whole row.
+      const row = [...m.root.querySelectorAll<HTMLElement>("#sidebar-favorites-list .nav-page-label")][0];
       expect(row).toBeTruthy();
       click(row, { shiftKey: true });
       expect(rightSidebar().length).toBeGreaterThan(0);
@@ -369,7 +370,8 @@ describe("Alt+click opens the link in the other pane (GH #438)", () => {
     setFavorites([{ name: "Fav One", kind: "page" }]);
     const m = mount(() => <Sidebar />);
     try {
-      const row = [...m.root.querySelectorAll<HTMLElement>("#sidebar-favorites-list .nav-page")][0];
+      // GH #464: the page TITLE is the link, not the whole row.
+      const row = [...m.root.querySelectorAll<HTMLElement>("#sidebar-favorites-list .nav-page-label")][0];
       expect(row).toBeTruthy();
       openPage("Elsewhere", "page");
       click(row, { altKey: true });

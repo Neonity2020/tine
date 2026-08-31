@@ -62,7 +62,10 @@ function mountThreeFavorites() {
   document.body.appendChild(root);
   const dispose = render(() => <Sidebar />, root);
   const rows = () => [...root.querySelectorAll<HTMLElement>("#sidebar-favorites-list .nav-page")];
-  return { root, dispose, rows };
+  // GH #464: a click navigates from the page TITLE, not from anywhere in the
+  // row — the rest of the row is grab space for this very drag.
+  const title = (row: HTMLElement) => row.querySelector<HTMLElement>(".nav-page-label")!;
+  return { root, dispose, rows, title };
 }
 
 describe("favorites drag reorder (GH #211)", () => {
@@ -160,7 +163,7 @@ describe("favorites drag reorder (GH #211)", () => {
   });
 
   it("keeps an ordinary click navigating (sub-threshold press does not reorder)", () => {
-    const { dispose, rows } = mountThreeFavorites();
+    const { dispose, rows, title } = mountThreeFavorites();
     const second = rows()[1]!;
     setRect(second, 0, 30, 200, 30);
 
@@ -170,13 +173,13 @@ describe("favorites drag reorder (GH #211)", () => {
 
     expect(favorites().map((f) => f.name)).toEqual(["Alpha", "Beta", "Gamma"]);
     expect(rowReorderClickSuppressed()).toBe(false);
-    second.click();
+    title(second).click();
     expect(route()).toMatchObject({ kind: "page", name: "Beta" });
     dispose();
   });
 
   it("the click that ends a completed drag is swallowed; a later click navigates", async () => {
-    const { root, dispose, rows } = mountThreeFavorites();
+    const { root, dispose, rows, title } = mountThreeFavorites();
     const [first, second] = rows();
     setRect(first, 0, 0, 200, 30);
     setRect(second, 0, 30, 200, 30);
@@ -193,11 +196,11 @@ describe("favorites drag reorder (GH #211)", () => {
     expect(favorites().map((f) => f.name)).toEqual(["Beta", "Alpha", "Gamma"]);
 
     // The drop's synthesized click is suppressed — no navigation.
-    (root.querySelector("#sidebar-favorites-list .nav-page") as HTMLElement).click();
+    title(root.querySelector("#sidebar-favorites-list .nav-page") as HTMLElement).click();
     expect(route()).toMatchObject({ kind: "journals" });
 
     await new Promise((r) => setTimeout(r, 5));
-    (root.querySelector("#sidebar-favorites-list .nav-page") as HTMLElement).click();
+    title(root.querySelector("#sidebar-favorites-list .nav-page") as HTMLElement).click();
     expect(route()).toMatchObject({ kind: "page", name: "Beta" });
     dispose();
   });

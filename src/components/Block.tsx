@@ -635,7 +635,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
                 macro={macro}
                 owner={instanceId}
                 outlineScope={outlineScope}
-                trailing={
+                refCountBadge={
                   // OG's per-block reference-count badge: shown only when the block
                   // is referenced. Plain click toggles the referrers panel below;
                   // shift-click opens the block in the sidebar (matching OG and the
@@ -834,7 +834,11 @@ function Rendered(props: {
   headingLevel: () => number | null;
   macro: () => { kind: "query" | "embed"; inner: string } | null;
   owner?: string;
-  trailing?: JSX.Element;
+  // The reference-count badge. It is a RIGHT FLOAT and must therefore be the
+  // FIRST child of `.block-content`: a float attaches to the line box that is
+  // current when the browser reaches it, so emitting it last parked it on the
+  // block's LAST line once the text wrapped (GH #454).
+  refCountBadge?: JSX.Element;
   outlineScope?: OutlineScope | null;
 }): JSX.Element {
   const node = props.node;
@@ -951,6 +955,12 @@ function Rendered(props: {
       style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
     >
+      {/* First, before any text: the badge floats right, and a float rides the
+          line box that is current where it appears in the flow. Emitted last it
+          sat on the block's final line, so a wrapped block dropped it a full
+          line below the rest of its header chips (GH #454). Emitted first it
+          rides the block's first line and the text flows around it. */}
+      {props.refCountBadge}
       {/* One gate for the whole header-chip group. Every chip below needs a
           marker or a priority, so an ordinary prose block — the overwhelming
           majority on a large page — evaluates ONE condition instead of three,
@@ -1039,7 +1049,6 @@ function Rendered(props: {
         </span>
       </Show>
       </Show>
-      {props.trailing}
     </div>
     </Show>
   );

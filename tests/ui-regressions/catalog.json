@@ -9542,6 +9542,82 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: driving search from the keyboard reaches the same destinations as the mouse \u2014 Ctrl/Cmd+Enter fans the highlighted result into a background tab and leaves the switcher open, so several results can be opened without searching again. Classification: blocking stateful UX (the modifier is already learned from the click established by GH #288 and did nothing on the keyboard). Root cause: the Enter handler implemented Shift and Alt but had no Ctrl/Cmd rung, so the chord fell through to plain navigation. Page and block rows only, matching the click; create and command rows keep their existing single action. Fail-before: with the new branch removed the switcher closes and no tab is added."
+    },
+    {
+      "id": "UI-BULLET-FIRST-LINE-459",
+      "title": "A block's bullet sits on the vertical centre of that block's first line of text, at every heading level and under every typography theme",
+      "family": "outline-controls",
+      "sources": {
+        "issues": [
+          459
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-block-first-line-alignment.mjs"
+        ],
+        "scenario": "outline-controls.bullet-first-line-alignment",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: the bullet reads as belonging to its line, and a column of bullets lines up with the column of text. Classification: flexible presentation, accepted as a defect because a user reported it on daily use. Root cause: .block-controls carried a literal height:26px chosen to match .block-content's line-height, but .block-content also has padding:2px 0, so centring inside the shorter column put every bullet in the graph exactly 2.00px above the middle of its own first line - and 4.00px above it under the editorial-serif typography preset, which raises the line box to 30px but could not move a literal. Fix: two tokens (--ls-block-line-height, --ls-block-content-pad-y) own the first line in one place; .block-content, .block-editor and the bullet column all derive from them, and the typography preset retunes the token instead of the content rule. Fail-before is quantitative: the guard reported 71 misplaced bullets, -2.00px on every measurable journal block and -4.00px under editorial-serif; after the fix every plain block is within 0.5px. Headings keep their own taller bullet column (.bullet-h1/h2/h3, ~1.2x the heading line box) and are deliberately unchanged - h1 still sits ~2px off its line centre; the guard holds them within 3px so a change to the ordinary column cannot silently drag them. jsdom applies no CSS layout, so headless-Chromium geometry is the only layer that can observe this; the oracle is derived from each element's own computed padding-top and line-height, never from a pixel constant, so a fix that cancelled one error with one constant would fail under the serif preset."
+    },
+    {
+      "id": "UI-BLOCKREF-BADGE-FIRST-LINE-454",
+      "title": "The reference-count badge sits on the block's first line, not on its last, when the block wraps",
+      "family": "block-refs",
+      "sources": {
+        "issues": [
+          454
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-block-first-line-alignment.mjs",
+          "src/components/Block.blockRefsCountPlacement.test.tsx"
+        ],
+        "scenario": "block-refs.count-badge-first-line",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: the count badge stays where the reader expects it - level with the top of the block, matching what a one-line block already looks like - instead of dropping to the bottom-right corner of a long block. Classification: flexible presentation, accepted because a user reported it. Root cause: .block-refs-count is float:right and was emitted as the LAST child of .block-content, so the float attached to the line box that was current when the browser reached it, i.e. the final line. Measured before the fix on the kitchen-sink referenced block: badge top = content top + 2px on one line (right), +28px once the column was narrowed enough to wrap (one full 26px line too low). Fix: the badge is emitted FIRST inside .block-content, so its float attaches to the first line box and the text flows around it; a right float does not disturb the block's own box, so nothing reflows vertically. Checked in a browser that a leading block-level child (code fence, table, blockquote) is not overlapped either - each shrinks or clears beside the float. The badge keeps its behaviour (plain click opens the referrers panel, shift-click opens the block in the right sidebar). Two layers: the browser guard measures the wrapped case that only CSS layout can show, and a render test pins the DOM order the float placement depends on, since jsdom can see the order but not the geometry."
+    },
+    {
+      "id": "UI-SIDEBAR-ROW-LINK-HITBOX-464",
+      "title": "Only the page title in a left-sidebar row navigates; the blank remainder of the row does not, and dragging a favourite by its title reorders it instead of opening it",
+      "family": "sidebar-navigation",
+      "sources": {
+        "issues": [
+          464
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Sidebar.rowHitbox.test.tsx"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: grabbing a sidebar row to move it does not navigate away, and the empty space to the right of a short page name is not a link. Classification: blocking stateful UX - the reporter lost his place in the graph while reordering, on Windows 10, daily. Root cause: .nav-item/.nav-page painted cursor:pointer across the whole flex row and the click/auxclick handlers lived on the row, so every pixel of it opened a page - including the blank remainder that looks like padding, which is exactly where a drag is grabbed and where a press that falls short of rowReorder's 4px threshold lands. Recent and All-pages rows made it worse: they offer a row-wide link with no drag semantics at all. Fix: the title is its own .nav-page-label element, navigation (click and auxclick) is gated on it in all three lists, the pointer cursor moved to the label, and favourites rows advertise their spare width with grab/grabbing. Context menu deliberately keeps the whole row: it is not navigation and cannot be confused with a drag. The 4px threshold and rowReorder's post-drag click suppression are unchanged - they already worked, and the test proves a title-grabbed drag reorders without navigating. OG provenance: the reporter is right that Logseq makes only the text clickable; the hover highlight still spans the row in both. Evidence at the render layer because what is asserted is which element answers a click and what a drag does to the order, both observable in jsdom; necessity gate: 5 of the 6 assertions fail against pre-fix Sidebar.tsx. Label sizing was checked separately in a real browser (label sized to its text at 80-94px in a 222px row, long names still truncating with an ellipsis, row cursor default and label cursor pointer) - that is presentation and is not a blocking assertion."
     }
   ]
 }
