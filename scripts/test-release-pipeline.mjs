@@ -77,6 +77,10 @@ const issue295Scenario = fs.readFileSync(
   path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
   "utf8"
 );
+const windowsManagedScenario = fs.readFileSync(
+  path.join(process.cwd(), "scripts/e2e-windows-managed-storage.mjs"),
+  "utf8"
+);
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
 const iosConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), "src-tauri/tauri.ios.conf.json"), "utf8"));
@@ -187,6 +191,12 @@ assert.match(
   uiE2eWorkflow,
   /managed_current_only:[\s\S]*?inputs\.windows_scenario == 'windows-managed-storage' && inputs\.managed_current_only != 'true'[\s\S]*?E2E_MANAGED_CURRENT_ONLY: \$\{\{ inputs\.managed_current_only \}\}/,
   "the focused Windows managed-storage lane cannot compare current-only activation and reopen without restoring the historical binary"
+);
+assert.match(uiE2eWorkflow, /windows-smoke:[\s\S]*?timeout-minutes: 75/);
+assert.match(
+  windowsManagedScenario,
+  /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);[\s\S]*?managedPageSwitch/,
+  "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
 );
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);

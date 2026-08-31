@@ -47311,7 +47311,10 @@ mod tests {
             let handle = reopened
                 .handle
                 .expect("scaled fixture cold reopen retains its actor");
+            let feed_started = Instant::now();
             drive_initial_feed_with_turn_budget(&handle, total_pages.saturating_add(128));
+            let initial_feed_settle = feed_started.elapsed();
+            let cold_ready_ms = cold_started.elapsed().as_millis();
             let mut managed_page_open = Vec::with_capacity(sample_count);
             for entry in &page_samples {
                 let started = Instant::now();
@@ -47323,8 +47326,9 @@ mod tests {
             let managed_page_open_p50 = startup_median(&managed_page_open);
             let managed_page_open_p95 = startup_p95(&managed_page_open);
             eprintln!(
-                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} page_samples={sample_count} direct_page_open_p50_ms={:.3} direct_page_open_p95_ms={:.3} managed_page_open_p50_ms={:.3} managed_page_open_p95_ms={:.3} source_bytes={} blocks={} phases={:?} clean={:?}",
+                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} initial_feed_settle_ms={:.3} cold_ready_ms={cold_ready_ms} page_samples={sample_count} direct_page_open_p50_ms={:.3} direct_page_open_p95_ms={:.3} managed_page_open_p50_ms={:.3} managed_page_open_p95_ms={:.3} source_bytes={} blocks={} phases={:?} clean={:?}",
                 receipt.total_ms,
+                startup_ms(initial_feed_settle),
                 startup_ms(direct_page_open_p50),
                 startup_ms(direct_page_open_p95),
                 startup_ms(managed_page_open_p50),
@@ -47335,8 +47339,8 @@ mod tests {
                 receipt.clean,
             );
             assert!(
-                managed_page_open_p95 < Duration::from_millis(20),
-                "managed 12k-scale logical page open exceeded the interactive backend budget: p50={managed_page_open_p50:?} p95={managed_page_open_p95:?}"
+                managed_page_open_p95 < Duration::from_millis(5),
+                "managed {total_pages}-page logical page open exceeded the 5 ms interactive backend budget: p50={managed_page_open_p50:?} p95={managed_page_open_p95:?}"
             );
             assert!(matches!(
                 handle.clean_shutdown(),

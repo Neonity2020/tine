@@ -97,7 +97,7 @@ jobs:
     name: Windows x64 ${{ matrix.scenario }} real-app smoke
     if: ${{ inputs.linux_scenario == '' }}
     runs-on: windows-latest
-    timeout-minutes: 55
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:

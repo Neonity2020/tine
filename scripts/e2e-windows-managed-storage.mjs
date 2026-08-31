@@ -33,6 +33,14 @@ const TOTAL_FILE_COUNT = Number(process.env.E2E_MANAGED_TOTAL_FILE_COUNT || 25_8
 const ASSET_LOGICAL_BYTES = Number(process.env.E2E_MANAGED_ASSET_LOGICAL_BYTES || 25_200_000_000);
 const ACTIVATION_TIMEOUT_MS = Number(process.env.E2E_MANAGED_ACTIVATION_TIMEOUT_MS || 30 * 60_000);
 const CURRENT_ONLY = process.env.E2E_MANAGED_CURRENT_ONLY === "true";
+const canonicalExecutable = (value) => fs.realpathSync(value).toLocaleLowerCase("en-US");
+const candidateExecutable = canonicalExecutable(APP);
+const activationExecutable = canonicalExecutable(BASELINE_APP);
+if (CURRENT_ONLY !== (candidateExecutable === activationExecutable)) {
+  throw new Error(
+    `managed mode/executable mismatch: currentOnly=${CURRENT_ONLY} candidate=${candidateExecutable} activation=${activationExecutable}`,
+  );
+}
 for (const [name, value, minimum] of [
   ["E2E_MANAGED_PAGE_COUNT", PAGE_COUNT, 2],
   ["E2E_MANAGED_BLOCKS_PER_PAGE", BLOCKS_PER_PAGE, 1],
@@ -319,11 +327,11 @@ async function openPage(title, { expectedMarker = nestedMarker, requireHeading =
 
 function timingReceipt(samples) {
   const ordered = [...samples].sort((a, b) => a - b);
-  const p95 = ordered[Math.max(0, Math.ceil(ordered.length * 0.95) - 1)];
   return {
     samples: ordered.length,
+    interaction: "open visible switcher, type exact title, choose result, wait for heading and page marker",
+    minMs: ordered[0],
     p50Ms: ordered[Math.floor(ordered.length / 2)],
-    p95Ms: p95,
     maxMs: ordered[ordered.length - 1],
   };
 }
@@ -462,6 +470,16 @@ const receipt = {
   blocksPerPage: BLOCKS_PER_PAGE,
   graph: inventory,
   candidateOnly: CURRENT_ONLY,
+  executables: {
+    candidate: {
+      path: candidateExecutable,
+      sha256: crypto.createHash("sha256").update(fs.readFileSync(APP)).digest("hex"),
+    },
+    activation: {
+      path: activationExecutable,
+      sha256: crypto.createHash("sha256").update(fs.readFileSync(BASELINE_APP)).digest("hex"),
+    },
+  },
   graphPathKinds: ["nested", "unicode", "markdown", "parseable-non-roundtripping-markdown", "many-assets", "sparse-large-asset"],
   milestones: {},
 };
@@ -478,22 +496,28 @@ try {
   receipt.milestones.activationMs = Date.now() - activationStarted;
   assertSameSource(before, "managed activation");
   await closeSettings();
-  // v0.6.94 may publish the managed page shell while leaving its body blank.
-  // That is predecessor evidence for #370, not a reason to abort before the
-  // candidate gets a chance to recover the same private state.  Require the
-  // candidate below to serve the actual marker.
-  await openPage(nestedTitle, { expectedMarker: null, requireHeading: false });
-  receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
-  if (receipt.milestones.baselineManagedPageBodyVisible) {
+  if (CURRENT_ONLY) {
+    // Candidate-only performance evidence must never inherit the historical
+    // predecessor's tolerated blank-shell behavior.
+    await openPage(nestedTitle);
+    receipt.milestones.baselineManagedPageBodyVisible = true;
     receipt.milestones.managedPageSwitch = await measurePageSwitches();
-  }
-  if (receipt.milestones.baselineManagedPageBodyVisible) {
-    receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+    receipt.milestones.managedEdit = await createManagedPageAndAttemptEdit();
   } else {
-    receipt.milestones.previousPatchEdit = {
-      attempted: false,
-      reason: "v0.6.94 published a managed page shell without its body",
-    };
+    // v0.6.94 may publish the managed page shell while leaving its body blank.
+    // That is predecessor evidence for #370, not a reason to abort before the
+    // candidate gets a chance to recover the same private state.
+    await openPage(nestedTitle, { expectedMarker: null, requireHeading: false });
+    receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
+    if (receipt.milestones.baselineManagedPageBodyVisible) {
+      receipt.milestones.managedPageSwitch = await measurePageSwitches();
+      receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+    } else {
+      receipt.milestones.previousPatchEdit = {
+        attempted: false,
+        reason: "v0.6.94 published a managed page shell without its body",
+      };
+    }
   }
 
   // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the

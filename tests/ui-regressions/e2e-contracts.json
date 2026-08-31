@@ -1062,7 +1062,7 @@
     },
     {
      "class": "core-operation",
-     "userOutcome": "In current-candidate mode, Windows activation, forced-close reopen, and repeated user-visible switching between ordinary and nested Unicode pages complete on a 12,000-page graph while recording comparable Direct Files and Managed Storage timings.",
+     "userOutcome": "In current-candidate mode, Windows activation, forced-close reopen, and repeated user-visible switching between ordinary and nested Unicode pages complete on a reporter-scale graph while recording comparable Direct Files and Managed Storage timing summaries.",
      "blocking": true
     }
    ],
