@@ -8162,7 +8162,7 @@
     "windows"
    ],
    "layer": "native",
-   "status": "covered",
+   "status": "reproduced",
    "coverage": {
     "tests": [
      "scripts/e2e-windows-managed-storage.mjs",
@@ -8171,7 +8171,7 @@
     "scenario": "managed.windows-previous-patch-upgrade-reopen",
     "failBefore": "proven"
    },
-   "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files."
+   "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files. MS-17 quarantined the shared Windows upgrade/reopen journey on 2026-08-31 after two inconclusive hosted attempts (runs 33349270671 and 33350869828); startupRecovery.test.ts retains the deterministic readiness/refusal coverage, but the literal Windows previous-release boundary returns to covered only after the corrected journey completes an unchanged-binary burn-in."
   },
   {
    "id": "UI-PANE-SCROLL-SLACK-369",
