@@ -7078,9 +7078,24 @@ body.file-drop-active::after {
   min-height: 30px;
   display: flex;
   align-items: center;
-  justify-content: center;
+  /* Left, not centred. The row spans the whole grid, and .sheet-table is
+     `width: max-content` inside a horizontal scroller, so a centred label sits
+     at the middle of the FULL table width — off-screen to the right on a wide
+     table, then sliding across the viewport as you scroll (GH #449). */
+  justify-content: flex-start;
   gap: 6px;
   padding: 4px 8px;
+}
+/* The row keeps its full-width hit area; only its content is pinned to the
+   left edge of the scroll viewport, so "+ Add row" is legible before, during
+   and after a horizontal scroll instead of travelling with the table. Same
+   mechanism as .sheet-sticky-left, which pins the title column. */
+.sheet-ghost-sticky {
+  position: sticky;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .sheet-table:hover .sheet-add-column-ghost,
 .sheet-table:focus-within .sheet-add-column-ghost,

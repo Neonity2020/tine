@@ -51,6 +51,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A wide table no longer drags its "Add row" label across the screen.** The
+  control spans the whole table, so its centred label sat at the midpoint of the
+  full table width — off to one side and travelling as you scrolled sideways.
+  The row keeps its full-width click target; only the label is now pinned to the
+  visible edge, the way the first column already is. (GH #449)
+
 - **iPad now behaves like a tablet instead of a Mac.** The on-screen editing
   toolbar (indent, move, insert) never appeared while editing on iPad, and
   long-press, text selection and window chrome all took their desktop branch.

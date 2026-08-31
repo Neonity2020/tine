@@ -9162,6 +9162,31 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: on iPad, editing a block offers the same on-screen actions (indent, move, insert) as on iPhone, and long-press/selection behave as touch rather than as a mouse. Classification: blocking stateful UX. Root cause: platform identity was sniffed from the WebView user agent, and iPadOS 13+ serves a desktop-class 'Macintosh; Intel Mac OS X' UA from a stock WKWebView, so an iPad failed the mobile test and passed the Mac test. The build now injects __TINE_PLATFORM__ before frontend code runs. Required neighbor: split panes and single-pane session restore were gated on the same flag, so they moved to a shell-shape predicate (isSinglePaneShell) rather than losing panes on iPad. The exact 700pt tablet threshold and the UA fallback strings are not user contracts."
+    },
+    {
+      "id": "UI-SHEET-ADDROW-HORIZONTAL-SCROLL-449",
+      "title": "The sheet Add row control stays put and legible while a wide table scrolls horizontally",
+      "family": "sheet-table",
+      "sources": {
+        "issues": [
+          449
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/check-sheet-scroll.mjs"
+        ],
+        "scenario": "sheet.addrow-horizontal-scroll",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: on a table wider than its container, '+ Add row' is readable before, during and after a horizontal scroll, and dragging the table sideways moves the cells rather than the label. Classification: blocking stateful UX (the control was unreachable without scrolling to find it). Root cause: the add-row button is a `grid-column: 1 / -1` item of a `width: max-content` grid inside `overflow-x: auto`, and its centred label therefore sat at the midpoint of the whole table. Fail-before measurement at a 420px viewport over a 1325px table: label at +647px unscrolled and -258px fully scrolled, outside the viewport at both extremes; after, +27px at both. The exact offset and the sticky implementation are not user contracts."
     }
   ]
 }
