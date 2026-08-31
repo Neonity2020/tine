@@ -307,13 +307,17 @@ export function clickBeyondRenderedEnd(root: Element, x: number, y: number): boo
 
 /** Line boxes of the IN-FLOW content of `node`, appended to `out`.
  *
- *  A single range over the whole block also picks up its floats, and a float in
- *  a block is drawn hard against the block's right edge: the reference-count
- *  badge alone made every referenced block report `right` = the full content
- *  width, so no click in such a block could ever be past the end. Measured in
- *  Chromium — badge box right 608 against text right 164.6 — which is why this
- *  is a filter and not an assumption. The `{{img … right}}` alignment wrapper
- *  floats the same way, from deeper in the inline tree, hence the recursion. */
+ *  A single range over the whole block also picks up its floats, and a float is
+ *  drawn hard against the block's right edge. A float TALLER than the line it
+ *  rides then owns the bottom band, and the block reports its text as ending at
+ *  the full content width — so no click in it can ever be past the end.
+ *  `{{img … right}}` is the live case: measured in the running app, its wrapper
+ *  box was right 1080 / bottom 545.2 against text right 665.5 / bottom 542.2,
+ *  and the past-the-end caret was dead in that block. The wrapper sits inside
+ *  the inline tree rather than directly under `.block-content`, hence the
+ *  recursion. (The reference-count badge floats too but is shorter than the
+ *  line, so it never defines the bottom band and never had this effect —
+ *  measured, not assumed, after a synthetic fixture wrongly said it did.) */
 function collectInFlowRects(node: Node, view: Window | null, range: Range, out: LineBox[]): void {
   if (node.nodeType === 1) {
     const el = node as Element;

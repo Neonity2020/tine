@@ -143,20 +143,20 @@ describe("click-to-caret span mapping", () => {
     }
   });
 
-  // GH #465 × GH #454: the reference-count badge is `float: right`, so it is
-  // drawn hard against the block's right edge no matter how short the text is.
-  // A single range over the whole block picks that box up, and it then answers
-  // "where does the text end?" with the full content width — which silently
-  // disabled the past-the-end caret on every referenced block. Measured in
-  // Chromium: badge box right 608, text right 164.6, so nothing could be past
-  // the end of a 608px-wide block. jsdom has no layout, so the geometry here is
-  // supplied; what the test pins is that out-of-flow children are excluded.
+  // GH #465: a `{{img … right}}` wrapper is `float: right`, so it is drawn hard
+  // against the block's right edge, and being taller than the line it rides it
+  // owns the bottom band. A single range over the whole block picks that box up
+  // and then answers "where does the text end?" with the full content width,
+  // which killed the past-the-end caret in that block. Measured in the running
+  // app: wrapper right 1080 / bottom 545.2 against text right 665.5 / bottom
+  // 542.2. jsdom has no layout, so the geometry here is supplied in the same
+  // shape; what the test pins is that out-of-flow children are excluded.
   it("ignores a floated decoration when deciding where the text ends", () => {
     const root = document.createElement("div");
     root.className = "block-content";
-    const badge = document.createElement("a");
+    const badge = document.createElement("span");
     badge.style.float = "right";
-    badge.textContent = "3";
+    badge.textContent = "img";
     root.append(badge, document.createTextNode("some text in italics."));
     document.body.appendChild(root);
 
@@ -177,8 +177,8 @@ describe("click-to-caret span mapping", () => {
       expect(clickBeyondRenderedEnd(root, 300, 22)).toBe(true);
       // ...but a click still over the glyphs is not past the end.
       expect(clickBeyondRenderedEnd(root, 100, 22)).toBe(false);
-      // The float alone never makes a click past the end: with the text gone
-      // there is no line of text to be past.
+      // Without the filter the float owns the bottom band and the same click is
+      // not past the end — the pre-fix behaviour, and the necessity control.
       badge.style.float = "";
       expect(clickBeyondRenderedEnd(root, 300, 22)).toBe(false);
     } finally {

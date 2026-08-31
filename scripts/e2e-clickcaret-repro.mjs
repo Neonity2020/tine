@@ -41,6 +41,7 @@ const PAGE = `- **bold** rest of line
 - *italics with a referrer.*
   id:: 4d1f0a20-0000-0000-0000-000000000465
 - points at ((4d1f0a20-0000-0000-0000-000000000465))
+- {{img https://example.invalid/floated.png 80 60 right}} *text beside a floated image.*
 `;
 
 fs.rmSync(G, { recursive: true, force: true });
@@ -309,12 +310,35 @@ try {
   // this block", including when the block ends in markup the reader cannot see.
   // Before the fix the caret stopped one byte short, between the last letter and
   // the closing delimiter, so Enter split the construct instead of leaving it.
-  // Block 9 carries a reference-count badge (block 10 references it). The badge
-  // is `float: right`, drawn hard against the block's right edge; measuring the
-  // block as one range therefore reported its text as ending at the full
-  // content width, and the past-the-end rule was silently dead on every
-  // referenced block (GH #454 x GH #465).
-  for (const [idx, raw] of [[6, "*some text in italics.*"], [7, "**ends in bold**"], [8, "ends in `code`"], [9, "*italics with a referrer.*"]]) {
+  // Block 11 puts a right-floated image beside its text. A float is drawn hard
+  // against the block's right edge and is taller than the line it rides, so
+  // measuring the block as ONE range reports its text as ending at the full
+  // content width — and the past-the-end rule is dead in that block. Measured
+  // in the running app: image box right 1080 / bottom 545.2 against text right
+  // 665.5 / bottom 542.2. Block 9 carries a reference-count badge (block 10
+  // references it) and is here as the control: that badge is shorter than the
+  // line, so it never defines the bottom band and never had this effect.
+  const badged = await browser.execute(() => {
+    const b = [...document.querySelectorAll(".ls-block")][9];
+    return b ? !!b.querySelector(":scope > .block-main .block-refs-count") : null;
+  });
+  console.log("block 9 carries a reference-count badge:", badged);
+  if (badged !== true) {
+    throw new Error("block 9 has no reference-count badge — the badge control is not being exercised");
+  }
+  const floated = await browser.execute(() => {
+    const b = [...document.querySelectorAll(".ls-block")][11];
+    const el = b && b.querySelector(".block-content .img-align-right");
+    if (!el) return null;
+    const box = el.getBoundingClientRect();
+    const host = b.querySelector(".block-content").getBoundingClientRect();
+    return { floats: getComputedStyle(el).float, reachesRightEdge: box.right >= host.right - 1 };
+  });
+  console.log("block 11 float:", JSON.stringify(floated));
+  if (!floated || floated.floats !== "right" || !floated.reachesRightEdge) {
+    throw new Error("block 11 has no right-floated image at the content edge — the float case is not being exercised");
+  }
+  for (const [idx, raw] of [[6, "*some text in italics.*"], [7, "**ends in bold**"], [8, "ends in `code`"], [9, "*italics with a referrer.*"], [11, "{{img https://example.invalid/floated.png 80 60 right}} *text beside a floated image.*"]]) {
     console.log(`\n=== GH #465: click past the end of ${JSON.stringify(raw)} ===`);
     const past = await pastEndPoint(idx);
     console.log("point:", JSON.stringify(past));
