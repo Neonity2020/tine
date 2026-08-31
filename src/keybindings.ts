@@ -1055,7 +1055,17 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     }
 
     // While typing, only modifier chords are eligible (so "g j" doesn't fire).
-    if (editing && !chord.mod && !chord.ctrl) {
+    // Alt counts as a modifier here (GH #461). It did not, so a global command
+    // bound to a bare Alt chord — Alt+S to switch tabs — worked everywhere in
+    // the app except inside a block, while Ctrl+Alt+S worked fine; that split is
+    // what the reporter hit, and Chrome and VS Code both fire Alt shortcuts with
+    // a text field focused. Only `scope: "global"` commands with a `run` are
+    // matched below (see `commands`), so the editor's own bare-Alt bindings
+    // (alt+f/alt+b/alt+w/alt+d/alt+u/alt+k/alt+l, dispatched from the block
+    // editor) are untouched, and an Alt chord nothing is bound to still falls
+    // through to the textarea unprevented — dead keys and Option-composed
+    // characters keep working.
+    if (editing && !chord.mod && !chord.ctrl && !chord.alt) {
       // Cancel GTK/browser focus traversal on Tab/Shift+Tab in the capture
       // phase (WebKitGTK grabs it before an outline editor can), but still let
       // that editor receive its owned gesture. Native form controls retain

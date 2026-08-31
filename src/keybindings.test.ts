@@ -408,6 +408,61 @@ describe("editable Tab ownership (GH #157)", () => {
   });
 });
 
+describe("Alt-only shortcuts while editing (GH #461)", () => {
+  const twoTabSnapshot = (): PaneSnapshot => ({
+    tabs: [
+      { history: [{ kind: "page", name: "First", pageKind: "page" }], pos: 0, pinned: false },
+      { history: [{ kind: "page", name: "Second", pageKind: "page" }], pos: 0, pinned: false },
+    ],
+    activeIndex: 0,
+  });
+
+  it("fires a bare-Alt global shortcut with the caret in a block", () => {
+    // The reporter's exact setup: next-tab on Alt+S, two tabs, caret in a block.
+    resetPaneLayoutToSingle(twoTabSnapshot());
+    const fake = installFakeWindow();
+    const dispose = installKeybindings({ "tab/next": "alt+s" });
+    const editor = editableTarget("TEXTAREA", { blockEditor: true });
+
+    const pressed = trackedKeyEvent({ key: "s", code: "KeyS", altKey: true, target: editor });
+    fake.dispatchCaptureKeydown(pressed.event);
+
+    expect(paneRouter("main").route()).toMatchObject({ kind: "page", name: "Second" });
+    expect(pressed.prevented()).toBe(true);
+    dispose();
+  });
+
+  it("still refuses unmodified keys while editing, so a sequence cannot fire", () => {
+    resetPaneLayoutToSingle(twoTabSnapshot());
+    const fake = installFakeWindow();
+    const dispose = installKeybindings({ "tab/next": "alt+s" });
+    const editor = editableTarget("TEXTAREA", { blockEditor: true });
+
+    const typed = trackedKeyEvent({ key: "s", code: "KeyS", target: editor });
+    fake.dispatchCaptureKeydown(typed.event);
+
+    expect(paneRouter("main").route()).toMatchObject({ kind: "page", name: "First" });
+    expect(typed.prevented()).toBe(false);
+    dispose();
+  });
+
+  it("leaves an Alt chord nothing is bound to for the textarea (Option-composed characters)", () => {
+    // Nothing global answers alt+e, so the dispatcher must not preventDefault:
+    // on macOS this event is the ´ dead key.
+    resetPaneLayoutToSingle(twoTabSnapshot());
+    const fake = installFakeWindow();
+    const dispose = installKeybindings({ "tab/next": "alt+s" });
+    const editor = editableTarget("TEXTAREA", { blockEditor: true });
+
+    const deadKey = trackedKeyEvent({ key: "e", code: "KeyE", altKey: true, target: editor });
+    fake.dispatchCaptureKeydown(deadKey.event);
+
+    expect(deadKey.prevented()).toBe(false);
+    expect(paneRouter("main").route()).toMatchObject({ kind: "page", name: "First" });
+    dispose();
+  });
+});
+
 describe("find-in-page routing", () => {
   it("opens notes find on mod+f when no PDF is open", () => {
     const fake = installFakeWindow();
