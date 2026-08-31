@@ -150,7 +150,9 @@ import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } fro
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
 import { seedAssetBlob } from "../assetCache";
-import { openInNewTab } from "../router";
+import { openInNewTab, type Route } from "../router";
+import { openRouteInOtherPane } from "../panes";
+import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
 import { editorCommandFor, isPermittedTabGesture, isTabLikeEvent } from "../keybindings";
@@ -493,6 +495,20 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // Ordered-list label for THIS block's own bullet (OG numbers the block itself,
   // not its children); null for a normal bullet.
   const orderMarker = () => orderedListMarker(props.id);
+  // "This block, zoomed" as a route, for every bullet destination that is not
+  // the in-place zoom. Taking a persistent ref writes `id::` so the tab or pane
+  // still resolves after a restart — which is why this is a function and not a
+  // memo: it must not run until a modified click actually asks for it.
+  const openZoomRoute = (open: (route: Route) => unknown): void => {
+    const ref = persistentBlockRef(props.id);
+    open({
+      kind: "page",
+      name: ref.page,
+      pageKind: ref.pageKind,
+      block: ref.uuid,
+      ...(ref.path ? { path: ref.path } : {}),
+    });
+  };
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
   const readOnly = () => !pageWritable(node().page);
@@ -559,28 +575,33 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           <span
             class="bullet-container"
             classList={{ "bullet-closed": collapsed() && hasChildren(), ordered: !!orderMarker() }}
-            title="Click to zoom; shift-click → sidebar; middle-click → new tab; drag to move"
+            title="Click to zoom; shift-click → sidebar; ctrl/cmd-click or middle-click → new tab; alt-click → other pane; drag to move"
             onMouseDown={(e) => {
+              // The other half of the shared contract (GH #207): suppress the
+              // shift-range selection and the middle-button autoscroll /
+              // PRIMARY-paste that these destinations replace. The bullet ran
+              // its own onMouseDown and skipped it.
+              internalLinkMouseDown(e);
               if (e.button === 0 && !readOnly()) beginDrag(props.id, e);
             }}
             onClick={(e) => {
               e.stopPropagation();
               if (dragMoved) return; // was a drag, not a click
-              if (e.shiftKey) openBlockInSidebar(persistentBlockRef(props.id));
-              else zoomInto(props.id);
+              // GH #456: the bullet used to read only Shift, so Ctrl/Cmd+click
+              // fell through to the plain zoom and the modifier did nothing.
+              // It now goes through the same one decision every other internal
+              // link uses (GH #283), which is why Alt lands here too rather
+              // than growing a second, slightly different ladder.
+              switch (internalLinkDest(e)) {
+                case "sidebar": openBlockInSidebar(persistentBlockRef(props.id)); break;
+                case "background": openZoomRoute(openInNewTab); break;
+                case "pane": openZoomRoute(openRouteInOtherPane); break;
+                default: zoomInto(props.id);
+              }
             }}
             onAuxClick={(e) => {
-              if (e.button !== 1) return; // middle-click → open the zoom in a new tab
-              e.preventDefault();
+              if (!internalLinkAuxClick(e, () => openZoomRoute(openInNewTab))) return;
               e.stopPropagation();
-              const ref = persistentBlockRef(props.id); // writes id:: so the tab survives a restart
-              openInNewTab({
-                kind: "page",
-                name: ref.page,
-                pageKind: ref.pageKind,
-                block: ref.uuid,
-                ...(ref.path ? { path: ref.path } : {}),
-              });
             }}
           >
             <Show when={orderMarker()} fallback={<span class="bullet" />}>
