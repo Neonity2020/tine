@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Focused Windows proof for GH #292. This is a real WebView2 + Tauri + NTFS
+// Focused Windows proof for GH #292 and #396. This is a real WebView2 + Tauri + NTFS
 // journey, including the native confirmation dialogs and the production
 // Settings action that invokes the managed-storage commands.
 import crypto from "node:crypto";
@@ -32,6 +32,15 @@ const BLOCKS_PER_PAGE = Number(process.env.E2E_MANAGED_BLOCKS_PER_PAGE || 10);
 const TOTAL_FILE_COUNT = Number(process.env.E2E_MANAGED_TOTAL_FILE_COUNT || 25_890);
 const ASSET_LOGICAL_BYTES = Number(process.env.E2E_MANAGED_ASSET_LOGICAL_BYTES || 25_200_000_000);
 const ACTIVATION_TIMEOUT_MS = Number(process.env.E2E_MANAGED_ACTIVATION_TIMEOUT_MS || 30 * 60_000);
+const CURRENT_ONLY = process.env.E2E_MANAGED_CURRENT_ONLY === "true";
+const canonicalExecutable = (value) => fs.realpathSync(value).toLocaleLowerCase("en-US");
+const candidateExecutable = canonicalExecutable(APP);
+const activationExecutable = canonicalExecutable(BASELINE_APP);
+if (CURRENT_ONLY !== (candidateExecutable === activationExecutable)) {
+  throw new Error(
+    `managed mode/executable mismatch: currentOnly=${CURRENT_ONLY} candidate=${candidateExecutable} activation=${activationExecutable}`,
+  );
+}
 for (const [name, value, minimum] of [
   ["E2E_MANAGED_PAGE_COUNT", PAGE_COUNT, 2],
   ["E2E_MANAGED_BLOCKS_PER_PAGE", BLOCKS_PER_PAGE, 1],
@@ -48,6 +57,7 @@ const artifacts = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "
 const debugLog = path.join(artifacts, "tine-debug.log");
 const nestedTitle = "Résumé 日本語";
 const nestedMarker = "WINDOWS_MANAGED_NESTED_UTF_MARKER";
+const ordinaryTitle = "Windows Managed 00002";
 const nestedFile = path.join(graph, "pages", "研究", `${nestedTitle}.md`);
 const now = new Date();
 const journalStem = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
@@ -60,11 +70,11 @@ for (const dir of ["pages", "pages/研究", "journals", "logseq", "assets/层级
 fs.mkdirSync(artifacts, { recursive: true });
 fs.writeFileSync(path.join(graph, "logseq", "config.edn"), '{:preferred-format "Markdown"}\n');
 fs.writeFileSync(path.join(graph, "journals", `${journalStem}.md`), `- ${journalMarker}\n`);
-const pageBody = (label) => Array.from(
+const pageBody = (label, referenceTarget) => Array.from(
   { length: BLOCKS_PER_PAGE },
-  (_, block) => `- ${label} block ${block + 1} references [[${nestedTitle}]] and #[[windows-managed]]`,
+  (_, block) => `- ${label} block ${block + 1} references [[${referenceTarget}]] and #[[windows-managed]]`,
 ).join("\n") + "\n";
-fs.writeFileSync(nestedFile, pageBody(nestedMarker));
+fs.writeFileSync(nestedFile, pageBody(nestedMarker, ordinaryTitle));
 for (let index = 1; index < PAGE_COUNT; index += 1) {
   const bucket = path.join(graph, "pages", `bucket-${String(index % 37).padStart(2, "0")}`);
   fs.mkdirSync(bucket, { recursive: true });
@@ -74,7 +84,13 @@ for (let index = 1; index < PAGE_COUNT; index += 1) {
     // round-trip. Managed activation must retain the exact bytes read-only,
     // not reject the entire reporter-shaped graph (#292).
     ? "- root\r  ```\r  - fake\r  ```"
-    : pageBody(`fixture page ${index}`);
+    // Keep graph-wide reference indexes representative without manufacturing
+    // 120,000 backlinks to the one page the timing journey opens. That shape
+    // measures long-backlink-query monopolization, not ordinary page switching.
+    : pageBody(
+      `fixture page ${index}`,
+      `Windows Managed ${String(index + 1 < PAGE_COUNT ? index + 1 : 1).padStart(5, "0")}`,
+    );
   fs.writeFileSync(path.join(bucket, `${stem}.md`), body);
 }
 
@@ -293,9 +309,13 @@ async function openPage(title, { expectedMarker = nestedMarker, requireHeading =
   await input.setValue(title);
   let row;
   await browser.waitUntil(async () => {
-    for (const candidate of await browser.$$(".switcher-row")) {
-      const text = await candidate.getText();
-      if (text.includes(title)) {
+    // Block-search hits can contain the exact page title while still routing
+    // back to the current page. Select the typed page result itself: its kind
+    // is page/journal and its displayed page name is an exact match.
+    for (const candidate of await browser.$$(".switcher-row:not(.block-result)")) {
+      const kind = await candidate.$(".switcher-kind").getText();
+      const name = await candidate.$(".switcher-name").getText();
+      if ((kind === "page" || kind === "journal") && name === title) {
         row = candidate;
         return true;
       }
@@ -306,10 +326,41 @@ async function openPage(title, { expectedMarker = nestedMarker, requireHeading =
   if (requireHeading) {
     const heading = await browser.$("h1.page-title");
     await heading.waitForExist({ timeout: 30_000 });
+    await browser.waitUntil(async () => (await heading.getText()).includes(title), {
+      timeout: 30_000,
+      timeoutMsg: `page heading did not switch to ${title}`,
+    });
   }
   if (expectedMarker) {
     await waitForBody(expectedMarker, 30_000, "nested UTF page after activation");
   }
+}
+
+function timingReceipt(samples) {
+  const ordered = [...samples].sort((a, b) => a - b);
+  return {
+    samples: ordered.length,
+    interaction: "open visible switcher, type exact title, choose result, wait for heading and page marker",
+    minMs: ordered[0],
+    p50Ms: ordered[Math.floor(ordered.length / 2)],
+    maxMs: ordered[ordered.length - 1],
+  };
+}
+
+async function measurePageSwitches(rounds = 8) {
+  const ordinaryMarker = "fixture page 2 block 1";
+  const samples = [];
+  for (let round = 0; round < rounds; round += 1) {
+    // Each measurement is a real transition: callers begin on the nested page,
+    // so visit the ordinary page first and alternate from there.
+    const nested = round % 2 === 1;
+    const started = Date.now();
+    await openPage(nested ? nestedTitle : ordinaryTitle, {
+      expectedMarker: nested ? nestedMarker : ordinaryMarker,
+    });
+    samples.push(Date.now() - started);
+  }
+  return timingReceipt(samples);
 }
 
 async function createManagedPageAndAttemptEdit() {
@@ -428,13 +479,25 @@ const receipt = {
   pageCount: PAGE_COUNT,
   blocksPerPage: BLOCKS_PER_PAGE,
   graph: inventory,
-  graphPathKinds: ["nested", "unicode", "markdown", "parseable-non-roundtripping-markdown", "many-assets", "sparse-large-asset"],
+  candidateOnly: CURRENT_ONLY,
+  executables: {
+    candidate: {
+      path: candidateExecutable,
+      sha256: crypto.createHash("sha256").update(fs.readFileSync(APP)).digest("hex"),
+    },
+    activation: {
+      path: activationExecutable,
+      sha256: crypto.createHash("sha256").update(fs.readFileSync(BASELINE_APP)).digest("hex"),
+    },
+  },
+  graphPathKinds: ["nested", "unicode", "markdown", "parseable-non-roundtripping-markdown", "distributed-page-references", "many-assets", "sparse-large-asset"],
   milestones: {},
 };
 try {
   await startJourney(BASELINE_APP, "activation");
   await openPage(nestedTitle);
   receipt.milestones.directFilesOpened = true;
+  receipt.milestones.directFilesPageSwitch = await measurePageSwitches();
 
   await openManagedSettings("Enable Tine-managed storage...");
   const activationStarted = Date.now();
@@ -443,19 +506,28 @@ try {
   receipt.milestones.activationMs = Date.now() - activationStarted;
   assertSameSource(before, "managed activation");
   await closeSettings();
-  // v0.6.94 may publish the managed page shell while leaving its body blank.
-  // That is predecessor evidence for #370, not a reason to abort before the
-  // candidate gets a chance to recover the same private state.  Require the
-  // candidate below to serve the actual marker.
-  await openPage(nestedTitle, { expectedMarker: null, requireHeading: false });
-  receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
-  if (receipt.milestones.baselineManagedPageBodyVisible) {
-    receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+  if (CURRENT_ONLY) {
+    // Candidate-only performance evidence must never inherit the historical
+    // predecessor's tolerated blank-shell behavior.
+    await openPage(nestedTitle);
+    receipt.milestones.baselineManagedPageBodyVisible = true;
+    receipt.milestones.managedPageSwitch = await measurePageSwitches();
+    receipt.milestones.managedEdit = await createManagedPageAndAttemptEdit();
   } else {
-    receipt.milestones.previousPatchEdit = {
-      attempted: false,
-      reason: "v0.6.94 published a managed page shell without its body",
-    };
+    // v0.6.94 may publish the managed page shell while leaving its body blank.
+    // That is predecessor evidence for #370, not a reason to abort before the
+    // candidate gets a chance to recover the same private state.
+    await openPage(nestedTitle, { expectedMarker: null, requireHeading: false });
+    receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
+    if (receipt.milestones.baselineManagedPageBodyVisible) {
+      receipt.milestones.managedPageSwitch = await measurePageSwitches();
+      receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
+    } else {
+      receipt.milestones.previousPatchEdit = {
+        attempted: false,
+        reason: "v0.6.94 published a managed page shell without its body",
+      };
+    }
   }
 
   // GH #370 is an upgrade/reopen failure, not an activation failure. Kill the
@@ -467,7 +539,9 @@ try {
   await startJourney(APP, "candidate-reopen");
   receipt.milestones.candidateReopenMs = Date.now() - reopenStarted;
   await openPage(nestedTitle);
+  receipt.milestones.candidateReopenReadyMs = Date.now() - reopenStarted;
   receipt.milestones.candidateManagedPageOpened = true;
+  receipt.milestones.reopenedManagedPageSwitch = await measurePageSwitches();
 
   const directFilesAction = await openManagedSettings([
     "Return to Direct files",

@@ -18,7 +18,9 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -32,7 +34,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Physical-input receipts for the three Android UI reports in UI-02.
+ * Physical-input receipts for Android UI reports that require a packaged app.
  *
  * The test only uses JavaScript to observe the packaged WebView (and, for the
  * responsive matrix, set the production Android root-zoom property). Every
@@ -305,6 +307,94 @@ class AndroidUiRuntimeTest {
     }
   }
 
+  @Test
+  fun generatedDirectFilesPdfRouteHonorsHardwareBackHistory() {
+    withFreshDemoGraph("generatedDirectFilesPdfRouteHonorsHardwareBackHistory") { scenario, webView ->
+      val fixture = installGeneratedPdfLinkFixture()
+      val sourceRoute = "Welcome to Tine"
+      val notesRoute = "hls__android-route"
+      val stages = JSONArray()
+
+      awaitCondition("production watcher imports the generated Direct Files link") {
+        pdfRouteState(webView).optInt("sourcePdfLinks") == 1
+      }
+      val pdfLink = awaitVisibleElementByScrolling(
+        webView,
+        "a.pdf-link",
+        "the generated Direct Files PDF link on $sourceRoute",
+      )
+      stages.put(pdfRouteState(webView).put("stage", "source").put("fixture", fixture.absolutePath))
+
+      // The route is entered through the packaged renderer's real PDF link, not
+      // through JavaScript navigation or a test-only router hook.
+      tap(webView, pdfLink)
+      awaitCondition("generated PDF in the one mobile route surface") {
+        val state = pdfRouteState(webView)
+        state.optBoolean("ready") && state.optInt("viewers") == 1 &&
+          state.optInt("routePanes") == 1 && state.optInt("soloRouteSurfaces") == 1 &&
+          state.optInt("pageSurfaces") == 0
+      }
+      val opened = pdfRouteState(webView).put("stage", "pdf-opened")
+      stages.put(opened)
+
+      val find = awaitElementRect(webView, "button[title^='Find in document']")
+      tap(webView, find)
+      awaitCondition("PDF Find child surface") {
+        pdfRouteState(webView).optInt("findBars") == 1
+      }
+      stages.put(pdfRouteState(webView).put("stage", "find-opened"))
+
+      pressHardwareBack(scenario)
+      awaitCondition("Hardware Back dismisses Find before leaving the PDF") {
+        val state = pdfRouteState(webView)
+        state.optInt("findBars") == 0 && state.optBoolean("ready") && state.optInt("viewers") == 1
+      }
+      stages.put(pdfRouteState(webView).put("stage", "find-dismissed"))
+
+      // At phone width Notes deliberately lives in the production More menu.
+      // Both controls are activated with native taps.
+      tap(webView, awaitElementRect(webView, "button[aria-label='More settings']"))
+      val notes = awaitElementRectByText(webView, ".pdf-settings-overflow button", "Notes")
+      tap(webView, notes)
+      awaitCondition("PDF notes route in the same mobile history") {
+        val state = pdfRouteState(webView)
+        state.optString("pageTitle") == notesRoute && state.optInt("viewers") == 0
+      }
+      stages.put(pdfRouteState(webView).put("stage", "notes-opened"))
+
+      pressHardwareBack(scenario)
+      awaitCondition("Hardware Back returns from Notes to the exact PDF route") {
+        val state = pdfRouteState(webView)
+        state.optBoolean("ready") && state.optString("pdfFilename") == "android-route.pdf" &&
+          state.optInt("viewers") == 1 && state.optInt("routePanes") == 1
+      }
+      stages.put(pdfRouteState(webView).put("stage", "notes-back-to-pdf"))
+
+      pressHardwareBack(scenario)
+      awaitCondition("Hardware Back returns from PDF to the exact source page") {
+        val state = pdfRouteState(webView)
+        state.optString("pageTitle") == sourceRoute && state.optInt("viewers") == 0 &&
+          state.optInt("sourcePdfLinks") == 1
+      }
+      val returned = pdfRouteState(webView).put("stage", "pdf-back-to-source")
+      stages.put(returned)
+
+      val receipt = JSONObject()
+        .put("journey", "route-owned-pdf-android-back")
+        .put("storageMode", "Direct Files")
+        .put("fixtureOwner", "app-private generated demo graph")
+        .put("sourceRoute", sourceRoute)
+        .put("notesRoute", notesRoute)
+        .put("stages", stages)
+      emitReceipt("generatedDirectFilesPdfRouteHonorsHardwareBackHistory", receipt)
+
+      assertEquals("PDF must occupy exactly one route pane", 1, opened.optInt("routePanes"))
+      assertEquals("solo mobile layout must expose exactly one route surface", 1, opened.optInt("soloRouteSurfaces"))
+      assertEquals("the PDF route must replace, not accompany, the page surface", 0, opened.optInt("pageSurfaces"))
+      assertEquals("final Hardware Back must return to the exact source page", sourceRoute, returned.optString("pageTitle"))
+    }
+  }
+
   private fun withFreshDemoGraph(
     test: String,
     block: (ActivityScenario<MainActivity>, WebView) -> Unit,
@@ -394,6 +484,94 @@ class AndroidUiRuntimeTest {
           it.optInt("blocks") >= 3 &&
           it.optString("activeDrawer").isEmpty()
       }
+    }
+  }
+
+  /**
+   * Add one generated PDF link to the app-owned demo graph that the first-run
+   * journey just created. This stays entirely in Direct Files: instrumentation
+   * shares the target app UID, writes beneath its private data directory, and
+   * lets the production watcher import the ordinary Markdown edit.
+   */
+  private fun installGeneratedPdfLinkFixture(): File {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val graphRoot = findGeneratedDirectFilesGraph(context)
+    val asset = File(graphRoot, "assets/android-route.pdf")
+    asset.parentFile?.let { require(it.mkdirs() || it.isDirectory) }
+    asset.writeBytes(generatedPdfBytes())
+    assertTrue("generated PDF fixture must be non-empty", asset.length() > 0)
+
+    val welcome = File(graphRoot, "pages").listFiles()
+      ?.singleOrNull { file ->
+        file.isFile && runCatching { file.readText().contains("# Welcome to Tine") }.getOrDefault(false)
+      }
+      ?: throw AssertionError("could not identify the generated Welcome to Tine Markdown file under $graphRoot")
+    welcome.appendText("\n- [Android route PDF](../assets/android-route.pdf)\n")
+    return asset
+  }
+
+  private fun findGeneratedDirectFilesGraph(context: Context): File {
+    val roots = listOfNotNull(context.filesDir, context.noBackupFilesDir, context.dataDir)
+      .distinctBy { it.absolutePath }
+    val graphs = roots.flatMap { root ->
+      root.walkTopDown()
+        .maxDepth(MAX_GRAPH_SEARCH_DEPTH)
+        .filter { candidate -> File(candidate, "logseq/config.edn").isFile && File(candidate, "pages").isDirectory }
+        .toList()
+    }.distinctBy { it.canonicalPath }
+    return graphs.singleOrNull()
+      ?: throw AssertionError("expected one app-owned Direct Files graph, found ${graphs.map(File::getAbsolutePath)}")
+  }
+
+  /** Build a valid one-page PDF without checking a repository fixture into the app. */
+  private fun generatedPdfBytes(): ByteArray {
+    val content = "BT /F1 18 Tf 72 720 Td (Android route PDF fixture) Tj ET\n"
+    val objects = listOf(
+      "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+      "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+      "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+      "4 0 obj\n<< /Length ${content.toByteArray(StandardCharsets.US_ASCII).size} >>\nstream\n$content" +
+        "endstream\nendobj\n",
+      "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    )
+    val output = ByteArrayOutputStream()
+    fun write(value: String) = output.write(value.toByteArray(StandardCharsets.US_ASCII))
+    write("%PDF-1.4\n")
+    val offsets = objects.map { body ->
+      val offset = output.size()
+      write(body)
+      offset
+    }
+    val xref = output.size()
+    write("xref\n0 ${objects.size + 1}\n")
+    write("0000000000 65535 f \n")
+    offsets.forEach { write(String.format(java.util.Locale.US, "%010d 00000 n \n", it)) }
+    write("trailer\n<< /Size ${objects.size + 1} /Root 1 0 R >>\nstartxref\n$xref\n%%EOF\n")
+    return output.toByteArray()
+  }
+
+  private fun pdfRouteState(webView: WebView): JSONObject = evaluateJson(webView, """
+    (() => JSON.stringify({
+      pageTitle: document.querySelector('.page-title')?.textContent?.trim() || '',
+      viewers: document.querySelectorAll('.pdf-viewer').length,
+      ready: document.querySelector('.pdf-viewer')?.getAttribute('data-pdf-ready') === 'true',
+      pdfFilename: document.querySelector('.pdf-viewer')?.getAttribute('data-pdf-filename') || '',
+      routePanes: document.querySelectorAll('.pdf-route-pane').length,
+      soloRouteSurfaces: document.querySelectorAll('.main-content-shell > .pdf-route-pane').length,
+      pageSurfaces: document.querySelectorAll('.main-content-shell > main.main-content').length,
+      findBars: document.querySelectorAll('.pdf-find-bar').length,
+      settingsMenus: document.querySelectorAll('.pdf-settings-menu').length,
+      sourcePdfLinks: document.querySelectorAll('a.pdf-link').length,
+      historyLength: history.length,
+    }))()
+  """.trimIndent())
+
+  private fun pressHardwareBack(scenario: ActivityScenario<MainActivity>) {
+    val gesturesBefore = SafeBackBridge.gesturesReceived
+    val deliveredBefore = SafeBackBridge.dispatchesDelivered
+    scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
+    awaitCondition("Android hardware Back reaches and is delivered by SafeBack") {
+      SafeBackBridge.gesturesReceived > gesturesBefore && SafeBackBridge.dispatchesDelivered > deliveredBefore
     }
   }
 
@@ -1014,6 +1192,7 @@ class AndroidUiRuntimeTest {
     const val LONG_PRESS_SETTLE_MS = 450L
     const val SELECTION_TIMEOUT_MS = 8_000L
     const val MAX_FIXTURE_SCROLLS = 14
+    const val MAX_GRAPH_SEARCH_DEPTH = 6
     const val SWIPE_STEPS = 8
     const val SWIPE_STEP_MS = 18L
     const val SWIPE_SETTLE_MS = 320L

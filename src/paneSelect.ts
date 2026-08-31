@@ -200,17 +200,16 @@ function spansOverlap(a: [number, number], b: [number, number]): boolean {
   return Math.min(a[1], b[1]) - Math.max(a[0], b[0]) > EPS;
 }
 
-// A step must land at-or-beyond the CURRENT TARGET'S boundary in the pressed
-// direction, not merely beyond its center: a perpendicular window edge whose
-// center is barely "ahead" of an off-center pane's center otherwise wins with
-// a near-zero distance (Martin's Jul 8 report #3: ArrowRight from a pane left
-// of window-center selected the global TOP edge).
-function beyondLeadingBoundary(rect: Rect, c: { x: number; y: number }, dir: PaneDirection): boolean {
+// A candidate must itself lie at-or-beyond the CURRENT TARGET'S boundary in
+// the pressed direction, not merely have a center beyond it. The latter admits
+// a perpendicular whole-window edge: from an off-center seam, that edge's
+// center can be closer than the adjacent wide pane and tint the whole window.
+function beyondLeadingBoundary(current: Rect, candidate: Rect, dir: PaneDirection): boolean {
   switch (dir) {
-    case "left": return c.x <= rect.x + EPS;
-    case "right": return c.x >= rect.x + rect.w - EPS;
-    case "up": return c.y <= rect.y + EPS;
-    case "down": return c.y >= rect.y + rect.h - EPS;
+    case "left": return candidate.x + candidate.w <= current.x + EPS;
+    case "right": return candidate.x >= current.x + current.w - EPS;
+    case "up": return candidate.y + candidate.h <= current.y + EPS;
+    case "down": return candidate.y >= current.y + current.h - EPS;
   }
 }
 
@@ -281,7 +280,7 @@ export function stepPaneTarget(root: LayoutNode, target: PaneTarget | null, dir:
     .filter((x): x is { candidate: PaneTarget; rect: Rect } => !!x.rect)
     .map((x) => ({ ...x, c: center(x.rect) }))
     .filter((x) => isAhead(from, x.c, dir))
-    .filter((x) => beyondLeadingBoundary(currentRect, x.c, dir))
+    .filter((x) => beyondLeadingBoundary(currentRect, x.rect, dir))
     .filter((x) => spansOverlap(fromSpan, crossSpan(x.rect, dir)))
     .sort((a, b) => {
       const ap = primaryDistance(from, a.c, dir);
@@ -322,6 +321,50 @@ export function nearestPane(root: LayoutNode, sourcePaneId: string, exclude = so
     })
     .sort((a, b) => a.distance - b.distance || a.paneId.localeCompare(b.paneId));
   return candidates[0]?.paneId ?? null;
+}
+
+/**
+ * Resolve "beside" structurally: use the sibling subtree at the source leaf's
+ * nearest ancestor split, then choose the leaf whose center is nearest in the
+ * layout's normalized coordinate space. Layout traversal order breaks ties.
+ */
+export function companionPane(root: LayoutNode, sourcePaneId: string): string | null {
+  const locate = (node: LayoutNode): { found: boolean; sibling: LayoutNode | null } => {
+    if (node.kind === "pane") return { found: node.paneId === sourcePaneId, sibling: null };
+    const left = locate(node.children[0]);
+    if (left.found) return { found: true, sibling: left.sibling ?? node.children[1] };
+    const right = locate(node.children[1]);
+    if (right.found) return { found: true, sibling: right.sibling ?? node.children[0] };
+    return { found: false, sibling: null };
+  };
+
+  const located = locate(root);
+  if (!located.found || !located.sibling) return null;
+
+  const siblingIds = new Set<string>();
+  const collect = (node: LayoutNode) => {
+    if (node.kind === "pane") siblingIds.add(node.paneId);
+    else {
+      collect(node.children[0]);
+      collect(node.children[1]);
+    }
+  };
+  collect(located.sibling);
+
+  const geom = computePaneGeometry(root);
+  const source = geom.panes.find((pane) => pane.paneId === sourcePaneId);
+  if (!source) return null;
+  const from = center(source.rect);
+  return geom.panes
+    .map((pane, order) => ({ pane, order }))
+    .filter(({ pane }) => siblingIds.has(pane.paneId))
+    .map(({ pane, order }) => {
+      const candidate = center(pane.rect);
+      const dx = candidate.x - from.x;
+      const dy = candidate.y - from.y;
+      return { paneId: pane.paneId, distance: dx * dx + dy * dy, order };
+    })
+    .sort((a, b) => a.distance - b.distance || a.order - b.order)[0]?.paneId ?? null;
 }
 
 export function nearestPaneInDirection(root: LayoutNode, sourcePaneId: string, dir: PaneDirection): string | null {

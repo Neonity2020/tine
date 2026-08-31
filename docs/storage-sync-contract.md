@@ -104,10 +104,13 @@ certified through `tine_storage::formats`.
 [ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the sole production
 activation format. Existing pre-0.7 enrollment and multipart-bootstrap state
 is refused as authority and the product offers Return to Direct Files before a
-fresh clean activation. The old constructor and same-process handoff remain
-callable only under `cfg(test)` as a bounded differential oracle while their
-source modules are physically retired; no production open, activation, or
-actor thread can enter them. A partially
+fresh clean activation. Production contains one baseline-plus-manifest actor
+constructor and one share/join state machine. The cursor-based join state,
+legacy mutation slot, and legacy provider indexes are absent from production
+and pinned absent by the retired-source guard. Older constructors and handoff
+fixtures remain callable only under `cfg(test)` as bounded differential oracles;
+they are not an alternate runtime authority. The final enumerated known-red
+oracle corpus remains pending for MS-14b. A partially
 implemented genesis artifact is never authoritative: only the final clean
 activation marker selects the baseline-plus-manifest runtime. The exact
 removal/replacement ledger is
@@ -121,6 +124,12 @@ superseded by later operations; it does not copy the graph-sized genesis map.
 Subsequent accepted operations must preserve the genesis binding. Test-only
 legacy fixtures are not an alternate activation marker or permission to admit
 a partially constructed candidate.
+
+The clean engine's resident document and document-head maps are bounded
+acceleration only. Evicting a document from either map does not turn an edited
+page back into lazy genesis: a cold point load derives its current direct heads
+from the complete accepted frontier and reconstructs the accepted suffix before
+another save or projection check.
 
 Production sharing likewise has one route: clean activation publishes a clean
 baseline descriptor and clean joining installs that exact baseline plus its
@@ -268,7 +277,7 @@ and manifest tail.
 
 | Path below the graph's private root | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
-| `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; deleted on Return to Direct Files |
+| `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; its app-private name is retired with the whole private root on Return to Direct Files |
 | private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1 | written last; sole local managed-authority selector |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
@@ -281,7 +290,7 @@ and manifest tail.
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
-| application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen | immutable episode sidecars | retained only to bind an application retry to its manifest |
+| application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
 | device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
 
 Emergency return publishes the sibling app-private selector
@@ -289,7 +298,21 @@ Emergency return publishes the sibling app-private selector
 this before managed binding discovery, so retained managed bytes cannot
 resurrect themselves. The receipt is retired only after an explicit fresh
 managed activation has quarantined the former private root and published its
-new binding.
+new binding. Both selectors are small app-private sole-writer authorities:
+create, exact replacement, and active-name retirement go through
+`DurableDirectoryPublication`. On Windows this means certified write-through
+name operations; on Unix/Android the initial parent chain and final name are
+flushed before success. Retirement first moves the exact selector bytes to a
+fresh same-directory name outside the selector grammar, then removes that inert
+residue, so a crash cannot turn a reported Managed activation back into Direct
+Files merely by resurrecting the old active name.
+
+**Refusal scenario:** `MS-REF-STORAGE-MODE-PUBLICATION-UNAVAILABLE`. The
+in-scope failure is a crash or power loss after Tine reports an explicit storage
+mode switch. If the platform cannot prove the required durable name operation,
+or the exact app-private selector changed during publication, the transition
+refuses before acknowledging the new mode. This protects authority selection,
+not against an adversarial local writer.
 
 The following path families are **retired pre-0.7 artifacts**, not an alternate
 production layout: `archive/bootstrap-v1/`, `archive/engine-history/`,
@@ -330,6 +353,20 @@ unchanged to typed conflict trash. Every move rechecks the artifact's physical
 identity and single-link status immediately before publication. A suffix
 lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
 or failed identity recheck is never deleted or selected as authority.
+
+Every Direct Files create, live-name retirement, staged publication, recovery
+restore, and recovery set-aside crosses the typed
+`DurableDirectoryPublication` boundary. The staged inode is flushed before it
+can become live. Windows uses write-through name publication; Unix-like hosts
+use their certified exact-name move plus directory durability policy. Tine
+never acknowledges the save merely because an ordinary rename became visible.
+Successful replacement retires the displaced recovery name through a typed
+`.editor-retired` name before deletion, so a crash cannot turn an unflushed
+name transition into a reported durable save. That exact producer-shaped name
+is cleanup-only: it never restores a document or becomes a conflict claimant.
+The same bounded no-follow checked-open walk removes any copy left by a crash
+or failed foreground unlink; a cleanup error fails that open without changing
+the artifact and the next checked open retries it.
 
 For an existing Direct editor save, the initial exact-file read supplies the
 serialization baseline. The late external-writer proof is the atomic
@@ -934,6 +971,14 @@ ambiguous baseline claims remain unresolved after reconstruction.
    Reconciliation databases, Patricia lookup indexes, and persistent
    projection-work indexes are retired formats: production neither opens nor
    rebuilds them.
+   An unsafe retained-runtime reopen after 800 accepted page edits on the
+   release corpus must finish within the manual gate's 5-second ceiling.
+   Recovery retains one coarse user-visible operation and its 10-second waiting
+   heartbeat, while native diagnostics emit ordered, content-free completion
+   boundaries for baseline authentication, receipt precheck, graph and endpoint
+   open, object-store validation, committed-tail replay, projection open,
+   indexes/sweeps, journal open/drain, terminal projection repair, and completion
+   flush. These observations confer no authority.
 4. Authoritative bytes are append-only or atomically replaced under an exact
    observed-generation/lease check. A cache cannot authorize oplog mutation or
    Markdown overwrite.
@@ -1048,16 +1093,20 @@ refusal that could have come from any of 131 unnamed sites.
 
 ### 3.1a The private receipt-store claim, and when it is checked
 
-`receipts/projection-receipts.claim` versions the private receipt store by
-magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**. Every
-prior magic — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — is *recognized and
-refused*, never migrated and never dually accepted.
+`receipts/projection-receipts.claim` identifies the one implemented private
+receipt-store format by magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**.
+Earlier development magics — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — are
+recognized only so the low-level opener can refuse them without mutation. They
+have no reader, compatibility implementation, or migration path.
 
 **Why the version moved to 6.** The intent and completion records now carry an
 explicit target-kind discriminant (below). Managed storage has not shipped, so
 the only stores carrying a pre-(c) claim are development stores, and the 0.7
-blank-slate policy applies: refuse with a named remedy rather than build
-migration machinery for records that exist on no user's disk.
+blank-slate policy applies: the low-level store refuses before mutation; the
+Tauri graph-open boundary preserves the entire unrecognized private root as a
+backup, opens the untouched Markdown/Org tree as the reconstruction source,
+and automatically activates a fresh store in the one current format. The user
+does not migrate or manually re-activate anything.
 
 **Why packet 2c does not move it again.** Packet 2c retires only the
 own-endpoint facet of the receipt protocol. The foreign receiver namespaces,
@@ -1076,16 +1125,15 @@ exactly this transition.
 | --- | --- |
 | current magic, current version, exactly `STORE_CLAIM_LEN` bytes, regular file | proceed to the full in-place validation |
 | current magic, any other length, or a non-regular file | `MalformedStoreClaim`, refuse, zero mutation |
-| a prior magic, or a version below the current one | `UpgradeRequired`, refuse, zero mutation, remedy named in the error: re-activate managed storage; the Markdown is intact and untouched |
+| a prior magic, or a version below the current one | `UpgradeRequired`, refuse, zero mutation; the graph-open boundary archives the private root and automatically rebuilds current state from the intact Markdown/Org tree |
 | a version above the current one | `UnknownStoreVersion`, refuse, zero mutation |
 | absent, on a populated store root | `ClaimlessNonemptyStore`, refuse, zero mutation |
 | absent, on an absent or empty store root | initialization owns it; this is a fresh store |
 
 **Refusal scenario** (§3.1 rule): `MS-REF-PROTOCOL-INCOMPATIBLE`. The in-scope
-failure is an honest pre-(c) private store meeting a (c) build — a real state on
-a developer's own devices, reachable with no attacker and no corruption. The
-recovery is re-activation, and the refusal says so in its own message rather
-than leaving the remedy to a caller's prose.
+failure is an honest pre-(c) private store meeting a (c) build — reachable with
+no attacker and no corruption. The low-level refusal is the typed signal for
+the outer blank-slate lifecycle; it is not a user-facing migration request.
 
 **Where the check runs, and why there.** The full validation has always been the
 first thing the receipt store's `open` does, and it stays there as defense in
@@ -1104,9 +1152,21 @@ envelope length. A magic-only check would pass a truncated claim, and graph
 publication recovery would then run before the in-place length check ever fired.
 
 A refusal propagates through the managed-open failure channel as a named notice
-(`OpenRefused`, carrying the scenario marker). It is never the silent
-Direct-Files fall-through, which is reserved for superseded outer Tauri
-bindings, and the (c) transition does not bump the outer Tauri binding schema.
+(`OpenRefused`, carrying the scenario marker). During startup the Tauri
+graph-open boundary treats that exact protocol-incompatible marker, and an
+unrecognized outer binding, identically: archive the whole private root,
+publish Direct Files as the intact source, and automatically construct and
+publish the current managed store. The Direct Files selector durably records
+that this is a pending blank-slate rebuild before private state is moved, so a
+crash at any later cut or a failed first reconstruction retries automatically
+on the next open. If reconstruction itself fails, Direct Files remains serving
+and the failure is retained in diagnostics. The original unrecognized private
+root is archived once behind a durable completion marker. Later failed
+reconstruction candidates are reconstructible and rotate through one bounded
+recovery slot rather than minting an unbounded archive on every launch. An
+explicit or emergency Direct
+Files selection does not request this retry. This is one current format, not a
+compatibility reader or migration.
 
 #### Explicit target kind on intent and completion records
 
@@ -1165,6 +1225,15 @@ and digest postings, and uncertain move retries point-query the pending batch
 identity. The derivative may read only the affected page identities and
 materialize those pages from the retained accepted catalog proof. It must not
 decode or validate the graph-sized catalog merely to apply a bounded move.
+Rapid application commands are serialized before their source/destination
+intent is resolved, so each command observes the accepted result of its
+predecessor rather than replaying a stale page pair. Once the frontend installs
+the actor-returned source/destination DTOs, it acknowledges that exact episode
+and batch. The actor revalidates the canonical episode, its completion proof,
+workspace/lineage binding, and accepted-or-visible semantic batch before
+retiring the two response-replay sidecars. The oplog batch remains authority;
+acknowledgement can only bound private response evidence and cannot undo or
+re-run the move.
 
 Page rename discovery follows the same bounded-work rule. An ordinary rename
 may point-read the exact normalized source and target names and range-read the
@@ -1185,6 +1254,22 @@ rehash every document touched earlier in the run or every earlier accepted
 batch. The incrementally maintained root is required to be byte-identical to a
 canonical complete rebuild; the complete rebuild remains only a differential
 oracle and an explicit rebuild operation.
+
+Checkpoint-generation support obeys the pre-0.7 blank-slate rule: production
+implements one current format, not old/new readers or a migration bridge. The
+canonical authenticated-map priority/node algorithm has one owner,
+`tine-storage::sealed_accepted_index`, shared by scratch, the clean runtime, and
+SQLite. The same module owns the one current sealed batch/status/sequence/causal
+encoding and its bounded cross-checking reader; its caller-provided Tine
+evidence decoder validates the one current accepted-evidence encoding without
+reversing the crate dependency. The R1a adapter has no filesystem/publication
+capability, so a live checkpoint-generation marker remains impossible until a
+later cut deliberately changes that tested boundary. The physical layer has
+one current SQLite schema for both the live disposable projection and a
+separately built checkpoint candidate, plus a read-only injected sealed-history
+reader. It has no prior-schema enum, reader, compatibility fixture, or
+migration path. An unrecognized pre-0.7 private store is preserved as a backup
+and rebuilt from the untouched Markdown/Org tree by Tine.
 
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
@@ -1910,8 +1995,9 @@ The remaining save/move gap is no longer receipt publication or repeated
 managed graph directory barriers; it is the turn/journal, graph publication,
 archive, and coalesced completion-index work shown by the exact 10/13 ledgers.
 Direct Files' user-visible Markdown publication keeps its
-temp + fsync + rename + base-revision guard + lock and immediate directory
-barriers unchanged.
+temp + fsync + exact durable name publication + base-revision guard + lock.
+The platform-specific typed publication boundary supplies the name-durability
+guarantee, including write-through publication on Windows.
 
 ### 2.10b No-clobber publication when the filesystem has no rename flags
 

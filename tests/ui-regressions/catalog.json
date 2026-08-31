@@ -1910,6 +1910,114 @@
    }
   },
   {
+   "id": "UI-PDF-TOOLBAR-CLOSE-443",
+   "title": "The PDF Close action remains directly operable at the right edge of the toolbar",
+   "family": "pdf",
+   "sources": {
+    "issues": [
+     443
+    ],
+    "commits": [
+     "05efa435"
+    ]
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "render",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/PdfViewer.test.tsx"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "The final toolbar button has the accessible name Close PDF and remains a direct visible action rather than moving behind the overflow menu. Packaged Linux pointer proof belongs to the route journey when that journey lands."
+  },
+  {
+   "id": "UI-PDF-TILE-AWARE-RENDER-393",
+   "title": "High-zoom PDF rendering stays readable and bounded without retaining arbitrary complete offscreen pages",
+   "family": "pdf",
+   "sources": {
+    "issues": [
+     393
+    ],
+    "commits": [
+     "400f4989",
+     "9c15daf7",
+     "391c443e",
+     "2b16bd3c",
+     "c398275e",
+     "466eabd0"
+    ]
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "fixing",
+   "coverage": {
+    "tests": [
+      "src/pdfjsContract.test.ts",
+      "src/pdfRenderCoordinator.test.ts",
+      "src/pdfTileRenderer.test.ts",
+      "src/pdfRendererBoundary.test.ts",
+      "src/components/PdfViewer.test.tsx",
+     "scripts/e2e-pdf-scroll-resources.mjs"
+    ],
+    "scenario": "pdf.tile-aware-high-zoom-rendering",
+    "failBefore": "proven"
+   },
+   "notes": "PDF.js 4.10.38 is pinned and characterized. Tine owns cross-view admission and measured backing-store eviction. Above the bounded 300% PDFPageView fallback, only visible page/scale/rectangle tiles are rendered; completed lower-resolution tiles remain aligned until the sharper set completes, stale work is cancelled, and area capture uses a dedicated clipped render. Exact pixels, tile dimensions, thresholds, frame timing, and DOM nesting are non-requirements. Native high-zoom interaction remains the final exact-candidate proof."
+  },
+  {
+   "id": "UI-PDF-ROUTE-PANE-SESSION-20260830",
+   "title": "A PDF behaves as a movable restorable pane tab and legacy dedicated-pane sessions migrate without pane loss",
+   "family": "pdf",
+   "sources": {
+    "issues": [],
+    "commits": [
+     "bf2f7526",
+     "236cb528",
+     "7d3c2e91",
+     "298ede0b",
+     "5f78fde3"
+    ]
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "fixing",
+   "coverage": {
+    "tests": [],
+    "scenario": "pdf.route-pane-session-migration",
+    "failBefore": "inferred"
+   },
+   "notes": "Default open-beside preserves the source; Notes uses the structural companion; the old dedicated pane and width authority are removed in the atomic route flip. The first release permits at most one visible view per document."
+  },
+  {
+   "id": "UI-PDF-MULTIVIEW-SHARED-ANNOTATIONS-20260830",
+   "title": "Two PDF views retain independent positions while observing one ordered annotation state",
+   "family": "pdf",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "reported",
+   "coverage": {
+    "tests": [],
+    "scenario": "pdf.multiview-shared-annotations",
+    "failBefore": "inferred"
+   },
+   "notes": "Reserved but deliberately not exposed while the Managed Storage campaign owns the write_highlights actor surface. Enabling duplicate editable views requires the command to return the committed merged highlight collection."
+  },
+  {
    "id": "UI-MEDIA-BLOB-FALLBACK-BUDGET-001",
    "title": "Audio and MKV fallback cannot retain or copy unbounded whole media files",
    "family": "media",
@@ -8054,7 +8162,7 @@
     "windows"
    ],
    "layer": "native",
-   "status": "covered",
+   "status": "reproduced",
    "coverage": {
     "tests": [
      "scripts/e2e-windows-managed-storage.mjs",
@@ -8063,7 +8171,7 @@
     "scenario": "managed.windows-previous-patch-upgrade-reopen",
     "failBefore": "proven"
    },
-   "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files."
+   "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files. MS-17 quarantined the shared Windows upgrade/reopen journey on 2026-08-31 after two inconclusive hosted attempts (runs 33349270671 and 33350869828); startupRecovery.test.ts retains the deterministic readiness/refusal coverage, but the literal Windows previous-release boundary returns to covered only after the corrected journey completes an unchanged-binary burn-in."
   },
   {
    "id": "UI-PANE-SCROLL-SLACK-369",
@@ -9004,6 +9112,28 @@
     "failBefore": "proven"
    },
    "notes": "GH #438 (follow-up to #283): giving Ctrl/Cmd+click to background tabs was the right browser convention but removed the only mouse+modifier route to the other pane. internalLinkDest now yields a fourth destination (Alt+click -> pane), with the GH #288 switcher precedence: pure Shift keeps the sidebar, pure Ctrl/Cmd keeps the background tab, Alt claims every chord it enters (Shift+Alt and Ctrl+Alt included), and combined modifiers without Alt keep plain-click meaning. Every internalLinkDest surface routes the new destination through openRouteInOtherPane — the gesture/routing call boundary — so the frontier replacement of the pane-selection helper can change its internals without touching these call sites. Context menus, middle-click, Shift/right-sidebar, guide-page guards, and the annotation-ref plain-click PDF flow are unchanged. Fail-before: all seven Alt+click surface/progression tests red pre-fix (no pane created; Alt fell through to plain-click navigation), the ten existing #283 contract tests green throughout. jsdom render-layer proof; native browser confirmation of the click matrix on a real split remains the manager smoke item."
+  },
+  {
+   "id": "UI-MANAGED-RAPID-JOURNAL-BOUNDARY-MOVE-001",
+   "title": "Rapid uninterrupted Managed Storage commands move one block across several journal-day boundaries without losing commands or flooding errors",
+   "family": "managed-storage",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Martin physical report 2026-08-30"
+   },
+   "platforms": ["all"],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result",
+     "scripts/e2e-managed-journal-feed.mjs"
+    ],
+    "scenario": "managed.journal-rapid-multi-day-move",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before: two queued calls captured one source page; the first crossed and the second returned none. The prior deployed binary accepted 120 immediate key events but the marker reached only the preceding journal instead of the fifth loaded day. The queue now contains commands, not precomputed page-pair intents. Each command resolves after its predecessor installs the accepted actor result. The permanent native journey dispatches 120 synthetic Alt+Shift+Down events uninterrupted at 5 ms spacing, requires one exact marker on the fifth loaded journal and no error toast, then separately moves 20 selected roots between named pages by cut/paste and verifies both rendered and durable source/destination state. Exact timing and queue implementation are not user contracts."
   }
  ]
 }

@@ -5,9 +5,12 @@ import {
   closePane,
   focusPane,
   openRouteInOtherPane,
+  openPdf,
+  openPdfNotes,
   layoutPaneIds,
   layoutRoot,
   focusedPaneId,
+  lastFocusedLayoutPaneId,
   maximizedPaneId,
   moveActiveTabInDirection,
   moveActiveTabToPane,
@@ -16,6 +19,7 @@ import {
   visibleLayoutNode,
   paneRouter,
   resetPaneLayoutToSingle,
+  restorePaneLayout,
   setFocusedPaneId,
   setSplitRatio,
   splitLayoutNode,
@@ -682,5 +686,124 @@ describe("openRouteInOtherPane", () => {
     openRouteInOtherPane({ kind: "page", name: "Dest", pageKind: "page" }, "main");
 
     expect(paneRouter(other).tabs().length).toBe(before + 1);
+  });
+
+  it("uses the nearest-ancestor sibling rather than a globally-nearest tie", () => {
+    const root: LayoutNode = {
+      kind: "split",
+      dir: "col",
+      ratio: 0.1,
+      children: [
+        {
+          kind: "split", dir: "row", ratio: 0.5,
+          children: [
+            { kind: "pane", paneId: "main" },
+            { kind: "pane", paneId: "z-structural" },
+          ],
+        },
+        {
+          kind: "split", dir: "row", ratio: 0.5,
+          children: [
+            { kind: "pane", paneId: "a-global-tie" },
+            { kind: "pane", paneId: "far" },
+          ],
+        },
+      ],
+    };
+    const snapshots = new Map([
+      ["main", pageSnapshot("Source")],
+      ["z-structural", pageSnapshot("Structural")],
+      ["a-global-tie", pageSnapshot("Global")],
+      ["far", pageSnapshot("Far")],
+    ]);
+    restorePaneLayout(root, snapshots, "main");
+
+    expect(openRouteInOtherPane({ kind: "page", name: "Dest", pageKind: "page" }, "main"))
+      .toBe("z-structural");
+  });
+
+  it("does not escape the structural selector for a missing source leaf", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const before = paneRouter("main").snapshot();
+
+    expect(openRouteInOtherPane({ kind: "page", name: "Dest", pageKind: "page" }, "missing"))
+      .toBeNull();
+    expect(layoutPaneIds()).toEqual(["main"]);
+    expect(paneRouter("main").snapshot()).toEqual(before);
+  });
+});
+
+describe("last focused layout pane", () => {
+  it("ignores satellite and legacy PDF focus while retaining current focus behavior", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const other = splitPane("main", "row")!;
+    setFocusedPaneId(other);
+    expect(lastFocusedLayoutPaneId()).toBe(other);
+
+    // The dedicated PDF representation may still publish its pseudo id during
+    // the migration. It must not become a future satellite action's source.
+    setFocusedPaneId("pdf", false);
+    expect(focusedPaneId()).toBe("pdf");
+    expect(lastFocusedLayoutPaneId()).toBe(other);
+
+    // Current outside-pane pointer behavior still retargets current focus to
+    // main, but does not erase the last focus backed by a real pane surface.
+    setFocusedPaneId("main", false);
+    expect(focusedPaneId()).toBe("main");
+    expect(lastFocusedLayoutPaneId()).toBe(other);
+  });
+});
+
+describe("PDF pane routes", () => {
+  it("opens beside the source in one exact PDF tab without cloned source history", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+
+    const opened = openPdf("assets/alpha.pdf", "Alpha", 3, undefined, { sourcePaneId: "main" });
+
+    expect(opened).toMatchObject({ kind: "pdf", filename: "assets/alpha.pdf", page: 3 });
+    expect(layoutPaneIds()).toHaveLength(2);
+    const pdfPane = layoutPaneIds().find((id) => id !== "main")!;
+    expect(paneRouter(pdfPane).snapshot().tabs).toEqual([{
+      history: [opened], pos: 0, pinned: false,
+    }]);
+    expect(paneRouter("main").route()).toMatchObject({ kind: "page", name: "Source" });
+  });
+
+  it("reuses one companion pane for different PDFs and focuses an existing document tab", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const alpha = openPdf("assets/alpha.pdf", "Alpha", 1, undefined, { sourcePaneId: "main" })!;
+    const pdfPane = focusedPaneId();
+    focusPane("main");
+    openPdf("assets/beta.pdf", "Beta", 2, undefined, { sourcePaneId: "main" });
+    expect(layoutPaneIds()).toHaveLength(2);
+    expect(paneRouter(pdfPane).tabs()).toHaveLength(2);
+
+    focusPane("main");
+    const reused = openPdf("assets/alpha.pdf", "Alpha", 9, "hl-9", { sourcePaneId: "main" });
+    expect(reused?.viewId).toBe(alpha.viewId);
+    expect(layoutPaneIds()).toHaveLength(2);
+    expect(paneRouter(pdfPane).route()).toMatchObject({ kind: "pdf", viewId: alpha.viewId, page: 9 });
+  });
+
+  it("does not expose deliberate duplicate views before shared annotation ownership lands", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    openPdf("assets/alpha.pdf", "Alpha", undefined, undefined, { sourcePaneId: "main" });
+    expect(openPdf("assets/alpha.pdf", "Alpha", undefined, undefined, {
+      sourcePaneId: "main", anotherView: true,
+    })).toBeNull();
+  });
+
+  it("focuses an existing notes tab in the structural companion instead of duplicating it", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    openPdf("assets/alpha.pdf", "Alpha", undefined, undefined, { sourcePaneId: "main" });
+    const pdfPane = focusedPaneId();
+    const notesPane = splitPane(pdfPane, "row", { focusNew: false })!;
+    paneRouter(notesPane).openPage("hls__alpha", "page");
+    const before = paneRouter(notesPane).tabs().length;
+
+    expect(openPdfNotes(pdfPane, "hls__alpha")).toBe(notesPane);
+    expect(paneRouter(notesPane).tabs()).toHaveLength(before);
+    expect(paneRouter(notesPane).route()).toMatchObject({ kind: "page", name: "hls__alpha" });
+    expect(focusedPaneId()).toBe(pdfPane);
   });
 });

@@ -313,15 +313,20 @@
    "contracts": [
     {
      "class": "core-operation",
-     "userOutcome": "After managed-storage activation, the Journals surface opens the newest bounded day window, paginates backward in newest-first order, and shows a newly accepted journal edit when the feed is reopened.",
+     "userOutcome": "After managed-storage activation, the Journals surface opens the newest bounded day window, paginates backward in newest-first order, shows a newly accepted journal edit when the feed is reopened, and accepts a rapid uninterrupted block move across several day boundaries without losing commands or flooding errors.",
+     "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "A 20-root cut from one ordinary page and paste into another commits all selected roots durably without partial source/destination state or error notifications.",
      "blocking": true
     }
    ],
    "acceptableVariations": [
-    "Journal title formatting, feed layout, and activation duration may vary while the same days, order, and accepted content are visible."
+    "Journal title formatting, feed layout, activation duration, and the exact completion latency of queued moves may vary while the same days, order, accepted content, and complete command sequence remain visible."
    ],
    "nonRequirements": [
-    "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, or millisecond timing."
+    "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, millisecond timing, or a particular internal queue implementation."
    ],
    "stability": "stable"
   },
@@ -508,6 +513,27 @@
     "Exact drag threshold.",
     "Exact theme palette/RGB.",
     "Exact CSS filter/DOM strategy."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-pdf-routes.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Opening graph PDFs preserves the source in a structural companion, treats each PDF as an ordinary tab, closes the selected PDF tab, and opens Notes in the adjacent pane.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "PDF pane routes and reader position survive relaunch, and a legacy dedicated PDF target migrates without discarding the user's existing pane layout.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Pane identifiers, split ratios, tab styling, and reader zoom percentages may vary while the route ownership and restored user state remain intact."
+   ],
+   "nonRequirements": [
+    "Exact PDF pixels, pane dimensions, DOM nesting, drag geometry, or mobile navigation."
    ],
    "stability": "stable"
   },
@@ -1038,15 +1064,21 @@
      "class": "core-operation",
      "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after v0.6.94 managed activation, forced process death, candidate upgrade/reopen, and return to Direct Files; when the old release serves pages, the predecessor journey also attempts a real managed edit.",
      "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "In current-candidate mode, Windows activation, forced-close reopen, and repeated user-visible switching between ordinary and nested Unicode pages complete on a reporter-scale graph while recording comparable Direct Files and Managed Storage timing summaries.",
+     "blocking": true
     }
    ],
    "acceptableVariations": [
-    "Hosted Windows filesystem speed, WebView2 startup timing, and managed-storage activation duration may vary."
+    "Hosted Windows filesystem speed, WebView2 startup timing, managed-storage activation duration, and individual page-switch timings may vary."
    ],
    "nonRequirements": [
-    "Exact native confirmation-dialog appearance, internal private-storage layout, or exact progress wording."
+    "Exact native confirmation-dialog appearance, internal private-storage layout, exact progress wording, or equality between Direct Files and Managed Storage timing samples."
    ],
-   "stability": "burn-in"
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-31: MS-17 exhausted the two-attempt hosted Windows E2E stop-loss without completing the current-candidate timing comparison. Run 33349270671 reached exact-candidate managed activation in 99.36 seconds, then the synthetic fixture's accidental 119,990-backlink hub monopolized the serialized actor and blocked the next page load. Run 33350869828 distributed those references but exposed a separate harness selector bug before activation: Ctrl+K chose a block-search hit containing the requested page title instead of the exact page result. The selector is now structurally corrected to require a page/journal row with an exact displayed name, but a prohibited third debugging run was not used to promote unburned evidence. The scenario remains diagnostic and must complete an unchanged-binary Windows burn-in before returning to release-blocking status."
   },
   "scripts/e2e-windows-page-reference-latency.mjs": {
    "contracts": [

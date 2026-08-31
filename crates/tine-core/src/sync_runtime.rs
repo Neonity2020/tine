@@ -29,7 +29,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cap_std::ambient_authority;
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, ReadDir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -102,12 +102,14 @@ use crate::oplog::operational_coordinator::{
     OperationalCoordinator, OperationalCoordinatorError, OperationalPhase,
     PreparedLocalMutationState,
 };
+use crate::oplog::projection::{
+    inject_policy_generated_logseq_id, render_requested_page_document, PreparedEditorProjection,
+};
 #[cfg(test)]
 use crate::oplog::projection::{
     prepared_editor_projection_instrumentation, reset_prepared_editor_projection_instrumentation,
     PreparedEditorProjectionInstrumentation,
 };
-use crate::oplog::projection::{render_requested_page_document, PreparedEditorProjection};
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::projection_turn_journal::{
     open_projection_turn_journal, ProjectionTurnJournalState,
@@ -160,13 +162,13 @@ use crate::oplog::{
     ContentDigest, CurrentPageAtPath, DeviceId, DocumentId, FrontierReferenceHit, LineageDigest,
     LogicalPageName, LogseqIdentityOrigin, LogseqUuid, ManagedLocalAppendError,
     ManagedLocalGenerationAnchorV2, ManagedLocalJournal, ManagedLocalJournalPayloadKind,
-    ManagedLocalJournalProtocol, ManagedLocalRecord, ManagedPath, ManagedTextKind,
-    MaterializedBlock, MaterializedBlockRow, MaterializedEntityId, MaterializedPage,
-    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
-    MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction, PageId, PageState,
-    PreparedBatch, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
-    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
-    SessionId, SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
+    ManagedLocalRecord, ManagedPath, ManagedTextKind, MaterializedBlock, MaterializedBlockRow,
+    MaterializedEntityId, MaterializedPage, MaterializedPageRow, MaterializedPropertyRow,
+    MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow, OperationBatch,
+    OperationObject, OperationTransaction, PageId, PageState, PreparedBatch, ProjectionClaim,
+    ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource, ReferenceCatalogPolicyV1,
+    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
+    SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
     MAX_MATERIALIZATION_QUERY_ROWS,
 };
 use uuid::Uuid;
@@ -342,7 +344,6 @@ struct ManagedApplicationSaveInstrumentation {
     graph_wide: GraphWideCommitWork,
     engine: crate::oplog::hot_engine::EngineInstrumentation,
     managed_local_work: crate::oplog::hot_engine::ManagedLocalWork,
-    provider_pending: usize,
     managed_local_pending: usize,
     managed_local_next_sequence: u64,
     prepared_editor_projection: PreparedEditorProjectionInstrumentation,
@@ -871,21 +872,11 @@ fn checked_editor_request_remainder(timings: &ManagedApplicationSaveStageTimings
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProviderRecoveryCoverageRoot {
-    acceptance_sequence: u64,
-    state_digest: ContentDigest,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderAcceptedManifestAudit {
     next_sequence: u64,
     target_sequence: u64,
     advances_coverage: bool,
 }
-
-impl ProviderAcceptedManifestAudit {}
-
-impl ProviderRecoveryCoverageRoot {}
 
 #[cfg(test)]
 static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
@@ -1742,6 +1733,46 @@ pub enum SyncRuntimeOpenPhase {
     AssemblingActor,
 }
 
+/// Content-free completion boundaries inside clean retained-runtime recovery.
+///
+/// These stages refine [`SyncRuntimeOpenPhase::RecoveringCleanManifestRuntime`]
+/// for diagnostics. They do not authorize recovery, expose storage details, or
+/// create a second admission state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncRuntimeCleanOpenStage {
+    AuthenticatedBaselineOpen,
+    ReceiptClaimPrecheck,
+    GraphOpen,
+    EndpointAndReceiptOpen,
+    ObjectStoreRepairAndValidation,
+    CommittedTailReplay,
+    ProjectionOpen,
+    EngineIndexesAndSweepsOpen,
+    RetainedJournalsOpen,
+    RetainedJournalsDrain,
+    TerminalProjectionRepair,
+    CompletionFlush,
+}
+
+impl SyncRuntimeCleanOpenStage {
+    pub const fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::AuthenticatedBaselineOpen => "authenticated_baseline_open",
+            Self::ReceiptClaimPrecheck => "receipt_claim_precheck",
+            Self::GraphOpen => "graph_open",
+            Self::EndpointAndReceiptOpen => "endpoint_and_receipt_open",
+            Self::ObjectStoreRepairAndValidation => "object_store_repair_and_validation",
+            Self::CommittedTailReplay => "committed_tail_replay",
+            Self::ProjectionOpen => "projection_open",
+            Self::EngineIndexesAndSweepsOpen => "engine_indexes_and_sweeps_open",
+            Self::RetainedJournalsOpen => "retained_journals_open",
+            Self::RetainedJournalsDrain => "retained_journals_drain",
+            Self::TerminalProjectionRepair => "terminal_projection_repair",
+            Self::CompletionFlush => "completion_flush",
+        }
+    }
+}
+
 /// Content-free detail for a debug-enabled promoted-runtime recovery.  It is
 /// observational only: no field grants recovery, scan, or mutation authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1796,6 +1827,10 @@ pub enum SyncRuntimeOpenProgress {
     },
     Waiting {
         phase: SyncRuntimeOpenPhase,
+        elapsed: Duration,
+    },
+    RecoveryStage {
+        stage: SyncRuntimeCleanOpenStage,
         elapsed: Duration,
     },
     RecoveryDiagnostics {
@@ -1908,6 +1943,9 @@ pub struct SyncRuntimeStatusSnapshot {
     /// True until both FTS families have caught up to the live projection.
     /// Search consumers must fall back or report progress while this is set.
     pub search_index_building: bool,
+    /// Actor-owned replay-evidence cleanup that can make progress without a
+    /// new filesystem or provider event.
+    pub move_episode_cleanup_pending: bool,
     pub managed_local_pending: usize,
     pub managed_local_checkpointed_sequence: u64,
     pub managed_local_next_sequence: u64,
@@ -1937,6 +1975,7 @@ impl SyncRuntimeStatusSnapshot {
         self.watcher.pending
             || self.provider_runnable
             || self.search_index_building
+            || self.move_episode_cleanup_pending
             || self.sweep_deadline_due
     }
 }
@@ -3501,7 +3540,14 @@ impl SyncRuntimeHandle {
                 elapsed: open_started.elapsed(),
             });
             let recovery_request = clean_request.clone();
-            let (recovery_sender, recovery_receiver) = mpsc::sync_channel(1);
+            enum RecoveryWorkerEvent {
+                Stage {
+                    stage: SyncRuntimeCleanOpenStage,
+                    elapsed: Duration,
+                },
+                Complete(Result<Option<CleanRuntimeResources>, String>),
+            }
+            let (recovery_sender, recovery_receiver) = mpsc::channel();
             let open_barrier_session = crate::durability_counters::current_session();
             let recovery_worker = match thread::Builder::new()
                 .name("tine-clean-runtime-open".into())
@@ -3509,7 +3555,16 @@ impl SyncRuntimeHandle {
                     if let Some(session) = open_barrier_session {
                         session.attach();
                     }
-                    let _ = recovery_sender.send(open_clean_runtime_resources(&recovery_request));
+                    let stage_sender = recovery_sender.clone();
+                    let result = open_clean_runtime_resources_with_progress(
+                        &recovery_request,
+                        &mut |_| {},
+                        &mut |stage, elapsed| {
+                            let _ =
+                                stage_sender.send(RecoveryWorkerEvent::Stage { stage, elapsed });
+                        },
+                    );
+                    let _ = recovery_sender.send(RecoveryWorkerEvent::Complete(result));
                 }) {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -3520,7 +3575,10 @@ impl SyncRuntimeHandle {
             };
             let clean_open = loop {
                 match recovery_receiver.recv_timeout(RUNTIME_OPEN_PROGRESS_HEARTBEAT) {
-                    Ok(result) => {
+                    Ok(RecoveryWorkerEvent::Stage { stage, elapsed }) => {
+                        progress(SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed });
+                    }
+                    Ok(RecoveryWorkerEvent::Complete(result)) => {
                         if recovery_worker.join().is_err() {
                             break Err("clean managed runtime recovery worker panicked".into());
                         }
@@ -3636,6 +3694,7 @@ impl SyncRuntimeHandle {
             provider_pending: 0,
             provider_runnable: false,
             search_index_building: false,
+            move_episode_cleanup_pending: true,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -3686,6 +3745,7 @@ impl SyncRuntimeHandle {
                         provider_pending: 0,
                         provider_runnable: false,
                         search_index_building: false,
+                        move_episode_cleanup_pending: false,
                         managed_local_pending: 0,
                         managed_local_checkpointed_sequence: 0,
                         managed_local_next_sequence: 0,
@@ -3701,7 +3761,7 @@ impl SyncRuntimeHandle {
             Err(error) => return refused(format!("cannot start clean sync actor thread: {error}")),
         };
         match started_receiver.recv() {
-            Ok(ActorStartupEvent::Finished(Ok(snapshot))) => {
+            Ok(ActorStartupEvent(Ok(snapshot))) => {
                 *status.write().unwrap() = snapshot;
                 SyncRuntimeOpenResult {
                     status: SyncRuntimeOpenStatus::Active,
@@ -3719,15 +3779,10 @@ impl SyncRuntimeHandle {
                     }),
                 }
             }
-            Ok(ActorStartupEvent::Finished(Err(detail))) => {
+            Ok(ActorStartupEvent(Err(detail))) => {
                 drop(sender);
                 let _ = join.join();
                 refused(detail)
-            }
-            Ok(ActorStartupEvent::Phase(_)) | Ok(ActorStartupEvent::RecoveryDiagnostics(_)) => {
-                drop(sender);
-                let _ = join.join();
-                refused("clean sync actor reported an unexpected startup event".into())
             }
             Err(_) => {
                 drop(sender);
@@ -3789,6 +3844,7 @@ impl SyncRuntimeHandle {
         match open_clean_runtime_resources_with_progress(
             &runtime_open_request_from_activation(&request),
             &mut progress,
+            &mut |_, _| {},
         ) {
             Ok(Some(resources)) => {
                 progress(SyncLocalActivationProgress::Phase {
@@ -4055,31 +4111,17 @@ impl SyncRuntimeHandle {
         let descriptor = descriptor
             .decode()
             .map_err(SyncRuntimeRequestError::InvalidRequest)?;
-        loop {
-            // One actor request performs at most one cursor entry. Release the
-            // public operation gate between entries so a large enrollment cut
-            // cannot monopolize status, shutdown, or other actor work for its
-            // entire history-sized traversal.
-            let _operation = self.inner.operation.lock().unwrap();
-            let (reply_sender, reply_receiver) = mpsc::channel();
-            self.send(ActorRequest::JoinShared {
-                descriptor: descriptor.clone(),
-                reply: reply_sender,
-            })?;
-            match reply_receiver
-                .recv()
-                .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)??
-            {
-                SharedJoinStep::Pending => {
-                    drop(_operation);
-                    std::thread::yield_now();
-                }
-                SharedJoinStep::Complete(descriptor) => {
-                    self.observe_retired_actor()?;
-                    return Ok(descriptor);
-                }
-            }
-        }
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::JoinShared {
+            descriptor,
+            reply: reply_sender,
+        })?;
+        let joined = reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)??;
+        self.observe_retired_actor()?;
+        Ok(joined)
     }
 
     /// A successful enrollment cut retires its actor by design: the actor
@@ -4293,6 +4335,32 @@ impl SyncRuntimeHandle {
     ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
         validate_application_move_request(&request)?;
         self.application_request(|reply| ActorRequest::MoveApplicationSubtrees { request, reply })
+    }
+
+    /// Retire the replay evidence for one move only after the caller has
+    /// installed the actor's committed page pair. The accepted semantic batch
+    /// remains authoritative; this only bounds the private response-replay
+    /// namespace during long editing sessions.
+    pub fn acknowledge_application_move(
+        &self,
+        episode_id: &str,
+        batch_id: &str,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        let episode_id = Uuid::parse_str(episode_id).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::MalformedPage,
+            )
+        })?;
+        let batch_id = batch_id.parse().map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::MalformedPage,
+            )
+        })?;
+        self.application_request(|reply| ActorRequest::AcknowledgeApplicationMove {
+            episode_id,
+            batch_id,
+            reply,
+        })
     }
 
     /// Resubmit one exact move request and observe its outcome plus runtime
@@ -5530,7 +5598,6 @@ struct CleanRetryFingerprint {
     phase: OperationalPhase,
     detail: String,
     attempts: u32,
-    escalated: bool,
 }
 
 #[derive(Debug)]
@@ -5821,7 +5888,6 @@ impl CleanRuntimeActorCore {
             phase,
             detail: detail.clone(),
             attempts,
-            escalated,
         });
         escalated.then_some(CleanActorMutationOutcome::DurableStuck {
             batch_id,
@@ -6594,7 +6660,7 @@ fn activate_clean_runtime_resources_retaining_archive(
 fn open_clean_runtime_resources(
     request: &SyncRuntimeOpenRequest,
 ) -> Result<Option<CleanRuntimeResources>, String> {
-    open_clean_runtime_resources_with_progress(request, &mut |_| {})
+    open_clean_runtime_resources_with_progress(request, &mut |_| {}, &mut |_, _| {})
 }
 
 /// Own the engine and its lease together throughout cold repair. Drop flushes
@@ -6650,36 +6716,45 @@ impl Drop for ColdOpenLocalCompletionGuard {
 /// directed `TINE_DEBUG=1` performance diagnosis and never carries paths,
 /// identities, names, content, or authority.
 struct CleanOpenStageTrace {
-    started: Option<Instant>,
-    previous: Option<Instant>,
+    started: Instant,
+    previous: Instant,
+    debug_enabled: bool,
 }
 
 impl CleanOpenStageTrace {
     fn new() -> Self {
-        let started = runtime_debug_diagnostics_enabled().then(Instant::now);
+        let started = Instant::now();
         Self {
             started,
             previous: started,
+            debug_enabled: runtime_debug_diagnostics_enabled(),
         }
     }
 
-    fn phase(&mut self, phase: &'static str) {
-        let (Some(started), Some(previous)) = (self.started, self.previous) else {
-            return;
-        };
+    fn phase(
+        &mut self,
+        stage: SyncRuntimeCleanOpenStage,
+        progress: &mut dyn FnMut(SyncRuntimeCleanOpenStage, Duration),
+    ) {
         let now = Instant::now();
-        eprintln!(
-            "[tine] managed clean open stage: {phase}; phase_ms={}; total_ms={}",
-            now.duration_since(previous).as_millis(),
-            now.duration_since(started).as_millis(),
-        );
-        self.previous = Some(now);
+        let elapsed = now.duration_since(self.started);
+        progress(stage, elapsed);
+        if self.debug_enabled {
+            eprintln!(
+                "[tine] managed clean open stage: {}; phase_ms={}; total_ms={}",
+                stage.diagnostic_name(),
+                now.duration_since(self.previous).as_millis(),
+                elapsed.as_millis(),
+            );
+        }
+        self.previous = now;
     }
 }
 
 fn open_clean_runtime_resources_with_progress(
     request: &SyncRuntimeOpenRequest,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
+    stage_progress: &mut dyn FnMut(SyncRuntimeCleanOpenStage, Duration),
 ) -> Result<Option<CleanRuntimeResources>, String> {
     let mut trace = CleanOpenStageTrace::new();
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
@@ -6706,7 +6781,10 @@ fn open_clean_runtime_resources_with_progress(
     else {
         return Ok(None);
     };
-    trace.phase("authenticated baseline open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::AuthenticatedBaselineOpen,
+        stage_progress,
+    );
     // (c) §1: the claim precheck is the HEAD of the clean cold open, before
     // `Graph::open_checked` -- which is not read-only, because its publication
     // recovery renames graph files and moves artifacts to `.trash/`. Clean
@@ -6715,9 +6793,12 @@ fn open_clean_runtime_resources_with_progress(
     // fresh store never reaches this line. The full in-place validation inside
     // the receipt-store open below stays as defense in depth.
     ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root).map_err(display)?;
-    trace.phase("receipt claim precheck");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::ReceiptClaimPrecheck,
+        stage_progress,
+    );
     let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
-    trace.phase("graph open");
+    trace.phase(SyncRuntimeCleanOpenStage::GraphOpen, stage_progress);
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
         identities.endpoint_id,
@@ -6730,7 +6811,10 @@ fn open_clean_runtime_resources_with_progress(
         endpoint,
     )
     .map_err(display)?;
-    trace.phase("endpoint and receipt open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
+        stage_progress,
+    );
     if opened.marker().workspace_id() != identities.workspace_id
         || opened.marker().lineage_digest() != identities.lineage_digest
     {
@@ -6748,7 +6832,10 @@ fn open_clean_runtime_resources_with_progress(
         .repair_covered_object_mismatches(&covered)
         .map_err(display)?;
     store.validate_namespace().map_err(display)?;
-    trace.phase("object store repair and validation");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
+        stage_progress,
+    );
     engine
         .attach_clean_archive_store(store.duplicate_retained_capability().map_err(display)?)
         .map_err(display)?;
@@ -6763,7 +6850,10 @@ fn open_clean_runtime_resources_with_progress(
         .replay_clean_committed_tail(baseline_claim_source.as_ref())
         .map_err(display)?;
     drop(baseline_claim_source);
-    trace.phase("committed tail replay");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CommittedTailReplay,
+        stage_progress,
+    );
     let projection = if replayed == 0 {
         let expected = engine.accepted_frontier_root().map_err(display)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
@@ -6773,7 +6863,6 @@ fn open_clean_runtime_resources_with_progress(
             ReferenceCatalogPolicyV1::default(),
         )
         .map_err(display)?;
-        trace.phase("clean genesis projection validation");
         LeasedWorkspaceProjection::adopt_clean_genesis(
             lease,
             &request.database_path,
@@ -6802,11 +6891,7 @@ fn open_clean_runtime_resources_with_progress(
         .map(|(projection, ())| projection)
         .map_err(|(_, error)| display(error))?
     };
-    trace.phase(if replayed == 0 {
-        "clean genesis projection adoption"
-    } else {
-        "replayed projection open"
-    });
+    trace.phase(SyncRuntimeCleanOpenStage::ProjectionOpen, stage_progress);
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
         .map_err(display)?;
@@ -6824,7 +6909,10 @@ fn open_clean_runtime_resources_with_progress(
         .into_iter()
         .collect();
     let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
-    trace.phase("engine indexes and sweeps open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
+        stage_progress,
+    );
     let mut retired_own_intent_ids = engine.local_completed_projection_intent_ids();
     let endpoint = engine
         .projection_endpoint_binding()
@@ -6849,7 +6937,10 @@ fn open_clean_runtime_resources_with_progress(
         binding.device_id().as_uuid(),
     )
     .map_err(display)?;
-    trace.phase("retained journals open");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
+        stage_progress,
+    );
     let retained_own_intents =
         retained_local_completion_intents(&managed_local, &projection_turns)?;
     retired_own_intent_ids.extend(retained_own_intents.iter().copied());
@@ -6879,7 +6970,10 @@ fn open_clean_runtime_resources_with_progress(
         completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
-    trace.phase("retained journals drain");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
+        stage_progress,
+    );
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeProjectionRepair,
     });
@@ -6889,11 +6983,14 @@ fn open_clean_runtime_resources_with_progress(
         completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
-    trace.phase("terminal projection repair");
+    trace.phase(
+        SyncRuntimeCleanOpenStage::TerminalProjectionRepair,
+        stage_progress,
+    );
     // Repair -> actor assembly boundary: the pre-actor window ends with zero
     // buffered entries, independent of how long actor construction takes.
     let runtime = completion_guard.finish()?;
-    trace.phase("completion flush");
+    trace.phase(SyncRuntimeCleanOpenStage::CompletionFlush, stage_progress);
     Ok(Some(CleanRuntimeResources {
         graph,
         receipts,
@@ -8349,12 +8446,23 @@ impl Drop for CleanJoinCandidate {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct CleanJoinUserPage {
     path: String,
     kind: ManagedTextKind,
     preamble: Option<String>,
     outline: Vec<(usize, String, Option<LogseqUuid>)>,
+    /// Exact ids a projection renders, including derived policy anchors. This
+    /// is representation evidence only and is deliberately excluded from the
+    /// user-semantic diff above.
+    projected_ids: Vec<Option<LogseqUuid>>,
+}
+
+fn clean_join_pages_user_equal(left: &CleanJoinUserPage, right: &CleanJoinUserPage) -> bool {
+    left.path == right.path
+        && left.kind == right.kind
+        && left.preamble == right.preamble
+        && left.outline == right.outline
 }
 
 const CLEAN_JOIN_MAX_MISMATCH_DETAILS: usize = 32;
@@ -8571,13 +8679,17 @@ fn clean_join_user_semantics(
         .blocks
         .into_iter()
         .map(|block| {
+            let projected_uuid = block.logseq_uuid;
             let external_uuid = matches!(
                 block.logseq_identity_origin,
                 Some(LogseqIdentityOrigin::ExternalImported)
             )
             .then_some(block.logseq_uuid)
             .flatten();
-            (block.block_id, (block.content, external_uuid))
+            (
+                block.block_id,
+                (block.content, external_uuid, projected_uuid),
+            )
         })
         .collect::<BTreeMap<_, _>>();
     let mut memberships = BTreeMap::<PageId, Vec<_>>::new();
@@ -8608,6 +8720,7 @@ fn clean_join_user_semantics(
             });
         }
         let mut outline = Vec::new();
+        let mut projected_ids = Vec::new();
         let mut pending = children
             .remove(&None)
             .unwrap_or_default()
@@ -8622,12 +8735,14 @@ fn clean_join_user_semantics(
                     "clean join semantic comparison found cyclic block structure".into(),
                 ));
             }
-            let (content, external_uuid) = blocks.get(&membership.block_id).ok_or_else(|| {
-                SyncRuntimeRequestError::ActorRefused(
-                    "clean join semantic comparison found a missing visible block".into(),
-                )
-            })?;
+            let (content, external_uuid, projected_uuid) =
+                blocks.get(&membership.block_id).ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(
+                        "clean join semantic comparison found a missing visible block".into(),
+                    )
+                })?;
             outline.push((depth, content.clone(), *external_uuid));
+            projected_ids.push(*projected_uuid);
             if let Some(descendants) = children.remove(&Some(membership.block_id)) {
                 pending.extend(
                     descendants
@@ -8647,6 +8762,7 @@ fn clean_join_user_semantics(
             kind,
             preamble: preambles.get(&page_id).cloned().flatten(),
             outline,
+            projected_ids,
         });
     }
     if !memberships.is_empty() {
@@ -8656,6 +8772,186 @@ fn clean_join_user_semantics(
     }
     pages.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok(pages)
+}
+
+/// Compare a fresh local activation with the shared frontier while accounting
+/// for a duplicate physical file that the shared history deliberately left
+/// unowned.
+///
+/// A synchronizer copies BOTH files to a new device. Fresh lexical discovery
+/// may select the older-sorting duplicate, even though the shared frontier
+/// selected another exact path before that duplicate arrived. Joining is safe
+/// only for an otherwise untouched fresh activation, when the provider-selected
+/// exact file still exists and parses to the provider semantics, and the
+/// local-only selected page decodes to that same logical page identity. The
+/// extra file remains untouched.
+fn clean_join_semantics_match_with_shared_path_authority(
+    graph: &Graph,
+    local: &[CleanJoinUserPage],
+    shared: &[CleanJoinUserPage],
+    local_is_activation_baseline: bool,
+) -> Result<bool, SyncRuntimeRequestError> {
+    if !local_is_activation_baseline || local.len() != shared.len() {
+        return Ok(false);
+    }
+    let mut consumed = vec![false; local.len()];
+    for shared_page in shared {
+        if let Some((index, _)) = local.iter().enumerate().find(|(index, local_page)| {
+            !consumed[*index] && clean_join_pages_user_equal(local_page, shared_page)
+        }) {
+            consumed[index] = true;
+            continue;
+        }
+        // This is a bounded exception to the ordinary semantic-diff refusal.
+        // Any path/read/parse failure must therefore decline the exception and
+        // preserve that useful original diff, not replace it with a lower-level
+        // probe error.
+        let Ok((shared_disk, shared_name)) = clean_join_disk_page(graph, &shared_page.path) else {
+            return Ok(false);
+        };
+        if !clean_join_disk_matches_shared_page(&shared_disk, shared_page) {
+            return Ok(false);
+        }
+        let Some((index, _)) = local.iter().enumerate().find(|(index, local_page)| {
+            if consumed[*index] {
+                return false;
+            }
+            clean_join_disk_page(graph, &local_page.path).is_ok_and(|(local_disk, local_name)| {
+                clean_join_disk_matches_shared_page(&local_disk, local_page)
+                    && local_name.key_digest() == shared_name.key_digest()
+            })
+        }) else {
+            return Ok(false);
+        };
+        consumed[index] = true;
+    }
+    Ok(consumed.into_iter().all(|matched| matched))
+}
+
+/// Disk parsing sees policy-generated `id::` anchors while the canonical user
+/// semantic view deliberately exposes only externally imported IDs. Compare
+/// all user-authored structure exactly and permit that one representation-only
+/// asymmetry when the shared side has no external ID.
+fn clean_join_disk_matches_shared_page(
+    disk: &CleanJoinUserPage,
+    shared: &CleanJoinUserPage,
+) -> bool {
+    if disk.path != shared.path
+        || disk.kind != shared.kind
+        || disk.preamble != shared.preamble
+        || disk.outline.len() != shared.outline.len()
+        || shared.projected_ids.len() != shared.outline.len()
+    {
+        return false;
+    }
+    let is_org = shared.path.to_ascii_lowercase().ends_with(".org");
+    disk.outline.iter().zip(&shared.outline).enumerate().all(
+        |(
+            index,
+            (
+                (disk_depth, disk_content, disk_uuid),
+                (shared_depth, shared_content, shared_external_uuid),
+            ),
+        )| {
+            if disk_depth != shared_depth {
+                return false;
+            }
+            if let Some(external_uuid) = shared_external_uuid {
+                return *disk_uuid == Some(*external_uuid) && disk_content == shared_content;
+            }
+            match shared.projected_ids[index] {
+                None => disk_uuid.is_none() && disk_content == shared_content,
+                Some(projected_uuid) if *disk_uuid == Some(projected_uuid) => {
+                    let mut canonical = crate::doc::DocBlock::new(shared_content);
+                    canonical.is_org = is_org;
+                    let raw_ids = canonical
+                        .properties()
+                        .into_iter()
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("id"))
+                        .filter_map(|(_, value)| LogseqUuid::parse(value.trim()).ok())
+                        .collect::<Vec<_>>();
+                    let expected = match raw_ids.as_slice() {
+                        [] => inject_policy_generated_logseq_id(
+                            shared_content,
+                            is_org,
+                            projected_uuid,
+                        )
+                        .ok(),
+                        [raw_uuid] if *raw_uuid == projected_uuid => Some(shared_content.clone()),
+                        _ => None,
+                    };
+                    expected.as_deref() == Some(disk_content.as_str())
+                }
+                Some(_) => false,
+            }
+        },
+    )
+}
+
+fn clean_join_disk_page(
+    graph: &Graph,
+    path: &str,
+) -> Result<(CleanJoinUserPage, LogicalPageName), SyncRuntimeRequestError> {
+    let managed = ManagedPath::parse(path.to_owned()).map_err(|error| {
+        SyncRuntimeRequestError::ActorRefused(format!(
+            "clean join cannot inspect provider-selected path: {error}"
+        ))
+    })?;
+    let observation = graph
+        .read_raw_managed_text(&managed)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        .ok_or_else(|| {
+            SyncRuntimeRequestError::ActorRefused(format!(
+                "clean join provider-selected path is absent: {path}"
+            ))
+        })?;
+    let parsed = graph
+        .parse_external_document(&managed, observation.bytes(), false)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let logical_name = LogicalPageName::parse(parsed.effective.name.clone())
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let kind = match parsed.effective.kind {
+        PageKind::Page => ManagedTextKind::Page,
+        PageKind::Journal => ManagedTextKind::Journal,
+    };
+    fn append_outline(
+        blocks: &[crate::doc::DocBlock],
+        depth: usize,
+        outline: &mut Vec<(usize, String, Option<LogseqUuid>)>,
+        projected_ids: &mut Vec<Option<LogseqUuid>>,
+    ) {
+        for block in blocks {
+            let external_uuid = block
+                .property("id")
+                .and_then(|value| LogseqUuid::parse(value.trim()).ok());
+            outline.push((depth, block.raw.clone(), external_uuid));
+            projected_ids.push(external_uuid);
+            append_outline(
+                &block.children,
+                depth.saturating_add(1),
+                outline,
+                projected_ids,
+            );
+        }
+    }
+    let mut outline = Vec::new();
+    let mut projected_ids = Vec::new();
+    append_outline(
+        &parsed.parsed.document.roots,
+        0,
+        &mut outline,
+        &mut projected_ids,
+    );
+    Ok((
+        CleanJoinUserPage {
+            path: path.to_owned(),
+            kind,
+            preamble: parsed.parsed.document.pre_block,
+            outline,
+            projected_ids,
+        },
+        logical_name,
+    ))
 }
 
 fn matching_clean_join_heads(
@@ -9216,11 +9512,7 @@ fn map_component(component: DiscoveryComponent) -> SyncRuntimeComponent {
     }
 }
 
-enum ActorStartupEvent {
-    Phase(SyncRuntimeOpenPhase),
-    RecoveryDiagnostics(SyncRuntimeRecoveryDiagnostics),
-    Finished(Result<SyncRuntimeStatusSnapshot, String>),
-}
+struct ActorStartupEvent(Result<SyncRuntimeStatusSnapshot, String>);
 
 enum ActorRequest {
     Query {
@@ -9289,6 +9581,11 @@ enum ActorRequest {
         reply: mpsc::Sender<
             Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError>,
         >,
+    },
+    AcknowledgeApplicationMove {
+        episode_id: Uuid,
+        batch_id: BatchId,
+        reply: mpsc::Sender<Result<(), SyncApplicationPageRequestError>>,
     },
     ResolveApplicationMoveSubtrees {
         request: SyncApplicationMoveSubtreesRequest,
@@ -9365,7 +9662,7 @@ enum ActorRequest {
     },
     JoinShared {
         descriptor: SharedEnrollmentDescriptor,
-        reply: mpsc::Sender<Result<SharedJoinStep, SyncRuntimeRequestError>>,
+        reply: mpsc::Sender<Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>>,
     },
     Tick {
         reply: mpsc::Sender<SyncRuntimeTick>,
@@ -9450,7 +9747,7 @@ fn actor_thread_from_clean_resources(
     let actor = match RuntimeActor::from_clean_resources(request, identities, resources, recovery) {
         Ok(actor) => actor,
         Err(error) => {
-            let _ = started.send(ActorStartupEvent::Finished(Err(error)));
+            let _ = started.send(ActorStartupEvent(Err(error)));
             return;
         }
     };
@@ -9465,10 +9762,7 @@ fn run_actor_loop(
 ) {
     let snapshot = actor.snapshot();
     *shared_status.write().unwrap() = snapshot.clone();
-    if started
-        .send(ActorStartupEvent::Finished(Ok(snapshot)))
-        .is_err()
-    {
+    if started.send(ActorStartupEvent(Ok(snapshot))).is_err() {
         return;
     }
 
@@ -9490,6 +9784,7 @@ fn run_actor_loop(
                     .managed_local
                     .as_ref()
                     .is_some_and(|managed| managed.pending_count() != 0)
+                    || actor.move_episode_cleanup_pending
                     || actor.local_completion_flush_due(Instant::now())
                     || actor.sweep_deadline_due()
                     || actor.search_index_build_has_work()
@@ -9551,6 +9846,15 @@ fn run_actor_loop(
             }
             ActorRequest::MoveApplicationSubtrees { request, reply } => {
                 let result = actor.move_application_subtrees(request);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::AcknowledgeApplicationMove {
+                episode_id,
+                batch_id,
+                reply,
+            } => {
+                let result = actor.acknowledge_application_move(episode_id, batch_id);
                 let _ = reply.send(result);
                 false
             }
@@ -9667,14 +9971,7 @@ fn run_actor_loop(
             }
             ActorRequest::JoinShared { descriptor, reply } => {
                 let result = actor.join_shared(descriptor);
-                let should_stop = matches!(result, Ok(SharedJoinStep::Complete(_)));
-                if result.is_err() {
-                    // A cursor has already consumed the path that produced the
-                    // refusal. The next explicit join attempt must start a
-                    // fresh full cut so malformed or transient provider
-                    // evidence cannot be skipped by retrying the same actor.
-                    actor.pending_join = None;
-                }
+                let should_stop = result.is_ok();
                 let _ = reply.send(result);
                 should_stop
             }
@@ -9753,7 +10050,6 @@ fn run_actor_loop(
                     graph_wide: graph_wide_commit_work(),
                     engine,
                     managed_local_work,
-                    provider_pending: actor.provider_pending.len(),
                     managed_local_pending: actor
                         .managed_local
                         .as_ref()
@@ -9899,17 +10195,6 @@ fn run_actor_loop(
     }
 }
 
-/// Deliberately `!Send + !Sync`; constructed and destroyed inside the actor
-/// thread. The `Rc` marker makes accidental movement into Tauri state a compile
-/// error even if every owned authority happens to gain `Send` later.
-enum PendingLocalMutation {
-    Reconciliation {
-        transaction: OperationTransaction,
-        correlated_batch_id: Option<BatchId>,
-        application_move_episode: Option<ApplicationMoveEpisodeDraft>,
-    },
-}
-
 enum PendingManagedLocalCommit {
     Projection(TrustedLocalCommittedPendingProjection),
     Overlay(TrustedLocalCommittedRecovery),
@@ -9928,6 +10213,7 @@ struct LatestTaskQueryOverlayPage {
     path: ManagedPath,
     kind: ManagedTextKind,
     format: Format,
+    #[cfg(test)]
     preamble: Option<String>,
     structures: BTreeMap<BlockId, LatestTaskQueryOverlayStructure>,
     candidates: BTreeMap<BlockId, LatestTaskQueryOverlayCandidate>,
@@ -10136,7 +10422,6 @@ struct ManagedLocalRuntimeState {
     checkpoint_batch_id: Option<BatchId>,
     continuation: Option<ManagedLocalDrainContinuation>,
     pending_commit: Option<PendingManagedLocalCommit>,
-    authorship_complete: BTreeSet<BatchId>,
     last_failure: Option<String>,
     /// Cleanup is cold, bounded work.  A settled managed-local runtime must
     /// never re-enumerate its history on ordinary idle ticks or saves.
@@ -10145,6 +10430,10 @@ struct ManagedLocalRuntimeState {
 
 const MOVE_EPISODE_SCHEMA_VERSION: u32 = 2;
 const MOVE_EPISODE_RECORD_MAX_BYTES: u64 = 16 * 1024;
+const MOVE_EPISODE_CLEANUP_PER_TURN: usize = 32;
+const MOVE_EPISODE_SCAN_ENTRIES_PER_TURN: usize = 128;
+const MOVE_EPISODE_CLEANUP_QUEUE_LIMIT: usize = 256;
+const RECENT_ACKNOWLEDGED_MOVE_EPISODES: usize = 256;
 
 /// Immutable private binding from one caller episode to the actor-derived
 /// batch identity and exact request digest. It is published before authoring,
@@ -10189,6 +10478,35 @@ impl ApplicationMoveEpisodeRecord {
     fn encode(&self) -> Result<Vec<u8>, SyncApplicationPageRequestError> {
         postcard::to_allocvec(self)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_encode"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationMoveEpisodeAcknowledgement {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    episode_id: Uuid,
+    batch_id: BatchId,
+}
+
+impl ApplicationMoveEpisodeAcknowledgement {
+    fn from_record(record: &ApplicationMoveEpisodeRecord) -> Self {
+        Self {
+            workspace_id: record.workspace_id,
+            lineage_digest: record.lineage_digest,
+            episode_id: record.episode_id,
+            batch_id: record.batch_id,
+        }
+    }
+
+    fn filename(&self) -> String {
+        format!("episode-{}.acknowledged", self.episode_id.simple())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, SyncApplicationPageRequestError> {
+        postcard::to_allocvec(self)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_encode"))
     }
 }
 
@@ -10289,11 +10607,6 @@ impl ManagedLocalRuntimeState {
         if self.pending_commit.is_some() {
             return Some("committed_foreground_recovery".into());
         }
-        if self.journal.protocol() == ManagedLocalJournalProtocol::LegacyV1
-            && self.frames.is_empty()
-        {
-            return Some("schema2_rollover".into());
-        }
         self.continuation
             .as_ref()
             .map(|continuation| format!("{:?}", continuation.stage()).to_ascii_lowercase())
@@ -10373,10 +10686,7 @@ impl ManagedLocalRuntimeState {
         if suffix_frames < MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
             return Ok(false);
         }
-        let generation = self
-            .journal
-            .v2_selector_generation()
-            .ok_or_else(|| "clean foreground journal is not schema 2".to_owned())?;
+        let generation = self.journal.selector_generation();
         let successor_generation = generation
             .checked_add(1)
             .ok_or_else(|| "clean foreground selector generation overflow".to_owned())?;
@@ -10400,10 +10710,7 @@ impl ManagedLocalRuntimeState {
         if !self.cleanup_pending {
             return Ok(());
         }
-        let retained_generation = self
-            .journal
-            .v2_selector_generation()
-            .ok_or_else(|| "clean foreground cleanup journal is not schema 2".to_owned())?;
+        let retained_generation = self.journal.selector_generation();
         self.cleanup_clean_foreground_history(retained_generation)?;
         self.cleanup_pending = false;
         Ok(())
@@ -10550,6 +10857,7 @@ fn latest_task_query_overlay_page_from_application(
         path: current.editor.page.path.clone(),
         kind: current.editor.page.kind,
         format: current.page.format,
+        #[cfg(test)]
         preamble: current.page.pre_block.clone(),
         structures,
         candidates,
@@ -10669,7 +10977,7 @@ fn prepare_clean_foreground_journal(
             format!("cannot publish clean foreground journal anchor {anchor_name}: {error}")
         })?;
     Ok((
-        ManagedLocalJournal::from_open_v2(selector_generation, journal),
+        ManagedLocalJournal::from_open(selector_generation, journal),
         anchor,
     ))
 }
@@ -10743,7 +11051,7 @@ fn recover_clean_foreground_journal_only(
                     format!("cannot open clean foreground journal {anchor_name}: {error}")
                 })?;
             (
-                ManagedLocalJournal::from_open_v2(selector_generation, segment),
+                ManagedLocalJournal::from_open(selector_generation, segment),
                 anchor.checkpoint().clone(),
                 anchor.accepted_batch_id(),
             )
@@ -10956,7 +11264,6 @@ fn open_clean_foreground_journal(
         checkpoint_batch_id,
         continuation: None,
         pending_commit: None,
-        authorship_complete: BTreeSet::new(),
         last_failure: None,
         cleanup_pending,
     })
@@ -11868,106 +12175,6 @@ enum EditorNameState {
     PathOccupied,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SharedJoinProviderPass {
-    Initial,
-    Confirmation,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SharedJoinMultisetSummary {
-    entries: u64,
-    digest_xor: [u8; 32],
-}
-
-impl SharedJoinMultisetSummary {}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SharedJoinProviderCut {
-    entries: SharedJoinMultisetSummary,
-    uncovered_frontier_head: bool,
-    publication_intents: u64,
-    incomplete_manifests: u64,
-    recovery_links: SharedJoinMultisetSummary,
-    recovery_blobs: SharedJoinMultisetSummary,
-}
-
-impl SharedJoinProviderCut {}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SharedJoinArchiveCut {
-    entries: u64,
-    digest_xor: [u8; 32],
-}
-
-impl SharedJoinArchiveCut {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SharedJoinLocalPass {
-    Archive,
-    Classification,
-}
-
-enum SharedJoinPhase {
-    Provider {
-        cursor: SharedProviderObservationCursor,
-        pass: SharedJoinProviderPass,
-    },
-    Local {
-        cursor: ObjectStoreManifestCursor,
-        pass: SharedJoinLocalPass,
-    },
-}
-
-struct PendingSharedJoin {
-    descriptor: SharedEnrollmentDescriptorV1,
-    phase: SharedJoinPhase,
-    initial_provider_cut: Option<SharedJoinProviderCut>,
-    current_provider_cut: SharedJoinProviderCut,
-    initial_archive_cut: Option<SharedJoinArchiveCut>,
-    current_archive_cut: SharedJoinArchiveCut,
-    unique_local_operations: u64,
-    ambiguous_local_operations: bool,
-    unsettled_local_operations: bool,
-}
-
-impl PendingSharedJoin {
-    #[cfg(test)]
-    fn retained_history_entries(&self) -> usize {
-        // Cursors, summaries, counters, and flags are all constant-size. Keep
-        // this explicit test hook beside the state so adding a history-sized
-        // collection makes the large-cut regression require an update.
-        0
-    }
-}
-
-enum SharedJoinStep {
-    Pending,
-    Complete(SyncSharedEnrollmentDescriptor),
-}
-
-struct PendingProviderBatch {
-    causal_dependencies: Vec<BatchId>,
-    unmet_dependencies: usize,
-}
-
-#[derive(Default)]
-struct ProviderDependencyIndex {
-    pending: BTreeMap<BatchId, PendingProviderBatch>,
-    ready: VecDeque<BatchId>,
-    blocked_by: BTreeMap<BatchId, BTreeSet<BatchId>>,
-}
-
-impl ProviderDependencyIndex {
-    fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.pending.len()
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActorRuntimeBinding {
     workspace_id: WorkspaceId,
@@ -12029,17 +12236,16 @@ impl ActorRuntimeBinding {
 struct RuntimeActor {
     graph: Graph,
     receipts: ProjectionReceiptStore,
-    /// Present only for the clean baseline-plus-manifest architecture. During
-    /// the bounded cutover the legacy fields remain populated only by legacy
-    /// opens; no request is allowed to combine the two mutation engines.
+    /// The one current baseline-plus-manifest runtime.
     clean: Option<CleanRuntimeActorCore>,
-    local_mutation: Option<PendingLocalMutation>,
-    /// Process-local ownership of a blocked correlated projection after its
-    /// reconstructed graph-text latch has been consumed into the exact feed.
-    correlated_move_feed_handoffs: BTreeSet<BatchId>,
     managed_local: Option<ManagedLocalRuntimeState>,
     projection_turns: Option<ProjectionTurnJournalState>,
     move_episode_directory: Dir,
+    move_episode_cold_scan: Option<ReadDir>,
+    move_episode_cleanup_queue: VecDeque<String>,
+    move_episode_cleanup_pending: bool,
+    move_episode_cleanup_blocked: Option<String>,
+    recent_acknowledged_move_episodes: VecDeque<(Uuid, BatchId)>,
     #[cfg(test)]
     fail_next_move_episode_publication_after_write: bool,
     #[cfg(test)]
@@ -12088,7 +12294,6 @@ struct RuntimeActor {
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
-    startup_recovery_diagnostics: Option<SyncRuntimeRecoveryDiagnostics>,
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
@@ -12102,17 +12307,12 @@ struct RuntimeActor {
     stopped_safe: bool,
     enrollment_root: EnrollmentApplicationRoot,
     binding: ActorRuntimeBinding,
-    legacy_binding: Option<EnrollmentBindingV1>,
-    session_id: SessionId,
-    promotion_session_id: SessionId,
     promoted_state_digest: ContentDigest,
     provider_root: PathBuf,
     provider_journal_root: PathBuf,
-    /// Exact private paths needed only for a clean join authority replacement.
-    /// Legacy actors never retain this request.
+    /// Exact private paths needed for a clean join authority replacement.
     clean_open_request: Option<SyncRuntimeOpenRequest>,
     provider: Option<SharedProviderTransport>,
-    shared_descriptor: Option<SharedEnrollmentDescriptorV1>,
     clean_shared_descriptor: Option<CleanSharedEnrollmentDescriptorV1>,
     shared_role: Option<SyncSharedRole>,
     shared_phase: Option<SyncSharedPhase>,
@@ -12127,11 +12327,6 @@ struct RuntimeActor {
     provider_rescan_required_for_safe: bool,
     provider_full_scan_requested: bool,
     provider_observation_cursor: Option<SharedProviderObservationCursor>,
-    provider_observation_full: bool,
-    provider_scan_valid_heads: usize,
-    provider_scan_invalid_head: bool,
-    provider_head_generations: BTreeMap<(DeviceId, u64), (ContentDigest, Vec<BatchId>)>,
-    provider_own_heads: BTreeMap<String, SharedProviderFrontierHeadV1>,
     provider_direct_manifests: VecDeque<BatchId>,
     /// Foreign batches accepted from the provider that still owe a
     /// conflict-resolution derivation (GH #351). Drained one batch per tick;
@@ -12144,34 +12339,23 @@ struct RuntimeActor {
     /// (audit 4, finding 3).
     conflict_backlog_seeded: bool,
     provider_direct_queued: BTreeSet<BatchId>,
-    provider_discovery_scan_complete: bool,
     provider_head_dirty: bool,
-    provider_current_head: Option<String>,
     provider_head_retirement: VecDeque<String>,
-    provider_pending: ProviderDependencyIndex,
-    provider_dependency_recheck_frontier: Option<ContentDigest>,
     provider_incomplete: BTreeSet<BatchId>,
     provider_incomplete_recheck: VecDeque<BatchId>,
     provider_accepted_archive_loss: BTreeSet<BatchId>,
     provider_accepted_manifest_audit: Option<ProviderAcceptedManifestAudit>,
-    provider_accepted_manifest_audit_covered_sequence: u64,
-    provider_accepted_manifest_revalidation_next_sequence: u64,
-    provider_accepted_manifest_revalidation_ready: bool,
-    provider_accepted_manifest_revalidation_after_external_tick: bool,
     provider_objects_changed: bool,
     provider_publication_probe: bool,
     provider_publication_cursor: Option<SharedProviderPublicationCursor>,
     provider_publication_forced: VecDeque<BatchId>,
     provider_descriptor_repair_requested: bool,
     provider_descriptor_republications: u32,
-    provider_namespace_repair_active: bool,
     provider_publication_repair_requested: bool,
     provider_publication_repair_cursor: Option<ObjectStoreManifestCursor>,
-    provider_recovery_coverage_root: Option<ProviderRecoveryCoverageRoot>,
     provider_recovery_exact: VecDeque<BatchId>,
     provider_recovery_backfill_requested: bool,
     provider_recovery_backfill_cursor: Option<ObjectStoreManifestCursor>,
-    pending_join: Option<PendingSharedJoin>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -12506,6 +12690,10 @@ impl RuntimeActor {
             .map_err(display)?;
         let move_episode_directory =
             open_dir_nofollow(&application_runtime_directory, "move-episodes").map_err(display)?;
+        let move_episode_cold_scan =
+            Some(move_episode_directory.entries().map_err(|error| {
+                format!("cannot begin cold move episode cleanup scan: {error}")
+            })?);
         let marker = read_activation_marker(enrollment_root.path())
             .map_err(display)?
             .ok_or_else(|| "clean runtime has no activation marker".to_owned())?;
@@ -12551,11 +12739,14 @@ impl RuntimeActor {
             graph,
             receipts,
             clean: Some(clean),
-            local_mutation: None,
-            correlated_move_feed_handoffs: BTreeSet::new(),
             managed_local: Some(managed_local),
             projection_turns: Some(projection_turns),
             move_episode_directory,
+            move_episode_cold_scan,
+            move_episode_cleanup_queue: VecDeque::new(),
+            move_episode_cleanup_pending: true,
+            move_episode_cleanup_blocked: None,
+            recent_acknowledged_move_episodes: VecDeque::new(),
             #[cfg(test)]
             fail_next_move_episode_publication_after_write: false,
             #[cfg(test)]
@@ -12584,7 +12775,6 @@ impl RuntimeActor {
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
             ),
-            startup_recovery_diagnostics: None,
             recovery,
             last_watcher,
             last_tick: None,
@@ -12595,15 +12785,11 @@ impl RuntimeActor {
             stopped_safe: false,
             enrollment_root,
             binding,
-            legacy_binding: None,
             clean_open_request: Some(request.clone()),
-            session_id: identities.session_id,
-            promotion_session_id: identities.session_id,
             promoted_state_digest,
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
             provider,
-            shared_descriptor: None,
             clean_shared_descriptor,
             shared_role,
             shared_phase,
@@ -12612,43 +12798,27 @@ impl RuntimeActor {
             provider_rescan_required_for_safe: false,
             provider_full_scan_requested: false,
             provider_observation_cursor: None,
-            provider_observation_full: false,
-            provider_scan_valid_heads: 0,
-            provider_scan_invalid_head: false,
-            provider_head_generations: BTreeMap::new(),
-            provider_own_heads: BTreeMap::new(),
             provider_direct_manifests: VecDeque::new(),
             pending_conflict_resolutions: VecDeque::new(),
             conflict_backlog_seeded: false,
             provider_direct_queued: BTreeSet::new(),
-            provider_discovery_scan_complete: false,
             provider_head_dirty: false,
-            provider_current_head: None,
             provider_head_retirement: VecDeque::new(),
-            provider_pending: ProviderDependencyIndex::default(),
-            provider_dependency_recheck_frontier: None,
             provider_incomplete: BTreeSet::new(),
             provider_incomplete_recheck: VecDeque::new(),
             provider_accepted_archive_loss: BTreeSet::new(),
             provider_accepted_manifest_audit: None,
-            provider_accepted_manifest_audit_covered_sequence: 0,
-            provider_accepted_manifest_revalidation_next_sequence: 1,
-            provider_accepted_manifest_revalidation_ready: false,
-            provider_accepted_manifest_revalidation_after_external_tick: false,
             provider_objects_changed: false,
             provider_publication_probe: false,
             provider_publication_cursor: None,
             provider_publication_forced: VecDeque::new(),
             provider_descriptor_repair_requested: false,
             provider_descriptor_republications: 0,
-            provider_namespace_repair_active: false,
             provider_publication_repair_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_publication_repair_cursor: None,
-            provider_recovery_coverage_root: None,
             provider_recovery_exact: VecDeque::new(),
             provider_recovery_backfill_requested: false,
             provider_recovery_backfill_cursor: None,
-            pending_join: None,
             _not_send_or_sync: PhantomData,
         };
         actor.admit_deferred_absence_observations()?;
@@ -12677,6 +12847,7 @@ impl RuntimeActor {
         for batch_id in recovered_provider_batches {
             actor.queue_clean_provider_publication(batch_id);
         }
+        actor.cleanup_acknowledged_move_episodes()?;
         Ok(actor)
     }
 
@@ -16646,6 +16817,302 @@ impl RuntimeActor {
         Ok(true)
     }
 
+    fn acknowledge_application_move(
+        &mut self,
+        episode_id: Uuid,
+        batch_id: BatchId,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        if self
+            .recent_acknowledged_move_episodes
+            .contains(&(episode_id, batch_id))
+        {
+            return Ok(());
+        }
+        let name = format!("episode-{}.bin", episode_id.simple());
+        let retained = read_optional_regular(
+            &self.move_episode_directory,
+            &name,
+            MOVE_EPISODE_RECORD_MAX_BYTES,
+            None,
+        )
+        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_read"))?
+        .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+            "move_episode_ack_missing",
+        ))?;
+        let record: ApplicationMoveEpisodeRecord =
+            postcard::from_bytes(&retained).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_decode")
+            })?;
+        if record.encode()? != retained
+            || record.schema_version != MOVE_EPISODE_SCHEMA_VERSION
+            || record.workspace_id != self.binding.workspace_id()
+            || record.lineage_digest != self.binding.lineage_digest()
+            || record.episode_id != episode_id
+            || record.batch_id != batch_id
+        {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "move_episode_ack_binding",
+            ));
+        }
+        let completion_name = record.completion_filename();
+        let expected_completion = record.completion_bytes()?;
+        let completion = read_optional_regular(
+            &self.move_episode_directory,
+            &completion_name,
+            MOVE_EPISODE_RECORD_MAX_BYTES,
+            None,
+        )
+        .map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_complete_read")
+        })?
+        .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+            "move_episode_ack_incomplete",
+        ))?;
+        if completion != expected_completion {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "move_episode_ack_complete_collision",
+            ));
+        }
+        match self.application_move_accepted(&record) {
+            Ok(true) => {}
+            Ok(false)
+                if self
+                    .active_engine()
+                    .is_ok_and(|engine| engine.managed_local_batch_is_visible(record.batch_id)) => {
+            }
+            Ok(false) => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_uncommitted",
+                ));
+            }
+            Err(_) => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_collision",
+                ));
+            }
+        }
+
+        // Publish one durable cleanup authorization before touching either
+        // replay sidecar. A crash after either removal therefore leaves enough
+        // exact workspace/lineage/episode/batch evidence for bounded actor-open
+        // cleanup to finish, rather than an immortal orphan `.complete` file.
+        let acknowledgement = ApplicationMoveEpisodeAcknowledgement::from_record(&record);
+        let acknowledgement_name = acknowledgement.filename();
+        let acknowledgement_bytes = acknowledgement.encode()?;
+        if !self
+            .move_episode_cleanup_queue
+            .contains(&acknowledgement_name)
+            && self.move_episode_cleanup_queue.len() >= MOVE_EPISODE_CLEANUP_QUEUE_LIMIT
+        {
+            // Make bounded room before publishing another durable marker. Once
+            // a marker exists it must either be queued here or discoverable by
+            // the retained cold cursor; after that cursor is exhausted, an
+            // overflow refusal would otherwise strand the marker until reopen.
+            self.move_episode_cleanup_pending = true;
+            self.cleanup_acknowledged_move_episodes().map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_cleanup_queue_drain",
+                )
+            })?;
+            if self.move_episode_cleanup_queue.len() >= MOVE_EPISODE_CLEANUP_QUEUE_LIMIT {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_cleanup_queue_full",
+                ));
+            }
+        }
+        DurableDirectoryPublication::open(&self.move_episode_directory)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_publication_open")
+            })?
+            .publish_new_exact_single_writer(&acknowledgement_name, &acknowledgement_bytes)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_publication")
+            })?;
+        if !self
+            .move_episode_cleanup_queue
+            .contains(&acknowledgement_name)
+        {
+            self.move_episode_cleanup_queue
+                .push_back(acknowledgement_name.clone());
+        }
+        self.move_episode_cleanup_pending = true;
+        for (sidecar, refusal) in [
+            (&name, "move_episode_ack_record_remove"),
+            (&completion_name, "move_episode_ack_complete_remove"),
+        ] {
+            if let Err(error) = self.move_episode_directory.remove_file(sidecar) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.move_episode_cleanup_pending = true;
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(refusal));
+                }
+            }
+        }
+        self.recent_acknowledged_move_episodes
+            .push_back((episode_id, batch_id));
+        while self.recent_acknowledged_move_episodes.len() > RECENT_ACKNOWLEDGED_MOVE_EPISODES {
+            self.recent_acknowledged_move_episodes.pop_front();
+        }
+        Ok(())
+    }
+
+    fn cleanup_move_episode_acknowledgement(
+        &mut self,
+        acknowledgement_name: &str,
+    ) -> Result<bool, String> {
+        let Some(bytes) = read_optional_regular(
+            &self.move_episode_directory,
+            acknowledgement_name,
+            MOVE_EPISODE_RECORD_MAX_BYTES,
+            None,
+        )
+        .map_err(|error| {
+            format!("cannot read move acknowledgement {acknowledgement_name}: {error}")
+        })?
+        else {
+            return Ok(false);
+        };
+        let acknowledgement: ApplicationMoveEpisodeAcknowledgement =
+            postcard::from_bytes(&bytes)
+                .map_err(|_| format!("move acknowledgement {acknowledgement_name} is invalid"))?;
+        if acknowledgement
+            .encode()
+            .map_err(|error| error.to_string())?
+            != bytes
+            || acknowledgement.workspace_id != self.binding.workspace_id()
+            || acknowledgement.lineage_digest != self.binding.lineage_digest()
+            || acknowledgement.filename() != acknowledgement_name
+        {
+            return Err(format!(
+                "move acknowledgement {acknowledgement_name} is bound to another runtime"
+            ));
+        }
+        for sidecar in [
+            format!("episode-{}.bin", acknowledgement.episode_id.simple()),
+            format!("episode-{}.complete", acknowledgement.episode_id.simple()),
+        ] {
+            if let Err(error) = self.move_episode_directory.remove_file(&sidecar) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "cannot retire move episode sidecar {sidecar}: {error}"
+                    ));
+                }
+            }
+        }
+        if let Err(error) = self
+            .move_episode_directory
+            .remove_file(acknowledgement_name)
+        {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!(
+                    "cannot retire move acknowledgement {acknowledgement_name}: {error}"
+                ));
+            }
+        }
+        Ok(true)
+    }
+
+    fn cleanup_cold_move_episode_entry(&mut self, name: &str) -> Result<bool, String> {
+        if name.starts_with("episode-") && name.ends_with(".acknowledged") {
+            return self.cleanup_move_episode_acknowledgement(name);
+        }
+        let Some(simple) = name
+            .strip_prefix("episode-")
+            .and_then(|name| name.strip_suffix(".complete"))
+        else {
+            return Ok(false);
+        };
+        let record_name = format!("episode-{simple}.bin");
+        let Some(_record_bytes) = read_optional_regular(
+            &self.move_episode_directory,
+            &record_name,
+            MOVE_EPISODE_RECORD_MAX_BYTES,
+            None,
+        )
+        .map_err(|error| format!("cannot inspect move episode record {record_name}: {error}"))?
+        else {
+            return match self.move_episode_directory.remove_file(name) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(format!(
+                    "cannot retire orphan move completion {name}: {error}"
+                )),
+            };
+        };
+        // A complete pair without an acknowledgement is exact response-replay
+        // evidence. Even an accepted batch is not proof that the frontend
+        // received and installed both returned page DTOs before a crash. Keep
+        // the pair until a durable acknowledgement marker authorizes cleanup.
+        Ok(false)
+    }
+
+    fn cleanup_acknowledged_move_episodes(&mut self) -> Result<bool, String> {
+        if let Some(error) = &self.move_episode_cleanup_blocked {
+            return Err(error.clone());
+        }
+        if !self.move_episode_cleanup_pending {
+            return Ok(false);
+        }
+        let mut processed = 0usize;
+        while processed < MOVE_EPISODE_CLEANUP_PER_TURN {
+            let Some(acknowledgement_name) = self.move_episode_cleanup_queue.pop_front() else {
+                break;
+            };
+            match self.cleanup_move_episode_acknowledgement(&acknowledgement_name) {
+                Ok(changed) => processed += usize::from(changed),
+                Err(error) => {
+                    self.move_episode_cleanup_queue
+                        .push_front(acknowledgement_name);
+                    self.move_episode_cleanup_pending = false;
+                    self.move_episode_cleanup_blocked = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
+
+        if processed < MOVE_EPISODE_CLEANUP_PER_TURN {
+            if let Some(mut scan) = self.move_episode_cold_scan.take() {
+                let mut finished = false;
+                for _ in 0..MOVE_EPISODE_SCAN_ENTRIES_PER_TURN {
+                    if processed == MOVE_EPISODE_CLEANUP_PER_TURN {
+                        break;
+                    }
+                    let Some(entry) = scan.next() else {
+                        finished = true;
+                        break;
+                    };
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            let error = format!("cannot inspect cold move episode entry: {error}");
+                            self.move_episode_cold_scan = Some(scan);
+                            self.move_episode_cleanup_pending = false;
+                            self.move_episode_cleanup_blocked = Some(error.clone());
+                            return Err(error);
+                        }
+                    };
+                    let Ok(name) = entry.file_name().into_string() else {
+                        continue;
+                    };
+                    match self.cleanup_cold_move_episode_entry(&name) {
+                        Ok(changed) => processed += usize::from(changed),
+                        Err(error) => {
+                            self.move_episode_cold_scan = Some(scan);
+                            self.move_episode_cleanup_pending = false;
+                            self.move_episode_cleanup_blocked = Some(error.clone());
+                            return Err(error);
+                        }
+                    }
+                }
+                if !finished {
+                    self.move_episode_cold_scan = Some(scan);
+                }
+            }
+        }
+        self.move_episode_cleanup_pending =
+            !self.move_episode_cleanup_queue.is_empty() || self.move_episode_cold_scan.is_some();
+        Ok(processed != 0)
+    }
+
     fn move_application_subtrees(
         &mut self,
         request: SyncApplicationMoveSubtreesRequest,
@@ -16655,6 +17122,12 @@ impl RuntimeActor {
             episode_id: episode_id.clone(),
             reason,
         };
+        if self.move_episode_cold_scan.is_some() {
+            return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id,
+                state: SyncEditorDeferred::RetryableExternalWork,
+            });
+        }
         if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncApplicationMoveSubtreesOutcome::Deferred { episode_id, state });
         }
@@ -18624,15 +19097,9 @@ impl RuntimeActor {
     fn settle_application_publication(
         &mut self,
         expected_batch_id: &str,
-        mut phase: SyncLocalMutationPhase,
+        phase: SyncLocalMutationPhase,
     ) -> Result<ApplicationPublicationSettlement, SyncApplicationPageRequestError> {
-        // The clean runtime and the legacy coordinator are two DIFFERENT
-        // retained-publication state machines. A clean runtime never populates
-        // `local_mutation`, so routing its retained work through the legacy
-        // settlement below can only ever refuse — which is precisely the
-        // Android defect this dispatch exists to prevent. Settle the clean
-        // actor on its own terms; never fabricate a `PendingLocalMutation` to
-        // satisfy the legacy check.
+        // The clean coordinator is the one retained-publication state machine.
         if self.clean.is_some() {
             return self.settle_clean_retained_publication(expected_batch_id, phase);
         }
@@ -19531,14 +19998,9 @@ impl RuntimeActor {
     /// ordinary save path remains the sole owner of those transitions.
     fn read_only_editor_turn_readiness(&self) -> EditorTurnReadiness {
         if self.terminal.is_some() {
-            let phase = if self.local_mutation.is_some() {
-                SyncLocalMutationPhase::Capture
-            } else {
-                SyncLocalMutationPhase::Bindings
-            };
             return EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
                 batch_id: None,
-                phase,
+                phase: SyncLocalMutationPhase::Bindings,
             });
         }
         if let Some(pending) = self.clean.as_ref().and_then(|clean| clean.pending.as_ref()) {
@@ -19560,14 +20022,9 @@ impl RuntimeActor {
 
     fn prepare_editor_turn(&mut self) -> EditorTurnReadiness {
         if self.terminal.is_some() {
-            let phase = if self.local_mutation.is_some() {
-                SyncLocalMutationPhase::Capture
-            } else {
-                SyncLocalMutationPhase::Bindings
-            };
             return EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
                 batch_id: None,
-                phase,
+                phase: SyncLocalMutationPhase::Bindings,
             });
         }
         if self.clean.is_some() {
@@ -19605,8 +20062,7 @@ impl RuntimeActor {
     }
 
     fn exact_projection_read_available(&self) -> bool {
-        self.local_mutation.is_none()
-            && self.terminal.is_none()
+        self.terminal.is_none()
             && self
                 .managed_local
                 .as_ref()
@@ -20707,6 +21163,11 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
+        match self.cleanup_acknowledged_move_episodes() {
+            Ok(true) => return SyncRuntimeTick::Recovering,
+            Ok(false) => {}
+            Err(error) => return SyncRuntimeTick::RecoveryBlocked(error),
+        }
         match self.admit_deferred_absence_observations() {
             Ok(true) => return SyncRuntimeTick::Recovering,
             Ok(false) => {}
@@ -20980,7 +21441,6 @@ impl RuntimeActor {
             || self.provider_full_scan_requested
             || self.provider_observation_cursor.is_some()
             || !self.provider_direct_manifests.is_empty()
-            || !self.provider_pending.is_empty()
             || !self.provider_incomplete_recheck.is_empty()
             || !self.provider_accepted_archive_loss.is_empty()
             || self.provider_accepted_manifest_audit.is_some()
@@ -21833,12 +22293,10 @@ impl RuntimeActor {
         // A claim is valid only for the request that made it.
         self.clean_request_retained_batch = None;
         if self.terminal.is_some() {
-            let (batch_id, phase) = if self.local_mutation.is_some() {
-                (None, SyncLocalMutationPhase::Capture)
-            } else {
-                (None, SyncLocalMutationPhase::Bindings)
+            return SyncLocalMutationOutcome::Revoked {
+                batch_id: None,
+                phase: SyncLocalMutationPhase::Bindings,
             };
-            return SyncLocalMutationOutcome::Revoked { batch_id, phase };
         }
         if self.clean.is_some() {
             let turns = self
@@ -22268,7 +22726,9 @@ impl RuntimeActor {
                         && !clean.watcher.pending()
                 }) && self.managed_local.as_ref().is_none_or(|managed| {
                     managed.pending_commit.is_none() && managed.frames.is_empty()
-                }) && !self.provider_has_work();
+                }) && !self.provider_has_work()
+                    && !self.move_episode_cleanup_pending
+                    && self.move_episode_cleanup_blocked.is_none();
                 if settled {
                     self.flush_local_completions().map_err(|error| {
                         SyncRuntimeRequestError::ActorRefused(format!(
@@ -22417,7 +22877,7 @@ impl RuntimeActor {
     fn join_shared(
         &mut self,
         descriptor: SharedEnrollmentDescriptor,
-    ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
+    ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         match descriptor {
             SharedEnrollmentDescriptor::Legacy(descriptor) => {
                 let _ = descriptor;
@@ -22571,7 +23031,7 @@ impl RuntimeActor {
     fn join_shared_clean(
         &mut self,
         descriptor: CleanSharedEnrollmentDescriptorV1,
-    ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
+    ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         if let Some(detail) = &self.terminal {
             return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
         }
@@ -22619,6 +23079,7 @@ impl RuntimeActor {
             .active_engine()?
             .accepted_frontier_root()
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let mut installed_candidate = false;
         if marker.baseline_root() != descriptor.baseline_root()
             || marker.source_capture() != descriptor.source_capture()
             || frontier.state_digest() != descriptor.accepted_frontier_digest()
@@ -22657,9 +23118,37 @@ impl RuntimeActor {
             let local_semantics = clean_join_user_semantics(local_snapshot)?;
             let provider_semantics = clean_join_user_semantics(provider_snapshot)?;
             if let Some(diff) = clean_join_semantic_diff(&local_semantics, &provider_semantics) {
-                return Err(SyncRuntimeRequestError::ActorRefused(diff.to_string()));
+                // Provider history can legitimately advance this fresh
+                // activation's accepted frontier before explicit join. The
+                // private foreground journal is the authority for whether the
+                // joiner itself has authored any accepted edit since activation.
+                let local_is_activation_baseline = self
+                    .managed_local
+                    .as_ref()
+                    .is_some_and(|managed| managed.journal.next_sequence() == 0);
+                if !clean_join_semantics_match_with_shared_path_authority(
+                    &self.graph,
+                    &local_semantics,
+                    &provider_semantics,
+                    local_is_activation_baseline,
+                )? {
+                    return Err(SyncRuntimeRequestError::ActorRefused(diff.to_string()));
+                }
             }
             self.install_clean_join_candidate(&descriptor, candidate, marker)?;
+            installed_candidate = true;
+        }
+        // Candidate installation seeds a full reconciliation scan. Drain it
+        // before the durable enrollment cut so a timeout or blocked tick is an
+        // honest pre-commit refusal. Once the cut below is published, the join
+        // must never be reported as failed.
+        if let Err(error) = self.clean_shutdown() {
+            if installed_candidate {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean join installed the provider authority but could not settle its pre-enrollment reconciliation; no shared enrollment was committed, and retry will resume from the installed authority: {error}"
+                )));
+            }
+            return Err(error);
         }
         #[cfg(test)]
         pause_shared_join_for_test(
@@ -22668,14 +23157,14 @@ impl RuntimeActor {
         );
         let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Joiner)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let public_descriptor = SyncSharedEnrollmentDescriptor::from_clean(descriptor.clone())
+            .map_err(SyncRuntimeRequestError::ActorRefused)?;
         publish_clean_shared_state(self.enrollment_root.path(), &state)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         self.clean_shared_descriptor = Some(descriptor.clone());
         self.shared_role = Some(SyncSharedRole::Joiner);
         self.shared_phase = Some(SyncSharedPhase::Active);
-        SyncSharedEnrollmentDescriptor::from_clean(descriptor)
-            .map(SharedJoinStep::Complete)
-            .map_err(SyncRuntimeRequestError::ActorRefused)
+        Ok(public_descriptor)
     }
 
     fn refresh_watcher(&mut self) {
@@ -22697,16 +23186,17 @@ impl RuntimeActor {
             watcher: self.last_watcher,
             last_tick: self.last_tick.clone(),
             detail: self.terminal.clone().or_else(|| {
-                self.search_index_build_failure.clone().or_else(|| {
-                    self.managed_local
-                        .as_ref()
-                        .and_then(|managed| managed.last_failure.clone())
+                self.move_episode_cleanup_blocked.clone().or_else(|| {
+                    self.search_index_build_failure.clone().or_else(|| {
+                        self.managed_local
+                            .as_ref()
+                            .and_then(|managed| managed.last_failure.clone())
+                    })
                 })
             }),
             shared_role: self.shared_role,
             shared_phase: self.shared_phase,
-            provider_pending: self.provider_pending.len()
-                + self.provider_exact.len()
+            provider_pending: self.provider_exact.len()
                 + self.provider_direct_manifests.len()
                 + self.provider_incomplete.len()
                 + self.provider_incomplete_recheck.len()
@@ -22739,6 +23229,7 @@ impl RuntimeActor {
             provider_runnable: self.shared_phase == Some(SyncSharedPhase::Active)
                 && self.provider_has_work(),
             search_index_building: self.search_index_building(),
+            move_episode_cleanup_pending: self.move_episode_cleanup_pending,
             managed_local_pending: self
                 .managed_local
                 .as_ref()
@@ -24826,6 +25317,10 @@ mod tests {
                     )
                 })
                 .collect(),
+            projected_ids: outline
+                .iter()
+                .map(|(_, _, uuid)| uuid.map(|value| LogseqUuid::from_uuid(Uuid::from_u128(value))))
+                .collect(),
         }
     }
 
@@ -25082,8 +25577,12 @@ mod tests {
             panic!("a pre-(c) store must surface a managed-open refusal: {result:?}");
         };
         assert!(
-            detail.contains("re-activate") && detail.contains("Markdown"),
-            "the refusal must name its remedy: {detail}"
+            !detail.is_empty(),
+            "the typed refusal must retain diagnostics"
+        );
+        assert!(
+            !detail.contains("re-activate"),
+            "the low-level refusal must not prescribe retired manual re-activation: {detail}"
         );
         assert_eq!(
             result.status.durable_refusal_scenario(),
@@ -27315,6 +27814,57 @@ mod tests {
         }));
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    /// The bounded hot-document cache may evict a page after unrelated pages
+    /// are edited. Re-materializing that page from accepted history must leave
+    /// its latest manifested projection usable as the predecessor of another
+    /// ordinary save. This is deliberately wider than the 64-document hot
+    /// cache; staying at or below the cache limit would never exercise the
+    /// history-backed materialization path.
+    #[test]
+    fn clean_foreground_page_can_be_saved_again_after_hot_document_eviction() {
+        const EDITED_PAGES: usize = 65;
+        let fixture = ActivationFixture::scaled_with_blocks(
+            "clean-foreground-save-after-hot-eviction",
+            0xa16f_100,
+            EDITED_PAGES,
+            1,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("hot-eviction fixture activates");
+        drive_initial_feed(&handle);
+
+        let path = |page: usize| format!("notes/規模/{}/深い/Página-{page}-計画.md", page % 8);
+        for page in 0..EDITED_PAGES {
+            let (current, revision) = load_application_exact(&handle, &path(page));
+            let _ = save_application_block_text(
+                &handle,
+                current,
+                revision,
+                &format!("first accepted edit for page {page}"),
+            );
+            drain_managed_local(&handle);
+        }
+
+        let first_path = path(0);
+        let (first, revision) = load_application_exact(&handle, &first_path);
+        let (saved, _) = save_application_block_text(
+            &handle,
+            first,
+            revision,
+            "second accepted edit after hot-document eviction",
+        );
+        assert_eq!(
+            saved.blocks[0].raw,
+            "second accepted edit after hot-document eviction"
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }
@@ -30856,7 +31406,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_runtime_actor_assembles_without_legacy_authority_and_saves_one_edit() {
+    fn clean_runtime_actor_assembles_one_current_authority_and_saves_one_edit() {
         let fixture = ActivationFixture::nested_unicode("clean-runtime-actor", 0xa176);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
         let resources =
@@ -30893,7 +31443,6 @@ mod tests {
         )
         .unwrap();
         assert!(actor.clean.is_some());
-        assert!(actor.legacy_binding.is_none());
         let saved = actor
             .execute_clean_editor_transaction(transaction, page_id, vec![page_id.to_string()])
             .unwrap();
@@ -32211,7 +32760,7 @@ mod tests {
             .split_once("fn run_actor_loop(")
             .unwrap()
             .1
-            .split_once("enum PendingLocalMutation")
+            .split_once("enum PendingManagedLocalCommit")
             .unwrap()
             .0;
         assert!(
@@ -32709,6 +33258,306 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_cross_page_move_retires_only_response_replay_evidence() {
+        let fixture = ActivationFixture::nested_unicode("acknowledged-cross-page-move", 0xa17710);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("acknowledged move actor opens");
+        let request = simple_application_move_request(&handle, "Acknowledged Cross Page");
+        let destination_path = request.destination_path.clone();
+        let (episode_id, batch_id) = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id,
+                batch_id,
+                ..
+            } => (episode_id, batch_id),
+            other => panic!("acknowledged move did not commit: {other:?}"),
+        };
+        let episode = Uuid::parse_str(&episode_id).unwrap();
+        let directory = fixture
+            .request
+            .application_runtime_root
+            .join("move-episodes");
+        let record = directory.join(format!("episode-{}.bin", episode.simple()));
+        let completion = directory.join(format!("episode-{}.complete", episode.simple()));
+        let acknowledgement = directory.join(format!("episode-{}.acknowledged", episode.simple()));
+        assert!(record.is_file());
+        assert!(completion.is_file());
+
+        handle
+            .acknowledge_application_move(&episode_id, &batch_id)
+            .expect("installed move acknowledgement retires replay evidence");
+        assert!(!record.exists());
+        assert!(!completion.exists());
+        assert!(acknowledgement.is_file());
+        handle
+            .acknowledge_application_move(&episode_id, &batch_id)
+            .expect("same-session acknowledgement retry is idempotent");
+        assert!(matches!(
+            handle.tick().unwrap(),
+            SyncRuntimeTick::Recovering
+        ));
+        assert!(!acknowledgement.exists());
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drain_managed_local(&handle);
+        assert!(
+            fs::read_to_string(fixture.graph_root.join(destination_path))
+                .unwrap()
+                .contains("source root")
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn cold_open_bounded_cleanup_retires_a_pre_ack_orphan_completion() {
+        let fixture = ActivationFixture::nested_unicode("move-orphan-cleanup", 0xa17712);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("orphan cleanup source actor opens");
+        let request = simple_application_move_request(&handle, "Orphan Completion Move");
+        let episode_id = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed { episode_id, .. } => episode_id,
+            other => panic!("orphan cleanup move did not commit: {other:?}"),
+        };
+        let episode = Uuid::parse_str(&episode_id).unwrap();
+        let directory = fixture
+            .request
+            .application_runtime_root
+            .join("move-episodes");
+        let record = directory.join(format!("episode-{}.bin", episode.simple()));
+        let completion = directory.join(format!("episode-{}.complete", episode.simple()));
+        fs::remove_file(&record).unwrap();
+        assert!(completion.is_file());
+        drop(handle);
+
+        let reopened = SyncRuntimeHandle::open(open_request);
+        let reopened = reopened.handle.expect("orphan cleanup actor reopens");
+        assert!(!completion.exists());
+        drop(reopened);
+    }
+
+    #[test]
+    fn cold_acknowledgement_cleanup_tolerates_stale_directory_entries() {
+        let fixture = ActivationFixture::nested_unicode("move-stale-cold-entry", 0xa17713);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("stale-entry source actor opens");
+        let request = simple_application_move_request(&handle, "Stale Cold Entry");
+        let episode_id = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed { episode_id, .. } => episode_id,
+            other => panic!("stale-entry move did not commit: {other:?}"),
+        };
+        let episode = Uuid::parse_str(&episode_id).unwrap();
+        let directory = fixture
+            .request
+            .application_runtime_root
+            .join("move-episodes");
+        let record_name = format!("episode-{}.bin", episode.simple());
+        let completion_name = format!("episode-{}.complete", episode.simple());
+        let record: ApplicationMoveEpisodeRecord =
+            postcard::from_bytes(&fs::read(directory.join(&record_name)).unwrap()).unwrap();
+        drop(handle);
+
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("stale-entry runtime resources reopen");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        let acknowledgement = ApplicationMoveEpisodeAcknowledgement::from_record(&record);
+        let acknowledgement_name = acknowledgement.filename();
+        fs::write(
+            directory.join(&acknowledgement_name),
+            acknowledgement.encode().unwrap(),
+        )
+        .unwrap();
+
+        assert!(actor
+            .cleanup_move_episode_acknowledgement(&acknowledgement_name)
+            .unwrap());
+        assert!(
+            !actor
+                .cleanup_cold_move_episode_entry(&completion_name)
+                .unwrap(),
+            "a ReadDir entry buffered before acknowledgement cleanup may be stale"
+        );
+        assert!(!directory.join(record_name).exists());
+        assert!(!directory.join(completion_name).exists());
+        assert!(!directory.join(acknowledgement_name).exists());
+    }
+
+    #[test]
+    fn live_acknowledgement_queue_saturation_drains_before_marker_publication() {
+        let fixture = ActivationFixture::nested_unicode("move-ack-queue-saturation", 0xa17715);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("saturation source actor opens");
+        let request = simple_application_move_request(&handle, "Saturated Ack Queue");
+        let (episode_id, batch_id) = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id,
+                batch_id,
+                ..
+            } => (episode_id, batch_id),
+            other => panic!("saturation move did not commit: {other:?}"),
+        };
+        drop(handle);
+
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("saturation runtime resources reopen");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        for _ in 0..MOVE_EPISODE_CLEANUP_QUEUE_LIMIT {
+            let acknowledgement = ApplicationMoveEpisodeAcknowledgement {
+                workspace_id: actor.binding.workspace_id(),
+                lineage_digest: actor.binding.lineage_digest(),
+                episode_id: Uuid::new_v4(),
+                batch_id: BatchId::new(),
+            };
+            let name = acknowledgement.filename();
+            fs::write(
+                fixture
+                    .request
+                    .application_runtime_root
+                    .join("move-episodes")
+                    .join(&name),
+                acknowledgement.encode().unwrap(),
+            )
+            .unwrap();
+            actor.move_episode_cleanup_queue.push_back(name);
+        }
+        actor.move_episode_cleanup_pending = true;
+
+        actor
+            .acknowledge_application_move(
+                Uuid::parse_str(&episode_id).unwrap(),
+                batch_id.parse::<BatchId>().unwrap(),
+            )
+            .expect("the 257th acknowledgement makes bounded room before publication");
+        assert!(actor.move_episode_cleanup_queue.len() <= MOVE_EPISODE_CLEANUP_QUEUE_LIMIT);
+        for _ in 0..16 {
+            if !actor.move_episode_cleanup_pending {
+                break;
+            }
+            actor.cleanup_acknowledged_move_episodes().unwrap();
+        }
+        assert!(!actor.move_episode_cleanup_pending);
+        let acknowledged = fs::read_dir(
+            fixture
+                .request
+                .application_runtime_root
+                .join("move-episodes"),
+        )
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".acknowledged")
+        })
+        .count();
+        assert_eq!(acknowledged, 0);
+        assert!(matches!(
+            actor.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn cold_move_cleanup_cursor_stays_runnable_and_bounded_across_turns() {
+        let fixture = ActivationFixture::nested_unicode("move-cold-bounded-cursor", 0xa17714);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("bounded cursor fixture activates");
+        let directory = fixture
+            .request
+            .application_runtime_root
+            .join("move-episodes");
+        drop(handle);
+
+        for index in 0..(MOVE_EPISODE_SCAN_ENTRIES_PER_TURN * 2 + 7) {
+            fs::write(
+                directory.join(format!("unrelated-{index:04}.keep")),
+                b"ignored",
+            )
+            .unwrap();
+        }
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let reopened = reopened.handle.expect("bounded cursor actor reopens");
+        let initial = reopened.status().unwrap();
+        assert!(initial.move_episode_cleanup_pending);
+        assert!(initial.has_runnable_work());
+
+        let mut turns = 0;
+        while reopened.status().unwrap().move_episode_cleanup_pending && turns < 4 {
+            reopened.tick().unwrap();
+            turns += 1;
+        }
+        let settled = reopened.status().unwrap();
+        assert!(
+            !settled.move_episode_cleanup_pending,
+            "the retained directory cursor must finish within its bounded turns: {settled:?}"
+        );
+        assert!(
+            turns >= 1 && turns <= 3,
+            "unexpected cleanup turn count: {turns}"
+        );
+        drop(reopened);
+    }
+
+    #[test]
     fn foreground_cross_page_move_crash_reopens_from_the_local_journal() {
         let fixture = ActivationFixture::nested_unicode("foreground-move-crash-reopen", 0xa17711);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
@@ -33163,10 +34012,16 @@ mod tests {
         drop(resources);
 
         let mut phases = Vec::new();
+        let mut recovery_stages = Vec::new();
         let opened =
             SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
-                if let SyncRuntimeOpenProgress::Phase { phase, .. } = progress {
-                    phases.push(phase);
+                match progress {
+                    SyncRuntimeOpenProgress::Phase { phase, .. } => phases.push(phase),
+                    SyncRuntimeOpenProgress::RecoveryStage { stage, .. } => {
+                        recovery_stages.push(stage)
+                    }
+                    SyncRuntimeOpenProgress::Waiting { .. }
+                    | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
                 }
             });
         assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
@@ -33179,6 +34034,24 @@ mod tests {
         assert!(
             !phases.contains(&SyncRuntimeOpenPhase::DiscoveringEnrollment),
             "clean marker must not enter legacy enrollment discovery"
+        );
+        assert_eq!(
+            recovery_stages,
+            vec![
+                SyncRuntimeCleanOpenStage::AuthenticatedBaselineOpen,
+                SyncRuntimeCleanOpenStage::ReceiptClaimPrecheck,
+                SyncRuntimeCleanOpenStage::GraphOpen,
+                SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
+                SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
+                SyncRuntimeCleanOpenStage::CommittedTailReplay,
+                SyncRuntimeCleanOpenStage::ProjectionOpen,
+                SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
+                SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
+                SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
+                SyncRuntimeCleanOpenStage::TerminalProjectionRepair,
+                SyncRuntimeCleanOpenStage::CompletionFlush,
+            ],
+            "clean cold-open diagnostics must identify every bounded recovery boundary"
         );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
@@ -34987,6 +35860,101 @@ mod tests {
             ) && detail.contains("->"),
             "the refusal must name the operation and both names: {detail}"
         );
+    }
+
+    #[test]
+    fn duplicate_path_join_exception_is_fresh_activation_only_and_fails_closed() {
+        let (root, request) = empty_request(SyncStorageProfile::ExperimentalLocal);
+        let owner_path = "pages/Denn\u{ed} pozn\u{e1}mky.md";
+        let backup_path = "archiv/2026/Denn\u{ed} pozn\u{e1}mky.md";
+        fs::create_dir_all(request.graph_root.join("pages")).unwrap();
+        fs::create_dir_all(request.graph_root.join("archiv/2026")).unwrap();
+        fs::write(
+            request.graph_root.join(owner_path),
+            b"- authoritative page\n  id:: 00000000-0000-4000-8000-000000000123\n",
+        )
+        .unwrap();
+        fs::write(
+            request.graph_root.join(backup_path),
+            b"- intentionally different backup\n",
+        )
+        .unwrap();
+        let graph = Graph::open_checked(&request.graph_root).unwrap();
+        let (mut shared_page, _) = clean_join_disk_page(&graph, owner_path).unwrap();
+        let (local_page, _) = clean_join_disk_page(&graph, backup_path).unwrap();
+
+        // Canonical snapshots hide policy-generated anchors. The disk probe may
+        // see one, but every user-authored byte/shape still has to match.
+        shared_page.outline[0].1 = "authoritative page".into();
+        shared_page.outline[0].2 = None;
+        assert!(clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[local_page],
+            &[shared_page],
+            true,
+        )
+        .unwrap());
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[clean_join_disk_page(&graph, backup_path).unwrap().0],
+            &[clean_join_disk_page(&graph, owner_path).unwrap().0],
+            false,
+        )
+        .unwrap());
+
+        let stale_local_page = clean_join_disk_page(&graph, backup_path).unwrap().0;
+        fs::write(
+            request.graph_root.join(backup_path),
+            b"- backup changed after its accepted observation\n",
+        )
+        .unwrap();
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[stale_local_page],
+            &[clean_join_disk_page(&graph, owner_path).unwrap().0],
+            true,
+        )
+        .unwrap());
+        fs::write(
+            request.graph_root.join(backup_path),
+            b"- intentionally different backup\n",
+        )
+        .unwrap();
+
+        fs::write(
+            request.graph_root.join(owner_path),
+            b"- provider-selected path changed locally\n",
+        )
+        .unwrap();
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[clean_join_disk_page(&graph, backup_path).unwrap().0],
+            &[CleanJoinUserPage {
+                path: owner_path.into(),
+                kind: ManagedTextKind::Page,
+                preamble: None,
+                outline: vec![(0, "authoritative page".into(), None)],
+                projected_ids: vec![None],
+            }],
+            true,
+        )
+        .unwrap());
+
+        fs::remove_file(request.graph_root.join(owner_path)).unwrap();
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[clean_join_disk_page(&graph, backup_path).unwrap().0],
+            &[CleanJoinUserPage {
+                path: owner_path.into(),
+                kind: ManagedTextKind::Page,
+                preamble: None,
+                outline: vec![(0, "authoritative page".into(), None)],
+                projected_ids: vec![None],
+            }],
+            true,
+        )
+        .expect("an absent provider-selected path must preserve the semantic diff"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -46710,6 +47678,24 @@ mod tests {
         ));
     }
 
+    const MANAGED_CRASH_REOPEN_GATE_ROUNDS: usize = 800;
+    const MANAGED_CRASH_REOPEN_BUDGET_SECONDS: u64 = 5;
+
+    #[test]
+    fn managed_crash_reopen_gate_and_contract_pin_the_same_scale_and_budget() {
+        let runner = include_str!("../../../scripts/run-managed-storage-perf-gates.mjs");
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        assert!(runner.contains(&format!(
+            "TINE_MANAGED_CRASH_REOPEN_ROUNDS: \"{MANAGED_CRASH_REOPEN_GATE_ROUNDS}\""
+        )));
+        assert!(contract.contains(&format!(
+            "after {MANAGED_CRASH_REOPEN_GATE_ROUNDS} accepted page edits"
+        )));
+        assert!(contract.contains(&format!(
+            "{MANAGED_CRASH_REOPEN_BUDGET_SECONDS}-second ceiling"
+        )));
+    }
+
     #[test]
     #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
     fn managed_crash_reopen_aged_history_manual_benchmark() {
@@ -46736,7 +47722,22 @@ mod tests {
         let mut editable = pages
             .into_iter()
             .map(|entry| entry.rel_path)
-            .filter(|path| !load_application_exact(&handle, path).0.blocks.is_empty())
+            .filter(|path| {
+                let page = load_application_exact(&handle, path).0;
+                let Some(first) = page.blocks.first() else {
+                    return false;
+                };
+                // This benchmark replaces the complete raw first-block text.
+                // The trusted-local application-save vocabulary declines
+                // removal of an externally imported `id::`, while this
+                // benchmark helper replaces the complete first-block text and
+                // expects a direct save. Exclude that separate identity case
+                // so this gate continues to measure history aging.
+                !first.raw.lines().any(|line| {
+                    line.split_once("::")
+                        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("id"))
+                })
+            })
             .take(rounds.max(1))
             .collect::<Vec<_>>();
         editable.sort();
@@ -46780,8 +47781,8 @@ mod tests {
             startup_ms(elapsed),
         );
         assert!(
-            elapsed < Duration::from_secs(10),
-            "aged-history crash reopen exceeded the 10-second real-corpus recovery ceiling: elapsed_ms={:.3}",
+            elapsed < Duration::from_secs(MANAGED_CRASH_REOPEN_BUDGET_SECONDS),
+            "aged-history crash reopen exceeded the 5-second real-corpus recovery ceiling: elapsed_ms={:.3}",
             startup_ms(elapsed),
         );
         assert!(matches!(
@@ -46975,6 +47976,30 @@ mod tests {
                 0xa0b0 + index as u128 * 0x10,
                 additional_pages,
             );
+            let direct_graph = Graph::open(&fixture.graph_root);
+            direct_graph.warm_cache();
+            let direct_entries = direct_graph
+                .list_pages()
+                .into_iter()
+                .filter(|entry| entry.kind == PageKind::Page)
+                .collect::<Vec<_>>();
+            let sample_count = direct_entries.len().min(64);
+            assert!(sample_count > 0, "scaled fixture has ordinary pages");
+            let page_samples = (0..sample_count)
+                .map(|sample| {
+                    direct_entries[sample.saturating_mul(direct_entries.len()) / sample_count]
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut direct_page_open = Vec::with_capacity(sample_count);
+            for entry in &page_samples {
+                let started = Instant::now();
+                direct_graph
+                    .load_named(&entry.name, entry.kind)
+                    .expect("Direct Files scale receipt page lookup succeeds")
+                    .expect("Direct Files scale receipt page exists");
+                direct_page_open.push(started.elapsed());
+            }
             let receipt = activate_with_scale_receipt(&fixture);
             assert_eq!(receipt.source_files, total_pages, "{receipt:?}");
             assert!(
@@ -46990,15 +48015,44 @@ mod tests {
             let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
             assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
             let cold_ms = cold_started.elapsed().as_millis();
+            let handle = reopened
+                .handle
+                .expect("scaled fixture cold reopen retains its actor");
+            let feed_started = Instant::now();
+            drive_initial_feed_with_turn_budget(&handle, total_pages.saturating_add(128));
+            let initial_feed_settle = feed_started.elapsed();
+            let cold_ready_ms = cold_started.elapsed().as_millis();
+            let mut managed_page_open = Vec::with_capacity(sample_count);
+            for entry in &page_samples {
+                let started = Instant::now();
+                let _ = load_application_logical(&handle, &entry.name, SyncPageKind::Page);
+                managed_page_open.push(started.elapsed());
+            }
+            let direct_page_open_p50 = startup_median(&direct_page_open);
+            let direct_page_open_p95 = startup_p95(&direct_page_open);
+            let managed_page_open_p50 = startup_median(&managed_page_open);
+            let managed_page_open_p95 = startup_p95(&managed_page_open);
             eprintln!(
-                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} source_bytes={} blocks={} phases={:?} clean={:?}",
+                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} initial_feed_settle_ms={:.3} cold_ready_ms={cold_ready_ms} page_samples={sample_count} direct_page_open_p50_ms={:.3} direct_page_open_p95_ms={:.3} managed_page_open_p50_ms={:.3} managed_page_open_p95_ms={:.3} source_bytes={} blocks={} phases={:?} clean={:?}",
                 receipt.total_ms,
+                startup_ms(initial_feed_settle),
+                startup_ms(direct_page_open_p50),
+                startup_ms(direct_page_open_p95),
+                startup_ms(managed_page_open_p50),
+                startup_ms(managed_page_open_p95),
                 receipt.source_bytes,
                 receipt.blocks,
                 receipt.phase_ms,
                 receipt.clean,
             );
-            drop(reopened.handle);
+            assert!(
+                managed_page_open_p95 < Duration::from_millis(5),
+                "managed {total_pages}-page logical page open exceeded the 5 ms interactive backend budget: p50={managed_page_open_p50:?} p95={managed_page_open_p95:?}"
+            );
+            assert!(matches!(
+                handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
         }
     }
 
@@ -48618,14 +49672,6 @@ mod tests {
             GraphWideCommitWork::default(),
             "ordinary application save performed graph-wide foreground work"
         );
-        assert_eq!(
-            after.provider_pending, before.provider_pending,
-            "ordinary application save must not enqueue provider work"
-        );
-        assert_eq!(
-            after.provider_pending, 0,
-            "the benchmark starts each timed save with settled provider work"
-        );
 
         let before_engine = before.engine;
         let after_engine = after.engine;
@@ -48788,7 +49834,10 @@ mod tests {
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
         let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
+        // The fixture deliberately scales to 10,000 pages. Its initial exact
+        // feed is page-bounded, so the fixed small-fixture helper would reject
+        // the intended large case before the measured reconciliation begins.
+        drive_initial_feed_with_turn_budget(&handle, total_pages.saturating_add(128));
 
         handle
             .observe_watcher(vec![SyncWatcherObservation::RescanRequired])

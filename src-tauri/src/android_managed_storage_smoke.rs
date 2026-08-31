@@ -27,7 +27,12 @@ use tine_core::sync_runtime::{
 };
 use uuid::Uuid;
 
-fn run(graph_root: PathBuf, private_root: PathBuf, write_fixture: bool) -> String {
+fn run(
+    graph_root: PathBuf,
+    private_root: PathBuf,
+    write_fixture: bool,
+    return_to_direct_files: bool,
+) -> String {
     if write_fixture {
         if let Err(error) = write_journey_graph_fixture(&graph_root) {
             return format!("journey graph fixture could not be written: {error}");
@@ -69,7 +74,22 @@ fn run(graph_root: PathBuf, private_root: PathBuf, write_fixture: bool) -> Strin
         provider_journal_root: open_request.provider_journal_root.clone(),
         identities,
     };
-    run_managed_storage_journey(graph_root, open_request, activation_request)
+    let receipt =
+        run_managed_storage_journey(graph_root.clone(), open_request.clone(), activation_request);
+    if !receipt.starts_with("ok ") {
+        return receipt;
+    }
+    if !return_to_direct_files {
+        return receipt;
+    }
+    match crate::sync_runtime::run_android_managed_return_to_direct_files(
+        &graph_root,
+        &private_root,
+        open_request,
+    ) {
+        Ok(return_receipt) => format!("{receipt} {return_receipt}"),
+        Err(error) => format!("Return to Direct Files failed after {receipt}: {error}"),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -79,6 +99,7 @@ pub extern "system" fn Java_page_tine_app_ManagedStorageSmoke_runManagedActivati
     graph_root: JString<'_>,
     private_root: JString<'_>,
     write_fixture: jboolean,
+    return_to_direct_files: jboolean,
 ) -> jstring {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let graph_root = env
@@ -89,7 +110,12 @@ pub extern "system" fn Java_page_tine_app_ManagedStorageSmoke_runManagedActivati
             .get_string(&private_root)
             .map(|value| PathBuf::from(value.to_string_lossy().into_owned()))
             .map_err(|error| format!("invalid private-root JNI string: {error}"))?;
-        Ok::<_, String>(run(graph_root, private_root, write_fixture != 0))
+        Ok::<_, String>(run(
+            graph_root,
+            private_root,
+            write_fixture != 0,
+            return_to_direct_files != 0,
+        ))
     }))
     .map_err(|_| "managed-storage smoke probe panicked".to_string())
     .and_then(|result| result)

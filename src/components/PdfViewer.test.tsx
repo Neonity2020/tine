@@ -35,7 +35,9 @@ function PdfViewer(props: {
   label: string;
   owner?: PdfOwnership;
   page?: number;
+  scale?: number;
   navigation?: () => any;
+  onViewState?: (state: { page: number; scale: number }) => void;
 }) {
   return <OwnedPdfViewer {...props} owner={props.owner ?? testPdfOwner()} />;
 }
@@ -49,18 +51,15 @@ function KeyedPdfViewer(props: { target: () => any }) {
 }
 
 vi.mock("pdfjs-dist", () => ({
+  AnnotationMode: { DISABLE: 0 },
   GlobalWorkerOptions: {},
+  PixelsPerInch: { PDF_TO_CSS_UNITS: 4 / 3 },
   getDocument: getDocumentMock,
-  TextLayer: class {
-    render() {
-      return Promise.resolve();
-    }
-
-    update() {
-      return Promise.resolve();
-    }
-  },
 }));
+
+vi.mock("pdfjs-dist/web/pdf_viewer.mjs", async () =>
+  import("../testPdfPageViewMock")
+);
 
 vi.mock("pdfjs-dist/build/pdf.worker.min.mjs?url", () => ({
   default: "pdf.worker.test.js",
@@ -379,6 +378,11 @@ describe("PdfViewer resource safety", () => {
       expect(original.isConnected).toBe(true);
 
       (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      // The visible wrapper already owns optimistic scaling because the
+      // ordinary canvas is sized to 100% of it. A second inline transform
+      // would turn a 10% step into a transient 21% overshoot.
+      expect(pageElement.style.width).toBe("673.2px");
+      expect(original.style.transform).toBe("");
       await vi.advanceTimersByTimeAsync(120);
       await flush();
       expect(visiblePage.render).toHaveBeenCalledTimes(2);
@@ -725,6 +729,42 @@ describe("PdfViewer OG state and reference behavior", () => {
       expect(writeState).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       expect(writeState).toHaveBeenCalledWith("paper.pdf", 2, 2.2);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("lets route-owned page and scale override the shared sidecar and publishes per-view changes", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [],
+      page: 2,
+      scale: 2,
+    });
+    vi.spyOn(backend(), "writePdfViewState").mockResolvedValue(undefined);
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([page(612, 792), page(612, 792)])) });
+    const states: Array<{ page: number; scale: number }> = [];
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => (
+      <PdfViewer
+        filename="paper.pdf"
+        label="Paper"
+        page={1}
+        scale={1.75}
+        onViewState={(state) => states.push(state)}
+      />
+    ), host);
+    try {
+      await flush();
+      expect((host.querySelector(".pdf-page-input") as HTMLInputElement).value).toBe("1");
+      expect(host.querySelector(".pdf-zoom-level")?.textContent).toBe("175%");
+      expect(states.at(-1)).toEqual({ page: 1, scale: 1.75 });
+
+      (host.querySelector('button[title="Zoom in"]') as HTMLButtonElement).click();
+      await flush();
+      expect(states.at(-1)).toEqual({ page: 1, scale: 1.93 });
     } finally {
       dispose();
     }
@@ -1562,6 +1602,21 @@ describe("PdfViewer released-OG themes and outline", () => {
     }
   });
 
+  it("keeps Close as the terminal PDF toolbar action", async () => {
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(documentWithPages([page(612, 792)])) });
+    const view = mountViewer();
+    try {
+      await flush();
+      const actions = view.host.querySelector(".pdf-toolbar-actions")!;
+      const buttons = [...actions.querySelectorAll<HTMLButtonElement>("button")];
+      expect(buttons.at(-1)?.title).toBe("Close PDF");
+      expect(buttons.at(-1)?.getAttribute("aria-label")).toBe("Close PDF");
+      expect(buttons.at(-1)?.classList.contains("pdf-close-btn")).toBe(true);
+    } finally {
+      view.dispose();
+    }
+  });
+
   it("matches released OG 1.0.0 page-theme filtering without inverting highlight overlays", () => {
     const css = readFileSync("src/styles/app.css", "utf8");
     expect(css).toContain('.pdf-viewer[data-theme="light"] {\n  --pdf-container-bg: #fff;\n  --pdf-toolbar-bg: #fff;\n  --pdf-page-bg: #fff;');
@@ -1570,7 +1625,7 @@ describe("PdfViewer released-OG themes and outline", () => {
     expect(css).not.toMatch(/\.pdf-viewer\[data-theme="dark"\][^{]*\{[^}]*filter:[^}]*\bhue-rotate\b/s);
     expect(css).toMatch(/\.pdf-page \{[^}]*background: var\(--pdf-page-bg\);/s);
     expect(css).toContain('.pdf-viewer[data-theme="dark"] {\n  --pdf-container-bg: #202124;');
-    expect(css).toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-page > :is\(canvas, \.textLayer\) \{[^}]*filter: invert\(1\);/s);
+    expect(css).toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-page :is\(\.canvasWrapper, \.textLayer\) \{[^}]*filter: invert\(1\);/s);
     expect(css).toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-hl \{[^}]*mix-blend-mode: screen/s);
     expect(css).not.toMatch(/\.pdf-viewer\[data-theme="dark"\] \.pdf-hl-layer \{[^}]*filter:/s);
   });

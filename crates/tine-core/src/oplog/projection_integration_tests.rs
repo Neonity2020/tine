@@ -1046,9 +1046,9 @@ fn claimless_nonempty_and_prior_version_receipt_roots_fail_without_mutation() {
         .collect::<Vec<_>>();
     assert_eq!(after, before);
 
-    // Every prior magic, including the pre-(c) TINEPR5, is recognized and
-    // refused with the re-activation remedy. There is no migration and no dual
-    // acceptance: the store format's version IS the (c) transition.
+    // Every prior magic, including the pre-(c) TINEPR5, is recognized only
+    // enough to refuse without mutation. There is no migration and no dual
+    // acceptance; the outer graph-open lifecycle owns backup and rebuild.
     for (magic, found) in [(&b"TINEPR5\0"[..], 5_u32), (&b"TINEPR4\0"[..], 4)] {
         let prior = TestDir::new("prior-receipt-claim");
         let mut claim = Vec::new();
@@ -1076,8 +1076,11 @@ fn claimless_nonempty_and_prior_version_receipt_roots_fail_without_mutation() {
         );
         let message = error.to_string();
         assert!(
-            message.contains("re-activate") && message.contains("Markdown"),
-            "the refusal must carry the re-activation remedy: {message}"
+            message.contains("backed up")
+                && message.contains("rebuilt")
+                && message.contains("Markdown/Org")
+                && !message.contains("re-activate"),
+            "the low-level refusal must name automatic blank-slate recovery, not manual re-activation: {message}"
         );
         assert_eq!(
             fs::read(prior.path().join("projection-receipts.claim")).unwrap(),

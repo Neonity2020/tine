@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { remote } from "webdriverio";
+import { Key, remote } from "webdriverio";
 import {
   createWebdriverLifecycle,
   tauriCapabilities,
@@ -34,6 +34,11 @@ const XDG = path.join(TMP, "xdg");
 const ARTIFACTS = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(TMP, "artifacts"));
 const RECEIPT_PATH = path.join(ARTIFACTS, "managed-journal-feed-receipt.json");
 const EDIT_MARKER = "accepted managed journal-feed edit";
+const RAPID_MOVE_MARKER = "RAPID-MANAGED-MULTI-DAY-MOVE";
+const RAPID_MOVE_COMMANDS = 120;
+const BULK_SOURCE_PAGE = "Bulk Move Source";
+const BULK_DESTINATION_PAGE = "Bulk Move Destination";
+const BULK_MARKERS = Array.from({ length: 20 }, (_, index) => `BULK-MOVE-${String(index + 1).padStart(2, "0")}`);
 const pad = (value) => String(value).padStart(2, "0");
 const addDays = (date, amount) => new Date(date.getFullYear(), date.getMonth(), date.getDate() + amount, 12);
 const stem = (date) => `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${date.getFullYear()}`;
@@ -52,14 +57,23 @@ for (const directory of [
 const today = new Date();
 const days = Array.from({ length: 7 }, (_, index) => addDays(today, -index));
 const markers = days.map((date, index) => index === 0 ? "MANAGED-FEED-TODAY" : `MANAGED-FEED-PAST-${index}`);
-const tallJournal = (marker) => `${[
+const tallJournal = (marker, rapidMove = false) => `${[
   `- ${marker}`,
   ...Array.from({ length: 32 }, (_, index) => `- tall journal fixture ${marker} ${index + 1}`),
+  ...(rapidMove ? [`- ${RAPID_MOVE_MARKER}`] : []),
 ].join("\n")}\n`;
 for (const [index, date] of days.entries()) {
-  fs.writeFileSync(path.join(GRAPH, "journals", `${stem(date)}.md`), tallJournal(markers[index]));
+  fs.writeFileSync(path.join(GRAPH, "journals", `${stem(date)}.md`), tallJournal(markers[index], index === 0));
 }
 fs.writeFileSync(path.join(GRAPH, "pages", "Feed Control.md"), "- managed feed route control\n");
+fs.writeFileSync(
+  path.join(GRAPH, "pages", `${BULK_SOURCE_PAGE}.md`),
+  `${BULK_MARKERS.map((marker) => `- ${marker}`).join("\n")}\n`,
+);
+fs.writeFileSync(
+  path.join(GRAPH, "pages", `${BULK_DESTINATION_PAGE}.md`),
+  "- BULK-DESTINATION-ANCHOR\n",
+);
 fs.writeFileSync(
   path.join(GRAPH, "logseq", "config.edn"),
   '{:preferred-format "Markdown" :journal/file-name-format "dd-MM-yyyy"}\n',
@@ -230,6 +244,36 @@ async function feedText() {
   });
 }
 
+async function openPageThroughSwitcher(name) {
+  await browser.keys(["Control", "k"]);
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 30_000 });
+  await input.setValue(name);
+  await browser.waitUntil(() => browser.execute((expected) => {
+    const active = document.querySelector(".switcher-row.active");
+    return active?.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && active.querySelector(".switcher-name")?.textContent?.trim() === expected;
+  }, name), { timeout: 30_000, timeoutMsg: `switcher did not select ${name}` });
+  await browser.keys("Enter");
+  const title = await browser.$("h1.page-title");
+  await title.waitForExist({ timeout: 30_000 });
+  await browser.waitUntil(async () => (await title.getText()).trim() === name, {
+    timeout: 30_000,
+    timeoutMsg: `visible UI did not open ${name}`,
+  });
+}
+
+async function visibleRootTexts() {
+  return browser.execute(() => [...document.querySelectorAll(".page-blocks > .ls-block")]
+    .map((block) => {
+      const main = block.querySelector(":scope > .block-main > .block-content-wrapper");
+      const editor = main?.querySelector("textarea.block-editor");
+      return editor instanceof HTMLTextAreaElement
+        ? editor.value.trim()
+        : main?.querySelector(":scope > .block-content")?.textContent?.trim() ?? "";
+    }));
+}
+
 async function stopHarness() {
   const currentBrowser = browser;
   const currentDriver = driver;
@@ -345,13 +389,18 @@ try {
     return editor.value === value;
   }, `${markers[0]} ${EDIT_MARKER}`);
   if (!edited) throw new Error("today's active editor rejected the managed feed edit input");
-  await (await browser.$(".journal-today .journal-title")).click();
+  // End the editor before navigating through the journal title. Clicking the
+  // title itself as the blur target races its route load against the save it
+  // just started; the correctly guarded stale DTO then emits an unrelated
+  // unsaved-instance refusal which can survive into the rapid-move phase.
+  await browser.keys(Key.Escape);
   const todayFile = path.join(GRAPH, "journals", `${stem(days[0])}.md`);
   await waitFor(
     () => fs.readFileSync(todayFile, "utf8").includes(EDIT_MARKER),
     30_000,
     "accepted managed edit did not reach the Markdown projection",
   );
+  await (await browser.$(".journal-today .journal-title")).click();
   const journals = await waitFor(async () => {
     for (const item of await browser.$$(".nav-item")) {
       if ((await item.getText()).trim() === "Journals") return item;
@@ -364,7 +413,179 @@ try {
     interval: 200,
     timeoutMsg: "reopened managed feed did not show the accepted edit",
   });
+  const acceptedEditErrors = await browser.execute(() =>
+    [...document.querySelectorAll(".toast-error .toast-msg")].map((node) => node.textContent ?? ""));
+  if (acceptedEditErrors.length) {
+    throw new Error(`accepted managed edit/reopen emitted error notifications: ${JSON.stringify(acceptedEditErrors)}`);
+  }
   receipt.milestones.acceptedEditRefresh = { marker: EDIT_MARKER, projected: true, rendered: true };
+
+  phase = "rapid-multi-day-move";
+  const rapidBlock = await waitFor(async () => {
+    for (const block of await browser.$$(".journal-today .ls-block")) {
+      if ((await block.getText()).includes(RAPID_MOVE_MARKER)) return block;
+    }
+    return undefined;
+  }, 30_000, "rapid managed move block was absent from today's journal");
+  await rapidBlock.$(":scope > .block-main > .block-content-wrapper").click();
+  await browser.waitUntil(() => browser.execute((marker) => {
+    const editor = document.querySelector(".journal-today textarea.block-editor");
+    return editor instanceof HTMLTextAreaElement
+      && document.activeElement === editor
+      && editor.value.includes(marker);
+  }, RAPID_MOVE_MARKER), {
+    timeout: 30_000,
+    interval: 100,
+    timeoutMsg: "rapid managed move block did not own the active editor",
+  });
+  const rapidStartedAt = Date.now();
+  // Deliberately do not wait for any UI or actor cycle between commands. This
+  // reproduces the physical key-repeat failure where several page-boundary
+  // moves were captured against one stale source page and then flooded errors.
+  const dispatched = await browser.execute(async (count, marker) => {
+    let accepted = 0;
+    for (let index = 0; index < count; index++) {
+      // A cross-page render replaces the textarea. Physical key repeat follows
+      // the newly focused editor; a synthetic loop that retains the first DOM
+      // node silently stops bubbling after that node is detached. Reacquire the
+      // live editor, but never wait for the managed actor or durable projection
+      // between commands.
+      let editor;
+      const deadline = performance.now() + 1_000;
+      do {
+        editor = [...document.querySelectorAll("textarea.block-editor")]
+          .find((candidate) => candidate instanceof HTMLTextAreaElement
+            && candidate.value.includes(marker));
+        if (!(editor instanceof HTMLTextAreaElement)) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      } while (!(editor instanceof HTMLTextAreaElement) && performance.now() < deadline);
+      if (!(editor instanceof HTMLTextAreaElement)) break;
+      editor.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "ArrowDown",
+        code: "ArrowDown",
+        altKey: true,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+      editor.dispatchEvent(new KeyboardEvent("keyup", {
+        key: "ArrowDown",
+        code: "ArrowDown",
+        altKey: true,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+      accepted++;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return accepted;
+  }, RAPID_MOVE_COMMANDS, RAPID_MOVE_MARKER);
+  if (dispatched !== RAPID_MOVE_COMMANDS) {
+    throw new Error(`rapid managed move dispatched only ${dispatched}/${RAPID_MOVE_COMMANDS} commands`);
+  }
+  const rapidDestination = path.join(GRAPH, "journals", `${stem(days[4])}.md`);
+  await waitFor(
+    () => fs.readFileSync(rapidDestination, "utf8").includes(RAPID_MOVE_MARKER),
+    180_000,
+    `rapid managed move did not reach the fifth loaded journal after ${RAPID_MOVE_COMMANDS} commands`,
+    100,
+  );
+  await sleep(1_000);
+  const rapidLocations = days
+    .map((date, index) => ({
+      index,
+      path: path.join(GRAPH, "journals", `${stem(date)}.md`),
+    }))
+    .filter(({ path: journalPath }) => fs.readFileSync(journalPath, "utf8").includes(RAPID_MOVE_MARKER));
+  const rapidErrors = await browser.execute(() =>
+    [...document.querySelectorAll(".toast-error .toast-msg")].map((node) => node.textContent ?? ""));
+  if (rapidLocations.length !== 1 || rapidLocations[0].index !== 4) {
+    throw new Error(`rapid managed move did not settle exactly once on the expected day: ${JSON.stringify(rapidLocations)}`);
+  }
+  if (rapidErrors.length) {
+    throw new Error(`rapid managed move emitted error notifications: ${JSON.stringify(rapidErrors)}`);
+  }
+  receipt.milestones.rapidMultiDayMove = {
+    marker: RAPID_MOVE_MARKER,
+    commands: RAPID_MOVE_COMMANDS,
+    interCommandDelayMs: 5,
+    crossedDayBoundaries: 4,
+    destinationDayIndex: rapidLocations[0].index,
+    elapsedMs: Date.now() - rapidStartedAt,
+    errorNotifications: rapidErrors,
+  };
+
+  phase = "bulk-cross-page-cut-paste";
+  const bulkStartedAt = Date.now();
+  await openPageThroughSwitcher(BULK_SOURCE_PAGE);
+  await waitFor(async () => (await visibleRootTexts()).length === BULK_MARKERS.length,
+    30_000, "bulk source did not render all 20 roots");
+  const firstBulk = await browser.$(".page-blocks > .ls-block:first-child > .block-main > .block-content-wrapper");
+  await firstBulk.click();
+  await browser.$("textarea.block-editor").waitForExist({ timeout: 10_000 });
+  await browser.keys(Key.Escape);
+  for (let index = 1; index < BULK_MARKERS.length; index++) {
+    await browser.keys([Key.Shift, Key.ArrowDown]);
+  }
+  await waitFor(() => browser.execute((expected) =>
+    [...document.querySelectorAll(".page-blocks > .ls-block > .block-main.selected")].length === expected,
+  BULK_MARKERS.length), 20_000, "bulk source selection did not include all 20 roots");
+  await browser.keys(["Control", "x"]);
+  // An empty page deliberately renders one blank root so the user has a place
+  // to type. Assert that the cut payload disappeared, rather than requiring an
+  // impossible zero-node DOM.
+  await waitFor(async () => {
+    const roots = await visibleRootTexts();
+    return BULK_MARKERS.every((marker) => !roots.includes(marker));
+  }, 60_000, "bulk cut did not clear the selected source roots");
+  await openPageThroughSwitcher(BULK_DESTINATION_PAGE);
+  const destinationAnchor = await browser.$(".page-blocks > .ls-block:first-child > .block-main > .block-content-wrapper");
+  await destinationAnchor.click();
+  await browser.$("textarea.block-editor").waitForExist({ timeout: 10_000 });
+  // WebKitWebDriver's synthetic Control+V does not dispatch a paste event on
+  // this host. Drive the same application boundary directly: the real cut
+  // above owns Tine's private one-shot payload; this event supplies the exact
+  // public text flavor which authorizes that payload association.
+  const bulkClipboardText = BULK_MARKERS.map((marker) => `- ${marker}`).join("\n");
+  const pasteDispatched = await browser.execute((text) => {
+    const editor = document.querySelector("textarea.block-editor");
+    if (!(editor instanceof HTMLTextAreaElement)
+      || typeof DataTransfer !== "function"
+      || typeof ClipboardEvent !== "function") return false;
+    const clipboard = new DataTransfer();
+    clipboard.setData("text/plain", text);
+    return !editor.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: clipboard,
+    }));
+  }, bulkClipboardText);
+  if (!pasteDispatched) throw new Error("bulk paste event was not claimed by the Tine editor");
+  await waitFor(async () => {
+    const roots = await visibleRootTexts();
+    return BULK_MARKERS.every((marker) => roots.includes(marker));
+  }, 60_000, "bulk paste did not install all 20 roots on the destination page");
+  const bulkSourcePath = path.join(GRAPH, "pages", `${BULK_SOURCE_PAGE}.md`);
+  const bulkDestinationPath = path.join(GRAPH, "pages", `${BULK_DESTINATION_PAGE}.md`);
+  await waitFor(() => {
+    const sourceText = fs.readFileSync(bulkSourcePath, "utf8");
+    const destinationText = fs.readFileSync(bulkDestinationPath, "utf8");
+    return BULK_MARKERS.every((marker) => !sourceText.includes(marker) && destinationText.includes(marker));
+  }, 90_000, "bulk cut/paste did not become durable on both pages", 200);
+  const bulkErrors = await browser.execute(() =>
+    [...document.querySelectorAll(".toast-error .toast-msg")].map((node) => node.textContent ?? ""));
+  if (bulkErrors.length) {
+    throw new Error(`bulk cross-page cut/paste emitted error notifications: ${JSON.stringify(bulkErrors)}`);
+  }
+  receipt.milestones.bulkCrossPageCutPaste = {
+    roots: BULK_MARKERS.length,
+    sourcePage: BULK_SOURCE_PAGE,
+    destinationPage: BULK_DESTINATION_PAGE,
+    elapsedMs: Date.now() - bulkStartedAt,
+    errorNotifications: bulkErrors,
+  };
   receipt.result = "pass";
   receipt.completedAt = new Date().toISOString();
   writeReceipt();

@@ -246,6 +246,54 @@ try {
   assert(ready.canvasCount < PAGE_COUNT / 2, "opening a long PDF rendered distant offscreen pages", ready.canvasCount);
   assert(ready.canvasPixels <= 52_000_000, "PDF canvases exceeded the desktop backing-store budget", ready.canvasPixels);
 
+  // A retained ordinary canvas is already width/height:100% of its page
+  // wrapper. During optimistic zoom it must never receive a second scale
+  // transform: the released failure made one Ctrl+ step overshoot, then visibly
+  // shrink when the 120 ms settled render replaced it.
+  await browser.execute(() => {
+    const probe = window.__tinePdfZoomProbe = { startedAt: performance.now(), samples: [], done: false };
+    const frame = (now) => {
+      const scroll = document.querySelector(".pdf-scroll");
+      const viewport = scroll?.getBoundingClientRect();
+      const page = viewport && [...scroll.querySelectorAll(".pdf-page")]
+        .find((candidate) => {
+          const rect = candidate.getBoundingClientRect();
+          return rect.bottom > viewport.top && rect.top < viewport.bottom;
+        });
+      const canvas = page?.querySelector(".canvasWrapper canvas:not([data-pdf-tile-key])");
+      if (page instanceof HTMLElement && canvas instanceof HTMLCanvasElement) {
+        const pageRect = page.getBoundingClientRect();
+        const canvasRect = canvas.getBoundingClientRect();
+        probe.samples.push({
+          elapsedMs: now - probe.startedAt,
+          zoom: document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "",
+          pageWidth: pageRect.width,
+          canvasWidth: canvasRect.width,
+          canvasToPage: pageRect.width > 0 ? canvasRect.width / pageRect.width : 0,
+          transform: canvas.style.transform,
+        });
+      }
+      if (now - probe.startedAt < 750) requestAnimationFrame(frame);
+      else probe.done = true;
+    };
+    requestAnimationFrame(frame);
+  });
+  await browser.keys(["Control", "="]);
+  await browser.waitUntil(() => browser.execute(() => window.__tinePdfZoomProbe?.done === true), {
+    timeout: 5_000,
+    timeoutMsg: "PDF zoom frame probe did not finish",
+  });
+  const zoomProbe = await browser.execute(() => window.__tinePdfZoomProbe);
+  observations.push({ label: "single-step-zoom", zoomProbe });
+  assert(zoomProbe?.samples?.length > 2, "PDF zoom probe collected too few frames", zoomProbe);
+  const finalZoom = zoomProbe.samples.at(-1)?.zoom;
+  assert(finalZoom && finalZoom !== zoomProbe.samples[0]?.zoom, "Ctrl+ did not change focused PDF zoom", zoomProbe);
+  const maxCanvasToPage = Math.max(...zoomProbe.samples.map((entry) => entry.canvasToPage));
+  assert(maxCanvasToPage <= 1.02, "ordinary PDF canvas overshot its resized wrapper during zoom", {
+    maxCanvasToPage,
+    samples: zoomProbe.samples.filter((entry) => entry.canvasToPage > 1.02),
+  });
+
   let previousFirst = ready.visible[0] ?? 1;
   for (let index = 0; index < 12; index += 1) {
     await wheel(browser, 240, `gentle-${index}`);

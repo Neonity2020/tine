@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tine_storage::{
     LocalJournalAppend, LocalJournalAppendError, LocalJournalError, LocalJournalFrame,
-    LocalJournalSegment,
 };
 use uuid::Uuid;
 
@@ -75,15 +74,14 @@ use super::{
     BatchOrigin, BlobDescription, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId,
     ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
-    ManagedLocalJournal, ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind,
-    ManifestObjectRef, ManifestProjectionPrecondition, ManifestProjectionTarget,
-    ManifestedProjectionIntent, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
-    OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
-    PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
-    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionTargetKind, ProjectionWork,
-    ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError, SessionId,
-    ValidatedBatch, WorkspaceId,
+    ManagedLocalJournal, ManagedPath, ManagedTextKind, ManifestObjectRef,
+    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
+    MembershipClaim, MembershipDelta, ObjectKind, ObjectStore, OperationBatch, OperationObject,
+    PageDelta, PageId, PageState, PortablePathKeyDigest, PreparedBatch, ProjectionClaimEvidence,
+    ProjectionClaimParticipant, ProjectionCompletedReceipt, ProjectionCompletion,
+    ProjectionEndpointId, ProjectionIntent, ProjectionIntentId, ProjectionPrecondition,
+    ProjectionReceiptStore, ProjectionTargetKind, ProjectionWork, ProjectionWorkTarget,
+    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -111,8 +109,8 @@ const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
 const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 14;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
-const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 8;
-const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
+pub(crate) const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 8;
+pub(crate) const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
 pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
@@ -4333,6 +4331,22 @@ impl AcceptedBatchEvidence {
     pub(crate) fn validate(&self) -> Result<(), EngineError> {
         validate_accepted_evidence(self)
     }
+
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, EngineError> {
+        self.validate()?;
+        postcard::to_allocvec(self).map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    pub(crate) fn decode_canonical(bytes: &[u8]) -> Result<Self, EngineError> {
+        let (evidence, trailing): (Self, &[u8]) = postcard::take_from_bytes(bytes)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if !trailing.is_empty() || evidence.encode_canonical()? != bytes {
+            return Err(EngineError::Archive(
+                "non-canonical accepted sequence evidence".into(),
+            ));
+        }
+        Ok(evidence)
+    }
 }
 
 impl AcceptedFrontierRoot {
@@ -4412,6 +4426,23 @@ impl AcceptedFrontierRoot {
         let mut normalized = self.clone();
         normalized.scratch_root = None;
         normalized
+    }
+
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, EngineError> {
+        let durable = self.without_scratch_root();
+        validate_accepted_frontier_root(&durable)?;
+        postcard::to_allocvec(&durable).map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    pub(crate) fn decode_canonical(bytes: &[u8]) -> Result<Self, EngineError> {
+        let (root, trailing): (Self, &[u8]) = postcard::take_from_bytes(bytes)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if !trailing.is_empty() || root.encode_canonical()? != bytes {
+            return Err(EngineError::Archive(
+                "non-canonical accepted-frontier root".into(),
+            ));
+        }
+        Ok(root)
     }
 
     pub(crate) const fn has_persistent_point_index(&self) -> bool {
@@ -7334,23 +7365,13 @@ pub struct ManagedLocalPrefixState {
     pub commitment: ContentDigest,
 }
 
-/// Protocol-bound evidence that one managed-local record became durable.
-///
-/// This is crate-owned evidence: only managed-journal adapters may construct
-/// it. Keeping the physical protocol in the proof lets the v2 rollover
-/// adapter produce the same evidence without teaching the coordinator a
-/// numeric sync count.
+/// Crate-owned evidence that one current-format managed-local record became durable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedLocalAppendProof {
-    protocol: ManagedLocalJournalProtocol,
     receipt: LocalJournalAppend,
 }
 
 impl ManagedLocalAppendProof {
-    pub(crate) const fn protocol(&self) -> ManagedLocalJournalProtocol {
-        self.protocol
-    }
-
     pub(crate) const fn receipt(&self) -> &LocalJournalAppend {
         &self.receipt
     }
@@ -7362,11 +7383,8 @@ impl ManagedLocalAppendProof {
     }
 }
 
-fn managed_local_append_proof(
-    protocol: ManagedLocalJournalProtocol,
-    receipt: LocalJournalAppend,
-) -> ManagedLocalAppendProof {
-    ManagedLocalAppendProof { protocol, receipt }
+fn managed_local_append_proof(receipt: LocalJournalAppend) -> ManagedLocalAppendProof {
+    ManagedLocalAppendProof { receipt }
 }
 
 /// Whether a managed-local append is proven not to have started or may have
@@ -7402,10 +7420,8 @@ impl std::error::Error for ManagedLocalAppendError {
     }
 }
 
-/// The only physical journal shapes that may reach the managed-local append
-/// adapter. Production owns the enum form; the legacy implementation remains
-/// available only to focused lower-level fixtures that establish its retained
-/// recovery behaviour.
+/// The single current physical journal shape that may reach the managed-local
+/// append adapter.
 pub(crate) trait ManagedLocalJournalAppend {
     fn managed_local_device_id(&self) -> Uuid;
     fn managed_local_next_sequence(&self) -> u64;
@@ -7414,30 +7430,6 @@ pub(crate) trait ManagedLocalJournalAppend {
         payload_kind: ManagedLocalJournalPayloadKind,
         payload: &[u8],
     ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError>;
-}
-
-impl ManagedLocalJournalAppend for LocalJournalSegment<ManagedLocalJournalPayloadKind> {
-    fn managed_local_device_id(&self) -> Uuid {
-        self.device_id()
-    }
-
-    fn managed_local_next_sequence(&self) -> u64 {
-        self.next_sequence()
-    }
-
-    fn append_managed_local_payload(
-        &mut self,
-        payload_kind: ManagedLocalJournalPayloadKind,
-        payload: &[u8],
-    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
-        let receipt = self
-            .append(payload_kind, payload)
-            .map_err(ManagedLocalAppendError::AppendOutcomeUnknown)?;
-        Ok(managed_local_append_proof(
-            ManagedLocalJournalProtocol::LegacyV1,
-            receipt,
-        ))
-    }
 }
 
 impl ManagedLocalJournalAppend for ManagedLocalJournal<ManagedLocalJournalPayloadKind> {
@@ -7454,35 +7446,17 @@ impl ManagedLocalJournalAppend for ManagedLocalJournal<ManagedLocalJournalPayloa
         payload_kind: ManagedLocalJournalPayloadKind,
         payload: &[u8],
     ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
-        match self {
-            // The inspector deliberately has no mutating append API. A
-            // legacy journal reaching this boundary is a runtime bug; saves
-            // must be deferred until the rollover actor swaps in v2.
-            ManagedLocalJournal::LegacyV1(_) => {
-                Err(ManagedLocalAppendError::DefinitelyNotAppended(
-                    ManagedLocalRecordError::Unsupported(
-                        "managed-local legacy journal is pending schema-2 rollover".into(),
-                    ),
-                ))
-            }
-            ManagedLocalJournal::V2 { segment, .. } => {
-                let receipt =
-                    segment
-                        .append(payload_kind, payload)
-                        .map_err(|error| match error {
-                            LocalJournalAppendError::DefinitelyNotAppended(error) => {
-                                ManagedLocalAppendError::DefinitelyNotAppendedStorage(error)
-                            }
-                            LocalJournalAppendError::AppendOutcomeUnknown(error) => {
-                                ManagedLocalAppendError::AppendOutcomeUnknown(error)
-                            }
-                        })?;
-                Ok(managed_local_append_proof(
-                    ManagedLocalJournalProtocol::V2,
-                    receipt,
-                ))
-            }
-        }
+        let receipt = self
+            .append(payload_kind, payload)
+            .map_err(|error| match error {
+                LocalJournalAppendError::DefinitelyNotAppended(error) => {
+                    ManagedLocalAppendError::DefinitelyNotAppendedStorage(error)
+                }
+                LocalJournalAppendError::AppendOutcomeUnknown(error) => {
+                    ManagedLocalAppendError::AppendOutcomeUnknown(error)
+                }
+            })?;
+        Ok(managed_local_append_proof(receipt))
     }
 }
 
@@ -15682,8 +15656,7 @@ impl ShardedHotEngine {
                 .as_uuid()
             || receipt.sequence != prepared.sequence
             || receipt.payload_digest != ContentDigest::of(prepared.journal_payload())
-            || receipt.data_durability_syncs
-                != append.protocol().expected_successful_append_data_syncs()
+            || receipt.data_durability_syncs != 2
         {
             return Err(ManagedLocalRecordError::WrongDurabilityProof);
         }
@@ -27808,11 +27781,13 @@ impl ShardedHotEngine {
         match self.visible_documents.get(&document_id) {
             Some(document) => clone_doc(document, peer),
             None => {
-                let document = if self
-                    .visible_document_heads
-                    .get(&document_id)
-                    .is_none_or(BTreeSet::is_empty)
-                {
+                // The document and its run-local head cache are evicted
+                // together, but accepted state is not. Recover the current
+                // direct heads from the authoritative accepted frontier so a
+                // cold point load cannot silently fall back to lazy genesis
+                // after this page has already been edited.
+                let heads = self.document_dependency_heads(document_id, false)?;
+                let document = if heads.is_empty() {
                     self.lazy_genesis_document(document_id, peer)?
                         .unwrap_or_else(LoroDoc::new)
                 } else {
@@ -28297,7 +28272,22 @@ impl ShardedHotEngine {
         } else {
             self.visible_document_heads.get(&document_id)
         };
-        Ok(heads.cloned().unwrap_or_default())
+        if let Some(heads) = heads {
+            return Ok(heads.clone());
+        }
+        // `visible_document_heads` is bounded acceleration. For a clean
+        // no-scratch runtime, the complete accepted frontier is the durable-
+        // history-derived authority that survives hot-document eviction.
+        if !terminal {
+            if let Some(dependencies) = self.accepted_frontier.get(&document_id) {
+                return Ok(dependencies
+                    .direct_dependency_heads()
+                    .iter()
+                    .copied()
+                    .collect());
+            }
+        }
+        Ok(BTreeSet::new())
     }
 
     fn current_document_dependencies(
@@ -31073,17 +31063,7 @@ fn decode_archive_status(bytes: &[u8]) -> Result<ArchiveStatus, EngineError> {
 }
 
 fn decode_accepted_evidence(bytes: &[u8]) -> Result<AcceptedBatchEvidence, EngineError> {
-    let evidence: AcceptedBatchEvidence =
-        postcard::from_bytes(bytes).map_err(|error| EngineError::Archive(error.to_string()))?;
-    if postcard::to_allocvec(&evidence).map_err(|error| EngineError::Archive(error.to_string()))?
-        != bytes
-    {
-        return Err(EngineError::Archive(
-            "non-canonical accepted sequence evidence".into(),
-        ));
-    }
-    validate_accepted_evidence(&evidence)?;
-    Ok(evidence)
+    AcceptedBatchEvidence::decode_canonical(bytes)
 }
 
 fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
@@ -31372,7 +31352,7 @@ fn authenticated_document_map_root(
             ))
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
-    Ok(authenticated_map_subtree(&entries))
+    shared_authenticated_map_root(&entries)
 }
 
 fn authenticated_map_root(
@@ -31383,19 +31363,19 @@ fn authenticated_map_root(
             "authenticated batch map is not canonically ordered".into(),
         ));
     }
-    Ok(authenticated_map_subtree(
+    shared_authenticated_map_root(
         &entries
             .iter()
             .map(|(batch_id, digest)| (batch_id.as_uuid().into_bytes(), *digest))
             .collect::<Vec<_>>(),
-    ))
+    )
 }
 
 pub(crate) fn causal_clock_counter_digest(peer: CausalPeerId, counter: u64) -> ContentDigest {
-    let mut bytes = b"tine/oplog/causal-clock-entry/v1\0".to_vec();
-    bytes.extend_from_slice(peer.as_device_id().as_uuid().as_bytes());
-    bytes.extend_from_slice(&counter.to_be_bytes());
-    ContentDigest::of(&bytes)
+    tine_storage::sealed_accepted_index::causal_clock_counter_digest(
+        peer.as_device_id().as_uuid().into_bytes(),
+        counter,
+    )
 }
 
 pub(crate) fn authenticated_causal_clock_root(
@@ -31418,7 +31398,7 @@ pub(crate) fn authenticated_causal_clock_root(
             )
         })
         .collect::<Vec<_>>();
-    Ok(authenticated_map_subtree(&entries))
+    shared_authenticated_map_root(&entries)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -31430,21 +31410,19 @@ pub(crate) fn accepted_causal_record_digest(
     clock_root_key: Option<[u8; 16]>,
     clock_root_digest: ContentDigest,
 ) -> ContentDigest {
-    let mut bytes = b"tine/oplog/accepted-causal-record/v1\0".to_vec();
-    bytes.extend_from_slice(batch_id.as_uuid().as_bytes());
-    bytes.extend_from_slice(manifest_fingerprint.as_bytes());
-    bytes.extend_from_slice(event_binding_digest.as_bytes());
-    bytes.extend_from_slice(dot.peer_id().as_device_id().as_uuid().as_bytes());
-    bytes.extend_from_slice(&dot.counter().to_be_bytes());
-    match clock_root_key {
-        Some(key) => {
-            bytes.push(1);
-            bytes.extend_from_slice(&key);
-        }
-        None => bytes.push(0),
-    }
-    bytes.extend_from_slice(clock_root_digest.as_bytes());
-    ContentDigest::of(&bytes)
+    tine_storage::sealed_accepted_index::accepted_causal_record_digest(
+        batch_id.as_uuid().into_bytes(),
+        manifest_fingerprint,
+        event_binding_digest,
+        dot.peer_id().as_device_id().as_uuid().into_bytes(),
+        dot.counter(),
+        clock_root_key.map(
+            |key| tine_storage::sealed_accepted_index::AuthenticatedMapLinkV1 {
+                key,
+                digest: clock_root_digest,
+            },
+        ),
+    )
 }
 
 /// Timing-independent rejection evidence for the complete immutable canonical
@@ -31538,30 +31516,12 @@ fn bounded_finalization_work(batch: &ValidatedBatch) -> u64 {
     byte_units.saturating_add(operation_units).saturating_add(1)
 }
 
-fn authenticated_map_subtree(
+fn shared_authenticated_map_root(
     entries: &[([u8; 16], ContentDigest)],
-) -> (Option<[u8; 16]>, ContentDigest) {
-    let Some((root_index, (key, value_digest))) =
-        entries
-            .iter()
-            .enumerate()
-            .min_by(|(_, (left, _)), (_, (right, _))| {
-                super::scratch_store::authenticated_map_priority_order(*left, *right)
-            })
-    else {
-        return (None, super::scratch_store::authenticated_map_empty_digest());
-    };
-    let left = authenticated_map_subtree(&entries[..root_index]);
-    let right = authenticated_map_subtree(&entries[root_index + 1..]);
-    (
-        Some(*key),
-        super::scratch_store::authenticated_map_node_digest(
-            *key,
-            *value_digest,
-            left.0.map(|child_key| (child_key, left.1)),
-            right.0.map(|child_key| (child_key, right.1)),
-        ),
-    )
+) -> Result<(Option<[u8; 16]>, ContentDigest), EngineError> {
+    let root = tine_storage::sealed_accepted_index::authenticated_map_root(entries)
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    Ok((root.root.map(|link| link.key), root.root_digest()))
 }
 
 fn validate_accepted_evidence(evidence: &AcceptedBatchEvidence) -> Result<(), EngineError> {

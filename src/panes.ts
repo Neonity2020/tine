@@ -7,13 +7,16 @@ import {
   installNavigationInterceptor,
   historyRouteContextAdapter,
   mainPaneRouter,
+  makePdfRoute,
   tabRoute,
   type AdoptedTab,
   type PaneSnapshot,
   type PaneRouter,
+  type PdfRoute,
   type Route,
   type PageTarget,
 } from "./router";
+import { publishPdfNavigationIntent } from "./pdfNavigation";
 import { registerPaneFocusSetter } from "./ui";
 import { setCellSel } from "./sheet/selection";
 import {
@@ -26,7 +29,7 @@ import {
 import { journalTitle } from "./journal";
 import { isMobilePlatform } from "./nativeChrome";
 import {
-  nearestPane,
+  companionPane,
   nearestPaneInDirection,
   takeBlockSelectionForPaneReturn,
   type PaneDirection,
@@ -82,8 +85,10 @@ function commitLayout(node: LayoutNode) {
 
 const [focusedPaneIdAccessor, writeFocusedPaneId] = createSignal("main");
 export const focusedPaneId = focusedPaneIdAccessor;
+const [lastFocusedLayoutPaneIdAccessor, writeLastFocusedLayoutPaneId] = createSignal("main");
+export const lastFocusedLayoutPaneId = lastFocusedLayoutPaneIdAccessor;
 
-export function setFocusedPaneId(paneId: string) {
+export function setFocusedPaneId(paneId: string, rememberLayout = true) {
   // Every focus route, including history/session adapters, must reveal the pane
   // it focuses. Keeping this at the state boundary prevents a hidden pane from
   // becoming the logical target while another pane remains maximized.
@@ -93,6 +98,9 @@ export function setFocusedPaneId(paneId: string) {
     setCellSel(null);
   }
   writeFocusedPaneId(paneId);
+  if (rememberLayout && layoutPaneIds().includes(paneId)) {
+    writeLastFocusedLayoutPaneId(paneId);
+  }
 }
 
 const routers = new Map<string, PaneRouter>([["main", mainPaneRouter]]);
@@ -352,9 +360,13 @@ export function closePane(paneId = focusedPaneId()): boolean {
   return true;
 }
 
-export function focusPane(paneId: string) {
-  if (!layoutPaneIds().includes(paneId) || focusedPaneId() === paneId) return;
-  setFocusedPaneId(paneId);
+export function focusPane(paneId: string, rememberLayout = true) {
+  if (!layoutPaneIds().includes(paneId)) return;
+  if (focusedPaneId() === paneId) {
+    if (rememberLayout) writeLastFocusedLayoutPaneId(paneId);
+    return;
+  }
+  setFocusedPaneId(paneId, rememberLayout);
   paneRouter(paneId).activateCurrentRoute();
 }
 
@@ -518,8 +530,7 @@ export function adjustPaneSize(paneId: string, axis: "width" | "height", grow: b
 }
 
 export function openRouteInOtherPane(route: Route, sourcePaneId = focusedPaneId()): string | null {
-  const ids = layoutPaneIds();
-  let target = nearestPane(layoutRoot(), sourcePaneId) ?? ids.find((id) => id !== sourcePaneId) ?? null;
+  let target = companionPane(layoutRoot(), sourcePaneId);
   const created = !target;
   if (!target) target = splitPane(sourcePaneId, "row", { focusNew: false });
   if (!target) return null;
@@ -531,6 +542,7 @@ export function openRouteInOtherPane(route: Route, sourcePaneId = focusedPaneId(
     // would leave a stray duplicate tab beside the target.
     if (route.kind === "journals") router.openJournals();
     else if (route.kind === "query") router.replaceActiveRoute(route);
+    else if (route.kind === "pdf" || route.kind === "invalid") router.replaceActiveRoute(route);
     else if (route.block) router.openPageAtBlock(route.name, route.pageKind, route.block, route.path);
     else if (route.path) router.openFile(route.path, route.name, route.pageKind);
     else router.openPage(route.name, route.pageKind);
@@ -539,6 +551,114 @@ export function openRouteInOtherPane(route: Route, sourcePaneId = focusedPaneId(
   }
   setFocusedPaneId(sourcePaneId);
   return target;
+}
+
+function pdfTab(filename: string): { paneId: string; tabId: string; route: PdfRoute } | null {
+  for (const paneId of layoutPaneIds()) {
+    for (const tab of paneRouter(paneId).tabs()) {
+      const route = tabRoute(tab);
+      if (route.kind === "pdf" && route.filename === filename) return { paneId, tabId: tab.id, route };
+    }
+  }
+  return null;
+}
+
+export interface OpenPdfOptions {
+  sourcePaneId?: string;
+  inPlace?: boolean;
+  background?: boolean;
+  anotherView?: boolean;
+}
+
+/** Open a graph PDF as an ordinary route. Desktop preserves the source in a
+ * reusable companion pane; mobile uses the current route history so hardware
+ * Back returns to the link. Deliberate duplicates are a separate operation and
+ * remain disabled until shared annotation mutation ownership lands. */
+export function openPdf(
+  filename: string,
+  label: string,
+  page?: number,
+  highlightId?: string,
+  options: OpenPdfOptions = {},
+): PdfRoute | null {
+  const sourcePaneId = options.sourcePaneId && layoutPaneIds().includes(options.sourcePaneId)
+    ? options.sourcePaneId
+    : focusedPaneId();
+  const existing = options.anotherView ? null : pdfTab(filename);
+  if (existing) {
+    const router = paneRouter(existing.paneId);
+    router.setActiveTab(existing.tabId);
+    if (page !== undefined) router.updateActivePdfViewState({ page });
+    publishPdfNavigationIntent(existing.route.viewId, { page, highlightId });
+    if (!options.background) focusPane(existing.paneId);
+    return existing.route;
+  }
+
+  // Do not expose editable duplicate views until the shared annotation session
+  // and committed-merge backend reply exist.
+  if (options.anotherView) return null;
+
+  const route = makePdfRoute(filename, label, { page });
+  publishPdfNavigationIntent(route.viewId, { page, highlightId });
+  if (isMobilePlatform || options.inPlace) {
+    paneRouter(sourcePaneId).openPdf(route);
+    return route;
+  }
+
+  const companion = companionPane(layoutRoot(), sourcePaneId);
+  if (companion) {
+    paneRouter(companion).openInNewTab(route, !options.background);
+    if (!options.background) focusPane(companion);
+    else setFocusedPaneId(sourcePaneId);
+    return route;
+  }
+
+  const created = splitPane(sourcePaneId, "row", {
+    focusNew: !options.background,
+    snapshot: {
+      tabs: [{ history: [route], pos: 0, pinned: false }],
+      activeIndex: 0,
+      scrolls: [null],
+    },
+  });
+  if (!created) return null;
+  if (options.background) setFocusedPaneId(sourcePaneId);
+  return route;
+}
+
+export function openPdfNotes(
+  sourcePaneId: string,
+  notesPage: string,
+  block?: string,
+): string | null {
+  if (isMobilePlatform) {
+    const router = paneRouter(sourcePaneId);
+    if (block) router.openPageAtBlock(notesPage, "page", block);
+    else router.openPage(notesPage, "page");
+    return sourcePaneId;
+  }
+
+  const targetPaneId = companionPane(layoutRoot(), sourcePaneId);
+  if (targetPaneId) {
+    const router = paneRouter(targetPaneId);
+    const existing = router.tabs().find((tab) => {
+      const route = tabRoute(tab);
+      return route.kind === "page" && route.name === notesPage && route.pageKind === "page";
+    });
+    if (existing) {
+      router.setActiveTab(existing.id);
+      if (block) router.openPageAtBlock(notesPage, "page", block);
+      setFocusedPaneId(sourcePaneId);
+      return targetPaneId;
+    }
+  }
+
+  return openRouteInOtherPane({
+    kind: "page",
+    name: notesPage,
+    pageKind: "page",
+    ...(block ? { block } : {}),
+  }, sourcePaneId);
 }
 
 export function resetPaneLayoutToSingle(snapshot?: PaneSnapshot) {

@@ -7,7 +7,7 @@ export const REQUIRED_FULL_CI_JOBS = Object.freeze([
   "Full CI / Linux tine-core nextest shard 4/4",
   "Full CI / Windows core compile + integration smoke",
   "Full CI / Android core compile",
-  "Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen",
+  "Android runtime / managed activation, share, join, reopen, and Return to Direct Files",
   "Full CI / performance A/B",
 ]);
 

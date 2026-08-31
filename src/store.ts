@@ -327,6 +327,22 @@ function bumpCollapseEpochs(ids: readonly string[]) {
   }));
 }
 let managedMoveQueue: Promise<void> = Promise.resolve();
+let managedMoveQueueEpoch = 0;
+let managedMoveQueuePending = 0;
+const MANAGED_MOVE_QUEUE_LIMIT = 256;
+type ManagedMoveAcknowledgement = {
+  epoch: number;
+  graphBinding: number;
+  bindingGeneration: number;
+  episodeId: string;
+  batchId: string;
+  attempt: number;
+};
+const managedMoveAcknowledgements: ManagedMoveAcknowledgement[] = [];
+let managedMoveAcknowledgementEpoch = 0;
+let managedMoveAcknowledgementRunnerEpoch: number | null = null;
+const MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT = 256;
+const MANAGED_MOVE_ACKNOWLEDGEMENT_ATTEMPTS = 3;
 let managedHistoryReplayRunning = false;
 let managedHistoryReplayEpoch = 0;
 const managedHistoryCommands: Array<"undo" | "redo"> = [];
@@ -1343,6 +1359,11 @@ export function resetStore() {
   clearAllEditorActivations();
   clearAllEditorLeases();
   setManagedMoveBusyPages(new Set<string>());
+  managedMoveQueueEpoch++;
+  managedMoveQueue = Promise.resolve();
+  managedMoveQueuePending = 0;
+  managedMoveAcknowledgementEpoch++;
+  managedMoveAcknowledgements.length = 0;
   setVisibleMutationBusyPages(new Set<string>());
   setCollapseEpochState("byId", {});
   managedHistoryReplayEpoch++;
@@ -6619,6 +6640,14 @@ async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Prom
       { ...result.outcome.destination.page, rev: result.outcome.destination.revision },
     );
     if (intent.history) pushManagedMoveHistory(intent.history);
+    // Replay-evidence retirement has its own bounded, graph-bound retry lane.
+    // The next physical move does not wait for those cleanup barriers after
+    // both authoritative page DTOs have already been installed.
+    enqueueManagedMoveAcknowledgement(
+      result.binding_generation,
+      result.outcome.episode_id,
+      result.outcome.batch_id,
+    );
     return true;
   } catch (error) {
     pushToast(`Couldn't move blocks. (${String(error)})`, "error");
@@ -6631,24 +6660,24 @@ async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Prom
   }
 }
 
-function enqueueManagedCrossPageMove(
+function prepareManagedCrossPageMoveIntent(
   sourcePage: string,
   destinationPage: string,
   roots: readonly string[],
   placement: ManagedApplicationMovePlacement,
   rewrites: Map<string, string>,
   recordHistory = true,
-): Promise<boolean> {
+): ManagedCrossPageMoveIntent | null {
   const admission = managedMoveAdmission();
   const sourceInstance = pageInstanceGeneration(sourcePage);
   const destinationInstance = pageInstanceGeneration(destinationPage);
-  if (!admission || sourceInstance === null || destinationInstance === null) return Promise.resolve(false);
+  if (!admission || sourceInstance === null || destinationInstance === null) return null;
   const nodes = roots.map((id) => doc.byId[id]);
-  if (nodes.some((node) => !node || node.page !== sourcePage)) return Promise.resolve(false);
+  if (nodes.some((node) => !node || node.page !== sourcePage)) return null;
   const originalParent = nodes[0].parent;
   if (nodes.some((node) => node.parent !== originalParent)) {
     pushToast("Managed multi-block moves require the selected roots to share one parent.", "error");
-    return Promise.resolve(false);
+    return null;
   }
   const originalSiblings = originalParent === null
     ? pageByName(sourcePage)?.roots
@@ -6658,7 +6687,7 @@ function enqueueManagedCrossPageMove(
     || originalPositions.some((position) => position < 0)
     || originalPositions.some((position, index) => index > 0 && position !== originalPositions[index - 1] + 1)) {
     pushToast("Managed multi-block moves require one contiguous selection.", "error");
-    return Promise.resolve(false);
+    return null;
   }
   const history: ManagedMoveHistorySpec | null = recordHistory ? {
     sourcePage,
@@ -6675,7 +6704,7 @@ function enqueueManagedCrossPageMove(
         .map((id) => [id, doc.byId[id].raw]),
     ),
   } : null;
-  const intent: ManagedCrossPageMoveIntent = {
+  return {
     sourcePage,
     destinationPage,
     roots: [...roots],
@@ -6700,9 +6729,116 @@ function enqueueManagedCrossPageMove(
       return node && roots.includes(node.id) ? context : null;
     })(),
   };
-  const result = managedMoveQueue.then(() => runManagedCrossPageMove(intent));
+}
+
+function enqueueManagedMove<T>(run: () => Promise<T>, stale: T): Promise<T> {
+  const epoch = managedMoveQueueEpoch;
+  const binding = graphBinding();
+  if (managedMoveQueuePending >= MANAGED_MOVE_QUEUE_LIMIT
+    || managedMoveAcknowledgements.length >= MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT) {
+    return Promise.resolve(stale);
+  }
+  managedMoveQueuePending++;
+  const result = managedMoveQueue.then(async () => {
+    if (epoch !== managedMoveQueueEpoch || binding !== graphBinding()) return stale;
+    return run();
+  }).finally(() => {
+    if (epoch === managedMoveQueueEpoch) {
+      managedMoveQueuePending = Math.max(0, managedMoveQueuePending - 1);
+    }
+  });
   managedMoveQueue = result.then(() => undefined, () => undefined);
   return result;
+}
+
+function removeManagedMoveAcknowledgement(item: ManagedMoveAcknowledgement): void {
+  const index = managedMoveAcknowledgements.indexOf(item);
+  if (index >= 0) managedMoveAcknowledgements.splice(index, 1);
+}
+
+function managedMoveAcknowledgementDelay(attempt: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 50 * (2 ** Math.max(0, attempt - 1))));
+}
+
+async function drainManagedMoveAcknowledgements(): Promise<void> {
+  const runnerEpoch = managedMoveAcknowledgementEpoch;
+  if (managedMoveAcknowledgementRunnerEpoch === runnerEpoch) return;
+  managedMoveAcknowledgementRunnerEpoch = runnerEpoch;
+  try {
+    while (runnerEpoch === managedMoveAcknowledgementEpoch
+      && managedMoveAcknowledgements.length > 0) {
+      const item = managedMoveAcknowledgements[0];
+      if (item.epoch !== managedMoveAcknowledgementEpoch
+        || item.graphBinding !== graphBinding()
+        || item.bindingGeneration !== managedMoveAdmission()?.binding_generation) {
+        removeManagedMoveAcknowledgement(item);
+        continue;
+      }
+      try {
+        await backend().acknowledgeManagedApplicationMove(
+          item.bindingGeneration,
+          item.episodeId,
+          item.batchId,
+        );
+        removeManagedMoveAcknowledgement(item);
+      } catch (error) {
+        item.attempt++;
+        if (item.attempt >= MANAGED_MOVE_ACKNOWLEDGEMENT_ATTEMPTS) {
+          removeManagedMoveAcknowledgement(item);
+          // The move is already authoritative. Without a durable native ack,
+          // its pair deliberately remains exact crash-response evidence; do
+          // not turn cleanup failure into a false move failure or retry the
+          // semantic transaction.
+          console.warn("Could not retire managed move replay evidence", error);
+          continue;
+        }
+        await managedMoveAcknowledgementDelay(item.attempt);
+      }
+    }
+  } finally {
+    if (managedMoveAcknowledgementRunnerEpoch === runnerEpoch) {
+      managedMoveAcknowledgementRunnerEpoch = null;
+      if (managedMoveAcknowledgements.length > 0) void drainManagedMoveAcknowledgements();
+    }
+  }
+}
+
+function enqueueManagedMoveAcknowledgement(
+  bindingGeneration: number,
+  episodeId: string,
+  batchId: string,
+): void {
+  if (managedMoveAcknowledgements.some((item) => item.episodeId === episodeId)) return;
+  if (managedMoveAcknowledgements.length >= MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT) return;
+  managedMoveAcknowledgements.push({
+    epoch: managedMoveAcknowledgementEpoch,
+    graphBinding: graphBinding(),
+    bindingGeneration,
+    episodeId,
+    batchId,
+    attempt: 0,
+  });
+  void drainManagedMoveAcknowledgements();
+}
+
+function enqueueManagedCrossPageMove(
+  sourcePage: string,
+  destinationPage: string,
+  roots: readonly string[],
+  placement: ManagedApplicationMovePlacement,
+  rewrites: Map<string, string>,
+  recordHistory = true,
+): Promise<boolean> {
+  const intent = prepareManagedCrossPageMoveIntent(
+    sourcePage,
+    destinationPage,
+    roots,
+    placement,
+    rewrites,
+    recordHistory,
+  );
+  if (!intent) return Promise.resolve(false);
+  return enqueueManagedMove(() => runManagedCrossPageMove(intent), false);
 }
 
 /** Before a cross-page move mutates memory, durably flush every SOURCE page while
@@ -6761,7 +6897,7 @@ export async function extendFeedForScroll(): Promise<boolean> {
 
 /** Move a single block one slot, crossing into the adjacent day at a page
  *  boundary. Returns how it moved so the caller can restore the caret. */
-export async function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
+async function moveBlockFeedNow(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
   const node = doc.byId[id];
   if (!node || !blockWritable(id)) return "none";
   if (canMoveItem(id, dir)) {
@@ -6778,19 +6914,31 @@ export async function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" |
   }
   if (admission.authority === "managed_writable") {
     const position = dir === -1 ? pageByName(target)!.roots.length : 0;
-    return (await enqueueManagedCrossPageMove(
+    const intent = prepareManagedCrossPageMoveIntent(
       node.page,
       target,
       [id],
       { placement: "root", position },
       new Map(),
-    )) ? "crossed" : "none";
+    );
+    return intent && await runManagedCrossPageMove(intent) ? "crossed" : "none";
   }
   if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
   if (!doc.byId[id]) return "none"; // vanished during the flush
   pushUndo("move-cross", [node.page, target]);
   crossMoveBlocks([id], node.page, target, dir);
   return "crossed";
+}
+
+/** Managed commands are queued before resolving their source/destination. Key
+ * repeat can otherwise capture several intents against the same pre-move page;
+ * the first commits and every later intent becomes stale (or reaches the actor
+ * as a missing/foreign root). Re-evaluating each command after its predecessor
+ * publishes preserves the user's complete rapid movement sequence. */
+export function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
+  return managedMoveAdmission()
+    ? enqueueManagedMove(() => moveBlockFeedNow(id, dir), "none")
+    : moveBlockFeedNow(id, dir);
 }
 
 /** Move every top-level selected block up/down by one slot, preserving the

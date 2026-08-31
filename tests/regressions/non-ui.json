@@ -3292,11 +3292,12 @@
   },
   {
    "id": "REG-MANAGED-ACTIVATION-LATENCY-292",
-   "title": "Managed activation avoids graph-sized intermediate operation I/O and stays within the representative Linux and Windows latency gates",
+   "title": "Managed activation, reopen, and page switching remain responsive at reporter scale",
    "family": "managed-storage-activation",
    "sources": {
     "issues": [
-     292
+     292,
+     396
     ],
     "commits": []
    },
@@ -3305,8 +3306,8 @@
     "linux",
     "android"
    ],
-   "layer": "core-native",
-   "status": "fixing",
+   "layer": "core-native-and-real-app",
+   "status": "reproduced",
    "coverage": {
     "tests": [
      "crates/tine-core/src/oplog/import.rs::in_memory_and_spilled_bootstrap_builders_publish_identical_canonical_state",
@@ -3314,7 +3315,7 @@
      "scripts/e2e-windows-managed-storage.mjs"
     ]
    },
-   "notes": "The reporter-scale hosted Windows baseline reached 427 seconds: 314 seconds in bootstrap preparation, including 302 seconds of detached authoring, before the intentionally non-roundtripping page produced its expected semantic refusal. The equivalent 13k-page Linux baseline was about 91 seconds. The approved redesign first reduced successful activation to one live capture plus one final live proof; this packet makes semantic lowering size-adaptive so ordinary graphs retain canonical encoded operations under a measured 128 MiB budget and never write or reread the operation spool, while oversized graphs retain the deterministic bounded spill route. Forced-route differential coverage requires byte-identical aggregate and commit output. Status remains fixing until the 13k Linux gate and same hosted Windows receipt are measured on the exact candidate, followed by the remaining terminal-materialization redesign."
+   "notes": "The original reporter-scale hosted Windows baseline reached 427 seconds: 314 seconds in bootstrap preparation, including 302 seconds of detached authoring, before the intentionally non-roundtripping page produced its expected semantic refusal. The equivalent 13k-page Linux baseline was about 91 seconds. The completed activation redesign reduced successful activation to one live capture plus one final live proof, uses size-adaptive semantic lowering to avoid ordinary graph-sized operation spools, publishes the terminal materialization directly, opens the disposable SQLite projection without replaying accepted history, and keeps page queries bounded. The manual 12k receipt records activation, cold actor open, initial-feed settle, total ready time, and paired Direct Files/Managed Storage logical page-open distributions. Hosted Windows run 33349270671 measured exact-candidate activation at 99.36 seconds but then exposed a separate synthetic 119,990-backlink actor stall; run 33350869828 stopped earlier on an exact-page switcher selector defect. The selector and fixture are corrected, but the two-attempt E2E stop-loss is exhausted and the journey is quarantined pending a fresh unchanged-binary Windows burn-in. The current-only journey still binds the activation executable to the exact candidate by canonical path and SHA-256, force-closes and reopens it, alternates repeated real UI page switches between ordinary and nested Unicode pages in both storage modes, records timing summary statistics, and proves byte-exact return to Direct Files when it completes. Windows responsiveness therefore remains reproduced but not yet covered."
   },
   {
    "id": "REG-MANAGED-LARGE-PAGE-ADMISSION-311",
@@ -4043,8 +4044,8 @@
    "notes": "GH #254 increment 3, contract rule 2. ensurePageLoaded replaced the loaded instance whenever the requested path differed from the incumbent's, with no check that the incumbent held unsaved work. Reproduced: the incumbent's nodes are purged, the dirty mark SURVIVES and now belongs to the replacement's content, and a live conflict banner survives describing a file the editor no longer holds. The gate is the existing reloadDisposition predicate AND an empty editor-lease set - enumerating dirty/conflicted/saving kept losing, because IME composition holds text in the textarea until compositionend and the page-title rename holds its draft in component-local signals, so neither is visible to any store predicate. A component holding uncommitted input now declares itself with a lease keyed by a unique per-component handle, released idempotently from the component lifecycle rather than only from commit/cancel - a lease that outlives its component would refuse every later replacement forever. The gate is re-evaluated synchronously at the final replacement boundary because every caller awaits a backend read first and the incumbent can become dirty during that await. Necessity: both behavioural tests fail against the pre-fix code; the lease-hygiene and clean-replacement cases pass both ways by design and are not regression guards for the refusal itself."
   },
   {
-   "id": "REG-SYNC-ENROLLMENT-CHECKPOINT-INTEGRITY-MIGRATION-001",
-   "title": "Enrollment opens byte-exact v1/v5 histories, then lazily appends and audits canonical keyless v6/v3 integrity checkpoints",
+   "id": "REG-SYNC-ENROLLMENT-CHECKPOINT-INTEGRITY-CURRENT-001",
+   "title": "Enrollment accepts one canonical keyless current format and fails closed on altered integrity evidence",
    "family": "sync-data-safety",
    "sources": {
     "issues": [],
@@ -4058,17 +4059,16 @@
    "coverage": {
     "tests": [
      "crates/tine-core/src/oplog/enrollment.rs::current_enrollment_claim_record_and_checkpoint_are_keyless_canonical_crc_v2_v6_v3",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_reopens_byte_exactly_then_lazily_appends_v6_without_rewriting_authority",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_mixed_suffix_opens_at_every_boundary_and_full_audit_pages_verify_both_codecs",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_initial_publication_resumes_every_durable_cross_version_cut",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_initial_recovery_rejects_wrong_names_and_invalid_hmac_without_cleanup",
-     "crates/tine-core/src/oplog/enrollment.rs::frozen_legacy_v1_v5_codec_golden_digests_remain_exact",
-     "crates/tine-core/src/oplog/enrollment.rs::enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_wire_scenarios"
+     "crates/tine-core/src/oplog/enrollment.rs::unknown_tampered_future_and_noncanonical_records_fail_closed",
+     "crates/tine-core/src/oplog/enrollment.rs::crash_cuts_leave_old_or_new_valid_head",
+     "crates/tine-core/src/oplog/enrollment.rs::forged_checkpoint_immediately_at_open_boundary_fails_authentication",
+     "crates/tine-core/src/oplog/enrollment.rs::audit_limit_sixty_four_validates_the_transition_across_page_boundary",
+     "crates/tine-core/src/oplog/enrollment.rs::enrollment_has_one_current_schema_and_no_legacy_authenticator"
     ],
-    "scenario": "sync.enrollment-keyless-integrity-with-frozen-legacy-suffix",
+    "scenario": "sync.enrollment-keyless-current-integrity",
     "failBefore": "source-proven"
    },
-   "notes": "Fresh schema-v2 authority claims omit secret material and schema-v6 records use schema-v3 CRC-32/ISO-HDLC checkpoints. The permanent mixed-history fixture constructs exact v1 authority/v5 HMAC bytes using a test-only legacy signer, proves their bytes and OS identity survive reopen, opens every mixed-chain suffix boundary, appends current v6 records without rewriting the claim, and pages a complete audit across both codecs. A cross-version publication matrix additionally resumes byte-exact legacy generation-one state from a full record temp, linked final/temp pair, final record plus HEAD temp, and committed HEAD; the first successor is v6, while fresh v2 authority remains v6-only. Wrong names, ambiguity, invalid legacy HMAC, structural mismatch, noncanonical encodings, illegal record/checkpoint pairs, and altered CRCs refuse before lifecycle admission without cleanup. Frozen v1/v5 golden digests and explicit read-only discovery classification keep the verifier byte-exact. A source guard permits production HMAC only in the frozen verifier module and permits signing only under cfg(test). Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "Pre-0.7 policy has no enrollment migration or compatibility route: unrecognized private state is preserved, Direct Files opens, and current managed state is rebuilt from Markdown/Org. Current authority claims omit secret material; current records use canonical CRC integrity checkpoints. Unknown, old, future, altered, and noncanonical records refuse before lifecycle admission. Crash-cut tests prove old-or-new valid authority, page-boundary audit tests authenticate the current chain, and the source guard proves no legacy schema or authenticator remains. The six stale legacy-migration test references were removed during MS-16 structural closure rather than reintroducing the retired compatibility contract."
   },
   {
    "id": "REG-MANAGED-RETAINED-SCRATCH-OPEN-RECOVERY-001",
@@ -5498,6 +5498,142 @@
     "failBefore": "The sparse-overlay fixture was falsely diagnosed as corrupt because physical frontier rows were compared with total baseline-plus-overlay document count. The save/move counter observed two reconstruct_frontier calls during one ordinary local save because SQLite rematerialized the just-validated accepted event from immutable history. Independent review found that caching an original author draft after concurrent same-page reconciliation could bind stale page contents to the merged accepted root, including when a moved block retained a foreign immutable home outside the transaction's changed documents; the regression reproduced local winner plus remote base where immutable materialization contained local winner plus remote winner."
    },
    "notes": "MS-14 R0 isolates two independently releasable V1 corrections before any durable checkpoint format work. Full integrity now starts history validation from the authenticated lazy-genesis baseline and authenticates the sparse physical overlay at its actual row count, without weakening ordinary full-frontier equality. A one-batch, root-keyed local-author cache lets SQLite consume a retained page only when its complete projection frontier exactly matches the accepted root, including catalog, membership shard, and every borrowed immutable home; absent outcomes, concurrent reconciliation, restart, another batch/root, or any miss still use immutable history. The permanent counter pins zero reconstruct_frontier calls for ordinary save and cross-page move. The ignored fixed-20-page release harness measures both tail save latency and unsafe-reopen history growth with content-free open-stage attribution."
+  },
+  {
+   "id": "REG-MANAGED-SAVE-AFTER-HOT-DOCUMENT-EVICTION-20260830",
+   "title": "A managed page remains editable after unrelated pages evict its hot document",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::clean_foreground_page_can_be_saved_again_after_hot_document_eviction"
+    ],
+    "failBefore": "On the exact MS-15 base, 64 distinct page saves succeeded, but after the 65th page displaced the first document from the bounded hot set, a second save of the first page was refused during trusted-local predecessor capture because its manifested projection no longer matched the history-materialized deterministic rendering. The same second save passed when only 64 pages were involved."
+   },
+   "notes": "Discovered by the MS-15 anonymized-corpus recovery benchmark, then reduced to a content-independent 65-page synthetic fixture. The bounded cache had evicted both a CRDT document and its run-local head entry; the cold path mistook that cache miss for an untouched lazy-genesis document and omitted the accepted edit. A no-scratch clean runtime now recovers missing hot heads from its authoritative accepted frontier and reconstructs the exact accepted document tail. Projection and reconciliation checks remain unchanged. The corpus benchmark also excludes first-block replacements that would delete an externally imported id:: property: that is an intentional identity refusal, not a representative content edit."
+  },
+  {
+   "id": "REG-MANAGED-MS16-CURRENT-ACTOR-ONLY",
+   "title": "Production managed storage retains only the current clean actor and enrollment state",
+   "family": "managed-storage-architecture",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "scripts/check-retired-managed-v1.mjs"
+    ],
+    "scenario": "managed-storage.ms16-current-actor-only",
+    "failBefore": "On the exact MS-16 base b39ad92c, sync_runtime.rs still compiled PendingLocalMutation, PendingSharedJoin, SharedJoinProviderPass, ProviderDependencyIndex, legacy_binding, and provider_recovery_coverage_root into the production actor even though the one current clean constructor never populated them."
+   },
+   "notes": "MS-16 compiler-guided oracle extraction. The dead local-mutation slot, cursor-based shared join state, legacy provider dependency indexes, and write-only legacy actor fields were removed rather than preserved as a second runtime. The retired-managed-v1 source guard scans the production prefix of sync_runtime.rs and fails if the named residue returns. Test-only fixtures and the explicitly enumerated known-red Patricia/bootstrap corpus remain owned by final packet MS-14b."
+  },
+  {
+   "id": "REG-MANAGED-MS16-JOIN-DUPLICATE-PATH-AUTHORITY",
+   "title": "A second device can join when a synchronized duplicate-name file sorts before the shared page owner",
+   "family": "managed-storage-share-and-join",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all",
+    "android"
+   ],
+   "layer": "rust-core-storage-and-android-app-uid",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::duplicate_path_join_exception_is_fresh_activation_only_and_fails_closed",
+     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph",
+     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem",
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/ManagedStorageSmokeTest.kt::activationEditCrashReopenShareJoinPeerReopenAndReturnWorkAsTheAppUidOnSharedStorage"
+    ],
+    "scenario": "managed-storage.ms16-duplicate-path-join-authority",
+    "failBefore": "The new MS-16 second-device leg copied the initiator's complete graph tree after share preparation. The initiator retained pages/Denní poznámky.md as the page owner and left the later archiv/2026 backup unowned; fresh joiner activation selected the earlier-sorting backup and refused the identical synchronized graph as local-only=1/shared-only=1."
+   },
+   "notes": "Join keeps fail-closed semantic comparison. It admits the duplicate-path case only for an otherwise untouched fresh activation, when the shared frontier's exact selected file is still present and parses to exactly the shared kind, preamble, outline, and externally imported ids, while the fresh local selection decodes to the same logical page identity. Policy-generated anchor ids are representation metadata and may be visible only in the disk parse. It never rewrites or deletes the duplicate. The focused unit test pins refusal after a local accepted edit, changed/absent provider-selected bytes, and the original semantic-diff diagnostic; the shared host/Android journey pins both duplicate files byte-for-byte and the exact owner path. The one Android app-UID journey proves activation, application save, crash-style reopen, external reconciliation, share, a distinct-device join and reopen, then Tauri's production graceful Return-to-Direct-Files composition."
+  },
+  {
+   "id": "REG-MANAGED-MOVE-EPISODE-ACK-001",
+   "title": "Accepted cross-page moves retire their private response-replay evidence after the frontend installs the authoritative page pair",
+   "family": "managed-storage-resource-lifecycle",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final performance audit"},
+   "platforms": ["all"],
+   "layer": "frontend-native-actor",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::acknowledged_cross_page_move_retires_only_response_replay_evidence",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_open_bounded_cleanup_retires_a_pre_ack_orphan_completion",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_acknowledgement_cleanup_tolerates_stale_directory_entries",
+     "crates/tine-core/src/sync_runtime.rs::tests::live_acknowledgement_queue_saturation_drains_before_marker_publication",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_move_cleanup_cursor_stays_runnable_and_bounded_across_turns",
+     "src-tauri/src/commands.rs::managed_actor_command_boundary_tests::move_acknowledgement_wakes_actor_cleanup_after_every_attempt",
+     "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result",
+     "src/store.test.ts::retries replay-evidence acknowledgement outside the serialized move lane",
+     "src/store.test.ts::retires queued rapid moves when the graph binding changes",
+     "src/store.test.ts::starts a new graph acknowledgement lane while the old graph acknowledgement is stalled",
+     "src/store.test.ts::bounds a sustained rapid-move backlog while one actor command is pending"
+    ],
+    "scenario": "managed.move-episode-ack-bounds-private-response-evidence",
+    "failBefore": "proven by complete production-source census: every cross-page move published episode-<uuid>.bin and .complete and no path retired either file"
+   },
+   "notes": "The acknowledgement is accepted only for one canonical workspace/lineage/episode/batch record with the exact completion bytes and an accepted or still-visible semantic batch. Before either response sidecar is removed, the actor durably publishes an exact cleanup authorization; bounded actor turns then retire that marker and any interrupted sidecars, including legacy orphan completions. Cleanup uses a retained, explicitly runnable directory cursor rather than repeated full enumeration, tolerates entries buffered before an authorized unlink, and makes bounded room before publishing a 257th live marker. The frontend acknowledges on a bounded graph-bound retry lane outside the serialized semantic move queue, and every native attempt wakes actor cleanup. Graph reset installs fresh semantic and acknowledgement lanes, so a stalled old graph cannot hold the new graph. A complete pair without a durable acknowledgement remains exact response-replay evidence after a crash; it is not safe to infer response delivery merely from batch acceptance. Failure to acknowledge does not turn a successful move into a false user-visible failure."
+  },
+  {
+   "id": "REG-DIRECT-FILES-WINDOWS-DURABLE-NAME-PUBLICATION-001",
+   "title": "A successful Direct Files save durably publishes the sole-authority Markdown or Org name on Windows",
+   "family": "direct-files-data-safety",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
+   "platforms": ["windows", "linux", "macos", "android"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::tests::direct_files_name_publication_stays_on_the_typed_durable_boundary",
+     "crates/tine-core/src/model.rs::tests::a_same_bytes_external_replace_does_not_strand_the_editor",
+     "crates/tine-core/src/model.rs::tests::a_changed_bytes_external_replace_still_conflicts",
+     "crates/tine-core/src/model.rs::tests::checked_open_retries_editor_retired_cleanup_without_restoring_it",
+     "crates/tine-core/src/model.rs::tests::editor_retired_cleanup_is_never_document_authority"
+    ],
+    "scenario": "direct-files.windows-write-through-create-replace-retire-restore",
+    "failBefore": "proven from the literal Windows path: Direct Files used raw NtSetInformationFile name changes and the following directory sync was a successful no-op"
+   },
+   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.2 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed. A post-publication .editor-retired entry is cleanup-only, never document authority; the bounded checked-open walk retries an interrupted or failed unlink without restoring its displaced bytes."
+  },
+  {
+   "id": "REG-STORAGE-MODE-SELECTOR-DURABILITY-001",
+   "title": "A reported storage-mode switch cannot resurrect the previously retired selector after a crash",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
+   "platforms": ["all", "windows", "android"],
+   "layer": "tauri-native-and-rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/sync_runtime.rs::tests::storage_mode_selectors_use_typed_durable_private_authority_publication",
+     "src-tauri/src/sync_runtime.rs::tests::managed_activation_durably_retires_the_direct_selector_name",
+     "src-tauri/src/sync_runtime.rs::tests::candidate_publication_crash_cuts_select_only_direct_or_managed"
+    ],
+    "scenario": "managed-storage.durable-app-private-storage-mode-selector",
+    "failBefore": "The compiler-enforced source guard failed on the MS-19 candidate: managed activation retired the Direct selector with plain remove_file and Android initial binding creation flushed the file but not its parent entry."
+   },
+   "notes": "Both the Direct selector and managed binding now use one app-private sole-writer wrapper over tine-storage DurableDirectoryPublication. Create and exact replace are collision-aware; retirement durably moves exact bytes outside the selector grammar before best-effort cleanup. The change does not route Direct Files through managed history and does not add a Managed Storage format or migration path."
   }
  ]
 }

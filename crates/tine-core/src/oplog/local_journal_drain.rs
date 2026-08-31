@@ -1280,7 +1280,6 @@ pub(crate) fn classify_local_journal_open_error(
         | LocalJournalError::FrameHeaderTooLarge(_)
         | LocalJournalError::SegmentTooLarge(_)
         | LocalJournalError::UnknownFrameSchemaVersion { .. }
-        | LocalJournalError::AmbiguousLegacySuffix { .. }
         | LocalJournalError::Decode(_)
         | LocalJournalError::SequenceExhausted => LocalJournalOpenRefusal::DiskCorrupt(detail),
         LocalJournalError::SegmentAlreadyOpen(_) | LocalJournalError::PreparedArtifactExists(_) => {

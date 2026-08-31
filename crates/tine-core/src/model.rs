@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use tine_storage::{
-    ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, FilesystemError,
+    ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact,
+    DurableDirectoryPublication, FilesystemError,
 };
 use uuid::Uuid;
 
@@ -4068,6 +4069,7 @@ thread_local! {
     static JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static EDITOR_RETIRED_CLEANUP: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EXACT_GRAPH_TEXT_EVENT_AFTER_CANDIDATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
@@ -5039,6 +5041,19 @@ fn managed_write_during_rollback_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
+fn editor_retired_cleanup_hook() -> io::Result<()> {
+    EDITOR_RETIRED_CLEANUP.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn editor_retired_cleanup_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
 fn editor_commit_before_recheck_hook() -> io::Result<()> {
     EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
@@ -5326,13 +5341,16 @@ impl Graph {
     /// target stay untouched because choosing one would discard information.
     fn recover_interrupted_editor_publications(&self) -> io::Result<RecoverySummary> {
         let write = self.admit_managed_text_writer()?;
-        let claims = self.editor_publication_recovery_claims(&write)?;
+        let (claims, cleaned_retired) = self.editor_publication_recovery_claims(&write)?;
         let mut by_target = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
         for (artifact, target) in claims {
             by_target.entry(target).or_default().push(artifact);
         }
 
-        let mut summary = RecoverySummary::default();
+        let mut summary = RecoverySummary {
+            reconciled: cleaned_retired,
+            ..RecoverySummary::default()
+        };
         for (target, artifacts) in by_target {
             let target_present = self.managed_exists(&write, &target)?;
             if !target_present {
@@ -5397,7 +5415,7 @@ impl Graph {
     fn editor_publication_recovery_claims(
         &self,
         permit: &ManagedTextWritePermit,
-    ) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    ) -> io::Result<(Vec<(PathBuf, PathBuf)>, usize)> {
         struct PendingDirectory {
             directory: Dir,
             relative: String,
@@ -5411,6 +5429,7 @@ impl Graph {
             depth: 0,
         }];
         let mut claims = Vec::new();
+        let mut cleaned_retired = 0_usize;
         let mut all_entries = 0_usize;
         let mut directories = 1_usize;
         let mut path_bytes = 0_u64;
@@ -5476,6 +5495,30 @@ impl Graph {
                 if !file_type.is_file() {
                     continue;
                 }
+                if let Some(target_name) = editor_retired_target_name(&name) {
+                    let target_relative = if relative.is_empty() {
+                        target_name.to_owned()
+                    } else {
+                        format!("{relative}/{target_name}")
+                    };
+                    if !self.graph_text_scope.is_eligible(&target_relative) {
+                        continue;
+                    }
+                    // `.editor-retired` is a durable cleanup-only state emitted
+                    // after the replacement is already live and validated. It
+                    // is never a publication claimant and can never restore a
+                    // document. A failed unlink aborts checked open, leaves the
+                    // exact entry intact, and is retried on the next open.
+                    editor_retired_cleanup_hook()?;
+                    match directory.remove_file(&name) {
+                        Ok(()) => {
+                            cleaned_retired = cleaned_retired.saturating_add(1);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    continue;
+                }
                 let Some(target_name) = editor_recovery_target_name(&name) else {
                     continue;
                 };
@@ -5493,7 +5536,7 @@ impl Graph {
                 ));
             }
         }
-        Ok(claims)
+        Ok((claims, cleaned_retired))
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
@@ -9048,6 +9091,8 @@ impl Graph {
         // precedes it. Re-run only the path-local portable/no-follow boundary
         // after the chain exists; the graph-wide census remains singular.
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
+        let publication = DurableDirectoryPublication::open(target.parent())
+            .map_err(managed_trash_filesystem_error)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
         if self.graph_text_external_observation_pending() {
@@ -9070,7 +9115,10 @@ impl Graph {
                 "effective page identity evidence changed before no-replace publication",
             ));
         }
-        if let Err(error) = rename_projection_noreplace(target.parent(), &temp, &target.filename) {
+        if let Err(error) = publication
+            .move_exact_no_replace(&temp, &target.filename, bytes)
+            .map_err(managed_trash_filesystem_error)
+        {
             let _ = target.parent().remove_file(&temp);
             if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
                 return Err(self.observe_editor_conflict(
@@ -9082,7 +9130,6 @@ impl Graph {
             }
             return Err(error);
         }
-        sync_projection_chain_required(&target.chain)?;
         self.finish_tine_owned_graph_text_identity_paths(std::iter::once(path))
     }
 
@@ -9130,6 +9177,24 @@ impl Graph {
         editor_episode: Option<&ConflictEditorEpisode>,
         validation: GraphTextPublicationValidation,
     ) -> io::Result<()> {
+        if !create_new {
+            if validation == GraphTextPublicationValidation::CompleteIndex {
+                let _ = self.guarded_graph_text_identity_index()?;
+            }
+            let expected_identity = self
+                .managed_optional_file_identity(permit, path)?
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            return self.managed_atomic_replace_bound(
+                permit,
+                path,
+                bytes,
+                expected_identity,
+                None,
+                editor_episode,
+                EditorPublicationAuthority::DirectFile,
+                None,
+            );
+        }
         let _identity = self.lock_graph_text_identity_mutation()?;
         // Establish the retained baseline before creating the staged inode. The
         // temp name is deliberately outside the graph-text namespace, but its
@@ -9153,6 +9218,8 @@ impl Graph {
         }
         let target = self.managed_target(permit, path, true)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
+        let publication = DurableDirectoryPublication::open(target.parent())
+            .map_err(managed_trash_filesystem_error)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
         let validation_result = match validation {
@@ -9170,15 +9237,10 @@ impl Graph {
                     &managed_path,
                     create_new,
                 )?;
-                if create_new {
-                    match target.parent().symlink_metadata(&target.filename) {
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                        Err(error) => Err(error),
-                        Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
-                    }
-                } else {
-                    self.validate_existing_graph_text_target_exact(&target, &managed_path, None)
-                        .map(|_| ())
+                match target.parent().symlink_metadata(&target.filename) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                    Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
                 }
             })(),
         };
@@ -9186,19 +9248,12 @@ impl Graph {
             let _ = target.parent().remove_file(&temp);
             return Err(error);
         }
-        let result = if create_new {
-            rename_projection_noreplace(target.parent(), &temp, &target.filename)
-        } else {
-            target
-                .parent()
-                .rename(&temp, target.parent(), &target.filename)
-        };
+        let result = publication
+            .move_exact_no_replace(&temp, &target.filename, bytes)
+            .map_err(managed_trash_filesystem_error);
         if let Err(error) = result {
             let _ = target.parent().remove_file(&temp);
-            if create_new
-                && error.kind() == io::ErrorKind::AlreadyExists
-                && editor_episode.is_some()
-            {
+            if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
                 return Err(self.observe_editor_conflict(
                     permit,
                     path,
@@ -9208,7 +9263,6 @@ impl Graph {
             }
             return Err(error);
         }
-        sync_projection_chain_required(&target.chain)?;
         self.finish_tine_owned_graph_text_identity_paths(std::iter::once(path))
     }
 
@@ -9291,6 +9345,16 @@ impl Graph {
             ),
             None => format!(".{}.{process}.{sequence}.editor-recovery", target.filename,),
         };
+        let retired_cleanup = format!(".{}.{process}.{sequence}.editor-retired", target.filename,);
+        let direct_publication = if publication_authority == EditorPublicationAuthority::DirectFile
+        {
+            Some(
+                DurableDirectoryPublication::open(target.parent())
+                    .map_err(managed_trash_filesystem_error)?,
+            )
+        } else {
+            None
+        };
         let mut retired = false;
         let mut published = false;
         let mut conflict_site = None;
@@ -9322,15 +9386,28 @@ impl Graph {
                 }
                 return Err(error);
             }
-            let rename_noreplace = |from: &str, to: &str| match publication_authority {
-                EditorPublicationAuthority::DirectFile => {
-                    rename_projection_noreplace(target.parent(), from, to)
-                }
-                EditorPublicationAuthority::ReconstructibleManagedProjection => {
-                    rename_reconstructible_projection_noreplace(target.parent(), from, to)
-                }
-            };
-            rename_noreplace(&target.filename, &recovery)?;
+            let rename_noreplace =
+                |from: &str, to: &str, expected: &[u8]| match publication_authority {
+                    EditorPublicationAuthority::DirectFile => direct_publication
+                        .as_ref()
+                        .expect("Direct Files publication was preflighted")
+                        .move_exact_no_replace(from, to, expected)
+                        .map_err(managed_trash_filesystem_error),
+                    EditorPublicationAuthority::ReconstructibleManagedProjection => {
+                        rename_reconstructible_projection_noreplace(target.parent(), from, to)
+                    }
+                };
+            let (live_file, live_bytes) =
+                open_and_read_projection_regular(target.parent(), &target.filename)?;
+            if canonical_projection_file_resource_id(&live_file)? != expected_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "managed text target changed before durable retirement",
+                ));
+            }
+            validate_graph_text_single_link(&live_file, managed_path.as_str())?;
+            drop(live_file);
+            rename_noreplace(&target.filename, &recovery, &live_bytes)?;
             retired = true;
 
             let (retired_file, retired_bytes) =
@@ -9338,9 +9415,6 @@ impl Graph {
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
             validate_graph_text_single_link(&retired_file, managed_path.as_str())?;
             drop(retired_file);
-            if publication_authority == EditorPublicationAuthority::DirectFile {
-                sync_editor_publication_chain(publication_authority, &target.chain)?;
-            }
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
             {
@@ -9363,7 +9437,7 @@ impl Graph {
             validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
             drop(staged_file);
 
-            if let Err(error) = rename_noreplace(&temp, &target.filename) {
+            if let Err(error) = rename_noreplace(&temp, &target.filename, bytes) {
                 if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
                     conflict_site = Some(EditorConflictSite::ReplacePublicationCollision);
                 }
@@ -9371,9 +9445,6 @@ impl Graph {
             }
             published = true;
             journal_projection_after_publish_hook()?;
-            if publication_authority == EditorPublicationAuthority::DirectFile {
-                sync_editor_publication_chain(publication_authority, &target.chain)?;
-            }
             if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
                 &managed_path,
@@ -9389,9 +9460,20 @@ impl Graph {
                 }
                 return Err(error);
             }
-            target.parent().remove_file(&recovery)?;
+            if let Some(publication) = direct_publication.as_ref() {
+                publication
+                    .move_exact_no_replace(&recovery, &retired_cleanup, &retired_bytes)
+                    .map_err(managed_trash_filesystem_error)?;
+                let _ = target.parent().remove_file(&retired_cleanup);
+            } else {
+                target.parent().remove_file(&recovery)?;
+            }
             retired = false;
-            sync_editor_publication_chain(publication_authority, &target.chain)
+            if publication_authority == EditorPublicationAuthority::DirectFile {
+                Ok(())
+            } else {
+                sync_editor_publication_chain(publication_authority, &target.chain)
+            }
         })();
 
         let outcome = match result {
@@ -9413,12 +9495,13 @@ impl Graph {
                             ));
                         }
                         validate_graph_text_single_link(&recovery_file, managed_path.as_str())?;
+                        let recovery_bytes = read_projection_regular(target.parent(), &recovery)?;
                         match publication_authority {
-                            EditorPublicationAuthority::DirectFile => rename_projection_noreplace(
-                                target.parent(),
-                                &recovery,
-                                &target.filename,
-                            ),
+                            EditorPublicationAuthority::DirectFile => direct_publication
+                                .as_ref()
+                                .expect("Direct Files publication was preflighted")
+                                .move_exact_no_replace(&recovery, &target.filename, &recovery_bytes)
+                                .map_err(managed_trash_filesystem_error),
                             EditorPublicationAuthority::ReconstructibleManagedProjection => {
                                 rename_reconstructible_projection_noreplace(
                                     target.parent(),
@@ -9431,9 +9514,15 @@ impl Graph {
                     match restore {
                         Ok(()) => {
                             retired = false;
-                            if let Err(sync_error) =
-                                sync_editor_publication_chain(publication_authority, &target.chain)
+                            let sync_error = if publication_authority
+                                != EditorPublicationAuthority::DirectFile
                             {
+                                sync_editor_publication_chain(publication_authority, &target.chain)
+                                    .err()
+                            } else {
+                                None
+                            };
+                            if let Some(sync_error) = sync_error {
                                 Err(io::Error::new(
                                     primary.kind(),
                                     format!(
@@ -30296,6 +30385,23 @@ fn editor_recovery_target_name(name: &str) -> Option<&str> {
     parse_legacy(rest)
 }
 
+/// Parse the cleanup-only name emitted after a Direct Files replacement has
+/// already published and validated its new live file. Unlike
+/// [`editor_recovery_target_name`], this grammar never confers restoration or
+/// conflict authority; checked open may only remove the exact producer shape.
+fn editor_retired_target_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix('.')?.strip_suffix(".editor-retired")?;
+    let (candidate, sequence) = rest.rsplit_once('.')?;
+    let (target, process) = candidate.rsplit_once('.')?;
+    (!target.is_empty()
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        && !process.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && text_extension_from_path(Path::new(target)).is_some())
+    .then_some(target)
+}
+
 fn create_projection_staging_file(
     dir: &Dir,
     filename: &str,
@@ -31926,6 +32032,127 @@ pub fn atomic_update(
     edit: impl Fn(&str) -> io::Result<String>,
 ) -> io::Result<()> {
     atomic_update_with_hooks(path, lock, edit, |_| {}, |_| {})
+}
+
+/// Read-modify-write one small app-private authority file through the typed
+/// durable directory-publication boundary.
+///
+/// This is deliberately narrower than [`atomic_update`]: callers must own a
+/// private single-writer namespace rather than a graph file that Logseq,
+/// Syncthing, or an external editor may also change. The typed publication is
+/// required because these files select which storage authority Tine serves;
+/// on Windows their create/replace acknowledgement therefore uses certified
+/// write-through name operations rather than a rename followed by an
+/// unavailable directory fsync.
+pub fn durable_private_authority_update(
+    path: &Path,
+    lock: &std::sync::Mutex<()>,
+    edit: impl Fn(&str) -> io::Result<String>,
+) -> io::Result<()> {
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for _attempt in 0..4 {
+        let baseline = match fs::read_to_string(path) {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let next = edit(baseline.as_deref().unwrap_or("{}\n"))?;
+        let current = match fs::read_to_string(path) {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if current != baseline {
+            continue;
+        }
+        let (directory, filename) = durable_private_authority_directory(path)?;
+        let publication = DurableDirectoryPublication::open(&directory)
+            .map_err(managed_trash_filesystem_error)?;
+        let published = match baseline.as_deref() {
+            None => publication.publish_new_exact_single_writer(&filename, next.as_bytes()),
+            Some(expected) => {
+                publication.replace_exact(&filename, expected.as_bytes(), next.as_bytes())
+            }
+        };
+        match published {
+            Ok(()) => return Ok(()),
+            Err(FilesystemError::ByteCollision) => continue,
+            Err(error) => return Err(managed_trash_filesystem_error(error)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "private authority changed repeatedly during update",
+    ))
+}
+
+/// Durably remove one app-private authority name by first moving its exact
+/// bytes to a fresh same-directory name outside the selector grammar.
+///
+/// A crash after the typed retirement can leave only inert recovery residue;
+/// it cannot resurrect the active selector name. Ordinary completion removes
+/// that residue immediately.
+pub fn durable_private_authority_retire(
+    path: &Path,
+    lock: &std::sync::Mutex<()>,
+) -> io::Result<()> {
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let expected = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let (directory, filename) = durable_private_authority_directory(path)?;
+    let publication =
+        DurableDirectoryPublication::open(&directory).map_err(managed_trash_filesystem_error)?;
+    let retired = format!(".{filename}.retired-{}", Uuid::new_v4().simple());
+    publication
+        .retire_exact(&filename, &retired, &expected)
+        .map_err(managed_trash_filesystem_error)?;
+    let _ = directory.remove_file(&retired);
+    Ok(())
+}
+
+fn durable_private_authority_directory(path: &Path) -> io::Result<(Dir, String)> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private authority has no parent",
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private authority has no safe filename",
+            )
+        })?
+        .to_owned();
+
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private authority parent has no existing ancestor",
+            )
+        })?;
+    }
+    fs::create_dir_all(parent)?;
+    // File publication below flushes `parent` itself. Flush every newly
+    // created directory's parent as well, so Android/Unix initial activation
+    // cannot acknowledge a binding whose parent entry is still volatile.
+    for directory in &missing {
+        if let Some(created_parent) = directory.parent() {
+            sync_dir_for_rename(created_parent)?;
+        }
+    }
+    Dir::open_ambient_dir(parent, ambient_authority()).map(|directory| (directory, filename))
 }
 
 fn atomic_update_with_hooks(
@@ -47225,6 +47452,45 @@ mod tests {
         assert!(source.contains("self.serialize_page_document("));
     }
 
+    #[test]
+    fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
+        let source = include_str!("model.rs");
+        let create = source
+            .split_once("    fn managed_atomic_create_with_proof(")
+            .expect("Direct Files create path")
+            .1
+            .split_once("\n    fn managed_atomic_write_with_conflict(")
+            .expect("next Direct Files write function")
+            .0;
+        assert!(create.contains("DurableDirectoryPublication::open(target.parent())"));
+        assert!(create.contains(".move_exact_no_replace(&temp, &target.filename, bytes)"));
+        assert!(!create.contains("rename_projection_noreplace("));
+
+        let write = source
+            .split_once("    fn managed_atomic_write_validated(")
+            .expect("Direct Files validated write path")
+            .1
+            .split_once("\n    /// Replace an existing editor target")
+            .expect("Direct Files bounded replacement")
+            .0;
+        assert!(write.contains("self.managed_atomic_replace_bound("));
+        assert!(write.contains("DurableDirectoryPublication::open(target.parent())"));
+        assert!(write.contains(".move_exact_no_replace(&temp, &target.filename, bytes)"));
+        assert!(!write.contains("target.parent().rename("));
+
+        let replace = source
+            .split_once("    fn managed_atomic_replace_bound(")
+            .expect("Direct Files bounded replacement")
+            .1
+            .split_once("\n    fn managed_move_noreplace(")
+            .expect("next projection method")
+            .0;
+        assert!(replace.contains("EditorPublicationAuthority::DirectFile => direct_publication"));
+        assert!(replace.matches(".move_exact_no_replace(").count() >= 3);
+        assert!(!replace
+            .contains("EditorPublicationAuthority::DirectFile => rename_projection_noreplace"));
+    }
+
     // ---- #21: path-pinned pages + duplicate-day reconcile ----
 
     /// A graph with a canonical day file AND a title-named stray for the same day,
@@ -47567,6 +47833,62 @@ mod tests {
         ] {
             assert_eq!(editor_recovery_target_name(lookalike), None, "{lookalike}");
         }
+        assert_eq!(
+            editor_retired_target_name(".Note.md.4242.1.editor-retired"),
+            Some("Note.md")
+        );
+        for lookalike in [
+            ".Note.md.4242.editor-retired",
+            ".Note.md.pid.1.editor-retired",
+            ".Note.md.4242.seq.editor-retired",
+            ".Note.txt.4242.1.editor-retired",
+            "Note.md.4242.1.editor-retired",
+        ] {
+            assert_eq!(editor_retired_target_name(lookalike), None, "{lookalike}");
+        }
+    }
+
+    #[test]
+    fn checked_open_retries_editor_retired_cleanup_without_restoring_it() {
+        let dir = scratch("editor-retired-cleanup-retry");
+        let live = dir.join("pages/Note.md");
+        let retired = dir.join("pages").join(".Note.md.4242.1.editor-retired");
+        fs::write(&live, b"- published bytes\n").unwrap();
+        fs::write(&retired, b"- displaced bytes\n").unwrap();
+        EDITOR_RETIRED_CLEANUP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected retired-cleanup unlink failure",
+                ))
+            }));
+        });
+
+        let refused = match Graph::open_checked(&dir) {
+            Ok(_) => panic!("checked open ignored a retired-cleanup failure"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert_eq!(fs::read(&live).unwrap(), b"- published bytes\n");
+        assert_eq!(fs::read(&retired).unwrap(), b"- displaced bytes\n");
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"- published bytes\n");
+        assert!(!retired.exists(), "the next checked open owns the retry");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editor_retired_cleanup_is_never_document_authority() {
+        let dir = scratch("editor-retired-never-authority");
+        let retired = dir.join("pages").join(".Note.md.4242.1.editor-retired");
+        fs::write(&retired, b"- displaced bytes\n").unwrap();
+
+        let _graph = Graph::open_checked(&dir).unwrap();
+
+        assert!(!dir.join("pages/Note.md").exists());
+        assert!(!retired.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -7503,7 +7503,8 @@ fn decode_frontier(bytes: &[u8]) -> Result<FrontierV2, ProjectionError> {
 /// depend on where this process happened to put things.
 fn canonical_frontier_root_bytes(root: &AcceptedFrontierRoot) -> Result<Vec<u8>, ProjectionError> {
     let durable = root.without_scratch_root();
-    let bytes = postcard::to_allocvec(&durable)
+    let bytes = durable
+        .encode_canonical()
         .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
     if decode_frontier_root(&bytes)? != durable {
         return Err(ProjectionError::InvalidFrontier(
@@ -7520,18 +7521,8 @@ pub(crate) fn canonical_frontier_root_digest(
 }
 
 fn decode_frontier_root(bytes: &[u8]) -> Result<AcceptedFrontierRoot, ProjectionError> {
-    let root: AcceptedFrontierRoot = postcard::from_bytes(bytes)
-        .map_err(|error| ProjectionError::Corrupt(format!("invalid frontier root: {error}")))?;
-    let canonical = postcard::to_allocvec(&root)
-        .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-    if canonical != bytes {
-        return Err(ProjectionError::Corrupt(
-            "stored frontier root is not canonical".into(),
-        ));
-    }
-    super::hot_engine::validate_accepted_frontier_root(&root)
-        .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-    Ok(root)
+    AcceptedFrontierRoot::decode_canonical(bytes)
+        .map_err(|error| ProjectionError::Corrupt(error.to_string()))
 }
 
 fn canonical_affected_documents_bytes(
@@ -9558,6 +9549,9 @@ impl From<storage_frontier::FrontierError> for ProjectionError {
             storage_frontier::FrontierError::Materialization(error) => Self::from(
                 super::sqlite_materialization::MaterializationError::from(error),
             ),
+            storage_frontier::FrontierError::SealedAcceptedIndex(error) => {
+                Self::Corrupt(error.to_string())
+            }
             storage_frontier::FrontierError::Schema(error) => Self::SchemaMismatch(error),
             storage_frontier::FrontierError::ClaimBytes {
                 field: "workspace_id",
@@ -12745,7 +12739,7 @@ mod tests {
         };
         assert!(
             reason.contains(&format!(
-                "user_version {} != {SQLITE_SCHEMA_VERSION}",
+                "unsupported SQLite frontier user_version {}; current is {SQLITE_SCHEMA_VERSION}",
                 SQLITE_SCHEMA_VERSION - 1
             )),
             "unexpected rebuild reason: {reason}"

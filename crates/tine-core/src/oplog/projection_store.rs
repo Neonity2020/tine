@@ -3781,15 +3781,14 @@ impl fmt::Display for ProjectionStoreError {
             Self::UnknownStoreVersion(version) => {
                 write!(f, "unknown projection store version {version}")
             }
-            // The remedy is part of the error, not of a caller's prose: this
-            // string is what the managed-open failure channel carries to the
-            // user, and the whole point of the (c) blank-slate transition is
-            // that the user is told exactly how to proceed.
+            // This typed refusal is consumed by the outer pre-0.7 blank-slate
+            // lifecycle. The low-level store never migrates or mutates bytes;
+            // Tauri archives the private root and rebuilds automatically.
             Self::UpgradeRequired { found, current } => write!(
                 f,
                 "projection receipt store version {found} requires upgrade to {current}: \
-                 re-activate managed storage for this graph; your Markdown files are intact \
-                 and are not modified by this refusal [{}]",
+                 this pre-0.7 private state must be backed up and rebuilt from the intact \
+                 Markdown/Org tree by the graph-open lifecycle [{}]",
                 crate::oplog::refusal::ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
             ),
             Self::MalformedStoreClaim => f.write_str("malformed projection store claim"),

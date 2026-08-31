@@ -701,23 +701,26 @@ pub(crate) fn load_graph_for_label(
             window_label: owner,
         });
     }
+    let mut rebuild_managed_after_direct = false;
     let binding_record = match state.sync_runtime.binding_record(app, &root_key) {
         Ok(binding_record) => binding_record,
-        // A binding file from before the current schema is pre-0.7
-        // experimental state, not corruption: set it aside and open the graph
-        // in Direct Files. A CURRENT-version file that fails to decode still
-        // fails the open - that is real corruption.
-        Err(_) if state.sync_runtime.superseded_binding_file(app, &root_key) => {
-            if let Err(error) = state.sync_runtime.retire_superseded_legacy(app, &root_key) {
-                let _ = state.storage_supervisor.finish_transition(
-                    app,
-                    lookup_id,
-                    StorageTransitionOutcome::Failed,
-                    None,
-                    Some("superseded_legacy_retire_failed".into()),
-                );
-                return Err(error);
+        // There is no pre-0.7 migration path. If the private opt-in record is
+        // readable but not the one current format, preserve the complete
+        // private root and rebuild managed state from the Markdown/Org tree.
+        Err(_) if state.sync_runtime.unrecognized_binding_file(app, &root_key) => {
+            if let Err(error) = state
+                .sync_runtime
+                .archive_unrecognized_private_state(app, &root_key)
+            {
+                // The archive helper published the durable Direct/rebuild
+                // intent first. Keep the Markdown/Org graph available now;
+                // automatic activation below will retry the archive, and a
+                // later open will retry again if that activation also fails.
+                crate::debug::diag(format!(
+                    "pre-0.7 managed-state archive deferred; opening Direct Files: {error}"
+                ));
             }
+            rebuild_managed_after_direct = true;
             None
         }
         Err(error) => {
@@ -731,6 +734,15 @@ pub(crate) fn load_graph_for_label(
             return Err(error);
         }
     };
+    if binding_record.is_none()
+        && state
+            .sync_runtime
+            .blank_slate_rebuild_pending(app, &root_key)?
+    {
+        // This includes a crash after archival and a prior automatic rebuild
+        // attempt that failed while Direct Files remained safely available.
+        rebuild_managed_after_direct = true;
+    }
     graph_load_phase(started, &mut previous, "private storage discovery");
     let mut lookup_finished = false;
     'managed: {
@@ -779,26 +791,35 @@ pub(crate) fn load_graph_for_label(
             }
         };
         graph_load_phase(started, &mut previous, "managed storage recovery");
-        if binding.superseded_legacy() {
-            // Pre-0.7 runtime state under a readable binding. Same policy as
-            // the unreadable-binding case above: set aside, open Direct Files.
-            if let Err(error) = state.sync_runtime.retire_superseded_legacy(app, &root_key) {
-                let _ = state.storage_supervisor.finish_transition(
+        if binding.requires_blank_slate_rebuild() {
+            // A readable outer binding can still lead to an unrecognized
+            // private store. Preserve it, publish a Direct Files source, then
+            // reconstruct the one current managed format automatically.
+            if let Err(error) = state
+                .sync_runtime
+                .archive_unrecognized_private_state(app, &root_key)
+            {
+                crate::debug::diag(format!(
+                    "pre-0.7 managed-state archive deferred; opening Direct Files: {error}"
+                ));
+                state.storage_supervisor.finish_transition(
                     app,
                     managed_id,
-                    StorageTransitionOutcome::Failed,
+                    StorageTransitionOutcome::Cancelled,
                     None,
-                    Some("superseded_legacy_retire_failed".into()),
-                );
-                return Err(error);
+                    Some("blank_slate_archive_deferred".into()),
+                )?;
+                rebuild_managed_after_direct = true;
+                break 'managed;
             }
             state.storage_supervisor.finish_transition(
                 app,
                 managed_id,
                 StorageTransitionOutcome::Cancelled,
                 None,
-                Some("superseded_legacy_retired".into()),
+                Some("blank_slate_rebuild_requested".into()),
             )?;
+            rebuild_managed_after_direct = true;
             break 'managed;
         }
         if let Some(detail) = binding.serving_failure_detail() {
@@ -960,6 +981,34 @@ pub(crate) fn load_graph_for_label(
         None,
     )?;
     graph_load_phase(started, &mut previous, "Direct Files publish");
+    if rebuild_managed_after_direct {
+        let source_generation = direct.binding_generation;
+        drop(_load);
+        return match crate::sync_runtime::activate_sparse_v2_blocking(
+            app,
+            window_label,
+            source_generation,
+        ) {
+            Ok(_) => {
+                let managed = slot_for_window(state, window_label)?;
+                Ok(LoadGraphResult::Loaded {
+                    meta: managed.graph_meta(),
+                    binding_generation: managed.binding_generation,
+                    application_page_admission: managed.application_page_admission(),
+                })
+            }
+            Err(error) => {
+                crate::debug::diag(format!(
+                    "automatic managed-storage rebuild failed; Direct Files remains active: {error}"
+                ));
+                Ok(LoadGraphResult::Loaded {
+                    meta: direct.meta,
+                    binding_generation: direct.binding_generation,
+                    application_page_admission: direct.application_page_admission,
+                })
+            }
+        };
+    }
     Ok(LoadGraphResult::Loaded {
         meta: direct.meta,
         binding_generation: direct.binding_generation,
@@ -1584,6 +1633,67 @@ mod tests {
             .find("prove_managed_application_ready(&slot, None)")
             .expect("managed page readiness proof");
         assert!(refusal < readiness);
+    }
+
+    #[test]
+    fn pre_07_unknown_state_archives_then_rebuilds_without_manual_reactivation() {
+        let source = include_str!("graph.rs");
+        let start = source
+            .find("pub(crate) fn load_graph_for_label")
+            .expect("graph load function");
+        let body = &source[start
+            ..source[start..]
+                .find("#[tauri::command]")
+                .map(|offset| start + offset)
+                .expect("end of graph load function")];
+        let classification = body
+            .find("unrecognized_binding_file")
+            .expect("unrecognized private binding classification");
+        let archive = body[classification..]
+            .find("archive_unrecognized_private_state")
+            .map(|offset| classification + offset)
+            .expect("unrecognized private state archive");
+        assert!(body[archive..].contains("blank_slate_archive_deferred"));
+        assert!(body[archive..].contains("opening Direct Files"));
+        let mut archive_paths = body;
+        let mut checked_archive_paths = 0;
+        while let Some(archive_offset) = archive_paths.find("archive_unrecognized_private_state") {
+            let after_archive = &archive_paths[archive_offset..];
+            let retry_offset = after_archive
+                .find("rebuild_managed_after_direct = true")
+                .expect("archive path must schedule automatic rebuild");
+            assert!(
+                !after_archive[..retry_offset].contains("return Err(error)"),
+                "archive failure must fall through to Direct Files"
+            );
+            checked_archive_paths += 1;
+            archive_paths = &after_archive[retry_offset + 1..];
+        }
+        assert_eq!(checked_archive_paths, 2);
+        let durable_retry = body[archive..]
+            .find("blank_slate_rebuild_pending")
+            .map(|offset| archive + offset)
+            .expect("durable automatic-rebuild retry intent");
+        let direct = body[durable_retry..]
+            .find("Direct Files publish")
+            .map(|offset| durable_retry + offset)
+            .expect("safe Markdown/Org source publication");
+        let unlock = body[direct..]
+            .find("drop(_load)")
+            .map(|offset| direct + offset)
+            .expect("graph-open lane release before activation");
+        let rebuild = body[unlock..]
+            .find("activate_sparse_v2_blocking")
+            .map(|offset| unlock + offset)
+            .expect("automatic managed rebuild");
+        assert!(
+            classification < archive
+                && archive < durable_retry
+                && durable_retry < direct
+                && direct < unlock
+                && unlock < rebuild
+        );
+        assert!(body[rebuild..].contains("Direct Files remains active"));
     }
 
     #[test]

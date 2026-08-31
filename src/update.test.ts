@@ -206,7 +206,7 @@ describe("update checks", () => {
       action: { label: "Install update" },
     });
     availableToast?.[2]?.action?.run();
-    await new Promise((r) => setTimeout(r, 10)); // let the detached applyUpdateOrOpen settle
+    await vi.waitFor(() => expect(openExternalMock).toHaveBeenCalled(), { timeout: 5_000 });
 
     expect(consoleErr).toHaveBeenCalledWith(
       "[update] self-update failed:",

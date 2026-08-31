@@ -43,6 +43,9 @@ static BINDING_WRITE: Mutex<()> = Mutex::new(());
 const DIRECT_SELECTION_SCHEMA_VERSION: u32 = 1;
 const DIRECT_SELECTION_DIR: &str = "storage-mode-selections";
 const DIRECT_SELECTION_FILE_SUFFIX: &str = ".direct-v1.json";
+const BLANK_SLATE_REBUILD_REASON: &str = "pre_0_7_blank_slate_rebuild_pending";
+const BLANK_SLATE_BACKUP_COMPLETE_SUFFIX: &str = "-blank-slate-original-preserved";
+const BLANK_SLATE_FAILED_CANDIDATE_SUFFIX: &str = "-blank-slate-failed-candidate";
 static DIRECT_SELECTION_WRITE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -250,6 +253,19 @@ fn direct_selection_is_active_at(path: &Path, graph_root: &Path) -> Result<bool,
     }
 }
 
+fn direct_selection_requests_blank_slate_rebuild_at(path: &Path, graph_root: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    matches!(
+        serde_json::from_slice::<DirectSelectionReceipt>(&bytes),
+        Ok(receipt)
+            if receipt.schema_version == DIRECT_SELECTION_SCHEMA_VERSION
+                && Path::new(&receipt.graph_root) == graph_root
+                && receipt.reason == BLANK_SLATE_REBUILD_REASON
+    )
+}
+
 fn publish_direct_selection(
     app: &tauri::AppHandle,
     graph_root: &Path,
@@ -271,19 +287,20 @@ fn publish_direct_selection_at(path: &Path, graph_root: &Path, reason: &str) -> 
             value
         })
         .map_err(|error| error.to_string())?;
-    tine_core::model::atomic_update(path, &DIRECT_SELECTION_WRITE, |_| Ok(encoded.clone()))
-        .map_err(|error| format!("Couldn't select Direct Files for this graph: {error}"))
+    tine_core::model::durable_private_authority_update(path, &DIRECT_SELECTION_WRITE, |_| {
+        Ok(encoded.clone())
+    })
+    .map_err(|error| format!("Couldn't select Direct Files for this graph: {error}"))
 }
 
 fn retire_direct_selection(app: &tauri::AppHandle, graph_root: &Path) -> Result<(), String> {
     let path = direct_selection_path(app, graph_root)?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "Couldn't retire the prior Direct Files selection: {error}"
-        )),
-    }
+    retire_direct_selection_at(&path)
+}
+
+fn retire_direct_selection_at(path: &Path) -> Result<(), String> {
+    tine_core::model::durable_private_authority_retire(path, &DIRECT_SELECTION_WRITE)
+        .map_err(|error| format!("Couldn't retire the prior Direct Files selection: {error}"))
 }
 
 fn binding_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
@@ -321,46 +338,7 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
             value
         })
         .map_err(|error| error.to_string())?;
-    #[cfg(target_os = "android")]
-    if !path.exists() {
-        use std::io::Write as _;
-
-        let parent = path
-            .parent()
-            .ok_or_else(|| "Tine-managed storage binding has no private parent".to_owned())?;
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!("Couldn't create Tine-managed storage private binding directory: {error}")
-        })?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(mut file) => {
-                file.write_all(encoded.as_bytes()).map_err(|error| {
-                    format!("Couldn't write Tine-managed storage private binding: {error}")
-                })?;
-                file.sync_all().map_err(|error| {
-                    format!("Couldn't flush Tine-managed storage private binding: {error}")
-                })?;
-                // The initial binding is small, device-local and published
-                // before any managed authority exists. Android kernels can
-                // deny renameat2(RENAME_NOREPLACE) even in app-private storage;
-                // direct create_new preserves no-clobber semantics. A crash
-                // can at worst leave a malformed private opt-in record, which
-                // is recoverable through the always-available Direct Files
-                // escape without touching the Markdown tree.
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!(
-                    "Couldn't create Tine-managed storage private binding: {error}"
-                ));
-            }
-        }
-    }
-    tine_core::model::atomic_update(path, &BINDING_WRITE, |existing| {
+    tine_core::model::durable_private_authority_update(path, &BINDING_WRITE, |existing| {
         if existing.trim().is_empty() || existing.trim() == "{}" {
             return Ok(encoded.clone());
         }
@@ -553,11 +531,18 @@ pub(crate) struct SparseV2Binding {
 }
 
 impl SparseV2Binding {
-    pub(crate) fn superseded_legacy(&self) -> bool {
+    /// Pre-0.7 private state is disposable authority, but never disposable
+    /// evidence.  The graph-open boundary archives it and reconstructs the
+    /// one current format from the Markdown/Org tree.
+    pub(crate) fn requires_blank_slate_rebuild(&self) -> bool {
         matches!(
             &self.availability,
             SparseV2Availability::Refused { reason_code, .. }
                 if reason_code == SUPERSEDED_LEGACY_REASON
+        ) || matches!(
+            &self.availability,
+            SparseV2Availability::Refused { scenario_id, .. }
+                if scenario_id == ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
         )
     }
 }
@@ -1215,11 +1200,12 @@ impl SyncRuntimeFacade {
         Ok(record)
     }
 
-    /// True when a binding file exists but predates the current schema. Such
-    /// a file cannot decode into `SparseV2ActivationRecord`, so ordinary
-    /// discovery reports corruption; startup instead retires it. A current-
-    /// version file that fails to decode stays an error - that IS corruption.
-    pub(crate) fn superseded_binding_file(
+    /// True when a binding file exists and is safely readable, but ordinary
+    /// discovery could not decode it as the one current pre-0.7 format.
+    /// Startup archives the entire private root and reconstructs current state
+    /// from Markdown/Org. An I/O failure remains a loud error: it is not proof
+    /// that the format itself is unrecognized.
+    pub(crate) fn unrecognized_binding_file(
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
@@ -1230,34 +1216,40 @@ impl SyncRuntimeFacade {
         let Ok(bytes) = std::fs::read(private.join(SPARSE_BINDING_FILE)) else {
             return false;
         };
-        binding_bytes_are_superseded(&bytes)
+        match serde_json::from_slice::<SparseV2ActivationRecord>(&bytes) {
+            Ok(record) => record.validate_for(graph_root).is_err(),
+            Err(_) => true,
+        }
     }
 
-    /// Pre-0.7 policy (Martin, Aug 19): experimental state is not migrated.
-    /// Archive the whole app-private root into the recovery directory - never
-    /// hard-delete - and select Direct Files so the next open is ordinary.
-    pub(crate) fn retire_superseded_legacy(
+    /// Pre-0.7 policy: experimental state is not migrated. Archive the whole
+    /// app-private root into the recovery directory - never hard-delete - and
+    /// select Direct Files as the safe source for an automatic current-format
+    /// rebuild from Markdown/Org.
+    pub(crate) fn archive_unrecognized_private_state(
         &self,
         app: &tauri::AppHandle,
         graph_root: &Path,
     ) -> Result<(), String> {
         let private = sparse_private_root(app, graph_root)?;
         let recovery = sparse_recovery_root(app)?;
+        clear_blank_slate_backup_complete(&private, &recovery)?;
+        // Publish the durable reconstruction intent before moving private
+        // state. A crash at any later cut therefore reopens the Markdown/Org
+        // tree in Direct Files and retries the automatic rebuild.
+        publish_direct_selection(app, graph_root, BLANK_SLATE_REBUILD_REASON)?;
         let archived = archive_private_root(&private, &recovery).map_err(|error| {
             format!("Couldn't set aside pre-0.7 managed-storage state: {error}")
         })?;
+        mark_blank_slate_backup_complete(&private, &recovery)?;
         crate::debug::diag(format!(
-            "pre-0.7 managed state retired: archived={}",
+            "unrecognized pre-0.7 managed state archived: archived={}",
             archived
                 .as_deref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "nothing-to-archive".into())
         ));
-        publish_direct_selection(
-            app,
-            graph_root,
-            "superseded pre-0.7 managed state set aside",
-        )
+        Ok(())
     }
 
     pub(crate) fn prepare_binding_record(
@@ -1267,6 +1259,7 @@ impl SyncRuntimeFacade {
         graph_meta: GraphMeta,
     ) -> Result<SparseV2ActivationRecord, String> {
         let direct_selected = direct_selection_is_active(app, graph_root)?;
+        let blank_slate_rebuild = self.blank_slate_rebuild_pending(app, graph_root)?;
         if !direct_selected {
             if let Some(record) = self.binding_record(app, graph_root)? {
                 return Ok(record);
@@ -1279,7 +1272,11 @@ impl SyncRuntimeFacade {
             graph_meta,
             DeviceId::from_uuid(crate::settings::managed_sync_device_id(app)?),
         );
-        prepare_fresh_authority_at_paths(&private, &recovery, record, "fresh activation")
+        if blank_slate_rebuild {
+            prepare_blank_slate_retry_at_paths(&private, &recovery, record)
+        } else {
+            prepare_fresh_authority_at_paths(&private, &recovery, record, "fresh activation")
+        }
     }
 
     pub(crate) fn prepare_shared_binding_record(
@@ -1319,6 +1316,17 @@ impl SyncRuntimeFacade {
         direct_selection_is_active(app, graph_root)
     }
 
+    pub(crate) fn blank_slate_rebuild_pending(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<bool, String> {
+        let path = direct_selection_path(app, graph_root)?;
+        Ok(direct_selection_requests_blank_slate_rebuild_at(
+            &path, graph_root,
+        ))
+    }
+
     pub(crate) fn graph_meta(record: &SparseV2ActivationRecord) -> GraphMeta {
         record.graph_meta.clone()
     }
@@ -1354,6 +1362,13 @@ impl SyncRuntimeFacade {
                     managed_open_waiting_phase_name(*phase),
                     elapsed.as_millis()
                 )),
+                SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed } => {
+                    crate::debug::diag(format!(
+                        "managed storage open: recovery_stage={} elapsed_ms={}",
+                        stage.diagnostic_name(),
+                        elapsed.as_millis()
+                    ))
+                }
                 SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics } => {
                     crate::debug::diag(format!(
                             "managed storage open: recovery={} retention={} retained_runs={} resume_candidate={} detached_bootstrap_reconstruction={} full_bootstrap_replay={} manifests={} manifest_enumeration_ms={} resume_selection_ms={} bootstrap_reconstruction_attempted={} bootstrap_reconstruction_ms={} engine_open_ms={} sqlite_open_ms={} tail_construction_ms={} total_ms={}",
@@ -1994,7 +2009,7 @@ pub(crate) async fn sparse_v2_status(
     .map_err(|error| error.to_string())?
 }
 
-/// Explicitly retire one legacy authority and activate/resume sparse v2.
+/// Explicitly retire one Direct authority and activate/resume managed storage.
 ///
 /// The durable opt-in record is published only after the legacy watcher,
 /// detached background work, and every in-flight legacy command have released
@@ -2016,7 +2031,7 @@ pub(crate) async fn activate_sparse_v2(
     .map_err(|error| format!("Tine-managed storage setup worker failed: {error}"))?
 }
 
-fn activate_sparse_v2_blocking(
+pub(crate) fn activate_sparse_v2_blocking(
     app: &tauri::AppHandle,
     label: &str,
     binding_generation: u64,
@@ -2270,13 +2285,32 @@ fn publish_managed_candidate_with(
             "The graph changed while the managed candidate was prepared. Retry setup.".into(),
         );
     }
-    persist_successor()?;
+    let predecessor_was_direct = candidate.direct_source_generation.is_some();
+    if let Err(error) = persist_successor() {
+        if predecessor_was_direct {
+            let rollback = restore_direct_selection(&candidate.predecessor.root_key);
+            return Err(match rollback {
+                Ok(()) => format!(
+                    "managed selector publication failed ({error}); Direct Files selection was restored"
+                ),
+                Err(rollback) => format!(
+                    "managed selector publication failed ({error}) and Direct Files selection could not be restored ({rollback})"
+                ),
+            });
+        }
+        return Err(format!("managed runtime publication failed: {error}"));
+    }
     if let Err(error) = graphs.replace_if_current(
         label,
         candidate.predecessor.binding_generation,
         &candidate.predecessor.root_key,
         Arc::clone(&candidate.replacement),
     ) {
+        if !predecessor_was_direct {
+            return Err(format!(
+                "managed runtime publication was superseded: {error}"
+            ));
+        }
         let rollback = restore_direct_selection(&candidate.predecessor.root_key);
         return Err(match rollback {
             Ok(()) => format!("managed publication was superseded: {error}"),
@@ -2307,19 +2341,6 @@ pub(crate) struct SparseV2CancelResult {
 /// in-app Direct Files return.  The caller's attempt is validated at the
 /// mutation boundary, not trusted as storage authority or reflected to the UI.
 pub(crate) type SparseV2ColdCancelResult = SparseV2CancelResult;
-
-/// A binding file from a schema before the current one is pre-0.7 state.
-/// Undecodable JSON is NOT superseded: a current-format file that fails to
-/// parse is corruption and must keep failing loudly.
-fn binding_bytes_are_superseded(bytes: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(u64::from(BINDING_SCHEMA_VERSION))
-}
 
 fn archive_private_root(
     private_root: &Path,
@@ -2358,6 +2379,136 @@ fn archive_private_root(
         format!("Couldn't preserve Tine-managed storage recovery state: {error}")
     })?;
     Ok(Some(destination))
+}
+
+fn blank_slate_recovery_key(private_root: &Path) -> Result<&str, String> {
+    private_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Tine-managed storage recovery state has no valid local key.".into())
+}
+
+fn blank_slate_backup_complete_path(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<PathBuf, String> {
+    Ok(recovery_root.join(format!(
+        "{}{BLANK_SLATE_BACKUP_COMPLETE_SUFFIX}",
+        blank_slate_recovery_key(private_root)?
+    )))
+}
+
+fn blank_slate_backup_is_complete(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<bool, String> {
+    let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
+    match std::fs::read(&marker) {
+        Ok(bytes) => Ok(bytes == b"complete\n"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Couldn't inspect the pre-0.7 managed-storage backup marker: {error}"
+        )),
+    }
+}
+
+fn clear_blank_slate_backup_complete(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<(), String> {
+    let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Couldn't reset the pre-0.7 managed-storage backup marker: {error}"
+        )),
+    }
+}
+
+fn mark_blank_slate_backup_complete(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(recovery_root).map_err(|error| {
+        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+    })?;
+    let marker = blank_slate_backup_complete_path(private_root, recovery_root)?;
+    tine_core::model::atomic_update(&marker, &DIRECT_SELECTION_WRITE, |_| {
+        Ok("complete\n".to_owned())
+    })
+    .map_err(|error| format!("Couldn't record the pre-0.7 managed-storage backup: {error}"))
+}
+
+/// Retain at most one disposable failed rebuild candidate. The original
+/// unrecognized private state has its own immutable archive and completion
+/// marker; retry products are reconstructed from Markdown/Org and must not
+/// create an unbounded recovery directory on every launch.
+fn replace_failed_blank_slate_candidate(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let metadata = match std::fs::symlink_metadata(private_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Couldn't inspect the failed managed-storage rebuild: {error}"
+            ));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("The failed managed-storage rebuild is not a safe local directory.".into());
+    }
+    std::fs::create_dir_all(recovery_root).map_err(|error| {
+        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+    })?;
+    let destination = recovery_root.join(format!(
+        "{}{BLANK_SLATE_FAILED_CANDIDATE_SUFFIX}",
+        blank_slate_recovery_key(private_root)?
+    ));
+    match std::fs::symlink_metadata(&destination) {
+        Ok(existing) if existing.is_dir() && !existing.file_type().is_symlink() => {
+            std::fs::remove_dir_all(&destination).map_err(|error| {
+                format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+            })?;
+        }
+        Ok(_) => {
+            std::fs::remove_file(&destination).map_err(|error| {
+                format!("Couldn't retire the prior failed managed-storage rebuild: {error}")
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Couldn't inspect the prior failed managed-storage rebuild: {error}"
+            ));
+        }
+    }
+    std::fs::rename(private_root, &destination).map_err(|error| {
+        format!("Couldn't set aside the failed managed-storage rebuild: {error}")
+    })?;
+    Ok(Some(destination))
+}
+
+fn prepare_blank_slate_retry_at_paths(
+    private_root: &Path,
+    recovery_root: &Path,
+    record: SparseV2ActivationRecord,
+) -> Result<SparseV2ActivationRecord, String> {
+    if blank_slate_backup_is_complete(private_root, recovery_root)? {
+        replace_failed_blank_slate_candidate(private_root, recovery_root)?;
+    } else {
+        // The durable Direct intent may have been published just before a
+        // crash or archive failure. Preserve the original bytes before any
+        // current-format reconstruction begins. If the prior rename already
+        // succeeded, absence is sufficient and the marker closes the gap.
+        archive_private_root(private_root, recovery_root).map_err(|error| {
+            format!("Couldn't preserve the original pre-0.7 managed-storage state: {error}")
+        })?;
+        mark_blank_slate_backup_complete(private_root, recovery_root)?;
+    }
+    Ok(record)
 }
 
 fn prepare_shared_binding_record_at_paths(
@@ -2872,6 +3023,115 @@ fn cancel_sparse_v2_at_paths(
         shutdown,
         archive_private_root,
     )
+}
+
+/// Android app-UID boundary for the final leg of the managed-storage journey.
+///
+/// The core journey proves activation/share/join/reopen. This function then
+/// drives the SAME graceful Return-to-Direct-Files composition as the command:
+/// stop the live actor, preserve the complete private root, apply the
+/// production provider-namespace policy, and publish one Direct Files slot.
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(crate) fn run_android_managed_return_to_direct_files(
+    graph_root: &Path,
+    private_root: &Path,
+    open_request: SyncRuntimeOpenRequest,
+) -> Result<String, String> {
+    let markdown_path = graph_root.join(tine_core::managed_storage_journey::JOURNEY_EDITED_PAGE);
+    let markdown_before = std::fs::read(&markdown_path)
+        .map_err(|error| format!("Return journey could not read its Markdown witness: {error}"))?;
+    let opened = SyncRuntimeHandle::open(open_request);
+    if opened.status != SyncRuntimeOpenStatus::Active {
+        return Err(format!(
+            "Return journey could not reopen managed storage: {:?}",
+            opened.status
+        ));
+    }
+    let graph_meta = tine_core::model::Graph::open_checked(graph_root)
+        .map_err(|error| format!("Return journey could not inspect Direct Files: {error}"))?
+        .meta();
+    let slot = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+        SparseV2Binding::from_open(opened),
+        graph_root.to_path_buf(),
+        graph_meta,
+    ));
+    let state = crate::state::AppState {
+        graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
+        storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+        watch_ctl: Mutex::new(None),
+        last_focused: Mutex::new(None),
+        capture_graph: Mutex::new(None),
+        sync_runtime: SyncRuntimeFacade,
+        #[cfg(desktop)]
+        next_window: std::sync::atomic::AtomicU64::new(1),
+    };
+    state
+        .graphs
+        .write()
+        .unwrap()
+        .bind("managed-storage-smoke".into(), Arc::clone(&slot))?;
+
+    let private_name = private_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("managed-storage-smoke");
+    let recovery_root = private_root
+        .parent()
+        .unwrap_or(private_root)
+        .join(format!(".{private_name}-return-recovery"));
+    let _ = std::fs::remove_dir_all(&recovery_root);
+    let proof = (|| {
+        let returned = cancel_sparse_v2_at_paths(
+            &state,
+            "managed-storage-smoke",
+            slot,
+            private_root,
+            &recovery_root,
+            None,
+            shutdown_for_graceful_direct_files,
+        )?;
+        let direct = state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("managed-storage-smoke")
+            .ok_or("Return journey published no graph slot")?;
+        direct
+            .legacy_graph()
+            .map_err(|error| format!("Return journey did not publish Direct Files: {error}"))?;
+        if private_root.exists() {
+            return Err("Return journey left the live managed private root in place".into());
+        }
+        let archived = std::fs::read_dir(&recovery_root)
+            .map_err(|error| format!("Return journey published no private-state archive: {error}"))?
+            .count();
+        if archived != 1 {
+            return Err(format!(
+                "Return journey expected one private-state archive, found {archived}"
+            ));
+        }
+        let markdown_after = std::fs::read(&markdown_path)
+            .map_err(|error| format!("Return journey lost its Markdown witness: {error}"))?;
+        if markdown_after != markdown_before {
+            return Err("Return journey changed the authoritative Markdown witness".into());
+        }
+        Ok(format!(
+            "return_to_direct=ok binding_generation={} private_archives={archived}",
+            returned.binding_generation
+        ))
+    })();
+    let cleanup = if recovery_root.exists() {
+        std::fs::remove_dir_all(&recovery_root)
+            .map_err(|error| format!("Return journey cleanup failed after proof: {error}"))
+    } else {
+        Ok(())
+    };
+    match (proof, cleanup) {
+        (Ok(receipt), Ok(())) => Ok(receipt),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
 }
 
 #[cfg(test)]
@@ -3985,6 +4245,7 @@ mod clean_shutdown_slot_tests {
             provider_pending: 0,
             provider_runnable: false,
             search_index_building: false,
+            move_episode_cleanup_pending: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -4040,6 +4301,31 @@ mod tests {
     }
 
     #[test]
+    fn blank_slate_rebuild_intent_is_durable_and_distinct_from_explicit_direct() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+
+        publish_direct_selection_at(&receipt, &graph, BLANK_SLATE_REBUILD_REASON).unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(direct_selection_requests_blank_slate_rebuild_at(
+            &receipt, &graph
+        ));
+
+        publish_direct_selection_at(&receipt, &graph, "emergency_return").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(!direct_selection_requests_blank_slate_rebuild_at(
+            &receipt, &graph
+        ));
+
+        std::fs::write(&receipt, b"{").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(!direct_selection_requests_blank_slate_rebuild_at(
+            &receipt, &graph
+        ));
+    }
+
+    #[test]
     fn malformed_emergency_receipt_fails_toward_direct_files() {
         let temp = tempfile::tempdir().unwrap();
         let graph = temp.path().join("graph");
@@ -4047,6 +4333,56 @@ mod tests {
         std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
         std::fs::write(&receipt, b"{").unwrap();
         assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+    }
+
+    #[test]
+    fn managed_activation_durably_retires_the_direct_selector_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+        publish_direct_selection_at(&receipt, &graph, "emergency_return").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+
+        retire_direct_selection_at(&receipt).unwrap();
+        assert!(!direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(!receipt.exists());
+        assert!(std::fs::read_dir(receipt.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("retired-")));
+
+        retire_direct_selection_at(&receipt).unwrap();
+    }
+
+    #[test]
+    fn storage_mode_selectors_use_typed_durable_private_authority_publication() {
+        let source = include_str!("sync_runtime.rs");
+        let direct_start = source
+            .find("fn publish_direct_selection_at(")
+            .expect("Direct Files selector publisher");
+        let direct_end = source[direct_start..]
+            .find("\nfn binding_path(")
+            .map(|offset| direct_start + offset)
+            .expect("end of Direct Files selector helpers");
+        let direct = &source[direct_start..direct_end];
+        assert!(direct.contains("durable_private_authority_update"));
+        assert!(direct.contains("durable_private_authority_retire"));
+        assert!(!direct.contains("std::fs::remove_file"));
+
+        let binding_start = source
+            .find("fn persist_binding_at(")
+            .expect("Managed Storage binding publisher");
+        let binding_end = source[binding_start..]
+            .find("\n#[derive(")
+            .map(|offset| binding_start + offset)
+            .expect("end of Managed Storage binding publisher");
+        let binding = &source[binding_start..binding_end];
+        assert!(binding.contains("durable_private_authority_update"));
+        assert!(!binding.contains("target_os = \"android\""));
+        assert!(!binding.contains("OpenOptions::new"));
     }
 
     #[test]
@@ -4222,6 +4558,7 @@ mod tests {
                 .expect("managed open diagnostic end")];
         assert!(open.contains("managed_open_phase_name(*phase)"));
         assert!(open.contains("managed_open_waiting_phase_name(*phase)"));
+        assert!(open.contains("stage.diagnostic_name()"));
         assert!(open.contains("managed_open_outcome_code(&opened.status)"));
         assert!(
             !open.contains("diagnostics.projection_reason")
@@ -4665,14 +5002,14 @@ mod tests {
                 sample_load_ms: 0,
                 total_ms: 0,
             },
-            direct_source_generation: Some(expected_generation),
+            direct_source_generation: expected_generation,
         };
 
         let persisted = std::sync::atomic::AtomicUsize::new(0);
         let error = publish_managed_candidate_with(
             &state,
             "main",
-            candidate(source_generation.saturating_add(1)),
+            candidate(Some(source_generation.saturating_add(1))),
             || {
                 persisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
@@ -4693,10 +5030,53 @@ mod tests {
             predecessor.binding_generation
         );
 
+        let restored = std::sync::atomic::AtomicUsize::new(0);
+        let error = publish_managed_candidate_with(
+            &state,
+            "main",
+            candidate(Some(source_generation)),
+            || Err("ambiguous managed selector publication".into()),
+            |_| {
+                restored.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("Direct Files selection was restored"));
+        assert_eq!(restored.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            state
+                .graphs
+                .read()
+                .unwrap()
+                .slot("main")
+                .unwrap()
+                .binding_generation,
+            predecessor.binding_generation
+        );
+
+        let error = publish_managed_candidate_with(
+            &state,
+            "main",
+            candidate(None),
+            || Err("managed-to-managed publication failure".into()),
+            |_| {
+                restored.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("managed runtime publication failed"));
+        assert_eq!(
+            restored.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a managed predecessor must not be rolled back to Direct Files"
+        );
+
         publish_managed_candidate_with(
             &state,
             "main",
-            candidate(source_generation),
+            candidate(Some(source_generation)),
             || {
                 persisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
@@ -6240,21 +6620,125 @@ mod tests {
     }
 
     #[test]
-    fn superseded_classification_spares_current_and_corrupt_bindings() {
-        // Pre-0.7 shapes: an explicit older version, and a record from before
-        // the version field existed at all.
-        assert!(binding_bytes_are_superseded(
-            br#"{"schema_version":1,"graph_root":"/g"}"#
-        ));
-        assert!(binding_bytes_are_superseded(
-            br#"{"graph_root":"/g","workspace":"w"}"#
-        ));
-        // The current version is not superseded even when the record is
-        // otherwise incomplete - that failure must stay a loud one.
-        assert!(!binding_bytes_are_superseded(br#"{"schema_version":2}"#));
-        // Not JSON at all: corruption, not an old format.
-        assert!(!binding_bytes_are_superseded(b"\x00\x01managed"));
-        assert!(!binding_bytes_are_superseded(b""));
+    fn blank_slate_rebuild_is_only_for_unrecognized_pre_07_state() {
+        for availability in [
+            SparseV2Availability::Refused {
+                reason_code: SUPERSEDED_LEGACY_REASON.into(),
+                scenario_id: SUPERSEDED_LEGACY_REASON.into(),
+                detail: None,
+            },
+            SparseV2Availability::Refused {
+                reason_code: "open_refused".into(),
+                scenario_id: ManagedStorageRefusalScenario::ProtocolIncompatible
+                    .as_str()
+                    .into(),
+                detail: None,
+            },
+        ] {
+            assert!(SparseV2Binding {
+                availability,
+                handle: None,
+            }
+            .requires_blank_slate_rebuild());
+        }
+
+        assert!(!SparseV2Binding {
+            availability: SparseV2Availability::Refused {
+                reason_code: "open_refused".into(),
+                scenario_id: ManagedStorageRefusalScenario::DiskCorrupt.as_str().into(),
+                detail: None,
+            },
+            handle: None,
+        }
+        .requires_blank_slate_rebuild());
+    }
+
+    #[test]
+    fn blank_slate_archive_preserves_every_private_byte() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private/current");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir_all(private.join("nested")).unwrap();
+        std::fs::write(private.join("binding.json"), b"unrecognized binding bytes").unwrap();
+        std::fs::write(
+            private.join("nested/evidence.bin"),
+            b"\0\x01retained evidence",
+        )
+        .unwrap();
+
+        let archived = archive_private_root(&private, &recovery)
+            .unwrap()
+            .expect("present private state must be archived");
+
+        assert!(!private.exists());
+        assert_eq!(
+            std::fs::read(archived.join("binding.json")).unwrap(),
+            b"unrecognized binding bytes"
+        );
+        assert_eq!(
+            std::fs::read(archived.join("nested/evidence.bin")).unwrap(),
+            b"\0\x01retained evidence"
+        );
+    }
+
+    #[test]
+    fn blank_slate_retry_preserves_original_once_and_bounds_failed_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let graph = root.path().join("graph");
+        std::fs::create_dir_all(graph.join("pages")).unwrap();
+        let private = root.path().join("private/current");
+        let recovery = root.path().join("recovery");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("original.bin"), b"unrecognized original").unwrap();
+        let record =
+            SparseV2ActivationRecord::new(&graph, Graph::open(&graph).meta(), DeviceId::new());
+
+        prepare_blank_slate_retry_at_paths(&private, &recovery, record.clone()).unwrap();
+        assert!(blank_slate_backup_is_complete(&private, &recovery).unwrap());
+
+        for attempt in [
+            b"first failed candidate".as_slice(),
+            b"latest failed candidate",
+        ] {
+            std::fs::create_dir_all(&private).unwrap();
+            std::fs::write(private.join("attempt.bin"), attempt).unwrap();
+            prepare_blank_slate_retry_at_paths(&private, &recovery, record.clone()).unwrap();
+        }
+
+        let entries = std::fs::read_dir(&recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let failed = entries
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(BLANK_SLATE_FAILED_CANDIDATE_SUFFIX)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            std::fs::read(failed[0].join("attempt.bin")).unwrap(),
+            b"latest failed candidate"
+        );
+        let originals = entries
+            .iter()
+            .filter(|path| {
+                path.is_dir()
+                    && !path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .ends_with(BLANK_SLATE_FAILED_CANDIDATE_SUFFIX)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 1);
+        assert_eq!(
+            std::fs::read(originals[0].join("original.bin")).unwrap(),
+            b"unrecognized original"
+        );
     }
 
     #[test]

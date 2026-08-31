@@ -2621,6 +2621,270 @@ describe("managed actor-owned cross-page moves", () => {
     }
   });
 
+  it("replays rapid journal-boundary move commands against each accepted actor result", async () => {
+    setToasts([]);
+    const moving = { id: "moving", raw: "moving", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+      page("Oldest", "journals/oldest.md", "oldest-r1", [], "journal"),
+    ]);
+    managed();
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let calls = 0;
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
+      calls++;
+      if (calls === 1) await firstMayFinish;
+      if (request.source_path === "journals/today.md") {
+        return {
+          binding_generation: binding,
+          application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+          outcome: {
+            status: "committed" as const,
+            episode_id: request.episode_id,
+            batch_id: "rapid-one",
+            recovered: false,
+            source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+            destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+          },
+        };
+      }
+      expect(request.source_path).toBe("journals/older.md");
+      expect(request.destination_path).toBe("journals/oldest.md");
+      return {
+        binding_generation: binding,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+        outcome: {
+          status: "committed" as const,
+          episode_id: request.episode_id,
+          batch_id: "rapid-two",
+          recovered: false,
+          source: { page: page("Older", "journals/older.md", "older-r3", [], "journal"), revision: "older-r3" },
+          destination: { page: page("Oldest", "journals/oldest.md", "oldest-r2", [moving], "journal"), revision: "oldest-r2" },
+        },
+      };
+    });
+    let releaseAcknowledgement!: () => void;
+    const acknowledgementMayFinish = new Promise<void>((resolve) => {
+      releaseAcknowledgement = resolve;
+    });
+    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove")
+      .mockImplementation(async () => acknowledgementMayFinish);
+    try {
+      const first = moveBlockFeed("moving", 1);
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      const second = moveBlockFeed("moving", 1);
+      releaseFirst();
+      await expect(Promise.all([first, second])).resolves.toEqual(["crossed", "crossed"]);
+      expect(move).toHaveBeenCalledTimes(2);
+      expect(pageByName("Today")!.roots).toEqual([]);
+      expect(pageByName("Older")!.roots).toEqual([]);
+      expect(pageByName("Oldest")!.roots).toEqual(["moving"]);
+      expect(toasts().filter((toast) => toast.kind === "error")).toEqual([]);
+      expect(acknowledge).toHaveBeenCalledTimes(1);
+      releaseAcknowledgement();
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(2));
+      expect(acknowledge.mock.calls).toEqual([
+        [managedStorageRuntime.snapshot().applicationPageAdmission!.binding_generation, expect.any(String), "rapid-one"],
+        [managedStorageRuntime.snapshot().applicationPageAdmission!.binding_generation, expect.any(String), "rapid-two"],
+      ]);
+    } finally {
+      releaseAcknowledgement();
+      acknowledge.mockRestore();
+      move.mockRestore();
+    }
+  });
+
+  it("retries replay-evidence acknowledgement outside the serialized move lane", async () => {
+    const moving = { id: "moving", raw: "moving", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed" as const,
+        episode_id: request.episode_id,
+        batch_id: "retry-ack",
+        recovered: false,
+        source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+        destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+      },
+    }));
+    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove")
+      .mockRejectedValueOnce(new Error("transient one"))
+      .mockRejectedValueOnce(new Error("transient two"))
+      .mockResolvedValue(undefined);
+    try {
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      expect(pageByName("Older")!.roots).toEqual(["moving"]);
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(3));
+      expect(move).toHaveBeenCalledTimes(1);
+    } finally {
+      acknowledge.mockRestore();
+      move.mockRestore();
+    }
+  });
+
+  it("retires queued rapid moves when the graph binding changes", async () => {
+    const moving = { id: "moving", raw: "old graph", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let calls = 0;
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
+      calls++;
+      if (calls === 1) await firstMayFinish;
+      const replacementGraph = calls > 1;
+      return {
+        binding_generation: binding,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+        outcome: {
+          status: "committed" as const,
+          episode_id: request.episode_id,
+          batch_id: replacementGraph ? "new-graph-move" : "old-graph-move",
+          recovered: false,
+          source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+          destination: {
+            page: page(
+              "Older",
+              "journals/older.md",
+              "older-r2",
+              [replacementGraph
+                ? { id: "moving", raw: "replacement graph", collapsed: false, children: [] }
+                : moving],
+              "journal",
+            ),
+            revision: "older-r2",
+          },
+        },
+      };
+    });
+    try {
+      const first = moveBlockFeed("moving", 1);
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      const queued = moveBlockFeed("moving", 1);
+
+      resetStore();
+      const replacement = { id: "moving", raw: "replacement graph", collapsed: false, children: [] };
+      await loadFeed([
+        page("Today", "journals/today.md", "replacement-r1", [replacement], "journal"),
+        page("Older", "journals/older.md", "replacement-older-r1", [], "journal"),
+      ]);
+      managed();
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      expect(move).toHaveBeenCalledTimes(2);
+      expect(pageByName("Older")!.roots).toEqual(["moving"]);
+      expect(doc.byId.moving.raw).toBe("replacement graph");
+
+      releaseFirst();
+      await expect(Promise.all([first, queued])).resolves.toEqual(["none", "none"]);
+      expect(doc.byId.moving.raw).toBe("replacement graph");
+      expect(pageByName("Today")!.roots).toEqual([]);
+    } finally {
+      releaseFirst();
+      move.mockRestore();
+    }
+  });
+
+  it("starts a new graph acknowledgement lane while the old graph acknowledgement is stalled", async () => {
+    const moving = { id: "moving", raw: "old graph", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed" as const,
+        episode_id: request.episode_id,
+        batch_id: request.source_revision,
+        recovered: false,
+        source: { page: page("Today", "journals/today.md", `${request.source_revision}-next`, [], "journal"), revision: `${request.source_revision}-next` },
+        destination: {
+          page: page(
+            "Older",
+            "journals/older.md",
+            `${request.destination_revision}-next`,
+            [{ id: "moving", raw: doc.byId.moving.raw, collapsed: false, children: [] }],
+            "journal",
+          ),
+          revision: `${request.destination_revision}-next`,
+        },
+      },
+    }));
+    let releaseOldAcknowledgement!: () => void;
+    const oldAcknowledgement = new Promise<void>((resolve) => { releaseOldAcknowledgement = resolve; });
+    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove")
+      .mockImplementationOnce(async () => oldAcknowledgement)
+      .mockResolvedValue(undefined);
+    try {
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(1));
+
+      resetStore();
+      const replacement = { id: "moving", raw: "replacement graph", collapsed: false, children: [] };
+      await loadFeed([
+        page("Today", "journals/today.md", "replacement-r1", [replacement], "journal"),
+        page("Older", "journals/older.md", "replacement-older-r1", [], "journal"),
+      ]);
+      managed();
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(2));
+    } finally {
+      releaseOldAcknowledgement();
+      acknowledge.mockRestore();
+      move.mockRestore();
+    }
+  });
+
+  it("bounds a sustained rapid-move backlog while one actor command is pending", async () => {
+    const moving = { id: "moving", raw: "moving", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
+      await firstMayFinish;
+      return {
+        binding_generation: binding,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+        outcome: {
+          status: "committed" as const,
+          episode_id: request.episode_id,
+          batch_id: "bounded-first",
+          recovered: false,
+          source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+          destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+        },
+      };
+    });
+    try {
+      const commands = Array.from({ length: 257 }, () => moveBlockFeed("moving", 1));
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      await expect(commands.at(-1)).resolves.toBe("none");
+      expect(move).toHaveBeenCalledTimes(1);
+      releaseFirst();
+      await Promise.all(commands);
+    } finally {
+      releaseFirst();
+      move.mockRestore();
+    }
+  });
+
   it("routes a contiguous journal selection through one ordered actor transaction", async () => {
     const t1 = { id: "today", raw: "today", collapsed: false, children: [] };
     const o1 = { id: "older-1", raw: "older 1", collapsed: false, children: [] };

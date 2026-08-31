@@ -9476,6 +9476,25 @@ html.row-reorder-dragging * {
   overflow: hidden;
 }
 
+.pdf-route-pane {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  border-left: 0;
+}
+
+.pane-route-error {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+}
+
 /* Android/iOS presents a PDF as a deliberate full-width takeover instead of
    shrinking the notes pane beside an over-wide fixed reader. */
 .pdf-pane-mobile {
@@ -9514,6 +9533,8 @@ html.row-reorder-dragging * {
   display: flex;
   flex-direction: column;
   height: 100%;
+  container-type: inline-size;
+  container-name: pdfviewer;
   color: var(--pdf-local-text);
   background: var(--pdf-container-bg);
 }
@@ -9542,7 +9563,11 @@ html.row-reorder-dragging * {
   --pdf-local-text: #e8eaed;
 }
 
-.pdf-viewer[data-theme="dark"] .pdf-page > :is(canvas, .textLayer) {
+.pdf-viewer[data-theme="dark"] .pdf-page :is(.canvasWrapper, .textLayer) {
+  filter: invert(1);
+}
+
+.pdf-viewer[data-theme="dark"] .pdf-page-view-host > canvas[data-pdf-tile-key] {
   filter: invert(1);
 }
 
@@ -9578,8 +9603,6 @@ html.row-reorder-dragging * {
   padding: 0 12px;
   border-bottom: 1px solid var(--border-color);
   background: var(--pdf-toolbar-bg);
-  container-type: inline-size;
-  container-name: pdftoolbar;
 }
 
 .pdf-title {
@@ -9601,8 +9624,8 @@ html.row-reorder-dragging * {
   min-width: 0;
 }
 
-/* Close leads the fixed control cluster, so a constrained reader can never
-   clip its only escape action from the far edge. */
+/* Close terminates the fixed control cluster, matching its conventional
+   discoverable position while remaining visible at the protected far edge. */
 .pdf-close-btn {
   flex: 0 0 auto;
 }
@@ -9715,11 +9738,11 @@ html.row-reorder-dragging * {
 /* The reader follows the topbar's container-query overflow pattern: the
    lower-priority tools remain available from the existing More menu while the
    pager, Find, zoom +/- and Close stay in the toolbar. */
-@container pdftoolbar (max-width: 520px) {
+@container pdfviewer (max-width: 520px) {
   .pdf-toolbar .pdf-overflow-action {
     display: none;
   }
-  .pdf-toolbar .pdf-settings-overflow {
+  .pdf-settings-overflow {
     display: grid;
   }
 }
@@ -9932,18 +9955,83 @@ html.row-reorder-dragging * {
   background: var(--pdf-page-bg);
 }
 
+.pdf-page-view-host,
+.pdf-page-view-host > .pdfjs-page-view {
+  position: absolute;
+  inset: 0;
+}
+
+.pdf-page-view-host .canvasWrapper {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+
+.pdf-page-view-host .canvasWrapper canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  contain: content;
+}
+
+.pdf-page-view-host > canvas[data-pdf-tile-key] {
+  z-index: 1;
+  display: block;
+  contain: strict;
+}
+
+.pdf-page-view-host .textLayer {
+  z-index: 2;
+}
+
 .pdf-page .textLayer {
   position: absolute;
   inset: 0;
   overflow: hidden;
   opacity: 1;
   line-height: 1;
+  text-align: initial;
+  transform-origin: 0 0;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  z-index: 2;
+}
+
+.pdf-page .textLayer :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+}
+
+.pdf-page .textLayer ::selection {
+  background: rgba(0, 0, 255, 0.25);
+  background: color-mix(in srgb, AccentColor, transparent 75%);
+}
+
+.pdf-page .textLayer .endOfContent {
+  position: absolute;
+  display: block;
+  inset: 100% 0 0;
+  cursor: default;
+  user-select: none;
+}
+
+.pdf-page .textLayer.selecting .endOfContent {
+  top: 0;
 }
 
 .pdf-hl-layer {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  z-index: 3;
 }
 
 .pdf-hl {

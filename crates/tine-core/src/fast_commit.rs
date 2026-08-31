@@ -1184,13 +1184,11 @@ mod tests {
     // exactly that; by v0.3.0 the same condition is `CorruptSegment`, because
     // `specs/notes/2026-08-10-storage-journal-v2-frontier-spec.md` requires a
     // partially declared frame to fail closed byte-for-byte rather than let a
-    // damaged length field silently erase a durable commit. The migration that
-    // reconciles the two — non-mutating v1 inspection, then rollover to v2 — is
-    // the in-flight lane. Un-ignore it there; do not "fix" it by loosening the
-    // dependency. This particular caller is the unwired latency prototype, so
-    // nothing a user can run depends on the answer today.
-    #[ignore = "GH #308: v1 torn-tail contract superseded by the journal-v2 fail-closed spec; \
-                un-ignore with the v2 migration"]
+    // damaged length field silently erase a durable commit. Pre-0.7 Managed
+    // Storage has one current fail-closed journal format and no migration or
+    // compatibility reader. This particular caller is the unwired latency
+    // prototype, so nothing a user can run depends on the retired behavior.
+    #[ignore = "GH #308: retired torn-tail prototype conflicts with the one current fail-closed journal format"]
     #[test]
     fn a_torn_final_append_is_recovered_without_losing_earlier_commits() {
         let fixture = GraphFixture::build(

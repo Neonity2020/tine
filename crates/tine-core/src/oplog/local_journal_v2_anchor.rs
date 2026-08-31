@@ -1,7 +1,7 @@
 use tine_storage::formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION;
 use tine_storage::{
     ContentDigest, LineageDigest, LocalJournalError, LocalJournalFrame, LocalJournalPayloadKind,
-    LocalJournalSegmentV2, LocalJournalSegmentV2Selection, LockedLocalJournalV1Segment,
+    LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
 };
 use uuid::Uuid;
 
@@ -12,85 +12,35 @@ pub(crate) const MANAGED_LOCAL_ANCHOR_V2_MAGIC: &[u8; 8] = b"TINEANC2";
 pub(crate) const MANAGED_LOCAL_ANCHOR_V2_SCHEMA: u32 = 2;
 pub(crate) const MANAGED_LOCAL_ANCHOR_V2_BYTES: usize = 1024;
 
-/// The durable protocol of the active managed-local journal segment.
-///
-/// This stays closed so the successful-append durability proof is selected by
-/// the physical protocol, never by a caller-provided numeric expectation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ManagedLocalJournalProtocol {
-    LegacyV1,
-    V2,
-}
-
-impl ManagedLocalJournalProtocol {
-    pub(crate) const fn expected_successful_append_data_syncs(self) -> u64 {
-        match self {
-            Self::LegacyV1 => 1,
-            Self::V2 => 2,
-        }
-    }
-}
-
-/// One already-open managed-local journal, retained in the protocol-specific
-/// form that established its physical authority.
-pub(crate) enum ManagedLocalJournal<K> {
-    LegacyV1(LockedLocalJournalV1Segment<K>),
-    V2 {
-        selector_generation: u64,
-        segment: LocalJournalSegmentV2<K>,
-    },
+/// One already-open managed-local journal in the single current pre-0.7 format.
+pub(crate) struct ManagedLocalJournal<K> {
+    selector_generation: u64,
+    segment: LocalJournalSegmentV2<K>,
 }
 
 impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
-    #[cfg(test)]
-    pub(crate) fn from_locked_v1(segment: LockedLocalJournalV1Segment<K>) -> Self {
-        Self::LegacyV1(segment)
-    }
-
-    pub(crate) fn from_open_v2(
-        selector_generation: u64,
-        segment: LocalJournalSegmentV2<K>,
-    ) -> Self {
-        Self::V2 {
+    pub(crate) fn from_open(selector_generation: u64, segment: LocalJournalSegmentV2<K>) -> Self {
+        Self {
             selector_generation,
             segment,
         }
     }
 
-    pub(crate) const fn protocol(&self) -> ManagedLocalJournalProtocol {
-        match self {
-            Self::LegacyV1(_) => ManagedLocalJournalProtocol::LegacyV1,
-            Self::V2 { .. } => ManagedLocalJournalProtocol::V2,
-        }
-    }
-
     pub(crate) fn device_id(&self) -> Uuid {
-        match self {
-            Self::LegacyV1(segment) => segment.device_id(),
-            Self::V2 { segment, .. } => segment.selection().device_id(),
-        }
+        self.segment.selection().device_id()
     }
 
     pub(crate) fn base_sequence(&self) -> u64 {
-        match self {
-            Self::LegacyV1(segment) => segment.base_sequence(),
-            Self::V2 { segment, .. } => segment.selection().base_sequence(),
-        }
+        self.segment.selection().base_sequence()
     }
 
     pub(crate) fn next_sequence(&self) -> u64 {
-        match self {
-            Self::LegacyV1(segment) => segment.next_sequence(),
-            Self::V2 { segment, .. } => segment.next_sequence(),
-        }
+        self.segment.next_sequence()
     }
 
     #[cfg(test)]
     pub(crate) fn committed_bytes(&self) -> u64 {
-        match self {
-            Self::LegacyV1(segment) => segment.committed_bytes(),
-            Self::V2 { segment, .. } => segment.committed_bytes(),
-        }
+        self.segment.committed_bytes()
     }
 
     /// The selector generation that authenticated this open schema-2 tuple.
@@ -98,29 +48,28 @@ impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
     /// Callers use this only to bind an already-open journal back to the
     /// authority generation re-enumerated immediately before successor
     /// publication.
-    pub(crate) const fn v2_selector_generation(&self) -> Option<u64> {
-        match self {
-            Self::LegacyV1(_) => None,
-            Self::V2 {
-                selector_generation,
-                ..
-            } => Some(*selector_generation),
-        }
+    pub(crate) const fn selector_generation(&self) -> u64 {
+        self.selector_generation
     }
 
     #[cfg(test)]
     pub(crate) const fn expected_successful_append_data_syncs(&self) -> u64 {
-        self.protocol().expected_successful_append_data_syncs()
+        2
     }
 
     pub(crate) fn replay(
         &self,
         visit: impl FnMut(LocalJournalFrame<K>),
     ) -> Result<u64, LocalJournalError> {
-        match self {
-            Self::LegacyV1(segment) => segment.replay(visit),
-            Self::V2 { segment, .. } => segment.replay(visit),
-        }
+        self.segment.replay(visit)
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        payload_kind: K,
+        payload: &[u8],
+    ) -> Result<tine_storage::LocalJournalAppend, tine_storage::LocalJournalAppendError> {
+        self.segment.append(payload_kind, payload)
     }
 }
 
@@ -148,18 +97,15 @@ const RESERVED_OFFSET: usize = SEGMENT_NAME_OFFSET + SEGMENT_NAME_CAPACITY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedLocalAnchorEncoding {
-    LegacyV1,
-    SchemaV2,
-    UnknownTineEncoding,
+    Current,
+    Unrecognized,
 }
 
 pub(crate) fn classify_managed_local_anchor(bytes: &[u8]) -> ManagedLocalAnchorEncoding {
     if bytes.starts_with(MANAGED_LOCAL_ANCHOR_V2_MAGIC) {
-        ManagedLocalAnchorEncoding::SchemaV2
-    } else if bytes.starts_with(b"TINE") {
-        ManagedLocalAnchorEncoding::UnknownTineEncoding
+        ManagedLocalAnchorEncoding::Current
     } else {
-        ManagedLocalAnchorEncoding::LegacyV1
+        ManagedLocalAnchorEncoding::Unrecognized
     }
 }
 
@@ -303,7 +249,7 @@ impl ManagedLocalGenerationAnchorV2 {
         expected_lineage_digest: LineageDigest,
         expected_device_id: Uuid,
     ) -> Result<Self, String> {
-        if classify_managed_local_anchor(bytes) != ManagedLocalAnchorEncoding::SchemaV2 {
+        if classify_managed_local_anchor(bytes) != ManagedLocalAnchorEncoding::Current {
             return Err("managed-local anchor is not schema 2".into());
         }
         if bytes.len() != MANAGED_LOCAL_ANCHOR_V2_BYTES {
@@ -558,8 +504,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use cap_std::{ambient_authority, fs::Dir};
-    use serde::Deserialize;
-    use tine_storage::{formats::LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, LocalJournalSegment};
+    use tine_storage::formats::LOCAL_JOURNAL_SEGMENT_HEADER_BYTES;
 
     use super::*;
     use crate::oplog::hot_engine::ManagedLocalJournalPayloadKind;
@@ -630,7 +575,7 @@ mod tests {
         );
         assert_eq!(
             classify_managed_local_anchor(&bytes),
-            ManagedLocalAnchorEncoding::SchemaV2
+            ManagedLocalAnchorEncoding::Current
         );
     }
 
@@ -669,7 +614,7 @@ mod tests {
         unknown[..8].copy_from_slice(b"TINEANC3");
         assert_eq!(
             classify_managed_local_anchor(&unknown),
-            ManagedLocalAnchorEncoding::UnknownTineEncoding
+            ManagedLocalAnchorEncoding::Unrecognized
         );
     }
 
@@ -738,123 +683,9 @@ mod tests {
         assert!(validate_checkpoint_batch_binding(1, 2, Some(batch)).is_err());
     }
 
-    #[derive(Deserialize)]
-    struct LegacySchema1Anchor {
-        schema_version: u32,
-        generation: u64,
-        workspace_id: WorkspaceId,
-        lineage_digest: LineageDigest,
-        device_id: Uuid,
-        checkpoint: ManagedLocalDrainCheckpoint,
-        accepted_batch_id: BatchId,
-    }
-
     #[test]
-    fn old_schema1_decoder_refuses_schema2_bytes() {
-        let bytes = fixture().encode().unwrap();
-        assert!(postcard::from_bytes::<LegacySchema1Anchor>(&bytes).is_err());
-    }
-
-    #[test]
-    fn managed_local_journal_wraps_a_locked_legacy_v1_segment() {
-        let directory = TemporaryCapabilityDirectory::new("legacy-v1");
-        let device_id = Uuid::from_u128(0x1200);
-        let base_sequence = 17;
-        let expected = LocalJournalFrame::new(
-            device_id,
-            base_sequence,
-            ManagedLocalJournalPayloadKind::RecordV1,
-            b"legacy-v1-frame".to_vec(),
-        );
-        let append = {
-            let (mut segment, recovery) = LocalJournalSegment::open_from_sequence(
-                &directory.dir,
-                "legacy-v1.journal",
-                device_id,
-                base_sequence,
-            )
-            .unwrap();
-            assert_eq!(recovery.frames_recovered, 0);
-            let append = segment
-                .append(expected.payload_kind(), expected.payload())
-                .unwrap();
-            drop(segment);
-            append
-        };
-
-        let inspector = LockedLocalJournalV1Segment::inspect(
-            &directory.dir,
-            "legacy-v1.journal",
-            device_id,
-            base_sequence,
-        )
-        .unwrap();
-        let journal = ManagedLocalJournal::from_locked_v1(inspector);
-
-        assert_eq!(journal.protocol(), ManagedLocalJournalProtocol::LegacyV1);
-        assert_eq!(journal.device_id(), device_id);
-        assert_eq!(journal.base_sequence(), base_sequence);
-        assert_eq!(journal.next_sequence(), base_sequence + 1);
-        assert_eq!(
-            journal.committed_bytes(),
-            expected.encode().unwrap().len() as u64
-        );
-        assert_eq!(journal.expected_successful_append_data_syncs(), 1);
-        assert_eq!(
-            append.data_durability_syncs,
-            journal.expected_successful_append_data_syncs()
-        );
-
-        let mut replayed = Vec::new();
-        assert_eq!(journal.replay(|frame| replayed.push(frame)).unwrap(), 1);
-        assert_eq!(replayed, vec![expected]);
-    }
-
-    #[test]
-    fn every_legacy_suffix_through_fifty_one_bytes_refuses_without_changing_bytes() {
-        let directory = TemporaryCapabilityDirectory::new("legacy-v1-suffixes");
-        let device_id = Uuid::from_u128(0x1250);
-        let name = "legacy-v1-suffixes.journal";
-        {
-            let (mut segment, _) = LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open(
-                &directory.dir,
-                name,
-                device_id,
-            )
-            .unwrap();
-            segment
-                .append(
-                    ManagedLocalJournalPayloadKind::RecordV1,
-                    b"complete legacy frame",
-                )
-                .unwrap();
-        }
-        let complete = fs::read(directory.root.join(name)).unwrap();
-        for suffix_bytes in 1..=51 {
-            let mut bytes = complete.clone();
-            bytes.extend(vec![0xa5; suffix_bytes]);
-            fs::write(directory.root.join(name), &bytes).unwrap();
-            assert!(
-                LockedLocalJournalV1Segment::<ManagedLocalJournalPayloadKind>::inspect(
-                    &directory.dir,
-                    name,
-                    device_id,
-                    0,
-                )
-                .is_err(),
-                "legacy suffix length {suffix_bytes} unexpectedly became appendable"
-            );
-            assert_eq!(
-                fs::read(directory.root.join(name)).unwrap(),
-                bytes,
-                "legacy suffix length {suffix_bytes} was modified while refusing"
-            );
-        }
-    }
-
-    #[test]
-    fn managed_local_journal_wraps_a_reopened_v2_segment() {
-        let directory = TemporaryCapabilityDirectory::new("v2");
+    fn managed_local_journal_wraps_a_reopened_current_segment() {
+        let directory = TemporaryCapabilityDirectory::new("current");
         let device_id = Uuid::from_u128(0x3400);
         let base_sequence = 23;
         let selection = LocalJournalSegmentV2Selection::new(
@@ -889,10 +720,9 @@ mod tests {
         let (segment, recovery) =
             LocalJournalSegmentV2::open_selected(&directory.dir, &selection).unwrap();
         assert_eq!(recovery.frames_recovered, 1);
-        let journal = ManagedLocalJournal::from_open_v2(7, segment);
+        let journal = ManagedLocalJournal::from_open(7, segment);
 
-        assert_eq!(journal.protocol(), ManagedLocalJournalProtocol::V2);
-        assert_eq!(journal.v2_selector_generation(), Some(7));
+        assert_eq!(journal.selector_generation(), 7);
         assert_eq!(journal.device_id(), device_id);
         assert_eq!(journal.base_sequence(), base_sequence);
         assert_eq!(journal.next_sequence(), base_sequence + 1);

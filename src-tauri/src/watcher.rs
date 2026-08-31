@@ -3016,6 +3016,7 @@ mod tests {
             provider_pending: 0,
             provider_runnable: false,
             search_index_building: false,
+            move_episode_cleanup_pending: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,

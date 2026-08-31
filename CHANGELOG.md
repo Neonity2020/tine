@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **PDFs are now ordinary pane tabs instead of a separate global side pane.**
+  Opening a graph PDF on desktop preserves the source and uses one reusable
+  companion pane; the PDF tab can be moved into any existing pane, split, or
+  quadrant, and its Notes action opens the `hls__` page in the structural
+  companion. Workspaces restore the layout and each PDF tab's page/zoom, while
+  legacy dedicated-pane sessions migrate without losing their existing panes.
+  Android keeps one route surface and Back returns through Notes, PDF, and the
+  source page in order.
+
 - **Alt+click opens an internal page or block link in the other pane.**
   After the unified click contract moved Ctrl/Cmd+click to background tabs,
   ordinary links had no mouse+modifier route to a pane; Alt+click is that
@@ -30,13 +39,69 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   failed restores retain their cause and can be re-run, while dismissing the
   warning or closing the panel never records a deletion decision.
 
+### Changed
+
+- **PDF rendering now uses PDF.js's maintained page-view lifecycle under one
+  window-wide admission and canvas-memory budget.** Visible/focused pages win
+  scheduling, stale work is cancelled, evicted views synchronously release
+  their backing stores, and zoom above 300% sharpens only visible clipped tiles
+  while retaining an aligned lower-resolution fallback. Area highlights use a
+  dedicated clipped capture, and a tab cannot multiply the old per-view
+  resource ceilings. (GH #393)
+
 ### Fixed
+
+- **A reported switch between Direct Files and Managed Storage now survives a
+  crash at the selector boundary.** App-private storage-mode bindings use the
+  same certified durable create/replace/retire primitive as other authority
+  names, including Windows write-through retirement and Android parent-entry
+  flushing. Once activation reports Managed active, a stale Direct selector can
+  no longer reappear after power loss and take precedence at the next startup.
+
+- **Rapid Managed Storage moves no longer reuse a stale source page and then
+  flood “missing or foreign root” errors.** Repeated cross-day commands now
+  resolve one at a time against the preceding accepted move, while the actor's
+  temporary response-replay files are retired after the committed page pair is
+  installed. A native journey drives 120 uninterrupted move commands across
+  four journal-day boundaries and compares that pressure with a durable
+  20-block cross-page cut/paste.
+
+- **Direct Files saves now use durable write-through name publication on
+  Windows.** Creating, replacing, restoring, and retiring the sole-authority
+  Markdown/Org name all cross the certified typed storage boundary, so a power
+  loss cannot be acknowledged merely because a non-write-through rename was
+  briefly visible.
+
+- **A second device can join a synchronized graph that contains an honest
+  duplicate-name backup file.** A fresh scan may choose the earlier-sorting
+  backup even though the shared history already owns the canonical page path.
+  Join now accepts that shape only when the provider-owned exact file is still
+  present with exactly the shared semantics and both physical files decode to
+  the same page identity; the extra file remains untouched. The Android
+  app-UID journey now covers activation, share, a distinct-device join and
+  reopen, and the real graceful Return-to-Direct-Files composition.
+
+- **Managed Storage has one production actor and enrollment path.** Dead
+  pre-clean-runtime mutation, provider, cursor-join, and handoff state has been
+  removed from the retained actor, and a source guard prevents those fields or
+  types from returning to the production prefix of `sync_runtime.rs`.
+
+- **Managed Storage pages remain editable after heavy use evicts them from the
+  in-memory document cache.** A cold point load now reconstructs the page from
+  its accepted history instead of mistaking the cache miss for an untouched
+  page. Retained-runtime recovery also reports content-free native sub-stages
+  and has a tighter real-corpus performance gate.
 
 - **A remote `http:`/`https:` link whose URL ends in `.pdf` now opens in the
   browser like every other external link, instead of being captured by Tine's
   PDF viewer.** Only graph/local asset PDF references and their highlight
   pages enter the viewer; an image-syntax remote PDF renders as an ordinary
   external link as well rather than a broken image frame. (GH #442)
+
+- **The PDF reader's Close control is now the terminal toolbar action.** It
+  stays at the conventional far-right edge with an explicit accessible label,
+  instead of reading like another tool in the middle of the control cluster
+  (GH #443).
 
 - **Bounded managed block-referrer panels now show the same document-order
   prefix and exact result count as Direct Files.** The SQLite-backed route
@@ -862,7 +927,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **No more white frame around the page after clicking empty space and pressing a key** (GH #345). Clicking an empty spot of the main content focused the page scroller, and the next keypress flipped the browser's focus heuristic, painting its default white frame around the whole content area. Only that default frame is suppressed — the pane-select ring and the usual focus cues on buttons and other controls are unchanged.
 
-- **Managed-storage block moves across journal-day boundaries now stay immediate and keep keyboard focus.** The source and destination publish as one durable foreground transaction, so archive/SQLite derivatives no longer dim or stall the interface before the block appears on the adjacent day. The foreground path is graph-size invariant at 100 and 10,000 pages, and rapid queued edits use exact pending-projection indexes instead of repeatedly scanning the journal prefix. Multi-page foreground prefixes now also drain from accepted state instead of letting later queued catalog heads block an earlier projection, and a peer move no longer stalls merely because this device concurrently advanced an unrelated page in its catalog. Page and namespace renames likewise use exact SQLite name/range lookups instead of enumerating every unrelated graph page before the indexed reference rewrite. Accepted saves advance authenticated roots by path-copying only changed documents and the new batch, provider-head publication reads an incremental frontier-tip set, and clean projection attach decodes only current path heads; none of these routine boundaries now clone or replay the graph/session history.
+- **Managed-storage block moves across journal-day boundaries now stay immediate and keep keyboard focus.** The source and destination publish as one durable foreground transaction, so archive/SQLite derivatives no longer dim or stall the interface before the block appears on the adjacent day. The foreground path is graph-size invariant at 100 and 10,000 pages, and rapid queued edits use exact pending-projection indexes instead of repeatedly scanning the journal prefix. Response-replay cleanup now runs on its own bounded retry lane, so a slow acknowledgement cannot stall the next move; actor cleanup remains crash-safe, bounded, and explicitly runnable. Multi-page foreground prefixes now also drain from accepted state instead of letting later queued catalog heads block an earlier projection, and a peer move no longer stalls merely because this device concurrently advanced an unrelated page in its catalog. Page and namespace renames likewise use exact SQLite name/range lookups instead of enumerating every unrelated graph page before the indexed reference rewrite. Accepted saves advance authenticated roots by path-copying only changed documents and the new batch, provider-head publication reads an incremental frontier-tip set, and clean projection attach decodes only current path heads; none of these routine boundaries now clone or replay the graph/session history.
 
 ## [0.6.94] - 2026-08-22
 

@@ -1196,9 +1196,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/settings.rs", "fs.write", 1),
         ("src-tauri/src/settings.rs", "open.create_new", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 2),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.rename", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 4),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 1),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.rename", 4),
         ("src-tauri/src/sync_runtime.rs", "open.create_new", 1),
     ]
     .into_iter()
@@ -1321,7 +1322,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("put_complete", 2),
         ("provider_retire_original_into_placeholder", 1),
         ("write_config", 9),
-        ("atomic_update", 5),
+        ("atomic_update", 6),
         ("create_graph", 0),
         ("create_demo_graph", 1),
         ("reserve_restore_recovery", 2),
@@ -1504,7 +1505,17 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
-            2,
+            1,
+        ),
+        (
+            "crates/tine-core/src/oplog/local_journal_v2_anchor.rs",
+            "journal.fast_append",
+            1,
+        ),
+        (
+            "crates/tine-core/src/oplog/local_journal_v2_anchor.rs",
+            "journal.managed_append",
+            1,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
@@ -1566,10 +1577,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.8.10\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.0\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "2f23010673a23d013608683e9ff6ebf4f4a624b926ec936590026dd0979db377",
+        "a424609af57c34813e0c612bae72c1961de4d17d3dced85eaa88997355965677",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

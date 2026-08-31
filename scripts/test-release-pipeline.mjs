@@ -77,6 +77,10 @@ const issue295Scenario = fs.readFileSync(
   path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
   "utf8"
 );
+const windowsManagedScenario = fs.readFileSync(
+  path.join(process.cwd(), "scripts/e2e-windows-managed-storage.mjs"),
+  "utf8"
+);
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
 const iosConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), "src-tauri/tauri.ios.conf.json"), "utf8"));
@@ -183,6 +187,32 @@ assert.match(
 assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(uiE2eWorkflow, /actions\/cache\/restore@v4[\s\S]*?windows-gh295-candidate-\$\{\{ inputs\.linux_scenario \}\}/);
 assert.match(uiE2eWorkflow, /actions\/cache\/save@v4[\s\S]*?candidate\/target\/release\/tine\.exe/);
+assert.match(
+  uiE2eWorkflow,
+  /managed_current_only:[\s\S]*?inputs\.windows_scenario == 'windows-managed-storage' && inputs\.managed_current_only != 'true'[\s\S]*?E2E_MANAGED_CURRENT_ONLY: \$\{\{ inputs\.managed_current_only \}\}/,
+  "the focused Windows managed-storage lane cannot compare current-only activation and reopen without restoring the historical binary"
+);
+assert.match(uiE2eWorkflow, /windows-smoke:[\s\S]*?timeout-minutes: 75/);
+assert.match(
+  uiE2eWorkflow,
+  /E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "2700000"/,
+  "the Windows managed-storage activation deadline can outrun its scenario failure capsule"
+);
+assert.match(
+  windowsManagedScenario,
+  /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
+  "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
+);
+assert.match(
+  windowsManagedScenario,
+  /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
+  "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
+);
+assert.match(
+  windowsManagedScenario,
+  /\.switcher-row:not\(\.block-result\)[\s\S]*?kind === "page" \|\| kind === "journal"[\s\S]*?name === title/,
+  "reporter-scale navigation must choose the exact page result, not a block-search hit containing its title"
+);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
@@ -575,6 +605,11 @@ assert.match(
 );
 assert.match(
   ciWorkflow,
+  /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- android-ui-runtime-pdf-routes/,
+  "manual CI does not expose the isolated PDF-route Android proof scope"
+);
+assert.match(
+  ciWorkflow,
   /pull_request:[\s\S]*?paths-ignore:[\s\S]*?"\*\*\/\*\.md"/,
   "docs-only pull requests still start app validation"
 );
@@ -822,7 +857,7 @@ assert.match(
 );
 assert.equal(
   yamlScalar(androidManagedRuntime, "name", 4),
-  "Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen"
+  "Android runtime / managed activation, share, join, reopen, and Return to Direct Files"
 );
 assert.equal(
   yamlScalar(androidManagedRuntime, "if", 4),
@@ -853,7 +888,12 @@ assert.equal(
 );
 assert.equal(
   yamlScalar(androidUiRuntime, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205')"
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes')"
+);
+assert.match(
+  yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs").join("\n"),
+  /inputs\.scope == 'android-ui-runtime-pdf-routes'[\s\S]*?'pdf-routes'/,
+  "focused PDF-route Android proof scope must select only the native PDF Back journey"
 );
 assert.doesNotMatch(
   androidUiRuntime.join("\n"),

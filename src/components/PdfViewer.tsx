@@ -3,9 +3,11 @@ import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
-import { closePdf, pushToast, isConflicted, activePane, requestBlockReferences, type PdfTarget } from "../ui";
+import { pushToast, isConflicted, requestBlockReferences, type PdfTarget } from "../ui";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
 import { openPage, openPageAtBlock } from "../router";
+import type { PdfRoute } from "../router";
+import { pdfNavigationIntent } from "../pdfNavigation";
 import { areaHighlightPosition, hlsPageName, rectInPageSpace, rectWithSourceSpace, type PdfPageDimensions } from "../pdf";
 import { decideWheelZoomGesture, type WheelZoomGestureState } from "../zoom";
 import type { Highlight, Rect } from "../types";
@@ -18,6 +20,17 @@ import {
   trackPdfMutation,
   type PdfOwnership,
 } from "../pdfOwnership";
+import {
+  PdfPageViewRenderer,
+  TINE_PDF_LOADING_OPTIONS,
+  pdfPageViewScaleToTineScale,
+  type DirectPdfPageView,
+} from "../pdfRenderer";
+import {
+  PDF_RENDERING_FINISHED,
+  PDF_RENDERING_RUNNING,
+  PdfRenderCoordinator,
+} from "../pdfRenderCoordinator";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -136,19 +149,17 @@ function PdfOutlineTree(props: {
 const MAX_PDF_BYTES = 256 * 1024 * 1024;
 const MAX_PDF_PAGES = 5000;
 const MAX_PAGE_DIMENSION = 14_400; // PDF points: 200 inches at 72 dpi.
-const MAX_CANVAS_DIMENSION = 16_384;
 const MAX_CANVAS_PIXELS = isMobilePlatform ? 8_388_608 : 16_777_216;
 // Canvas backing stores are normally 4-byte RGBA. Bound the aggregate rather
 // than counting pages: at high zoom one page can be far larger than 24 ordinary
 // fit-width pages. Mobile keeps at most ~64 MiB; desktop ~192 MiB.
 export const PDF_CANVAS_CACHE_PIXEL_BUDGET = isMobilePlatform ? 16_777_216 : 50_331_648;
-const PDF_CANVAS_CACHE_PAGE_CAP = isMobilePlatform ? 6 : 12;
+const PDF_RENDER_COORDINATOR = new PdfRenderCoordinator(
+  PDF_CANVAS_CACHE_PIXEL_BUDGET,
+  MAX_CANVAS_PIXELS,
+);
 const PDF_FAST_SCROLL_PX_PER_MS = 2.5;
 const PDF_SCROLL_SETTLE_MS = 180;
-const PDF_TEXT_SETTLE_MS = 220;
-const PDF_RENDER_INTERACTIVE = 0;
-const PDF_RENDER_VIEWPORT = 1;
-const PDF_RENDER_PREFETCH = 2;
 export const PDF_FIND_TEXT_CACHE_BYTES = isMobilePlatform ? 4 * 1024 * 1024 : 8 * 1024 * 1024;
 export const PDF_FIND_PAGE_TEXT_BYTES = 1024 * 1024;
 export const PDF_FIND_MATCH_CAP = 10_000;
@@ -167,22 +178,6 @@ interface Pending {
   text: string;
 }
 
-type PdfRenderPriority =
-  | typeof PDF_RENDER_INTERACTIVE
-  | typeof PDF_RENDER_VIEWPORT
-  | typeof PDF_RENDER_PREFETCH;
-
-interface PdfRenderRequest {
-  page: number;
-  scale: number;
-  layout: number;
-  priority: PdfRenderPriority;
-  sequence: number;
-  cancelled: boolean;
-  promise: Promise<void>;
-  resolve: () => void;
-}
-
 interface PendingArea {
   page: number;
   wrap: HTMLElement;
@@ -194,22 +189,52 @@ interface PendingArea {
  * that identity: page/highlight changes within one asset stay reactive, while
  * switching assets still tears down every document-local cache and pdf.js task.
  */
-export function KeyedPdfViewer(props: { target: () => PdfTarget | null }): JSX.Element {
+export function KeyedPdfViewer(props: {
+  target?: () => PdfTarget | null;
+  route?: () => PdfRoute;
+  owner?: () => PdfOwnership | null;
+  focused?: () => boolean;
+  onClose?: () => void;
+  onOpenNotes?: (block?: string) => void;
+  onViewState?: (state: { page: number; scale: number }) => void;
+}): JSX.Element {
+  const resolvedTarget = (): PdfTarget | null => {
+    const legacy = props.target?.();
+    if (legacy) return legacy;
+    const route = props.route?.();
+    const owner = props.owner?.();
+    if (!route || !owner) return null;
+    const intent = pdfNavigationIntent(route.viewId)();
+    return {
+      filename: route.filename,
+      label: route.label,
+      owner,
+      page: intent?.page ?? route.page,
+      ...(route.scale !== undefined ? { scale: route.scale } : {}),
+      ...(intent?.highlightId ? { highlightId: intent.highlightId } : {}),
+    };
+  };
   const resourceKey = () => {
-    const target = props.target();
-    return target ? `${pdfOwnershipKey(target.owner)}:${target.filename}` : null;
+    const target = resolvedTarget();
+    const route = props.route?.();
+    return target ? `${pdfOwnershipKey(target.owner)}:${route?.viewId ?? target.filename}` : null;
   };
   return (
     <Show when={resourceKey()} keyed>
       {(_key) => {
-        const target = props.target()!;
+        const target = resolvedTarget()!;
         return (
           <PdfViewer
             filename={target.filename}
-            label={props.target()?.label ?? target.filename}
+            label={resolvedTarget()?.label ?? target.filename}
             owner={target.owner}
-            page={props.target()?.page}
-            navigation={props.target}
+            page={resolvedTarget()?.page}
+            scale={resolvedTarget()?.scale}
+            navigation={resolvedTarget}
+            focused={props.focused}
+            onClose={props.onClose}
+            onOpenNotes={props.onOpenNotes}
+            onViewState={props.onViewState}
           />
         );
       }}
@@ -222,7 +247,12 @@ export function PdfViewer(props: {
   label: string;
   owner: PdfOwnership;
   page?: number;
+  scale?: number;
   navigation?: () => PdfTarget | null;
+  focused?: () => boolean;
+  onClose?: () => void;
+  onOpenNotes?: (block?: string) => void;
+  onViewState?: (state: { page: number; scale: number }) => void;
 }): JSX.Element {
   const owner = props.owner;
   const instanceStem = `pdf-viewer-${createUniqueId()}`;
@@ -230,6 +260,7 @@ export function PdfViewer(props: {
   const highlightMenuLayerId = `${instanceStem}-highlight-menu`;
   const settingsLayerId = `${instanceStem}-settings`;
   const outlineLayerId = `${instanceStem}-outline`;
+  const surfaceLayerId = `${instanceStem}-surface`;
   let viewerRootEl: HTMLDivElement | undefined;
   let scrollRef!: HTMLDivElement;
   let findTriggerEl: HTMLButtonElement | undefined;
@@ -240,7 +271,7 @@ export function PdfViewer(props: {
   let outlineTriggerEl: HTMLButtonElement | undefined;
   let outlineRootEl: HTMLDivElement | undefined;
   const pageEls: Record<number, HTMLDivElement> = {};
-  const textLayers: Record<number, HTMLDivElement> = {};
+  const pageViewHosts: Record<number, HTMLDivElement> = {};
   const hlLayers: Record<number, HTMLDivElement> = {};
   const [highlights, setHighlights] = createSignal<Highlight[]>([]);
   // The create-highlight popup (no `id`) OR the edit popup for an existing
@@ -293,6 +324,8 @@ export function PdfViewer(props: {
   // preserving externally-added highlights.
   let baseIds: string[] = [];
   let pdfDoc: pdfjs.PDFDocumentProxy | null = null;
+  let pageRenderer: PdfPageViewRenderer | null = null;
+  const pageMounts: Partial<Record<number, Promise<DirectPdfPageView | null>>> = {};
   let disposed = false;
   let navigationToken = 0;
   let activeHighlightId: string | undefined;
@@ -334,60 +367,25 @@ export function PdfViewer(props: {
   // page wrapper up front — that gives correct scroll geometry without having to
   // rasterize the whole document.
   const dims: { w: number; h: number }[] = [];
-  // The scale a page's canvas was last rasterized at (absent = never). Used to
-  // skip work and to detect a page that's stale after a zoom.
-  const renderedScale: Record<number, number> = {};
-  // Live render tasks (so a zoom mid-render can cancel the stale raster).
-  const tasks: Record<number, pdfjs.RenderTask> = {};
-  // One global scheduler owns full-page raster work. Intersection observers may
-  // discover several pages at once, but only the page that matters most to the
-  // current viewport is allowed to paint. This keeps rapid wheel/zoom bursts
-  // from turning into competing full-page canvas jobs on the WebView UI thread.
-  const renderQueue = new Map<number, PdfRenderRequest>();
-  let activeRender: PdfRenderRequest | null = null;
-  let renderSequence = 0;
   let maxQueuedRenders = 0;
   let cancelledRenders = 0;
-  // Ownership begins before getPage(): duplicate observer/navigation requests
-  // can otherwise both pass the await and render into one canvas concurrently.
-  const renderGeneration: Record<number, number> = {};
-  let layoutGeneration = 0;
   // Pages whose REAL unscaled size has been measured (others use a page-1
   // estimate until first render), so opening a long PDF doesn't parse every page
   // dict before first paint.
   const dimsKnown = new Set<number>();
-  // Rendered pages in recency order (LRU). Admission is governed primarily by
-  // actual aggregate backing-store pixels, with a page count as a secondary
-  // guard. The wrapper stays sized and re-renders on scroll-back.
-  const lru: number[] = [];
-  const canvasPixels: Record<number, number> = {};
-  // Actual backing-store scale used for each rendered page. This can be lower
-  // than devicePixelRatio for an unusually large page, keeping canvas memory
-  // bounded while preserving the requested CSS zoom level.
-  const renderedPixelRatio: Record<number, number> = {};
   // Pages currently intersecting the viewport — the only ones we rasterize.
   const visible = new Set<number>();
   let io: IntersectionObserver | null = null;
   let fastScrolling = false;
   let lastScrollAt = 0;
   let lastScrollTop = 0;
+  let scrollingDown = true;
   let scrollSettleTimer: number | undefined;
   let zoomTimer: number | undefined;
   // Scroll anchor captured at the START of a zoom burst (pre-resize), restored
   // once on settle — so a 5×Ctrl+ burst keeps the document position without an
   // anchor calc per press.
   let zoomAnchorRatio: number | null = null;
-  // The text layer (hundreds of glyph spans on a math page) is rebuilt OFF the
-  // zoom hot path: the canvas sharpens immediately, the text catches up shortly
-  // after the view settles. `textScale[n]` is the scale its text was built at;
-  // `pendingText` holds pages whose text needs a (re)build.
-  const textScale: Record<number, number> = {};
-  // The live pdf.js TextLayer instance per page, so a zoom can reposition it
-  // cheaply via .update({viewport}) instead of re-extracting text and recreating
-  // every glyph span (the expensive work that made zoom-in janky).
-  const textLayerObjs: Record<number, any> = {};
-  const pendingText = new Set<number>();
-  let textTimer: number | undefined;
 
   async function exactPageDimensions(pageNumber: number): Promise<PdfPageDimensions> {
     if (dimsKnown.has(pageNumber) && dims[pageNumber]) return dims[pageNumber];
@@ -491,7 +489,8 @@ export function PdfViewer(props: {
     closeHighlightMenu();
     if (!(await ensureExistingHighlightRef(id))) return;
     requestBlockReferences(id);
-    openPageAtBlock(hlsPageName(props.filename), "page", id);
+    if (props.onOpenNotes) props.onOpenNotes(id);
+    else openPageAtBlock(hlsPageName(props.filename), "page", id);
   };
   // Remove a highlight (and its annotation block on the hls page).
   const deleteHighlight = async (id: string) => {
@@ -544,6 +543,7 @@ export function PdfViewer(props: {
     if (!isPdfOwnershipCurrent(owner)) return;
     if (!viewStateReady || !Number.isFinite(nextScale) || nextScale <= 0) return;
     if (viewStateBaseline?.page === page && viewStateBaseline?.scale === nextScale) return;
+    props.onViewState?.({ page, scale: nextScale });
     pendingViewState = { page, scale: nextScale };
     if (viewStateTimer !== undefined) clearTimeout(viewStateTimer);
     viewStateTimer = window.setTimeout(() => {
@@ -556,15 +556,11 @@ export function PdfViewer(props: {
     io?.disconnect();
     io = null;
     clearTimeout(zoomTimer);
-    clearTimeout(textTimer);
     clearTimeout(scrollSettleTimer);
     clearTimeout(findDebounce);
-    cancelAllRenders();
-    releaseAllCanvases();
-    for (const k of Object.keys(tasks)) {
-      tasks[Number(k)]?.cancel();
-      delete tasks[Number(k)];
-    }
+    pageRenderer?.dispose();
+    pageRenderer = null;
+    for (const page of Object.keys(pageMounts)) delete pageMounts[Number(page)];
     scrollRef?.replaceChildren();
     const doc = pdfDoc;
     pdfDoc = null;
@@ -587,43 +583,29 @@ export function PdfViewer(props: {
     return null;
   }
 
-  function safeCanvasSize(width: number, height: number, maxPixels = MAX_CANVAS_PIXELS) {
-    const pixelLimit = Math.max(1, Math.min(MAX_CANVAS_PIXELS, maxPixels));
-    const requestedRatio = Math.min(window.devicePixelRatio || 1, 2);
-    const ratio = Math.min(
-      requestedRatio,
-      MAX_CANVAS_DIMENSION / width,
-      MAX_CANVAS_DIMENSION / height,
-      Math.sqrt(pixelLimit / (width * height))
-    );
-    if (!Number.isFinite(ratio) || ratio <= 0) return null;
-    return {
-      ratio,
-      width: Math.max(1, Math.min(MAX_CANVAS_DIMENSION, Math.floor(width * ratio))),
-      height: Math.max(1, Math.min(MAX_CANVAS_DIMENSION, Math.floor(height * ratio))),
-    };
-  }
-
   // Build all page wrappers once, sized for the current scale. Cheap: no
   // rasterization — just sized placeholders that the IntersectionObserver fills
   // in as they scroll into view.
   function buildLayout() {
     if (!pdfDoc) return;
-    layoutGeneration += 1;
-    cancelAllRenders();
-    releaseAllCanvases();
+    pageRenderer?.dispose();
+    pageRenderer = new PdfPageViewRenderer({
+      document: pdfDoc,
+      coordinator: PDF_RENDER_COORDINATOR,
+      priority: () => (props.focused?.() ?? !!viewerRootEl?.contains(document.activeElement)) ? 0 : 10,
+      onPageRendered: (pageNumber) => {
+        repaintPage(pageNumber);
+        updateRenderDiagnostics();
+      },
+      onRenderError: (_pageNumber, error) => {
+        if (!disposed) failPdf(errorMessage("Couldn't render this PDF page", error));
+      },
+    });
     scrollRef.innerHTML = "";
     for (const k of Object.keys(pageEls)) delete pageEls[Number(k)];
-    for (const k of Object.keys(textLayers)) delete textLayers[Number(k)];
+    for (const k of Object.keys(pageViewHosts)) delete pageViewHosts[Number(k)];
     for (const k of Object.keys(hlLayers)) delete hlLayers[Number(k)];
-    for (const k of Object.keys(renderedScale)) delete renderedScale[Number(k)];
-    for (const k of Object.keys(renderedPixelRatio)) delete renderedPixelRatio[Number(k)];
-    for (const k of Object.keys(canvasPixels)) delete canvasPixels[Number(k)];
-    for (const k of Object.keys(textScale)) delete textScale[Number(k)];
-    for (const k of Object.keys(textLayerObjs)) delete textLayerObjs[Number(k)];
-    pendingText.clear();
-    clearTimeout(textTimer);
-    lru.length = 0;
+    for (const k of Object.keys(pageMounts)) delete pageMounts[Number(k)];
     visible.clear();
     io?.disconnect();
     // Modest prefetch margin: render/text only pages near the viewport, so a
@@ -639,19 +621,52 @@ export function PdfViewer(props: {
       wrap.style.height = `${dims[n].h * s}px`;
       wrap.style.setProperty("--scale-factor", String(s));
 
-      const textLayer = document.createElement("div");
-      textLayer.className = "textLayer";
+      const pageViewHost = document.createElement("div");
+      pageViewHost.className = "pdf-page-view-host";
       const hl = document.createElement("div");
       hl.className = "pdf-hl-layer";
-      wrap.appendChild(textLayer);
+      wrap.appendChild(pageViewHost);
       wrap.appendChild(hl);
 
       scrollRef.appendChild(wrap);
       pageEls[n] = wrap;
-      textLayers[n] = textLayer;
+      pageViewHosts[n] = pageViewHost;
       hlLayers[n] = hl;
       io.observe(wrap);
     }
+  }
+
+  async function ensurePageView(n: number): Promise<DirectPdfPageView | null> {
+    const existing = pageRenderer?.getPageView(n);
+    if (existing) return existing;
+    if (pageMounts[n]) return pageMounts[n];
+    const renderer = pageRenderer;
+    const host = pageViewHosts[n];
+    if (!renderer || !host) return null;
+    const mount = renderer.mountPage(n, host, scale()).then((view) => {
+      if (!view || disposed || pageRenderer !== renderer || pageViewHosts[n] !== host) return null;
+      const displayScale = pdfPageViewScaleToTineScale(view.scale);
+      const width = view.width / displayScale;
+      const height = view.height / displayScale;
+      const dimensionError = pageDimensionsError(n, width, height);
+      if (dimensionError) {
+        failPdf(dimensionError);
+        return null;
+      }
+      dims[n] = { w: width, h: height };
+      dimsKnown.add(n);
+      sizeWrapper(n, scale());
+      repaintPage(n);
+      syncVisibleRendering();
+      return view;
+    }).catch((error: unknown) => {
+      if (!disposed) failPdf(errorMessage("Couldn't read this PDF page", error));
+      return null;
+    }).finally(() => {
+      if (pageMounts[n] === mount) delete pageMounts[n];
+    });
+    pageMounts[n] = mount;
+    return mount;
   }
 
   function onIntersect(entries: IntersectionObserverEntry[]) {
@@ -659,14 +674,11 @@ export function PdfViewer(props: {
       const n = Number((e.target as HTMLElement).dataset.page);
       if (e.isIntersecting) {
         visible.add(n);
-        const priority = pageIsInViewport(n) ? PDF_RENDER_VIEWPORT : PDF_RENDER_PREFETCH;
-        if (!fastScrolling || priority === PDF_RENDER_VIEWPORT) void requestRender(n, priority);
       } else {
         visible.delete(n);
-        cancelQueuedRender(n);
-        pendingText.delete(n);
       }
     }
+    syncVisibleRendering();
   }
 
   function pageIsInViewport(n: number) {
@@ -685,283 +697,77 @@ export function PdfViewer(props: {
     return Math.abs((rect.top + rect.bottom) / 2 - (viewport.top + viewport.bottom) / 2);
   }
 
+  function visiblePageRegion(n: number) {
+    const page = pageEls[n];
+    if (!page || !scrollRef) return null;
+    const pageRect = page.getBoundingClientRect();
+    const viewport = scrollRef.getBoundingClientRect();
+    const left = Math.max(pageRect.left, viewport.left);
+    const top = Math.max(pageRect.top, viewport.top);
+    const right = Math.min(pageRect.right, viewport.right);
+    const bottom = Math.min(pageRect.bottom, viewport.bottom);
+    if (right <= left || bottom <= top) return null;
+    return {
+      pageNumber: n,
+      rect: {
+        left: left - pageRect.left,
+        top: top - pageRect.top,
+        width: right - left,
+        height: bottom - top,
+      },
+    };
+  }
+
   function updateRenderDiagnostics() {
     if (!scrollRef) return;
-    maxQueuedRenders = Math.max(maxQueuedRenders, renderQueue.size);
-    scrollRef.dataset.activeRenders = activeRender ? "1" : "0";
-    scrollRef.dataset.queuedRenders = String(renderQueue.size);
+    const views = [...(pageRenderer?.getCachedPageViews() ?? [])];
+    const active = views.filter((view) => view.renderingState === PDF_RENDERING_RUNNING).length;
+    const queued = views.filter((view) =>
+      visible.has(view.id)
+      && view.renderingState !== PDF_RENDERING_RUNNING
+      && view.renderingState !== PDF_RENDERING_FINISHED
+    ).length;
+    maxQueuedRenders = Math.max(maxQueuedRenders, queued);
+    scrollRef.dataset.activeRenders = String(active);
+    scrollRef.dataset.queuedRenders = String(queued);
     scrollRef.dataset.maxQueuedRenders = String(maxQueuedRenders);
     scrollRef.dataset.cancelledRenders = String(cancelledRenders);
     scrollRef.dataset.fastScrolling = fastScrolling ? "true" : "false";
   }
 
-  function effectiveRenderPriority(request: PdfRenderRequest) {
-    if (request.priority === PDF_RENDER_INTERACTIVE) return PDF_RENDER_INTERACTIVE;
-    return pageIsInViewport(request.page) ? PDF_RENDER_VIEWPORT : request.priority;
-  }
-
-  function nextRenderRequest() {
-    return [...renderQueue.values()]
-      .filter((request) => !request.cancelled)
+  function syncVisibleRendering() {
+    const renderer = pageRenderer;
+    if (!renderer) return;
+    const candidates = [...visible]
+      .filter((pageNumber) => !fastScrolling || pageIsInViewport(pageNumber))
       .sort((left, right) =>
-        effectiveRenderPriority(left) - effectiveRenderPriority(right)
-        || pageDistanceFromViewport(left.page) - pageDistanceFromViewport(right.page)
-        || left.sequence - right.sequence
-      )[0];
-  }
-
-  function pumpRenderQueue() {
-    if (disposed || activeRender) return;
-    for (const [page, request] of renderQueue) {
-      if (request.cancelled || request.layout !== layoutGeneration) {
-        renderQueue.delete(page);
-        request.resolve();
-      }
-    }
-    const request = nextRenderRequest();
-    if (!request) {
-      updateRenderDiagnostics();
-      return;
-    }
-    renderQueue.delete(request.page);
-    activeRender = request;
-    updateRenderDiagnostics();
-    void renderPageNow(request).finally(() => {
-      request.resolve();
-      if (activeRender === request) activeRender = null;
-      updateRenderDiagnostics();
-      pumpRenderQueue();
-    });
-  }
-
-  function requestRender(n: number, priority: PdfRenderPriority = PDF_RENDER_INTERACTIVE): Promise<void> {
-    if (!pdfDoc || disposed || !pageEls[n]) return Promise.resolve();
-    const requestedScale = scale();
-    if (renderedScale[n] === requestedScale) {
-      setCanvasTransform(n, 1);
-      return Promise.resolve();
-    }
-
-    if (activeRender?.page === n && !activeRender.cancelled) {
-      if (activeRender.scale === requestedScale && activeRender.layout === layoutGeneration) {
-        activeRender.priority = Math.min(activeRender.priority, priority) as PdfRenderPriority;
-        return activeRender.promise;
-      }
-      activeRender.cancelled = true;
-      cancelledRenders += 1;
-      tasks[n]?.cancel();
-    }
-
-    const queued = renderQueue.get(n);
-    if (queued && queued.scale === requestedScale && queued.layout === layoutGeneration && !queued.cancelled) {
-      queued.priority = Math.min(queued.priority, priority) as PdfRenderPriority;
-      return queued.promise;
-    }
-    if (queued) {
-      queued.cancelled = true;
-      cancelledRenders += 1;
-      queued.resolve();
-      renderQueue.delete(n);
-    }
-
-    let resolve = () => {};
-    const promise = new Promise<void>((done) => { resolve = done; });
-    const request: PdfRenderRequest = {
-      page: n,
-      scale: requestedScale,
-      layout: layoutGeneration,
-      priority,
-      sequence: renderSequence++,
-      cancelled: false,
-      promise,
-      resolve,
-    };
-    renderQueue.set(n, request);
-    updateRenderDiagnostics();
-    pumpRenderQueue();
-    return promise;
-  }
-
-  function cancelQueuedRender(n: number) {
-    const queued = renderQueue.get(n);
-    if (queued) {
-      queued.cancelled = true;
-      cancelledRenders += 1;
-      queued.resolve();
-      renderQueue.delete(n);
-    }
-    if (activeRender?.page === n && !activeRender.cancelled && activeRender.priority !== PDF_RENDER_INTERACTIVE) {
-      activeRender.cancelled = true;
-      cancelledRenders += 1;
-      tasks[n]?.cancel();
-    }
-    updateRenderDiagnostics();
-  }
-
-  function cancelSpeculativeRenders() {
-    for (const [page, request] of renderQueue) {
-      if (request.priority !== PDF_RENDER_PREFETCH) continue;
-      request.cancelled = true;
-      cancelledRenders += 1;
-      request.resolve();
-      renderQueue.delete(page);
-    }
-    if (activeRender && !activeRender.cancelled && activeRender.priority === PDF_RENDER_PREFETCH) {
-      activeRender.cancelled = true;
-      cancelledRenders += 1;
-      tasks[activeRender.page]?.cancel();
-    }
-    updateRenderDiagnostics();
-  }
-
-  function cancelAllRenders() {
-    for (const request of renderQueue.values()) {
-      request.cancelled = true;
-      cancelledRenders += 1;
-      request.resolve();
-    }
-    renderQueue.clear();
-    if (activeRender && !activeRender.cancelled) {
-      activeRender.cancelled = true;
-      cancelledRenders += 1;
-      tasks[activeRender.page]?.cancel();
-    }
+        Number(pageIsInViewport(right)) - Number(pageIsInViewport(left))
+        || pageDistanceFromViewport(left) - pageDistanceFromViewport(right)
+      );
+    renderer.setVisibleRegions(
+      candidates.flatMap((pageNumber) => {
+        const region = visiblePageRegion(pageNumber);
+        return region ? [region] : [];
+      }),
+      scrollingDown,
+      candidates,
+    );
+    for (const pageNumber of candidates) void ensurePageView(pageNumber);
     updateRenderDiagnostics();
   }
 
   async function renderPage(n: number) {
-    await requestRender(n, PDF_RENDER_INTERACTIVE);
-  }
-
-  // Rasterize one page at the current scale (no-op if already current). Cancels
-  // any in-flight raster for the page first so rapid zooms don't pile up.
-  async function renderPageNow(request: PdfRenderRequest) {
-    if (!pdfDoc) return;
-    const n = request.page;
-    const s = request.scale;
-    // Already rasterized at exactly this scale → just drop any transient zoom
-    // transform; the bitmap is pixel-accurate. Otherwise re-raster at the CURRENT
-    // scale so text is ALWAYS crisp. renderPage runs only on the debounced zoom
-    // settle and on scroll-in, not per zoom step, so this re-raster is the moment
-    // the page sharpens — the CSS transform (applyZoomTransform) covers the gesture
-    // itself. (Re-rastering rather than upscaling a stale bitmap is what fixes the
-    // blur at high zoom; it touches only the 1–3 visible pages.)
-    if (request.cancelled || request.layout !== layoutGeneration) return;
-    if (renderedScale[n] === s) {
-      setCanvasTransform(n, 1);
-      return;
+    const renderer = pageRenderer;
+    const view = await ensurePageView(n);
+    if (!renderer || renderer !== pageRenderer || !view) return;
+    if (Math.abs(pdfPageViewScaleToTineScale(view.scale) - scale()) > 0.001) {
+      renderer.updateScale(n, scale());
     }
-    const wrap = pageEls[n];
-    if (!wrap) return;
-    const generation = (renderGeneration[n] ?? 0) + 1;
-    const layout = request.layout;
-    renderGeneration[n] = generation;
-    tasks[n]?.cancel();
-    delete tasks[n];
-
-    let page: pdfjs.PDFPageProxy;
     try {
-      page = await pdfDoc.getPage(n);
-    } catch (err) {
-      failPdf(errorMessage("Couldn't render this PDF page", err));
-      return;
+      await renderer.renderPage(n, visible);
+    } catch (error) {
+      if (!disposed) failPdf(errorMessage("Couldn't render this PDF page", error));
     }
-    if (
-      disposed || request.cancelled || layoutGeneration !== layout || renderGeneration[n] !== generation
-      || scale() !== s || pageEls[n] !== wrap
-    ) return; // superseded, rebuilt, or zoomed again while awaiting
-    const viewport = page.getViewport({ scale: s });
-    // First time we touch this page, learn its real unscaled size and correct the
-    // wrapper if the page-1 estimate was off (non-uniform PDF).
-    if (!dimsKnown.has(n)) {
-      dimsKnown.add(n);
-      const rw = viewport.width / s;
-      const rh = viewport.height / s;
-      const dimensionError = pageDimensionsError(n, rw, rh);
-      if (dimensionError) {
-        failPdf(dimensionError);
-        return;
-      }
-      if (Math.abs(rw - dims[n].w) > 0.5 || Math.abs(rh - dims[n].h) > 0.5) {
-        dims[n] = { w: rw, h: rh };
-        sizeWrapper(n, scale());
-      }
-    }
-
-    const previousCanvas = wrap.querySelector("canvas") as HTMLCanvasElement | null;
-    // Render into a staging canvas. If this page already has a lower-resolution
-    // bitmap (normally while zoom settles), leave it visible until the sharper
-    // replacement is complete. Reusing/resizing the displayed canvas made the
-    // page flash blank during exactly the expensive part of a zoom.
-    const canvas = document.createElement("canvas");
-    if (!previousCanvas) wrap.insertBefore(canvas, wrap.firstChild);
-    // Render into a backing store at device-pixel resolution and CSS-size it
-    // back down, so text is crisp on HiDPI displays. Cap the device-pixel factor
-    // at 2 — beyond that the extra pixels aren't visible but the raster cost (and
-    // zoom-in lag) grows quadratically.
-    const otherVisiblePixels = [...visible]
-      .filter((pageNumber) => pageNumber !== n)
-      .reduce((total, pageNumber) => total + (canvasPixels[pageNumber] ?? 0), 0);
-    const availablePixels = Math.max(1, PDF_CANVAS_CACHE_PIXEL_BUDGET - otherVisiblePixels);
-    const canvasSize = safeCanvasSize(viewport.width, viewport.height, availablePixels);
-    if (!canvasSize) {
-      failPdf(`PDF page ${n} couldn't be sized safely for rendering.`);
-      return;
-    }
-    const nextPixels = canvasSize.width * canvasSize.height;
-    makeRoomForCanvas(n, nextPixels);
-    const dpr = canvasSize.ratio;
-    canvas.width = canvasSize.width;
-    canvas.height = canvasSize.height;
-    canvas.style.width = `${Math.floor(viewport.width)}px`;
-    canvas.style.height = `${Math.floor(viewport.height)}px`;
-    canvas.style.transform = "";
-
-    const task = page.render({
-      canvasContext: canvas.getContext("2d")!,
-      viewport,
-      transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
-    });
-    tasks[n] = task;
-    try {
-      await task.promise;
-    } catch (err) {
-      if (tasks[n] === task) delete tasks[n];
-      canvas.width = 0;
-      canvas.height = 0;
-      canvas.remove();
-      if (request.cancelled || renderGeneration[n] !== generation || layoutGeneration !== layout) return;
-      if ((err as { name?: string } | undefined)?.name === "RenderingCancelledException") return;
-      failPdf(errorMessage("Couldn't render this PDF page", err));
-      return;
-    }
-    if (tasks[n] === task) delete tasks[n];
-    if (
-      request.cancelled || renderGeneration[n] !== generation
-      || layoutGeneration !== layout || scale() !== s
-    ) {
-      canvas.width = 0;
-      canvas.height = 0;
-      canvas.remove();
-      return;
-    }
-
-    if (previousCanvas) {
-      previousCanvas.replaceWith(canvas);
-      previousCanvas.width = 0;
-      previousCanvas.height = 0;
-    }
-    canvasPixels[n] = nextPixels;
-
-    // Canvas is crisp now — the page is usable. Rebuild the (expensive) text
-    // layer off the hot path so it doesn't make every zoom step janky.
-    renderedScale[n] = s;
-    renderedPixelRatio[n] = dpr;
-    clearTransform(n);
-    repaintPage(n);
-    scheduleText(n);
-    touchLru(n);
-    evictCanvases();
   }
 
   function currentNavigation(): PdfTarget {
@@ -977,6 +783,7 @@ export function PdfViewer(props: {
       ? highlights().find((candidate) => candidate.id === target.highlightId)
       : undefined;
     activeHighlightId = highlight?.id;
+    repaintPage(highlight?.page ?? target.page ?? 1);
     const requestedPage = highlight?.page ?? target.page ?? 1;
     const page = pageEls[requestedPage] ? requestedPage : 1;
     setCurPage(page);
@@ -1007,155 +814,28 @@ export function PdfViewer(props: {
     exact?.scrollIntoView({ block: "center", inline: "nearest" });
   }
 
-  // Record `n` as most-recently rendered.
-  function touchLru(n: number) {
-    const i = lru.indexOf(n);
-    if (i >= 0) lru.splice(i, 1);
-    lru.push(n);
-  }
-  function retainedCanvasPixels(except?: number) {
-    return Object.entries(canvasPixels).reduce(
-      (total, [page, pixels]) => Number(page) === except ? total : total + pixels,
-      0,
-    );
-  }
-  // Free least-recently rendered off-screen pages BEFORE allocating the next
-  // backing store. This prevents a valid high-zoom document from transiently
-  // building the old count-based 1.5 GiB cache.
-  function makeRoomForCanvas(n: number, incomingPixels: number) {
-    let total = retainedCanvasPixels(n);
-    let count = Object.keys(canvasPixels).filter((page) => Number(page) !== n).length;
-    const incomingCount = n >= 1 ? 1 : 0;
-    while (
-      total + incomingPixels > PDF_CANVAS_CACHE_PIXEL_BUDGET
-      || count + incomingCount > PDF_CANVAS_CACHE_PAGE_CAP
-    ) {
-      // Completed pages use true LRU order. Include an off-screen in-flight
-      // allocation as a fallback so rapid scrolling cannot outrun the LRU.
-      const candidate = lru.find((page) => page !== n && !visible.has(page))
-        ?? Object.keys(canvasPixels)
-          .map(Number)
-          .find((page) => page !== n && !visible.has(page));
-      if (candidate === undefined) break;
-      total -= canvasPixels[candidate] ?? 0;
-      count -= canvasPixels[candidate] === undefined ? 0 : 1;
-      freePage(candidate);
-      const lruIndex = lru.indexOf(candidate);
-      if (lruIndex >= 0) lru.splice(lruIndex, 1);
-    }
-  }
-  function evictCanvases() {
-    makeRoomForCanvas(-1, 0);
-  }
-  function freePage(n: number) {
-    renderGeneration[n] = (renderGeneration[n] ?? 0) + 1;
-    tasks[n]?.cancel();
-    delete tasks[n];
-    const canvas = pageEls[n]?.querySelector("canvas") as HTMLCanvasElement | null;
-    if (canvas) {
-      // WebKit may defer freeing a detached canvas's backing store. Resizing to
-      // zero releases it synchronously before the DOM node is removed.
-      canvas.width = 0;
-      canvas.height = 0;
-      canvas.remove();
-    }
-    delete canvasPixels[n];
-    delete renderedScale[n];
-    delete renderedPixelRatio[n];
-    if (textLayers[n]) textLayers[n].innerHTML = "";
-    delete textLayerObjs[n];
-    delete textScale[n];
-    pendingText.delete(n);
-  }
-  function releaseAllCanvases() {
-    for (const page of Object.keys(canvasPixels)) freePage(Number(page));
-    lru.length = 0;
-  }
-
-  // Coalesced, deferred text-layer (re)build. Runs ~after the view settles, only
-  // for visible pages whose text isn't already at the page's current scale.
-  function scheduleText(n: number) {
-    pendingText.add(n);
-    clearTimeout(textTimer);
-    // TextLayer can create hundreds of positioned spans on a mathematical page.
-    // Keep that DOM work outside an active wheel burst; the raster is already
-    // readable, and selection becomes available shortly after the view settles.
-    textTimer = window.setTimeout(
-      () => void buildPendingText(),
-      fastScrolling ? PDF_SCROLL_SETTLE_MS + PDF_TEXT_SETTLE_MS : PDF_TEXT_SETTLE_MS,
-    );
-  }
-  async function buildPendingText() {
-    const todo = [...pendingText];
-    pendingText.clear();
-    for (const n of todo) {
-      const r = renderedScale[n];
-      if (!visible.has(n) || !pageIsInViewport(n) || r === undefined || textScale[n] === r) continue;
-      await buildTextLayer(n, r);
-    }
-  }
-  async function buildTextLayer(n: number, atScale: number) {
-    if (!pdfDoc || !textLayers[n]) return;
-    let page: pdfjs.PDFPageProxy;
-    try {
-      page = await pdfDoc.getPage(n);
-    } catch (err) {
-      failPdf(errorMessage("Couldn't read this PDF page", err));
-      return;
-    }
-    if (renderedScale[n] !== atScale || !textLayers[n]) return; // re-rastered since
-    const viewport = page.getViewport({ scale: atScale });
-
-    // Reposition an existing text layer (cheap) rather than rebuilding it.
-    const existing = textLayerObjs[n];
-    if (existing) {
-      try {
-        await existing.update({ viewport });
-        textScale[n] = atScale;
-        return;
-      } catch {
-        // pdf.js API mismatch — fall through to a full rebuild.
-      }
-    }
-
-    let textContent: Awaited<ReturnType<pdfjs.PDFPageProxy["getTextContent"]>>;
-    try {
-      textContent = await page.getTextContent();
-    } catch (err) {
-      failPdf(errorMessage("Couldn't read this PDF text", err));
-      return;
-    }
-    if (renderedScale[n] !== atScale || !textLayers[n]) return;
-    const tl = textLayers[n];
-    tl.innerHTML = "";
-    const layer = new (pdfjs as any).TextLayer({ textContentSource: textContent, container: tl, viewport });
-    await layer.render();
-    textLayerObjs[n] = layer;
-    textScale[n] = atScale;
-  }
-
-  function clearTransform(n: number) {
-    const c = pageEls[n]?.querySelector("canvas") as HTMLCanvasElement | null;
-    if (c) c.style.transform = "";
-  }
-  // Display an already-rasterized page at the current scale via a GPU transform
-  // of its bitmap (no re-raster). factor 1 → identity (native bitmap).
-  function setCanvasTransform(n: number, factor: number) {
-    const c = pageEls[n]?.querySelector("canvas") as HTMLCanvasElement | null;
-    if (!c) return;
-    c.style.transformOrigin = "top left";
-    c.style.transform = Math.abs(factor - 1) < 0.001 ? "" : `scale(${factor})`;
-  }
   // Instant zoom feedback: scale the already-rendered canvas via CSS transform
   // (GPU, no raster) until the debounced re-raster at the new scale lands.
   function applyZoomTransform() {
     const s = scale();
     for (const n of visible) {
-      const prev = renderedScale[n];
-      const c = pageEls[n]?.querySelector("canvas") as HTMLCanvasElement | null;
-      if (c && prev) {
-        c.style.transformOrigin = "top left";
-        c.style.transform = `scale(${s / prev})`;
+      const canvases = pageEls[n]?.querySelectorAll<HTMLCanvasElement>("canvas") ?? [];
+      for (const canvas of canvases) {
+        const tileScale = Number(canvas.dataset.pdfTileScale);
+        if (tileScale) {
+          const ratio = s / tileScale;
+          canvas.style.left = `${Number(canvas.dataset.pdfTileLeft) * ratio}px`;
+          canvas.style.top = `${Number(canvas.dataset.pdfTileTop) * ratio}px`;
+          canvas.style.width = `${Number(canvas.dataset.pdfTileWidth) * ratio}px`;
+          canvas.style.height = `${Number(canvas.dataset.pdfTileHeight) * ratio}px`;
+          canvas.style.transform = "";
+        } else {
+          // Ordinary canvases are width/height:100% of the wrapper. The wrapper
+          // was already resized above, so another scale transform would square
+          // the optimistic zoom step (1.1 -> 1.21) until the settled raster.
+          canvas.style.transformOrigin = "";
+          canvas.style.transform = "";
+        }
       }
     }
   }
@@ -1194,9 +874,11 @@ export function PdfViewer(props: {
       zoomAnchorRatio = null;
     }
     for (const n of visible) {
-      const priority = pageIsInViewport(n) ? PDF_RENDER_VIEWPORT : PDF_RENDER_PREFETCH;
-      if (!fastScrolling || priority === PDF_RENDER_VIEWPORT) void requestRender(n, priority);
+      const view = pageRenderer?.getPageView(n);
+      if (view) pageRenderer?.updateScale(n, s);
+      else void ensurePageView(n);
     }
+    syncVisibleRendering();
   }
 
   function cancelOwnedWork() {
@@ -1206,7 +888,6 @@ export function PdfViewer(props: {
     io?.disconnect();
     io = null;
     clearTimeout(zoomTimer);
-    clearTimeout(textTimer);
     clearTimeout(scrollSettleTimer);
     clearTimeout(findDebounce);
     if (viewStateTimer !== undefined) {
@@ -1217,8 +898,8 @@ export function PdfViewer(props: {
       cancelAnimationFrame(scrollRaf);
       scrollRaf = undefined;
     }
-    cancelAllRenders();
-    for (const k of Object.keys(tasks)) tasks[Number(k)]?.cancel();
+    pageRenderer?.dispose();
+    pageRenderer = null;
     window.removeEventListener("mousemove", onAreaMove);
     window.removeEventListener("mouseup", onAreaUp);
     areaDrag?.band.remove();
@@ -1261,7 +942,7 @@ export function PdfViewer(props: {
       return;
     }
     try {
-      const loaded = await pdfjs.getDocument({ data: bytes }).promise;
+      const loaded = await pdfjs.getDocument({ data: bytes, ...TINE_PDF_LOADING_OPTIONS }).promise;
       if (disposed) {
         void loaded.destroy().catch(() => {});
         return;
@@ -1301,7 +982,7 @@ export function PdfViewer(props: {
     dimsKnown.clear();
     dimsKnown.add(1);
     for (let n = 2; n <= doc.numPages; n++) dims[n] = { w: vp1.width, h: vp1.height };
-    setScale(restoredScale != null ? clampScale(restoredScale) : fitWidthScale());
+    setScale(props.scale != null ? clampScale(props.scale) : restoredScale != null ? clampScale(restoredScale) : fitWidthScale());
     setNumPages(doc.numPages);
     buildLayout();
     const navigation = currentNavigation();
@@ -1310,6 +991,7 @@ export function PdfViewer(props: {
     if (disposed) return;
     viewStateBaseline = { page: curPage(), scale: scale() };
     viewStateReady = true;
+    props.onViewState?.(viewStateBaseline);
     setReady(true);
   });
 
@@ -1325,7 +1007,8 @@ export function PdfViewer(props: {
     setOutlineItems([]);
     setOutlineReady(false);
     setExpandedOutlineIds(new Set<string>());
-    releaseAllCanvases();
+    pageRenderer?.dispose();
+    pageRenderer = null;
     const doc = pdfDoc;
     pdfDoc = null;
     if (doc) void doc.destroy().catch(() => {});
@@ -1340,7 +1023,7 @@ export function PdfViewer(props: {
   ));
   // Repaint highlight overlays whenever the set changes (rendered pages only).
   createEffect(on(highlights, () => {
-    for (const n of Object.keys(renderedScale)) repaintPage(Number(n));
+    for (const n of Object.keys(hlLayers)) repaintPage(Number(n));
   }));
   // A new intent within the same asset must navigate without remounting the
   // PDF. Asset switches are handled by KeyedPdfViewer's filename key.
@@ -1348,7 +1031,7 @@ export function PdfViewer(props: {
     on(
       () => props.navigation?.(),
       (target) => {
-        if (viewStateReady && target?.filename === props.filename) {
+        if (pdfDoc && target?.filename === props.filename && pageEls[1]) {
           void navigateToTarget(target);
         }
       },
@@ -1435,7 +1118,7 @@ export function PdfViewer(props: {
     }
     // +/-/0 zoom the PDF only when the PDF pane is focused; otherwise the notes
     // pane owns them for whole-interface zoom (see zoom.ts).
-    if (activePane() !== "pdf") return;
+    if (!(props.focused?.() ?? !!viewerRootEl?.contains(document.activeElement))) return;
     if (e.key === "=" || e.key === "+") {
       e.preventDefault();
       zoomBy(1.1);
@@ -1627,32 +1310,18 @@ export function PdfViewer(props: {
     setAreaMode(false);
   };
 
-  // Crop the page canvas to `rect` (unscaled coords) → PNG bytes.
-  async function cropArea(page: number, wrap: HTMLElement, rect: Rect): Promise<Uint8Array | null> {
-    const s = scale();
-    let canvas = wrap.querySelector("canvas") as HTMLCanvasElement | null;
-    // The page may have been LRU-evicted (or never rendered at this scale) — render
-    // it so we crop a crisp, current bitmap.
-    if (!canvas || renderedScale[page] !== s) {
-      await renderPage(page);
-      canvas = wrap.querySelector("canvas") as HTMLCanvasElement | null;
+  // Area capture always uses a dedicated clipped PDF.js render. At high zoom
+  // there is deliberately no single full-page canvas, and choosing whichever
+  // visible tile happens to be first would make captures partial or stale.
+  async function cropArea(page: number, _wrap: HTMLElement, rect: Rect): Promise<Uint8Array | null> {
+    const renderer = pageRenderer;
+    if (!renderer) return null;
+    const view = await ensurePageView(page);
+    if (!view) return null;
+    if (Math.abs(pdfPageViewScaleToTineScale(view.scale) - scale()) > 0.001) {
+      renderer.updateScale(page, scale());
     }
-    if (!canvas) return null;
-    // The canvas backing store is `unscaledWidth * s * dpr` px wide (see renderPage),
-    // so one unscaled unit = `s * dpr` backing pixels.
-    const dpr = renderedPixelRatio[page] ?? 1;
-    const f = s * dpr;
-    const sx = Math.max(0, Math.round(rect.left * f));
-    const sy = Math.max(0, Math.round(rect.top * f));
-    const sw = Math.min(canvas.width - sx, Math.round(rect.width * f));
-    const sh = Math.min(canvas.height - sy, Math.round(rect.height * f));
-    if (sw <= 0 || sh <= 0) return null;
-    const crop = document.createElement("canvas");
-    crop.width = sw;
-    crop.height = sh;
-    crop.getContext("2d")!.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
-    const blob: Blob | null = await new Promise((res) => crop.toBlob(res, "image/png"));
-    return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+    return renderer.captureArea(page, rect);
   }
 
   const createAreaHighlightOwned = async (color: string): Promise<boolean> => {
@@ -1759,25 +1428,17 @@ export function PdfViewer(props: {
     const top = scrollRef.scrollTop;
     const elapsed = now - lastScrollAt;
     const speed = elapsed > 0 ? Math.abs(top - lastScrollTop) / elapsed : 0;
+    scrollingDown = top >= lastScrollTop;
     lastScrollAt = now;
     lastScrollTop = top;
     if (speed >= PDF_FAST_SCROLL_PX_PER_MS) {
       fastScrolling = true;
-      cancelSpeculativeRenders();
-      clearTimeout(textTimer);
     }
-
-    for (const n of visible) {
-      if (pageIsInViewport(n)) void requestRender(n, PDF_RENDER_VIEWPORT);
-    }
+    syncVisibleRendering();
     clearTimeout(scrollSettleTimer);
     scrollSettleTimer = window.setTimeout(() => {
       fastScrolling = false;
-      for (const n of visible) {
-        const priority = pageIsInViewport(n) ? PDF_RENDER_VIEWPORT : PDF_RENDER_PREFETCH;
-        void requestRender(n, priority);
-        if (priority === PDF_RENDER_VIEWPORT && renderedScale[n] !== undefined) scheduleText(n);
-      }
+      syncVisibleRendering();
       updateRenderDiagnostics();
     }, PDF_SCROLL_SETTLE_MS);
     updateRenderDiagnostics();
@@ -1896,18 +1557,14 @@ export function PdfViewer(props: {
   // it) — used when jumping to a match on a not-yet-rendered page.
   async function ensureTextLayer(n: number) {
     if (!pdfDoc) return;
-    const s = scale();
-    if (renderedScale[n] !== s) await renderPage(n);
-    if (renderedScale[n] !== undefined && textScale[n] !== renderedScale[n]) {
-      await buildTextLayer(n, renderedScale[n]);
-    }
+    await renderPage(n);
   }
   // Select the occ-th occurrence of the query within page n's text layer (the
   // pdf.js text layer is transparent text over the canvas, so a DOM selection IS
   // the visible find highlight — no overlay needed). Offsets are computed against
   // the same item concatenation runFind counts, so the index lines up.
   function selectOccurrence(n: number, occ: number) {
-    const tl = textLayers[n];
+    const tl = pageEls[n]?.querySelector<HTMLElement>(".textLayer");
     if (!tl || occ < 0) return;
     const q = findQuery().trim().toLowerCase();
     if (!q) return;
@@ -1949,6 +1606,7 @@ export function PdfViewer(props: {
     const sel = window.getSelection();
     sel?.removeAllRanges();
     sel?.addRange(range);
+    if (typeof range.getBoundingClientRect !== "function") return;
     const rect = range.getBoundingClientRect();
     const cont = scrollRef.getBoundingClientRect();
     if (rect.top < cont.top + 48 || rect.bottom > cont.bottom - 24) {
@@ -1973,10 +1631,10 @@ export function PdfViewer(props: {
   createEffect(() => {
     if (!isMobilePlatform) return;
     const unregister = registerTransientLayer({
-      id: "pdf-pane",
+      id: surfaceLayerId,
       root: () => viewerRootEl ?? null,
       dismiss: () => {
-        closePdf();
+        props.onClose?.();
         return true;
       },
     });
@@ -1986,7 +1644,7 @@ export function PdfViewer(props: {
     if (!findOpen()) return;
     const unregister = registerTransientLayer({
       id: findLayerId,
-      parentId: "pdf-pane",
+      parentId: surfaceLayerId,
       root: () => findRootEl ?? null,
       trigger: () => findTriggerEl ?? null,
       dismiss: () => {
@@ -2000,7 +1658,7 @@ export function PdfViewer(props: {
     if (!settingsOpen()) return;
     const unregister = registerTransientLayer({
       id: settingsLayerId,
-      parentId: "pdf-pane",
+      parentId: surfaceLayerId,
       root: () => settingsRootEl ?? null,
       trigger: () => settingsTriggerEl ?? null,
       dismiss: () => {
@@ -2026,7 +1684,7 @@ export function PdfViewer(props: {
     if (!outlineOpen()) return;
     const unregister = registerTransientLayer({
       id: outlineLayerId,
-      parentId: "pdf-pane",
+      parentId: surfaceLayerId,
       root: () => outlineRootEl ?? null,
       trigger: () => outlineTriggerEl ?? null,
       dismiss: () => {
@@ -2052,7 +1710,7 @@ export function PdfViewer(props: {
     if (!menu()) return;
     const unregister = registerTransientLayer({
       id: highlightMenuLayerId,
-      parentId: "pdf-pane",
+      parentId: surfaceLayerId,
       root: () => highlightMenuRootEl ?? null,
       dismiss: () => {
         closeHighlightMenu();
@@ -2086,9 +1744,6 @@ export function PdfViewer(props: {
       <div class="pdf-toolbar">
         <span class="pdf-title">{props.label}</span>
         <div class="pdf-toolbar-actions">
-          <button class="icon-btn pdf-close-btn" title="Close PDF" onClick={closePdf}>
-            ✕
-          </button>
           <div class="pdf-pager">
             <button class="icon-btn" title="Previous page" onClick={() => scrollToPage(curPage() - 1)}>
               ‹
@@ -2154,7 +1809,7 @@ export function PdfViewer(props: {
           <button
             class="pdf-notes-btn pdf-overflow-action"
             title="Open highlights & notes page"
-            onClick={() => openPage(hlsPageName(props.filename), "page")}
+            onClick={() => props.onOpenNotes ? props.onOpenNotes() : openPage(hlsPageName(props.filename), "page")}
           >
             Notes
           </button>
@@ -2188,6 +1843,15 @@ export function PdfViewer(props: {
           >
             ⋯
           </button>
+          <button
+            type="button"
+            class="icon-btn pdf-close-btn"
+            title="Close PDF"
+            aria-label="Close PDF"
+            onClick={() => props.onClose?.()}
+          >
+            ✕
+          </button>
         </div>
       </div>
       <Show when={settingsOpen()}>
@@ -2202,7 +1866,7 @@ export function PdfViewer(props: {
             >
               Area highlight
             </button>
-            <button type="button" onClick={() => { openPage(hlsPageName(props.filename), "page"); setSettingsOpen(false); }}>Notes</button>
+            <button type="button" onClick={() => { if (props.onOpenNotes) props.onOpenNotes(); else openPage(hlsPageName(props.filename), "page"); setSettingsOpen(false); }}>Notes</button>
             <button type="button" onClick={() => { setSettingsOpen(false); setOutlineOpen(true); }}>Outline</button>
           </div>
           <div class="pdf-settings-heading">Theme</div>

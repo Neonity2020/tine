@@ -469,6 +469,23 @@ async function nativeClickSelector(selector, id, text) {
   await nativeClickAt(target.point, id);
 }
 
+async function openOutlineWithNativePointer(id) {
+  const inlineOutlineVisible = await browser.execute(() => {
+    const button = document.querySelector('button[title="Outline"]');
+    const rect = button?.getBoundingClientRect();
+    const style = button ? getComputedStyle(button) : null;
+    return Boolean(rect && rect.width > 0 && rect.height > 0 && style?.display !== "none" && style?.visibility !== "hidden");
+  });
+  if (inlineOutlineVisible) {
+    await nativeClickSelector('button[title="Outline"]', id);
+    return;
+  }
+
+  await nativeClickSelector('button[title="More settings"]', `${id}-more`);
+  await browser.$(".pdf-settings-menu").waitForExist({ timeout: 5_000 });
+  await nativeClickSelector(".pdf-settings-overflow button", `${id}-overflow`, "Outline");
+}
+
 async function nativeClickIndexed(selector, index, id) {
   const point = await browser.execute((wanted, wantedIndex) => {
     const element = document.querySelectorAll(wanted)[wantedIndex];
@@ -907,7 +924,7 @@ async function proveNativeUploadsThemesAndHighlights() {
   // The real fixture contains an explicit page-reference parent and a nested
   // named destination. Expansion and both navigation kinds are pointer actions;
   // the DOM only observes their visible result.
-  await nativeClickSelector('button[title="Outline"]', "pdf-outline-open");
+  await openOutlineWithNativePointer("pdf-outline-open");
   try {
     await browser.waitUntil(() => browser.execute(() =>
       document.querySelector(".pdf-outline-panel")?.textContent?.includes("Explicit Page One")), {
@@ -944,7 +961,7 @@ async function proveNativeUploadsThemesAndHighlights() {
   });
   await browser.keys(["Escape"]);
   await browser.$(".pdf-outline-panel").waitForExist({ reverse: true, timeout: 5_000 });
-  await nativeClickSelector('button[title="Outline"]', "pdf-outline-reopen");
+  await openOutlineWithNativePointer("pdf-outline-reopen");
   await browser.$(".pdf-outline-panel").waitForExist({ timeout: 5_000 });
   await nativeClickSelector(".pdf-scroll", "pdf-outline-outside-dismiss");
   await browser.$(".pdf-outline-panel").waitForExist({ reverse: true, timeout: 5_000 });
@@ -1246,7 +1263,7 @@ try {
   // `logseq-sample.pdf` deliberately has no outline dictionary. Open the real
   // reader's outline popover by pointer and observe its visible empty state;
   // this is not a component mock or a synthetic outline result.
-  await nativeClickSelector('button[title="Outline"]', "pdf-no-outline-open");
+  await openOutlineWithNativePointer("pdf-no-outline-open");
   await browser.waitUntil(() => browser.execute(() =>
     document.querySelector(".pdf-outline-empty")?.textContent?.trim() === "No outlines"), {
     timeout: 10_000,
