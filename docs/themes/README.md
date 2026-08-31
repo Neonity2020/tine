@@ -73,6 +73,8 @@ available so revocation never traps a package on the device.
 
 Behavioral or source-derived ports add `portedFrom` with the original ecosystem,
 name, public source URL, immutable revision, license, authors, and relationship.
+All seven are required; `tine-theme.mjs check` holds the package to the same
+vocabulary Tine installs against, so a package it passes is one the app accepts.
 A behavioral port preserves the visual design through Tine's semantic tokens; it
 does not claim that Logseq or Obsidian selectors run unchanged.
 

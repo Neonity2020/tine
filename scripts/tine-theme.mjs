@@ -20,6 +20,19 @@ const ROOT_FIELDS = new Set([
   "schemaVersion", "id", "name", "version", "apiVersion", "description", "author", "license",
   "source", "modes", "presentation", "screenshots", "portedFrom", "aiDevelopment",
 ]);
+// Registry intake must never certify bytes Tine refuses to install. The runtime
+// parser (src/themes/manifest.ts, parseProvenance) is the authority; this block
+// mirrors it field for field. GH #410 was the drift: the checker asked only for
+// source/revision/authors, so an `ecosystem` the app rejects passed intake.
+// src/themes/themeCheckerCli.test.ts holds the one-directional contract —
+// anything this checker passes, parseThemeManifest must accept. The checker may
+// be STRICTER (the SPDX allow-list and the dotted id are registry policy, not
+// runtime rules); it may never be laxer.
+const PORTED_FROM_FIELDS = new Set([
+  "ecosystem", "name", "source", "revision", "license", "authors", "relationship",
+]);
+const ECOSYSTEMS = new Set(["logseq", "obsidian", "other"]);
+const RELATIONSHIPS = new Set(["behavioral-port", "source-derived"]);
 const PRESENTATION = {
   contentTypography: new Set(["default", "editorial-serif"]),
   journalHeader: new Set(["default", "editorial"]),
@@ -28,6 +41,10 @@ const PRESENTATION = {
 
 function fail(errors, code, message) { errors.push({ code, message }); }
 function checkUrl(value) { try { return typeof value === "string" && new URL(value).protocol === "https:"; } catch { return false; } }
+/** Mirrors the runtime's `text()`: non-empty, bounded, no control characters. */
+function boundedText(value, max) {
+  return typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f]/.test(value);
+}
 
 export function checkTheme(file) {
   const report = { format: "tine-theme-check/v1", checkedAt: new Date().toISOString(), status: "failed", theme: null, sha256: null, errors: [], warnings: [] };
@@ -65,8 +82,28 @@ export function checkTheme(file) {
       }
     }
   }
-  if (value?.portedFrom && (!checkUrl(value.portedFrom.source) || !value.portedFrom.revision || !Array.isArray(value.portedFrom.authors) || value.portedFrom.authors.length === 0)) {
-    fail(report.errors, "theme.provenance", "portedFrom must include source, revision, and original authors");
+  if (value.portedFrom !== undefined) {
+    const port = value.portedFrom;
+    if (!port || typeof port !== "object" || Array.isArray(port)) {
+      fail(report.errors, "theme.provenance", "portedFrom must be an object");
+    } else {
+      for (const key of Object.keys(port)) {
+        if (!PORTED_FROM_FIELDS.has(key)) {
+          fail(report.errors, "theme.provenance-field", `portedFrom contains unknown field ${key}`);
+        }
+      }
+      if (!ECOSYSTEMS.has(port.ecosystem)) fail(report.errors, "theme.provenance-ecosystem", "portedFrom.ecosystem is unsupported");
+      if (!RELATIONSHIPS.has(port.relationship)) fail(report.errors, "theme.provenance-relationship", "portedFrom.relationship is unsupported");
+      if (!Array.isArray(port.authors) || port.authors.length === 0 || port.authors.length > 32) {
+        fail(report.errors, "theme.provenance-authors", "portedFrom.authors must contain 1 to 32 entries");
+      } else if (port.authors.some((author) => !boundedText(author, 160))) {
+        fail(report.errors, "theme.provenance-authors", "each portedFrom author must be bounded plain text");
+      }
+      if (!boundedText(port.name, 120)) fail(report.errors, "theme.provenance-name", "portedFrom.name must be bounded plain text");
+      if (!checkUrl(port.source) || !boundedText(port.source, 500)) fail(report.errors, "theme.provenance-source", "portedFrom.source must be a public https URL");
+      if (!boundedText(port.revision, 160)) fail(report.errors, "theme.provenance-revision", "portedFrom.revision must be bounded plain text");
+      if (!boundedText(port.license, 80)) fail(report.errors, "theme.provenance-license", "portedFrom.license must be bounded plain text");
+    }
   }
   if (value.presentation !== undefined) {
     if (value.apiVersion !== "0.2") {
