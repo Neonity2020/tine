@@ -203,6 +203,11 @@ assert.match(
   /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
   "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
 );
+assert.match(
+  windowsManagedScenario,
+  /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
+  "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
+);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);

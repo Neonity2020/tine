@@ -57,6 +57,7 @@ const artifacts = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "
 const debugLog = path.join(artifacts, "tine-debug.log");
 const nestedTitle = "Résumé 日本語";
 const nestedMarker = "WINDOWS_MANAGED_NESTED_UTF_MARKER";
+const ordinaryTitle = "Windows Managed 00002";
 const nestedFile = path.join(graph, "pages", "研究", `${nestedTitle}.md`);
 const now = new Date();
 const journalStem = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
@@ -69,11 +70,11 @@ for (const dir of ["pages", "pages/研究", "journals", "logseq", "assets/层级
 fs.mkdirSync(artifacts, { recursive: true });
 fs.writeFileSync(path.join(graph, "logseq", "config.edn"), '{:preferred-format "Markdown"}\n');
 fs.writeFileSync(path.join(graph, "journals", `${journalStem}.md`), `- ${journalMarker}\n`);
-const pageBody = (label) => Array.from(
+const pageBody = (label, referenceTarget) => Array.from(
   { length: BLOCKS_PER_PAGE },
-  (_, block) => `- ${label} block ${block + 1} references [[${nestedTitle}]] and #[[windows-managed]]`,
+  (_, block) => `- ${label} block ${block + 1} references [[${referenceTarget}]] and #[[windows-managed]]`,
 ).join("\n") + "\n";
-fs.writeFileSync(nestedFile, pageBody(nestedMarker));
+fs.writeFileSync(nestedFile, pageBody(nestedMarker, ordinaryTitle));
 for (let index = 1; index < PAGE_COUNT; index += 1) {
   const bucket = path.join(graph, "pages", `bucket-${String(index % 37).padStart(2, "0")}`);
   fs.mkdirSync(bucket, { recursive: true });
@@ -83,7 +84,13 @@ for (let index = 1; index < PAGE_COUNT; index += 1) {
     // round-trip. Managed activation must retain the exact bytes read-only,
     // not reject the entire reporter-shaped graph (#292).
     ? "- root\r  ```\r  - fake\r  ```"
-    : pageBody(`fixture page ${index}`);
+    // Keep graph-wide reference indexes representative without manufacturing
+    // 120,000 backlinks to the one page the timing journey opens. That shape
+    // measures long-backlink-query monopolization, not ordinary page switching.
+    : pageBody(
+      `fixture page ${index}`,
+      `Windows Managed ${String(index + 1 < PAGE_COUNT ? index + 1 : 1).padStart(5, "0")}`,
+    );
   fs.writeFileSync(path.join(bucket, `${stem}.md`), body);
 }
 
@@ -337,7 +344,6 @@ function timingReceipt(samples) {
 }
 
 async function measurePageSwitches(rounds = 8) {
-  const ordinaryTitle = "Windows Managed 00002";
   const ordinaryMarker = "fixture page 2 block 1";
   const samples = [];
   for (let round = 0; round < rounds; round += 1) {
@@ -480,7 +486,7 @@ const receipt = {
       sha256: crypto.createHash("sha256").update(fs.readFileSync(BASELINE_APP)).digest("hex"),
     },
   },
-  graphPathKinds: ["nested", "unicode", "markdown", "parseable-non-roundtripping-markdown", "many-assets", "sparse-large-asset"],
+  graphPathKinds: ["nested", "unicode", "markdown", "parseable-non-roundtripping-markdown", "distributed-page-references", "many-assets", "sparse-large-asset"],
   milestones: {},
 };
 try {
