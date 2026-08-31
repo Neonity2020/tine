@@ -330,6 +330,19 @@ let managedMoveQueue: Promise<void> = Promise.resolve();
 let managedMoveQueueEpoch = 0;
 let managedMoveQueuePending = 0;
 const MANAGED_MOVE_QUEUE_LIMIT = 256;
+type ManagedMoveAcknowledgement = {
+  epoch: number;
+  graphBinding: number;
+  bindingGeneration: number;
+  episodeId: string;
+  batchId: string;
+  attempt: number;
+};
+const managedMoveAcknowledgements: ManagedMoveAcknowledgement[] = [];
+let managedMoveAcknowledgementEpoch = 0;
+let managedMoveAcknowledgementRunning = false;
+const MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT = 256;
+const MANAGED_MOVE_ACKNOWLEDGEMENT_ATTEMPTS = 3;
 let managedHistoryReplayRunning = false;
 let managedHistoryReplayEpoch = 0;
 const managedHistoryCommands: Array<"undo" | "redo"> = [];
@@ -1348,6 +1361,8 @@ export function resetStore() {
   setManagedMoveBusyPages(new Set<string>());
   managedMoveQueueEpoch++;
   managedMoveQueuePending = 0;
+  managedMoveAcknowledgementEpoch++;
+  managedMoveAcknowledgements.length = 0;
   setVisibleMutationBusyPages(new Set<string>());
   setCollapseEpochState("byId", {});
   managedHistoryReplayEpoch++;
@@ -6624,18 +6639,14 @@ async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Prom
       { ...result.outcome.destination.page, rev: result.outcome.destination.revision },
     );
     if (intent.history) pushManagedMoveHistory(intent.history);
-    try {
-      await backend().acknowledgeManagedApplicationMove(
-        result.binding_generation,
-        result.outcome.episode_id,
-        result.outcome.batch_id,
-      );
-    } catch (error) {
-      // The move and both authoritative page DTOs are already installed. Ack
-      // only bounds private replay evidence; an ack failure must not turn a
-      // successful user operation into a false error or trigger a second move.
-      console.warn("Could not retire managed move replay evidence", error);
-    }
+    // Replay-evidence retirement has its own bounded, graph-bound retry lane.
+    // The next physical move does not wait for those cleanup barriers after
+    // both authoritative page DTOs have already been installed.
+    enqueueManagedMoveAcknowledgement(
+      result.binding_generation,
+      result.outcome.episode_id,
+      result.outcome.batch_id,
+    );
     return true;
   } catch (error) {
     pushToast(`Couldn't move blocks. (${String(error)})`, "error");
@@ -6722,7 +6733,10 @@ function prepareManagedCrossPageMoveIntent(
 function enqueueManagedMove<T>(run: () => Promise<T>, stale: T): Promise<T> {
   const epoch = managedMoveQueueEpoch;
   const binding = graphBinding();
-  if (managedMoveQueuePending >= MANAGED_MOVE_QUEUE_LIMIT) return Promise.resolve(stale);
+  if (managedMoveQueuePending >= MANAGED_MOVE_QUEUE_LIMIT
+    || managedMoveAcknowledgements.length >= MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT) {
+    return Promise.resolve(stale);
+  }
   managedMoveQueuePending++;
   const result = managedMoveQueue.then(async () => {
     if (epoch !== managedMoveQueueEpoch || binding !== graphBinding()) return stale;
@@ -6734,6 +6748,72 @@ function enqueueManagedMove<T>(run: () => Promise<T>, stale: T): Promise<T> {
   });
   managedMoveQueue = result.then(() => undefined, () => undefined);
   return result;
+}
+
+function removeManagedMoveAcknowledgement(item: ManagedMoveAcknowledgement): void {
+  const index = managedMoveAcknowledgements.indexOf(item);
+  if (index >= 0) managedMoveAcknowledgements.splice(index, 1);
+}
+
+function managedMoveAcknowledgementDelay(attempt: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 50 * (2 ** Math.max(0, attempt - 1))));
+}
+
+async function drainManagedMoveAcknowledgements(): Promise<void> {
+  if (managedMoveAcknowledgementRunning) return;
+  managedMoveAcknowledgementRunning = true;
+  try {
+    while (managedMoveAcknowledgements.length > 0) {
+      const item = managedMoveAcknowledgements[0];
+      if (item.epoch !== managedMoveAcknowledgementEpoch
+        || item.graphBinding !== graphBinding()
+        || item.bindingGeneration !== managedMoveAdmission()?.binding_generation) {
+        removeManagedMoveAcknowledgement(item);
+        continue;
+      }
+      try {
+        await backend().acknowledgeManagedApplicationMove(
+          item.bindingGeneration,
+          item.episodeId,
+          item.batchId,
+        );
+        removeManagedMoveAcknowledgement(item);
+      } catch (error) {
+        item.attempt++;
+        if (item.attempt >= MANAGED_MOVE_ACKNOWLEDGEMENT_ATTEMPTS) {
+          removeManagedMoveAcknowledgement(item);
+          // The move is already authoritative. Without a durable native ack,
+          // its pair deliberately remains exact crash-response evidence; do
+          // not turn cleanup failure into a false move failure or retry the
+          // semantic transaction.
+          console.warn("Could not retire managed move replay evidence", error);
+          continue;
+        }
+        await managedMoveAcknowledgementDelay(item.attempt);
+      }
+    }
+  } finally {
+    managedMoveAcknowledgementRunning = false;
+    if (managedMoveAcknowledgements.length > 0) void drainManagedMoveAcknowledgements();
+  }
+}
+
+function enqueueManagedMoveAcknowledgement(
+  bindingGeneration: number,
+  episodeId: string,
+  batchId: string,
+): void {
+  if (managedMoveAcknowledgements.some((item) => item.episodeId === episodeId)) return;
+  if (managedMoveAcknowledgements.length >= MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT) return;
+  managedMoveAcknowledgements.push({
+    epoch: managedMoveAcknowledgementEpoch,
+    graphBinding: graphBinding(),
+    bindingGeneration,
+    episodeId,
+    batchId,
+    attempt: 0,
+  });
+  void drainManagedMoveAcknowledgements();
 }
 
 function enqueueManagedCrossPageMove(

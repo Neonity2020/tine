@@ -1267,9 +1267,14 @@ pub(crate) async fn acknowledge_managed_application_move(
         let handle = sparse_application_handle(&slot)?.ok_or_else(|| {
             "managed cross-page move acknowledgement requires managed storage".to_owned()
         })?;
-        handle
+        let result = handle
             .acknowledge_application_move(&episode_id, &batch_id)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        // Acknowledgement schedules actor-owned bounded cleanup. Wake the
+        // watcher on both success and retryable failure so the cleanup lane is
+        // not stranded on an otherwise quiet graph.
+        crate::state::poke_watcher(&state);
+        result
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1651,6 +1656,27 @@ mod graph_wide_command_boundary_tests {
 
 #[cfg(test)]
 mod managed_actor_command_boundary_tests {
+    #[test]
+    fn move_acknowledgement_wakes_actor_cleanup_after_every_attempt() {
+        let source = include_str!("commands.rs");
+        let signature = "pub(crate) async fn acknowledge_managed_application_move(";
+        let start = source
+            .find(signature)
+            .expect("acknowledgement command remains");
+        let tail = &source[start..];
+        let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+        let command = &tail[..end];
+        assert!(command.contains("tauri::async_runtime::spawn_blocking(move ||"));
+        assert!(command.contains("slot_for_bound_window"));
+        assert!(command.contains("Some(binding_generation)"));
+        assert!(command.contains("crate::state::poke_watcher(&state);"));
+        assert!(
+            command.find("let result = handle").unwrap()
+                < command.find("crate::state::poke_watcher(&state);").unwrap(),
+            "the watcher wake must happen after the actor attempt and before its result returns"
+        );
+    }
+
     #[test]
     fn every_ordinary_managed_actor_command_re_resolves_off_the_async_command_thread() {
         let source = include_str!("commands.rs");

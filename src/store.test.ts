@@ -2665,7 +2665,12 @@ describe("managed actor-owned cross-page moves", () => {
         },
       };
     });
-    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove");
+    let releaseAcknowledgement!: () => void;
+    const acknowledgementMayFinish = new Promise<void>((resolve) => {
+      releaseAcknowledgement = resolve;
+    });
+    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove")
+      .mockImplementation(async () => acknowledgementMayFinish);
     try {
       const first = moveBlockFeed("moving", 1);
       await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
@@ -2677,10 +2682,48 @@ describe("managed actor-owned cross-page moves", () => {
       expect(pageByName("Older")!.roots).toEqual([]);
       expect(pageByName("Oldest")!.roots).toEqual(["moving"]);
       expect(toasts().filter((toast) => toast.kind === "error")).toEqual([]);
+      expect(acknowledge).toHaveBeenCalledTimes(1);
+      releaseAcknowledgement();
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(2));
       expect(acknowledge.mock.calls).toEqual([
         [managedStorageRuntime.snapshot().applicationPageAdmission!.binding_generation, expect.any(String), "rapid-one"],
         [managedStorageRuntime.snapshot().applicationPageAdmission!.binding_generation, expect.any(String), "rapid-two"],
       ]);
+    } finally {
+      releaseAcknowledgement();
+      acknowledge.mockRestore();
+      move.mockRestore();
+    }
+  });
+
+  it("retries replay-evidence acknowledgement outside the serialized move lane", async () => {
+    const moving = { id: "moving", raw: "moving", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed" as const,
+        episode_id: request.episode_id,
+        batch_id: "retry-ack",
+        recovered: false,
+        source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+        destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+      },
+    }));
+    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove")
+      .mockRejectedValueOnce(new Error("transient one"))
+      .mockRejectedValueOnce(new Error("transient two"))
+      .mockResolvedValue(undefined);
+    try {
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      expect(pageByName("Older")!.roots).toEqual(["moving"]);
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(3));
+      expect(move).toHaveBeenCalledTimes(1);
     } finally {
       acknowledge.mockRestore();
       move.mockRestore();

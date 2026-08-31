@@ -2285,13 +2285,32 @@ fn publish_managed_candidate_with(
             "The graph changed while the managed candidate was prepared. Retry setup.".into(),
         );
     }
-    persist_successor()?;
+    let predecessor_was_direct = candidate.direct_source_generation.is_some();
+    if let Err(error) = persist_successor() {
+        if predecessor_was_direct {
+            let rollback = restore_direct_selection(&candidate.predecessor.root_key);
+            return Err(match rollback {
+                Ok(()) => format!(
+                    "managed selector publication failed ({error}); Direct Files selection was restored"
+                ),
+                Err(rollback) => format!(
+                    "managed selector publication failed ({error}) and Direct Files selection could not be restored ({rollback})"
+                ),
+            });
+        }
+        return Err(format!("managed runtime publication failed: {error}"));
+    }
     if let Err(error) = graphs.replace_if_current(
         label,
         candidate.predecessor.binding_generation,
         &candidate.predecessor.root_key,
         Arc::clone(&candidate.replacement),
     ) {
+        if !predecessor_was_direct {
+            return Err(format!(
+                "managed runtime publication was superseded: {error}"
+            ));
+        }
         let rollback = restore_direct_selection(&candidate.predecessor.root_key);
         return Err(match rollback {
             Ok(()) => format!("managed publication was superseded: {error}"),
@@ -4226,6 +4245,7 @@ mod clean_shutdown_slot_tests {
             provider_pending: 0,
             provider_runnable: false,
             search_index_building: false,
+            move_episode_cleanup_pending: false,
             managed_local_pending: 0,
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
@@ -4982,14 +5002,14 @@ mod tests {
                 sample_load_ms: 0,
                 total_ms: 0,
             },
-            direct_source_generation: Some(expected_generation),
+            direct_source_generation: expected_generation,
         };
 
         let persisted = std::sync::atomic::AtomicUsize::new(0);
         let error = publish_managed_candidate_with(
             &state,
             "main",
-            candidate(source_generation.saturating_add(1)),
+            candidate(Some(source_generation.saturating_add(1))),
             || {
                 persisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
@@ -5010,10 +5030,53 @@ mod tests {
             predecessor.binding_generation
         );
 
+        let restored = std::sync::atomic::AtomicUsize::new(0);
+        let error = publish_managed_candidate_with(
+            &state,
+            "main",
+            candidate(Some(source_generation)),
+            || Err("ambiguous managed selector publication".into()),
+            |_| {
+                restored.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("Direct Files selection was restored"));
+        assert_eq!(restored.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            state
+                .graphs
+                .read()
+                .unwrap()
+                .slot("main")
+                .unwrap()
+                .binding_generation,
+            predecessor.binding_generation
+        );
+
+        let error = publish_managed_candidate_with(
+            &state,
+            "main",
+            candidate(None),
+            || Err("managed-to-managed publication failure".into()),
+            |_| {
+                restored.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("managed runtime publication failed"));
+        assert_eq!(
+            restored.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a managed predecessor must not be rolled back to Direct Files"
+        );
+
         publish_managed_candidate_with(
             &state,
             "main",
-            candidate(source_generation),
+            candidate(Some(source_generation)),
             || {
                 persisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
