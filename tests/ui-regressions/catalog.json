@@ -9459,6 +9459,89 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: clicking in the empty space to the right of a block's last line puts the caret at the end of what the editor will show, so Enter starts the next block instead of splitting the construct. Classification: blocking stateful UX (the caret is one byte short, inside markup the reader cannot see). Root cause: the click was answered by the span map, which for a trailing construct like *italics* legitimately maps the end of the visible text to the source byte BEFORE the invisible closing delimiter \u2014 a valid interior offset, so the existing 'mapping failed' fallback never ran. Proven at the mapping layer: for `*some text in italics.*` the end of the rendered text maps to 22, one short of the 23-character source. Fix: recognise the click by WHERE it landed, not what it landed on \u2014 beyondFinalGlyph() in src/render/spans.ts asks whether the point lies past the rightmost glyph of the bottom-most line band, and Block.tsx consults it before the span map, returning the end of the editor's VISIBLE value (not raw.length, which counts hidden property lines). Deliberately geometric rather than per-syntax: a rule keyed on emphasis would have to be repeated for bold, inline code, strikethrough and the Org forms, and a rule that snapped any span-end to the construct end would break precise clicks inside formatted text. Siblings preserved: a precise interior click still maps exactly (asserted for the italic body), a click past an EARLIER wrapped line still lands at that line's end rather than the block's, and the trailing-link behaviour of GH #34 is unchanged because there the editable end and the span end coincide. Real-app proof drives WebKitGTK pointer clicks at computed run-out coordinates for three trailing constructs (emphasis, strong, inline code); fail-before was reproduced by running the same extended journey against the pre-fix release binary."
+    },
+    {
+      "id": "UI-BULLET-MODIFIED-CLICK-456",
+      "title": "Ctrl/Cmd+click and Alt+click on a block bullet zoom in place instead of opening a new tab or the other pane",
+      "family": "navigation-modified-click",
+      "sources": {
+        "issues": [
+          456
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.bulletModifiedClick.test.tsx",
+          "src/components/RefBlocks.test.tsx"
+        ],
+        "scenario": "navigation.bullet-modified-click",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a modifier held over a bullet sends the block where the same modifier sends a [[page ref]] \u2014 Ctrl/Cmd or middle-click to a background tab, Alt to the other pane, Shift to the right sidebar \u2014 instead of silently zooming in place. Classification: blocking stateful UX (the gesture is learned from links and the app answered it differently in one place). Root cause: the bullet's own handler tested `e.shiftKey` alone rather than the shared decision in src/linkGesture.ts, so every other modifier fell through to the plain zoom. Sibling swept in the same change: the read-only reference bullet in RefBlocks.tsx (linked references, query results, embeds) had the identical Shift-only handler. Both bullets also ran their own onMouseDown and skipped GH #207's other half, so shift-range text selection and middle-button autoscroll / PRIMARY-paste were never suppressed there; they now go through internalLinkMouseDown, asserted in both files. Not covered here: the ref-count badge and the query workspace's result rows, which are separate surfaces that ignore all modifiers today \u2014 recorded as follow-ups, not part of this row. Fail-before: with the handlers reverted, the Ctrl and Alt assertions fail in both files while the Shift and plain-click controls pass."
+    },
+    {
+      "id": "UI-ALT-SHORTCUT-WHILE-EDITING-461",
+      "title": "A global shortcut whose only modifier is Alt does not fire while the caret is in a block",
+      "family": "keybindings-dispatch",
+      "sources": {
+        "issues": [
+          461
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/keybindings.test.ts"
+        ],
+        "scenario": "keybindings.alt-only-chord-while-editing",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a shortcut the user bound to a bare Alt chord (the reporter's Alt+S for the next tab) fires with the caret in a block, the same as it does everywhere else in the app. Classification: blocking core operation (the binding is configured and simply does not run in the place the user spends most of their time). Root cause: the global dispatcher's while-typing guard admitted only `mod`/`ctrl` chords, so Ctrl+Alt+S worked and Alt+S did not. Alt now counts as a modifier there. Only `scope: \"global\"` commands with a `run` are matched by that dispatcher, so the block editor's own bare-Alt bindings (alt+f/alt+b/alt+w/alt+d/alt+u/alt+k/alt+l) are untouched, and an Alt chord nothing is bound to still reaches the textarea unprevented \u2014 asserted directly, because on macOS that event is an Option-composed character. Fail-before: with the guard reverted the Alt+S assertion fails while both control assertions pass."
+    },
+    {
+      "id": "UI-SWITCHER-CTRL-ENTER-NEW-TAB-463",
+      "title": "Ctrl/Cmd+Enter on the highlighted search result navigates in place instead of opening a background tab",
+      "family": "navigation-modified-click",
+      "sources": {
+        "issues": [
+          463,
+          288
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QuickSwitcher.modifiedClicks.test.tsx"
+        ],
+        "scenario": "navigation.switcher-modifier-enter",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: driving search from the keyboard reaches the same destinations as the mouse \u2014 Ctrl/Cmd+Enter fans the highlighted result into a background tab and leaves the switcher open, so several results can be opened without searching again. Classification: blocking stateful UX (the modifier is already learned from the click established by GH #288 and did nothing on the keyboard). Root cause: the Enter handler implemented Shift and Alt but had no Ctrl/Cmd rung, so the chord fell through to plain navigation. Page and block rows only, matching the click; create and command rows keep their existing single action. Fail-before: with the new branch removed the switcher closes and no tab is added."
     }
   ]
 }

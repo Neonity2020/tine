@@ -9,13 +9,13 @@ icon:: 📌
   - 4. Press **t r** to hide the whole sidebar and **t r** again to bring it back just as it was; its items are restored with your session.
   - What you should see: the source parked beside your page, both editable — and it stays parked while the main page navigates elsewhere.
 - ## Gather places in tabs, and pin the ones you live in
-  - 1. **Middle-click** a link, a search hit, or a bullet's dot to open it in a background tab — you never leave the page you're on.
+  - 1. **Middle-click** or **Ctrl/Cmd-click** a link, a search hit, or a bullet's dot to open it in a background tab — you never leave the page you're on. In **Ctrl+K**, **Ctrl/Cmd+Enter** does the same for the highlighted result and leaves the search open, so you can fan several out in a row.
   - 2. Navigating to a page that's already open just focuses its tab instead of making a duplicate (Settings → **Editor** → **Switch to an already-open tab when navigating** turns that off).
   - 3. **Double-click** a tab to pin it. Pinned tabs gather at the left and hold their content: ordinary navigation from one opens a fresh tab instead, and closing a pinned tab asks first — an accidental **Ctrl+W** can't eat it.
   - 4. Closed one too soon? **Ctrl+Shift+T** reopens the last closed tab with its history. When titles stop fitting, the **⌄ Show all tabs** button at the strip's edge lists them in full — activate, pin, close, or drag to reorder there.
   - What you should see: the same tabs, pins included, come back after a restart — and as session state outside your graph, none of this ever adds a file to it.
 - ## Split the window for true side-by-side
-  - 1. Desktop only: **Alt+click** any `[[link]]`, tag, or block reference to open it in another pane — with a single pane, Tine splits right for it. In **Ctrl+K**, **Alt+click** or **Alt+Enter** does the same for the highlighted result. The direct bindings: `Ctrl+Alt+\` splits right with a copy of the current tab, `Ctrl+Alt+Shift+\` splits down.
+  - 1. Desktop only: **Alt+click** any `[[link]]`, tag, block reference, or bullet's dot to open it in another pane — with a single pane, Tine splits right for it. In **Ctrl+K**, **Alt+click** or **Alt+Enter** does the same for the highlighted result. The direct bindings: `Ctrl+Alt+\` splits right with a copy of the current tab, `Ctrl+Alt+Shift+\` splits down.
   - 2. Each pane keeps its own tab strip and its own back/forward history — **Alt+Left** and **Alt+Right** step through it, even mid-edit.
   - 3. Drag the seam between panes to resize them. Drag a tab onto another pane's strip to move it there, onto a pane's body to append it, or onto a seam or pane edge to split that spot and drop the tab into the new pane — **Esc** cancels a drag mid-way.
   - 4. PDF readers use the same tabs and panes. Opening a PDF link makes a companion pane while preserving the source page; you can then drag the PDF tab into any pane or quadrant. **Notes** opens the PDF's notes page in its structural companion pane, and that notes tab can be moved in exactly the same way.

@@ -4,7 +4,7 @@ icon:: ⌨️
 	- A quick tour of the things that aren't obvious on day one. (Shortcuts are remappable in Settings.)
 - ## Find anything — Ctrl+K
 	- **Ctrl+K** opens the quick switcher: jump to a page, search the text of any block, or run a command — all from one box. **Ctrl+Shift+P** opens the command palette (commands only).
-	- Use **Ctrl+Shift+K** to search only the focused page, including children hidden under folded bullets. In the ordinary Ctrl+K switcher, press **Shift+Enter** on a page or block to send it to the right sidebar without leaving your current page.
+	- Use **Ctrl+Shift+K** to search only the focused page, including children hidden under folded bullets. In the ordinary Ctrl+K switcher, press **Shift+Enter** on a page or block to send it to the right sidebar, or **Ctrl/Cmd+Enter** to open it in a background tab — either way the switcher stays open.
 	- Use **Search syntax** for phrases, alternatives, exclusions, and regular expressions. Choose **Open search tab** to keep the complete search in a graph-specific tab instead of choosing only one hit.
 	- That result tab can switch between **Search**, **List**, **Table**, and **Board** without changing what matched. Use **Name this search to save it as a page** and **Save page** when the search is worth keeping: Tine turns it into an ordinary query page in your graph. **Filters / Advanced** handles friendly fields and date ranges; **Edit as visual query** opens the deeper visual editor when needed.
 	- Page-title matching keeps exact, prefix, substring, and fuzzy results in that order. Repeated choices may break ties inside one class using device-local history; Settings → **Editor** → **Learn Ctrl+K choices** disables or resets it.
@@ -20,7 +20,7 @@ icon:: ⌨️
 - ## Slash commands — /
 	- Type **/** at the start of a bullet for a menu: tasks, headings, a code block, a `/calc` live calculator, dates (Scheduled / Deadline), callouts, queries, a math block, asset upload, and more. `/Code block` opens a language picker; typing a language after an opening backtick or tilde fence offers the same completion.
 - ## Tabs
-	- **Middle-click** any bullet, page, or search result to open it in a background tab. **Double-click** a tab to pin it, **drag** to reorder, **Ctrl+W** to close. Your tabs come back next launch.
+	- **Middle-click** or **Ctrl/Cmd-click** any bullet, page, or search result to open it in a background tab; **Alt-click** the same thing to open it in the other pane. **Double-click** a tab to pin it, **drag** to reorder, **Ctrl+W** to close. Your tabs come back next launch.
 	- When a pane has more tabs than fit, use its tab-overview button to see every full title, activate or pin a tab, close it, or reorder it with the drag handle / **Alt+Up/Down** without guessing from truncated labels.
 	- For arranging tabs with the sidebars and split panes into a working layout — and saving it as a workspace — see [[Workflows/Keep context visible]]; [[Start/Where things are]] maps the places first.
 - ## The sidebars
@@ -35,7 +35,7 @@ icon:: ⌨️
 	- **t w** switches between the standard reading column and Wide mode. The page keeps the same width while you edit, fold blocks, or open reference sections.
 	- Wide mode fills the available pane by default. To tune either layout on this device, open Settings → **Appearance** → **Advanced**: set the standard page width in pixels, or give Wide mode a custom maximum.
 - ## A few more worth knowing
-	- In Settings → **Keyboard Shortcuts**, use the settings search field to filter commands by name, command ID, or current binding before recording a replacement.
+	- In Settings → **Keyboard Shortcuts**, use the settings search field to filter commands by name, command ID, or current binding before recording a replacement. A shortcut you record works while you are editing a block too, including one whose only modifier is Alt.
 	- Use the **…** beside an ordinary page title for its complete actions menu: open the source file, copy/export, inspect properties, rename, carry tasks, or delete. It is the same menu as right-click and works from the keyboard and touch.
 	- **Carry unfinished tasks** forward into today (from the command palette) — the last 7 / 30 / 365 days, optionally with their context.
 	- Select several task bullets and press **Ctrl/Cmd+Enter** to advance each one through your workflow in a single Undo step. The selection toolbar can also wrap selected text as a page link or inline code.

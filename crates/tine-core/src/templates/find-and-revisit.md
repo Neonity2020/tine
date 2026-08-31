@@ -5,7 +5,7 @@ icon:: 🔍
 - ## "I saw it somewhere" — jump with Ctrl+K
   - 1. Press **Ctrl+K** (Cmd on Mac) and type any words from the title or the text you remember. The switcher matches page titles and the visible text of blocks — not hidden properties or ids.
   - 2. Too many hits? Narrow with the **Search syntax** forms listed in the switcher footer: `-draft` excludes a word, `OR` offers alternatives, quotes pin an exact phrase, `/…/` is a case-sensitive regular expression.
-  - 3. **Enter** opens the highlighted result; **Shift+Enter** opens it in the right sidebar beside your current page; middle-click a result for a background tab.
+  - 3. **Enter** opens the highlighted result; **Shift+Enter** opens it in the right sidebar beside your current page; **Ctrl/Cmd+Enter** or a middle-click opens it in a background tab without closing the search.
   - 4. Sure it's on the open page? **Ctrl+Shift+K** searches only that page's blocks, including the ones folded away, and **Ctrl+F** is the slim in-page find bar with match counts.
   - What you should see: Tine jumps to the page or block. Exact title matches lead the list; over time Tine may prefer a result you deliberately picked before, but only among equally strong matches — Settings → **Editor** → **Learn Ctrl+K choices** resets or disables that.
 - ## Follow the trail: links, tags, and references

@@ -967,6 +967,8 @@ mod tests {
         assert!(page.markdown.contains("- # Find and revisit"));
         assert!(page.markdown.contains("**Ctrl+K**"));
         assert!(page.markdown.contains("Open search tab"));
+        // GH #463: the keyboard reaches every destination the mouse does.
+        assert!(page.markdown.contains("**Ctrl/Cmd+Enter**"));
         assert!(page.markdown.contains("+ New group"));
         assert!(page.markdown.contains("copy/export button"));
         assert!(page.markdown.contains("{{query [[Project/Roadmap]]}}"));
@@ -1187,6 +1189,14 @@ mod tests {
         // pre-#283 Ctrl+click — pin the modal so the Guide can't drift back.
         assert!(page.markdown.contains("**Alt+click**"));
         assert!(!page.markdown.contains("**Ctrl+click**"));
+        // GH #456/#463: the bullet answers the same ladder as a link, so the
+        // Guide names the bullet's dot for the pane gesture and names the
+        // Ctrl/Cmd routes to a background tab beside the middle-click.
+        assert!(page
+            .markdown
+            .contains("block reference, or bullet's dot to open it in another pane"));
+        assert!(page.markdown.contains("**Ctrl/Cmd-click**"));
+        assert!(page.markdown.contains("**Ctrl/Cmd+Enter**"));
         assert!(page.markdown.contains("+ New workspace"));
         assert!(page
             .markdown
@@ -1362,6 +1372,10 @@ mod tests {
             .markdown
             .contains("keeps the same width while you edit"));
         assert!(tips.markdown.contains("Appearance** → **Advanced"));
+        // GH #456/#461/#463.
+        assert!(tips.markdown.contains("**Ctrl/Cmd-click** any bullet"));
+        assert!(tips.markdown.contains("**Alt-click** the same thing"));
+        assert!(tips.markdown.contains("whose only modifier is Alt"));
         assert!(tips.markdown.contains("custom maximum"));
     }
 
