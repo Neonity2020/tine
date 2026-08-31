@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, Suspense, createEffect, createMemo, createResource, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
@@ -119,6 +119,7 @@ import { openPage, openFile, openPageTarget } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
+import { settingsMaximized, setSettingsMaximized } from "../settingsLayout";
 import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
@@ -357,14 +358,13 @@ export function Settings(): JSX.Element {
   // Settings owns its semantic Escape rungs.  Registering here (rather than in
   // App) keeps shortcut recording/search/disclosures from being skipped by a
   // blanket modal close and ensures disposal follows this component lifetime.
-  // Transient maximize (GH #287): a pure geometry toggle on the dialog, so the
-  // selected page and scroll position ride through untouched, and closing the
-  // modal always restores the default size for the next open.
-  const [maximized, setMaximized] = createSignal(false);
-  createEffect(() => {
-    if (settingsOpen()) return;
-    setMaximized(false);
-  });
+  // Maximize (GH #287): a pure geometry toggle on the dialog, so the selected
+  // page and scroll position ride through untouched. GH #427 made it stick —
+  // the state lives in settingsLayout.ts and is remembered across a reopen and
+  // a restart, because this dialog unmounts on close and someone who wants the
+  // wide size wants it every time, not once per open.
+  const maximized = settingsMaximized;
+  const setMaximized = setSettingsMaximized;
 
   createEffect(() => {
     if (!settingsOpen()) return;
@@ -469,6 +469,17 @@ export function Settings(): JSX.Element {
               </button>
             </div>
             <div class="settings-pane-body">
+              {/* GH #409: Settings is mounted under a fallback-less <Suspense>
+                  in App.tsx (it is lazy()), so a panel that starts loading a
+                  resource when it mounts suspended the WHOLE dialog — the user
+                  saw Settings vanish and come back on every switch to Journals,
+                  Backups and Graph, the three sections whose panels do exactly
+                  that (the template list, the journal-filename inventory, the
+                  home-page picker). Sections with nothing to load never
+                  flickered, which is why the report names only those three.
+                  This boundary keeps the suspension inside the pane, so the
+                  dialog, its list of sections and the search box stay put. */}
+              <Suspense fallback={<div class="settings-pane-pending" aria-hidden="true" />}>
               <Show when={settingsQuery().trim() && tab() !== "shortcuts"}>
                 <div class="settings-search-results" aria-live="polite">
                   <Show when={matches().length} fallback={<div class="settings-search-empty">No matching settings</div>}>
@@ -525,6 +536,7 @@ export function Settings(): JSX.Element {
               <Show when={tab() === "about"}>
                 <AboutTab />
               </Show>
+              </Suspense>
             </div>
           </div>
         </div>

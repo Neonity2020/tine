@@ -8848,6 +8848,57 @@
       "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after. Retrofitted to GH #426 on 2026-08-31: this internal find and the Linux/Windows half of that public report are the same defect, and the reporter's own diagnostics attachment (v0.6.98, build 94579a0, which predates the fix) confirms it \u2014 its previous session records runtime.started and 26 later events but no runtime.clean_shutdown. The mobile half of #426 is a different orderly-end question and is UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426."
     },
     {
+      "id": "UI-SETTINGS-SECTION-SWITCH-FLICKER-409",
+      "title": "Switching to a Settings section that loads something does not close and reopen the whole dialog",
+      "family": "settings",
+      "sources": {
+        "issues": [
+          409
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Settings.tabSwitch.test.tsx"
+        ],
+        "scenario": "settings.section-switch-keeps-the-dialog",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: choosing a section inside Settings changes the pane, and the dialog, its section list and the search box stay where they are. Classification: blocking stateful UX. Root cause: Settings is lazy() and mounted under a FALLBACK-LESS <Suspense> in App.tsx, so any panel that starts loading a resource as it mounts suspended the whole dialog and Solid removed it from the document until the load settled \u2014 the user saw Settings vanish and come back. The three sections the reporter names are exactly the three whose panels load on mount: Journals (the template list), Backups & recovery (the journal-filename inventory) and Graph (the home-page picker, confirmed by removing HomePageField and watching the Graph case go green). Sections with nothing to load never flickered, which is why the report names only those three. Fix: a <Suspense> inside settings-pane-body, so a section that loads shows a blank pane for that moment instead of taking the dialog with it; the modal has a fixed height, so nothing resizes. Fixed at the boundary rather than at each of the three panels so a fourth loading panel cannot reintroduce it. The regression reproduces the App.tsx wrapper deliberately \u2014 rendering Settings bare hides the defect entirely \u2014 and asserts synchronously after the click, because the flash is one frame wide and a settled assertion cannot see it."
+    },
+    {
+      "id": "UI-SETTINGS-MAXIMIZE-PERSISTS-427",
+      "title": "The Settings dialog opens at the size it was last left at",
+      "family": "settings",
+      "sources": {
+        "issues": [
+          427,
+          287
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Settings.maximize.test.tsx"
+        ],
+        "scenario": "settings.maximize-is-remembered",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: someone who maximizes Settings finds it maximized the next time they open it, and after restarting Tine; someone who restores it finds it small. Classification: blocking stateful UX (a preference the user re-enters several times a day). GH #287 shipped the control as deliberately transient and #427 asked for the opposite on the reporter's case: 'I never want the small version \u2014 having to press the control on every open is a small tax paid several times a day.' The state moved out of the dialog into src/settingsLayout.ts, because Settings is lazy() and unmounts on close, and is persisted through the same device-local app_bool store the other remembered preferences use. Hydrated at startup rather than at dialog mount, so a remembered wide dialog opens wide instead of opening small and snapping. Default is unchanged (small) for anyone who never presses the control. #287's 'does not persist across modal close/reopen' assertion was the old contract and is replaced, not grandfathered; both directions of the store round trip are asserted, since either half alone would look right while the setting evaporated on restart."
+    },
+    {
       "id": "UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426",
       "title": "A mobile app the OS reaps while backgrounded is not reported as having closed uncleanly",
       "family": "diagnostics",

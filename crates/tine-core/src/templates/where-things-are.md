@@ -18,6 +18,7 @@ icon:: 🗺️
   - Anything you want **beside** the current page rather than instead of it — another page, or zoomed into one bullet — goes to the right sidebar: **Shift-click** a link or a bullet's dot. Items there are live editors, not previews. Press **t r** to show or hide the whole sidebar.
 - ## Settings and Help
   - The gear at the top right (or press **t s**) opens **Settings**: appearance, editor behavior, graph files and backups, and the remappable shortcut list.
+  - Settings opens as a small dialog. The button beside its search box makes it fill the window, which is easier to read through; Tine remembers which size you left it at and opens it that way next time.
   - The **?** button at the bottom right (or press **Shift+?**) opens Help: this Guide, the shortcut reference, and links out to release notes and bug reports.
 - ## On a phone
   - Below a 640 px window width, either sidebar opens as an overlay on top of the current route instead of shrinking it — tap the shaded outside edge, press Esc, or use Android Back to dismiss. Split panes and the tab strip are desktop-only.
