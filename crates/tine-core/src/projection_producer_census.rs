@@ -872,13 +872,18 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/managed_storage_journey.rs",
             "fs.create_dir_all",
-            4,
+            5,
+        ),
+        (
+            "crates/tine-core/src/managed_storage_journey.rs",
+            "fs.remove_dir_all",
+            2,
         ),
         ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/model.rs", "cap.remove_file", 23),
-        ("crates/tine-core/src/model.rs", "cap.rename", 2),
+        ("crates/tine-core/src/model.rs", "cap.remove_file", 26),
+        ("crates/tine-core/src/model.rs", "cap.rename", 1),
         ("crates/tine-core/src/model.rs", "fs.create_dir", 8),
-        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 15),
+        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 16),
         ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 2),
         ("crates/tine-core/src/model.rs", "fs.remove_file", 16),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
@@ -896,67 +901,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "cap.create_dir",
             1,
         ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "cap.hard_link",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "cap.remove_file",
-            6,
-        ),
-        ("crates/tine-core/src/oplog/enrollment.rs", "cap.rename", 1),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "fs.create_dir_all",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "libc.openat.create",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "libc.renameat2",
-            1,
-        ),
-        ("crates/tine-core/src/oplog/enrollment.rs", "open.create", 1),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "open.create_new",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/hot_engine.rs",
-            "cap.remove_dir",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/hot_engine.rs",
-            "cap.remove_dir_all",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/identity.rs",
-            "libc.openat.create",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/identity.rs",
-            "open.create_new",
-            1,
-        ),
         ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
         (
             "crates/tine-core/src/oplog/import.rs",
             "fs.create_dir_all",
             1,
         ),
-        ("crates/tine-core/src/oplog/import.rs", "fs.remove_file", 5),
-        ("crates/tine-core/src/oplog/import.rs", "fs.rename", 2),
-        ("crates/tine-core/src/oplog/import.rs", "open.create_new", 2),
+        ("crates/tine-core/src/oplog/import.rs", "fs.remove_file", 4),
+        ("crates/tine-core/src/oplog/import.rs", "open.create_new", 1),
         (
             "crates/tine-core/src/oplog/lazy_genesis.rs",
             "fs.create_dir",
@@ -991,7 +943,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "cap.create_dir",
-            6,
+            2,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
@@ -1001,27 +953,17 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "cap.remove_file",
-            4,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "cap.rename",
             2,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
-            "libc.openat.create",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "open.create",
+            "cap.rename",
             1,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "open.create_new",
-            3,
+            1,
         ),
         (
             "crates/tine-core/src/oplog/projection_store.rs",
@@ -1083,11 +1025,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "cap.remove_file",
             2,
         ),
-        (
-            "crates/tine-core/src/oplog/resume_point.rs",
-            "cap.remove_file",
-            1,
-        ),
         ("crates/tine-core/src/oplog/sqlite.rs", "cap.create_dir", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "fs.create_dir", 1),
         (
@@ -1121,7 +1058,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/publish.rs", "fs.create_dir", 1),
         ("crates/tine-core/src/publish.rs", "fs.remove_dir_all", 1),
         ("crates/tine-core/src/publish.rs", "open.create_new", 1),
-        ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 3),
+        ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 7),
         (
             "crates/tine-core/src/sync_runtime.rs",
             "fs.create_dir_all",
@@ -1196,11 +1133,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/settings.rs", "fs.write", 1),
         ("src-tauri/src/settings.rs", "open.create_new", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 4),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 2),
         ("src-tauri/src/sync_runtime.rs", "fs.rename", 4),
-        ("src-tauri/src/sync_runtime.rs", "open.create_new", 1),
     ]
     .into_iter()
     .map(|(path, primitive, count)| (path.to_owned(), primitive.to_owned(), count))
@@ -1279,7 +1215,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
     let expected = vec![
         ("managed_atomic_create_with_proof", 2),
         ("managed_atomic_write_validated", 2),
-        ("managed_atomic_replace_bound", 1),
+        ("managed_atomic_replace_bound", 2),
         ("rename_projection_noreplace_platform", 1),
         ("rename_managed_noreplace", 3),
         ("atomic_publish", 2),
@@ -1313,16 +1249,16 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("flip_pending_cleanup_round", 1),
         ("stage_object_bytes", 1),
         ("stage_manifest_bytes", 1),
-        ("stage", 24),
-        ("commit", 8),
-        ("publish_immutable", 8),
+        ("stage", 6),
+        ("commit", 6),
+        ("publish_immutable", 6),
         ("install_staged_artifact", 1),
-        ("replace_head", 2),
+        ("replace_head", 0),
         ("ensure_shared_provider_directory", 4),
         ("put_complete", 2),
         ("provider_retire_original_into_placeholder", 1),
         ("write_config", 9),
-        ("atomic_update", 6),
+        ("atomic_update", 4),
         ("create_graph", 0),
         ("create_demo_graph", 1),
         ("reserve_restore_recovery", 2),
@@ -1502,6 +1438,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             1,
         ),
         ("crates/tine-core/src/fast_commit.rs", "journal.v1.open", 1),
+        ("crates/tine-core/src/model.rs", "durable_directory.open", 5),
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
@@ -1521,11 +1458,6 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             "crates/tine-core/src/oplog/object_store.rs",
             "durable_directory.open",
             1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "immutable.batch",
-            2,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
@@ -1555,7 +1487,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         (
             "crates/tine-core/src/sync_runtime.rs",
             "durable_directory.open",
-            3,
+            4,
         ),
         ("crates/tine-core/src/sync_runtime.rs", "journal.v2.open", 2),
         (
@@ -1577,10 +1509,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.11.0\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "a424609af57c34813e0c612bae72c1961de4d17d3dced85eaa88997355965677",
+        "9ef9a144697760038b8d607ead9cf5c667d7883e0a54b158b59a7188943dea2c",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -1798,6 +1730,50 @@ fn g_g_user_selected_report_writes_stay_on_the_atomic_family() {
 }
 
 #[test]
+fn ms14b_retired_patricia_and_detached_bootstrap_routes_are_absent() {
+    let files = production_rust();
+
+    // The production Patricia-opening constructor is retired. Tests that need
+    // an archive exercise `attach_clean_archive_store` through a cfg(test)
+    // helper, so neither spelling may become a production entry point.
+    assert_eq!(call_count(&files, "with_archive_store"), 0);
+    assert_eq!(call_count(&files, "with_clean_archive_store_for_test"), 0);
+
+    // The detached/inactive-bootstrap entry roots are physically absent from
+    // production. Any new caller or definition is an architectural decision,
+    // not an incidental resurrection of the retired bootstrap route.
+    for root in [
+        "prepare_bootstrap_transaction",
+        "publish_install_verify_inactive_bootstrap",
+        "prepare_inactive_bootstrap_import",
+        "prepare_inactive_bootstrap_import_with_progress",
+        "reopen_inactive_bootstrap_accepted_authority",
+        "retain_inactive_bootstrap_accepted_authority",
+    ] {
+        assert_eq!(call_count(&files, root), 0, "unexpected caller of {root}");
+    }
+
+    for opener in [
+        "open_logseq_claim_index",
+        "open_portable_path_index",
+        "open_page_name_ownership_index",
+    ] {
+        assert_eq!(call_count(&files, opener), 0, "retired opener {opener}");
+    }
+    assert!(files
+        .iter()
+        .all(|file| file.relative != "oplog/content_patricia.rs"));
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| identifier_occurrences(&file.code, "PatriciaIndexStore"))
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(call_count(&files, "bootstrap_authoring_capability"), 0);
+}
+
+#[test]
 fn syntax_aware_test_mask_handles_items_fields_locals_and_expressions() {
     let source = r#"
         #[cfg(test)] fn omitted_item() { fs::write("x", b"x"); }
@@ -1837,5 +1813,10 @@ fn census_guard_itself_names_every_required_guard() {
     assert_eq!(
         prefixes,
         BTreeSet::from(["a", "b", "c", "d", "e", "f", "g"])
+    );
+    assert!(
+        include_str!("oplog/mod.rs")
+            .contains("fn oplog_external_module_surface_is_exactly_the_named_consumers()"),
+        "G-14b-a public oplog surface guard must remain present"
     );
 }

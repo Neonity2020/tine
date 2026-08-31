@@ -1169,15 +1169,6 @@ impl SegmentSealMemo {
             proofs: AtomicUsize::new(0),
         }
     }
-
-    /// Forget every proof. Used when the pack's location changes underneath a
-    /// retained candidate, so the next read re-proves the seal at its new home.
-    fn reset(&self) {
-        for proved in &self.proved {
-            proved.store(false, Ordering::Release);
-        }
-        self.proofs.store(0, Ordering::Release);
-    }
 }
 
 impl LazyGenesisCandidate {
@@ -1203,10 +1194,6 @@ impl LazyGenesisCandidate {
 
     pub(crate) const fn catalog_document_id(&self) -> DocumentId {
         self.manifest.catalog_document_id
-    }
-
-    pub(crate) fn manifest_bytes(&self) -> &[u8] {
-        &self.manifest_bytes
     }
 
     pub(crate) fn provider_index(&self) -> io::Result<LazyGenesisProviderIndexV1> {
@@ -1298,10 +1285,6 @@ impl LazyGenesisCandidate {
         self.index
             .get(&page_id)
             .map(|index| self.manifest.pages[*index].home_document_id)
-    }
-
-    pub(crate) const fn block_count(&self) -> u64 {
-        self.manifest.block_count
     }
 
     /// Prove one sealed segment pack against its manifest digest at most once
@@ -1456,21 +1439,6 @@ impl LazyGenesisCandidate {
     pub(crate) fn retain_as_authoritative(mut self) -> Self {
         self.cleanup_on_drop = false;
         self
-    }
-
-    pub(crate) fn relocate_after_parent_move(mut self, destination: &Path) -> io::Result<Self> {
-        if self.scratch.exists() || !destination.is_dir() {
-            return Err(invalid(
-                "lazy genesis same-process relocation does not match the sealed parent move",
-            ));
-        }
-        self.scratch = destination.to_path_buf();
-        self.cleanup_on_drop = false;
-        // The sealed packs now live somewhere else. Whatever this candidate
-        // proved about the old location says nothing about the new one, so
-        // discard every seal proof and let the next read re-prove it.
-        self.segment_seals.reset();
-        Ok(self)
     }
 
     pub(crate) fn open_sealed(directory: &Path, expected: LazyGenesisCommitV1) -> io::Result<Self> {
@@ -1903,9 +1871,9 @@ mod tests {
         let first = build();
         let second = build();
         assert_eq!(first.root(), second.root());
-        assert_eq!(first.manifest_bytes(), second.manifest_bytes());
+        assert_eq!(first.manifest_bytes, second.manifest_bytes);
         assert_eq!(first.page_count(), 2);
-        assert_eq!(first.block_count(), 3);
+        assert_eq!(first.manifest.block_count, 3);
         assert_eq!(first.catalog_document_id(), catalog_document_id());
         let read = first
             .page(PageId::from_uuid(Uuid::from_u128(2)))
@@ -2054,37 +2022,6 @@ mod tests {
             "a resized sealed segment must be rejected: {error}"
         );
         assert_eq!(candidate.segment_seal_proofs(), 0);
-    }
-
-    /// A relocation moves the packs to a different directory, so proofs about
-    /// the old location say nothing about the new one and must be discarded.
-    #[test]
-    fn lazy_genesis_reproves_sealed_segments_after_a_parent_move() {
-        let candidate = sealed_pack(0xa184, 8);
-        assert!(candidate.page(page_id_at(0)).unwrap().is_some());
-        assert_eq!(candidate.segment_seal_proofs(), 1);
-
-        let destination = std::env::temp_dir().join(format!(
-            "tine-lazy-genesis-moved-{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::rename(&candidate.scratch, &destination).unwrap();
-        let candidate = candidate.relocate_after_parent_move(&destination).unwrap();
-        assert_eq!(candidate.segment_seal_proofs(), 0);
-
-        // Damage the relocated pack in a way no single capsule read notices.
-        let segment = segment_path(&destination, 0);
-        let mut bytes = fs::read(&segment).unwrap();
-        bytes.push(0x00);
-        fs::write(&segment, &bytes).unwrap();
-
-        let error = candidate.page(page_id_at(0)).unwrap_err();
-        assert!(
-            error.to_string().contains("segment bytes changed"),
-            "a relocated candidate must re-prove its sealed segments: {error}"
-        );
-        drop(candidate);
-        let _ = fs::remove_dir_all(&destination);
     }
 
     #[test]
@@ -2314,10 +2251,6 @@ mod tests {
             .unwrap();
         let (candidate, commit) = candidate.stage_into(&parent.join("genesis")).unwrap();
         fs::rename(&parent, &moved_parent).unwrap();
-        let candidate = candidate
-            .relocate_after_parent_move(&moved_parent.join("genesis"))
-            .unwrap();
-        assert_eq!(candidate.root(), commit.root());
         drop(candidate);
 
         let reopened =

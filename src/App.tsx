@@ -1026,7 +1026,9 @@ export function App(): JSX.Element {
   createEffect(on(
     () => managedStorageRuntime.snapshot().notice,
     (notice) => {
-      if (notice) pushToast(managedStorageRuntimeErrorMessage(notice.message), "error");
+      if (notice) {
+        pushToast(managedStorageRuntimeErrorMessage(notice.message), "error", { dedupe: true });
+      }
     },
     { defer: true },
   ));

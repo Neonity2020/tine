@@ -4,6 +4,16 @@
 - **Date:** 2026-07-22
 - **Supersedes:** [ADR 0048](0048-compatible-managed-sync.md)
 
+> **Implementation note (2026-08-31):** The physical Patricia indexes,
+> `engine-scratch-v2`, and the separate `engine-history` store described in
+> the original implementation sections below have been retired. Current
+> pre-0.7 Managed Storage has one format: lazy genesis plus immutable operation
+> objects, inline semantic accepted evidence/roots, and disposable SQLite.
+> Unknown private state is preserved for diagnosis and rebuilt from the graph
+> text; there is no internal migration or alternate legacy reader. The older
+> sections remain here as the historical rationale for the sparse-shard model,
+> not as a statement that those physical stores still exist.
+
 ## Context
 
 ADR 0048 correctly made durable operations the sync truth, but its experimental

@@ -1,280 +1,22 @@
-//! The two `LocalActive` runtime boundaries: first activation and fresh-process
-//! reopen.
+//! The local managed-storage runtime boundary.
 //!
-//! Neither changes anything but device-local enrollment and runtime state. They
-//! never write migration or projection bytes into the live graph, never enable
-//! migration on ordinary startup, and never wire a watcher.
+//! Clean activation commits a baseline-plus-manifest authority and opens the
+//! enrolled engine and disposable SQLite projection. Subsequent process opens
+//! reconstruct the same authority from the current enrollment and sealed
+//! accepted history; there is no detached or inactive bootstrap runtime.
 //!
-//! [`LocalActiveAuthority`] is the only value in the new sparse-oplog
-//! architecture that admits local mutation, projection, import, or coordinator
-//! execution. It has no public constructor, no serialized form, no `Clone`, and
-//! no test mint. Exactly two functions can produce one:
+//! `LocalActiveAuthority` is the only value that admits managed mutation,
+//! projection, import, or coordinator execution. It has no public constructor,
+//! serialized form, `Clone`, or production mint outside the verified activation
+//! and reopen boundaries in this module.
 //!
-//! * [`activate_verified_local`] performs the one-time `VerifiedLocal ->
-//!   LocalActive` transition. It requires the retained
-//!   [`VerifiedLocalEvidence`], the exact live retained proof set, the retained
-//!   runtime components, and a fresh committed-head reopen proving the exact
-//!   verification digest, session, binding, and `Unsafe`+`Idle` state.
-//! * [`reopen_local_active_authority`] serves a restarted process, which has no
-//!   retained evidence and no authority at all. It reconstructs the predecessor
-//!   evidence from the durable, validated enrollment chain, revalidates the same
-//!   complete proof set and runtime components, and mints an authority only for
-//!   the exact committed session (or, from a clean `Safe` handoff, for exactly
-//!   one requested new session).
+//! `PromotedLocalRuntime` owns the archive-rooted workspace lease together with
+//! the SQLite projection it authorizes. Lease identity is re-proved at
+//! authority-changing coordinator boundaries and failures latch terminal runtime
+//! revocation. Safe handoff remains gated on complete device-local drains.
 //!
-//! Handoff is conservative. Activation always persists `HandoffUnsafe`, so a
-//! crash at any cut resumes unsafe. `Safe` may only be persisted after every
-//! device-local drain is proved and revalidated; the dependency that this
-//! packet cannot prove inside `tine-core` is named exactly rather than assumed.
-//!
-//! The graph-text watcher event queue is owned by the Tauri watcher, so
-//! [`SAFE_HANDOFF_MISSING_DEPENDENCY`] blocks the production `Safe` transition
-//! after every core-checkable drain has been proved.
-//!
-//! # Runtime promotion
-//!
-//! [`LocalActiveAuthority`] alone still cannot write: an inactive-bootstrap
-//! archive is fenced from ordinary runtime opening, so the bootstrap's own
-//! engine is read-only. [`PromotedLocalRuntime`] is the boundary that lifts that
-//! fence for exactly one durably bound lineage. Promotion is two phase, because
-//! the device-local SQLite applier lease is one-per-workspace and the retained
-//! inactive bootstrap projection must be released before a promoted one exists:
-//!
-//! 1. [`seal_local_runtime_promotion`] re-proves the live authority, retained
-//!    proof set, inactive accepted authority, bound archive capability and its
-//!    persisted canonical resource claim, enrolled endpoint, and bootstrap
-//!    SQLite projection, then publishes one immutable exact durable promotion
-//!    state. Publication and its readback run on the exact retained archive
-//!    capability, never on a re-resolved pathname, and an archive whose
-//!    retained capability and enrolled pathname have stopped naming the same
-//!    directory is refused before anything is written.
-//! 2. [`open_promoted_local_runtime`] (same process) or
-//!    [`reopen_promoted_local_runtime`] (restarted process, no retained
-//!    evidence at all) opens and completely recovers the writable enrolled
-//!    engine, projection-work index, reference/catalog authority, SQLite
-//!    projection, and bounded tail, proves the current history is exactly or
-//!    insertion-only descended from the exact bootstrap anchor, and only then
-//!    mints the token.
-//!
-//! # Workspace ownership and crash takeover
-//!
-//! A promoted runtime holds exactly one archive-rooted
-//! [`super::sqlite::WorkspaceRuntimeLease`] for its entire writable life, and
-//! owns it inseparably from the device-local database it authorized (see
-//! [`super::sqlite::LeasedWorkspaceProjection`]), so the database handle and the
-//! workspace authority cannot drift apart.
-//!
-//! The lease is taken before any archive, engine, SQLite, or enrollment state
-//! may *become authority* — which is a weaker and more accurate claim than
-//! "before any of it is read". A restarted process holds no capability at all,
-//! so [`reopen_promoted_local_runtime`] necessarily reads the enrollment chain,
-//! takes the device-local enrollment lease, and reads the durable promoted-runtime
-//! state before it can even know which archive and workspace to lease. None of
-//! those pre-lease reads can authorize anything: the promotion state is
-//! published immutably-once and is compared byte-for-byte against the durable
-//! file again under the lease by `authorize_promoted_lineage`, the archive
-//! identity is re-derived by `authenticate_archive_identity`, and the bootstrap
-//! anchor is reread from the chain by [`require_unchanged_bootstrap_anchor`]
-//! after the swap. Everything this runtime *writes* happens under the lease.
-//!
-//! The lock is never released across a bootstrap -> promoted database handoff.
-//! That is a property of the construction, not of a test assembly:
-//! [`InactiveBootstrapRuntimeSession`] is the crate's inactive-bootstrap open,
-//! and its `promote` consumes the session, so there is no way to reach phase two
-//! of promotion except on the exact lease the bootstrap database was opened
-//! under. What is *not* yet true is that a running Tine binary executes it:
-//! nothing in this module is reachable from application startup, a watcher, or
-//! Tauri (see the module comments in `oplog/mod.rs`). Tests drive the same
-//! construction the activation wiring will call; they do not stand in for it.
-//!
-//! That lease is also the crash proof. An unclean shutdown leaves
-//! `HandoffUnsafe { old session }` committed, and
-//! [`take_over_promoted_local_runtime`] is the only boundary that may replace it
-//! with `HandoffUnsafe { new session }`. It may do so only while it owns the
-//! workspace lease — an `EnrollmentLease` is device-local app data, so a process
-//! under another XDG, HOME, or Flatpak root would not contend for it at all —
-//! and only after it has recovered and authenticated the entire runtime the
-//! crashed process left behind. The replacement is then an exact
-//! compare-and-swap from the authenticated old head and old unsafe session, so
-//! two racing newcomers cannot both win. It never mints `Safe`. Automatic
-//! external import remains fenced until the actor-owned exact feed completes
-//! and revalidates one full recovery catch-up, or until a later clean `Safe`
-//! handoff is adopted.
-//!
-//! ## Workspace lease identity
-//!
-//! Holding the lock is not by itself proof of ownership, because the lock file
-//! lives inside the replicated archive. A provider or user action that replaces
-//! `<archive>/.tine-runtime/sqlite-workspaces/<workspace>/sqlite-applier.lock`
-//! — a receive-only revert, a folder reset/re-add, a delete-then-restore, a
-//! `.stversions` restore, `rm -rf .tine-runtime` — unlinks the locked file and
-//! puts a new one at the same name. The old holder keeps a lock nobody can
-//! reach by name; a newcomer opening the name locks the new file and succeeds.
-//!
-//! [`super::sqlite::WorkspaceRuntimeLease`] therefore binds itself to one
-//! platform-native stable file identity at acquisition and revalidates it
-//! while held. This is the exact, and deliberately smallest, set of places that
-//! revalidation happens; every one of them is a boundary this runtime already
-//! re-derives archive, enrollment, or head authority at:
-//!
-//! 1. **Acquisition.** `WorkspaceRuntimeLease::acquire` compares the locked
-//!    handle against a fresh no-follow resolution of the exact pathname, with a
-//!    small bounded number of explicit retries, then fails closed as
-//!    `LeaseContended`.
-//! 2. **Every database opened under the lease.** `SqliteApplierSlot::authorize`,
-//!    reached from `DatabaseApplierLease::acquire` — so the inactive bootstrap
-//!    open, its retry [`InactiveBootstrapRuntimeSession::reopen_under`], and the
-//!    promoted open inside [`mint_promoted_runtime`] all revalidate.
-//! 3. **Every use of the lease as a proof.**
-//!    `WorkspaceRuntimeProof::authorize_archive`, which is what
-//!    [`RetainedWorkspaceLease::into_lease`] consumes at the bootstrap ->
-//!    promoted handover and what
-//!    `RetainedEnrollmentSession::authenticate_unsafe_predecessor` consumes
-//!    before the crash-takeover compare-and-swap.
-//! 4. **Every archive-identity reread.** [`PromotedLocalRuntime::prove_binding`]
-//!    revalidates exactly when it rereads the archive's canonical resource claim
-//!    and control-directory identity — that is, at every
-//!    [`BindingProofDepth::Boundary`] proof (the promoted-open/recovery final
-//!    proof) and at every admission whose enrollment binding generation moved.
-//! 5. **Every SQLite advance.** [`PromotedRuntimeSession::drain_projection`].
-//! 6. **The promoted `Safe` handoff**, before the drain proof is believed.
-//!
-//! 7. **Every handout of the mutable SQLite/tail parts.**
-//!    [`PromotedRuntimeSession::parts`], which is the shape both the
-//!    operational coordinator and the reconciliation session take.
-//! 8. **Every authority-changing coordinator boundary**: immutable publication,
-//!    every bounded accepted-history archive-stage slice, tail admission, the
-//!    SQLite drain, and each manifested Markdown projection step, through
-//!    [`LocalRuntimeAdmission::reprove_workspace_authority`].
-//!
-//! It deliberately does **not** run in the per-mutation admission fast path.
-//! Lease identity is a stable session fact of exactly the same class as the
-//! archive control-directory identity, and it is carried under the identical
-//! rule: [`ArchiveAuthentication::Carried`] carries it, any observed
-//! enrollment-head change escalates to [`ArchiveAuthentication::Reread`] and
-//! re-derives it. So an unchanged-head admission issues no filesystem call for
-//! it, which `bounded_admission`'s zero-cost table asserts at 1, 1,000, and
-//! 10,000 admissions.
-//!
-//! ## Revocation is terminal, and deliberately not self-healing
-//!
-//! The first failed revalidation at *any* of those boundaries latches
-//! [`RuntimeRevocation`] on the runtime, one way and forever. Every later
-//! admission, mutation window, projection drain, mutable-part handout, window
-//! authorization, coordinator phase proof, and `Safe` handoff then refuses
-//! from the latch, without reusing a proof this runtime carried from before the
-//! replacement — which is exactly the hole a carried
-//! [`ArchiveAuthentication::Carried`] admission would otherwise leave open
-//! after a failed boundary proof.
-//!
-//! It is deliberately not recoverable in place. A replaced lease pathname means
-//! another process may legitimately own the archive now, so "recovering" would
-//! mean two appliers. Recovery is a fresh reopen or crash takeover, which
-//! contends for the lease honestly through
-//! [`reopen_promoted_local_runtime`]/[`take_over_promoted_local_runtime`].
-//!
-//! The honest residual: one batch authored inside an already-open mutation
-//! window can still be *published* to the archive after a replacement, because
-//! immutable content-addressed publication is not lease-gated at all (honest
-//! peers on other devices publish into the same archive by design). The
-//! coordinator's own publication boundary reproves first, so the *coordinator*
-//! cannot publish after a replacement; a hand-rolled caller holding a live
-//! window still can. What the lease gates — opening a device-local database,
-//! advancing SQLite, admitting to the tail, writing manifested Markdown,
-//! swapping a crash-takeover handoff record, and publishing `Safe` — all fail
-//! closed first.
-//!
-//! ## Lock order, and why it is safe to invert it without blocking
-//!
-//! The global order is enrollment lease, then archive-rooted workspace lease.
-//! [`reopen_promoted_local_runtime`] and [`take_over_promoted_local_runtime`]
-//! take it in that order. The bootstrap path deliberately **inverts** it:
-//! [`InactiveBootstrapRuntimeSession::open`] takes the workspace lease first and
-//! [`InactiveBootstrapRuntimeSession::promote`] takes the enrollment lease
-//! afterwards, because the workspace lease has to be continuously held across
-//! the database handoff.
-//!
-//! That inversion cannot deadlock for exactly one reason: **both acquisitions
-//! are non-blocking.** `fs2::try_lock_exclusive` under `WorkspaceRuntimeLease`
-//! and under `EnrollmentLease` both return immediately, and contention becomes
-//! an immediate refusal rather than a wait. The identity retry added above is
-//! bounded and explicit for the same reason, and it releases the lock it took
-//! before retrying.
-//!
-//! This is a standing contract for the activation, watcher, and Tauri phases:
-//! **no future code may block, spin, or retry unboundedly while holding either
-//! lease and waiting for the other.** If a retry is ever genuinely needed, bound
-//! it explicitly and release the already-held lease first.
-//!
-//! The bootstrap stays an immutable historical anchor. Ordinary local batches
-//! extend it by carrying the identical bootstrap aggregate binding forward, so
-//! the promoted history is one homogeneous bootstrap-anchored lineage that the
-//! durable promotion state explicitly authorizes — never a silently
-//! reinterpreted inactive root and never mixed record bindings. Ancestry is
-//! proved by the store-minted [`super::object_store::AuthenticatedEngineHistoryTransition`],
-//! never by raw generation or acceptance sequence.
-//!
-//! # The retained-resume accelerator
-//!
-//! A promoted open may reuse the run-local engine state a previous session left
-//! behind instead of replaying the whole authenticated history. The entire
-//! lifecycle lives inside this module's sealed boundaries, and every step is
-//! dominated by the one archive-rooted workspace lease this runtime holds:
-//!
-//! 1. **Open.** [`mint_promoted_runtime`] takes the lease, authenticates the
-//!    archive, then — before anything is adopted — reproves the lease, asks the
-//!    durable history store for a retention plan, and reads at most one
-//!    published candidate through a duplicate of the *retained* archive
-//!    capability. The enrollment evidence that read is admitted against is
-//!    derived here from the retained authenticated session
-//!    ([`resume_enrollment_admission`]), never supplied by a caller.
-//! 2. **Selection.** Only a valid `ResumeAdoptionCandidate::Available` is
-//!    offered to the engine. Never published, proof denied by residue or
-//!    surplus, torn, stale, conflicted, binding-refused, still-leased — every
-//!    other shape opens exactly as a fresh full replay would, without failing
-//!    startup and without changing one candidate byte. An `Ephemeral` retention
-//!    plan means the archive cannot currently prove a retained run collectable,
-//!    so this open takes a disposable run and adds nothing to the population.
-//! 3. **Unsafe publication.**
-//!    [`PromotedLocalRuntime::publish_quiescent_resume_point`] and the narrower
-//!    post-open/pre-first-mutation operation mint exact Unsafe-bound evidence.
-//!    They run the same device-local drain proof as the Safe transaction and
-//!    reprove the lease immediately before the snapshot.
-//! 4. **Safe transaction.** [`PromotedLocalRuntime::quiesce_and_mark_safe`]
-//!    holds graph and watcher barriers through drain proof, clear-before-Safe,
-//!    durable Safe commit/readback, and report-only Safe-bound publication.
-//! 5. **Reclamation.** Only the sealed `PublishedResumePoint` a successful
-//!    publication mints authorizes deletion, and the pass reproves the lease
-//!    once more first. This is the only boundary in this module that can delete
-//!    archive bytes. Packed Patricia scanning is enabled only for a caller's
-//!    explicit quiescent publication or after durable Safe; the automatic
-//!    post-open publication never scans those directories.
-//!
-//! The whole thing is an accelerator, so it has no `Err` reaching a caller's
-//! control flow: [`ResumePublicationStatus`] and [`RuntimeResumeOpenStatus`] are
-//! typed, diagnosable status. A full replay is always available and always
-//! correct, and a publication or maintenance failure must never block an
-//! otherwise valid `Unsafe -> Safe` handoff.
-//!
-//! Neither status vends a scan, a reachability proof, a record, or any deletion
-//! surface, and neither is read by ordinary admission: the accelerator is
-//! absent from successful keystroke, authoring, and acceptance paths. The one
-//! exceptional boundary is a deferred catalog authentication refusal, which
-//! refuses that mutation, fully replays immutable history into a fresh run,
-//! and publishes its replacement so the damaged run cannot be re-adopted.
-//!
-//! A proven pathname/file-identity replacement latches a terminal
-//! [`RuntimeRevocation`]; inability to perform an identity check refuses only
-//! that operation and remains retryable. Typed refusals distinguish the two,
-//! and [`PromotedLocalRuntime::workspace_authority_revocation`] gives a future
-//! startup/UI facade the terminal boundary and cause needed to reopen/take over
-//! automatically. Core deliberately does not implement that facade.
-//!
-//! Every new-architecture mutation, projection, import, coordinator, and
-//! reconciliation path requires a [`LocalRuntimeAdmission`] whose only
-//! production source is [`PromotedRuntimeAdmission::admission`], which is itself
-//! derived from *both* a live [`LocalActiveAuthority`] and the exact
-//! [`PromotedLocalRuntime`].
+//! Retained resume state is only an accelerator: refusal or damage falls back to
+//! authenticated history replay and cannot become an alternate authority.
 
 use crate::model::Graph;
 #[cfg(test)]
@@ -288,7 +30,7 @@ use super::enrollment::VerifiedLocalCompositionError;
 use super::hot_engine::{EngineError, LocalAuthorGeneration, ShardedHotEngine};
 use super::object_store::StoreError;
 use super::sqlite::{
-    LeasedWorkspaceProjection, ProjectionError, SqliteFrontier, TailOverlay, WorkspaceLeaseIdentity,
+    LeasedWorkspaceProjection, ProjectionError, SqliteFrontier, WorkspaceLeaseIdentity,
 };
 use super::{DeviceId, ProjectionEndpointBinding, ProjectionIntentId, SessionId, WorkspaceId};
 
@@ -578,7 +320,7 @@ impl LocalRuntimeAdmission<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime promotion: inactive bootstrap archive -> writable promoted runtime.
+// Runtime authority: verified clean activation -> writable local runtime.
 // ---------------------------------------------------------------------------
 
 /// Why a runtime promotion, promoted open, or promoted admission failed.
@@ -589,9 +331,6 @@ pub(crate) enum RuntimePromotionError {
     Store(StoreError),
     Engine(EngineError),
     Sqlite(ProjectionError),
-    /// The durable promotion state, bootstrap anchor, or authenticated history
-    /// transition does not authenticate the live runtime.
-    Anchor(&'static str),
     /// This runtime no longer owns the archive-rooted workspace lease and has
     /// latched [`RuntimeRevocation`]. Terminal: recovery is a fresh reopen or
     /// crash takeover, never this runtime.
@@ -609,9 +348,6 @@ impl fmt::Display for RuntimePromotionError {
             Self::Store(error) => error.fmt(formatter),
             Self::Engine(error) => error.fmt(formatter),
             Self::Sqlite(error) => error.fmt(formatter),
-            Self::Anchor(detail) => {
-                write!(formatter, "promoted runtime anchor failed: {detail}")
-            }
             Self::WorkspaceAuthorityRevoked(refusal) => refusal.fmt(formatter),
             Self::WorkspaceAuthorityCheckUnavailable(refusal) => refusal.fmt(formatter),
         }

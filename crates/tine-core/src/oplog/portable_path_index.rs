@@ -1,11 +1,9 @@
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
-use super::content_patricia::{PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore};
 use super::object_store::StoreError;
+use super::uuid_claim_index::SemanticIndexRoot;
 use super::{
     BatchCausalDot, BatchId, ContentDigest, ManagedPath, PageId, PortablePathKeyDigest,
     PORTABLE_PATH_KEY_VERSION,
@@ -15,11 +13,11 @@ const PORTABLE_PATH_RECORD_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PortablePathIndexRoot(PatriciaIndexRoot);
+pub struct PortablePathIndexRoot(SemanticIndexRoot);
 
 impl PortablePathIndexRoot {
     pub fn empty() -> Self {
-        Self(PatriciaIndexRoot::empty())
+        Self(SemanticIndexRoot::empty())
     }
 
     pub const fn digest(self) -> ContentDigest {
@@ -27,7 +25,7 @@ impl PortablePathIndexRoot {
     }
 
     pub(crate) const fn from_digest(digest: ContentDigest) -> Self {
-        Self(PatriciaIndexRoot::from_digest(digest))
+        Self(SemanticIndexRoot::from_digest(digest))
     }
 }
 
@@ -191,342 +189,9 @@ impl PortablePathRecord {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct PortablePathIndexStore {
-    patricia: PatriciaIndexStore,
-}
-
-impl PortablePathIndexStore {
-    pub(crate) fn new(patricia: PatriciaIndexStore) -> Self {
-        Self { patricia }
-    }
-
-    pub(crate) fn for_detached_bootstrap(
-        &self,
-        publisher: super::object_store::DetachedBootstrapImmutablePublisher,
-        resident_budget_bytes: usize,
-    ) -> Result<Self, StoreError> {
-        Ok(Self {
-            patricia: self
-                .patricia
-                .for_detached_bootstrap_construction(publisher, resident_budget_bytes)?,
-        })
-    }
-
-    pub(crate) fn finish_detached_construction(
-        &self,
-        root: PortablePathIndexRoot,
-    ) -> Result<Option<super::content_patricia::CompletedPatriciaConstruction>, StoreError> {
-        self.patricia.finish_detached_construction(root.0)
-    }
-
-    pub(crate) fn stats(&self) -> PatriciaIndexStats {
-        self.patricia.stats()
-    }
-
-    pub(crate) const fn patricia_index(&self) -> &PatriciaIndexStore {
-        &self.patricia
-    }
-
-    pub(crate) fn validate_root(&self, root: PortablePathIndexRoot) -> Result<(), StoreError> {
-        self.patricia.validate_root(root.0)
-    }
-
-    pub(crate) fn lookup(
-        &self,
-        root: PortablePathIndexRoot,
-        key: PortablePathKeyDigest,
-    ) -> Result<Option<PortablePathRecord>, StoreError> {
-        self.patricia
-            .lookup(root.0, key.as_bytes())?
-            .map(|bytes| decode_record(key, &bytes))
-            .transpose()
-    }
-
-    pub(crate) fn lookup_many(
-        &self,
-        root: PortablePathIndexRoot,
-        keys: &[PortablePathKeyDigest],
-    ) -> Result<BTreeMap<PortablePathKeyDigest, PortablePathRecord>, StoreError> {
-        keys.iter()
-            .filter_map(|key| {
-                self.lookup(root, *key)
-                    .transpose()
-                    .map(|result| result.map(|record| (*key, record)))
-            })
-            .collect()
-    }
-
-    pub(crate) fn insert_many(
-        &self,
-        root: PortablePathIndexRoot,
-        records: &BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
-    ) -> Result<PortablePathIndexRoot, StoreError> {
-        let encoded = records
-            .iter()
-            .map(|(key, record)| {
-                record.validate(*key)?;
-                Ok((key.as_bytes().to_vec(), encode_record(record)?))
-            })
-            .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-        self.patricia
-            .insert_many(root.0, &encoded)
-            .map(PortablePathIndexRoot)
-    }
-
-    /// Publish one source-selected bootstrap path set from the empty root.
-    /// Chunking follows the adaptive detached-construction memory budget; no
-    /// accumulated prefix is reopened between physical bootstrap parts.
-    pub(crate) fn build_detached_bootstrap_records(
-        &self,
-        records: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
-    ) -> Result<PortablePathIndexRoot, StoreError> {
-        let chunk_limit = self.patricia.detached_construction_bulk_record_limit()?;
-        if chunk_limit.is_none() {
-            let encoded = records
-                .iter()
-                .map(|(key, record)| {
-                    record.validate(*key)?;
-                    Ok((key.as_bytes().to_vec(), encode_record(record)?))
-                })
-                .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
-            return self
-                .patricia
-                .derive_complete_root(&encoded)
-                .map(PortablePathIndexRoot);
-        }
-        let chunk_limit = chunk_limit.expect("checked detached construction").max(1);
-        let mut root = PortablePathIndexRoot::empty();
-        let mut chunk = BTreeMap::new();
-        for (key, record) in records {
-            chunk.insert(key, record);
-            if chunk.len() == chunk_limit {
-                root = self.insert_many(root, &chunk)?;
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            root = self.insert_many(root, &chunk)?;
-        }
-        Ok(root)
-    }
-}
-
 fn exact_path_digest(path: &ManagedPath) -> ContentDigest {
     let mut bytes = b"tine/exact-managed-path/v1\0".to_vec();
     bytes.extend_from_slice(&(path.as_str().len() as u64).to_be_bytes());
     bytes.extend_from_slice(path.as_str().as_bytes());
     ContentDigest::of(&bytes)
-}
-
-fn encode_record(record: &PortablePathRecord) -> Result<Vec<u8>, StoreError> {
-    postcard::to_allocvec(record).map_err(|_| StoreError::MalformedLogseqClaimIndex)
-}
-
-fn decode_record(
-    expected: PortablePathKeyDigest,
-    bytes: &[u8],
-) -> Result<PortablePathRecord, StoreError> {
-    let record: PortablePathRecord =
-        postcard::from_bytes(bytes).map_err(|_| StoreError::MalformedLogseqClaimIndex)?;
-    record.validate(expected)?;
-    if encode_record(&record)? != bytes {
-        return Err(StoreError::MalformedLogseqClaimIndex);
-    }
-    Ok(record)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use cap_std::{ambient_authority, fs::Dir};
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::oplog::object_store::{
-        ensure_reconstructible_directory_nofollow, open_dir_nofollow,
-    };
-    use crate::oplog::{CausalPeerId, DeviceId};
-
-    fn store(name: &str) -> (std::path::PathBuf, PortablePathIndexStore) {
-        let path =
-            std::env::temp_dir().join(format!("tine-portable-index-{name}-{}", Uuid::new_v4()));
-        fs::create_dir(&path).unwrap();
-        let root = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
-        ensure_reconstructible_directory_nofollow(&root, "nodes").unwrap();
-        let nodes = open_dir_nofollow(&root, "nodes").unwrap();
-        (
-            path,
-            PortablePathIndexStore::new(PatriciaIndexStore::new(nodes)),
-        )
-    }
-
-    fn dot() -> BatchCausalDot {
-        BatchCausalDot::new(
-            CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(1))),
-            1,
-        )
-        .unwrap()
-    }
-
-    fn dot_at(counter: u64) -> BatchCausalDot {
-        BatchCausalDot::new(
-            CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(1))),
-            counter,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn authenticated_node_tamper_fails_closed() {
-        let (path, store) = store("tamper");
-        let exact_path = ManagedPath::parse("pages/Foo.md").unwrap();
-        let key = exact_path.portable_key().digest();
-        let record = PortablePathRecord::new(
-            key,
-            Some(PortablePathOccupied::new(
-                PageId::from_uuid(Uuid::from_u128(2)),
-                exact_path,
-                BatchId::from_uuid(Uuid::from_u128(3)),
-                dot(),
-            )),
-            None,
-        )
-        .unwrap();
-        let root = store
-            .insert_many(
-                PortablePathIndexRoot::empty(),
-                &BTreeMap::from([(key, record.clone())]),
-            )
-            .unwrap();
-        assert_eq!(store.lookup(root, key).unwrap(), Some(record));
-        // Damage the authenticated authority itself: packed publication need not
-        // leave a loose node whose filename a core test can safely assume.
-        let mut tampered_digest = *root.digest().as_bytes();
-        tampered_digest[0] ^= 0x01;
-        let tampered_digest = ContentDigest::from_bytes(tampered_digest);
-        assert!(matches!(
-            store.lookup(PortablePathIndexRoot::from_digest(tampered_digest), key),
-            Err(StoreError::MissingLogseqClaimIndexNode(digest)) if digest == tampered_digest
-        ));
-        crate::test_support::remove_dir_all(path);
-    }
-
-    #[test]
-    fn authenticated_but_semantically_misbound_record_fails_closed() {
-        let (path, store) = store("misbound");
-        let indexed_path = ManagedPath::parse("pages/Foo.md").unwrap();
-        let wrong_path = ManagedPath::parse("pages/Bar.md").unwrap();
-        let key = indexed_path.portable_key().digest();
-        let invalid = PortablePathRecord {
-            schema_version: PORTABLE_PATH_RECORD_SCHEMA_VERSION,
-            key_version: PORTABLE_PATH_KEY_VERSION,
-            key_digest: key,
-            occupied: Some(PortablePathOccupied {
-                page_id: PageId::from_uuid(Uuid::from_u128(4)),
-                exact_path_digest: exact_path_digest(&wrong_path),
-                exact_path: wrong_path,
-                acquisition_batch: BatchId::from_uuid(Uuid::from_u128(5)),
-                causal_dot: dot(),
-            }),
-            latest_release: None,
-        };
-        let bytes = postcard::to_allocvec(&invalid).unwrap();
-        let raw_root = store
-            .patricia
-            .insert_many(
-                PatriciaIndexRoot::empty(),
-                &BTreeMap::from([(key.as_bytes().to_vec(), bytes)]),
-            )
-            .unwrap();
-        let root = PortablePathIndexRoot(raw_root);
-
-        assert!(store.lookup(root, key).is_err());
-        crate::test_support::remove_dir_all(path);
-    }
-
-    #[test]
-    fn four_hundred_reuses_keep_values_and_structural_work_bounded() {
-        let (path, store) = store("long-reuse");
-        let exact_path = ManagedPath::parse("pages/Reused.md").unwrap();
-        let key = exact_path.portable_key().digest();
-        let pages = [
-            PageId::from_uuid(Uuid::from_u128(20)),
-            PageId::from_uuid(Uuid::from_u128(21)),
-        ];
-        let mut root = PortablePathIndexRoot::empty();
-        let mut prior_page = pages[0];
-        let mut prior_acquisition = BatchId::from_uuid(Uuid::from_u128(30));
-        let mut samples = Vec::new();
-
-        for iteration in 1_u128..=400 {
-            let page = pages[iteration as usize % pages.len()];
-            let acquisition = BatchId::from_uuid(Uuid::from_u128(1_000 + iteration));
-            let release = BatchId::from_uuid(Uuid::from_u128(2_000 + iteration));
-            let record = PortablePathRecord::new(
-                key,
-                Some(PortablePathOccupied::new(
-                    page,
-                    exact_path.clone(),
-                    acquisition,
-                    dot_at(iteration as u64),
-                )),
-                Some(PortablePathReleased::new(
-                    prior_page,
-                    exact_path.clone(),
-                    prior_acquisition,
-                    release,
-                    dot_at(iteration as u64),
-                )),
-            )
-            .unwrap();
-            assert!(
-                encode_record(&record).unwrap().len() < 4 * 1024,
-                "portable value grew with reuse history at generation {iteration}"
-            );
-            root = store
-                .insert_many(root, &BTreeMap::from([(key, record)]))
-                .unwrap();
-            prior_page = page;
-            prior_acquisition = acquisition;
-            if matches!(iteration, 100 | 200 | 400) {
-                samples.push((iteration, store.stats()));
-            }
-        }
-
-        assert_eq!(
-            samples.iter().map(|sample| sample.0).collect::<Vec<_>>(),
-            [100, 200, 400]
-        );
-        let first_bytes = samples[0].1.bytes_written;
-        let second_bytes = samples[1]
-            .1
-            .bytes_written
-            .saturating_sub(samples[0].1.bytes_written);
-        let next_two_hundred_bytes = samples[2]
-            .1
-            .bytes_written
-            .saturating_sub(samples[1].1.bytes_written);
-        assert!(
-            second_bytes <= first_bytes.saturating_add(first_bytes / 8),
-            "the second 100 point updates copied history: {first_bytes} then {second_bytes}"
-        );
-        assert!(
-            next_two_hundred_bytes
-                <= second_bytes
-                    .saturating_mul(2)
-                    .saturating_add(second_bytes / 4),
-            "point-update bytes grew with path lifetime: {second_bytes} then {next_two_hundred_bytes}"
-        );
-        assert_eq!(samples[0].1.writes, 100);
-        assert_eq!(samples[1].1.writes - samples[0].1.writes, 100);
-        assert_eq!(samples[2].1.writes - samples[1].1.writes, 200);
-        let current = store.lookup(root, key).unwrap().unwrap();
-        assert_eq!(
-            current.latest_release().unwrap().release_batch(),
-            BatchId::from_uuid(Uuid::from_u128(2_400))
-        );
-        crate::test_support::remove_dir_all(path);
-    }
 }

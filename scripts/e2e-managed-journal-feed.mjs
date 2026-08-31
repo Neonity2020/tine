@@ -36,6 +36,7 @@ const RECEIPT_PATH = path.join(ARTIFACTS, "managed-journal-feed-receipt.json");
 const EDIT_MARKER = "accepted managed journal-feed edit";
 const RAPID_MOVE_MARKER = "RAPID-MANAGED-MULTI-DAY-MOVE";
 const RAPID_MOVE_COMMANDS = 120;
+const BACKUP_RELATIVE_PATH = "logseq/bak/journals/2026_08_31/2026-08-31T15_34_34.562Z.Desktop.md";
 const BULK_SOURCE_PAGE = "Bulk Move Source";
 const BULK_DESTINATION_PAGE = "Bulk Move Destination";
 const BULK_MARKERS = Array.from({ length: 20 }, (_, index) => `BULK-MOVE-${String(index + 1).padStart(2, "0")}`);
@@ -419,6 +420,24 @@ try {
     throw new Error(`accepted managed edit/reopen emitted error notifications: ${JSON.stringify(acceptedEditErrors)}`);
   }
   receipt.milestones.acceptedEditRefresh = { marker: EDIT_MARKER, projected: true, rendered: true };
+
+  phase = "excluded-backup-noise";
+  const backupPath = path.join(GRAPH, ...BACKUP_RELATIVE_PATH.split("/"));
+  fs.mkdirSync(path.dirname(backupPath), { recursive: true });
+  fs.writeFileSync(backupPath, "- excluded Logseq backup copy\n");
+  // Give both inotify debounce and the managed actor retry cadence enough time
+  // to expose an accidental exact-path admission before the move stress begins.
+  await sleep(1_500);
+  const backupErrors = await browser.execute(() =>
+    [...document.querySelectorAll(".toast-error .toast-msg")].map((node) => node.textContent ?? ""));
+  if (backupErrors.length) {
+    throw new Error(`excluded Logseq backup emitted error notifications: ${JSON.stringify(backupErrors)}`);
+  }
+  receipt.milestones.excludedBackupNoise = {
+    path: BACKUP_RELATIVE_PATH,
+    retained: fs.existsSync(backupPath),
+    errorNotifications: backupErrors,
+  };
 
   phase = "rapid-multi-day-move";
   const rapidBlock = await waitFor(async () => {

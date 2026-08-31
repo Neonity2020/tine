@@ -1,29 +1,9 @@
-#[cfg(unix)]
-use std::ffi::CString;
 use std::fmt;
-use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
 use std::str::FromStr;
 
-#[cfg(windows)]
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
-#[cfg(windows)]
-use cap_std::fs::{MetadataExt as _, OpenOptions};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-
-#[cfg(unix)]
-use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt as _;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt as _;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle as _;
-
-use super::object_store::sync_dir_required;
-pub(crate) use super::sync_layout::ARCHIVE_INSTANCE_CLAIM_FILE;
 
 macro_rules! opaque_uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -246,59 +226,6 @@ impl ImportId {
     }
 }
 
-/// Deterministic identity of one bounded multipart bootstrap-import part.
-///
-/// This stays crate-private until the later import and receipt packets define
-/// the durable authority that is allowed to publish one.  It deliberately uses
-/// a full digest rather than the UUID namespace used by ordinary batch IDs.
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BootstrapPartId([u8; 32]);
-
-impl BootstrapPartId {
-    pub(crate) fn derive(
-        import_id: ImportId,
-        profile_digest: &[u8; 32],
-        ordinal: u32,
-        source_span_root: &[u8; 32],
-        operation_root: &[u8; 32],
-    ) -> Self {
-        let mut hasher = Sha256::new();
-        let ordinal_bytes = ordinal.to_be_bytes();
-        hasher.update(b"tine/bootstrap-import/part-id/v1\0");
-        for part in [
-            import_id.as_bytes().as_slice(),
-            profile_digest.as_slice(),
-            ordinal_bytes.as_slice(),
-            source_span_root.as_slice(),
-            operation_root.as_slice(),
-        ] {
-            hasher.update((part.len() as u64).to_be_bytes());
-            hasher.update(part);
-        }
-        Self(hasher.finalize().into())
-    }
-
-    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
-    }
-
-    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for BootstrapPartId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BootstrapPartId({self})")
-    }
-}
-
-impl fmt::Display for BootstrapPartId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
-    }
-}
-
 /// Stable identity of one canonical graph-root filesystem resource.
 ///
 /// The digest is derived only from a retained no-follow directory capability:
@@ -370,340 +297,22 @@ impl<'de> Deserialize<'de> for CanonicalGraphResourceId {
     }
 }
 
-const ARCHIVE_INSTANCE_CLAIM_SCHEMA_VERSION: u32 = 1;
-const MAX_ARCHIVE_INSTANCE_CLAIM_BYTES: usize = 256;
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ArchiveInstanceClaimV1 {
-    schema_version: u32,
-    instance_id: Uuid,
-}
-
 /// Stable identity of one claimed canonical device-local archive directory.
 ///
-/// The digest binds a create-new random, versioned claim retained inside the
-/// archive and the exact opened directory capability identity. Paths are not
-/// evidence. Existing enrolled archives are opened only by checking their
-/// persisted claim against the expected identity; absence never mints a new
-/// claim.
+/// This remains part of the semantic enrollment records after retirement of
+/// the unused archive-claim codec and filesystem protocol.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CanonicalArchiveResourceId([u8; 32]);
 
 impl CanonicalArchiveResourceId {
-    fn from_claim_and_capability_identity(platform: &[u8], identity: &[u8], claim: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"tine/canonical-archive-resource/v2\0");
-        hasher.update((platform.len() as u64).to_be_bytes());
-        hasher.update(platform);
-        hasher.update((identity.len() as u64).to_be_bytes());
-        hasher.update(identity);
-        hasher.update((claim.len() as u64).to_be_bytes());
-        hasher.update(claim);
-        Self(hasher.finalize().into())
-    }
-
-    /// Provision one archive instance exactly once.
-    ///
-    /// If any claim artifact already exists, including a partial artifact from
-    /// an interrupted provision, this fails without replacing or repairing it.
-    pub(crate) fn provision_in_retained_directory(
-        directory: &cap_std::fs::Dir,
-    ) -> std::io::Result<Self> {
-        let bytes = Self::claim_bytes(Uuid::new_v4())?;
-        let mut file = create_new_archive_claim(directory)?;
-        validate_archive_claim_handle(&file)?;
-        file.write_all(&bytes)?;
-        crate::durability_counters::sync_file(&file)?;
-        sync_dir_required(directory).map_err(|error| std::io::Error::other(error.to_string()))?;
-        derive_archive_resource_id(directory, &bytes)
-    }
-
-    /// Canonical claim bytes for one private local-activation reservation.
-    /// Keeping the instance identity outside the graph before archive creation
-    /// lets an honest crash retry publish the same archive claim head-last.
-    pub(crate) fn claim_bytes(instance_id: Uuid) -> std::io::Result<Vec<u8>> {
-        serde_json::to_vec(&ArchiveInstanceClaimV1 {
-            schema_version: ARCHIVE_INSTANCE_CLAIM_SCHEMA_VERSION,
-            instance_id,
-        })
-        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
-    }
-
-    /// Open the claim published for one exact private activation reservation.
-    /// A different, partial, or non-canonical claim is never adopted.
-    pub(crate) fn open_exact_claim_in_retained_directory(
-        directory: &cap_std::fs::Dir,
-        expected_claim: &[u8],
-    ) -> std::io::Result<Self> {
-        let expected = derive_archive_resource_id(directory, expected_claim)?;
-        Self::open_enrolled_in_retained_directory(directory, expected)
-    }
-
-    /// Open an already-enrolled archive using its exact persisted claim.
-    ///
-    /// Missing, incompatible, substituted, non-regular, or reparse claims fail
-    /// closed. This function never provisions a replacement.
-    pub(crate) fn open_enrolled_in_retained_directory(
-        directory: &cap_std::fs::Dir,
-        expected: Self,
-    ) -> std::io::Result<Self> {
-        let metadata = directory.symlink_metadata(ARCHIVE_INSTANCE_CLAIM_FILE)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || cap_metadata_is_windows_reparse(&metadata)
-        {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "archive instance claim is not a regular no-follow file",
-            ));
-        }
-        if metadata.len() > MAX_ARCHIVE_INSTANCE_CLAIM_BYTES as u64 {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "archive instance claim exceeds its byte bound",
-            ));
-        }
-        let file = open_archive_claim(directory)?;
-        validate_archive_claim_handle(&file)?;
-        let opened_len = file.metadata()?.len();
-        if opened_len > MAX_ARCHIVE_INSTANCE_CLAIM_BYTES as u64 {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "opened archive instance claim exceeds its byte bound",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(opened_len as usize);
-        file.take((MAX_ARCHIVE_INSTANCE_CLAIM_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        let claim: ArchiveInstanceClaimV1 = serde_json::from_slice(&bytes)
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
-        if claim.schema_version != ARCHIVE_INSTANCE_CLAIM_SCHEMA_VERSION {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "unsupported archive instance claim schema",
-            ));
-        }
-        let canonical = serde_json::to_vec(&claim)
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
-        if canonical != bytes {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "archive instance claim is not canonical",
-            ));
-        }
-        let found = derive_archive_resource_id(directory, &bytes)?;
-        if found != expected {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "archive instance claim or capability identity was substituted",
-            ));
-        }
-        Ok(found)
-    }
-
     #[cfg(test)]
-    pub(crate) fn from_capability_identity(platform: &[u8], identity: &[u8]) -> Self {
-        Self::from_claim_and_capability_identity(platform, identity, b"test-only-claim")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_test_claim_and_capability_identity(
-        platform: &[u8],
-        identity: &[u8],
-        claim: &[u8],
-    ) -> Self {
-        Self::from_claim_and_capability_identity(platform, identity, claim)
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-}
-
-fn derive_archive_resource_id(
-    directory: &cap_std::fs::Dir,
-    claim: &[u8],
-) -> std::io::Result<CanonicalArchiveResourceId> {
-    let (platform, identity) = archive_directory_capability_identity(directory)?;
-    Ok(CanonicalArchiveResourceId::from_claim_and_capability_identity(platform, &identity, claim))
-}
-
-#[cfg(unix)]
-fn archive_directory_capability_identity(
-    directory: &cap_std::fs::Dir,
-) -> std::io::Result<(&'static [u8], Vec<u8>)> {
-    let metadata = directory.try_clone()?.into_std_file().metadata()?;
-    if !metadata.is_dir() {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "archive capability is not a directory",
-        ));
-    }
-    let mut identity = Vec::with_capacity(16);
-    identity.extend_from_slice(&metadata.dev().to_be_bytes());
-    identity.extend_from_slice(&metadata.ino().to_be_bytes());
-    Ok((b"unix-dev-inode", identity))
-}
-
-#[cfg(windows)]
-fn archive_directory_capability_identity(
-    directory: &cap_std::fs::Dir,
-) -> std::io::Result<(&'static [u8], Vec<u8>)> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileIdInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO,
-    };
-
-    let file = directory.try_clone()?.into_std_file();
-    let metadata = file.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "archive capability is not an exact non-reparse directory",
-        ));
-    }
-    let mut information = FILE_ID_INFO::default();
-    // SAFETY: `file` remains live and `information` is correctly sized.
-    let result = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileIdInfo,
-            (&mut information as *mut FILE_ID_INFO).cast(),
-            std::mem::size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut identity = Vec::with_capacity(24);
-    identity.extend_from_slice(&information.VolumeSerialNumber.to_be_bytes());
-    identity.extend_from_slice(&information.FileId.Identifier);
-    Ok((b"windows-volume-file-id", identity))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn archive_directory_capability_identity(
-    _directory: &cap_std::fs::Dir,
-) -> std::io::Result<(&'static [u8], Vec<u8>)> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "canonical archive directory identity is unavailable on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn create_new_archive_claim(directory: &cap_std::fs::Dir) -> std::io::Result<File> {
-    openat_archive_claim(
-        directory,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        0o600,
-    )
-}
-
-#[cfg(windows)]
-fn create_new_archive_claim(directory: &cap_std::fs::Dir) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No);
-    Ok(directory
-        .open_with(ARCHIVE_INSTANCE_CLAIM_FILE, &options)?
-        .into_std())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_new_archive_claim(_directory: &cap_std::fs::Dir) -> std::io::Result<File> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "archive claims are unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn open_archive_claim(directory: &cap_std::fs::Dir) -> std::io::Result<File> {
-    openat_archive_claim(directory, libc::O_RDONLY, 0)
-}
-
-#[cfg(windows)]
-fn open_archive_claim(directory: &cap_std::fs::Dir) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    Ok(directory
-        .open_with(ARCHIVE_INSTANCE_CLAIM_FILE, &options)?
-        .into_std())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_archive_claim(_directory: &cap_std::fs::Dir) -> std::io::Result<File> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "archive claims are unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn openat_archive_claim(
-    directory: &cap_std::fs::Dir,
-    flags: i32,
-    mode: u32,
-) -> std::io::Result<File> {
-    let name = CString::new(ARCHIVE_INSTANCE_CLAIM_FILE).expect("static claim name has no NUL");
-    // SAFETY: `name` is live and relative to the retained directory descriptor.
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_fd().as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            mode,
-        )
-    };
-    if descriptor < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        // SAFETY: openat returned one newly owned descriptor.
-        Ok(unsafe { File::from_raw_fd(descriptor) })
-    }
-}
-
-fn validate_archive_claim_handle(file: &File) -> std::io::Result<()> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "opened archive claim is not a regular file",
-        ));
-    }
-    #[cfg(unix)]
-    if metadata.nlink() != 1 {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "opened archive claim has unexpected links",
-        ));
-    }
-    #[cfg(windows)]
-    if metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-    {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "opened archive claim is a reparse point",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn cap_metadata_is_windows_reparse(metadata: &cap_std::fs::Metadata) -> bool {
-    metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-}
-
-#[cfg(not(windows))]
-fn cap_metadata_is_windows_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
-    false
 }
 
 impl fmt::Debug for CanonicalArchiveResourceId {
@@ -856,18 +465,6 @@ impl BatchId {
             &[import_id.as_bytes()],
         ))
     }
-
-    /// Derive the batch identity bound to one multipart bootstrap-import part.
-    ///
-    /// This is intentionally separate from `for_import`: an import transaction
-    /// retains its existing singleton batch identity, while each bootstrap part
-    /// has an independently bound identity.
-    pub(crate) fn for_bootstrap_part(part_id: BootstrapPartId) -> Self {
-        Self(derived_uuid(
-            b"tine/bootstrap-import/part-batch-id/v1\0",
-            &[part_id.as_bytes()],
-        ))
-    }
 }
 
 impl DocumentId {
@@ -910,16 +507,6 @@ impl DocumentId {
         Self(derived_uuid(
             b"tine/import/external-observation-document-id/v1\0",
             &[workspace_id.as_uuid().as_bytes(), import_id.as_bytes()],
-        ))
-    }
-}
-
-impl DeviceId {
-    /// Derive the synthetic external author device for a workspace.
-    pub(crate) fn for_external_import_author(workspace_id: WorkspaceId) -> Self {
-        Self(derived_uuid(
-            b"tine/import/external-author-device-id/v1\0",
-            &[workspace_id.as_uuid().as_bytes()],
         ))
     }
 }
@@ -1067,7 +654,6 @@ mod tests {
         let workspace = workspace();
         let import = import_id();
         let home = DocumentId::for_unmatched_import_page(workspace, b"pages/nested/naive.md");
-        let device = DeviceId::for_external_import_author(workspace);
         let session = SessionId::for_external_import_author(workspace, import);
         let observation = DocumentId::for_external_import_observation(workspace, import);
         let peer = CrdtPeerId::external_import_candidate(workspace, import, 7);
@@ -1076,7 +662,6 @@ mod tests {
             home,
             DocumentId::for_unmatched_import_page(workspace, b"pages/nested/naive.md")
         );
-        assert_eq!(device, DeviceId::for_external_import_author(workspace));
         assert_eq!(
             session,
             SessionId::for_external_import_author(workspace, import)
@@ -1092,7 +677,6 @@ mod tests {
 
         let rendered = [
             home.to_string(),
-            device.to_string(),
             session.to_string(),
             observation.to_string(),
             peer.to_string(),
@@ -1108,7 +692,6 @@ mod tests {
         );
 
         assert_eq!(home.to_string(), "737b3bff-157d-8cfe-a3e8-be0ca069e2d6");
-        assert_eq!(device.to_string(), "6c3c7276-a0d6-803e-9e0c-e24f8b58d13c");
         assert_eq!(session.to_string(), "5e69f6b5-0b83-8916-904c-36f09da566e1");
         assert_eq!(
             observation.to_string(),
@@ -1118,11 +701,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_archive_resource_identity_is_persistable_and_domain_separated() {
-        let archive = CanonicalArchiveResourceId::from_capability_identity(
-            b"test-platform",
-            b"same-retained-directory-identity",
-        );
+    fn canonical_archive_resource_identity_is_persistable() {
+        let archive = CanonicalArchiveResourceId::from_bytes([0xaa; 32]);
         let graph = CanonicalGraphResourceId::from_capability_identity(
             b"test-platform",
             b"same-retained-directory-identity",

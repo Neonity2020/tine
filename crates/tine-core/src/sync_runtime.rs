@@ -65,12 +65,10 @@ use crate::oplog::hot_engine::{AcceptedFrontierRoot, ShardedHotEngine};
 use crate::oplog::import::{
     commit_clean_activation, open_clean_activation_authority,
     open_or_rebuild_clean_genesis_projection, prepare_clean_activation,
-    BootstrapPreparationProgress, BootstrapPreparationSubphase, BootstrapPreparationSummary,
 };
 #[cfg(test)]
 use crate::oplog::import::{
     BootstrapStreamingImportInstrumentation, CleanActivationInstrumentation,
-    InactiveBootstrapOrchestrationInstrumentation,
 };
 use crate::oplog::lazy_genesis::{
     publish_clean_shared_state, read_activation_marker, read_clean_shared_state,
@@ -118,7 +116,7 @@ use crate::oplog::projection_turn_journal::{
 use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, reset_projection_open_test_observation,
     take_full_digest_scan_instrumentation, take_projection_open_test_observation,
-    BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
+    CleanProjectionRebuildInstrumentation, FullDigestScanInstrumentation,
     ProjectionOpenTestObservation,
 };
 use crate::oplog::sqlite::{
@@ -1360,48 +1358,11 @@ pub enum SyncLocalActivationPhase {
     RetainedRuntimeActorOpen,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncBootstrapPreparationSubphase {
-    SourceProtocol,
-    OperationSpool,
-    Partition,
-    DetachedAuthoring,
-    Sealing,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SyncBootstrapPreparationSummary {
-    pub source_files: u64,
-    pub source_bytes: u64,
-    pub parser_nodes: u64,
-    pub operations: u64,
-    pub parts: u32,
-    pub prepared_bytes: u64,
-    pub operation_builder_retained_bytes: u64,
-    pub operation_builder_spilled: bool,
-    pub source_protocol_micros: u64,
-    pub operation_spool_micros: u64,
-    pub partition_micros: u64,
-    pub detached_authoring_micros: u64,
-    pub sealing_micros: u64,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SyncLocalActivationProgress {
     Phase {
         phase: SyncLocalActivationPhase,
-    },
-    BootstrapPreparationSubphase {
-        subphase: SyncBootstrapPreparationSubphase,
-    },
-    BootstrapDetachedAuthoring {
-        completed: u32,
-        total: u32,
-    },
-    BootstrapPreparationSummary {
-        summary: SyncBootstrapPreparationSummary,
     },
     /// Source-capture metadata retained for the application readiness proof.
     /// It is emitted from the already-built activation record and therefore
@@ -1415,89 +1376,10 @@ impl SyncLocalActivationProgress {
     pub fn diagnostic_name(&self) -> String {
         match self {
             Self::Phase { phase } => phase.diagnostic_name().into(),
-            Self::BootstrapPreparationSubphase { subphase } => format!(
-                "bootstrap preparation: {}",
-                match subphase {
-                    SyncBootstrapPreparationSubphase::SourceProtocol => "source protocol",
-                    SyncBootstrapPreparationSubphase::OperationSpool => "semantic lowering",
-                    SyncBootstrapPreparationSubphase::Partition => "partition",
-                    SyncBootstrapPreparationSubphase::DetachedAuthoring => "detached authoring",
-                    SyncBootstrapPreparationSubphase::Sealing => "sealing",
-                }
-            ),
-            Self::BootstrapDetachedAuthoring { completed, total } => {
-                format!("bootstrap preparation: detached authoring {completed}/{total} parts")
-            }
-            Self::BootstrapPreparationSummary { summary } => format!(
-                "bootstrap preparation complete: source_files={}, source_bytes={}, parser_nodes={}, operations={}, parts={}, prepared_bytes={}, operation_builder_retained_bytes={}, operation_builder_spilled={}, durations_us=source_protocol:{},semantic_lowering:{},partition:{},detached_authoring:{},sealing:{}",
-                summary.source_files,
-                summary.source_bytes,
-                summary.parser_nodes,
-                summary.operations,
-                summary.parts,
-                summary.prepared_bytes,
-                summary.operation_builder_retained_bytes,
-                summary.operation_builder_spilled,
-                summary.source_protocol_micros,
-                summary.operation_spool_micros,
-                summary.partition_micros,
-                summary.detached_authoring_micros,
-                summary.sealing_micros,
-            ),
             Self::ReadinessSample { largest_page_path } => format!(
                 "readiness sample selected: largest_page_path={}",
                 largest_page_path.as_deref().unwrap_or("none")
             ),
-        }
-    }
-}
-
-impl From<BootstrapPreparationSubphase> for SyncBootstrapPreparationSubphase {
-    fn from(subphase: BootstrapPreparationSubphase) -> Self {
-        match subphase {
-            BootstrapPreparationSubphase::SourceProtocol => Self::SourceProtocol,
-            BootstrapPreparationSubphase::OperationSpool => Self::OperationSpool,
-            BootstrapPreparationSubphase::Partition => Self::Partition,
-            BootstrapPreparationSubphase::DetachedAuthoring => Self::DetachedAuthoring,
-            BootstrapPreparationSubphase::Sealing => Self::Sealing,
-        }
-    }
-}
-
-impl From<BootstrapPreparationSummary> for SyncBootstrapPreparationSummary {
-    fn from(summary: BootstrapPreparationSummary) -> Self {
-        Self {
-            source_files: summary.source_files,
-            source_bytes: summary.source_bytes,
-            parser_nodes: summary.parser_nodes,
-            operations: summary.operations,
-            parts: summary.parts,
-            prepared_bytes: summary.prepared_bytes,
-            operation_builder_retained_bytes: summary.operation_builder_retained_bytes,
-            operation_builder_spilled: summary.operation_builder_spilled,
-            source_protocol_micros: summary.source_protocol_micros,
-            operation_spool_micros: summary.operation_spool_micros,
-            partition_micros: summary.partition_micros,
-            detached_authoring_micros: summary.detached_authoring_micros,
-            sealing_micros: summary.sealing_micros,
-        }
-    }
-}
-
-impl From<BootstrapPreparationProgress> for SyncLocalActivationProgress {
-    fn from(progress: BootstrapPreparationProgress) -> Self {
-        match progress {
-            BootstrapPreparationProgress::Subphase(subphase) => {
-                Self::BootstrapPreparationSubphase {
-                    subphase: subphase.into(),
-                }
-            }
-            BootstrapPreparationProgress::DetachedAuthoring { completed, total } => {
-                Self::BootstrapDetachedAuthoring { completed, total }
-            }
-            BootstrapPreparationProgress::Summary(summary) => Self::BootstrapPreparationSummary {
-                summary: summary.into(),
-            },
         }
     }
 }
@@ -1590,6 +1472,8 @@ pub enum SyncAmbiguousEvidence {
     ArchiveResidue,
     ArchiveNamespace,
     ArchiveBinding,
+    /// The application-level opener found that the archive selected by the
+    /// active runtime does not match the archive it was asked to open.
     ActiveArchiveMismatch,
 }
 
@@ -2942,10 +2826,8 @@ pub enum SyncEditorRefusalCode {
     TrustedLocalPreparationDraft,
     TrustedLocalPreparationCapture,
     TrustedLocalPreparationFinalize,
-    TrustedLocalPreparationTailReservation,
     TrustedLocalPreparationPublication,
     TrustedLocalPreparationArchiveStage,
-    TrustedLocalPreparationTailAdmission,
     TrustedLocalPreparationSqliteDrain,
     TrustedLocalPreparationProjectionDrain,
     TrustedLocalEngineAuthority,
@@ -2971,14 +2853,8 @@ impl SyncEditorRefusalCode {
             Self::TrustedLocalPreparationDraft => "trusted_local.preparation.draft",
             Self::TrustedLocalPreparationCapture => "trusted_local.preparation.capture",
             Self::TrustedLocalPreparationFinalize => "trusted_local.preparation.finalize",
-            Self::TrustedLocalPreparationTailReservation => {
-                "trusted_local.preparation.tail_reservation"
-            }
             Self::TrustedLocalPreparationPublication => "trusted_local.preparation.publication",
             Self::TrustedLocalPreparationArchiveStage => "trusted_local.preparation.archive_stage",
-            Self::TrustedLocalPreparationTailAdmission => {
-                "trusted_local.preparation.tail_admission"
-            }
             Self::TrustedLocalPreparationSqliteDrain => "trusted_local.preparation.sqlite_drain",
             Self::TrustedLocalPreparationProjectionDrain => {
                 "trusted_local.preparation.projection_drain"
@@ -3312,10 +3188,8 @@ pub enum SyncLocalMutationPhase {
     Draft,
     Capture,
     Finalize,
-    TailReservation,
     Publication,
     ArchiveStage,
-    TailAdmission,
     SqliteDrain,
     ProjectionDrain,
 }
@@ -9501,7 +9375,6 @@ fn map_ambiguous_evidence(evidence: AmbiguousEvidence) -> SyncAmbiguousEvidence 
         AmbiguousEvidence::ArchiveResidue => SyncAmbiguousEvidence::ArchiveResidue,
         AmbiguousEvidence::ArchiveNamespace => SyncAmbiguousEvidence::ArchiveNamespace,
         AmbiguousEvidence::ArchiveBinding => SyncAmbiguousEvidence::ArchiveBinding,
-        AmbiguousEvidence::ActiveArchiveMismatch => SyncAmbiguousEvidence::ActiveArchiveMismatch,
     }
 }
 
@@ -12187,19 +12060,6 @@ struct ActorRuntimeBinding {
 }
 
 impl ActorRuntimeBinding {
-    #[cfg(test)]
-    fn from_legacy(binding: &EnrollmentBindingV1) -> Self {
-        Self {
-            workspace_id: binding.workspace_id(),
-            lineage_digest: binding.lineage_digest(),
-            catalog_document_id: binding.catalog_document_id(),
-            endpoint_id: binding.endpoint_id(),
-            device_id: binding.device_id(),
-            graph_resource_id: binding.graph_resource_id(),
-            receipt_store_id: binding.receipt_store_id(),
-        }
-    }
-
     fn from_clean(
         identities: &SyncLocalActivationIdentities,
         endpoint: ProjectionEndpointBinding,
@@ -23373,15 +23233,9 @@ fn trusted_local_preparation_refusal_code(phase: OperationalPhase) -> SyncEditor
         OperationalPhase::Draft => SyncEditorRefusalCode::TrustedLocalPreparationDraft,
         OperationalPhase::Capture => SyncEditorRefusalCode::TrustedLocalPreparationCapture,
         OperationalPhase::Finalize => SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
-        OperationalPhase::TailReservation => {
-            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation
-        }
         OperationalPhase::Publication => SyncEditorRefusalCode::TrustedLocalPreparationPublication,
         OperationalPhase::ArchiveStage => {
             SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage
-        }
-        OperationalPhase::TailAdmission => {
-            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission
         }
         OperationalPhase::SqliteDrain => SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
         OperationalPhase::ProjectionDrain => {
@@ -25276,10 +25130,8 @@ fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
         OperationalPhase::Draft => SyncLocalMutationPhase::Draft,
         OperationalPhase::Capture => SyncLocalMutationPhase::Capture,
         OperationalPhase::Finalize => SyncLocalMutationPhase::Finalize,
-        OperationalPhase::TailReservation => SyncLocalMutationPhase::TailReservation,
         OperationalPhase::Publication => SyncLocalMutationPhase::Publication,
         OperationalPhase::ArchiveStage => SyncLocalMutationPhase::ArchiveStage,
-        OperationalPhase::TailAdmission => SyncLocalMutationPhase::TailAdmission,
         OperationalPhase::SqliteDrain => SyncLocalMutationPhase::SqliteDrain,
         OperationalPhase::ProjectionDrain => SyncLocalMutationPhase::ProjectionDrain,
     }
@@ -25971,10 +25823,8 @@ mod tests {
             SyncEditorRefusalCode::TrustedLocalPreparationDraft,
             SyncEditorRefusalCode::TrustedLocalPreparationCapture,
             SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
-            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
             SyncEditorRefusalCode::TrustedLocalPreparationPublication,
             SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
-            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
             SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
             SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain,
             SyncEditorRefusalCode::TrustedLocalEngineAuthority,
@@ -26051,20 +25901,12 @@ mod tests {
                 SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
             ),
             (
-                OperationalPhase::TailReservation,
-                SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
-            ),
-            (
                 OperationalPhase::Publication,
                 SyncEditorRefusalCode::TrustedLocalPreparationPublication,
             ),
             (
                 OperationalPhase::ArchiveStage,
                 SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
-            ),
-            (
-                OperationalPhase::TailAdmission,
-                SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
             ),
             (
                 OperationalPhase::SqliteDrain,
@@ -46166,7 +46008,6 @@ mod tests {
             "engine-history",
             "projection-work-index-v1",
             "reference-catalog-v2",
-            "managed-local-journal-v1",
             "inactive-bootstrap-publication-v1",
         ]
         .iter()
@@ -46217,48 +46058,6 @@ mod tests {
             observed <= ceiling,
             "scaled activation exceeded the near-linear normalized ceiling: small={small:?}, large={large:?}"
         );
-    }
-
-    #[test]
-    fn detailed_activation_progress_reports_preparation_parts_and_summary_observationally() {
-        let fixture = ActivationFixture::nested_unicode("detailed-progress", 0xa08f);
-        let before = user_graph_bytes(&fixture.graph_root);
-        let mut updates = Vec::new();
-        let activated = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
-            fixture.request.clone(),
-            |update| updates.push(update),
-        );
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
-
-        let phases = updates
-            .iter()
-            .filter_map(|update| match update {
-                SyncLocalActivationProgress::Phase { phase } => Some(*phase),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            phases,
-            vec![
-                SyncLocalActivationPhase::PrivateSetup,
-                SyncLocalActivationPhase::SourceCapture,
-                SyncLocalActivationPhase::BootstrapImportPreparation,
-                SyncLocalActivationPhase::ImmutablePublicationInstall,
-                SyncLocalActivationPhase::SqliteOpenBuild,
-                SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
-            ]
-        );
-        assert!(
-            !updates.iter().any(|update| matches!(
-                update,
-                SyncLocalActivationProgress::BootstrapPreparationSubphase { .. }
-                    | SyncLocalActivationProgress::BootstrapDetachedAuthoring { .. }
-                    | SyncLocalActivationProgress::BootstrapPreparationSummary { .. }
-            )),
-            "clean activation must not report the retired operation-spool, partition, detached-authoring, or sealing pipeline"
-        );
-        drop(activated.handle);
     }
 
     #[test]
@@ -46323,9 +46122,8 @@ mod tests {
                 "the clean builder must consume one activation record per source page"
             );
             assert_eq!(
-                receipt.clean.source_bytes,
-                (receipt.source_bytes as u64).saturating_mul(2),
-                "the clean builder must account for the initial capture plus one sealed-source lowering read"
+                receipt.clean.source_bytes, receipt.source_bytes as u64,
+                "the clean builder must consume each sealed source byte exactly once"
             );
             assert!(
                 receipt.clean.parser_nodes >= receipt.blocks as u64,
@@ -46345,7 +46143,7 @@ mod tests {
             );
             assert!(
                 receipt.retired_artifacts.is_empty(),
-                "clean activation retained retired bootstrap, Patricia, journal, shadow, backup, or capture artifacts: {:?}",
+                "clean activation retained retired bootstrap, Patricia, shadow, or backup artifacts: {:?}",
                 receipt.retired_artifacts
             );
             assert_eq!(
@@ -49730,24 +49528,6 @@ mod tests {
                     after_engine
                         .external_history_blob_reads
                         .saturating_sub(before_engine.external_history_blob_reads),
-                )
-                .saturating_add(
-                    after_engine
-                        .store
-                        .history_record_reads
-                        .saturating_sub(before_engine.store.history_record_reads),
-                )
-                .saturating_add(
-                    after_engine
-                        .store
-                        .history_index_reads
-                        .saturating_sub(before_engine.store.history_index_reads),
-                )
-                .saturating_add(
-                    after_engine
-                        .store
-                        .history_decodes
-                        .saturating_sub(before_engine.store.history_decodes),
                 ),
         };
         let point_bound = managed_application_save_page_local_read_bound(page_blocks);
@@ -50093,10 +49873,11 @@ mod tests {
         ));
         drop(handle);
 
+        const LEGACY_RECONCILIATION_DIR: &str = "reconciliation";
         let legacy_baseline_root = fixture
             .request
             .application_runtime_root
-            .join(crate::oplog::sync_layout::RECONCILIATION_DIR)
+            .join(LEGACY_RECONCILIATION_DIR)
             .join(fixture.request.identities.workspace_id.to_string())
             .join(fixture.request.identities.endpoint_id.to_string());
         assert!(
@@ -50175,232 +49956,6 @@ mod tests {
             .raw
             .contains("accepted without legacy retained scratch authority")));
         drop(reopened);
-    }
-
-    #[cfg(any())]
-    /// A retained run is a reconstructible accelerator, not authority.  This
-    /// captures the pre-recovery failure journey by corrupting only the
-    /// `blobs.data` file of the exact run selected by the published resume
-    /// point, then forcing SQLite to materialize documents from that selected
-    /// run on reopen.
-    #[test]
-    fn managed_reopen_rebuilds_after_malformed_retained_scratch_blob() {
-        let fixture = ActivationFixture::nested_unicode(
-            "managed-reopen-malformed-retained-scratch-blob",
-            0xa0ed,
-        );
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("synthetic graph activates");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_exact(&handle, "Root.md");
-        let _ = save_application_block_text(
-            &handle,
-            page,
-            revision,
-            "accepted before retained scratch corruption",
-        );
-        let (written, _) = load_application_exact(&handle, "Root.md");
-        assert!(
-            written
-                .blocks
-                .iter()
-                .any(|block| block.raw.contains("accepted before retained scratch corruption")),
-            "the fresh activation's current retained scratch must serve a read-after-write before any restart"
-        );
-        drain_managed_local(&handle);
-        assert!(
-            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
-            "the selected run is emitted only after a safe, settled handoff"
-        );
-        drop(handle);
-
-        let expected_graph = user_graph_bytes(&fixture.graph_root);
-        let immutable_archive_before_recovery =
-            immutable_archive_bytes(&fixture.request.archive_root);
-        let immutable_history_before_recovery =
-            immutable_engine_history_bytes(&fixture.request.archive_root);
-        let immutable_receipts_before_recovery =
-            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
-
-        let (selected_run_id, selected_run) =
-            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
-        let selected_before = fs::read_dir(&selected_run)
-            .unwrap()
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_file())
-            .map(|entry| {
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    fs::read(entry.path()).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let selected_blobs = selected_run.join(tine_storage::formats::SCRATCH_BLOBS_FILE);
-        assert!(
-            selected_blobs.is_file(),
-            "selected retained run has blobs.data"
-        );
-
-        // The retained SQLite projection would otherwise remain a valid cache
-        // and hide the fault.  It is disposable, so force its normal rebuild
-        // without touching any accepted immutable archive bytes.
-        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
-            .remove()
-            .expect("the disposable SQLite projection is removable");
-        fs::write(&selected_blobs, b"not a scratch blob").unwrap();
-        let selected_corrupted = fs::read_dir(&selected_run)
-            .unwrap()
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_file())
-            .map(|entry| {
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    fs::read(entry.path()).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        let selected_at_reclamation = Arc::new(Mutex::new(None));
-        let selected_at_reclamation_result = Arc::clone(&selected_at_reclamation);
-        let selected_at_reclamation_path = selected_run.clone();
-        let selected_at_reclamation_expected = selected_corrupted.clone();
-        act_once_at_resume_lifecycle_cut_for_workspace_for_test(
-            fixture.request.identities.workspace_id,
-            ResumeLifecycleCut::BeforeReclamation,
-            Box::new(move || {
-                let observed = recursive_file_bytes(&selected_at_reclamation_path);
-                assert_eq!(
-                    observed, selected_at_reclamation_expected,
-                    "recovery must leave the refused run byte-exact through replacement publication and up to authenticated reclamation"
-                );
-                *selected_at_reclamation_result.lock().unwrap() = Some(observed);
-            }),
-        );
-        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
-        let reopened = reopened
-            .handle
-            .expect("typed retained-scratch failure replays into an active runtime");
-        assert_eq!(
-            immutable_archive_bytes(&fixture.request.archive_root),
-            immutable_archive_before_recovery,
-            "cache-only retained-scratch recovery must not alter immutable archive authority"
-        );
-        assert_eq!(
-            immutable_engine_history_bytes(&fixture.request.archive_root),
-            immutable_history_before_recovery,
-            "cache-only retained-scratch recovery must not alter immutable engine history"
-        );
-        assert_eq!(
-            immutable_projection_receipt_bytes(&fixture.request.receipt_root),
-            immutable_receipts_before_recovery,
-            "cache-only retained-scratch recovery must not alter immutable projection receipts"
-        );
-        assert_eq!(
-            user_graph_bytes(&fixture.graph_root),
-            expected_graph,
-            "replay recovery must not rewrite direct graph bytes"
-        );
-        assert_eq!(
-            selected_at_reclamation.lock().unwrap().as_ref(),
-            Some(&selected_corrupted),
-            "the exact pre-reclamation preservation seam must fire during post-open publication"
-        );
-        let (replacement_after_recovery, replacement_after_recovery_path) =
-            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
-        assert_ne!(replacement_after_recovery, selected_run_id);
-        assert!(replacement_after_recovery_path.is_dir());
-        if selected_run.is_dir() {
-            assert_eq!(
-                recursive_file_bytes(&selected_run),
-                selected_corrupted,
-                "an unreclaimed refused run must remain byte-for-byte intact"
-            );
-        } else {
-            assert!(
-                !selected_run.exists(),
-                "authenticated reclamation must remove the whole refused run, never leave a partial entry"
-            );
-        }
-        assert_ne!(selected_corrupted, selected_before);
-
-        let (recovered_page, recovered_revision) = load_application_exact(&reopened, "Root.md");
-        assert!(
-            recovered_page.blocks.iter().any(|block| block
-                .raw
-                .contains("accepted before retained scratch corruption")),
-            "the recovered public application page must contain the last accepted edit"
-        );
-        let _ = save_application_block_text(
-            &reopened,
-            recovered_page,
-            recovered_revision,
-            "accepted after retained scratch recovery",
-        );
-        let (saved_page, _) = load_application_exact(&reopened, "Root.md");
-        assert!(
-            saved_page.blocks.iter().any(|block| block
-                .raw
-                .contains("accepted after retained scratch recovery")),
-            "a public application save after recovery must be immediately readable"
-        );
-        drain_managed_local(&reopened);
-
-        let immutable_archive_after_save = immutable_archive_bytes(&fixture.request.archive_root);
-        let immutable_history_after_save =
-            immutable_engine_history_bytes(&fixture.request.archive_root);
-        let immutable_receipts_after_save =
-            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
-        assert_byte_map_is_strict_extension(
-            &immutable_archive_before_recovery,
-            &immutable_archive_after_save,
-            "immutable archive",
-        );
-        assert_byte_map_is_strict_extension(
-            &immutable_history_before_recovery,
-            &immutable_history_after_save,
-            "immutable engine history",
-        );
-        assert_byte_map_is_strict_extension(
-            &immutable_receipts_before_recovery,
-            &immutable_receipts_after_save,
-            "immutable projection receipts",
-        );
-        let graph_after_save = user_graph_bytes(&fixture.graph_root);
-        assert_ne!(
-            graph_after_save, expected_graph,
-            "the accepted post-recovery save must update the direct graph projection"
-        );
-        assert!(
-            graph_after_save.values().any(|bytes| bytes
-                .windows(b"accepted after retained scratch recovery".len())
-                .any(|window| window == b"accepted after retained scratch recovery")),
-            "the direct graph projection must contain the accepted post-recovery edit"
-        );
-        if selected_run.is_dir() {
-            assert_eq!(
-                recursive_file_bytes(&selected_run),
-                selected_corrupted,
-                "the accepted post-recovery save must not reuse or alter abandoned run {selected_run_id}"
-            );
-        } else {
-            assert!(
-                !selected_run.exists(),
-                "later lifecycle work must not recreate a partially retired refused run"
-            );
-        }
-        assert!(matches!(
-            reopened.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(_))
-        ));
-        let (replacement_run_id, _) =
-            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
-        assert_ne!(
-            replacement_run_id, selected_run_id,
-            "safe recovery publishes a fresh retained run rather than reusing the malformed one"
-        );
     }
 
     /// Only a tick that committed a batch may be reported as a content change.
@@ -50701,7 +50256,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_crash_reopen_synthetic_history_sweep_with_and_without_resume_point() {
+    fn managed_crash_reopen_synthetic_history_sweep_with_and_without_projection_cache() {
         const PATH: &str = "notes/Synthetic crash history.md";
         const INITIAL: &[u8] = b"- initial synthetic history\n";
 

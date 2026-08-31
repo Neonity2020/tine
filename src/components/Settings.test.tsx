@@ -811,12 +811,11 @@ describe("Settings storage transitions", () => {
     expect(root.textContent).toContain("Capturing source files");
     expect(progress.hasAttribute("value")).toBe(false);
 
-    listeners[0]({ kind: "bootstrap_detached_authoring", completed: 2, total: 4 });
+    listeners[0]({ kind: "phase", phase: "sqlite_open_build" });
     await tick();
     progress = root.querySelector(".settings-activation-progress progress") as HTMLProgressElement;
-    expect(root.textContent).toContain("Building operation history (2 of 4 parts)");
-    expect(progress.value).toBe(2);
-    expect(progress.max).toBe(4);
+    expect(root.textContent).toContain("Building the local index");
+    expect(progress.hasAttribute("value")).toBe(false);
 
     listeners[0]({ kind: "phase", phase: "retained_runtime_open" });
     await tick();
@@ -845,10 +844,10 @@ describe("Settings storage transitions", () => {
     await tick();
     await tick();
     expect(calls.slice(-2)).toEqual(["listen-11", "activate"]);
-    listeners[1]({ kind: "bootstrap_preparation_subphase", subphase: "sealing" });
+    listeners[1]({ kind: "phase", phase: "immutable_publication_install" });
     await tick();
     progress = root.querySelector(".settings-activation-progress progress") as HTMLProgressElement;
-    expect(root.textContent).toContain("Sealing prepared history");
+    expect(root.textContent).toContain("Installing prepared history");
     expect(progress.hasAttribute("value")).toBe(false);
     storageTransitionRuntime.receive({
       operationId: activationOperation,
