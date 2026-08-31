@@ -9298,6 +9298,58 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: a link written as [Test](file://D:\\\\test.txt) (Logseq) or [Test](<file:///D:\\\\test.txt>) (Obsidian) opens that file or folder in the OS default application, and a link that cannot be opened says why instead of doing nothing. Classification: blocking core operation. Root cause: two independent halves, both silent. open_external refused every scheme but http/https/mailto, so file: returned 'unsupported url scheme'; and the renderer's click handler discarded that rejection with a bare void, so the user saw a live-looking link with no effect and no message. OG provenance: og-1.0.0 electron/window.cljs open-default-app! sends http(s)/mailto to shell.openExternal and hands every OTHER scheme, file: included, to the OS default app with no confirmation and no extension filter; Tine matches that for file: and keeps refusing all other schemes, which is stricter than OG. URL shapes are resolved by the WHATWG parser rather than string surgery, so a drive letter in the authority slot, backslash separators and percent escapes all resolve. A path that no longer exists is now reported rather than handed to an opener that would silently do nothing (explorer.exe opens an unrelated window for one). EVIDENCE LIMIT: the reporter is on Windows and no Windows runtime was available; the routing decision and the click path are proven on Linux, the ShellExecute/explorer spawn itself is not, so confidence stays moderate. Relative paths without a scheme are GH #457, not this row."
+    },
+    {
+      "id": "UI-OUTLINE-GUIDE-HITBOX-423",
+      "title": "The fold-all guide covers the left edge of the per-block fold arrow, so aiming at the arrow folds the whole subtree",
+      "family": "outline-controls",
+      "sources": {
+        "issues": [
+          423
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-outline-guide-hitbox.mjs"
+        ],
+        "scenario": "outline-controls.fold-all-guide-hitbox",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: aiming at a block's fold arrow folds that one block, never the whole subtree. Classification: blocking stateful UX. Root cause: the children guide (the vertical line that folds EVERY descendant) is position:absolute z-index:1 with left:-9px width:14px, while the child row's 18px fold arrow begins at the children container's left edge \u2014 so the guide was painted over the arrow's leftmost 5px and answered clicks there. The reporter, three weeks into daily use, kept hitting it; aim cannot adapt to a control that is invisibly on top of another. Fix: the guide is now 5px wide, centred within 0.5px on the 1px line it draws, and stops exactly at the arrow's edge, so the arrow keeps all 18 of its pixels. OG provenance: og-1.0.0 components/block.css .block-children-left-border is 4px wide at left:-1px, i.e. it hugs its line and overlaps nothing; the reporter's 'hitbox is smaller' is accurate. The reported 'right-skewed' is not literally true \u2014 the old box was centred on the line to within 0.5px \u2014 but the harm was real and is what the fix targets. Fail-before is quantitative: restoring left:-9px/width:14px makes the guard report the guide covering exactly 5px of the per-block controls at x=29..33. jsdom applies no CSS layout, so a headless-Chromium geometry guard is the only layer that can see this; scripts/check-outline-guide-hitbox.mjs asserts the user-visible contract (covers no pixel of the neighbouring controls, centred on its own line, no larger than the per-block control) rather than the constants."
+    },
+    {
+      "id": "UI-SIDEBAR-RESIZER-COVERS-SCROLLBAR-435",
+      "title": "The left sidebar's resize strip is drawn over its scrollbar, so the scrollbar cannot be grabbed",
+      "family": "app-shell-layout",
+      "sources": {
+        "issues": [
+          435
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "windows",
+        "linux",
+        "macos"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-sidebar-resizer-scrollbar.mjs"
+        ],
+        "scenario": "app-shell.sidebar-resizer-and-scrollbar-columns",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: the left sidebar's scrollbar can be grabbed and dragged with the mouse. Classification: blocking core operation (the surface is scrollable but its scrollbar is unreachable). Root cause: .sidebar-resizer is position:absolute right:0 width:7px z-index:20 inside .left-sidebar, and .left-sidebar-scroll fills that same box \u2014 so on any platform whose scrollbar consumes layout width (Windows/WebView2 is the reported one) the drag strip was painted over the outer 7px of a 10px scrollbar. Resizing worked; scrolling by mouse did not, which is exactly what two Windows reporters described. Fix: .left-sidebar-scroll reserves a transparent right border of --sidebar-resizer-width, the same token the strip's width now uses, so the scrollbar column and the drag column are disjoint and moving a few pixels left off the strip reaches the bar, as the reporter asked. The border is transparent so the sidebar background is unchanged; the mobile drawer, where the strip is hidden, sets the border back to 0 and keeps its full width. Siblings reviewed: .rs-resizer sits at the RIGHT sidebar's LEFT edge while that pane scrolls on its right, and the main pane's scrollbar ends where the right sidebar begins, so neither pair overlaps \u2014 the left sidebar was the only conflicting pair. The frameless-window .grip-e strip does overlay the rightmost 4px of whatever pane touches the window edge, but that is the ordinary window-edge resize zone every frameless app has, not this defect. Fail-before is quantitative: removing the gutter makes the guard report the strip covering 7.0px of the 10px scrollbar. EVIDENCE LIMIT: no Windows runtime was available. jsdom applies no CSS layout and this headless Chromium always draws overlay scrollbars, so scripts/check-sidebar-resizer-scrollbar.mjs reproduces the Windows condition with scrollbar-gutter:stable in the fixture; the column geometry is proven, the WebView2 bar itself is not, so confidence stays moderate."
     }
   ]
 }
