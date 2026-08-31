@@ -265,7 +265,13 @@ async function openPageThroughSwitcher(name) {
 
 async function visibleRootTexts() {
   return browser.execute(() => [...document.querySelectorAll(".page-blocks > .ls-block")]
-    .map((block) => block.querySelector(":scope > .block-main > .block-content-wrapper > .block-content")?.textContent?.trim() ?? ""));
+    .map((block) => {
+      const main = block.querySelector(":scope > .block-main > .block-content-wrapper");
+      const editor = main?.querySelector("textarea.block-editor");
+      return editor instanceof HTMLTextAreaElement
+        ? editor.value.trim()
+        : main?.querySelector(":scope > .block-content")?.textContent?.trim() ?? "";
+    }));
 }
 
 async function stopHarness() {
@@ -383,13 +389,18 @@ try {
     return editor.value === value;
   }, `${markers[0]} ${EDIT_MARKER}`);
   if (!edited) throw new Error("today's active editor rejected the managed feed edit input");
-  await (await browser.$(".journal-today .journal-title")).click();
+  // End the editor before navigating through the journal title. Clicking the
+  // title itself as the blur target races its route load against the save it
+  // just started; the correctly guarded stale DTO then emits an unrelated
+  // unsaved-instance refusal which can survive into the rapid-move phase.
+  await browser.keys(Key.Escape);
   const todayFile = path.join(GRAPH, "journals", `${stem(days[0])}.md`);
   await waitFor(
     () => fs.readFileSync(todayFile, "utf8").includes(EDIT_MARKER),
     30_000,
     "accepted managed edit did not reach the Markdown projection",
   );
+  await (await browser.$(".journal-today .journal-title")).click();
   const journals = await waitFor(async () => {
     for (const item of await browser.$$(".nav-item")) {
       if ((await item.getText()).trim() === "Journals") return item;
@@ -402,6 +413,11 @@ try {
     interval: 200,
     timeoutMsg: "reopened managed feed did not show the accepted edit",
   });
+  const acceptedEditErrors = await browser.execute(() =>
+    [...document.querySelectorAll(".toast-error .toast-msg")].map((node) => node.textContent ?? ""));
+  if (acceptedEditErrors.length) {
+    throw new Error(`accepted managed edit/reopen emitted error notifications: ${JSON.stringify(acceptedEditErrors)}`);
+  }
   receipt.milestones.acceptedEditRefresh = { marker: EDIT_MARKER, projected: true, rendered: true };
 
   phase = "rapid-multi-day-move";
@@ -528,8 +544,25 @@ try {
   const destinationAnchor = await browser.$(".page-blocks > .ls-block:first-child > .block-main > .block-content-wrapper");
   await destinationAnchor.click();
   await browser.$("textarea.block-editor").waitForExist({ timeout: 10_000 });
-  await browser.keys(Key.Escape);
-  await browser.keys(["Control", "v"]);
+  // WebKitWebDriver's synthetic Control+V does not dispatch a paste event on
+  // this host. Drive the same application boundary directly: the real cut
+  // above owns Tine's private one-shot payload; this event supplies the exact
+  // public text flavor which authorizes that payload association.
+  const bulkClipboardText = BULK_MARKERS.map((marker) => `- ${marker}`).join("\n");
+  const pasteDispatched = await browser.execute((text) => {
+    const editor = document.querySelector("textarea.block-editor");
+    if (!(editor instanceof HTMLTextAreaElement)
+      || typeof DataTransfer !== "function"
+      || typeof ClipboardEvent !== "function") return false;
+    const clipboard = new DataTransfer();
+    clipboard.setData("text/plain", text);
+    return !editor.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: clipboard,
+    }));
+  }, bulkClipboardText);
+  if (!pasteDispatched) throw new Error("bulk paste event was not claimed by the Tine editor");
   await waitFor(async () => {
     const roots = await visibleRootTexts();
     return BULK_MARKERS.every((marker) => roots.includes(marker));
