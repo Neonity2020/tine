@@ -49893,10 +49893,11 @@ mod tests {
         ));
         drop(handle);
 
+        const LEGACY_RECONCILIATION_DIR: &str = "reconciliation";
         let legacy_baseline_root = fixture
             .request
             .application_runtime_root
-            .join(tine_storage::formats::RECONCILIATION_DIR)
+            .join(LEGACY_RECONCILIATION_DIR)
             .join(fixture.request.identities.workspace_id.to_string())
             .join(fixture.request.identities.endpoint_id.to_string());
         assert!(
