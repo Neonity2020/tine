@@ -22,7 +22,9 @@ import "./styles/app.css";
 import { installEditableEmojiPlatform } from "./editableEmoji";
 import { applyContentWidths } from "./contentWidth";
 import { installSystemInsetOwner } from "./systemInsets";
+import { installPlatformAttribute } from "./nativeChrome";
 
+installPlatformAttribute();
 installSystemInsetOwner();
 installEditableEmojiPlatform();
 applyTheme();

@@ -1,8 +1,18 @@
 // GH #231: long-press → context menu for touch input. A still hold dispatches
 // a SYNTHETIC contextmenu at the held point, so the gesture goes through the
-// exact desktop menu path (which preventDefaults — that also suppresses the
-// browser's own long-press text-selection, the reporter's complaint). Only
-// touch/pen arm it: desktop mice already have right-click.
+// exact desktop menu path. Only touch/pen arm it: desktop mice already have
+// right-click.
+//
+// What preventDefault() on that synthetic event does NOT do — this header used
+// to claim otherwise, and GH #452 is what the claim cost — is cancel the
+// platform's own long-press text selection. That gesture belongs to a native
+// recognizer; iOS does not fire `contextmenu` for touch at all, so there is no
+// default to prevent. Selection is refused in CSS instead
+// (`html[data-platform="ios"] :is(.page-ref, .tag)` and the `.ctx-*` rules in
+// app.css). Dropping any range the hold already produced, below, covers the
+// window between the OS recognizer firing and our menu appearing.
+
+import { dropSelection } from "../dragSelectionGuard";
 
 export const LONG_PRESS_DELAY = 500; // ms — the conventional hold time
 export const LONG_PRESS_MOVE_TOLERANCE = 10; // px — beyond it, the hold is a scroll/drag
@@ -73,6 +83,9 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
           clientY: armedNow.y,
         });
         ownedContextMenuEvents.add(contextMenu);
+        // The OS recognizer may have selected the held word first; the menu is
+        // about to open over it.
+        dropSelection();
         el.dispatchEvent(contextMenu);
       }, LONG_PRESS_DELAY);
     },

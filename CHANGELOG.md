@@ -51,6 +51,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Long-pressing a page link on iOS or Android no longer raises the system
+  text-selection bar over Tine's menu.** The same hold that opens Tine's context
+  menu is also the platform's own selection gesture, which no amount of event
+  handling on our side can call off — so page links and tags simply decline to
+  be selected on touch. Menus themselves are now unselectable everywhere. On
+  desktop you can still drag a selection across a link's text. (GH #452)
+
+- **Dragging a block by its bullet no longer paints a blue trail behind it.**
+  On macOS the drag doubled as a text selection and highlighted every block it
+  passed over, which made the landing spot hard to read. The same guard the
+  sidebar already used now covers the outline. (GH #424)
+
 - **A wide table no longer drags its "Add row" label across the screen.** The
   control spans the whole table, so its centred label sat at the midpoint of the
   full table width — off to one side and travelling as you scrolled sideways.

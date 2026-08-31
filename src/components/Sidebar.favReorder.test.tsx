@@ -213,24 +213,24 @@ describe("favorites drag reorder (GH #211)", () => {
     setRect(second, 0, 30, 200, 30);
     setRect(third, 0, 60, 200, 30);
 
-    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+    expect(document.documentElement.classList.contains("drag-selection-suppressed")).toBe(false);
 
     first.dispatchEvent(pointer("pointerdown", 10, 10));
     // Still under the 4px threshold: this is a click, not a drag — leave
     // ordinary text selection alone.
     document.dispatchEvent(pointer("pointermove", 11, 11));
-    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+    expect(document.documentElement.classList.contains("drag-selection-suppressed")).toBe(false);
 
     const prev = document.elementFromPoint;
     try {
       document.elementFromPoint = () => third;
       document.dispatchEvent(pointer("pointermove", 10, 85));
-      expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(true);
+      expect(document.documentElement.classList.contains("drag-selection-suppressed")).toBe(true);
       document.dispatchEvent(pointer("pointerup", 10, 85));
     } finally {
       document.elementFromPoint = prev;
     }
-    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+    expect(document.documentElement.classList.contains("drag-selection-suppressed")).toBe(false);
     dispose();
   });
 
@@ -246,12 +246,12 @@ describe("favorites drag reorder (GH #211)", () => {
     try {
       document.elementFromPoint = () => third;
       document.dispatchEvent(pointer("pointermove", 10, 85));
-      expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(true);
+      expect(document.documentElement.classList.contains("drag-selection-suppressed")).toBe(true);
       document.dispatchEvent(pointer("pointercancel", 10, 85));
     } finally {
       document.elementFromPoint = prev;
     }
-    expect(document.documentElement.classList.contains("row-reorder-dragging")).toBe(false);
+    expect(document.documentElement.classList.contains("drag-selection-suppressed")).toBe(false);
     dispose();
   });
 });

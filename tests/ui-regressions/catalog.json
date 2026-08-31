@@ -9187,6 +9187,59 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: on a table wider than its container, '+ Add row' is readable before, during and after a horizontal scroll, and dragging the table sideways moves the cells rather than the label. Classification: blocking stateful UX (the control was unreachable without scrolling to find it). Root cause: the add-row button is a `grid-column: 1 / -1` item of a `width: max-content` grid inside `overflow-x: auto`, and its centred label therefore sat at the midpoint of the whole table. Fail-before measurement at a 420px viewport over a 1325px table: label at +647px unscrolled and -258px fully scrolled, outside the viewport at both extremes; after, +27px at both. The exact offset and the sticky implementation are not user contracts."
+    },
+    {
+      "id": "UI-TOUCH-LONGPRESS-NATIVE-SELECTION-452",
+      "title": "Long-pressing a page link on a touch platform opens Tine's menu without the OS selection bar over it",
+      "family": "page-link-gestures",
+      "sources": {
+        "issues": [
+          452
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "ios",
+        "android"
+      ],
+      "layer": "browser",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/check-touch-selection.mjs"
+        ],
+        "scenario": "touch.longpress-page-link-selection",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a long press on a page link or tag shows Tine's context menu alone \u2014 no platform Copy/Look Up bar stacked over it and no menu action highlighted as selected text. Classification: blocking stateful UX. Root cause: the hold is simultaneously the OS's text-selection gesture, owned by a native recognizer; preventDefault() on Tine's SYNTHETIC contextmenu cannot cancel it, and iOS fires no contextmenu for touch. Only refusing to be selectable stops it, so .page-ref/.tag are user-select:none on touch platforms and the .ctx-* menu surfaces are unselectable everywhere. Accepted tradeoff: on a phone or tablet a rendered page link can no longer be included in a text selection sweep; desktop selection is unchanged, and that asymmetry is itself asserted. The stale claim in longPress.ts that preventDefault suppressed native selection has been corrected in place."
+    },
+    {
+      "id": "UI-BLOCK-BULLET-DRAG-SELECTION-424",
+      "title": "Dragging an outline block by its bullet does not select the blocks the pointer passes over",
+      "family": "outline-drag-drop",
+      "sources": {
+        "issues": [
+          424
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "macos",
+        "linux",
+        "windows"
+      ],
+      "layer": "unit",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/components/Block.selectionDrag.test.tsx::suppresses document selection while a bullet drag is in flight and releases it on drop"
+        ],
+        "scenario": "outline.bullet-drag-selection",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: while a block is being dragged to a new position, only the drop indicator moves; no block under the pointer turns blue. Classification: flexible presentation, but a visible usability defect \u2014 the reporter could not tell where the block would land. Root cause: the bullet drag never suppressed document selection, so WebKit ran its own text selection from the bullet across everything the pointer crossed. Chromium/WebView2 does not, which is why the same build looked clean on Windows. The sidebar row reorder already solved this (GH #211 follow-up); both now share dragSelectionGuard.ts, and the CSS class was renamed from row-reorder-dragging to drag-selection-suppressed to stop describing only half its callers. Platform layer: the guard is asserted structurally in jsdom, which cannot paint; the blue smear itself was not reproduced on macOS hardware."
     }
   ]
 }

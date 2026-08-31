@@ -80,6 +80,15 @@ export function isTabletViewport(
   return Math.min(width, height) >= 700;
 }
 
+/** Stamp the resolved platform on <html> so CSS can ask the same question the
+ *  TypeScript does. Styling that depends on touch input — suppressing the
+ *  native long-press selection under Tine's own long-press menu, GH #452 —
+ *  has no other way to reach it, and must not guess from a media query. */
+export function installPlatformAttribute(): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.setAttribute("data-platform", platformKind);
+}
+
 /** Does this device present the single-pane mobile shell?
  *
  *  Split panes are not a desktop-OS privilege — they need screen room and a

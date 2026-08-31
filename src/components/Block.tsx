@@ -143,6 +143,7 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
+import { dropSelection, setDragSelectionSuppressed } from "../dragSelectionGuard";
 import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
@@ -254,7 +255,14 @@ function beginDrag(id: string, e: MouseEvent) {
       capturedIds = selected.length ? [...selected] : [id];
       setDragId(id);
       endEdit("drag-start");
+      // Moving a block is not a text gesture. WebKit otherwise runs its own
+      // selection drag from the bullet and paints every block the pointer
+      // crosses blue (GH #424, macOS; Chromium does not do this, which is why
+      // the same build looked clean on Windows).
+      setDragSelectionSuppressed(true);
     }
+    // WebKit can re-anchor a selection mid-drag; the class alone is not enough.
+    dropSelection();
     const el = (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)?.closest(
       ".ls-block"
     ) as HTMLElement | null;
@@ -272,6 +280,7 @@ function beginDrag(id: string, e: MouseEvent) {
   const onUp = () => {
     document.removeEventListener("mousemove", onMove);
     document.removeEventListener("mouseup", onUp);
+    setDragSelectionSuppressed(false);
     const ind = dropInd();
     if (dragMoved && ind && doc.byId[ind.id]) {
       void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.position);
