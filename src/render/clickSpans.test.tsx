@@ -143,6 +143,50 @@ describe("click-to-caret span mapping", () => {
     }
   });
 
+  // GH #465 × GH #454: the reference-count badge is `float: right`, so it is
+  // drawn hard against the block's right edge no matter how short the text is.
+  // A single range over the whole block picks that box up, and it then answers
+  // "where does the text end?" with the full content width — which silently
+  // disabled the past-the-end caret on every referenced block. Measured in
+  // Chromium: badge box right 608, text right 164.6, so nothing could be past
+  // the end of a 608px-wide block. jsdom has no layout, so the geometry here is
+  // supplied; what the test pins is that out-of-flow children are excluded.
+  it("ignores a floated decoration when deciding where the text ends", () => {
+    const root = document.createElement("div");
+    root.className = "block-content";
+    const badge = document.createElement("a");
+    badge.style.float = "right";
+    badge.textContent = "3";
+    root.append(badge, document.createTextNode("some text in italics."));
+    document.body.appendChild(root);
+
+    const rects = new Map<Node, DOMRect>([
+      [badge, new DOMRect(585.8, 10, 22.2, 26)],
+      [root.lastChild!, new DOMRect(8, 13, 156.6, 19)],
+    ]);
+    const original = Range.prototype.getClientRects;
+    // Only `selectNode` is used, so the range's start container/offset names the
+    // node being measured.
+    Range.prototype.getClientRects = function (this: Range) {
+      const node = this.startContainer.childNodes[this.startOffset];
+      const rect = rects.get(node);
+      return [rect ?? new DOMRect(0, 0, 0, 0)] as unknown as DOMRectList;
+    };
+    try {
+      // A click in the run-out after "italics." on the block's only line.
+      expect(clickBeyondRenderedEnd(root, 300, 22)).toBe(true);
+      // ...but a click still over the glyphs is not past the end.
+      expect(clickBeyondRenderedEnd(root, 100, 22)).toBe(false);
+      // The float alone never makes a click past the end: with the text gone
+      // there is no line of text to be past.
+      badge.style.float = "";
+      expect(clickBeyondRenderedEnd(root, 300, 22)).toBe(false);
+    } finally {
+      Range.prototype.getClientRects = original;
+      root.remove();
+    }
+  });
+
   it("accounts for hidden property lines between rendered regions", () => {
     const raw = "**bold**\nid:: abc\nplain";
     const { root, dispose } = mountedBody(raw);

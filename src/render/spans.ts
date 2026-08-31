@@ -290,17 +290,51 @@ export function beyondFinalGlyph(boxes: ArrayLike<LineBox>, x: number, y: number
  *  Measures the CONTENTS, not the element: a block-level container is full
  *  width, so its own border box says nothing about where the text ends. */
 export function clickBeyondRenderedEnd(root: Element, x: number, y: number): boolean {
-  const range = root.ownerDocument.createRange();
+  const doc = root.ownerDocument;
+  const range = doc.createRange();
   // An environment with no layout engine has no line boxes to ask about: jsdom
   // does not implement Range.getClientRects at all, and calling it there threw
   // out of the click handler and took the whole edit gesture with it. Declining
   // is the right answer, not an approximation — the caller falls back to the
   // ordinary span mapping, which is what ran before GH #465.
   if (typeof range.getClientRects !== "function") return false;
-  range.selectNodeContents(root);
-  const boxes = range.getClientRects();
+  const view = doc.defaultView;
+  const boxes: LineBox[] = [];
+  for (const child of Array.from(root.childNodes)) collectInFlowRects(child, view, range, boxes);
   range.detach?.();
   return beyondFinalGlyph(boxes, x, y);
+}
+
+/** Line boxes of the IN-FLOW content of `node`, appended to `out`.
+ *
+ *  A single range over the whole block also picks up its floats, and a float in
+ *  a block is drawn hard against the block's right edge: the reference-count
+ *  badge alone made every referenced block report `right` = the full content
+ *  width, so no click in such a block could ever be past the end. Measured in
+ *  Chromium — badge box right 608 against text right 164.6 — which is why this
+ *  is a filter and not an assumption. The `{{img … right}}` alignment wrapper
+ *  floats the same way, from deeper in the inline tree, hence the recursion. */
+function collectInFlowRects(node: Node, view: Window | null, range: Range, out: LineBox[]): void {
+  if (node.nodeType === 1) {
+    const el = node as Element;
+    // Positive tests, not `float !== "none"`: a stylesheet-less environment
+    // reports "" for everything, and treating that as out-of-flow would discard
+    // the whole block.
+    const style = view?.getComputedStyle(el);
+    const f = style?.float;
+    const p = style?.position;
+    if (f === "left" || f === "right" || p === "absolute" || p === "fixed") return;
+    if (el.childElementCount > 0) {
+      for (const child of Array.from(el.childNodes)) collectInFlowRects(child, view, range, out);
+      return;
+    }
+  }
+  // A leaf: a text node, or an element with no element children — including a
+  // replaced one such as an image, which has no contents to measure but does
+  // occupy a box on the line. Hence selectNode, not selectNodeContents.
+  range.selectNode(node);
+  const rects = range.getClientRects();
+  for (let i = 0; i < rects.length; i++) out.push(rects[i]);
 }
 
 export function editorOffsetFromRenderedRange(
