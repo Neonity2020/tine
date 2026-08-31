@@ -1803,6 +1803,45 @@ fn g_g_user_selected_report_writes_stay_on_the_atomic_family() {
 }
 
 #[test]
+fn ms14b_retired_constructor_and_detached_bootstrap_residual_are_bounded() {
+    let files = production_rust();
+
+    // The production Patricia-opening constructor is retired. Tests that need
+    // an archive exercise `attach_clean_archive_store` through a cfg(test)
+    // helper, so neither spelling may become a production entry point.
+    assert_eq!(call_count(&files, "with_archive_store"), 0);
+    assert_eq!(call_count(&files, "with_clean_archive_store_for_test"), 0);
+
+    // These are the remaining detached/inactive-bootstrap SCC roots. They are
+    // retained for a later mechanical excision because their implementation is
+    // interleaved with live clean identity semantics, but no application path
+    // may start them. Any new caller is an architectural decision, not an
+    // incidental resurrection of the retired bootstrap route.
+    for root in [
+        "prepare_bootstrap_transaction",
+        "publish_install_verify_inactive_bootstrap",
+        "prepare_inactive_bootstrap_import",
+        "prepare_inactive_bootstrap_import_with_progress",
+        "reopen_inactive_bootstrap_accepted_authority",
+        "retain_inactive_bootstrap_accepted_authority",
+    ] {
+        assert_eq!(call_count(&files, root), 0, "unexpected caller of {root}");
+    }
+
+    // The three Patricia openers now survive only as one internal edge from
+    // that detached-bootstrap SCC. Keep the residual exact until it is removed
+    // as a unit; a second edge would create another retirement root.
+    for opener in [
+        "open_logseq_claim_index",
+        "open_portable_path_index",
+        "open_page_name_ownership_index",
+    ] {
+        assert_eq!(call_count(&files, opener), 1, "residual drift for {opener}");
+    }
+    assert_eq!(call_count(&files, "bootstrap_authoring_capability"), 0);
+}
+
+#[test]
 fn syntax_aware_test_mask_handles_items_fields_locals_and_expressions() {
     let source = r#"
         #[cfg(test)] fn omitted_item() { fs::write("x", b"x"); }
