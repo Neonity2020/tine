@@ -49074,7 +49074,10 @@ mod tests {
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
         let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
+        // The fixture deliberately scales to 10,000 pages. Its initial exact
+        // feed is page-bounded, so the fixed small-fixture helper would reject
+        // the intended large case before the measured reconciliation begins.
+        drive_initial_feed_with_turn_budget(&handle, total_pages.saturating_add(128));
 
         handle
             .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
