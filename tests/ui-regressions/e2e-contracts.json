@@ -328,7 +328,8 @@
    "nonRequirements": [
     "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, millisecond timing, or a particular internal queue implementation."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-31: the rapid multi-day move passed once on the candidate, but the two-attempt packet stop-loss ended the comparison run at a harness-only bulk-cut oracle before paste. Keep both stress outcomes out of unattended release blocking until an unchanged-binary burn-in completes the full rapid and 20-root cut/paste journey."
   },
   "scripts/e2e-media.mjs": {
    "contracts": [

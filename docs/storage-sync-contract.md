@@ -277,7 +277,7 @@ and manifest tail.
 
 | Path below the graph's private root | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
-| `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; deleted on Return to Direct Files |
+| `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; its app-private name is retired with the whole private root on Return to Direct Files |
 | private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1 | written last; sole local managed-authority selector |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
@@ -298,7 +298,21 @@ Emergency return publishes the sibling app-private selector
 this before managed binding discovery, so retained managed bytes cannot
 resurrect themselves. The receipt is retired only after an explicit fresh
 managed activation has quarantined the former private root and published its
-new binding.
+new binding. Both selectors are small app-private sole-writer authorities:
+create, exact replacement, and active-name retirement go through
+`DurableDirectoryPublication`. On Windows this means certified write-through
+name operations; on Unix/Android the initial parent chain and final name are
+flushed before success. Retirement first moves the exact selector bytes to a
+fresh same-directory name outside the selector grammar, then removes that inert
+residue, so a crash cannot turn a reported Managed activation back into Direct
+Files merely by resurrecting the old active name.
+
+**Refusal scenario:** `MS-REF-STORAGE-MODE-PUBLICATION-UNAVAILABLE`. The
+in-scope failure is a crash or power loss after Tine reports an explicit storage
+mode switch. If the platform cannot prove the required durable name operation,
+or the exact app-private selector changed during publication, the transition
+refuses before acknowledging the new mode. This protects authority selection,
+not against an adversarial local writer.
 
 The following path families are **retired pre-0.7 artifacts**, not an alternate
 production layout: `archive/bootstrap-v1/`, `archive/engine-history/`,

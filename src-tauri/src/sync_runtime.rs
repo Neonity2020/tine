@@ -287,19 +287,20 @@ fn publish_direct_selection_at(path: &Path, graph_root: &Path, reason: &str) -> 
             value
         })
         .map_err(|error| error.to_string())?;
-    tine_core::model::atomic_update(path, &DIRECT_SELECTION_WRITE, |_| Ok(encoded.clone()))
-        .map_err(|error| format!("Couldn't select Direct Files for this graph: {error}"))
+    tine_core::model::durable_private_authority_update(path, &DIRECT_SELECTION_WRITE, |_| {
+        Ok(encoded.clone())
+    })
+    .map_err(|error| format!("Couldn't select Direct Files for this graph: {error}"))
 }
 
 fn retire_direct_selection(app: &tauri::AppHandle, graph_root: &Path) -> Result<(), String> {
     let path = direct_selection_path(app, graph_root)?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "Couldn't retire the prior Direct Files selection: {error}"
-        )),
-    }
+    retire_direct_selection_at(&path)
+}
+
+fn retire_direct_selection_at(path: &Path) -> Result<(), String> {
+    tine_core::model::durable_private_authority_retire(path, &DIRECT_SELECTION_WRITE)
+        .map_err(|error| format!("Couldn't retire the prior Direct Files selection: {error}"))
 }
 
 fn binding_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
@@ -337,46 +338,7 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
             value
         })
         .map_err(|error| error.to_string())?;
-    #[cfg(target_os = "android")]
-    if !path.exists() {
-        use std::io::Write as _;
-
-        let parent = path
-            .parent()
-            .ok_or_else(|| "Tine-managed storage binding has no private parent".to_owned())?;
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!("Couldn't create Tine-managed storage private binding directory: {error}")
-        })?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(mut file) => {
-                file.write_all(encoded.as_bytes()).map_err(|error| {
-                    format!("Couldn't write Tine-managed storage private binding: {error}")
-                })?;
-                file.sync_all().map_err(|error| {
-                    format!("Couldn't flush Tine-managed storage private binding: {error}")
-                })?;
-                // The initial binding is small, device-local and published
-                // before any managed authority exists. Android kernels can
-                // deny renameat2(RENAME_NOREPLACE) even in app-private storage;
-                // direct create_new preserves no-clobber semantics. A crash
-                // can at worst leave a malformed private opt-in record, which
-                // is recoverable through the always-available Direct Files
-                // escape without touching the Markdown tree.
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(format!(
-                    "Couldn't create Tine-managed storage private binding: {error}"
-                ));
-            }
-        }
-    }
-    tine_core::model::atomic_update(path, &BINDING_WRITE, |existing| {
+    tine_core::model::durable_private_authority_update(path, &BINDING_WRITE, |existing| {
         if existing.trim().is_empty() || existing.trim() == "{}" {
             return Ok(encoded.clone());
         }
@@ -4351,6 +4313,56 @@ mod tests {
         std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
         std::fs::write(&receipt, b"{").unwrap();
         assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+    }
+
+    #[test]
+    fn managed_activation_durably_retires_the_direct_selector_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph");
+        let receipt = direct_selection_path_at(temp.path(), &graph);
+        publish_direct_selection_at(&receipt, &graph, "emergency_return").unwrap();
+        assert!(direct_selection_is_active_at(&receipt, &graph).unwrap());
+
+        retire_direct_selection_at(&receipt).unwrap();
+        assert!(!direct_selection_is_active_at(&receipt, &graph).unwrap());
+        assert!(!receipt.exists());
+        assert!(std::fs::read_dir(receipt.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("retired-")));
+
+        retire_direct_selection_at(&receipt).unwrap();
+    }
+
+    #[test]
+    fn storage_mode_selectors_use_typed_durable_private_authority_publication() {
+        let source = include_str!("sync_runtime.rs");
+        let direct_start = source
+            .find("fn publish_direct_selection_at(")
+            .expect("Direct Files selector publisher");
+        let direct_end = source[direct_start..]
+            .find("\nfn binding_path(")
+            .map(|offset| direct_start + offset)
+            .expect("end of Direct Files selector helpers");
+        let direct = &source[direct_start..direct_end];
+        assert!(direct.contains("durable_private_authority_update"));
+        assert!(direct.contains("durable_private_authority_retire"));
+        assert!(!direct.contains("std::fs::remove_file"));
+
+        let binding_start = source
+            .find("fn persist_binding_at(")
+            .expect("Managed Storage binding publisher");
+        let binding_end = source[binding_start..]
+            .find("\n#[derive(")
+            .map(|offset| binding_start + offset)
+            .expect("end of Managed Storage binding publisher");
+        let binding = &source[binding_start..binding_end];
+        assert!(binding.contains("durable_private_authority_update"));
+        assert!(!binding.contains("target_os = \"android\""));
+        assert!(!binding.contains("OpenOptions::new"));
     }
 
     #[test]

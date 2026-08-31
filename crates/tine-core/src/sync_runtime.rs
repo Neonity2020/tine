@@ -10423,6 +10423,8 @@ struct ManagedLocalRuntimeState {
 
 const MOVE_EPISODE_SCHEMA_VERSION: u32 = 2;
 const MOVE_EPISODE_RECORD_MAX_BYTES: u64 = 16 * 1024;
+const MOVE_EPISODE_CLEANUP_PER_TURN: usize = 32;
+const RECENT_ACKNOWLEDGED_MOVE_EPISODES: usize = 256;
 
 /// Immutable private binding from one caller episode to the actor-derived
 /// batch identity and exact request digest. It is published before authoring,
@@ -10467,6 +10469,35 @@ impl ApplicationMoveEpisodeRecord {
     fn encode(&self) -> Result<Vec<u8>, SyncApplicationPageRequestError> {
         postcard::to_allocvec(self)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_encode"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationMoveEpisodeAcknowledgement {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    episode_id: Uuid,
+    batch_id: BatchId,
+}
+
+impl ApplicationMoveEpisodeAcknowledgement {
+    fn from_record(record: &ApplicationMoveEpisodeRecord) -> Self {
+        Self {
+            workspace_id: record.workspace_id,
+            lineage_digest: record.lineage_digest,
+            episode_id: record.episode_id,
+            batch_id: record.batch_id,
+        }
+    }
+
+    fn filename(&self) -> String {
+        format!("episode-{}.acknowledged", self.episode_id.simple())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, SyncApplicationPageRequestError> {
+        postcard::to_allocvec(self)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_encode"))
     }
 }
 
@@ -12201,6 +12232,8 @@ struct RuntimeActor {
     managed_local: Option<ManagedLocalRuntimeState>,
     projection_turns: Option<ProjectionTurnJournalState>,
     move_episode_directory: Dir,
+    move_episode_cleanup_pending: bool,
+    recent_acknowledged_move_episodes: VecDeque<(Uuid, BatchId)>,
     #[cfg(test)]
     fail_next_move_episode_publication_after_write: bool,
     #[cfg(test)]
@@ -12693,6 +12726,8 @@ impl RuntimeActor {
             managed_local: Some(managed_local),
             projection_turns: Some(projection_turns),
             move_episode_directory,
+            move_episode_cleanup_pending: true,
+            recent_acknowledged_move_episodes: VecDeque::new(),
             #[cfg(test)]
             fail_next_move_episode_publication_after_write: false,
             #[cfg(test)]
@@ -16763,10 +16798,16 @@ impl RuntimeActor {
     }
 
     fn acknowledge_application_move(
-        &self,
+        &mut self,
         episode_id: Uuid,
         batch_id: BatchId,
     ) -> Result<(), SyncApplicationPageRequestError> {
+        if self
+            .recent_acknowledged_move_episodes
+            .contains(&(episode_id, batch_id))
+        {
+            return Ok(());
+        }
         let name = format!("episode-{}.bin", episode_id.simple());
         let retained = read_optional_regular(
             &self.move_episode_directory,
@@ -16831,21 +16872,167 @@ impl RuntimeActor {
             }
         }
 
-        // The frontend now owns the committed DTO pair. The semantic batch is
-        // retained by the oplog; these two private files are only response
-        // replay evidence. Remove the record first so a partial cleanup can
-        // never make an incomplete record appear complete on a later retry.
-        self.move_episode_directory
-            .remove_file(&name)
+        // Publish one durable cleanup authorization before touching either
+        // replay sidecar. A crash after either removal therefore leaves enough
+        // exact workspace/lineage/episode/batch evidence for bounded actor-open
+        // cleanup to finish, rather than an immortal orphan `.complete` file.
+        let acknowledgement = ApplicationMoveEpisodeAcknowledgement::from_record(&record);
+        let acknowledgement_name = acknowledgement.filename();
+        let acknowledgement_bytes = acknowledgement.encode()?;
+        DurableDirectoryPublication::open(&self.move_episode_directory)
             .map_err(|_| {
-                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_record_remove")
-            })?;
-        self.move_episode_directory
-            .remove_file(&completion_name)
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_publication_open")
+            })?
+            .publish_new_exact_single_writer(&acknowledgement_name, &acknowledgement_bytes)
             .map_err(|_| {
-                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_complete_remove")
+                SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_publication")
             })?;
+        for (sidecar, refusal) in [
+            (&name, "move_episode_ack_record_remove"),
+            (&completion_name, "move_episode_ack_complete_remove"),
+        ] {
+            if let Err(error) = self.move_episode_directory.remove_file(sidecar) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.move_episode_cleanup_pending = true;
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(refusal));
+                }
+            }
+        }
+        self.recent_acknowledged_move_episodes
+            .push_back((episode_id, batch_id));
+        while self.recent_acknowledged_move_episodes.len() > RECENT_ACKNOWLEDGED_MOVE_EPISODES {
+            self.recent_acknowledged_move_episodes.pop_front();
+        }
+        self.move_episode_cleanup_pending = true;
         Ok(())
+    }
+
+    fn cleanup_acknowledged_move_episodes(&mut self) -> Result<bool, String> {
+        if !self.move_episode_cleanup_pending {
+            return Ok(false);
+        }
+        let mut acknowledgement_names = Vec::with_capacity(MOVE_EPISODE_CLEANUP_PER_TURN);
+        for entry in self
+            .move_episode_directory
+            .entries()
+            .map_err(|error| format!("cannot enumerate move episode cleanup: {error}"))?
+        {
+            let entry = entry
+                .map_err(|error| format!("cannot inspect move episode cleanup entry: {error}"))?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name.starts_with("episode-") && name.ends_with(".acknowledged") {
+                acknowledgement_names.push(name);
+                if acknowledgement_names.len() == MOVE_EPISODE_CLEANUP_PER_TURN {
+                    break;
+                }
+            }
+        }
+        acknowledgement_names.sort();
+        let mut processed = 0usize;
+        for acknowledgement_name in &acknowledgement_names {
+            let bytes = read_optional_regular(
+                &self.move_episode_directory,
+                acknowledgement_name,
+                MOVE_EPISODE_RECORD_MAX_BYTES,
+                None,
+            )
+            .map_err(|error| {
+                format!("cannot read move acknowledgement {acknowledgement_name}: {error}")
+            })?
+            .ok_or_else(|| format!("move acknowledgement {acknowledgement_name} disappeared"))?;
+            let acknowledgement: ApplicationMoveEpisodeAcknowledgement =
+                postcard::from_bytes(&bytes).map_err(|_| {
+                    format!("move acknowledgement {acknowledgement_name} is invalid")
+                })?;
+            if acknowledgement
+                .encode()
+                .map_err(|error| error.to_string())?
+                != bytes
+                || acknowledgement.workspace_id != self.binding.workspace_id()
+                || acknowledgement.lineage_digest != self.binding.lineage_digest()
+                || acknowledgement.filename() != *acknowledgement_name
+            {
+                return Err(format!(
+                    "move acknowledgement {acknowledgement_name} is bound to another runtime"
+                ));
+            }
+            for sidecar in [
+                format!("episode-{}.bin", acknowledgement.episode_id.simple()),
+                format!("episode-{}.complete", acknowledgement.episode_id.simple()),
+            ] {
+                if let Err(error) = self.move_episode_directory.remove_file(&sidecar) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(format!(
+                            "cannot retire move episode sidecar {sidecar}: {error}"
+                        ));
+                    }
+                }
+            }
+            self.move_episode_directory
+                .remove_file(acknowledgement_name)
+                .map_err(|error| {
+                    format!("cannot retire move acknowledgement {acknowledgement_name}: {error}")
+                })?;
+            processed += 1;
+        }
+
+        // Repair residue from the pre-acknowledgement cleanup order: a lone
+        // completion has no replay value once its binding record is absent.
+        // Stream the whole directory so live completions cannot permanently
+        // hide a later orphan, but retain and mutate at most one actor-turn
+        // budget. The queue cap bounds ordinary current-version directory size.
+        let remaining = MOVE_EPISODE_CLEANUP_PER_TURN.saturating_sub(processed);
+        let mut orphan_completions = Vec::with_capacity(remaining);
+        if remaining != 0 {
+            for entry in self
+                .move_episode_directory
+                .entries()
+                .map_err(|error| format!("cannot enumerate orphan move completions: {error}"))?
+            {
+                let entry = entry.map_err(|error| {
+                    format!("cannot inspect orphan move completion entry: {error}")
+                })?;
+                let Ok(completion_name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let Some(simple) = completion_name
+                    .strip_prefix("episode-")
+                    .and_then(|name| name.strip_suffix(".complete"))
+                else {
+                    continue;
+                };
+                let record_name = format!("episode-{simple}.bin");
+                if read_optional_regular(
+                    &self.move_episode_directory,
+                    &record_name,
+                    MOVE_EPISODE_RECORD_MAX_BYTES,
+                    None,
+                )
+                .map_err(|error| {
+                    format!("cannot inspect move episode record {record_name}: {error}")
+                })?
+                .is_none()
+                {
+                    orphan_completions.push(completion_name);
+                    if orphan_completions.len() == remaining {
+                        break;
+                    }
+                }
+            }
+        }
+        orphan_completions.sort();
+        for completion_name in orphan_completions {
+            self.move_episode_directory
+                .remove_file(&completion_name)
+                .map_err(|error| {
+                    format!("cannot retire orphan move completion {completion_name}: {error}")
+                })?;
+            processed += 1;
+        }
+        self.move_episode_cleanup_pending = processed == MOVE_EPISODE_CLEANUP_PER_TURN;
+        Ok(processed != 0)
     }
 
     fn move_application_subtrees(
@@ -20892,6 +21079,11 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
+        match self.cleanup_acknowledged_move_episodes() {
+            Ok(true) => return SyncRuntimeTick::Recovering,
+            Ok(false) => {}
+            Err(error) => return SyncRuntimeTick::RecoveryBlocked(error),
+        }
         match self.admit_deferred_absence_observations() {
             Ok(true) => return SyncRuntimeTick::Recovering,
             Ok(false) => {}
@@ -33008,6 +33200,7 @@ mod tests {
             .join("move-episodes");
         let record = directory.join(format!("episode-{}.bin", episode.simple()));
         let completion = directory.join(format!("episode-{}.complete", episode.simple()));
+        let acknowledgement = directory.join(format!("episode-{}.acknowledged", episode.simple()));
         assert!(record.is_file());
         assert!(completion.is_file());
 
@@ -33016,6 +33209,15 @@ mod tests {
             .expect("installed move acknowledgement retires replay evidence");
         assert!(!record.exists());
         assert!(!completion.exists());
+        assert!(acknowledgement.is_file());
+        handle
+            .acknowledge_application_move(&episode_id, &batch_id)
+            .expect("same-session acknowledgement retry is idempotent");
+        assert!(matches!(
+            handle.tick().unwrap(),
+            SyncRuntimeTick::Recovering
+        ));
+        assert!(!acknowledgement.exists());
         assert_eq!(handle.status().unwrap().managed_local_pending, 1);
         drain_managed_local(&handle);
         assert!(
@@ -33027,6 +33229,47 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn cold_open_bounded_cleanup_retires_a_pre_ack_orphan_completion() {
+        let fixture = ActivationFixture::nested_unicode("move-orphan-cleanup", 0xa17712);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("orphan cleanup source actor opens");
+        let request = simple_application_move_request(&handle, "Orphan Completion Move");
+        let episode_id = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed { episode_id, .. } => episode_id,
+            other => panic!("orphan cleanup move did not commit: {other:?}"),
+        };
+        let episode = Uuid::parse_str(&episode_id).unwrap();
+        let directory = fixture
+            .request
+            .application_runtime_root
+            .join("move-episodes");
+        let record = directory.join(format!("episode-{}.bin", episode.simple()));
+        let completion = directory.join(format!("episode-{}.complete", episode.simple()));
+        fs::remove_file(&record).unwrap();
+        assert!(completion.is_file());
+        drop(handle);
+
+        let reopened = SyncRuntimeHandle::open(open_request);
+        let reopened = reopened.handle.expect("orphan cleanup actor reopens");
+        assert!(matches!(
+            reopened.tick().unwrap(),
+            SyncRuntimeTick::Recovering
+        ));
+        assert!(!completion.exists());
+        drop(reopened);
     }
 
     #[test]

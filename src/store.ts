@@ -327,6 +327,9 @@ function bumpCollapseEpochs(ids: readonly string[]) {
   }));
 }
 let managedMoveQueue: Promise<void> = Promise.resolve();
+let managedMoveQueueEpoch = 0;
+let managedMoveQueuePending = 0;
+const MANAGED_MOVE_QUEUE_LIMIT = 256;
 let managedHistoryReplayRunning = false;
 let managedHistoryReplayEpoch = 0;
 const managedHistoryCommands: Array<"undo" | "redo"> = [];
@@ -1343,6 +1346,8 @@ export function resetStore() {
   clearAllEditorActivations();
   clearAllEditorLeases();
   setManagedMoveBusyPages(new Set<string>());
+  managedMoveQueueEpoch++;
+  managedMoveQueuePending = 0;
   setVisibleMutationBusyPages(new Set<string>());
   setCollapseEpochState("byId", {});
   managedHistoryReplayEpoch++;
@@ -6714,8 +6719,19 @@ function prepareManagedCrossPageMoveIntent(
   };
 }
 
-function enqueueManagedMove<T>(run: () => Promise<T>): Promise<T> {
-  const result = managedMoveQueue.then(run);
+function enqueueManagedMove<T>(run: () => Promise<T>, stale: T): Promise<T> {
+  const epoch = managedMoveQueueEpoch;
+  const binding = graphBinding();
+  if (managedMoveQueuePending >= MANAGED_MOVE_QUEUE_LIMIT) return Promise.resolve(stale);
+  managedMoveQueuePending++;
+  const result = managedMoveQueue.then(async () => {
+    if (epoch !== managedMoveQueueEpoch || binding !== graphBinding()) return stale;
+    return run();
+  }).finally(() => {
+    if (epoch === managedMoveQueueEpoch) {
+      managedMoveQueuePending = Math.max(0, managedMoveQueuePending - 1);
+    }
+  });
   managedMoveQueue = result.then(() => undefined, () => undefined);
   return result;
 }
@@ -6737,7 +6753,7 @@ function enqueueManagedCrossPageMove(
     recordHistory,
   );
   if (!intent) return Promise.resolve(false);
-  return enqueueManagedMove(() => runManagedCrossPageMove(intent));
+  return enqueueManagedMove(() => runManagedCrossPageMove(intent), false);
 }
 
 /** Before a cross-page move mutates memory, durably flush every SOURCE page while
@@ -6836,7 +6852,7 @@ async function moveBlockFeedNow(id: string, dir: 1 | -1): Promise<"within" | "cr
  * publishes preserves the user's complete rapid movement sequence. */
 export function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
   return managedMoveAdmission()
-    ? enqueueManagedMove(() => moveBlockFeedNow(id, dir))
+    ? enqueueManagedMove(() => moveBlockFeedNow(id, dir), "none")
     : moveBlockFeedNow(id, dir);
 }
 

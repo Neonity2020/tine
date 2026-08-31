@@ -51,6 +51,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A reported switch between Direct Files and Managed Storage now survives a
+  crash at the selector boundary.** App-private storage-mode bindings use the
+  same certified durable create/replace/retire primitive as other authority
+  names, including Windows write-through retirement and Android parent-entry
+  flushing. Once activation reports Managed active, a stale Direct selector can
+  no longer reappear after power loss and take precedence at the next startup.
+
 - **Rapid Managed Storage moves no longer reuse a stale source page and then
   flood “missing or foreign root” errors.** Repeated cross-day commands now
   resolve one at a time against the preceding accepted move, while the actor's

@@ -2687,6 +2687,90 @@ describe("managed actor-owned cross-page moves", () => {
     }
   });
 
+  it("retires queued rapid moves when the graph binding changes", async () => {
+    const moving = { id: "moving", raw: "old graph", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
+      await firstMayFinish;
+      return {
+        binding_generation: binding,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+        outcome: {
+          status: "committed" as const,
+          episode_id: request.episode_id,
+          batch_id: "old-graph-move",
+          recovered: false,
+          source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+          destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+        },
+      };
+    });
+    try {
+      const first = moveBlockFeed("moving", 1);
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      const queued = moveBlockFeed("moving", 1);
+
+      resetStore();
+      const replacement = { id: "moving", raw: "replacement graph", collapsed: false, children: [] };
+      await loadFeed([
+        page("Today", "journals/today.md", "replacement-r1", [replacement], "journal"),
+        page("Older", "journals/older.md", "replacement-older-r1", [], "journal"),
+      ]);
+      managed();
+      releaseFirst();
+
+      await expect(Promise.all([first, queued])).resolves.toEqual(["none", "none"]);
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(doc.byId.moving.raw).toBe("replacement graph");
+      expect(pageByName("Today")!.roots).toEqual(["moving"]);
+    } finally {
+      move.mockRestore();
+    }
+  });
+
+  it("bounds a sustained rapid-move backlog while one actor command is pending", async () => {
+    const moving = { id: "moving", raw: "moving", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
+      await firstMayFinish;
+      return {
+        binding_generation: binding,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+        outcome: {
+          status: "committed" as const,
+          episode_id: request.episode_id,
+          batch_id: "bounded-first",
+          recovered: false,
+          source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
+          destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+        },
+      };
+    });
+    try {
+      const commands = Array.from({ length: 257 }, () => moveBlockFeed("moving", 1));
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      await expect(commands.at(-1)).resolves.toBe("none");
+      expect(move).toHaveBeenCalledTimes(1);
+      releaseFirst();
+      await Promise.all(commands);
+    } finally {
+      releaseFirst();
+      move.mockRestore();
+    }
+  });
+
   it("routes a contiguous journal selection through one ordered actor transaction", async () => {
     const t1 = { id: "today", raw: "today", collapsed: false, children: [] };
     const o1 = { id: "older-1", raw: "older 1", collapsed: false, children: [] };

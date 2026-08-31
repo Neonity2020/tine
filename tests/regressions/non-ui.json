@@ -5579,12 +5579,13 @@
    "coverage": {
     "tests": [
      "crates/tine-core/src/sync_runtime.rs::tests::acknowledged_cross_page_move_retires_only_response_replay_evidence",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_open_bounded_cleanup_retires_a_pre_ack_orphan_completion",
      "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result"
     ],
     "scenario": "managed.move-episode-ack-bounds-private-response-evidence",
     "failBefore": "proven by complete production-source census: every cross-page move published episode-<uuid>.bin and .complete and no path retired either file"
    },
-   "notes": "The acknowledgement is accepted only for one canonical workspace/lineage/episode/batch record with the exact completion bytes and an accepted or still-visible semantic batch. It removes response replay evidence only after the frontend has installed both committed DTOs; oplog authority remains. Failure to acknowledge does not turn a successful move into a false user-visible failure. Interrupted pre-ack and partial-cleanup residue remains a bounded-cleanup follow-up rather than being guessed away."
+   "notes": "The acknowledgement is accepted only for one canonical workspace/lineage/episode/batch record with the exact completion bytes and an accepted or still-visible semantic batch. Before either response sidecar is removed, the actor durably publishes an exact cleanup authorization; bounded actor turns then retire that marker and any interrupted sidecars, including legacy orphan completions. The frontend retains a bounded same-session acknowledgement memo, while oplog authority remains independent. Failure to acknowledge does not turn a successful move into a false user-visible failure."
   },
   {
    "id": "REG-DIRECT-FILES-WINDOWS-DURABLE-NAME-PUBLICATION-001",
@@ -5604,6 +5605,25 @@
     "failBefore": "proven from the literal Windows path: Direct Files used raw NtSetInformationFile name changes and the following directory sync was a successful no-op"
    },
    "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.1 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed."
+  },
+  {
+   "id": "REG-STORAGE-MODE-SELECTOR-DURABILITY-001",
+   "title": "A reported storage-mode switch cannot resurrect the previously retired selector after a crash",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
+   "platforms": ["all", "windows", "android"],
+   "layer": "tauri-native-and-rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/sync_runtime.rs::tests::storage_mode_selectors_use_typed_durable_private_authority_publication",
+     "src-tauri/src/sync_runtime.rs::tests::managed_activation_durably_retires_the_direct_selector_name",
+     "src-tauri/src/sync_runtime.rs::tests::candidate_publication_crash_cuts_select_only_direct_or_managed"
+    ],
+    "scenario": "managed-storage.durable-app-private-storage-mode-selector",
+    "failBefore": "The compiler-enforced source guard failed on the MS-19 candidate: managed activation retired the Direct selector with plain remove_file and Android initial binding creation flushed the file but not its parent entry."
+   },
+   "notes": "Both the Direct selector and managed binding now use one app-private sole-writer wrapper over tine-storage DurableDirectoryPublication. Create and exact replace are collision-aware; retirement durably moves exact bytes outside the selector grammar before best-effort cleanup. The change does not route Direct Files through managed history and does not add a Managed Storage format or migration path."
   }
  ]
 }

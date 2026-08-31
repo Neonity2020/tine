@@ -31975,6 +31975,127 @@ pub fn atomic_update(
     atomic_update_with_hooks(path, lock, edit, |_| {}, |_| {})
 }
 
+/// Read-modify-write one small app-private authority file through the typed
+/// durable directory-publication boundary.
+///
+/// This is deliberately narrower than [`atomic_update`]: callers must own a
+/// private single-writer namespace rather than a graph file that Logseq,
+/// Syncthing, or an external editor may also change. The typed publication is
+/// required because these files select which storage authority Tine serves;
+/// on Windows their create/replace acknowledgement therefore uses certified
+/// write-through name operations rather than a rename followed by an
+/// unavailable directory fsync.
+pub fn durable_private_authority_update(
+    path: &Path,
+    lock: &std::sync::Mutex<()>,
+    edit: impl Fn(&str) -> io::Result<String>,
+) -> io::Result<()> {
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for _attempt in 0..4 {
+        let baseline = match fs::read_to_string(path) {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let next = edit(baseline.as_deref().unwrap_or("{}\n"))?;
+        let current = match fs::read_to_string(path) {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if current != baseline {
+            continue;
+        }
+        let (directory, filename) = durable_private_authority_directory(path)?;
+        let publication = DurableDirectoryPublication::open(&directory)
+            .map_err(managed_trash_filesystem_error)?;
+        let published = match baseline.as_deref() {
+            None => publication.publish_new_exact_single_writer(&filename, next.as_bytes()),
+            Some(expected) => {
+                publication.replace_exact(&filename, expected.as_bytes(), next.as_bytes())
+            }
+        };
+        match published {
+            Ok(()) => return Ok(()),
+            Err(FilesystemError::ByteCollision) => continue,
+            Err(error) => return Err(managed_trash_filesystem_error(error)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "private authority changed repeatedly during update",
+    ))
+}
+
+/// Durably remove one app-private authority name by first moving its exact
+/// bytes to a fresh same-directory name outside the selector grammar.
+///
+/// A crash after the typed retirement can leave only inert recovery residue;
+/// it cannot resurrect the active selector name. Ordinary completion removes
+/// that residue immediately.
+pub fn durable_private_authority_retire(
+    path: &Path,
+    lock: &std::sync::Mutex<()>,
+) -> io::Result<()> {
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let expected = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let (directory, filename) = durable_private_authority_directory(path)?;
+    let publication =
+        DurableDirectoryPublication::open(&directory).map_err(managed_trash_filesystem_error)?;
+    let retired = format!(".{filename}.retired-{}", Uuid::new_v4().simple());
+    publication
+        .retire_exact(&filename, &retired, &expected)
+        .map_err(managed_trash_filesystem_error)?;
+    let _ = directory.remove_file(&retired);
+    Ok(())
+}
+
+fn durable_private_authority_directory(path: &Path) -> io::Result<(Dir, String)> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private authority has no parent",
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private authority has no safe filename",
+            )
+        })?
+        .to_owned();
+
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private authority parent has no existing ancestor",
+            )
+        })?;
+    }
+    fs::create_dir_all(parent)?;
+    // File publication below flushes `parent` itself. Flush every newly
+    // created directory's parent as well, so Android/Unix initial activation
+    // cannot acknowledge a binding whose parent entry is still volatile.
+    for directory in &missing {
+        if let Some(created_parent) = directory.parent() {
+            sync_dir_for_rename(created_parent)?;
+        }
+    }
+    Dir::open_ambient_dir(parent, ambient_authority()).map(|directory| (directory, filename))
+}
+
 fn atomic_update_with_hooks(
     path: &Path,
     lock: &std::sync::Mutex<()>,
