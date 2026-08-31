@@ -26,7 +26,6 @@ use crate::oplog::{
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
-const ENGINE_STAGE_WORK_PER_RESUME: usize = 8;
 
 /// Exact point answer derived from the already decoded pending local journal.
 /// The index is rebuildable acceleration state; the journal and hot-prefix
@@ -719,7 +718,6 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         stage_started = std::time::Instant::now();
     }
 
-    let direct_clean_runtime = matches!(&sqlite_mode, ManagedLocalSqliteMode::Direct);
     match exact_archive_batch(&record, &archive) {
         Ok(true) => {}
         Ok(false) => {
@@ -778,38 +776,22 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         {
             return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string());
         }
-        let (disposition, has_more, stage_work) = if direct_clean_runtime {
-            let claim_source = match database.materialized_read() {
-                Ok(source) => source,
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
-                }
-            };
-            match engine.accept_clean_prepared_below_managed_local_overlay(
-                record.prepared_batch(),
-                &claim_source,
-            ) {
-                Ok(staged) => (staged.disposition().clone(), false, 1),
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
-                }
-            }
-        } else {
-            match engine.stage_archive_batch_bounded_below_managed_local_overlay(
-                batch_id,
-                ENGINE_STAGE_WORK_PER_RESUME,
-            ) {
-                Ok(staged) => (
-                    staged.outcome().disposition().clone(),
-                    staged.has_more(),
-                    staged.work(),
-                ),
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
-                }
+        let claim_source = match database.materialized_read() {
+            Ok(source) => source,
+            Err(error) => {
+                return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
             }
         };
-        work_done.engine_stage_work = stage_work;
+        let disposition = match engine.accept_clean_prepared_below_managed_local_overlay(
+            record.prepared_batch(),
+            &claim_source,
+        ) {
+            Ok(staged) => staged.disposition().clone(),
+            Err(error) => {
+                return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+            }
+        };
+        work_done.engine_stage_work = 1;
         match disposition {
             BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => {}
             BatchDisposition::IncompleteStaged {
@@ -834,9 +816,6 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
                     "accepted-history staging quarantined the journal batch",
                 )
             }
-        }
-        if has_more {
-            return pending(ManagedLocalDrainStage::EngineAcceptance, frame, &record);
         }
         if drain_fault!(AfterEngineAcceptance) {
             return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);

@@ -4,7 +4,7 @@ This document is the implementation contract for Tine's opt-in managed-storage
 runtime. Direct Files is the default product path and selects a mutually
 exclusive `Legacy(Graph)` runtime before graph open. When Direct Files is
 selected, no code below may inspect or modify `.tine-sync`, open an oplog,
-create managed scratch state, or start managed recovery.
+create managed private state, or start managed recovery.
 
 One native `StorageModeSupervisor` owns storage-transition identity, priority,
 serialization, and terminal outcomes. A transition has a monotonically
@@ -319,9 +319,9 @@ production layout: `archive/bootstrap-v1/`, `archive/engine-history/`,
 `archive/promoted-runtime.state`, the block/name/path/UUID Patricia indexes,
 `archive/projection-work-index-v1/`, `archive/reference-catalog-v2/`, the old
 multi-record enrollment tree and reservation, `reconciliation/`, runtime
-scratch, `managed-local-journal-v1/`, `local-authorship-v1/`,
+scratch, `local-authorship-v1/`,
 `inactive-bootstrap-publication-v1/`, `inactive-shadow-projections-v1/`,
-`migration-source-backups-v1/`, and `bootstrap-source-capture-v1/`. Production
+and `migration-source-backups-v1/`. Production
 open never treats any of them as authority. Their production construction and
 recovery routes are physically removed; negative contract tests and the frozen
 pre-0.7 failure corpus may still name the formats. A real graph containing only
@@ -460,7 +460,7 @@ replaces and deletes each old route.
 | joiner | its own local archive/enrollment after validating the exact shared descriptor and provider cut | rewriting the descriptor or adopting incomplete provider bytes |
 | provider transport | durable copy/rename/retirement of exact files | semantic acceptance; directory presence is not enrollment |
 | immutable oplog/archive | managed page/journal semantic truth | assets, PDF sidecars, config/settings |
-| SQLite, scratch, projection receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
+| SQLite and projection receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
 
 The native watcher may observe metadata changes below the approved assets
 capability solely to invalidate WebView render caches. That observation grants
@@ -984,7 +984,7 @@ ambiguous baseline claims remain unresolved after reconstruction.
    state and does not create an empty semantic `hls__` page; the first
    annotation write creates or updates that page through the paired sidecar and
    managed-page publication path.
-3. SQLite, runtime scratch, and transient projection receipts are disposable.
+3. SQLite and transient projection receipts are disposable.
    Deleting or version-mismatching one may cause exactly one bounded rebuild,
    never a second rebuild on the following open. A complete rebuild must be
    linear in graph size and finish within 10 seconds on the release corpus.
@@ -1278,7 +1278,7 @@ oracle and an explicit rebuild operation.
 Checkpoint-generation support obeys the pre-0.7 blank-slate rule: production
 implements one current format, not old/new readers or a migration bridge. The
 canonical authenticated-map priority/node algorithm has one owner,
-`tine-storage::sealed_accepted_index`, shared by scratch, the clean runtime, and
+`tine-storage::sealed_accepted_index`, shared by the clean runtime and
 SQLite. The same module owns the one current sealed batch/status/sequence/causal
 encoding and its bounded cross-checking reader; its caller-provided Tine
 evidence decoder validates the one current accepted-evidence encoding without
@@ -2274,9 +2274,8 @@ strict: an existing parent is synchronized before it may carry a private local
 journal, projection-turn journal, move episode, provider retry journal, absence
 disposition record, recovery-trash name, archive namespace, or other durable
 authority. `ensure_reconstructible_directory_nofollow` is the narrow exception
-for detached bootstrap scratch, retired bootstrap/index construction, and the
-local-completion and receiver-summary caches whose authoritative inputs remain
-elsewhere. Call-site source guards pin that split. `enrollment::open_component`
+for the local-completion and receiver-summary caches whose authoritative inputs
+remain elsewhere. Call-site source guards pin that split. `enrollment::open_component`
 creates its component chain before promotion, while promoted readers use
 `create=false`, so it retains the pre-promotion policy.
 
@@ -2367,12 +2366,13 @@ authorize a production change without an independent current-runtime
 fail-before. Architectural guards that bind this document to the code therefore
 enter the release suite without a second hand-maintained allowlist.
 
-Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
-20. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
-SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates
-only that derived representation and costs one rebuild; it must not migrate or
-reinterpret authoritative oplog bytes. Authoritative format changes require an
-explicit versioned migration and cannot be treated as a cache rebuild.
+The current disposable SQLite schema identity is 22, owned by
+`tine_storage::formats::SQLITE_SCHEMA_VERSION`. Bumping it invalidates only the
+derived SQLite representation and costs one rebuild; it must not reinterpret
+authoritative oplog bytes. Before 0.7, an unrecognized private Managed Storage
+format is preserved as a backup and rebuilt from Markdown/Org into the sole
+current format. Production does not carry an old-format reader, dual schemas,
+or an in-place migration bridge.
 
 ### 2.10d When the graph filesystem folds two page names into one file
 

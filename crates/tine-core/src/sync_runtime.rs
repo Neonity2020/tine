@@ -46008,7 +46008,6 @@ mod tests {
             "engine-history",
             "projection-work-index-v1",
             "reference-catalog-v2",
-            "managed-local-journal-v1",
             "inactive-bootstrap-publication-v1",
         ]
         .iter()
@@ -46123,9 +46122,8 @@ mod tests {
                 "the clean builder must consume one activation record per source page"
             );
             assert_eq!(
-                receipt.clean.source_bytes,
-                (receipt.source_bytes as u64).saturating_mul(2),
-                "the clean builder must account for the initial capture plus one sealed-source lowering read"
+                receipt.clean.source_bytes, receipt.source_bytes as u64,
+                "the clean builder must consume each sealed source byte exactly once"
             );
             assert!(
                 receipt.clean.parser_nodes >= receipt.blocks as u64,
@@ -46145,7 +46143,7 @@ mod tests {
             );
             assert!(
                 receipt.retired_artifacts.is_empty(),
-                "clean activation retained retired bootstrap, Patricia, journal, shadow, backup, or capture artifacts: {:?}",
+                "clean activation retained retired bootstrap, Patricia, shadow, or backup artifacts: {:?}",
                 receipt.retired_artifacts
             );
             assert_eq!(
@@ -49958,232 +49956,6 @@ mod tests {
             .raw
             .contains("accepted without legacy retained scratch authority")));
         drop(reopened);
-    }
-
-    #[cfg(any())]
-    /// A retained run is a reconstructible accelerator, not authority.  This
-    /// captures the pre-recovery failure journey by corrupting only the
-    /// `blobs.data` file of the exact run selected by the published resume
-    /// point, then forcing SQLite to materialize documents from that selected
-    /// run on reopen.
-    #[test]
-    fn managed_reopen_rebuilds_after_malformed_retained_scratch_blob() {
-        let fixture = ActivationFixture::nested_unicode(
-            "managed-reopen-malformed-retained-scratch-blob",
-            0xa0ed,
-        );
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("synthetic graph activates");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_exact(&handle, "Root.md");
-        let _ = save_application_block_text(
-            &handle,
-            page,
-            revision,
-            "accepted before retained scratch corruption",
-        );
-        let (written, _) = load_application_exact(&handle, "Root.md");
-        assert!(
-            written
-                .blocks
-                .iter()
-                .any(|block| block.raw.contains("accepted before retained scratch corruption")),
-            "the fresh activation's current retained scratch must serve a read-after-write before any restart"
-        );
-        drain_managed_local(&handle);
-        assert!(
-            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
-            "the selected run is emitted only after a safe, settled handoff"
-        );
-        drop(handle);
-
-        let expected_graph = user_graph_bytes(&fixture.graph_root);
-        let immutable_archive_before_recovery =
-            immutable_archive_bytes(&fixture.request.archive_root);
-        let immutable_history_before_recovery =
-            immutable_engine_history_bytes(&fixture.request.archive_root);
-        let immutable_receipts_before_recovery =
-            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
-
-        let (selected_run_id, selected_run) =
-            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
-        let selected_before = fs::read_dir(&selected_run)
-            .unwrap()
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_file())
-            .map(|entry| {
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    fs::read(entry.path()).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let selected_blobs = selected_run.join(tine_storage::formats::SCRATCH_BLOBS_FILE);
-        assert!(
-            selected_blobs.is_file(),
-            "selected retained run has blobs.data"
-        );
-
-        // The retained SQLite projection would otherwise remain a valid cache
-        // and hide the fault.  It is disposable, so force its normal rebuild
-        // without touching any accepted immutable archive bytes.
-        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
-            .remove()
-            .expect("the disposable SQLite projection is removable");
-        fs::write(&selected_blobs, b"not a scratch blob").unwrap();
-        let selected_corrupted = fs::read_dir(&selected_run)
-            .unwrap()
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_file())
-            .map(|entry| {
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    fs::read(entry.path()).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        let selected_at_reclamation = Arc::new(Mutex::new(None));
-        let selected_at_reclamation_result = Arc::clone(&selected_at_reclamation);
-        let selected_at_reclamation_path = selected_run.clone();
-        let selected_at_reclamation_expected = selected_corrupted.clone();
-        act_once_at_resume_lifecycle_cut_for_workspace_for_test(
-            fixture.request.identities.workspace_id,
-            ResumeLifecycleCut::BeforeReclamation,
-            Box::new(move || {
-                let observed = recursive_file_bytes(&selected_at_reclamation_path);
-                assert_eq!(
-                    observed, selected_at_reclamation_expected,
-                    "recovery must leave the refused run byte-exact through replacement publication and up to authenticated reclamation"
-                );
-                *selected_at_reclamation_result.lock().unwrap() = Some(observed);
-            }),
-        );
-        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
-        let reopened = reopened
-            .handle
-            .expect("typed retained-scratch failure replays into an active runtime");
-        assert_eq!(
-            immutable_archive_bytes(&fixture.request.archive_root),
-            immutable_archive_before_recovery,
-            "cache-only retained-scratch recovery must not alter immutable archive authority"
-        );
-        assert_eq!(
-            immutable_engine_history_bytes(&fixture.request.archive_root),
-            immutable_history_before_recovery,
-            "cache-only retained-scratch recovery must not alter immutable engine history"
-        );
-        assert_eq!(
-            immutable_projection_receipt_bytes(&fixture.request.receipt_root),
-            immutable_receipts_before_recovery,
-            "cache-only retained-scratch recovery must not alter immutable projection receipts"
-        );
-        assert_eq!(
-            user_graph_bytes(&fixture.graph_root),
-            expected_graph,
-            "replay recovery must not rewrite direct graph bytes"
-        );
-        assert_eq!(
-            selected_at_reclamation.lock().unwrap().as_ref(),
-            Some(&selected_corrupted),
-            "the exact pre-reclamation preservation seam must fire during post-open publication"
-        );
-        let (replacement_after_recovery, replacement_after_recovery_path) =
-            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
-        assert_ne!(replacement_after_recovery, selected_run_id);
-        assert!(replacement_after_recovery_path.is_dir());
-        if selected_run.is_dir() {
-            assert_eq!(
-                recursive_file_bytes(&selected_run),
-                selected_corrupted,
-                "an unreclaimed refused run must remain byte-for-byte intact"
-            );
-        } else {
-            assert!(
-                !selected_run.exists(),
-                "authenticated reclamation must remove the whole refused run, never leave a partial entry"
-            );
-        }
-        assert_ne!(selected_corrupted, selected_before);
-
-        let (recovered_page, recovered_revision) = load_application_exact(&reopened, "Root.md");
-        assert!(
-            recovered_page.blocks.iter().any(|block| block
-                .raw
-                .contains("accepted before retained scratch corruption")),
-            "the recovered public application page must contain the last accepted edit"
-        );
-        let _ = save_application_block_text(
-            &reopened,
-            recovered_page,
-            recovered_revision,
-            "accepted after retained scratch recovery",
-        );
-        let (saved_page, _) = load_application_exact(&reopened, "Root.md");
-        assert!(
-            saved_page.blocks.iter().any(|block| block
-                .raw
-                .contains("accepted after retained scratch recovery")),
-            "a public application save after recovery must be immediately readable"
-        );
-        drain_managed_local(&reopened);
-
-        let immutable_archive_after_save = immutable_archive_bytes(&fixture.request.archive_root);
-        let immutable_history_after_save =
-            immutable_engine_history_bytes(&fixture.request.archive_root);
-        let immutable_receipts_after_save =
-            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
-        assert_byte_map_is_strict_extension(
-            &immutable_archive_before_recovery,
-            &immutable_archive_after_save,
-            "immutable archive",
-        );
-        assert_byte_map_is_strict_extension(
-            &immutable_history_before_recovery,
-            &immutable_history_after_save,
-            "immutable engine history",
-        );
-        assert_byte_map_is_strict_extension(
-            &immutable_receipts_before_recovery,
-            &immutable_receipts_after_save,
-            "immutable projection receipts",
-        );
-        let graph_after_save = user_graph_bytes(&fixture.graph_root);
-        assert_ne!(
-            graph_after_save, expected_graph,
-            "the accepted post-recovery save must update the direct graph projection"
-        );
-        assert!(
-            graph_after_save.values().any(|bytes| bytes
-                .windows(b"accepted after retained scratch recovery".len())
-                .any(|window| window == b"accepted after retained scratch recovery")),
-            "the direct graph projection must contain the accepted post-recovery edit"
-        );
-        if selected_run.is_dir() {
-            assert_eq!(
-                recursive_file_bytes(&selected_run),
-                selected_corrupted,
-                "the accepted post-recovery save must not reuse or alter abandoned run {selected_run_id}"
-            );
-        } else {
-            assert!(
-                !selected_run.exists(),
-                "later lifecycle work must not recreate a partially retired refused run"
-            );
-        }
-        assert!(matches!(
-            reopened.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(_))
-        ));
-        let (replacement_run_id, _) =
-            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
-        assert_ne!(
-            replacement_run_id, selected_run_id,
-            "safe recovery publishes a fresh retained run rather than reusing the malformed one"
-        );
     }
 
     /// Only a tick that committed a batch may be reported as a content change.

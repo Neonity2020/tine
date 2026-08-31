@@ -225,11 +225,10 @@ pub(crate) enum ArchiveDiscoveryInspection {
 /// Inspect one explicit existing archive root without constructing an
 /// [`ObjectStore`] or any writer/runtime authority.
 ///
-/// With no expected enrollment binding this is intentionally only a presence
-/// probe, used to distinguish true absence from unexplained archive residue.
-/// With a binding it opens the exact existing engine-history control no-follow,
-/// validates its canonical claim and live root, strictly decodes the promoted
-/// state, and checks the graph/archive/resource/control identities.
+/// This is intentionally only a presence probe, used to distinguish true
+/// absence from unexplained pre-0.7 archive residue. The expected binding is
+/// retained at the caller boundary while the old bound engine-history reader
+/// is gone; neither case constructs an archive writer or runtime authority.
 pub(crate) fn inspect_existing_archive_at(
     archive_root: &Path,
     _expected_binding: Option<&EnrollmentBindingV1>,
