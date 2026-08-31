@@ -827,7 +827,7 @@ assert.match(
 );
 assert.equal(
   yamlScalar(androidManagedRuntime, "name", 4),
-  "Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen"
+  "Android runtime / managed activation, share, join, reopen, and Return to Direct Files"
 );
 assert.equal(
   yamlScalar(androidManagedRuntime, "if", 4),

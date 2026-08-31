@@ -15,7 +15,10 @@
 //! It exercises the NATIVE runtime as the app's UID against a real graph tree:
 //! activation, an application save, a force-close reopen, clean external
 //! reconciliation of changes another writer made under the graph root, the
-//! shared-enrollment cut, and clean shutdown.
+//! shared-enrollment cut, a second-device join and reopen, and clean shutdown.
+//! The Android shim follows it with Tauri's real graceful Return-to-Direct-
+//! Files composition; host coverage for that app layer lives beside the
+//! composition rather than being duplicated here.
 //!
 //! It is deliberately NOT app coverage. There is no WebView, no Tauri command
 //! layer, no watcher thread, and no UI: watcher observations are delivered by
@@ -33,13 +36,16 @@ use std::{
 };
 
 use crate::graph_name_folding::{graph_name_folding, GraphNameFolding};
+use crate::oplog::{DeviceId, ProjectionEndpointId, SessionId};
 use crate::sync_runtime::{
     SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
     SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
-    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncLocalActivationRequest,
-    SyncLocalActivationStatus, SyncRuntimeHandle, SyncRuntimeOpenRequest, SyncRuntimeOpenStatus,
-    SyncRuntimeTick, SyncShutdownOutcome, SyncWatcherObservation,
+    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncLocalActivationIdentities,
+    SyncLocalActivationRequest, SyncLocalActivationStatus, SyncRuntimeHandle,
+    SyncRuntimeOpenRequest, SyncRuntimeOpenStatus, SyncRuntimeTick, SyncSharedEnrollmentDescriptor,
+    SyncShutdownOutcome, SyncWatcherObservation,
 };
+use uuid::Uuid;
 
 /// The page the journey edits through the application save path.
 pub const JOURNEY_EDITED_PAGE: &str = "pages/Smoke.md";
@@ -107,7 +113,7 @@ const JOURNEY_EXTERNAL_WRITES: &[(&str, &str)] = &[
     (JOURNEY_EXTERNAL_EDIT_PAGE, JOURNEY_EXTERNAL_EDIT_AFTER),
     // An honest backup copy: a second physical file whose decoded page name is
     // already owned. This is the reported refusal, arriving the ordinary way.
-    ("archiv/2026/Denn\u{ed} pozn\u{e1}mky.md", "- backup copy\n"),
+    (JOURNEY_EXTERNAL_BACKUP_PAGE, JOURNEY_EXTERNAL_BACKUP_BYTES),
 ];
 
 /// The page the outside writer EDITS.
@@ -125,6 +131,10 @@ pub const JOURNEY_EXTERNAL_EDIT_BEFORE: &str = "- ordinary non-ASCII page\n";
 pub const JOURNEY_EXTERNAL_EDIT_AFTER: &str = "- ordinary non-ASCII page\n- edited outside Tine\n";
 /// The block the external edit appends, as the editor surfaces it.
 pub const JOURNEY_EXTERNAL_EDIT_BLOCK: &str = "edited outside Tine";
+/// The honest duplicate-name file that sorts before the authoritative owner.
+pub const JOURNEY_EXTERNAL_BACKUP_PAGE: &str = "archiv/2026/Denn\u{ed} pozn\u{e1}mky.md";
+/// The duplicate file is intentionally semantically different and unowned.
+pub const JOURNEY_EXTERNAL_BACKUP_BYTES: &str = "- backup copy\n";
 /// The page the outside writer CREATES.
 pub const JOURNEY_EXTERNAL_CREATED_PAGE: &str = "pages/Extern\u{ed} novinka.md";
 /// The block that created page carries, as the editor surfaces it.
@@ -633,6 +643,102 @@ fn drain_external_reconciliation(
 /// `activation_retried=`.
 const JOURNEY_ACTIVATION_ATTEMPTS: usize = 3;
 
+/// The second device lives below the disposable journey roots so the Android
+/// instrumentation's existing cleanup owns every byte it creates. The graph
+/// directory is hidden from the initiator's graph scan but remains on the same
+/// Android shared-storage filesystem and under the same app UID.
+pub const JOURNEY_PEER_GRAPH_DIRECTORY: &str = ".tine-journey-peer";
+pub const JOURNEY_PEER_PRIVATE_DIRECTORY: &str = "journey-peer";
+
+#[derive(Clone, Debug)]
+pub struct ManagedStorageJourneyPeer {
+    pub graph_root: PathBuf,
+    pub private_root: PathBuf,
+    pub open_request: SyncRuntimeOpenRequest,
+    pub activation_request: SyncLocalActivationRequest,
+}
+
+/// Derive the second-device paths and requests used by both host and Android.
+///
+/// The graph identity comes from the signed descriptor; endpoint, device,
+/// preparation, and session identities are device-local and deliberately new.
+#[must_use]
+pub fn managed_storage_journey_peer(
+    graph_root: &Path,
+    private_root: &Path,
+    descriptor: &SyncSharedEnrollmentDescriptor,
+) -> ManagedStorageJourneyPeer {
+    let peer_graph_root = graph_root.join(JOURNEY_PEER_GRAPH_DIRECTORY);
+    let peer_private_root = private_root.join(JOURNEY_PEER_PRIVATE_DIRECTORY);
+    let identities = SyncLocalActivationIdentities {
+        workspace_id: descriptor.workspace_id,
+        lineage_digest: descriptor.lineage_digest,
+        catalog_document_id: descriptor.catalog_document_id,
+        endpoint_id: ProjectionEndpointId::new(),
+        device_id: DeviceId::new(),
+        preparation_id: Uuid::new_v4(),
+        session_id: SessionId::new(),
+    };
+    let open_request = SyncRuntimeOpenRequest {
+        profile: crate::sync_runtime::SyncStorageProfile::ExperimentalLocal,
+        clean_identities: Some(identities.clone()),
+        graph_root: peer_graph_root.clone(),
+        archive_root: peer_private_root.join("archive"),
+        enrollment_root: peer_private_root.join("enrollment"),
+        receipt_root: peer_private_root.join("receipts"),
+        database_path: peer_private_root.join("projection/materialization.sqlite"),
+        application_runtime_root: peer_private_root.join("runtime"),
+        provider_root: peer_graph_root.join(".tine-sync/v2/shared"),
+        provider_journal_root: peer_private_root.join("provider/device/journal"),
+    };
+    let activation_request = SyncLocalActivationRequest {
+        graph_root: peer_graph_root.clone(),
+        archive_root: open_request.archive_root.clone(),
+        enrollment_root: open_request.enrollment_root.clone(),
+        receipt_root: open_request.receipt_root.clone(),
+        database_path: open_request.database_path.clone(),
+        application_runtime_root: open_request.application_runtime_root.clone(),
+        capture_root: peer_private_root.join("capture"),
+        preparation_root: peer_private_root.join("preparation"),
+        provider_root: open_request.provider_root.clone(),
+        provider_journal_root: open_request.provider_journal_root.clone(),
+        identities,
+    };
+    ManagedStorageJourneyPeer {
+        graph_root: peer_graph_root,
+        private_root: peer_private_root,
+        open_request,
+        activation_request,
+    }
+}
+
+fn copy_journey_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_name() == JOURNEY_PEER_GRAPH_DIRECTORY {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journey graph contains a symlink at {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+        let target = destination.join(entry.file_name());
+        if kind.is_dir() {
+            copy_journey_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            write_journey_file(&target, &fs::read(entry.path())?)?;
+        }
+    }
+    sync_journey_directory(destination)
+}
+
 /// Run the whole journey and return its receipt. `Ok` receipts start with
 /// `"ok "`; every other string is the refusal, carrying what localises it.
 pub fn run_managed_storage_journey(
@@ -938,10 +1044,11 @@ pub fn run_managed_storage_journey(
         }
     }
 
-    let shared = match handle.prepare_shared() {
-        Ok(descriptor) => format!("shared_descriptor={}", descriptor.descriptor_digest),
+    let descriptor = match handle.prepare_shared() {
+        Ok(descriptor) => descriptor,
         Err(error) => return format!("prepare shared failed: {error}"),
     };
+    let shared = format!("shared_descriptor={}", descriptor.descriptor_digest);
     // A successful enrollment cut retires the actor, so this shutdown reads
     // the runtime's own final state rather than reaching a live thread.
     // `ActorUnavailable` carries no payload at all, so never report a shutdown
@@ -960,6 +1067,111 @@ pub fn run_managed_storage_journey(
     }
     drop(handle);
 
+    // Model the filesystem synchronizer between two devices by copying the
+    // complete graph tree only after the initiator has durably prepared its
+    // share. The peer then activates from the same Markdown/Org semantics with
+    // distinct device-local identities, joins the provider-visible descriptor,
+    // retires that enrollment epoch, and cold-reopens as a joiner.
+    let Some(private_root) = activation_request.application_runtime_root.parent() else {
+        return format!(
+            "journey could not derive its private root from {}; {shared}",
+            activation_request.application_runtime_root.display()
+        );
+    };
+    let peer = managed_storage_journey_peer(&graph_root, private_root, &descriptor);
+    let _ = fs::remove_dir_all(&peer.graph_root);
+    let _ = fs::remove_dir_all(&peer.private_root);
+    if let Err(error) = copy_journey_tree(&graph_root, &peer.graph_root) {
+        return format!("second-device graph delivery failed: {error}; {shared}");
+    }
+    let join_started = Instant::now();
+    let peer_activation = SyncRuntimeHandle::activate_or_resume_local(peer.activation_request);
+    if peer_activation.status != SyncLocalActivationStatus::Active {
+        return format!(
+            "second-device activation failed: {:?}; {shared}",
+            peer_activation.status
+        );
+    }
+    let Some(peer_joining) = peer_activation.handle else {
+        return "second-device activation returned Active without a handle".into();
+    };
+    if let Err(error) = peer_joining.join_shared(descriptor) {
+        return format!("second-device join failed: {error}; {shared}");
+    }
+    for (path, expected) in [
+        (JOURNEY_EXTERNAL_EDIT_PAGE, JOURNEY_EXTERNAL_EDIT_AFTER),
+        (JOURNEY_EXTERNAL_BACKUP_PAGE, JOURNEY_EXTERNAL_BACKUP_BYTES),
+    ] {
+        match fs::read(peer.graph_root.join(path)) {
+            Ok(bytes) if bytes == expected.as_bytes() => {}
+            outcome => {
+                return format!(
+                "second-device join changed duplicate-path bytes at {path}: {outcome:?}; {shared}"
+            )
+            }
+        }
+    }
+    match peer_joining.clean_shutdown() {
+        Ok(SyncShutdownOutcome::Safe(_)) => {}
+        outcome => {
+            return format!(
+                "second-device join retirement was not Safe: {outcome:?}; status={}; {shared}",
+                describe_status(&peer_joining)
+            )
+        }
+    }
+    drop(peer_joining);
+    let join_ms = join_started.elapsed().as_millis();
+
+    let peer_reopen_started = Instant::now();
+    let peer_reopened = SyncRuntimeHandle::open(peer.open_request);
+    let peer_reopen_ms = peer_reopen_started.elapsed().as_millis();
+    if peer_reopened.status != SyncRuntimeOpenStatus::Active {
+        return format!(
+            "second-device reopen failed: {:?}; {shared}",
+            peer_reopened.status
+        );
+    }
+    let Some(peer_handle) = peer_reopened.handle else {
+        return "second-device reopen returned Active without a handle".into();
+    };
+    match peer_handle.load_application_page(SyncApplicationPageLoadRequest {
+        page: SyncApplicationPageSelector::ExactPath {
+            path: JOURNEY_EXTERNAL_EDIT_PAGE.into(),
+        },
+    }) {
+        Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. })
+            if page
+                .blocks
+                .iter()
+                .map(|block| block.raw.as_str())
+                .collect::<Vec<_>>()
+                == vec!["ordinary non-ASCII page", JOURNEY_EXTERNAL_EDIT_BLOCK] => {}
+        outcome => {
+            return format!("second-device duplicate-path owner mismatch: {outcome:?}; {shared}")
+        }
+    }
+    match peer_handle.load_application_page(SyncApplicationPageLoadRequest {
+        page: SyncApplicationPageSelector::ExactPath {
+            path: JOURNEY_EDITED_PAGE.into(),
+        },
+    }) {
+        Ok(SyncApplicationPageLoadOutcome::Loaded { page, .. })
+            if page.blocks.first().map(|block| block.raw.as_str())
+                == Some(JOURNEY_EDITED_BYTES.trim_start_matches("- ").trim()) => {}
+        outcome => return format!("second-device joined page mismatch: {outcome:?}; {shared}"),
+    }
+    match peer_handle.clean_shutdown() {
+        Ok(SyncShutdownOutcome::Safe(_)) => {}
+        outcome => {
+            return format!(
+                "second-device reopened clean shutdown failed: {outcome:?}; status={}; {shared}",
+                describe_status(&peer_handle)
+            )
+        }
+    }
+    drop(peer_handle);
+
     let reopened = SyncRuntimeHandle::open(open_request);
     if reopened.status != SyncRuntimeOpenStatus::Active {
         return format!(
@@ -972,7 +1184,7 @@ pub fn run_managed_storage_journey(
     };
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => format!(
-            "ok activation_ms={activation_ms} activation_attempts={attempts} activation_retried={retried_receipt} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} total_ms={} {folding_receipt} {retained} {shared} reconciliation[{reconciliation}] progress={}",
+            "ok activation_ms={activation_ms} activation_attempts={attempts} activation_retried={retried_receipt} first_page_ms={first_page_ms} crash_reopen_ms={crash_reopen_ms} reconciliation_ms={reconciliation_ms} join_ms={join_ms} peer_reopen_ms={peer_reopen_ms} total_ms={} {folding_receipt} {retained} {shared} second_device_join=ok reconciliation[{reconciliation}] progress={}",
             journey_started.elapsed().as_millis(),
             progress_receipt.join("|")
         ),
@@ -1016,7 +1228,8 @@ mod tests {
         let shim = include_str!("../../../src-tauri/src/android_managed_storage_smoke.rs");
         assert!(
             shim.contains("run_managed_storage_journey")
-                && shim.contains("write_journey_graph_fixture"),
+                && shim.contains("write_journey_graph_fixture")
+                && shim.contains("run_android_managed_return_to_direct_files"),
             "the Android instrumentation shim must drive the shared journey"
         );
         assert!(
@@ -1031,7 +1244,7 @@ mod tests {
             "the instrumentation test must ask the native side for the shared fixture"
         );
         let journey_case = instrumentation
-            .split_once("fun activationEditCrashReopenShareSetupCleanShutdownAndReopen")
+            .split_once("fun activationEditCrashReopenShare")
             .and_then(|(_, tail)| tail.split_once("@Test"))
             .map(|(body, _)| body)
             .expect("the journey instrumentation case must remain identifiable");

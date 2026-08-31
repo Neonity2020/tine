@@ -21,18 +21,22 @@ object ManagedStorageSmoke {
    * two hand-maintained copies they diverged, and the divergence was invisible —
    * this journey was green on CI in the same round a physical device flooded the
    * app with a reconciliation refusal on page-name shapes neither fixture had.
+   * [returnToDirectFiles] is true for the full lifecycle journey. The separate
+   * interrupted-activation test leaves the rebuilt private tree in place long
+   * enough to inspect its quarantined pre-promotion receipt directly.
    */
   external fun runManagedActivationSmoke(
     graphRoot: String,
     privateRoot: String,
     writeFixture: Boolean,
+    returnToDirectFiles: Boolean,
   ): String
 }
 
 @RunWith(AndroidJUnit4::class)
 class ManagedStorageSmokeTest {
   @Test
-  fun activationEditCrashReopenShareSetupCleanShutdownAndReopenWorkAsTheAppUidOnSharedStorage() {
+  fun activationEditCrashReopenShareJoinPeerReopenAndReturnWorkAsTheAppUidOnSharedStorage() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val nonce = UUID.randomUUID().toString()
     val graphRoot = File(
@@ -73,9 +77,12 @@ class ManagedStorageSmokeTest {
         graphRoot.absolutePath,
         privateRoot.absolutePath,
         true,
+        true,
       )
       println("TINE_ANDROID_MANAGED_LARGE_GRAPH_RECEIPT $result")
       assertTrue(result, result.startsWith("ok "))
+      assertTrue(result, result.contains("second_device_join=ok"))
+      assertTrue(result, result.contains("return_to_direct=ok"))
       assertEquals(
         "- Android managed storage edited\n",
         File(graphRoot, "pages/Smoke.md").readText(),
@@ -121,9 +128,12 @@ class ManagedStorageSmokeTest {
         graphRoot.absolutePath,
         privateRoot.absolutePath,
         true,
+        false,
       )
       println("TINE_ANDROID_MANAGED_RESUME_RECEIPT $result")
       assertTrue(result, result.startsWith("ok "))
+      assertTrue(result, result.contains("second_device_join=ok"))
+      assertTrue(result, !result.contains("return_to_direct=ok"))
       assertEquals(
         "- Android interrupted activation resume\n",
         File(graphRoot, "pages/Resume.md").readText(),

@@ -3044,6 +3044,115 @@ fn cancel_sparse_v2_at_paths(
     )
 }
 
+/// Android app-UID boundary for the final leg of the managed-storage journey.
+///
+/// The core journey proves activation/share/join/reopen. This function then
+/// drives the SAME graceful Return-to-Direct-Files composition as the command:
+/// stop the live actor, preserve the complete private root, apply the
+/// production provider-namespace policy, and publish one Direct Files slot.
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(crate) fn run_android_managed_return_to_direct_files(
+    graph_root: &Path,
+    private_root: &Path,
+    open_request: SyncRuntimeOpenRequest,
+) -> Result<String, String> {
+    let markdown_path = graph_root.join(tine_core::managed_storage_journey::JOURNEY_EDITED_PAGE);
+    let markdown_before = std::fs::read(&markdown_path)
+        .map_err(|error| format!("Return journey could not read its Markdown witness: {error}"))?;
+    let opened = SyncRuntimeHandle::open(open_request);
+    if opened.status != SyncRuntimeOpenStatus::Active {
+        return Err(format!(
+            "Return journey could not reopen managed storage: {:?}",
+            opened.status
+        ));
+    }
+    let graph_meta = tine_core::model::Graph::open_checked(graph_root)
+        .map_err(|error| format!("Return journey could not inspect Direct Files: {error}"))?
+        .meta();
+    let slot = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+        SparseV2Binding::from_open(opened),
+        graph_root.to_path_buf(),
+        graph_meta,
+    ));
+    let state = crate::state::AppState {
+        graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
+        storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+        watch_ctl: Mutex::new(None),
+        last_focused: Mutex::new(None),
+        capture_graph: Mutex::new(None),
+        sync_runtime: SyncRuntimeFacade,
+        #[cfg(desktop)]
+        next_window: std::sync::atomic::AtomicU64::new(1),
+    };
+    state
+        .graphs
+        .write()
+        .unwrap()
+        .bind("managed-storage-smoke".into(), Arc::clone(&slot))?;
+
+    let private_name = private_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("managed-storage-smoke");
+    let recovery_root = private_root
+        .parent()
+        .unwrap_or(private_root)
+        .join(format!(".{private_name}-return-recovery"));
+    let _ = std::fs::remove_dir_all(&recovery_root);
+    let proof = (|| {
+        let returned = cancel_sparse_v2_at_paths(
+            &state,
+            "managed-storage-smoke",
+            slot,
+            private_root,
+            &recovery_root,
+            None,
+            shutdown_for_graceful_direct_files,
+        )?;
+        let direct = state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("managed-storage-smoke")
+            .ok_or("Return journey published no graph slot")?;
+        direct
+            .legacy_graph()
+            .map_err(|error| format!("Return journey did not publish Direct Files: {error}"))?;
+        if private_root.exists() {
+            return Err("Return journey left the live managed private root in place".into());
+        }
+        let archived = std::fs::read_dir(&recovery_root)
+            .map_err(|error| format!("Return journey published no private-state archive: {error}"))?
+            .count();
+        if archived != 1 {
+            return Err(format!(
+                "Return journey expected one private-state archive, found {archived}"
+            ));
+        }
+        let markdown_after = std::fs::read(&markdown_path)
+            .map_err(|error| format!("Return journey lost its Markdown witness: {error}"))?;
+        if markdown_after != markdown_before {
+            return Err("Return journey changed the authoritative Markdown witness".into());
+        }
+        Ok(format!(
+            "return_to_direct=ok binding_generation={} private_archives={archived}",
+            returned.binding_generation
+        ))
+    })();
+    let cleanup = if recovery_root.exists() {
+        std::fs::remove_dir_all(&recovery_root)
+            .map_err(|error| format!("Return journey cleanup failed after proof: {error}"))
+    } else {
+        Ok(())
+    };
+    match (proof, cleanup) {
+        (Ok(receipt), Ok(())) => Ok(receipt),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
+}
+
 #[cfg(test)]
 fn cold_recovery_graph_meta(private_root: &Path, root_key: &Path) -> Result<GraphMeta, String> {
     match read_binding_at(&private_root.join(SPARSE_BINDING_FILE), root_key) {

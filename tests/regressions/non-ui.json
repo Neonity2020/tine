@@ -4043,8 +4043,8 @@
    "notes": "GH #254 increment 3, contract rule 2. ensurePageLoaded replaced the loaded instance whenever the requested path differed from the incumbent's, with no check that the incumbent held unsaved work. Reproduced: the incumbent's nodes are purged, the dirty mark SURVIVES and now belongs to the replacement's content, and a live conflict banner survives describing a file the editor no longer holds. The gate is the existing reloadDisposition predicate AND an empty editor-lease set - enumerating dirty/conflicted/saving kept losing, because IME composition holds text in the textarea until compositionend and the page-title rename holds its draft in component-local signals, so neither is visible to any store predicate. A component holding uncommitted input now declares itself with a lease keyed by a unique per-component handle, released idempotently from the component lifecycle rather than only from commit/cancel - a lease that outlives its component would refuse every later replacement forever. The gate is re-evaluated synchronously at the final replacement boundary because every caller awaits a backend read first and the incumbent can become dirty during that await. Necessity: both behavioural tests fail against the pre-fix code; the lease-hygiene and clean-replacement cases pass both ways by design and are not regression guards for the refusal itself."
   },
   {
-   "id": "REG-SYNC-ENROLLMENT-CHECKPOINT-INTEGRITY-MIGRATION-001",
-   "title": "Enrollment opens byte-exact v1/v5 histories, then lazily appends and audits canonical keyless v6/v3 integrity checkpoints",
+   "id": "REG-SYNC-ENROLLMENT-CHECKPOINT-INTEGRITY-CURRENT-001",
+   "title": "Enrollment accepts one canonical keyless current format and fails closed on altered integrity evidence",
    "family": "sync-data-safety",
    "sources": {
     "issues": [],
@@ -4058,17 +4058,16 @@
    "coverage": {
     "tests": [
      "crates/tine-core/src/oplog/enrollment.rs::current_enrollment_claim_record_and_checkpoint_are_keyless_canonical_crc_v2_v6_v3",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_reopens_byte_exactly_then_lazily_appends_v6_without_rewriting_authority",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_mixed_suffix_opens_at_every_boundary_and_full_audit_pages_verify_both_codecs",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_initial_publication_resumes_every_durable_cross_version_cut",
-     "crates/tine-core/src/oplog/enrollment.rs::legacy_initial_recovery_rejects_wrong_names_and_invalid_hmac_without_cleanup",
-     "crates/tine-core/src/oplog/enrollment.rs::frozen_legacy_v1_v5_codec_golden_digests_remain_exact",
-     "crates/tine-core/src/oplog/enrollment.rs::enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_wire_scenarios"
+     "crates/tine-core/src/oplog/enrollment.rs::unknown_tampered_future_and_noncanonical_records_fail_closed",
+     "crates/tine-core/src/oplog/enrollment.rs::crash_cuts_leave_old_or_new_valid_head",
+     "crates/tine-core/src/oplog/enrollment.rs::forged_checkpoint_immediately_at_open_boundary_fails_authentication",
+     "crates/tine-core/src/oplog/enrollment.rs::audit_limit_sixty_four_validates_the_transition_across_page_boundary",
+     "crates/tine-core/src/oplog/enrollment.rs::enrollment_has_one_current_schema_and_no_legacy_authenticator"
     ],
-    "scenario": "sync.enrollment-keyless-integrity-with-frozen-legacy-suffix",
+    "scenario": "sync.enrollment-keyless-current-integrity",
     "failBefore": "source-proven"
    },
-   "notes": "Fresh schema-v2 authority claims omit secret material and schema-v6 records use schema-v3 CRC-32/ISO-HDLC checkpoints. The permanent mixed-history fixture constructs exact v1 authority/v5 HMAC bytes using a test-only legacy signer, proves their bytes and OS identity survive reopen, opens every mixed-chain suffix boundary, appends current v6 records without rewriting the claim, and pages a complete audit across both codecs. A cross-version publication matrix additionally resumes byte-exact legacy generation-one state from a full record temp, linked final/temp pair, final record plus HEAD temp, and committed HEAD; the first successor is v6, while fresh v2 authority remains v6-only. Wrong names, ambiguity, invalid legacy HMAC, structural mismatch, noncanonical encodings, illegal record/checkpoint pairs, and altered CRCs refuse before lifecycle admission without cleanup. Frozen v1/v5 golden digests and explicit read-only discovery classification keep the verifier byte-exact. A source guard permits production HMAC only in the frozen verifier module and permits signing only under cfg(test). Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "Pre-0.7 policy has no enrollment migration or compatibility route: unrecognized private state is preserved, Direct Files opens, and current managed state is rebuilt from Markdown/Org. Current authority claims omit secret material; current records use canonical CRC integrity checkpoints. Unknown, old, future, altered, and noncanonical records refuse before lifecycle admission. Crash-cut tests prove old-or-new valid authority, page-boundary audit tests authenticate the current chain, and the source guard proves no legacy schema or authenticator remains. The six stale legacy-migration test references were removed during MS-16 structural closure rather than reintroducing the retired compatibility contract."
   },
   {
    "id": "REG-MANAGED-RETAINED-SCRATCH-OPEN-RECOVERY-001",
@@ -5519,6 +5518,54 @@
     "failBefore": "On the exact MS-15 base, 64 distinct page saves succeeded, but after the 65th page displaced the first document from the bounded hot set, a second save of the first page was refused during trusted-local predecessor capture because its manifested projection no longer matched the history-materialized deterministic rendering. The same second save passed when only 64 pages were involved."
    },
    "notes": "Discovered by the MS-15 anonymized-corpus recovery benchmark, then reduced to a content-independent 65-page synthetic fixture. The bounded cache had evicted both a CRDT document and its run-local head entry; the cold path mistook that cache miss for an untouched lazy-genesis document and omitted the accepted edit. A no-scratch clean runtime now recovers missing hot heads from its authoritative accepted frontier and reconstructs the exact accepted document tail. Projection and reconciliation checks remain unchanged. The corpus benchmark also excludes first-block replacements that would delete an externally imported id:: property: that is an intentional identity refusal, not a representative content edit."
+  },
+  {
+   "id": "REG-MANAGED-MS16-CURRENT-ACTOR-ONLY",
+   "title": "Production managed storage retains only the current clean actor and enrollment state",
+   "family": "managed-storage-architecture",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "scripts/check-retired-managed-v1.mjs"
+    ],
+    "scenario": "managed-storage.ms16-current-actor-only",
+    "failBefore": "On the exact MS-16 base b39ad92c, sync_runtime.rs still compiled PendingLocalMutation, PendingSharedJoin, SharedJoinProviderPass, ProviderDependencyIndex, legacy_binding, and provider_recovery_coverage_root into the production actor even though the one current clean constructor never populated them."
+   },
+   "notes": "MS-16 compiler-guided oracle extraction. The dead local-mutation slot, cursor-based shared join state, legacy provider dependency indexes, and write-only legacy actor fields were removed rather than preserved as a second runtime. The retired-managed-v1 source guard scans the production prefix of sync_runtime.rs and fails if the named residue returns. Test-only fixtures and the explicitly enumerated known-red Patricia/bootstrap corpus remain owned by final packet MS-14b."
+  },
+  {
+   "id": "REG-MANAGED-MS16-JOIN-DUPLICATE-PATH-AUTHORITY",
+   "title": "A second device can join when a synchronized duplicate-name file sorts before the shared page owner",
+   "family": "managed-storage-share-and-join",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all",
+    "android"
+   ],
+   "layer": "rust-core-storage-and-android-app-uid",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime.rs::tests::duplicate_path_join_exception_is_fresh_activation_only_and_fails_closed",
+     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_reconciles_real_graph_name_shapes_on_a_host_graph",
+     "crates/tine-core/src/sync_runtime.rs::tests::android_managed_storage_journey_holds_one_page_on_a_case_folding_graph_filesystem",
+     "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/ManagedStorageSmokeTest.kt::activationEditCrashReopenShareJoinPeerReopenAndReturnWorkAsTheAppUidOnSharedStorage"
+    ],
+    "scenario": "managed-storage.ms16-duplicate-path-join-authority",
+    "failBefore": "The new MS-16 second-device leg copied the initiator's complete graph tree after share preparation. The initiator retained pages/Denní poznámky.md as the page owner and left the later archiv/2026 backup unowned; fresh joiner activation selected the earlier-sorting backup and refused the identical synchronized graph as local-only=1/shared-only=1."
+   },
+   "notes": "Join keeps fail-closed semantic comparison. It admits the duplicate-path case only for an otherwise untouched fresh activation, when the shared frontier's exact selected file is still present and parses to exactly the shared kind, preamble, outline, and externally imported ids, while the fresh local selection decodes to the same logical page identity. Policy-generated anchor ids are representation metadata and may be visible only in the disk parse. It never rewrites or deletes the duplicate. The focused unit test pins refusal after a local accepted edit, changed/absent provider-selected bytes, and the original semantic-diff diagnostic; the shared host/Android journey pins both duplicate files byte-for-byte and the exact owner path. The one Android app-UID journey proves activation, application save, crash-style reopen, external reconciliation, share, a distinct-device join and reopen, then Tauri's production graceful Return-to-Direct-Files composition."
   }
  ]
 }

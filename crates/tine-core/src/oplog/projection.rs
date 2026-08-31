@@ -3787,6 +3787,25 @@ fn inject_logseq_id(
     }
 }
 
+/// Reconstruct the exact on-disk representation of a policy-generated Logseq
+/// anchor. Join admission uses this to distinguish Tine's derived projection
+/// metadata from a user-authored external `id::` change.
+pub(crate) fn inject_policy_generated_logseq_id(
+    content: &str,
+    is_org: bool,
+    uuid: LogseqUuid,
+) -> Result<String, ProjectionError> {
+    inject_logseq_id(
+        content,
+        if is_org {
+            ProjectionFormat::Org
+        } else {
+            ProjectionFormat::Markdown
+        },
+        uuid,
+    )
+}
+
 fn inject_org_id(content: &str, uuid: LogseqUuid) -> Result<String, ProjectionError> {
     let projection = crate::render::parse_projection(content, true);
     if let Some(span) = projection.blocks.iter().find_map(|block| match block {

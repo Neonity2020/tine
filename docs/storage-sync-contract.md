@@ -104,10 +104,13 @@ certified through `tine_storage::formats`.
 [ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the sole production
 activation format. Existing pre-0.7 enrollment and multipart-bootstrap state
 is refused as authority and the product offers Return to Direct Files before a
-fresh clean activation. The old constructor and same-process handoff remain
-callable only under `cfg(test)` as a bounded differential oracle while their
-source modules are physically retired; no production open, activation, or
-actor thread can enter them. A partially
+fresh clean activation. Production contains one baseline-plus-manifest actor
+constructor and one share/join state machine. The cursor-based join state,
+legacy mutation slot, and legacy provider indexes are absent from production
+and pinned absent by the retired-source guard. Older constructors and handoff
+fixtures remain callable only under `cfg(test)` as bounded differential oracles;
+they are not an alternate runtime authority. The final enumerated known-red
+oracle corpus remains pending for MS-14b. A partially
 implemented genesis artifact is never authoritative: only the final clean
 activation marker selects the baseline-plus-manifest runtime. The exact
 removal/replacement ledger is

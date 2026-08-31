@@ -51,6 +51,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A second device can join a synchronized graph that contains an honest
+  duplicate-name backup file.** A fresh scan may choose the earlier-sorting
+  backup even though the shared history already owns the canonical page path.
+  Join now accepts that shape only when the provider-owned exact file is still
+  present with exactly the shared semantics and both physical files decode to
+  the same page identity; the extra file remains untouched. The Android
+  app-UID journey now covers activation, share, a distinct-device join and
+  reopen, and the real graceful Return-to-Direct-Files composition.
+
+- **Managed Storage has one production actor and enrollment path.** Dead
+  pre-clean-runtime mutation, provider, cursor-join, and handoff state has been
+  removed from the retained actor, and a source guard prevents those fields or
+  types from returning to the production prefix of `sync_runtime.rs`.
+
 - **Managed Storage pages remain editable after heavy use evicts them from the
   in-memory document cache.** A cold point load now reconstructs the page from
   its accepted history instead of mistaking the cache miss for an untouched

@@ -102,12 +102,14 @@ use crate::oplog::operational_coordinator::{
     OperationalCoordinator, OperationalCoordinatorError, OperationalPhase,
     PreparedLocalMutationState,
 };
+use crate::oplog::projection::{
+    inject_policy_generated_logseq_id, render_requested_page_document, PreparedEditorProjection,
+};
 #[cfg(test)]
 use crate::oplog::projection::{
     prepared_editor_projection_instrumentation, reset_prepared_editor_projection_instrumentation,
     PreparedEditorProjectionInstrumentation,
 };
-use crate::oplog::projection::{render_requested_page_document, PreparedEditorProjection};
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::projection_turn_journal::{
     open_projection_turn_journal, ProjectionTurnJournalState,
@@ -342,7 +344,6 @@ struct ManagedApplicationSaveInstrumentation {
     graph_wide: GraphWideCommitWork,
     engine: crate::oplog::hot_engine::EngineInstrumentation,
     managed_local_work: crate::oplog::hot_engine::ManagedLocalWork,
-    provider_pending: usize,
     managed_local_pending: usize,
     managed_local_next_sequence: u64,
     prepared_editor_projection: PreparedEditorProjectionInstrumentation,
@@ -871,21 +872,11 @@ fn checked_editor_request_remainder(timings: &ManagedApplicationSaveStageTimings
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProviderRecoveryCoverageRoot {
-    acceptance_sequence: u64,
-    state_digest: ContentDigest,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderAcceptedManifestAudit {
     next_sequence: u64,
     target_sequence: u64,
     advances_coverage: bool,
 }
-
-impl ProviderAcceptedManifestAudit {}
-
-impl ProviderRecoveryCoverageRoot {}
 
 #[cfg(test)]
 static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
@@ -3764,7 +3755,7 @@ impl SyncRuntimeHandle {
             Err(error) => return refused(format!("cannot start clean sync actor thread: {error}")),
         };
         match started_receiver.recv() {
-            Ok(ActorStartupEvent::Finished(Ok(snapshot))) => {
+            Ok(ActorStartupEvent(Ok(snapshot))) => {
                 *status.write().unwrap() = snapshot;
                 SyncRuntimeOpenResult {
                     status: SyncRuntimeOpenStatus::Active,
@@ -3782,15 +3773,10 @@ impl SyncRuntimeHandle {
                     }),
                 }
             }
-            Ok(ActorStartupEvent::Finished(Err(detail))) => {
+            Ok(ActorStartupEvent(Err(detail))) => {
                 drop(sender);
                 let _ = join.join();
                 refused(detail)
-            }
-            Ok(ActorStartupEvent::Phase(_)) | Ok(ActorStartupEvent::RecoveryDiagnostics(_)) => {
-                drop(sender);
-                let _ = join.join();
-                refused("clean sync actor reported an unexpected startup event".into())
             }
             Err(_) => {
                 drop(sender);
@@ -4119,31 +4105,17 @@ impl SyncRuntimeHandle {
         let descriptor = descriptor
             .decode()
             .map_err(SyncRuntimeRequestError::InvalidRequest)?;
-        loop {
-            // One actor request performs at most one cursor entry. Release the
-            // public operation gate between entries so a large enrollment cut
-            // cannot monopolize status, shutdown, or other actor work for its
-            // entire history-sized traversal.
-            let _operation = self.inner.operation.lock().unwrap();
-            let (reply_sender, reply_receiver) = mpsc::channel();
-            self.send(ActorRequest::JoinShared {
-                descriptor: descriptor.clone(),
-                reply: reply_sender,
-            })?;
-            match reply_receiver
-                .recv()
-                .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)??
-            {
-                SharedJoinStep::Pending => {
-                    drop(_operation);
-                    std::thread::yield_now();
-                }
-                SharedJoinStep::Complete(descriptor) => {
-                    self.observe_retired_actor()?;
-                    return Ok(descriptor);
-                }
-            }
-        }
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::JoinShared {
+            descriptor,
+            reply: reply_sender,
+        })?;
+        let joined = reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)??;
+        self.observe_retired_actor()?;
+        Ok(joined)
     }
 
     /// A successful enrollment cut retires its actor by design: the actor
@@ -5594,7 +5566,6 @@ struct CleanRetryFingerprint {
     phase: OperationalPhase,
     detail: String,
     attempts: u32,
-    escalated: bool,
 }
 
 #[derive(Debug)]
@@ -5885,7 +5856,6 @@ impl CleanRuntimeActorCore {
             phase,
             detail: detail.clone(),
             attempts,
-            escalated,
         });
         escalated.then_some(CleanActorMutationOutcome::DurableStuck {
             batch_id,
@@ -8444,12 +8414,23 @@ impl Drop for CleanJoinCandidate {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct CleanJoinUserPage {
     path: String,
     kind: ManagedTextKind,
     preamble: Option<String>,
     outline: Vec<(usize, String, Option<LogseqUuid>)>,
+    /// Exact ids a projection renders, including derived policy anchors. This
+    /// is representation evidence only and is deliberately excluded from the
+    /// user-semantic diff above.
+    projected_ids: Vec<Option<LogseqUuid>>,
+}
+
+fn clean_join_pages_user_equal(left: &CleanJoinUserPage, right: &CleanJoinUserPage) -> bool {
+    left.path == right.path
+        && left.kind == right.kind
+        && left.preamble == right.preamble
+        && left.outline == right.outline
 }
 
 const CLEAN_JOIN_MAX_MISMATCH_DETAILS: usize = 32;
@@ -8666,13 +8647,17 @@ fn clean_join_user_semantics(
         .blocks
         .into_iter()
         .map(|block| {
+            let projected_uuid = block.logseq_uuid;
             let external_uuid = matches!(
                 block.logseq_identity_origin,
                 Some(LogseqIdentityOrigin::ExternalImported)
             )
             .then_some(block.logseq_uuid)
             .flatten();
-            (block.block_id, (block.content, external_uuid))
+            (
+                block.block_id,
+                (block.content, external_uuid, projected_uuid),
+            )
         })
         .collect::<BTreeMap<_, _>>();
     let mut memberships = BTreeMap::<PageId, Vec<_>>::new();
@@ -8703,6 +8688,7 @@ fn clean_join_user_semantics(
             });
         }
         let mut outline = Vec::new();
+        let mut projected_ids = Vec::new();
         let mut pending = children
             .remove(&None)
             .unwrap_or_default()
@@ -8717,12 +8703,14 @@ fn clean_join_user_semantics(
                     "clean join semantic comparison found cyclic block structure".into(),
                 ));
             }
-            let (content, external_uuid) = blocks.get(&membership.block_id).ok_or_else(|| {
-                SyncRuntimeRequestError::ActorRefused(
-                    "clean join semantic comparison found a missing visible block".into(),
-                )
-            })?;
+            let (content, external_uuid, projected_uuid) =
+                blocks.get(&membership.block_id).ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(
+                        "clean join semantic comparison found a missing visible block".into(),
+                    )
+                })?;
             outline.push((depth, content.clone(), *external_uuid));
+            projected_ids.push(*projected_uuid);
             if let Some(descendants) = children.remove(&Some(membership.block_id)) {
                 pending.extend(
                     descendants
@@ -8742,6 +8730,7 @@ fn clean_join_user_semantics(
             kind,
             preamble: preambles.get(&page_id).cloned().flatten(),
             outline,
+            projected_ids,
         });
     }
     if !memberships.is_empty() {
@@ -8751,6 +8740,186 @@ fn clean_join_user_semantics(
     }
     pages.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok(pages)
+}
+
+/// Compare a fresh local activation with the shared frontier while accounting
+/// for a duplicate physical file that the shared history deliberately left
+/// unowned.
+///
+/// A synchronizer copies BOTH files to a new device. Fresh lexical discovery
+/// may select the older-sorting duplicate, even though the shared frontier
+/// selected another exact path before that duplicate arrived. Joining is safe
+/// only for an otherwise untouched fresh activation, when the provider-selected
+/// exact file still exists and parses to the provider semantics, and the
+/// local-only selected page decodes to that same logical page identity. The
+/// extra file remains untouched.
+fn clean_join_semantics_match_with_shared_path_authority(
+    graph: &Graph,
+    local: &[CleanJoinUserPage],
+    shared: &[CleanJoinUserPage],
+    local_is_activation_baseline: bool,
+) -> Result<bool, SyncRuntimeRequestError> {
+    if !local_is_activation_baseline || local.len() != shared.len() {
+        return Ok(false);
+    }
+    let mut consumed = vec![false; local.len()];
+    for shared_page in shared {
+        if let Some((index, _)) = local.iter().enumerate().find(|(index, local_page)| {
+            !consumed[*index] && clean_join_pages_user_equal(local_page, shared_page)
+        }) {
+            consumed[index] = true;
+            continue;
+        }
+        // This is a bounded exception to the ordinary semantic-diff refusal.
+        // Any path/read/parse failure must therefore decline the exception and
+        // preserve that useful original diff, not replace it with a lower-level
+        // probe error.
+        let Ok((shared_disk, shared_name)) = clean_join_disk_page(graph, &shared_page.path) else {
+            return Ok(false);
+        };
+        if !clean_join_disk_matches_shared_page(&shared_disk, shared_page) {
+            return Ok(false);
+        }
+        let Some((index, _)) = local.iter().enumerate().find(|(index, local_page)| {
+            if consumed[*index] {
+                return false;
+            }
+            clean_join_disk_page(graph, &local_page.path).is_ok_and(|(local_disk, local_name)| {
+                clean_join_disk_matches_shared_page(&local_disk, local_page)
+                    && local_name.key_digest() == shared_name.key_digest()
+            })
+        }) else {
+            return Ok(false);
+        };
+        consumed[index] = true;
+    }
+    Ok(consumed.into_iter().all(|matched| matched))
+}
+
+/// Disk parsing sees policy-generated `id::` anchors while the canonical user
+/// semantic view deliberately exposes only externally imported IDs. Compare
+/// all user-authored structure exactly and permit that one representation-only
+/// asymmetry when the shared side has no external ID.
+fn clean_join_disk_matches_shared_page(
+    disk: &CleanJoinUserPage,
+    shared: &CleanJoinUserPage,
+) -> bool {
+    if disk.path != shared.path
+        || disk.kind != shared.kind
+        || disk.preamble != shared.preamble
+        || disk.outline.len() != shared.outline.len()
+        || shared.projected_ids.len() != shared.outline.len()
+    {
+        return false;
+    }
+    let is_org = shared.path.to_ascii_lowercase().ends_with(".org");
+    disk.outline.iter().zip(&shared.outline).enumerate().all(
+        |(
+            index,
+            (
+                (disk_depth, disk_content, disk_uuid),
+                (shared_depth, shared_content, shared_external_uuid),
+            ),
+        )| {
+            if disk_depth != shared_depth {
+                return false;
+            }
+            if let Some(external_uuid) = shared_external_uuid {
+                return *disk_uuid == Some(*external_uuid) && disk_content == shared_content;
+            }
+            match shared.projected_ids[index] {
+                None => disk_uuid.is_none() && disk_content == shared_content,
+                Some(projected_uuid) if *disk_uuid == Some(projected_uuid) => {
+                    let mut canonical = crate::doc::DocBlock::new(shared_content);
+                    canonical.is_org = is_org;
+                    let raw_ids = canonical
+                        .properties()
+                        .into_iter()
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("id"))
+                        .filter_map(|(_, value)| LogseqUuid::parse(value.trim()).ok())
+                        .collect::<Vec<_>>();
+                    let expected = match raw_ids.as_slice() {
+                        [] => inject_policy_generated_logseq_id(
+                            shared_content,
+                            is_org,
+                            projected_uuid,
+                        )
+                        .ok(),
+                        [raw_uuid] if *raw_uuid == projected_uuid => Some(shared_content.clone()),
+                        _ => None,
+                    };
+                    expected.as_deref() == Some(disk_content.as_str())
+                }
+                Some(_) => false,
+            }
+        },
+    )
+}
+
+fn clean_join_disk_page(
+    graph: &Graph,
+    path: &str,
+) -> Result<(CleanJoinUserPage, LogicalPageName), SyncRuntimeRequestError> {
+    let managed = ManagedPath::parse(path.to_owned()).map_err(|error| {
+        SyncRuntimeRequestError::ActorRefused(format!(
+            "clean join cannot inspect provider-selected path: {error}"
+        ))
+    })?;
+    let observation = graph
+        .read_raw_managed_text(&managed)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        .ok_or_else(|| {
+            SyncRuntimeRequestError::ActorRefused(format!(
+                "clean join provider-selected path is absent: {path}"
+            ))
+        })?;
+    let parsed = graph
+        .parse_external_document(&managed, observation.bytes(), false)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let logical_name = LogicalPageName::parse(parsed.effective.name.clone())
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let kind = match parsed.effective.kind {
+        PageKind::Page => ManagedTextKind::Page,
+        PageKind::Journal => ManagedTextKind::Journal,
+    };
+    fn append_outline(
+        blocks: &[crate::doc::DocBlock],
+        depth: usize,
+        outline: &mut Vec<(usize, String, Option<LogseqUuid>)>,
+        projected_ids: &mut Vec<Option<LogseqUuid>>,
+    ) {
+        for block in blocks {
+            let external_uuid = block
+                .property("id")
+                .and_then(|value| LogseqUuid::parse(value.trim()).ok());
+            outline.push((depth, block.raw.clone(), external_uuid));
+            projected_ids.push(external_uuid);
+            append_outline(
+                &block.children,
+                depth.saturating_add(1),
+                outline,
+                projected_ids,
+            );
+        }
+    }
+    let mut outline = Vec::new();
+    let mut projected_ids = Vec::new();
+    append_outline(
+        &parsed.parsed.document.roots,
+        0,
+        &mut outline,
+        &mut projected_ids,
+    );
+    Ok((
+        CleanJoinUserPage {
+            path: path.to_owned(),
+            kind,
+            preamble: parsed.parsed.document.pre_block,
+            outline,
+            projected_ids,
+        },
+        logical_name,
+    ))
 }
 
 fn matching_clean_join_heads(
@@ -9311,11 +9480,7 @@ fn map_component(component: DiscoveryComponent) -> SyncRuntimeComponent {
     }
 }
 
-enum ActorStartupEvent {
-    Phase(SyncRuntimeOpenPhase),
-    RecoveryDiagnostics(SyncRuntimeRecoveryDiagnostics),
-    Finished(Result<SyncRuntimeStatusSnapshot, String>),
-}
+struct ActorStartupEvent(Result<SyncRuntimeStatusSnapshot, String>);
 
 enum ActorRequest {
     Query {
@@ -9460,7 +9625,7 @@ enum ActorRequest {
     },
     JoinShared {
         descriptor: SharedEnrollmentDescriptor,
-        reply: mpsc::Sender<Result<SharedJoinStep, SyncRuntimeRequestError>>,
+        reply: mpsc::Sender<Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>>,
     },
     Tick {
         reply: mpsc::Sender<SyncRuntimeTick>,
@@ -9545,7 +9710,7 @@ fn actor_thread_from_clean_resources(
     let actor = match RuntimeActor::from_clean_resources(request, identities, resources, recovery) {
         Ok(actor) => actor,
         Err(error) => {
-            let _ = started.send(ActorStartupEvent::Finished(Err(error)));
+            let _ = started.send(ActorStartupEvent(Err(error)));
             return;
         }
     };
@@ -9560,10 +9725,7 @@ fn run_actor_loop(
 ) {
     let snapshot = actor.snapshot();
     *shared_status.write().unwrap() = snapshot.clone();
-    if started
-        .send(ActorStartupEvent::Finished(Ok(snapshot)))
-        .is_err()
-    {
+    if started.send(ActorStartupEvent(Ok(snapshot))).is_err() {
         return;
     }
 
@@ -9762,14 +9924,7 @@ fn run_actor_loop(
             }
             ActorRequest::JoinShared { descriptor, reply } => {
                 let result = actor.join_shared(descriptor);
-                let should_stop = matches!(result, Ok(SharedJoinStep::Complete(_)));
-                if result.is_err() {
-                    // A cursor has already consumed the path that produced the
-                    // refusal. The next explicit join attempt must start a
-                    // fresh full cut so malformed or transient provider
-                    // evidence cannot be skipped by retrying the same actor.
-                    actor.pending_join = None;
-                }
+                let should_stop = result.is_ok();
                 let _ = reply.send(result);
                 should_stop
             }
@@ -9848,7 +10003,6 @@ fn run_actor_loop(
                     graph_wide: graph_wide_commit_work(),
                     engine,
                     managed_local_work,
-                    provider_pending: actor.provider_pending.len(),
                     managed_local_pending: actor
                         .managed_local
                         .as_ref()
@@ -9994,17 +10148,6 @@ fn run_actor_loop(
     }
 }
 
-/// Deliberately `!Send + !Sync`; constructed and destroyed inside the actor
-/// thread. The `Rc` marker makes accidental movement into Tauri state a compile
-/// error even if every owned authority happens to gain `Send` later.
-enum PendingLocalMutation {
-    Reconciliation {
-        transaction: OperationTransaction,
-        correlated_batch_id: Option<BatchId>,
-        application_move_episode: Option<ApplicationMoveEpisodeDraft>,
-    },
-}
-
 enum PendingManagedLocalCommit {
     Projection(TrustedLocalCommittedPendingProjection),
     Overlay(TrustedLocalCommittedRecovery),
@@ -10023,6 +10166,7 @@ struct LatestTaskQueryOverlayPage {
     path: ManagedPath,
     kind: ManagedTextKind,
     format: Format,
+    #[cfg(test)]
     preamble: Option<String>,
     structures: BTreeMap<BlockId, LatestTaskQueryOverlayStructure>,
     candidates: BTreeMap<BlockId, LatestTaskQueryOverlayCandidate>,
@@ -10231,7 +10375,6 @@ struct ManagedLocalRuntimeState {
     checkpoint_batch_id: Option<BatchId>,
     continuation: Option<ManagedLocalDrainContinuation>,
     pending_commit: Option<PendingManagedLocalCommit>,
-    authorship_complete: BTreeSet<BatchId>,
     last_failure: Option<String>,
     /// Cleanup is cold, bounded work.  A settled managed-local runtime must
     /// never re-enumerate its history on ordinary idle ticks or saves.
@@ -10634,6 +10777,7 @@ fn latest_task_query_overlay_page_from_application(
         path: current.editor.page.path.clone(),
         kind: current.editor.page.kind,
         format: current.page.format,
+        #[cfg(test)]
         preamble: current.page.pre_block.clone(),
         structures,
         candidates,
@@ -11040,7 +11184,6 @@ fn open_clean_foreground_journal(
         checkpoint_batch_id,
         continuation: None,
         pending_commit: None,
-        authorship_complete: BTreeSet::new(),
         last_failure: None,
         cleanup_pending,
     })
@@ -11952,106 +12095,6 @@ enum EditorNameState {
     PathOccupied,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SharedJoinProviderPass {
-    Initial,
-    Confirmation,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SharedJoinMultisetSummary {
-    entries: u64,
-    digest_xor: [u8; 32],
-}
-
-impl SharedJoinMultisetSummary {}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SharedJoinProviderCut {
-    entries: SharedJoinMultisetSummary,
-    uncovered_frontier_head: bool,
-    publication_intents: u64,
-    incomplete_manifests: u64,
-    recovery_links: SharedJoinMultisetSummary,
-    recovery_blobs: SharedJoinMultisetSummary,
-}
-
-impl SharedJoinProviderCut {}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SharedJoinArchiveCut {
-    entries: u64,
-    digest_xor: [u8; 32],
-}
-
-impl SharedJoinArchiveCut {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SharedJoinLocalPass {
-    Archive,
-    Classification,
-}
-
-enum SharedJoinPhase {
-    Provider {
-        cursor: SharedProviderObservationCursor,
-        pass: SharedJoinProviderPass,
-    },
-    Local {
-        cursor: ObjectStoreManifestCursor,
-        pass: SharedJoinLocalPass,
-    },
-}
-
-struct PendingSharedJoin {
-    descriptor: SharedEnrollmentDescriptorV1,
-    phase: SharedJoinPhase,
-    initial_provider_cut: Option<SharedJoinProviderCut>,
-    current_provider_cut: SharedJoinProviderCut,
-    initial_archive_cut: Option<SharedJoinArchiveCut>,
-    current_archive_cut: SharedJoinArchiveCut,
-    unique_local_operations: u64,
-    ambiguous_local_operations: bool,
-    unsettled_local_operations: bool,
-}
-
-impl PendingSharedJoin {
-    #[cfg(test)]
-    fn retained_history_entries(&self) -> usize {
-        // Cursors, summaries, counters, and flags are all constant-size. Keep
-        // this explicit test hook beside the state so adding a history-sized
-        // collection makes the large-cut regression require an update.
-        0
-    }
-}
-
-enum SharedJoinStep {
-    Pending,
-    Complete(SyncSharedEnrollmentDescriptor),
-}
-
-struct PendingProviderBatch {
-    causal_dependencies: Vec<BatchId>,
-    unmet_dependencies: usize,
-}
-
-#[derive(Default)]
-struct ProviderDependencyIndex {
-    pending: BTreeMap<BatchId, PendingProviderBatch>,
-    ready: VecDeque<BatchId>,
-    blocked_by: BTreeMap<BatchId, BTreeSet<BatchId>>,
-}
-
-impl ProviderDependencyIndex {
-    fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.pending.len()
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActorRuntimeBinding {
     workspace_id: WorkspaceId,
@@ -12113,14 +12156,8 @@ impl ActorRuntimeBinding {
 struct RuntimeActor {
     graph: Graph,
     receipts: ProjectionReceiptStore,
-    /// Present only for the clean baseline-plus-manifest architecture. During
-    /// the bounded cutover the legacy fields remain populated only by legacy
-    /// opens; no request is allowed to combine the two mutation engines.
+    /// The one current baseline-plus-manifest runtime.
     clean: Option<CleanRuntimeActorCore>,
-    local_mutation: Option<PendingLocalMutation>,
-    /// Process-local ownership of a blocked correlated projection after its
-    /// reconstructed graph-text latch has been consumed into the exact feed.
-    correlated_move_feed_handoffs: BTreeSet<BatchId>,
     managed_local: Option<ManagedLocalRuntimeState>,
     projection_turns: Option<ProjectionTurnJournalState>,
     move_episode_directory: Dir,
@@ -12172,7 +12209,6 @@ struct RuntimeActor {
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
-    startup_recovery_diagnostics: Option<SyncRuntimeRecoveryDiagnostics>,
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
@@ -12186,17 +12222,12 @@ struct RuntimeActor {
     stopped_safe: bool,
     enrollment_root: EnrollmentApplicationRoot,
     binding: ActorRuntimeBinding,
-    legacy_binding: Option<EnrollmentBindingV1>,
-    session_id: SessionId,
-    promotion_session_id: SessionId,
     promoted_state_digest: ContentDigest,
     provider_root: PathBuf,
     provider_journal_root: PathBuf,
-    /// Exact private paths needed only for a clean join authority replacement.
-    /// Legacy actors never retain this request.
+    /// Exact private paths needed for a clean join authority replacement.
     clean_open_request: Option<SyncRuntimeOpenRequest>,
     provider: Option<SharedProviderTransport>,
-    shared_descriptor: Option<SharedEnrollmentDescriptorV1>,
     clean_shared_descriptor: Option<CleanSharedEnrollmentDescriptorV1>,
     shared_role: Option<SyncSharedRole>,
     shared_phase: Option<SyncSharedPhase>,
@@ -12211,11 +12242,6 @@ struct RuntimeActor {
     provider_rescan_required_for_safe: bool,
     provider_full_scan_requested: bool,
     provider_observation_cursor: Option<SharedProviderObservationCursor>,
-    provider_observation_full: bool,
-    provider_scan_valid_heads: usize,
-    provider_scan_invalid_head: bool,
-    provider_head_generations: BTreeMap<(DeviceId, u64), (ContentDigest, Vec<BatchId>)>,
-    provider_own_heads: BTreeMap<String, SharedProviderFrontierHeadV1>,
     provider_direct_manifests: VecDeque<BatchId>,
     /// Foreign batches accepted from the provider that still owe a
     /// conflict-resolution derivation (GH #351). Drained one batch per tick;
@@ -12228,34 +12254,23 @@ struct RuntimeActor {
     /// (audit 4, finding 3).
     conflict_backlog_seeded: bool,
     provider_direct_queued: BTreeSet<BatchId>,
-    provider_discovery_scan_complete: bool,
     provider_head_dirty: bool,
-    provider_current_head: Option<String>,
     provider_head_retirement: VecDeque<String>,
-    provider_pending: ProviderDependencyIndex,
-    provider_dependency_recheck_frontier: Option<ContentDigest>,
     provider_incomplete: BTreeSet<BatchId>,
     provider_incomplete_recheck: VecDeque<BatchId>,
     provider_accepted_archive_loss: BTreeSet<BatchId>,
     provider_accepted_manifest_audit: Option<ProviderAcceptedManifestAudit>,
-    provider_accepted_manifest_audit_covered_sequence: u64,
-    provider_accepted_manifest_revalidation_next_sequence: u64,
-    provider_accepted_manifest_revalidation_ready: bool,
-    provider_accepted_manifest_revalidation_after_external_tick: bool,
     provider_objects_changed: bool,
     provider_publication_probe: bool,
     provider_publication_cursor: Option<SharedProviderPublicationCursor>,
     provider_publication_forced: VecDeque<BatchId>,
     provider_descriptor_repair_requested: bool,
     provider_descriptor_republications: u32,
-    provider_namespace_repair_active: bool,
     provider_publication_repair_requested: bool,
     provider_publication_repair_cursor: Option<ObjectStoreManifestCursor>,
-    provider_recovery_coverage_root: Option<ProviderRecoveryCoverageRoot>,
     provider_recovery_exact: VecDeque<BatchId>,
     provider_recovery_backfill_requested: bool,
     provider_recovery_backfill_cursor: Option<ObjectStoreManifestCursor>,
-    pending_join: Option<PendingSharedJoin>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -12635,8 +12650,6 @@ impl RuntimeActor {
             graph,
             receipts,
             clean: Some(clean),
-            local_mutation: None,
-            correlated_move_feed_handoffs: BTreeSet::new(),
             managed_local: Some(managed_local),
             projection_turns: Some(projection_turns),
             move_episode_directory,
@@ -12668,7 +12681,6 @@ impl RuntimeActor {
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
             ),
-            startup_recovery_diagnostics: None,
             recovery,
             last_watcher,
             last_tick: None,
@@ -12679,15 +12691,11 @@ impl RuntimeActor {
             stopped_safe: false,
             enrollment_root,
             binding,
-            legacy_binding: None,
             clean_open_request: Some(request.clone()),
-            session_id: identities.session_id,
-            promotion_session_id: identities.session_id,
             promoted_state_digest,
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
             provider,
-            shared_descriptor: None,
             clean_shared_descriptor,
             shared_role,
             shared_phase,
@@ -12696,43 +12704,27 @@ impl RuntimeActor {
             provider_rescan_required_for_safe: false,
             provider_full_scan_requested: false,
             provider_observation_cursor: None,
-            provider_observation_full: false,
-            provider_scan_valid_heads: 0,
-            provider_scan_invalid_head: false,
-            provider_head_generations: BTreeMap::new(),
-            provider_own_heads: BTreeMap::new(),
             provider_direct_manifests: VecDeque::new(),
             pending_conflict_resolutions: VecDeque::new(),
             conflict_backlog_seeded: false,
             provider_direct_queued: BTreeSet::new(),
-            provider_discovery_scan_complete: false,
             provider_head_dirty: false,
-            provider_current_head: None,
             provider_head_retirement: VecDeque::new(),
-            provider_pending: ProviderDependencyIndex::default(),
-            provider_dependency_recheck_frontier: None,
             provider_incomplete: BTreeSet::new(),
             provider_incomplete_recheck: VecDeque::new(),
             provider_accepted_archive_loss: BTreeSet::new(),
             provider_accepted_manifest_audit: None,
-            provider_accepted_manifest_audit_covered_sequence: 0,
-            provider_accepted_manifest_revalidation_next_sequence: 1,
-            provider_accepted_manifest_revalidation_ready: false,
-            provider_accepted_manifest_revalidation_after_external_tick: false,
             provider_objects_changed: false,
             provider_publication_probe: false,
             provider_publication_cursor: None,
             provider_publication_forced: VecDeque::new(),
             provider_descriptor_repair_requested: false,
             provider_descriptor_republications: 0,
-            provider_namespace_repair_active: false,
             provider_publication_repair_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_publication_repair_cursor: None,
-            provider_recovery_coverage_root: None,
             provider_recovery_exact: VecDeque::new(),
             provider_recovery_backfill_requested: false,
             provider_recovery_backfill_cursor: None,
-            pending_join: None,
             _not_send_or_sync: PhantomData,
         };
         actor.admit_deferred_absence_observations()?;
@@ -18708,15 +18700,9 @@ impl RuntimeActor {
     fn settle_application_publication(
         &mut self,
         expected_batch_id: &str,
-        mut phase: SyncLocalMutationPhase,
+        phase: SyncLocalMutationPhase,
     ) -> Result<ApplicationPublicationSettlement, SyncApplicationPageRequestError> {
-        // The clean runtime and the legacy coordinator are two DIFFERENT
-        // retained-publication state machines. A clean runtime never populates
-        // `local_mutation`, so routing its retained work through the legacy
-        // settlement below can only ever refuse — which is precisely the
-        // Android defect this dispatch exists to prevent. Settle the clean
-        // actor on its own terms; never fabricate a `PendingLocalMutation` to
-        // satisfy the legacy check.
+        // The clean coordinator is the one retained-publication state machine.
         if self.clean.is_some() {
             return self.settle_clean_retained_publication(expected_batch_id, phase);
         }
@@ -19615,14 +19601,9 @@ impl RuntimeActor {
     /// ordinary save path remains the sole owner of those transitions.
     fn read_only_editor_turn_readiness(&self) -> EditorTurnReadiness {
         if self.terminal.is_some() {
-            let phase = if self.local_mutation.is_some() {
-                SyncLocalMutationPhase::Capture
-            } else {
-                SyncLocalMutationPhase::Bindings
-            };
             return EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
                 batch_id: None,
-                phase,
+                phase: SyncLocalMutationPhase::Bindings,
             });
         }
         if let Some(pending) = self.clean.as_ref().and_then(|clean| clean.pending.as_ref()) {
@@ -19644,14 +19625,9 @@ impl RuntimeActor {
 
     fn prepare_editor_turn(&mut self) -> EditorTurnReadiness {
         if self.terminal.is_some() {
-            let phase = if self.local_mutation.is_some() {
-                SyncLocalMutationPhase::Capture
-            } else {
-                SyncLocalMutationPhase::Bindings
-            };
             return EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
                 batch_id: None,
-                phase,
+                phase: SyncLocalMutationPhase::Bindings,
             });
         }
         if self.clean.is_some() {
@@ -19689,8 +19665,7 @@ impl RuntimeActor {
     }
 
     fn exact_projection_read_available(&self) -> bool {
-        self.local_mutation.is_none()
-            && self.terminal.is_none()
+        self.terminal.is_none()
             && self
                 .managed_local
                 .as_ref()
@@ -21064,7 +21039,6 @@ impl RuntimeActor {
             || self.provider_full_scan_requested
             || self.provider_observation_cursor.is_some()
             || !self.provider_direct_manifests.is_empty()
-            || !self.provider_pending.is_empty()
             || !self.provider_incomplete_recheck.is_empty()
             || !self.provider_accepted_archive_loss.is_empty()
             || self.provider_accepted_manifest_audit.is_some()
@@ -21917,12 +21891,10 @@ impl RuntimeActor {
         // A claim is valid only for the request that made it.
         self.clean_request_retained_batch = None;
         if self.terminal.is_some() {
-            let (batch_id, phase) = if self.local_mutation.is_some() {
-                (None, SyncLocalMutationPhase::Capture)
-            } else {
-                (None, SyncLocalMutationPhase::Bindings)
+            return SyncLocalMutationOutcome::Revoked {
+                batch_id: None,
+                phase: SyncLocalMutationPhase::Bindings,
             };
-            return SyncLocalMutationOutcome::Revoked { batch_id, phase };
         }
         if self.clean.is_some() {
             let turns = self
@@ -22501,7 +22473,7 @@ impl RuntimeActor {
     fn join_shared(
         &mut self,
         descriptor: SharedEnrollmentDescriptor,
-    ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
+    ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         match descriptor {
             SharedEnrollmentDescriptor::Legacy(descriptor) => {
                 let _ = descriptor;
@@ -22655,7 +22627,7 @@ impl RuntimeActor {
     fn join_shared_clean(
         &mut self,
         descriptor: CleanSharedEnrollmentDescriptorV1,
-    ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
+    ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         if let Some(detail) = &self.terminal {
             return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
         }
@@ -22703,6 +22675,7 @@ impl RuntimeActor {
             .active_engine()?
             .accepted_frontier_root()
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let mut installed_candidate = false;
         if marker.baseline_root() != descriptor.baseline_root()
             || marker.source_capture() != descriptor.source_capture()
             || frontier.state_digest() != descriptor.accepted_frontier_digest()
@@ -22741,9 +22714,37 @@ impl RuntimeActor {
             let local_semantics = clean_join_user_semantics(local_snapshot)?;
             let provider_semantics = clean_join_user_semantics(provider_snapshot)?;
             if let Some(diff) = clean_join_semantic_diff(&local_semantics, &provider_semantics) {
-                return Err(SyncRuntimeRequestError::ActorRefused(diff.to_string()));
+                // Provider history can legitimately advance this fresh
+                // activation's accepted frontier before explicit join. The
+                // private foreground journal is the authority for whether the
+                // joiner itself has authored any accepted edit since activation.
+                let local_is_activation_baseline = self
+                    .managed_local
+                    .as_ref()
+                    .is_some_and(|managed| managed.journal.next_sequence() == 0);
+                if !clean_join_semantics_match_with_shared_path_authority(
+                    &self.graph,
+                    &local_semantics,
+                    &provider_semantics,
+                    local_is_activation_baseline,
+                )? {
+                    return Err(SyncRuntimeRequestError::ActorRefused(diff.to_string()));
+                }
             }
             self.install_clean_join_candidate(&descriptor, candidate, marker)?;
+            installed_candidate = true;
+        }
+        // Candidate installation seeds a full reconciliation scan. Drain it
+        // before the durable enrollment cut so a timeout or blocked tick is an
+        // honest pre-commit refusal. Once the cut below is published, the join
+        // must never be reported as failed.
+        if let Err(error) = self.clean_shutdown() {
+            if installed_candidate {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean join installed the provider authority but could not settle its pre-enrollment reconciliation; no shared enrollment was committed, and retry will resume from the installed authority: {error}"
+                )));
+            }
+            return Err(error);
         }
         #[cfg(test)]
         pause_shared_join_for_test(
@@ -22752,14 +22753,14 @@ impl RuntimeActor {
         );
         let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Joiner)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let public_descriptor = SyncSharedEnrollmentDescriptor::from_clean(descriptor.clone())
+            .map_err(SyncRuntimeRequestError::ActorRefused)?;
         publish_clean_shared_state(self.enrollment_root.path(), &state)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         self.clean_shared_descriptor = Some(descriptor.clone());
         self.shared_role = Some(SyncSharedRole::Joiner);
         self.shared_phase = Some(SyncSharedPhase::Active);
-        SyncSharedEnrollmentDescriptor::from_clean(descriptor)
-            .map(SharedJoinStep::Complete)
-            .map_err(SyncRuntimeRequestError::ActorRefused)
+        Ok(public_descriptor)
     }
 
     fn refresh_watcher(&mut self) {
@@ -22789,8 +22790,7 @@ impl RuntimeActor {
             }),
             shared_role: self.shared_role,
             shared_phase: self.shared_phase,
-            provider_pending: self.provider_pending.len()
-                + self.provider_exact.len()
+            provider_pending: self.provider_exact.len()
                 + self.provider_direct_manifests.len()
                 + self.provider_incomplete.len()
                 + self.provider_incomplete_recheck.len()
@@ -24909,6 +24909,10 @@ mod tests {
                         uuid.map(|value| LogseqUuid::from_uuid(Uuid::from_u128(value))),
                     )
                 })
+                .collect(),
+            projected_ids: outline
+                .iter()
+                .map(|(_, _, uuid)| uuid.map(|value| LogseqUuid::from_uuid(Uuid::from_u128(value))))
                 .collect(),
         }
     }
@@ -30995,7 +30999,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_runtime_actor_assembles_without_legacy_authority_and_saves_one_edit() {
+    fn clean_runtime_actor_assembles_one_current_authority_and_saves_one_edit() {
         let fixture = ActivationFixture::nested_unicode("clean-runtime-actor", 0xa176);
         let graph = Graph::open_checked(&fixture.graph_root).unwrap();
         let resources =
@@ -31032,7 +31036,6 @@ mod tests {
         )
         .unwrap();
         assert!(actor.clean.is_some());
-        assert!(actor.legacy_binding.is_none());
         let saved = actor
             .execute_clean_editor_transaction(transaction, page_id, vec![page_id.to_string()])
             .unwrap();
@@ -32350,7 +32353,7 @@ mod tests {
             .split_once("fn run_actor_loop(")
             .unwrap()
             .1
-            .split_once("enum PendingLocalMutation")
+            .split_once("enum PendingManagedLocalCommit")
             .unwrap()
             .0;
         assert!(
@@ -35150,6 +35153,101 @@ mod tests {
             ) && detail.contains("->"),
             "the refusal must name the operation and both names: {detail}"
         );
+    }
+
+    #[test]
+    fn duplicate_path_join_exception_is_fresh_activation_only_and_fails_closed() {
+        let (root, request) = empty_request(SyncStorageProfile::ExperimentalLocal);
+        let owner_path = "pages/Denn\u{ed} pozn\u{e1}mky.md";
+        let backup_path = "archiv/2026/Denn\u{ed} pozn\u{e1}mky.md";
+        fs::create_dir_all(request.graph_root.join("pages")).unwrap();
+        fs::create_dir_all(request.graph_root.join("archiv/2026")).unwrap();
+        fs::write(
+            request.graph_root.join(owner_path),
+            b"- authoritative page\n  id:: 00000000-0000-4000-8000-000000000123\n",
+        )
+        .unwrap();
+        fs::write(
+            request.graph_root.join(backup_path),
+            b"- intentionally different backup\n",
+        )
+        .unwrap();
+        let graph = Graph::open_checked(&request.graph_root).unwrap();
+        let (mut shared_page, _) = clean_join_disk_page(&graph, owner_path).unwrap();
+        let (local_page, _) = clean_join_disk_page(&graph, backup_path).unwrap();
+
+        // Canonical snapshots hide policy-generated anchors. The disk probe may
+        // see one, but every user-authored byte/shape still has to match.
+        shared_page.outline[0].1 = "authoritative page".into();
+        shared_page.outline[0].2 = None;
+        assert!(clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[local_page],
+            &[shared_page],
+            true,
+        )
+        .unwrap());
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[clean_join_disk_page(&graph, backup_path).unwrap().0],
+            &[clean_join_disk_page(&graph, owner_path).unwrap().0],
+            false,
+        )
+        .unwrap());
+
+        let stale_local_page = clean_join_disk_page(&graph, backup_path).unwrap().0;
+        fs::write(
+            request.graph_root.join(backup_path),
+            b"- backup changed after its accepted observation\n",
+        )
+        .unwrap();
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[stale_local_page],
+            &[clean_join_disk_page(&graph, owner_path).unwrap().0],
+            true,
+        )
+        .unwrap());
+        fs::write(
+            request.graph_root.join(backup_path),
+            b"- intentionally different backup\n",
+        )
+        .unwrap();
+
+        fs::write(
+            request.graph_root.join(owner_path),
+            b"- provider-selected path changed locally\n",
+        )
+        .unwrap();
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[clean_join_disk_page(&graph, backup_path).unwrap().0],
+            &[CleanJoinUserPage {
+                path: owner_path.into(),
+                kind: ManagedTextKind::Page,
+                preamble: None,
+                outline: vec![(0, "authoritative page".into(), None)],
+                projected_ids: vec![None],
+            }],
+            true,
+        )
+        .unwrap());
+
+        fs::remove_file(request.graph_root.join(owner_path)).unwrap();
+        assert!(!clean_join_semantics_match_with_shared_path_authority(
+            &graph,
+            &[clean_join_disk_page(&graph, backup_path).unwrap().0],
+            &[CleanJoinUserPage {
+                path: owner_path.into(),
+                kind: ManagedTextKind::Page,
+                preamble: None,
+                outline: vec![(0, "authoritative page".into(), None)],
+                projected_ids: vec![None],
+            }],
+            true,
+        )
+        .expect("an absent provider-selected path must preserve the semantic diff"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -48813,14 +48911,6 @@ mod tests {
             after.graph_wide.since(before.graph_wide),
             GraphWideCommitWork::default(),
             "ordinary application save performed graph-wide foreground work"
-        );
-        assert_eq!(
-            after.provider_pending, before.provider_pending,
-            "ordinary application save must not enqueue provider work"
-        );
-        assert_eq!(
-            after.provider_pending, 0,
-            "the benchmark starts each timed save with settled provider work"
         );
 
         let before_engine = before.engine;

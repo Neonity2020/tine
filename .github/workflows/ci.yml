@@ -431,7 +431,7 @@ jobs:
   # It is mandatory for a frozen full release candidate and remains available
   # as a focused Android lane between releases.
   android-managed-storage-runtime:
-    name: Android runtime / managed activation, crash recovery, share setup, shutdown, and reopen
+    name: Android runtime / managed activation, share, join, reopen, and Return to Direct Files
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')
     runs-on: ubuntu-22.04
     steps:
