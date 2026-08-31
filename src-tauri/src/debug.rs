@@ -356,9 +356,10 @@ pub(crate) fn mark_clean_shutdown() {
 /// Desktop deliberately ignores this. There an occluded or minimised window is
 /// still a running session, `RunEvent::Exit` already provides the orderly end
 /// (see `run()` in lib.rs), and honouring visibility would hide exactly the
-/// background crashes the recorder exists to catch. `desktop_never_ends_a_session_on_visibility`
-/// holds that half; the frontend caller is gated too (`src/sessionActivity.ts`),
-/// which is where the mobile half of the decision is testable.
+/// background crashes the recorder exists to catch.
+/// `visibility_ends_a_session_only_where_the_os_reaps_backgrounded_apps` holds
+/// that half; the frontend caller is gated too (`src/sessionActivity.ts`),
+/// which is where both platform branches are testable at runtime.
 #[tauri::command]
 pub(crate) fn diagnostic_session_active(active: bool) {
     if !cfg!(mobile) {
