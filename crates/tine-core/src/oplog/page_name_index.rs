@@ -3,20 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::object_store::{
-    ensure_reconstructible_directory_nofollow, open_dir_nofollow, publish_immutable_exact,
-    read_optional_regular, StoreError,
-};
-use super::scratch_store::{ScratchLsmRoot, ScratchPageKind, ScratchStore};
-use super::sync_layout::{
-    PAGE_NAME_EXACT_BLOB_SUFFIX as EXACT_NAME_BLOB_SUFFIX,
-    PAGE_NAME_EXACT_NAMES_DIR as EXACT_NAMES_DIR, PAGE_NAME_NODES_DIR as NODES_DIR,
-    PAGE_NAME_STORE_CLAIM_FILE as STORE_CLAIM_FILE,
-};
+use super::object_store::StoreError;
 use super::{
     BatchCausalDot, BatchId, ContentDigest, DocumentCausalDigest, DocumentDependencies, DocumentId,
     FrontierV2, LogicalPageName, PageDelta, PageId, PageNameKeyDigest, PageState,
@@ -38,7 +28,6 @@ const MAX_EPHEMERAL_PAGE_NAME_RECORDS: usize = 4_096;
 
 const MAX_EXACT_NAME_BLOB_BYTES: u64 = 4 * 1024 * 1024 + 1024;
 const MAX_INLINE_EXACT_NAME_BYTES: usize = 64 * 1024;
-const PAGE_NAME_INDEX_DOMAIN: &[u8] = b"tine/page-name-ownership-index/v2";
 
 /// Opaque bounded page-name view extracted from one authenticated exact
 /// catalog checkpoint.
@@ -55,22 +44,6 @@ pub(crate) struct AuthenticatedCatalogPageNameCheckpointV1 {
 }
 
 impl AuthenticatedCatalogPageNameCheckpointV1 {
-    pub(crate) const fn catalog_document_id(&self) -> DocumentId {
-        self.catalog_document_id
-    }
-
-    pub(crate) const fn catalog_causal_digest(&self) -> DocumentCausalDigest {
-        self.catalog_causal_digest
-    }
-
-    pub(crate) const fn catalog_checkpoint_binding(&self) -> ContentDigest {
-        self.catalog_checkpoint_binding
-    }
-
-    pub(crate) const fn catalog_checkpoint_content_digest(&self) -> ContentDigest {
-        self.catalog_checkpoint_content_digest
-    }
-
     /// Reuse the bounded observations only after the caller has independently
     /// proven that current catalog authority is exactly this authenticated
     /// frontier. The authenticated checkpoint itself remains the persistent
@@ -515,14 +488,6 @@ pub(crate) struct AuthenticatedPageNameExactStateV1 {
 }
 
 impl PageNamePublicationCandidateV1 {
-    pub(crate) fn unchanged(root: PageNameOwnershipRootV1) -> Self {
-        Self {
-            root,
-            conflicts: Vec::new(),
-            ephemeral: None,
-        }
-    }
-
     pub(crate) fn authenticated_ephemeral_exact_state(
         &self,
         prior: &EphemeralPageNameOwnershipStateV1,
@@ -573,10 +538,6 @@ impl AuthenticatedPageNameExactStateV1 {
 
     pub(crate) const fn exact_state_batch(&self) -> BatchId {
         self.exact_state_batch
-    }
-
-    pub(crate) fn revises_acquired_exact_name(&self) -> bool {
-        self.exact_state_batch != self.acquisition_batch
     }
 
     pub(crate) const fn exact_state_dot(&self) -> BatchCausalDot {
@@ -1434,13 +1395,6 @@ impl PageNameOwnershipRecordV1 {
 
     pub const fn latest_release(&self) -> Option<&PageNameOwnershipReleasedV1> {
         self.latest_release.as_ref()
-    }
-
-    /// Canonical opaque bytes used while SQLite shadows and replaces the
-    /// Patricia point map. Domain interpretation remains in tine-core.
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, StoreError> {
-        self.validate_shape(self.key_digest)?;
-        encode_canonical(self)
     }
 
     fn validate_shape(&self, expected_key: PageNameKeyDigest) -> Result<(), StoreError> {

@@ -27,7 +27,6 @@ use super::lazy_genesis::{
 #[cfg(test)]
 use super::local_completion_index::{LocalCompletionFlushStats, LocalCompletionOpenStats};
 use super::local_completion_index::{LocalCompletionIndex, LocalCompletionPruningContext};
-use super::object_store::{BlockClaimIndexRoot, BlockClaimIndexValue};
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
     extract_semantic_page_name_observations, extract_validated_catalog_page_names,
@@ -94,7 +93,6 @@ const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
 const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
 const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 14;
-const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
 pub(crate) const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 8;
 pub(crate) const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
@@ -1037,7 +1035,6 @@ struct ValidatedReferenceSourceSnapshot {
 struct IdentityPublicationCandidate {
     blocked: bool,
     scratch_roots: ScratchRoots,
-    block_claim_root: BlockClaimIndexRoot,
     ephemeral_block_claims: Vec<(u128, BTreeSet<ImmutableHomeClaim>)>,
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
@@ -1128,32 +1125,12 @@ impl PortablePathConflict {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BlockClaimRecord {
-    schema_version: u32,
-    block_id: BlockId,
-    claims: Vec<ImmutableHomeClaim>,
-}
-
-#[derive(Serialize)]
-struct BlockClaimRecordRef<'a> {
-    schema_version: u32,
-    block_id: BlockId,
-    claims: &'a [ImmutableHomeClaim],
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 struct LogseqClaimIntroduction {
     block_id: BlockId,
     home_document_id: DocumentId,
     batch_id: BatchId,
     causal_dot: BatchCausalDot,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct LogseqClaimIntroductionRecord {
-    schema_version: u32,
-    introduction: LogseqClaimIntroduction,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -6787,7 +6764,6 @@ pub struct ShardedHotEngine {
     // Authenticated point-validation evidence, never a live owner authority.
     // Store-backed engines retain only this root; the sole live owner remains
     // in the immutable home shard. The bounded map is a no-store test harness.
-    block_claim_root: BlockClaimIndexRoot,
     ephemeral_block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
     logseq_claim_root: LogseqClaimIndexRoot,
     ephemeral_logseq_claims: BTreeMap<LogseqUuid, LogseqClaimRecord>,
@@ -7003,7 +6979,6 @@ impl ShardedHotEngine {
             persisted_staged: BTreeSet::new(),
             statuses: BTreeMap::new(),
             staged_batches: BTreeSet::new(),
-            block_claim_root: BlockClaimIndexRoot::default(),
             ephemeral_block_claims: AHashMap::new(),
             logseq_claim_root,
             ephemeral_logseq_claims: BTreeMap::new(),
@@ -23763,7 +23738,6 @@ impl ShardedHotEngine {
     }
 
     fn commit_identity_publication(&mut self, candidate: IdentityPublicationCandidate) {
-        self.block_claim_root = candidate.block_claim_root;
         for (block_key, claims) in candidate.ephemeral_block_claims {
             self.ephemeral_block_claims.insert(block_key, claims);
         }
@@ -25493,22 +25467,15 @@ impl ShardedHotEngine {
         // first observed after it.
         drop(candidate_keys);
         let encode_started = Instant::now();
-        let mut changed = Vec::with_capacity(candidates.len());
         let mut changed_claims = Vec::with_capacity(candidates.len());
         for (block_key, block_id, claim) in candidates {
             let mut claims = existing_by_key.remove(&block_key).unwrap_or_default();
             claims.insert(claim);
-            changed.push((
-                block_id.as_uuid().into_bytes(),
-                BlockClaimIndexValue::from_vec(encode_block_claim_record(block_id, &claims)?),
-            ));
             changed_claims.push((block_id, claims));
         }
-        changed.sort_unstable_by_key(|(key, _)| *key);
         let encode_nanos =
             usize::try_from(encode_started.elapsed().as_nanos()).unwrap_or(usize::MAX);
         let insert_started = Instant::now();
-        let candidate_block_claim_root = self.block_claim_root;
         let novel = changed_claims
             .iter()
             .filter(|(block_id, _)| {
@@ -25586,7 +25553,6 @@ impl ShardedHotEngine {
         Ok(IdentityPublicationCandidate {
             blocked: candidate_fatal_handle.is_some() || candidate_fatal_evidence.is_some(),
             scratch_roots: candidate_roots,
-            block_claim_root: candidate_block_claim_root,
             ephemeral_block_claims,
             fatal_evidence: candidate_fatal_evidence,
             fatal_handle: candidate_fatal_handle,
@@ -27965,118 +27931,6 @@ fn materialize_accepted_frontier(
     FrontierV2::new(documents).map_err(EngineError::from)
 }
 
-fn encode_block_claim_record(
-    block_id: BlockId,
-    claims: &BTreeSet<ImmutableHomeClaim>,
-) -> Result<Vec<u8>, EngineError> {
-    let claims: Vec<_> = claims.iter().copied().collect();
-    encode_block_claim_record_slice(block_id, &claims)
-}
-
-fn encode_block_claim_record_slice(
-    block_id: BlockId,
-    claims: &[ImmutableHomeClaim],
-) -> Result<Vec<u8>, EngineError> {
-    if claims.is_empty() || !strictly_sorted(claims) {
-        return Err(EngineError::Archive(
-            "block-claim record claims must be nonempty and canonical".into(),
-        ));
-    }
-    postcard::to_allocvec(&BlockClaimRecordRef {
-        schema_version: BLOCK_CLAIM_RECORD_SCHEMA_VERSION,
-        block_id,
-        claims,
-    })
-    .map_err(|error| EngineError::Archive(error.to_string()))
-}
-
-fn encode_inline_block_claim_index_value(
-    block_id: BlockId,
-    claim: ImmutableHomeClaim,
-) -> Result<BlockClaimIndexValue, EngineError> {
-    let mut buffer = [0_u8; 128];
-    let encoded = postcard::to_slice(
-        &BlockClaimRecordRef {
-            schema_version: BLOCK_CLAIM_RECORD_SCHEMA_VERSION,
-            block_id,
-            claims: &[claim],
-        },
-        &mut buffer,
-    )
-    .map_err(|error| EngineError::Archive(error.to_string()))?;
-    Ok(BlockClaimIndexValue::from_slice(encoded))
-}
-
-fn decode_block_claim_record(
-    expected_block_id: BlockId,
-    bytes: &[u8],
-) -> Result<BlockClaimRecord, EngineError> {
-    let record: BlockClaimRecord =
-        postcard::from_bytes(bytes).map_err(|error| EngineError::Archive(error.to_string()))?;
-    if record.schema_version != BLOCK_CLAIM_RECORD_SCHEMA_VERSION
-        || record.block_id != expected_block_id
-        || record.claims.is_empty()
-        || !strictly_sorted(&record.claims)
-        || postcard::to_allocvec(&record)
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            != bytes
-    {
-        return Err(EngineError::Archive(
-            "non-canonical or misbound block-claim record".into(),
-        ));
-    }
-    Ok(record)
-}
-
-fn logseq_claim_introduction_key(
-    logseq_uuid: LogseqUuid,
-    introduction: LogseqClaimIntroduction,
-) -> Vec<u8> {
-    let mut key = Vec::with_capacity(88);
-    key.extend_from_slice(logseq_uuid.as_uuid().as_bytes());
-    key.extend_from_slice(introduction.block_id.as_uuid().as_bytes());
-    key.extend_from_slice(introduction.home_document_id.as_uuid().as_bytes());
-    key.extend_from_slice(introduction.batch_id.as_uuid().as_bytes());
-    key.extend_from_slice(
-        introduction
-            .causal_dot
-            .peer_id()
-            .as_device_id()
-            .as_uuid()
-            .as_bytes(),
-    );
-    key.extend_from_slice(&introduction.causal_dot.counter().to_be_bytes());
-    key
-}
-
-fn encode_logseq_claim_introduction(
-    introduction: LogseqClaimIntroduction,
-) -> Result<Vec<u8>, EngineError> {
-    postcard::to_allocvec(&LogseqClaimIntroductionRecord {
-        schema_version: LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION,
-        introduction,
-    })
-    .map_err(|error| EngineError::Archive(error.to_string()))
-}
-
-fn decode_logseq_claim_introduction(
-    expected_uuid: LogseqUuid,
-    key: &[u8],
-    bytes: &[u8],
-) -> Result<LogseqClaimIntroduction, EngineError> {
-    let record: LogseqClaimIntroductionRecord =
-        postcard::from_bytes(bytes).map_err(|error| EngineError::Archive(error.to_string()))?;
-    if record.schema_version != LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION
-        || logseq_claim_introduction_key(expected_uuid, record.introduction) != key
-        || encode_logseq_claim_introduction(record.introduction)?.as_slice() != bytes
-    {
-        return Err(EngineError::Archive(
-            "non-canonical or misbound Logseq claim introduction".into(),
-        ));
-    }
-    Ok(record.introduction)
-}
-
 fn new_history_record(
     generation: u64,
     batch_id: BatchId,
@@ -28100,17 +27954,6 @@ fn new_history_record(
         logseq_claim_root,
         reference_catalog_policy,
         status,
-    }
-}
-
-fn history_record_binding(record: &ColdHistoryRecord) -> super::object_store::EngineHistoryBinding {
-    super::object_store::EngineHistoryBinding {
-        portable_path_key_version: record.portable_path_key_version,
-        portable_path_root: record.portable_path_root.digest(),
-        catalog_checkpoint_binding: record.catalog_checkpoint_binding,
-        portable_path_conflicts: record.portable_path_conflicts.clone(),
-        terminal_evidence: record.terminal_evidence,
-        page_names: record.page_names.clone(),
     }
 }
 
@@ -30652,7 +30495,6 @@ mod validation_tests {
         persisted_staged: BTreeSet<BatchId>,
         statuses: BTreeMap<BatchId, ArchiveStatus>,
         staged_batches: BTreeSet<BatchId>,
-        block_claim_root: BlockClaimIndexRoot,
         ephemeral_block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
         logseq_claim_root: LogseqClaimIndexRoot,
         ephemeral_logseq_claims: BTreeMap<LogseqUuid, LogseqClaimRecord>,
@@ -30712,7 +30554,6 @@ mod validation_tests {
             persisted_staged: engine.persisted_staged.clone(),
             statuses: engine.statuses.clone(),
             staged_batches: engine.staged_batches.clone(),
-            block_claim_root: engine.block_claim_root,
             ephemeral_block_claims: engine.ephemeral_block_claims.clone(),
             logseq_claim_root: engine.logseq_claim_root,
             ephemeral_logseq_claims: engine.ephemeral_logseq_claims.clone(),
@@ -32443,40 +32284,6 @@ mod validation_tests {
             ),
             Err(EngineError::MissingCrdtDependencies(_))
         ));
-    }
-
-    #[test]
-    fn block_claim_records_are_canonical_sorted_and_key_bound() {
-        let block_id = BlockId::from_uuid(Uuid::from_u128(42));
-        let other_block_id = BlockId::from_uuid(Uuid::from_u128(43));
-        let claim_a = ImmutableHomeClaim::new(
-            BatchId::from_uuid(Uuid::from_u128(44)),
-            DocumentId::from_uuid(Uuid::from_u128(45)),
-        );
-        let claim_b = ImmutableHomeClaim::new(
-            BatchId::from_uuid(Uuid::from_u128(46)),
-            DocumentId::from_uuid(Uuid::from_u128(47)),
-        );
-        let claims = BTreeSet::from([claim_a, claim_b]);
-        let bytes = encode_block_claim_record(block_id, &claims).unwrap();
-        assert_eq!(
-            decode_block_claim_record(block_id, &bytes).unwrap().claims,
-            vec![claim_a, claim_b]
-        );
-        assert!(decode_block_claim_record(other_block_id, &bytes).is_err());
-
-        let mut trailing = bytes;
-        trailing.push(0);
-        assert!(decode_block_claim_record(block_id, &trailing).is_err());
-        for malformed_claims in [vec![], vec![claim_a, claim_a], vec![claim_b, claim_a]] {
-            let malformed = postcard::to_allocvec(&BlockClaimRecord {
-                schema_version: BLOCK_CLAIM_RECORD_SCHEMA_VERSION,
-                block_id,
-                claims: malformed_claims,
-            })
-            .unwrap();
-            assert!(decode_block_claim_record(block_id, &malformed).is_err());
-        }
     }
 
     #[test]
@@ -35278,7 +35085,6 @@ mod validation_tests {
         let prior_fatal_handle = receiver.fatal_handle;
         let prior_fatal_evidence = receiver.fatal_evidence.clone();
         let prior_roots = receiver.scratch_roots.clone();
-        let prior_block_claim_root = receiver.block_claim_root;
         let prior_blocked = receiver.is_blocked();
         let prior_status = receiver.workspace_status();
 
@@ -35301,7 +35107,6 @@ mod validation_tests {
         assert_eq!(receiver.logseq_claim_root, prior_logseq_claim_root);
         assert_eq!(receiver.fatal_handle, prior_fatal_handle);
         assert_eq!(receiver.fatal_evidence, prior_fatal_evidence);
-        assert_eq!(receiver.block_claim_root, prior_block_claim_root);
         assert_eq!(
             receiver.scratch_roots.external_document_current_root,
             prior_roots.external_document_current_root
@@ -35593,7 +35398,6 @@ mod validation_tests {
         let prior_snapshot = engine.canonical_snapshot().unwrap();
         let prior_accepted = engine.status().accepted_batch_ids().unwrap();
         let prior_roots = engine.scratch_roots.clone();
-        let prior_claim_root = engine.block_claim_root;
         let prior_logseq_claim_root = engine.logseq_claim_root;
         let prior_fatal_handle = engine.fatal_handle;
         let prior_fatal_evidence = engine.fatal_evidence.clone();
@@ -35644,7 +35448,6 @@ mod validation_tests {
             engine.status().accepted_batch_ids().unwrap(),
             prior_accepted
         );
-        assert_eq!(engine.block_claim_root, prior_claim_root);
         assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
         assert_eq!(engine.fatal_handle, prior_fatal_handle);
         assert_eq!(engine.fatal_evidence, prior_fatal_evidence);
@@ -36150,7 +35953,7 @@ mod replay_benchmark {
             .saturating_add(replay_timing.checkpoint_blob_append_nanos)
             .saturating_add(replay_timing.checkpoint_whole_digest_nanos);
         eprintln!(
-            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_insert_ms={:.3} claim_index_reads={} claim_index_writes={} claim_index_syncs={} claim_hot_entries={} owned_semantic_snapshot_entries={}",
+            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_insert_ms={:.3} claim_hot_entries={} owned_semantic_snapshot_entries={}",
             replay.status().accepted_batch_ids().unwrap().len(),
             elapsed.as_secs_f64() * 1_000.0,
             inspection_elapsed.as_secs_f64() * 1_000.0,
@@ -36160,9 +35963,6 @@ mod replay_benchmark {
             instrumentation.block_claim_lookup_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_encode_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_insert_nanos as f64 / 1_000_000.0,
-            instrumentation.store.block_claim_index_reads,
-            instrumentation.store.block_claim_index_writes,
-            instrumentation.store.block_claim_index_syncs,
             instrumentation.block_claim_hot_entries,
             owned_semantic_snapshot_entries(),
         );

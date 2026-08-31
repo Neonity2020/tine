@@ -3421,10 +3421,7 @@ fn crossed_concurrent_identity_collisions_converge_live_and_from_fresh_store() {
         for batch_id in order {
             receiver.stage_archive_batch(batch_id).unwrap();
         }
-        let instrumentation = receiver.instrumentation();
-        assert_eq!(instrumentation.block_claim_hot_entries, 0);
-        assert!(instrumentation.store.block_claim_index_reads > 0);
-        assert!(instrumentation.store.block_claim_index_writes > 0);
+        assert_eq!(receiver.instrumentation().block_claim_hot_entries, 0);
         assert_eq!(receiver.fatal_evidence(), None);
         let first = receiver.fatal_evidence_page(None, 1).unwrap().unwrap();
         assert_eq!(first.conflicts().len(), 1);
@@ -3509,7 +3506,6 @@ fn concurrent_same_home_duplicate_creation_converges_after_fresh_replay() {
         }
         assert_eq!(replay.fatal_evidence(), None);
         assert_eq!(replay.instrumentation().block_claim_hot_entries, 0);
-        assert!(replay.instrumentation().store.block_claim_index_reads > 0);
         snapshots.push(replay.canonical_snapshot().unwrap());
     }
     assert_eq!(snapshots[0], snapshots[1]);

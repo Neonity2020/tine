@@ -231,20 +231,18 @@ fn classify_archive_error(error: StoreError) -> DiscoveryClassification {
         StoreError::Io(_) => {
             DiscoveryClassification::Retryable(DiscoveryComponent::Archive, detail)
         }
-        StoreError::UpgradeRequired { .. }
-        | StoreError::UnsupportedStoreVersion { .. }
-        | StoreError::UnsupportedPromotedRuntimeSchema(_) => {
+        StoreError::UpgradeRequired { .. } | StoreError::UnsupportedStoreVersion { .. } => {
             DiscoveryClassification::UnsupportedOrIncompatible(
                 DiscoveryComponent::Archive,
                 ManagedStorageRefusalScenario::ProtocolIncompatible,
             )
         }
-        StoreError::PromotedRuntimeStateMismatch(_)
-        | StoreError::WorkspaceMismatch { .. }
-        | StoreError::LineageMismatch { .. } => DiscoveryClassification::AmbiguousOrForeignResidue(
-            AmbiguousEvidence::ArchiveBinding,
-            ManagedStorageRefusalScenario::SyncConflict,
-        ),
+        StoreError::WorkspaceMismatch { .. } | StoreError::LineageMismatch { .. } => {
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                AmbiguousEvidence::ArchiveBinding,
+                ManagedStorageRefusalScenario::SyncConflict,
+            )
+        }
         StoreError::UnsafeEntry(_) => DiscoveryClassification::AmbiguousOrForeignResidue(
             AmbiguousEvidence::ArchiveNamespace,
             ManagedStorageRefusalScenario::UnsafeFilesystemKind,
@@ -259,19 +257,13 @@ fn classify_archive_error(error: StoreError) -> DiscoveryClassification {
                 ManagedStorageRefusalScenario::Bounds,
             )
         }
-        StoreError::CompetingRuntimePromotion => {
-            DiscoveryClassification::Retryable(DiscoveryComponent::Archive, detail)
-        }
         StoreError::ObjectCollision(_)
         | StoreError::BatchCollision(_)
         | StoreError::LineageClaimCollision(_)
-        | StoreError::ImmutableCollision(_)
-        | StoreError::BootstrapArtifactCollision { .. } => {
-            DiscoveryClassification::CorruptOrUnreadable(
-                DiscoveryComponent::Archive,
-                ManagedStorageRefusalScenario::SyncConflict,
-            )
-        }
+        | StoreError::ImmutableCollision(_) => DiscoveryClassification::CorruptOrUnreadable(
+            DiscoveryComponent::Archive,
+            ManagedStorageRefusalScenario::SyncConflict,
+        ),
         _ => DiscoveryClassification::CorruptOrUnreadable(
             DiscoveryComponent::Archive,
             ManagedStorageRefusalScenario::DiskCorrupt,

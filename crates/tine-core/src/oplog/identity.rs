@@ -226,59 +226,6 @@ impl ImportId {
     }
 }
 
-/// Deterministic identity of one bounded multipart bootstrap-import part.
-///
-/// This stays crate-private until the later import and receipt packets define
-/// the durable authority that is allowed to publish one.  It deliberately uses
-/// a full digest rather than the UUID namespace used by ordinary batch IDs.
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BootstrapPartId([u8; 32]);
-
-impl BootstrapPartId {
-    pub(crate) fn derive(
-        import_id: ImportId,
-        profile_digest: &[u8; 32],
-        ordinal: u32,
-        source_span_root: &[u8; 32],
-        operation_root: &[u8; 32],
-    ) -> Self {
-        let mut hasher = Sha256::new();
-        let ordinal_bytes = ordinal.to_be_bytes();
-        hasher.update(b"tine/bootstrap-import/part-id/v1\0");
-        for part in [
-            import_id.as_bytes().as_slice(),
-            profile_digest.as_slice(),
-            ordinal_bytes.as_slice(),
-            source_span_root.as_slice(),
-            operation_root.as_slice(),
-        ] {
-            hasher.update((part.len() as u64).to_be_bytes());
-            hasher.update(part);
-        }
-        Self(hasher.finalize().into())
-    }
-
-    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
-    }
-
-    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for BootstrapPartId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BootstrapPartId({self})")
-    }
-}
-
-impl fmt::Display for BootstrapPartId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(&self.0, f)
-    }
-}
-
 /// Stable identity of one canonical graph-root filesystem resource.
 ///
 /// The digest is derived only from a retained no-follow directory capability:
@@ -518,18 +465,6 @@ impl BatchId {
             &[import_id.as_bytes()],
         ))
     }
-
-    /// Derive the batch identity bound to one multipart bootstrap-import part.
-    ///
-    /// This is intentionally separate from `for_import`: an import transaction
-    /// retains its existing singleton batch identity, while each bootstrap part
-    /// has an independently bound identity.
-    pub(crate) fn for_bootstrap_part(part_id: BootstrapPartId) -> Self {
-        Self(derived_uuid(
-            b"tine/bootstrap-import/part-batch-id/v1\0",
-            &[part_id.as_bytes()],
-        ))
-    }
 }
 
 impl DocumentId {
@@ -572,16 +507,6 @@ impl DocumentId {
         Self(derived_uuid(
             b"tine/import/external-observation-document-id/v1\0",
             &[workspace_id.as_uuid().as_bytes(), import_id.as_bytes()],
-        ))
-    }
-}
-
-impl DeviceId {
-    /// Derive the synthetic external author device for a workspace.
-    pub(crate) fn for_external_import_author(workspace_id: WorkspaceId) -> Self {
-        Self(derived_uuid(
-            b"tine/import/external-author-device-id/v1\0",
-            &[workspace_id.as_uuid().as_bytes()],
         ))
     }
 }
@@ -729,7 +654,6 @@ mod tests {
         let workspace = workspace();
         let import = import_id();
         let home = DocumentId::for_unmatched_import_page(workspace, b"pages/nested/naive.md");
-        let device = DeviceId::for_external_import_author(workspace);
         let session = SessionId::for_external_import_author(workspace, import);
         let observation = DocumentId::for_external_import_observation(workspace, import);
         let peer = CrdtPeerId::external_import_candidate(workspace, import, 7);
@@ -738,7 +662,6 @@ mod tests {
             home,
             DocumentId::for_unmatched_import_page(workspace, b"pages/nested/naive.md")
         );
-        assert_eq!(device, DeviceId::for_external_import_author(workspace));
         assert_eq!(
             session,
             SessionId::for_external_import_author(workspace, import)
@@ -754,7 +677,6 @@ mod tests {
 
         let rendered = [
             home.to_string(),
-            device.to_string(),
             session.to_string(),
             observation.to_string(),
             peer.to_string(),
@@ -770,7 +692,6 @@ mod tests {
         );
 
         assert_eq!(home.to_string(), "737b3bff-157d-8cfe-a3e8-be0ca069e2d6");
-        assert_eq!(device.to_string(), "6c3c7276-a0d6-803e-9e0c-e24f8b58d13c");
         assert_eq!(session.to_string(), "5e69f6b5-0b83-8916-904c-36f09da566e1");
         assert_eq!(
             observation.to_string(),

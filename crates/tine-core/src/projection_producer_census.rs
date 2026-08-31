@@ -1261,7 +1261,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("stage_manifest_bytes", 1),
         ("stage", 18),
         ("commit", 6),
-        ("publish_immutable", 8),
+        ("publish_immutable", 7),
         ("install_staged_artifact", 1),
         ("replace_head", 1),
         ("ensure_shared_provider_directory", 4),
@@ -1522,7 +1522,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.2\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "dcfe086b976b2bcb7c6ad9e8b3084943edce1be3dc2c2098c3cabe77c238e43f",
+        "d963a0a594241fcfe997f885b42d3aab43236070f41c06e1eb61fe9d9a5d9a1a",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

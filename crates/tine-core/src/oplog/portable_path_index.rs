@@ -195,20 +195,3 @@ fn exact_path_digest(path: &ManagedPath) -> ContentDigest {
     bytes.extend_from_slice(path.as_str().as_bytes());
     ContentDigest::of(&bytes)
 }
-
-fn encode_record(record: &PortablePathRecord) -> Result<Vec<u8>, StoreError> {
-    postcard::to_allocvec(record).map_err(|_| StoreError::MalformedLogseqClaimIndex)
-}
-
-fn decode_record(
-    expected: PortablePathKeyDigest,
-    bytes: &[u8],
-) -> Result<PortablePathRecord, StoreError> {
-    let record: PortablePathRecord =
-        postcard::from_bytes(bytes).map_err(|_| StoreError::MalformedLogseqClaimIndex)?;
-    record.validate(expected)?;
-    if encode_record(&record)? != bytes {
-        return Err(StoreError::MalformedLogseqClaimIndex);
-    }
-    Ok(record)
-}

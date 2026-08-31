@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs;
 #[cfg(any(test, target_os = "android"))]
 use std::io;
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 #[cfg(windows)]
@@ -18,20 +18,15 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ahash::AHashMap;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, ReadDir};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use smallvec::SmallVec;
 use uuid::Uuid;
 
 use super::enrollment::EnrollmentBindingV1;
 use super::identity::parse_digest;
-#[cfg(test)]
-use super::sync_layout::BLOCK_CLAIM_INDEX_DIR;
 use super::sync_layout::{
-    ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_OBJECTS_DIR as OBJECTS_DIR, BLOCK_CLAIM_INDEX_FILE,
+    ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_OBJECTS_DIR as OBJECTS_DIR,
     ENGINE_HISTORY_CLAIM_FILE, ENGINE_HISTORY_DIR, ENGINE_HISTORY_HEAD_FILE,
     ENGINE_HISTORY_NODES_DIR, ENGINE_HISTORY_ROOTS_DIR, ENGINE_HISTORY_ROOT_SUFFIX,
     ENGINE_HISTORY_TRANSITION_LOCK_FILE, LINEAGE_CLAIM_FILE,
@@ -56,26 +51,10 @@ const ENGINE_HISTORY_ROOT_SCHEMA_VERSION: u32 = 8;
 /// The first honest promoted-runtime state format. No earlier experimental
 /// bytes were ever published, and any other value is rejected rather than
 /// reinterpreted.
-pub(crate) const PROMOTED_RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
-const MAX_PROMOTED_RUNTIME_STATE_BYTES: u64 = 4096;
 const MAX_ENGINE_HISTORY_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_ENGINE_HISTORY_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 const ENGINE_HISTORY_INDEX_SCHEMA_VERSION: u32 = 1;
 pub(crate) const ENGINE_HISTORY_RADIX_DEPTH: u8 = 32;
-const BLOCK_CLAIM_INDEX_SCHEMA_VERSION: u32 = 1;
-const BLOCK_CLAIM_RADIX_DEPTH: u8 = 32;
-// Large replay batches touch most hash prefixes. Keeping tens of thousands of
-// compact claim records per leaf bounds point depth while avoiding hundreds
-// of thousands of tiny copy-on-write page appends and syscalls. The encoded
-// page byte ceiling remains the independent fail-closed bound.
-const BLOCK_CLAIM_LEAF_ENTRIES: usize = 65_536;
-const BLOCK_CLAIM_INDEX_LEVELS: usize = 8;
-const BLOCK_CLAIM_SEGMENTS_PER_LEVEL: usize = 32;
-const BLOCK_CLAIM_FILTER_BITS_PER_ENTRY: usize = 16;
-const BLOCK_CLAIM_FILTER_HASHES: u64 = 7;
-const BLOCK_CLAIM_GLOBAL_FILTER_BYTES: usize = 1024 * 1024;
-const MAX_BLOCK_CLAIM_RECORD_BYTES: usize = 64 * 1024;
-const MAX_BLOCK_CLAIM_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 thread_local! {
     // This one hook is also used by the crate-private deterministic simulator.
@@ -124,10 +103,6 @@ pub(crate) fn fail_next_engine_history_after_head_swap() {
 
 #[cfg(test)]
 pub(crate) fn fail_next_publish_after_objects() {
-    fail_next_publish_after_objects_for_harness();
-}
-
-pub(crate) fn fail_next_publish_after_objects_for_harness() {
     HARNESS_PUBLISH_FAIL_AFTER_OBJECTS.with(|fail| fail.set(true));
 }
 
@@ -236,9 +211,6 @@ fn enrolled_open_use_hook() {
     });
 }
 
-#[cfg(not(test))]
-fn enrolled_open_use_hook() {}
-
 #[cfg(test)]
 fn enrolled_open_act_hook() {
     ENROLLED_OPEN_ACT_HOOK.with(|slot| {
@@ -247,9 +219,6 @@ fn enrolled_open_act_hook() {
         }
     });
 }
-
-#[cfg(not(test))]
-fn enrolled_open_act_hook() {}
 
 /// A caller-rooted, v2-candidate immutable object and batch-manifest store.
 ///
@@ -302,34 +271,6 @@ pub struct ControlDirectoryIdentity {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ControlDirectoryIdentity;
 
-impl ControlDirectoryIdentity {
-    pub(crate) fn binding_digest(self) -> ContentDigest {
-        let mut hasher = Sha256::new();
-        hasher.update(b"tine/control-directory-identity-binding/v1\0");
-        self.hash_platform_identity(&mut hasher);
-        ContentDigest::from_bytes(hasher.finalize().into())
-    }
-
-    fn hash_platform_identity(self, hasher: &mut Sha256) {
-        #[cfg(unix)]
-        {
-            hasher.update(b"unix-dev-inode\0");
-            hasher.update(self.device.to_be_bytes());
-            hasher.update(self.inode.to_be_bytes());
-        }
-        #[cfg(windows)]
-        {
-            hasher.update(b"windows-volume-file-id\0");
-            hasher.update(self.volume.to_be_bytes());
-            hasher.update(self.file_id);
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            hasher.update(b"unsupported\0");
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AcceptedReadStats {
     pub manifest_reads: usize,
@@ -363,9 +304,6 @@ pub struct ObjectStoreStats {
     pub history_index_reads: usize,
     pub history_index_writes: usize,
     pub history_decodes: usize,
-    pub block_claim_index_reads: usize,
-    pub block_claim_index_writes: usize,
-    pub block_claim_index_syncs: usize,
     pub inspected_manifest_operations: usize,
     pub inspected_manifest_bytes: usize,
     pub inspected_object_operations: usize,
@@ -382,9 +320,6 @@ struct StoreCounters {
     history_index_reads: AtomicUsize,
     history_index_writes: AtomicUsize,
     history_decodes: AtomicUsize,
-    block_claim_index_reads: AtomicUsize,
-    block_claim_index_writes: AtomicUsize,
-    block_claim_index_syncs: AtomicUsize,
     inspected_manifest_operations: AtomicUsize,
     inspected_manifest_bytes: AtomicUsize,
     inspected_object_operations: AtomicUsize,
@@ -416,11 +351,6 @@ pub(crate) struct DurableEngineHistoryStore {
     graph_resource_id: super::CanonicalGraphResourceId,
     receipt_store_id: super::ProjectionReceiptStoreId,
     control: Dir,
-    /// The retained no-follow capability of the archive root this control
-    /// directory lives in. It is the only thing that can prove a promoted
-    /// runtime state names *this* physical archive, so it is retained here
-    /// rather than re-derived from an ambient pathname by each caller.
-    archive_root: Dir,
     roots: Dir,
     index: EngineHistoryStore,
     transition_lock: fs::File,
@@ -646,129 +576,6 @@ impl EngineHistoryBinding {
             page_names: PageNameDurableBinding::empty(),
         }
     }
-
-    /// Compare the replay-stable typed authority. The catalog checkpoint is
-    /// intentionally omitted because it embeds fresh scratch-run page
-    /// references; authenticated recovery applies the same rule while exact
-    /// historical record bytes continue to protect the retained checkpoint.
-    pub(crate) fn same_replay_authority(&self, other: &Self) -> bool {
-        self.portable_path_key_version == other.portable_path_key_version
-            && self.portable_path_root == other.portable_path_root
-            && self.portable_path_conflicts == other.portable_path_conflicts
-            && self.terminal_evidence == other.terminal_evidence
-            && self.page_names == other.page_names
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BlockClaimIndexRoot {
-    next_generation: u64,
-    global_filter: Option<BlockClaimPageRef>,
-    levels:
-        [[Option<BlockClaimSegmentRef>; BLOCK_CLAIM_SEGMENTS_PER_LEVEL]; BLOCK_CLAIM_INDEX_LEVELS],
-}
-
-#[derive(Debug)]
-pub(crate) struct BlockClaimIndexStore {
-    backing: BlockClaimIndexBacking,
-    counters: Arc<StoreCounters>,
-}
-
-#[derive(Debug)]
-enum BlockClaimIndexBacking {
-    Scratch(Arc<super::scratch_store::ScratchStore>),
-    #[cfg(test)]
-    Standalone(Mutex<fs::File>),
-}
-
-impl BlockClaimIndexStore {
-    /// A run-local block-claim point index over a caller-owned scratch store.
-    ///
-    /// The block-claim root is reconstructible run-local derived state — no
-    /// accepted cold record binds it — so it belongs in whichever scratch run
-    /// owns the engine. Detached bootstrap authoring owns its own disposable
-    /// scratch run rather than the archive's, and builds its point index the
-    /// same way an enrolled engine does instead of falling back to the bounded
-    /// in-memory test map, whose fixed capacity would otherwise cap an
-    /// importable graph at a few thousand blocks.
-    pub(crate) fn for_scratch(
-        scratch: Arc<super::scratch_store::ScratchStore>,
-    ) -> Result<Self, StoreError> {
-        Ok(Self {
-            backing: BlockClaimIndexBacking::Scratch(scratch),
-            counters: Arc::new(StoreCounters::default()),
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct BlockClaimIndexValue(SmallVec<[u8; 64]>);
-
-impl BlockClaimIndexValue {
-    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
-        Self(SmallVec::from_slice(bytes))
-    }
-
-    pub(crate) fn from_vec(bytes: Vec<u8>) -> Self {
-        Self(SmallVec::from_vec(bytes))
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BlockClaimPageRef {
-    offset: u64,
-    encoded_len: u32,
-    digest: ContentDigest,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BlockClaimSegmentRef {
-    generation: u64,
-    entry_count: u64,
-    page_ref: BlockClaimPageRef,
-    filter_ref: BlockClaimPageRef,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BlockClaimFilterPage {
-    schema_version: u32,
-    entry_count: u64,
-    bit_len: u64,
-    bits: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BlockClaimGlobalFilterPage {
-    schema_version: u32,
-    insertions: u64,
-    bits: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum BlockClaimIndexPage {
-    Branch {
-        schema_version: u32,
-        depth: u8,
-        children: Vec<(u8, BlockClaimPageRef)>,
-    },
-    Leaf {
-        schema_version: u32,
-        depth: u8,
-        entries: Vec<([u8; 16], BlockClaimIndexValue)>,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1440,7 +1247,6 @@ impl ObjectStore {
                 binding.endpoint.graph_resource_id,
                 binding.receipt_store_id,
                 control,
-                self.capability.try_clone()?,
                 open_engine_history_transition_lock(&self.capability)?,
                 Arc::clone(&self.counters),
             )
@@ -1470,7 +1276,6 @@ impl ObjectStore {
             endpoint.graph_resource_id,
             binding.receipt_store_id,
             control.try_clone()?,
-            self.capability.try_clone()?,
             open_dir_nofollow(&control, ENGINE_HISTORY_ROOTS_DIR)?,
             EngineHistoryStore {
                 capability: open_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?,
@@ -1497,7 +1302,6 @@ impl ObjectStore {
             binding.endpoint.graph_resource_id,
             binding.receipt_store_id,
             control.try_clone()?,
-            self.capability.try_clone()?,
             open_dir_nofollow(&control, ENGINE_HISTORY_ROOTS_DIR)?,
             EngineHistoryStore {
                 capability: open_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?,
@@ -1521,24 +1325,6 @@ impl ObjectStore {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn start_block_claim_index(&self) -> Result<BlockClaimIndexStore, StoreError> {
-        ensure_directory(&self.capability, BLOCK_CLAIM_INDEX_DIR)?;
-        let indexes = self.open_namespace(BLOCK_CLAIM_INDEX_DIR)?;
-        let run = format!("run-{}", Uuid::new_v4());
-        ensure_directory(&indexes, &run)?;
-        let run = open_dir_nofollow(&indexes, &run)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        let file = run.open_with(BLOCK_CLAIM_INDEX_FILE, &options)?.into_std();
-        crate::durability_counters::sync_file(&file)?;
-        sync_dir_required(&run)?;
-        Ok(BlockClaimIndexStore {
-            backing: BlockClaimIndexBacking::Standalone(Mutex::new(file)),
-            counters: Arc::clone(&self.counters),
-        })
-    }
-
     /// Stable identity of the retained no-follow archive root capability.
     ///
     /// This is derived from the opened directory resource, never from an
@@ -1548,25 +1334,6 @@ impl ObjectStore {
         &self,
     ) -> Result<ControlDirectoryIdentity, StoreError> {
         control_directory_identity(&self.capability)
-    }
-
-    pub(crate) fn start_engine_scratch(
-        &self,
-    ) -> Result<
-        (
-            Arc<super::scratch_store::ScratchStore>,
-            BlockClaimIndexStore,
-        ),
-        StoreError,
-    > {
-        let scratch = Arc::new(
-            super::scratch_store::ScratchStore::open(&self.capability, self.workspace_id)
-                .map_err(|error| StoreError::Scratch(error.to_string()))?,
-        );
-        Ok((
-            Arc::clone(&scratch),
-            self.engine_claim_index(Arc::clone(&scratch))?,
-        ))
     }
 
     /// Start only the disposable document scratch used by the clean managed
@@ -1583,16 +1350,6 @@ impl ObjectStore {
         super::scratch_store::ScratchStore::open(&self.capability, self.workspace_id)
             .map(Arc::new)
             .map_err(|error| StoreError::Scratch(error.to_string()))
-    }
-
-    fn engine_claim_index(
-        &self,
-        scratch: Arc<super::scratch_store::ScratchStore>,
-    ) -> Result<BlockClaimIndexStore, StoreError> {
-        Ok(BlockClaimIndexStore {
-            backing: BlockClaimIndexBacking::Scratch(scratch),
-            counters: Arc::clone(&self.counters),
-        })
     }
 
     fn preflight_engine_history(
@@ -2259,9 +2016,6 @@ impl StoreCounters {
             history_index_reads: self.history_index_reads.load(Ordering::Relaxed),
             history_index_writes: self.history_index_writes.load(Ordering::Relaxed),
             history_decodes: self.history_decodes.load(Ordering::Relaxed),
-            block_claim_index_reads: self.block_claim_index_reads.load(Ordering::Relaxed),
-            block_claim_index_writes: self.block_claim_index_writes.load(Ordering::Relaxed),
-            block_claim_index_syncs: self.block_claim_index_syncs.load(Ordering::Relaxed),
             inspected_manifest_operations: self
                 .inspected_manifest_operations
                 .load(Ordering::Relaxed),
@@ -2523,7 +2277,6 @@ impl DurableEngineHistoryStore {
         graph_resource_id: super::CanonicalGraphResourceId,
         receipt_store_id: super::ProjectionReceiptStoreId,
         control: Dir,
-        archive_root: Dir,
         transition_lock: fs::File,
         counters: Arc<StoreCounters>,
     ) -> Result<Self, StoreError> {
@@ -2555,7 +2308,6 @@ impl DurableEngineHistoryStore {
             graph_resource_id,
             receipt_store_id,
             control,
-            archive_root,
             roots,
             index: EngineHistoryStore {
                 capability: nodes,
@@ -2584,7 +2336,6 @@ impl DurableEngineHistoryStore {
         graph_resource_id: super::CanonicalGraphResourceId,
         receipt_store_id: super::ProjectionReceiptStoreId,
         control: Dir,
-        archive_root: Dir,
         roots: Dir,
         index: EngineHistoryStore,
         transition_lock: fs::File,
@@ -2595,7 +2346,6 @@ impl DurableEngineHistoryStore {
             graph_resource_id,
             receipt_store_id,
             control,
-            archive_root,
             roots,
             index,
             transition_lock,
@@ -3310,408 +3060,6 @@ fn validate_engine_history_root(
     Ok(())
 }
 
-impl BlockClaimIndexStore {
-    fn with_file<T>(
-        &self,
-        operation: impl FnOnce(&mut fs::File) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
-        match &self.backing {
-            BlockClaimIndexBacking::Scratch(scratch) => scratch
-                .with_pages(operation)
-                .map_err(|error| StoreError::Scratch(error.to_string()))?,
-            #[cfg(test)]
-            BlockClaimIndexBacking::Standalone(file) => {
-                let mut file = file
-                    .lock()
-                    .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-                operation(&mut file)
-            }
-        }
-    }
-
-    pub(crate) fn lookup_many(
-        &self,
-        root: BlockClaimIndexRoot,
-        keys: &[[u8; 16]],
-    ) -> Result<BTreeMap<[u8; 16], BlockClaimIndexValue>, StoreError> {
-        if keys.is_empty() || root.levels.iter().flatten().all(Option::is_none) {
-            return Ok(BTreeMap::new());
-        }
-        if !keys.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        self.with_file(|file| {
-            let mut segments: Vec<_> = root.levels.into_iter().flatten().flatten().collect();
-            segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
-            let mut remaining: Vec<_> = keys
-                .iter()
-                .copied()
-                .map(|key| {
-                    let (first, second) = block_claim_filter_hashes(&key);
-                    (key, first, second)
-                })
-                .collect();
-            let global_filter = self.read_claim_global_filter(
-                file,
-                root.global_filter
-                    .ok_or(StoreError::MalformedBlockClaimIndex)?,
-            )?;
-            remaining.retain(|(_, first, second)| {
-                block_claim_global_filter_might_contain(&global_filter, *first, *second)
-            });
-            if remaining.is_empty() {
-                return Ok(BTreeMap::new());
-            }
-            let mut found = BTreeMap::new();
-            for segment in segments {
-                let filter = self.read_claim_filter(file, segment.filter_ref)?;
-                if filter.entry_count != segment.entry_count {
-                    return Err(StoreError::MalformedBlockClaimIndex);
-                }
-                let selected: Vec<_> = remaining
-                    .iter()
-                    .filter(|(_, first, second)| {
-                        block_claim_filter_might_contain(&filter, *first, *second)
-                    })
-                    .map(|(key, _, _)| *key)
-                    .collect();
-                if selected.is_empty() {
-                    continue;
-                }
-                let mut segment_found = BTreeMap::new();
-                self.lookup_many_at(file, segment.page_ref, 0, &selected, &mut segment_found)?;
-                found.extend(segment_found);
-                remaining.retain(|(key, _, _)| !found.contains_key(key));
-                if remaining.is_empty() {
-                    break;
-                }
-            }
-            Ok(found)
-        })
-    }
-
-    pub(crate) fn insert_many(
-        &self,
-        root: BlockClaimIndexRoot,
-        records: &[([u8; 16], BlockClaimIndexValue)],
-    ) -> Result<BlockClaimIndexRoot, StoreError> {
-        if records.is_empty() {
-            return Ok(root);
-        }
-        if !records.windows(2).all(|pair| pair[0].0 < pair[1].0)
-            || records
-                .iter()
-                .any(|(_, record)| record.is_empty() || record.len() > MAX_BLOCK_CLAIM_RECORD_BYTES)
-        {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        self.with_file(|file| {
-            let generation = root
-                .next_generation
-                .checked_add(1)
-                .ok_or(StoreError::MalformedBlockClaimIndex)?;
-            let mut global_filter = match root.global_filter {
-                Some(page_ref) => self.read_claim_global_filter(file, page_ref)?,
-                None => new_block_claim_global_filter(),
-            };
-            update_block_claim_global_filter(&mut global_filter, records)?;
-            let mut next = root;
-            next.next_generation = generation;
-            let mut merged = records.to_vec();
-            let mut installed = false;
-            for level in &mut next.levels {
-                if let Some(empty) = level.iter().position(Option::is_none) {
-                    let entry_count = u64::try_from(merged.len())
-                        .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-                    let filter_ref = self.append_claim_filter(file, &merged)?;
-                    let page_ref = self.build_claim_subtree(file, 0, merged)?;
-                    level[empty] = Some(BlockClaimSegmentRef {
-                        generation,
-                        entry_count,
-                        page_ref,
-                        filter_ref,
-                    });
-                    installed = true;
-                    break;
-                }
-                let mut existing: Vec<_> = level.iter_mut().filter_map(Option::take).collect();
-                existing.sort_unstable_by_key(|segment| segment.generation);
-                let capacity = existing.iter().try_fold(merged.len(), |capacity, segment| {
-                    usize::try_from(segment.entry_count)
-                        .ok()
-                        .and_then(|entries| capacity.checked_add(entries))
-                });
-                let mut combined =
-                    AHashMap::with_capacity(capacity.ok_or(StoreError::MalformedBlockClaimIndex)?);
-                for segment in existing {
-                    let mut older = Vec::with_capacity(
-                        usize::try_from(segment.entry_count)
-                            .map_err(|_| StoreError::MalformedBlockClaimIndex)?,
-                    );
-                    self.materialize_claim_segment(file, segment.page_ref, 0, &mut older)?;
-                    if older.len() as u64 != segment.entry_count {
-                        return Err(StoreError::MalformedBlockClaimIndex);
-                    }
-                    combined.extend(older);
-                }
-                combined.extend(merged);
-                merged = combined.into_iter().collect();
-            }
-            if !installed {
-                return Err(StoreError::MalformedBlockClaimIndex);
-            }
-            next.global_filter = Some(self.append_claim_global_filter(file, &global_filter)?);
-            Ok(next)
-        })
-    }
-
-    fn lookup_many_at(
-        &self,
-        file: &mut fs::File,
-        page_ref: BlockClaimPageRef,
-        expected_depth: u8,
-        keys: &[[u8; 16]],
-        found: &mut BTreeMap<[u8; 16], BlockClaimIndexValue>,
-    ) -> Result<(), StoreError> {
-        match self.read_claim_page(file, page_ref, expected_depth)? {
-            BlockClaimIndexPage::Leaf { entries, .. } => {
-                for key in keys {
-                    if let Ok(index) =
-                        entries.binary_search_by_key(key, |(candidate, _)| *candidate)
-                    {
-                        found.insert(*key, entries[index].1.clone());
-                    }
-                }
-            }
-            BlockClaimIndexPage::Branch {
-                depth, children, ..
-            } => {
-                let mut grouped = BTreeMap::<u8, Vec<[u8; 16]>>::new();
-                for key in keys {
-                    grouped
-                        .entry(block_claim_key_nibble(key, depth))
-                        .or_default()
-                        .push(*key);
-                }
-                for (nibble, selected) in grouped {
-                    if let Ok(index) =
-                        children.binary_search_by_key(&nibble, |(candidate, _)| *candidate)
-                    {
-                        self.lookup_many_at(file, children[index].1, depth + 1, &selected, found)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn build_claim_subtree(
-        &self,
-        file: &mut fs::File,
-        depth: u8,
-        mut entries: Vec<([u8; 16], BlockClaimIndexValue)>,
-    ) -> Result<BlockClaimPageRef, StoreError> {
-        let estimated_encoded_bytes = entries.iter().try_fold(32_usize, |total, (_, record)| {
-            total.checked_add(26)?.checked_add(record.len())
-        });
-        if (entries.len() <= BLOCK_CLAIM_LEAF_ENTRIES
-            && estimated_encoded_bytes.is_some_and(|bytes| bytes <= MAX_BLOCK_CLAIM_PAGE_BYTES))
-            || depth == BLOCK_CLAIM_RADIX_DEPTH
-        {
-            entries.sort_unstable_by_key(|entry| entry.0);
-            return self.append_claim_page(
-                file,
-                &BlockClaimIndexPage::Leaf {
-                    schema_version: BLOCK_CLAIM_INDEX_SCHEMA_VERSION,
-                    depth,
-                    entries,
-                },
-            );
-        }
-        let mut grouped = BTreeMap::<u8, Vec<([u8; 16], BlockClaimIndexValue)>>::new();
-        for entry in entries {
-            grouped
-                .entry(block_claim_key_nibble(&entry.0, depth))
-                .or_default()
-                .push(entry);
-        }
-        let mut children = Vec::with_capacity(grouped.len());
-        for (nibble, selected) in grouped {
-            children.push((nibble, self.build_claim_subtree(file, depth + 1, selected)?));
-        }
-        self.append_claim_page(
-            file,
-            &BlockClaimIndexPage::Branch {
-                schema_version: BLOCK_CLAIM_INDEX_SCHEMA_VERSION,
-                depth,
-                children,
-            },
-        )
-    }
-
-    fn append_claim_page(
-        &self,
-        file: &mut fs::File,
-        page: &BlockClaimIndexPage,
-    ) -> Result<BlockClaimPageRef, StoreError> {
-        validate_block_claim_page(page)?;
-        let bytes =
-            postcard::to_allocvec(page).map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        self.append_claim_bytes(file, &bytes)
-    }
-
-    fn append_claim_filter(
-        &self,
-        file: &mut fs::File,
-        entries: &[([u8; 16], BlockClaimIndexValue)],
-    ) -> Result<BlockClaimPageRef, StoreError> {
-        let filter = new_block_claim_filter(entries)?;
-        let bytes =
-            postcard::to_allocvec(&filter).map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        self.append_claim_bytes(file, &bytes)
-    }
-
-    fn append_claim_global_filter(
-        &self,
-        file: &mut fs::File,
-        filter: &BlockClaimGlobalFilterPage,
-    ) -> Result<BlockClaimPageRef, StoreError> {
-        validate_block_claim_global_filter(filter)?;
-        let bytes =
-            postcard::to_allocvec(filter).map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        self.append_claim_bytes(file, &bytes)
-    }
-
-    fn append_claim_bytes(
-        &self,
-        file: &mut fs::File,
-        bytes: &[u8],
-    ) -> Result<BlockClaimPageRef, StoreError> {
-        if bytes.len() > MAX_BLOCK_CLAIM_PAGE_BYTES {
-            return Err(StoreError::StoredFileTooLarge {
-                path: BLOCK_CLAIM_INDEX_FILE.into(),
-                length: bytes.len() as u64,
-                limit: MAX_BLOCK_CLAIM_PAGE_BYTES as u64,
-            });
-        }
-        let encoded_len =
-            u32::try_from(bytes.len()).map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(&encoded_len.to_be_bytes())?;
-        file.write_all(bytes)?;
-        self.counters
-            .block_claim_index_writes
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(BlockClaimPageRef {
-            offset,
-            encoded_len,
-            digest: ContentDigest::of(bytes),
-        })
-    }
-
-    fn materialize_claim_segment(
-        &self,
-        file: &mut fs::File,
-        page_ref: BlockClaimPageRef,
-        expected_depth: u8,
-        entries: &mut Vec<([u8; 16], BlockClaimIndexValue)>,
-    ) -> Result<(), StoreError> {
-        match self.read_claim_page(file, page_ref, expected_depth)? {
-            BlockClaimIndexPage::Leaf {
-                entries: selected, ..
-            } => entries.extend(selected),
-            BlockClaimIndexPage::Branch {
-                depth, children, ..
-            } => {
-                for (_, child) in children {
-                    self.materialize_claim_segment(file, child, depth + 1, entries)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn read_claim_page(
-        &self,
-        file: &mut fs::File,
-        page_ref: BlockClaimPageRef,
-        expected_depth: u8,
-    ) -> Result<BlockClaimIndexPage, StoreError> {
-        let bytes = self.read_claim_bytes(file, page_ref)?;
-        let page: BlockClaimIndexPage =
-            postcard::from_bytes(&bytes).map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        validate_block_claim_page(&page)?;
-        if block_claim_page_depth(&page) != expected_depth
-            || postcard::to_allocvec(&page).map_err(|_| StoreError::MalformedBlockClaimIndex)?
-                != bytes
-        {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        Ok(page)
-    }
-
-    fn read_claim_filter(
-        &self,
-        file: &mut fs::File,
-        page_ref: BlockClaimPageRef,
-    ) -> Result<BlockClaimFilterPage, StoreError> {
-        let bytes = self.read_claim_bytes(file, page_ref)?;
-        let filter: BlockClaimFilterPage =
-            postcard::from_bytes(&bytes).map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        validate_block_claim_filter(&filter)?;
-        if postcard::to_allocvec(&filter).map_err(|_| StoreError::MalformedBlockClaimIndex)?
-            != bytes
-        {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        Ok(filter)
-    }
-
-    fn read_claim_global_filter(
-        &self,
-        file: &mut fs::File,
-        page_ref: BlockClaimPageRef,
-    ) -> Result<BlockClaimGlobalFilterPage, StoreError> {
-        let bytes = self.read_claim_bytes(file, page_ref)?;
-        let filter: BlockClaimGlobalFilterPage =
-            postcard::from_bytes(&bytes).map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        validate_block_claim_global_filter(&filter)?;
-        if postcard::to_allocvec(&filter).map_err(|_| StoreError::MalformedBlockClaimIndex)?
-            != bytes
-        {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        Ok(filter)
-    }
-
-    fn read_claim_bytes(
-        &self,
-        file: &mut fs::File,
-        page_ref: BlockClaimPageRef,
-    ) -> Result<Vec<u8>, StoreError> {
-        file.seek(SeekFrom::Start(page_ref.offset))?;
-        let mut length = [0_u8; 4];
-        file.read_exact(&mut length)?;
-        let found_len = u32::from_be_bytes(length);
-        if found_len != page_ref.encoded_len
-            || usize::try_from(found_len)
-                .ok()
-                .is_none_or(|length| length == 0 || length > MAX_BLOCK_CLAIM_PAGE_BYTES)
-        {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        let mut bytes = vec![0_u8; found_len as usize];
-        file.read_exact(&mut bytes)?;
-        if ContentDigest::of(&bytes) != page_ref.digest {
-            return Err(StoreError::BlockClaimIndexPathMismatch(page_ref.digest));
-        }
-        self.counters
-            .block_claim_index_reads
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(bytes)
-    }
-}
-
 #[derive(Clone, Copy)]
 enum NamespaceKind {
     Objects,
@@ -3739,7 +3087,6 @@ impl Collision {
             Self::HistoryIndex(_) => "history-index".to_owned(),
             Self::Lineage(_) => "archive-lineage-claim".to_owned(),
             Self::Exact(kind) => (*kind).to_owned(),
-            Self::Bootstrap(kind, _) => format!("bootstrap:{kind}"),
         }
     }
 }
@@ -3751,7 +3098,6 @@ enum Collision {
     HistoryIndex(ContentDigest),
     Lineage(LineageDigest),
     Exact(&'static str),
-    Bootstrap(&'static str, String),
 }
 
 fn ensure_single_lineage(manifests: &[OperationBatch]) -> Result<(), StoreError> {
@@ -3822,8 +3168,6 @@ pub enum StoreError {
         store: &'static str,
         version: u32,
     },
-    BlockClaimIndexPathMismatch(ContentDigest),
-    MalformedBlockClaimIndex,
     MissingLogseqClaimIndexNode(ContentDigest),
     LogseqClaimIndexPathMismatch(ContentDigest),
     MalformedLogseqClaimIndex,
@@ -3840,20 +3184,8 @@ pub enum StoreError {
     Scratch(String),
     LineageClaimCollision(LineageDigest),
     ImmutableCollision(&'static str),
-    BootstrapArtifactCollision {
-        kind: &'static str,
-        identity: String,
-    },
-    BootstrapArtifactMismatch(&'static str),
-    MissingBootstrapArtifact(&'static str),
     BootstrapBatchRequiresDirectPublication,
-    BootstrapHistoryRequiresEmptyAuthority,
     InactiveBootstrapHistory,
-    PromotedRuntimeStateAbsent,
-    PromotedRuntimeStateMismatch(&'static str),
-    MalformedPromotedRuntimeState,
-    UnsupportedPromotedRuntimeSchema(u32),
-    CompetingRuntimePromotion,
     StoredLengthMismatch {
         path: String,
         expected: u64,
@@ -3929,13 +3261,6 @@ impl fmt::Display for StoreError {
             Self::UnsupportedStoreVersion { store, version } => {
                 write!(f, "{store} version {version} is unsupported")
             }
-            Self::BlockClaimIndexPathMismatch(digest) => write!(
-                f,
-                "authenticated block-claim index bytes do not match page {digest}"
-            ),
-            Self::MalformedBlockClaimIndex => {
-                f.write_str("authenticated block-claim index is malformed or non-canonical")
-            }
             Self::MissingLogseqClaimIndexNode(digest) => {
                 write!(
                     f,
@@ -3981,40 +3306,12 @@ impl fmt::Display for StoreError {
             Self::ImmutableCollision(kind) => {
                 write!(f, "immutable {kind} collision")
             }
-            Self::BootstrapArtifactCollision { kind, identity } => {
-                write!(f, "immutable bootstrap {kind} collision at {identity}")
-            }
-            Self::BootstrapArtifactMismatch(kind) => {
-                write!(f, "bootstrap {kind} does not match its direct authority")
-            }
-            Self::MissingBootstrapArtifact(kind) => {
-                write!(f, "required bootstrap {kind} is missing")
-            }
             Self::BootstrapBatchRequiresDirectPublication => {
                 f.write_str("bootstrap batches require bootstrap-specific direct publication")
-            }
-            Self::BootstrapHistoryRequiresEmptyAuthority => {
-                f.write_str("bootstrap history installation requires empty durable authority")
             }
             Self::InactiveBootstrapHistory => {
                 f.write_str("inactive bootstrap history cannot be opened as ordinary runtime")
             }
-            Self::PromotedRuntimeStateAbsent => {
-                f.write_str("no durable promoted runtime state authorizes this archive")
-            }
-            Self::PromotedRuntimeStateMismatch(detail) => {
-                write!(f, "promoted runtime state mismatch: {detail}")
-            }
-            Self::MalformedPromotedRuntimeState => {
-                f.write_str("promoted runtime state is malformed, truncated, or non-canonical")
-            }
-            Self::UnsupportedPromotedRuntimeSchema(version) => write!(
-                f,
-                "unsupported promoted runtime state schema version {version}"
-            ),
-            Self::CompetingRuntimePromotion => f.write_str(
-                "a different promoted runtime state is already committed for this archive",
-            ),
             Self::StoredLengthMismatch {
                 path,
                 expected,
@@ -4254,30 +3551,6 @@ pub(crate) fn ensure_reconstructible_directory_nofollow(
         name,
         PrivateDirectoryDurability::Reconstructible,
     )
-}
-
-/// Create only the immediate parent of an explicitly bound object-store root.
-/// The grandparent must already exist; the final parent component is opened
-/// no-follow and its creation is durability-synced before store construction.
-pub(crate) fn prepare_object_store_parent_nofollow(root: &Path) -> Result<(), StoreError> {
-    let parent = root
-        .parent()
-        .ok_or_else(|| StoreError::UnsafeEntry("store root has no parent".into()))?;
-    let name = parent
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| StoreError::UnsafeEntry("store parent is not UTF-8".into()))?;
-    if !matches!(parent.components().next_back(), Some(Component::Normal(_))) {
-        return Err(StoreError::UnsafeEntry(
-            "store parent must end in a normal path component".into(),
-        ));
-    }
-    let grandparent = parent
-        .parent()
-        .ok_or_else(|| StoreError::UnsafeEntry("store parent has no grandparent".into()))?;
-    let canonical_grandparent = fs::canonicalize(grandparent)?;
-    let grandparent = Dir::open_ambient_dir(&canonical_grandparent, ambient_authority())?;
-    ensure_directory_nofollow(&grandparent, name)
 }
 
 fn ensure_directory(root: &Dir, name: &str) -> Result<(), StoreError> {
@@ -4771,44 +4044,7 @@ fn collision_error(collision: Collision) -> StoreError {
         Collision::HistoryIndex(digest) => StoreError::HistoryIndexPathMismatch(digest),
         Collision::Lineage(lineage) => StoreError::LineageClaimCollision(lineage),
         Collision::Exact(kind) => StoreError::ImmutableCollision(kind),
-        Collision::Bootstrap(kind, identity) => {
-            StoreError::BootstrapArtifactCollision { kind, identity }
-        }
     }
-}
-
-fn publish_bootstrap_immutable(
-    dir: &Dir,
-    filename: &str,
-    bytes: &[u8],
-    kind: &'static str,
-    identity: String,
-) -> Result<(), StoreError> {
-    publish_immutable(dir, filename, bytes, Collision::Bootstrap(kind, identity))
-}
-
-fn bootstrap_page_filename(ordinal: u32) -> String {
-    ordinal.to_string()
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-fn read_regular_file_nofollow(dir: &Dir, name: &str) -> Result<fs::File, StoreError> {
-    let file = open_file_nofollow(dir, name)?;
-    if !file.metadata()?.is_file() {
-        return Err(StoreError::UnsafeEntry(format!(
-            "{name} is not a regular no-follow file"
-        )));
-    }
-    Ok(file)
 }
 
 struct AdvisoryTransitionGuard<'a>(&'a fs::File);
@@ -4905,10 +4141,6 @@ fn open_engine_history_transition_lock(_root: &Dir) -> Result<fs::File, StoreErr
     .into())
 }
 
-pub(crate) fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
-    tine_storage::open_file_nofollow(dir, path)
-}
-
 pub(crate) fn open_dir_nofollow(dir: &Dir, path: &str) -> Result<Dir, StoreError> {
     tine_storage::open_dir_nofollow(dir, path).map_err(filesystem_error_without_collision)
     // SAFETY: `openat` returned a newly owned directory descriptor.
@@ -4961,208 +4193,6 @@ fn history_key_nibble(key: &[u8; 16], depth: u8) -> u8 {
     } else {
         byte & 0x0f
     }
-}
-
-fn block_claim_key_nibble(key: &[u8; 16], depth: u8) -> u8 {
-    let digest = ContentDigest::of(key);
-    let byte = digest.as_bytes()[usize::from(depth / 2)];
-    if depth.is_multiple_of(2) {
-        byte >> 4
-    } else {
-        byte & 0x0f
-    }
-}
-
-fn block_claim_page_depth(page: &BlockClaimIndexPage) -> u8 {
-    match page {
-        BlockClaimIndexPage::Branch { depth, .. } | BlockClaimIndexPage::Leaf { depth, .. } => {
-            *depth
-        }
-    }
-}
-
-fn new_block_claim_filter(
-    entries: &[([u8; 16], BlockClaimIndexValue)],
-) -> Result<BlockClaimFilterPage, StoreError> {
-    let bit_len = entries
-        .len()
-        .checked_mul(BLOCK_CLAIM_FILTER_BITS_PER_ENTRY)
-        .ok_or(StoreError::MalformedBlockClaimIndex)?;
-    let byte_len = bit_len
-        .checked_add(7)
-        .ok_or(StoreError::MalformedBlockClaimIndex)?
-        / 8;
-    let mut filter = BlockClaimFilterPage {
-        schema_version: BLOCK_CLAIM_INDEX_SCHEMA_VERSION,
-        entry_count: u64::try_from(entries.len())
-            .map_err(|_| StoreError::MalformedBlockClaimIndex)?,
-        bit_len: u64::try_from(bit_len).map_err(|_| StoreError::MalformedBlockClaimIndex)?,
-        bits: vec![0; byte_len],
-    };
-    for (key, _) in entries {
-        let (first, second) = block_claim_filter_hashes(key);
-        for position in block_claim_filter_positions(first, second, filter.bit_len) {
-            filter.bits[position as usize / 8] |= 1 << (position % 8);
-        }
-    }
-    validate_block_claim_filter(&filter)?;
-    Ok(filter)
-}
-
-fn new_block_claim_global_filter() -> BlockClaimGlobalFilterPage {
-    BlockClaimGlobalFilterPage {
-        schema_version: BLOCK_CLAIM_INDEX_SCHEMA_VERSION,
-        insertions: 0,
-        bits: vec![0; BLOCK_CLAIM_GLOBAL_FILTER_BYTES],
-    }
-}
-
-fn update_block_claim_global_filter(
-    filter: &mut BlockClaimGlobalFilterPage,
-    records: &[([u8; 16], BlockClaimIndexValue)],
-) -> Result<(), StoreError> {
-    filter.insertions = filter
-        .insertions
-        .checked_add(
-            u64::try_from(records.len()).map_err(|_| StoreError::MalformedBlockClaimIndex)?,
-        )
-        .ok_or(StoreError::MalformedBlockClaimIndex)?;
-    let bit_len = u64::try_from(filter.bits.len())
-        .ok()
-        .and_then(|bytes| bytes.checked_mul(8))
-        .ok_or(StoreError::MalformedBlockClaimIndex)?;
-    for (key, _) in records {
-        let (first, second) = block_claim_filter_hashes(key);
-        for position in block_claim_filter_positions(first, second, bit_len) {
-            filter.bits[position as usize / 8] |= 1 << (position % 8);
-        }
-    }
-    Ok(())
-}
-
-fn validate_block_claim_global_filter(
-    filter: &BlockClaimGlobalFilterPage,
-) -> Result<(), StoreError> {
-    if filter.schema_version != BLOCK_CLAIM_INDEX_SCHEMA_VERSION
-        || filter.insertions == 0
-        || filter.bits.len() != BLOCK_CLAIM_GLOBAL_FILTER_BYTES
-    {
-        return Err(StoreError::MalformedBlockClaimIndex);
-    }
-    Ok(())
-}
-
-fn block_claim_global_filter_might_contain(
-    filter: &BlockClaimGlobalFilterPage,
-    first: u64,
-    second: u64,
-) -> bool {
-    let bit_len = (filter.bits.len() as u64) * 8;
-    block_claim_filter_positions(first, second, bit_len)
-        .into_iter()
-        .all(|position| filter.bits[position as usize / 8] & (1 << (position % 8)) != 0)
-}
-
-fn validate_block_claim_filter(filter: &BlockClaimFilterPage) -> Result<(), StoreError> {
-    let expected_bits = usize::try_from(filter.entry_count)
-        .ok()
-        .and_then(|entries| entries.checked_mul(BLOCK_CLAIM_FILTER_BITS_PER_ENTRY))
-        .ok_or(StoreError::MalformedBlockClaimIndex)?;
-    let expected_bytes = expected_bits
-        .checked_add(7)
-        .ok_or(StoreError::MalformedBlockClaimIndex)?
-        / 8;
-    if filter.schema_version != BLOCK_CLAIM_INDEX_SCHEMA_VERSION
-        || filter.entry_count == 0
-        || filter.bit_len != expected_bits as u64
-        || filter.bits.len() != expected_bytes
-    {
-        return Err(StoreError::MalformedBlockClaimIndex);
-    }
-    let unused_bits = expected_bytes * 8 - expected_bits;
-    if unused_bits != 0
-        && filter.bits.last().is_some_and(|last| {
-            let used_mask = u8::MAX >> unused_bits;
-            *last & !used_mask != 0
-        })
-    {
-        return Err(StoreError::MalformedBlockClaimIndex);
-    }
-    Ok(())
-}
-
-fn block_claim_filter_might_contain(
-    filter: &BlockClaimFilterPage,
-    first: u64,
-    second: u64,
-) -> bool {
-    block_claim_filter_positions(first, second, filter.bit_len)
-        .into_iter()
-        .all(|position| filter.bits[position as usize / 8] & (1 << (position % 8)) != 0)
-}
-
-fn block_claim_filter_hashes(key: &[u8; 16]) -> (u64, u64) {
-    let high = u64::from_be_bytes(key[..8].try_into().expect("fixed block key"));
-    let low = u64::from_be_bytes(key[8..].try_into().expect("fixed block key"));
-    let first = splitmix64(high ^ low.rotate_left(23));
-    let second = splitmix64(low ^ high.rotate_right(17) ^ 0x9e37_79b9_7f4a_7c15) | 1;
-    (first, second)
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn block_claim_filter_positions(
-    first: u64,
-    second: u64,
-    bit_len: u64,
-) -> [u64; BLOCK_CLAIM_FILTER_HASHES as usize] {
-    std::array::from_fn(|index| {
-        first
-            .wrapping_add((index as u64).wrapping_mul(second))
-            .wrapping_rem(bit_len)
-    })
-}
-
-fn validate_block_claim_page(page: &BlockClaimIndexPage) -> Result<(), StoreError> {
-    match page {
-        BlockClaimIndexPage::Branch {
-            schema_version,
-            depth,
-            children,
-        } => {
-            if *schema_version != BLOCK_CLAIM_INDEX_SCHEMA_VERSION
-                || *depth >= BLOCK_CLAIM_RADIX_DEPTH
-                || children.is_empty()
-                || children.iter().any(|(nibble, _)| *nibble >= 16)
-                || !children.windows(2).all(|pair| pair[0].0 < pair[1].0)
-            {
-                return Err(StoreError::MalformedBlockClaimIndex);
-            }
-        }
-        BlockClaimIndexPage::Leaf {
-            schema_version,
-            depth,
-            entries,
-        } => {
-            if *schema_version != BLOCK_CLAIM_INDEX_SCHEMA_VERSION
-                || *depth > BLOCK_CLAIM_RADIX_DEPTH
-                || entries.is_empty()
-                || (*depth < BLOCK_CLAIM_RADIX_DEPTH && entries.len() > BLOCK_CLAIM_LEAF_ENTRIES)
-                || !entries.windows(2).all(|pair| pair[0].0 < pair[1].0)
-                || entries.iter().any(|(_, record)| {
-                    record.is_empty() || record.len() > MAX_BLOCK_CLAIM_RECORD_BYTES
-                })
-            {
-                return Err(StoreError::MalformedBlockClaimIndex);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_history_node(node: &HistoryIndexNode) -> Result<(), StoreError> {
@@ -6963,184 +5993,6 @@ mod history_index_tests {
             Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound
         ));
         drop(history);
-        drop(store);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
-    fn authenticated_block_claim_point_index_is_bounded_and_fails_closed() {
-        let root = test_root("block-claim-integrity");
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(20));
-        let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
-        let index = store.start_block_claim_index().unwrap();
-        let records: Vec<_> = (0_u128..256)
-            .map(|value| {
-                (
-                    Uuid::from_u128(10_000 + value).into_bytes(),
-                    BlockClaimIndexValue::from_slice(&value.to_be_bytes()),
-                )
-            })
-            .collect();
-        let before_insert = store.instrumentation();
-        let mut index_root = index
-            .insert_many(BlockClaimIndexRoot::default(), &records)
-            .unwrap();
-        let after_insert = store.instrumentation();
-        assert_eq!(
-            after_insert.directory_enumerations - before_insert.directory_enumerations,
-            0
-        );
-        assert!(after_insert.block_claim_index_writes > before_insert.block_claim_index_writes);
-        assert_eq!(
-            after_insert.block_claim_index_syncs - before_insert.block_claim_index_syncs,
-            0,
-            "the reconstructible run-local index must not enter the authoritative durability path"
-        );
-
-        let requested = [
-            records[0].0,
-            records[127].0,
-            records[255].0,
-            Uuid::from_u128(99_999).into_bytes(),
-        ];
-        let before_lookup = store.instrumentation();
-        let found = index.lookup_many(index_root, &requested).unwrap();
-        let after_lookup = store.instrumentation();
-        assert_eq!(found.len(), 3);
-        assert_eq!(found[&records[127].0], records[127].1);
-        assert_eq!(
-            after_lookup.directory_enumerations - before_lookup.directory_enumerations,
-            0
-        );
-        assert!(
-            after_lookup.block_claim_index_reads - before_lookup.block_claim_index_reads <= 16,
-            "point lookup escaped the requested radix paths"
-        );
-
-        assert!(matches!(
-            index.lookup_many(index_root, &[records[1].0, records[0].0]),
-            Err(StoreError::MalformedBlockClaimIndex)
-        ));
-        assert!(matches!(
-            index.insert_many(
-                index_root,
-                &[
-                    (records[1].0, BlockClaimIndexValue::from_slice(&[1])),
-                    (records[0].0, BlockClaimIndexValue::from_slice(&[2]))
-                ]
-            ),
-            Err(StoreError::MalformedBlockClaimIndex)
-        ));
-
-        let replacement = BlockClaimIndexValue::from_slice(b"newest canonical value");
-        index_root = index
-            .insert_many(index_root, &[(records[0].0, replacement.clone())])
-            .unwrap();
-        assert_eq!(
-            index.lookup_many(index_root, &requested[..1]).unwrap()[&records[0].0],
-            replacement,
-            "newest authenticated segment must deterministically shadow an older value"
-        );
-
-        let run = std::fs::read_dir(root.join("archive/block-claim-index"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let page_path = run.join(BLOCK_CLAIM_INDEX_FILE);
-        let original = std::fs::read(&page_path).unwrap();
-        let global_ref = index_root.global_filter.unwrap();
-        let global_payload_offset = usize::try_from(global_ref.offset).unwrap() + 4;
-        let mut tampered_global = original.clone();
-        tampered_global[global_payload_offset] ^= 1;
-        std::fs::write(&page_path, &tampered_global).unwrap();
-        assert!(matches!(
-            index.lookup_many(index_root, &requested[..1]),
-            Err(StoreError::BlockClaimIndexPathMismatch(found)) if found == global_ref.digest
-        ));
-        std::fs::write(&page_path, &original).unwrap();
-
-        let root_segment = *index_root
-            .levels
-            .iter()
-            .flatten()
-            .flatten()
-            .max_by_key(|segment| segment.generation)
-            .unwrap();
-        let root_ref = root_segment.page_ref;
-        let payload_offset = usize::try_from(root_ref.offset).unwrap() + 4;
-        let mut tampered = original.clone();
-        tampered[payload_offset] ^= 1;
-        std::fs::write(&page_path, &tampered).unwrap();
-        assert!(matches!(
-            index.lookup_many(index_root, &requested[..1]),
-            Err(StoreError::BlockClaimIndexPathMismatch(found)) if found == root_ref.digest
-        ));
-
-        std::fs::write(&page_path, &original[..original.len() - 1]).unwrap();
-        assert!(matches!(
-            index.lookup_many(index_root, &requested[..1]),
-            Err(StoreError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof
-        ));
-        std::fs::write(&page_path, &original).unwrap();
-
-        let malformed = BlockClaimIndexPage::Branch {
-            schema_version: BLOCK_CLAIM_INDEX_SCHEMA_VERSION,
-            depth: 0,
-            children: vec![(0, root_ref), (0, root_ref)],
-        };
-        let malformed_bytes = postcard::to_allocvec(&malformed).unwrap();
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(&page_path)
-            .unwrap();
-        let offset = file.seek(SeekFrom::End(0)).unwrap();
-        file.write_all(&(malformed_bytes.len() as u32).to_be_bytes())
-            .unwrap();
-        file.write_all(&malformed_bytes).unwrap();
-        file.sync_all().unwrap();
-        let mut malformed_root = BlockClaimIndexRoot {
-            next_generation: 1,
-            global_filter: index_root.global_filter,
-            ..BlockClaimIndexRoot::default()
-        };
-        malformed_root.levels[0][0] = Some(BlockClaimSegmentRef {
-            generation: 1,
-            entry_count: root_segment.entry_count,
-            page_ref: BlockClaimPageRef {
-                offset,
-                encoded_len: malformed_bytes.len() as u32,
-                digest: ContentDigest::of(&malformed_bytes),
-            },
-            filter_ref: root_segment.filter_ref,
-        });
-        assert!(matches!(
-            index.lookup_many(malformed_root, &requested[..1]),
-            Err(StoreError::MalformedBlockClaimIndex)
-        ));
-
-        let mut full_level = index_root;
-        full_level.next_generation = BLOCK_CLAIM_SEGMENTS_PER_LEVEL as u64;
-        for (slot, segment) in full_level.levels[0].iter_mut().enumerate() {
-            let mut selected = root_segment;
-            selected.generation = slot as u64 + 1;
-            *segment = Some(selected);
-        }
-        let compacted_key = Uuid::from_u128(200_000).into_bytes();
-        let compacted_value = BlockClaimIndexValue::from_slice(b"level carry");
-        let compacted = index
-            .insert_many(full_level, &[(compacted_key, compacted_value.clone())])
-            .unwrap();
-        assert!(compacted.levels[0].iter().all(Option::is_none));
-        assert_eq!(compacted.levels[1].iter().flatten().count(), 1);
-        let compacted_lookup = index
-            .lookup_many(compacted, &[records[0].0, compacted_key])
-            .unwrap();
-        assert_eq!(compacted_lookup[&records[0].0], replacement);
-        assert_eq!(compacted_lookup[&compacted_key], compacted_value);
-
-        drop(index);
         drop(store);
         crate::test_support::remove_dir_all(root);
     }
