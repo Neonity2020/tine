@@ -16899,6 +16899,27 @@ impl RuntimeActor {
         let acknowledgement = ApplicationMoveEpisodeAcknowledgement::from_record(&record);
         let acknowledgement_name = acknowledgement.filename();
         let acknowledgement_bytes = acknowledgement.encode()?;
+        if !self
+            .move_episode_cleanup_queue
+            .contains(&acknowledgement_name)
+            && self.move_episode_cleanup_queue.len() >= MOVE_EPISODE_CLEANUP_QUEUE_LIMIT
+        {
+            // Make bounded room before publishing another durable marker. Once
+            // a marker exists it must either be queued here or discoverable by
+            // the retained cold cursor; after that cursor is exhausted, an
+            // overflow refusal would otherwise strand the marker until reopen.
+            self.move_episode_cleanup_pending = true;
+            self.cleanup_acknowledged_move_episodes().map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_cleanup_queue_drain",
+                )
+            })?;
+            if self.move_episode_cleanup_queue.len() >= MOVE_EPISODE_CLEANUP_QUEUE_LIMIT {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_episode_ack_cleanup_queue_full",
+                ));
+            }
+        }
         DurableDirectoryPublication::open(&self.move_episode_directory)
             .map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt("move_episode_ack_publication_open")
@@ -16911,12 +16932,6 @@ impl RuntimeActor {
             .move_episode_cleanup_queue
             .contains(&acknowledgement_name)
         {
-            if self.move_episode_cleanup_queue.len() >= MOVE_EPISODE_CLEANUP_QUEUE_LIMIT {
-                self.move_episode_cleanup_pending = true;
-                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
-                    "move_episode_ack_cleanup_queue_full",
-                ));
-            }
             self.move_episode_cleanup_queue
                 .push_back(acknowledgement_name.clone());
         }
@@ -17015,10 +17030,13 @@ impl RuntimeActor {
         )
         .map_err(|error| format!("cannot inspect move episode record {record_name}: {error}"))?
         else {
-            self.move_episode_directory
-                .remove_file(name)
-                .map_err(|error| format!("cannot retire orphan move completion {name}: {error}"))?;
-            return Ok(true);
+            return match self.move_episode_directory.remove_file(name) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(format!(
+                    "cannot retire orphan move completion {name}: {error}"
+                )),
+            };
         };
         // A complete pair without an acknowledgement is exact response-replay
         // evidence. Even an accepted batch is not proof that the frontend
@@ -33337,6 +33355,164 @@ mod tests {
         let reopened = reopened.handle.expect("orphan cleanup actor reopens");
         assert!(!completion.exists());
         drop(reopened);
+    }
+
+    #[test]
+    fn cold_acknowledgement_cleanup_tolerates_stale_directory_entries() {
+        let fixture = ActivationFixture::nested_unicode("move-stale-cold-entry", 0xa17713);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("stale-entry source actor opens");
+        let request = simple_application_move_request(&handle, "Stale Cold Entry");
+        let episode_id = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed { episode_id, .. } => episode_id,
+            other => panic!("stale-entry move did not commit: {other:?}"),
+        };
+        let episode = Uuid::parse_str(&episode_id).unwrap();
+        let directory = fixture
+            .request
+            .application_runtime_root
+            .join("move-episodes");
+        let record_name = format!("episode-{}.bin", episode.simple());
+        let completion_name = format!("episode-{}.complete", episode.simple());
+        let record: ApplicationMoveEpisodeRecord =
+            postcard::from_bytes(&fs::read(directory.join(&record_name)).unwrap()).unwrap();
+        drop(handle);
+
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("stale-entry runtime resources reopen");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        let acknowledgement = ApplicationMoveEpisodeAcknowledgement::from_record(&record);
+        let acknowledgement_name = acknowledgement.filename();
+        fs::write(
+            directory.join(&acknowledgement_name),
+            acknowledgement.encode().unwrap(),
+        )
+        .unwrap();
+
+        assert!(actor
+            .cleanup_move_episode_acknowledgement(&acknowledgement_name)
+            .unwrap());
+        assert!(
+            !actor
+                .cleanup_cold_move_episode_entry(&completion_name)
+                .unwrap(),
+            "a ReadDir entry buffered before acknowledgement cleanup may be stale"
+        );
+        assert!(!directory.join(record_name).exists());
+        assert!(!directory.join(completion_name).exists());
+        assert!(!directory.join(acknowledgement_name).exists());
+    }
+
+    #[test]
+    fn live_acknowledgement_queue_saturation_drains_before_marker_publication() {
+        let fixture = ActivationFixture::nested_unicode("move-ack-queue-saturation", 0xa17715);
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let resources =
+            activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+        let open_request = reopen_request(&fixture.request);
+        let identities = open_request.clean_identities.clone().unwrap();
+        let opened = SyncRuntimeHandle::open_from_clean_resources(
+            open_request.clone(),
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanActivation,
+        );
+        let handle = opened.handle.expect("saturation source actor opens");
+        let request = simple_application_move_request(&handle, "Saturated Ack Queue");
+        let (episode_id, batch_id) = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id,
+                batch_id,
+                ..
+            } => (episode_id, batch_id),
+            other => panic!("saturation move did not commit: {other:?}"),
+        };
+        drop(handle);
+
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("saturation runtime resources reopen");
+        let identities = open_request.clean_identities.clone().unwrap();
+        let mut actor = RuntimeActor::from_clean_resources(
+            open_request,
+            identities,
+            resources,
+            SyncRuntimeRecovery::CleanManifestReplay,
+        )
+        .unwrap();
+        for _ in 0..MOVE_EPISODE_CLEANUP_QUEUE_LIMIT {
+            let acknowledgement = ApplicationMoveEpisodeAcknowledgement {
+                workspace_id: actor.binding.workspace_id(),
+                lineage_digest: actor.binding.lineage_digest(),
+                episode_id: Uuid::new_v4(),
+                batch_id: BatchId::new(),
+            };
+            let name = acknowledgement.filename();
+            fs::write(
+                fixture
+                    .request
+                    .application_runtime_root
+                    .join("move-episodes")
+                    .join(&name),
+                acknowledgement.encode().unwrap(),
+            )
+            .unwrap();
+            actor.move_episode_cleanup_queue.push_back(name);
+        }
+        actor.move_episode_cleanup_pending = true;
+
+        actor
+            .acknowledge_application_move(
+                Uuid::parse_str(&episode_id).unwrap(),
+                batch_id.parse::<BatchId>().unwrap(),
+            )
+            .expect("the 257th acknowledgement makes bounded room before publication");
+        assert!(actor.move_episode_cleanup_queue.len() <= MOVE_EPISODE_CLEANUP_QUEUE_LIMIT);
+        for _ in 0..16 {
+            if !actor.move_episode_cleanup_pending {
+                break;
+            }
+            actor.cleanup_acknowledged_move_episodes().unwrap();
+        }
+        assert!(!actor.move_episode_cleanup_pending);
+        let acknowledged = fs::read_dir(
+            fixture
+                .request
+                .application_runtime_root
+                .join("move-episodes"),
+        )
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".acknowledged")
+        })
+        .count();
+        assert_eq!(acknowledged, 0);
+        assert!(matches!(
+            actor.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     #[test]

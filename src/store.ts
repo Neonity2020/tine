@@ -340,7 +340,7 @@ type ManagedMoveAcknowledgement = {
 };
 const managedMoveAcknowledgements: ManagedMoveAcknowledgement[] = [];
 let managedMoveAcknowledgementEpoch = 0;
-let managedMoveAcknowledgementRunning = false;
+let managedMoveAcknowledgementRunnerEpoch: number | null = null;
 const MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT = 256;
 const MANAGED_MOVE_ACKNOWLEDGEMENT_ATTEMPTS = 3;
 let managedHistoryReplayRunning = false;
@@ -1360,6 +1360,7 @@ export function resetStore() {
   clearAllEditorLeases();
   setManagedMoveBusyPages(new Set<string>());
   managedMoveQueueEpoch++;
+  managedMoveQueue = Promise.resolve();
   managedMoveQueuePending = 0;
   managedMoveAcknowledgementEpoch++;
   managedMoveAcknowledgements.length = 0;
@@ -6760,10 +6761,12 @@ function managedMoveAcknowledgementDelay(attempt: number): Promise<void> {
 }
 
 async function drainManagedMoveAcknowledgements(): Promise<void> {
-  if (managedMoveAcknowledgementRunning) return;
-  managedMoveAcknowledgementRunning = true;
+  const runnerEpoch = managedMoveAcknowledgementEpoch;
+  if (managedMoveAcknowledgementRunnerEpoch === runnerEpoch) return;
+  managedMoveAcknowledgementRunnerEpoch = runnerEpoch;
   try {
-    while (managedMoveAcknowledgements.length > 0) {
+    while (runnerEpoch === managedMoveAcknowledgementEpoch
+      && managedMoveAcknowledgements.length > 0) {
       const item = managedMoveAcknowledgements[0];
       if (item.epoch !== managedMoveAcknowledgementEpoch
         || item.graphBinding !== graphBinding()
@@ -6793,8 +6796,10 @@ async function drainManagedMoveAcknowledgements(): Promise<void> {
       }
     }
   } finally {
-    managedMoveAcknowledgementRunning = false;
-    if (managedMoveAcknowledgements.length > 0) void drainManagedMoveAcknowledgements();
+    if (managedMoveAcknowledgementRunnerEpoch === runnerEpoch) {
+      managedMoveAcknowledgementRunnerEpoch = null;
+      if (managedMoveAcknowledgements.length > 0) void drainManagedMoveAcknowledgements();
+    }
   }
 }
 

@@ -5580,16 +5580,20 @@
     "tests": [
      "crates/tine-core/src/sync_runtime.rs::tests::acknowledged_cross_page_move_retires_only_response_replay_evidence",
      "crates/tine-core/src/sync_runtime.rs::tests::cold_open_bounded_cleanup_retires_a_pre_ack_orphan_completion",
+     "crates/tine-core/src/sync_runtime.rs::tests::cold_acknowledgement_cleanup_tolerates_stale_directory_entries",
+     "crates/tine-core/src/sync_runtime.rs::tests::live_acknowledgement_queue_saturation_drains_before_marker_publication",
      "crates/tine-core/src/sync_runtime.rs::tests::cold_move_cleanup_cursor_stays_runnable_and_bounded_across_turns",
      "src-tauri/src/commands.rs::managed_actor_command_boundary_tests::move_acknowledgement_wakes_actor_cleanup_after_every_attempt",
      "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result",
      "src/store.test.ts::retries replay-evidence acknowledgement outside the serialized move lane",
+     "src/store.test.ts::retires queued rapid moves when the graph binding changes",
+     "src/store.test.ts::starts a new graph acknowledgement lane while the old graph acknowledgement is stalled",
      "src/store.test.ts::bounds a sustained rapid-move backlog while one actor command is pending"
     ],
     "scenario": "managed.move-episode-ack-bounds-private-response-evidence",
     "failBefore": "proven by complete production-source census: every cross-page move published episode-<uuid>.bin and .complete and no path retired either file"
    },
-   "notes": "The acknowledgement is accepted only for one canonical workspace/lineage/episode/batch record with the exact completion bytes and an accepted or still-visible semantic batch. Before either response sidecar is removed, the actor durably publishes an exact cleanup authorization; bounded actor turns then retire that marker and any interrupted sidecars, including legacy orphan completions. Cleanup uses a retained, explicitly runnable directory cursor rather than repeated full enumeration. The frontend acknowledges on a bounded graph-bound retry lane outside the serialized semantic move queue, and every native attempt wakes actor cleanup. A complete pair without a durable acknowledgement remains exact response-replay evidence after a crash; it is not safe to infer response delivery merely from batch acceptance. Failure to acknowledge does not turn a successful move into a false user-visible failure."
+   "notes": "The acknowledgement is accepted only for one canonical workspace/lineage/episode/batch record with the exact completion bytes and an accepted or still-visible semantic batch. Before either response sidecar is removed, the actor durably publishes an exact cleanup authorization; bounded actor turns then retire that marker and any interrupted sidecars, including legacy orphan completions. Cleanup uses a retained, explicitly runnable directory cursor rather than repeated full enumeration, tolerates entries buffered before an authorized unlink, and makes bounded room before publishing a 257th live marker. The frontend acknowledges on a bounded graph-bound retry lane outside the serialized semantic move queue, and every native attempt wakes actor cleanup. Graph reset installs fresh semantic and acknowledgement lanes, so a stalled old graph cannot hold the new graph. A complete pair without a durable acknowledgement remains exact response-replay evidence after a crash; it is not safe to infer response delivery merely from batch acceptance. Failure to acknowledge does not turn a successful move into a false user-visible failure."
   },
   {
    "id": "REG-DIRECT-FILES-WINDOWS-DURABLE-NAME-PUBLICATION-001",

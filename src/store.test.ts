@@ -2739,18 +2739,32 @@ describe("managed actor-owned cross-page moves", () => {
     managed();
     let releaseFirst!: () => void;
     const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let calls = 0;
     const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
-      await firstMayFinish;
+      calls++;
+      if (calls === 1) await firstMayFinish;
+      const replacementGraph = calls > 1;
       return {
         binding_generation: binding,
         application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
         outcome: {
           status: "committed" as const,
           episode_id: request.episode_id,
-          batch_id: "old-graph-move",
+          batch_id: replacementGraph ? "new-graph-move" : "old-graph-move",
           recovered: false,
           source: { page: page("Today", "journals/today.md", "today-r2", [], "journal"), revision: "today-r2" },
-          destination: { page: page("Older", "journals/older.md", "older-r2", [moving], "journal"), revision: "older-r2" },
+          destination: {
+            page: page(
+              "Older",
+              "journals/older.md",
+              "older-r2",
+              [replacementGraph
+                ? { id: "moving", raw: "replacement graph", collapsed: false, children: [] }
+                : moving],
+              "journal",
+            ),
+            revision: "older-r2",
+          },
         },
       };
     });
@@ -2766,13 +2780,70 @@ describe("managed actor-owned cross-page moves", () => {
         page("Older", "journals/older.md", "replacement-older-r1", [], "journal"),
       ]);
       managed();
-      releaseFirst();
-
-      await expect(Promise.all([first, queued])).resolves.toEqual(["none", "none"]);
-      expect(move).toHaveBeenCalledTimes(1);
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      expect(move).toHaveBeenCalledTimes(2);
+      expect(pageByName("Older")!.roots).toEqual(["moving"]);
       expect(doc.byId.moving.raw).toBe("replacement graph");
-      expect(pageByName("Today")!.roots).toEqual(["moving"]);
+
+      releaseFirst();
+      await expect(Promise.all([first, queued])).resolves.toEqual(["none", "none"]);
+      expect(doc.byId.moving.raw).toBe("replacement graph");
+      expect(pageByName("Today")!.roots).toEqual([]);
     } finally {
+      releaseFirst();
+      move.mockRestore();
+    }
+  });
+
+  it("starts a new graph acknowledgement lane while the old graph acknowledgement is stalled", async () => {
+    const moving = { id: "moving", raw: "old graph", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [moving], "journal"),
+      page("Older", "journals/older.md", "older-r1", [], "journal"),
+    ]);
+    managed();
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed" as const,
+        episode_id: request.episode_id,
+        batch_id: request.source_revision,
+        recovered: false,
+        source: { page: page("Today", "journals/today.md", `${request.source_revision}-next`, [], "journal"), revision: `${request.source_revision}-next` },
+        destination: {
+          page: page(
+            "Older",
+            "journals/older.md",
+            `${request.destination_revision}-next`,
+            [{ id: "moving", raw: doc.byId.moving.raw, collapsed: false, children: [] }],
+            "journal",
+          ),
+          revision: `${request.destination_revision}-next`,
+        },
+      },
+    }));
+    let releaseOldAcknowledgement!: () => void;
+    const oldAcknowledgement = new Promise<void>((resolve) => { releaseOldAcknowledgement = resolve; });
+    const acknowledge = vi.spyOn(backend(), "acknowledgeManagedApplicationMove")
+      .mockImplementationOnce(async () => oldAcknowledgement)
+      .mockResolvedValue(undefined);
+    try {
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(1));
+
+      resetStore();
+      const replacement = { id: "moving", raw: "replacement graph", collapsed: false, children: [] };
+      await loadFeed([
+        page("Today", "journals/today.md", "replacement-r1", [replacement], "journal"),
+        page("Older", "journals/older.md", "replacement-older-r1", [], "journal"),
+      ]);
+      managed();
+      await expect(moveBlockFeed("moving", 1)).resolves.toBe("crossed");
+      await vi.waitFor(() => expect(acknowledge).toHaveBeenCalledTimes(2));
+    } finally {
+      releaseOldAcknowledgement();
+      acknowledge.mockRestore();
       move.mockRestore();
     }
   });
