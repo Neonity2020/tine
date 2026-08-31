@@ -872,13 +872,18 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/managed_storage_journey.rs",
             "fs.create_dir_all",
-            4,
+            5,
+        ),
+        (
+            "crates/tine-core/src/managed_storage_journey.rs",
+            "fs.remove_dir_all",
+            2,
         ),
         ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/model.rs", "cap.remove_file", 23),
-        ("crates/tine-core/src/model.rs", "cap.rename", 2),
+        ("crates/tine-core/src/model.rs", "cap.remove_file", 26),
+        ("crates/tine-core/src/model.rs", "cap.rename", 1),
         ("crates/tine-core/src/model.rs", "fs.create_dir", 8),
-        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 15),
+        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 16),
         ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 2),
         ("crates/tine-core/src/model.rs", "fs.remove_file", 16),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
@@ -1121,7 +1126,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/publish.rs", "fs.create_dir", 1),
         ("crates/tine-core/src/publish.rs", "fs.remove_dir_all", 1),
         ("crates/tine-core/src/publish.rs", "open.create_new", 1),
-        ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 3),
+        ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 7),
         (
             "crates/tine-core/src/sync_runtime.rs",
             "fs.create_dir_all",
@@ -1196,11 +1201,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/settings.rs", "fs.write", 1),
         ("src-tauri/src/settings.rs", "open.create_new", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 4),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 3),
+        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 2),
         ("src-tauri/src/sync_runtime.rs", "fs.rename", 4),
-        ("src-tauri/src/sync_runtime.rs", "open.create_new", 1),
     ]
     .into_iter()
     .map(|(path, primitive, count)| (path.to_owned(), primitive.to_owned(), count))
@@ -1279,7 +1283,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
     let expected = vec![
         ("managed_atomic_create_with_proof", 2),
         ("managed_atomic_write_validated", 2),
-        ("managed_atomic_replace_bound", 1),
+        ("managed_atomic_replace_bound", 2),
         ("rename_projection_noreplace_platform", 1),
         ("rename_managed_noreplace", 3),
         ("atomic_publish", 2),
@@ -1322,7 +1326,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("put_complete", 2),
         ("provider_retire_original_into_placeholder", 1),
         ("write_config", 9),
-        ("atomic_update", 6),
+        ("atomic_update", 4),
         ("create_graph", 0),
         ("create_demo_graph", 1),
         ("reserve_restore_recovery", 2),
@@ -1503,6 +1507,11 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ),
         ("crates/tine-core/src/fast_commit.rs", "journal.v1.open", 1),
         (
+            "crates/tine-core/src/model.rs",
+            "durable_directory.open",
+            5,
+        ),
+        (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
             1,
@@ -1555,7 +1564,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         (
             "crates/tine-core/src/sync_runtime.rs",
             "durable_directory.open",
-            3,
+            4,
         ),
         ("crates/tine-core/src/sync_runtime.rs", "journal.v2.open", 2),
         (
@@ -1577,10 +1586,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.2\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "a424609af57c34813e0c612bae72c1961de4d17d3dced85eaa88997355965677",
+        "1ce230676551bb70c7d165a8a9f9c73939fe3e10203a97d14e81443a55828a31",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
