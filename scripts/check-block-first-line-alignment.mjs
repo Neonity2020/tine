@@ -1,9 +1,10 @@
-// Vertical alignment of everything that must sit on a block's FIRST line.
-// Today that is the bullet dot / ordered number (GH #459).
+// Vertical alignment of everything that must sit on a block's FIRST line:
+// the bullet dot / ordered number (GH #459) and the reference-count badge
+// (GH #454).
 //
-// jsdom applies no CSS layout, so the defect is invisible to a render test: it
-// is line-box arithmetic. This drives the real frontend in headless Chromium
-// and measures the rendered boxes.
+// jsdom applies no CSS layout, so neither defect is visible to a render test:
+// both are line-box arithmetic. This drives the real frontend in headless
+// Chromium and measures the rendered boxes.
 //
 // The oracle is the first line box of `.block-content`, derived from the
 // element's own computed style (padding-top + line-height / 2), never from a
@@ -22,6 +23,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const shots = path.join(root, "screenshots");
 mkdirSync(shots, { recursive: true });
 
+// The kitchen-sink block that the mock graph references twice, so it carries a
+// count badge (see scripts/shot-blockrefs.mjs).
+const REFERENCED_BLOCK = "64b9c0e2-0000-0000-0000-000000000000";
 // Half a device pixel: the bullet must land ON the line, not near it.
 const TOLERANCE_PX = 0.5;
 // A heading keeps its own taller bullet column. This guard only asserts the dot
@@ -82,6 +86,26 @@ const measureBullets = () => {
   return rows;
 };
 
+/** In-page: where the reference-count badge sits relative to the first line of
+ *  the block it belongs to. */
+const measureBadge = (id) => {
+  const block = document.querySelector(`.ls-block[data-block-id="${id}"]`);
+  const content = block?.querySelector(":scope > .block-main > .block-content-wrapper > .block-content");
+  const badge = block?.querySelector(":scope > .block-main > .block-content-wrapper > .block-content > .block-refs-count");
+  if (!content || !badge) return { found: false };
+  const style = getComputedStyle(content);
+  const box = content.getBoundingClientRect();
+  const badgeBox = badge.getBoundingClientRect();
+  const lineHeight = parseFloat(style.lineHeight);
+  return {
+    found: true,
+    lines: Math.round((box.height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)) / lineHeight),
+    // 0 when the badge's top edge is level with the top of the first line box.
+    offsetFromFirstLine: badgeBox.top - (box.top + parseFloat(style.paddingTop)),
+    lineHeight,
+  };
+};
+
 const problems = [];
 const note = (message) => problems.push(message);
 
@@ -120,8 +144,7 @@ try {
   await page.evaluate(() => document.documentElement.removeAttribute("data-theme-content-typography"));
   await sleep(250);
 
-  // The kitchen sink carries the shapes the journal feed has not: ordered
-  // blocks, headings from macro expansion, collapsed parents.
+  // ---- GH #454: the reference-count badge sits on the first line ----
   await page.keyboard.press("Control+k");
   await page.waitForSelector(".switcher-input", { timeout: 5000 });
   await page.locator(".switcher-input").fill("kitchen");
@@ -129,7 +152,37 @@ try {
   await page.locator(".switcher-row").first().click();
   await page.waitForSelector(".ls-block", { timeout: 5000 });
   await sleep(700);
+  await page.locator(`.ls-block[data-block-id="${REFERENCED_BLOCK}"]`).scrollIntoViewIfNeeded();
+
+  const single = await page.evaluate(measureBadge, REFERENCED_BLOCK);
+  if (!single.found) note("kitchen-sink: the referenced block has no count badge — fixture drifted");
+  else {
+    if (single.lines !== 1) note(`kitchen-sink: expected the wide layout to keep the referenced block on one line, saw ${single.lines}`);
+    if (Math.abs(single.offsetFromFirstLine) > 1) note(`single-line badge is ${single.offsetFromFirstLine.toFixed(2)}px off its first line`);
+  }
+
+  // The kitchen sink carries the shapes the journal feed has not: ordered
+  // blocks, headings from macro expansion, collapsed parents.
   check("kitchen-sink", await page.evaluate(measureBullets));
+
+  // Narrow the text column until the same block wraps: the reported case.
+  // Constraining the column rather than the window keeps every responsive
+  // breakpoint out of the measurement.
+  await page.addStyleTag({ content: ":root { --tine-main-content-max-width: 380px; }" });
+  await sleep(400);
+  await page.locator(`.ls-block[data-block-id="${REFERENCED_BLOCK}"]`).scrollIntoViewIfNeeded();
+  await sleep(200);
+  const wrapped = await page.evaluate(measureBadge, REFERENCED_BLOCK);
+  await page.locator(`.ls-block[data-block-id="${REFERENCED_BLOCK}"]`)
+    .screenshot({ path: path.join(shots, "block-refs-badge-wrapped.png") });
+  if (!wrapped.found) note("kitchen-sink (narrow): the referenced block has no count badge");
+  else {
+    if (wrapped.lines < 2) note(`kitchen-sink (narrow): the referenced block did not wrap (${wrapped.lines} line) — the fixture cannot show the defect`);
+    if (Math.abs(wrapped.offsetFromFirstLine) > 1) {
+      note(`wrapped badge is ${wrapped.offsetFromFirstLine.toFixed(2)}px below its first line`
+        + ` (one line is ${wrapped.lineHeight}px — the badge is riding the last line, GH #454)`);
+    }
+  }
 
   // ---- headings keep their own, taller bullet column ----
   // Neither demo page renders a heading block with its own bullet column, so the
@@ -171,5 +224,6 @@ if (problems.length) {
   for (const problem of problems) console.error(`  ${problem}`);
   process.exit(1);
 }
-console.log("block first-line alignment OK: bullets sit on their block's first line.");
+console.log("block first-line alignment OK: bullets and reference badges sit on their block's first line.");
 console.log(`  screenshots/block-first-line-journals.png`);
+console.log(`  screenshots/block-refs-badge-wrapped.png`);
