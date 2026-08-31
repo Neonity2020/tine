@@ -3292,11 +3292,12 @@
   },
   {
    "id": "REG-MANAGED-ACTIVATION-LATENCY-292",
-   "title": "Managed activation avoids graph-sized intermediate operation I/O and stays within the representative Linux and Windows latency gates",
+   "title": "Managed activation, reopen, and page switching remain responsive at reporter scale",
    "family": "managed-storage-activation",
    "sources": {
     "issues": [
-     292
+     292,
+     396
     ],
     "commits": []
    },
@@ -3305,8 +3306,8 @@
     "linux",
     "android"
    ],
-   "layer": "core-native",
-   "status": "fixing",
+   "layer": "core-native-and-real-app",
+   "status": "covered",
    "coverage": {
     "tests": [
      "crates/tine-core/src/oplog/import.rs::in_memory_and_spilled_bootstrap_builders_publish_identical_canonical_state",
@@ -3314,7 +3315,7 @@
      "scripts/e2e-windows-managed-storage.mjs"
     ]
    },
-   "notes": "The reporter-scale hosted Windows baseline reached 427 seconds: 314 seconds in bootstrap preparation, including 302 seconds of detached authoring, before the intentionally non-roundtripping page produced its expected semantic refusal. The equivalent 13k-page Linux baseline was about 91 seconds. The approved redesign first reduced successful activation to one live capture plus one final live proof; this packet makes semantic lowering size-adaptive so ordinary graphs retain canonical encoded operations under a measured 128 MiB budget and never write or reread the operation spool, while oversized graphs retain the deterministic bounded spill route. Forced-route differential coverage requires byte-identical aggregate and commit output. Status remains fixing until the 13k Linux gate and same hosted Windows receipt are measured on the exact candidate, followed by the remaining terminal-materialization redesign."
+   "notes": "The original reporter-scale hosted Windows baseline reached 427 seconds: 314 seconds in bootstrap preparation, including 302 seconds of detached authoring, before the intentionally non-roundtripping page produced its expected semantic refusal. The equivalent 13k-page Linux baseline was about 91 seconds. The completed activation redesign reduced successful activation to one live capture plus one final live proof, uses size-adaptive semantic lowering to avoid ordinary graph-sized operation spools, publishes the terminal materialization directly, opens the disposable SQLite projection without replaying accepted history, and keeps page queries bounded. The manual 12k receipt records activation and cold reopen plus matched Direct Files/Managed Storage logical page-open distributions. The current-only Windows journey activates the exact candidate, force-closes and reopens it, alternates repeated real UI page switches between ordinary and nested Unicode pages in both storage modes, records the complete timing distributions, and then proves byte-exact return to Direct Files."
   },
   {
    "id": "REG-MANAGED-LARGE-PAGE-ADMISSION-311",

@@ -1059,13 +1059,18 @@
      "class": "core-operation",
      "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after v0.6.94 managed activation, forced process death, candidate upgrade/reopen, and return to Direct Files; when the old release serves pages, the predecessor journey also attempts a real managed edit.",
      "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "In current-candidate mode, Windows activation, forced-close reopen, and repeated user-visible switching between ordinary and nested Unicode pages complete on a 12,000-page graph while recording comparable Direct Files and Managed Storage timings.",
+     "blocking": true
     }
    ],
    "acceptableVariations": [
-    "Hosted Windows filesystem speed, WebView2 startup timing, and managed-storage activation duration may vary."
+    "Hosted Windows filesystem speed, WebView2 startup timing, managed-storage activation duration, and individual page-switch timings may vary."
    ],
    "nonRequirements": [
-    "Exact native confirmation-dialog appearance, internal private-storage layout, or exact progress wording."
+    "Exact native confirmation-dialog appearance, internal private-storage layout, exact progress wording, or equality between Direct Files and Managed Storage timing samples."
    ],
    "stability": "burn-in"
   },

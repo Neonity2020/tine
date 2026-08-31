@@ -27,6 +27,10 @@ on:
         description: Logical bytes in the compact sparse asset for the focused Windows managed-storage receipt
         required: false
         default: "25200000000"
+      managed_current_only:
+        description: Activate and reopen the current candidate instead of the historical upgrade baseline
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -122,7 +126,7 @@ jobs:
         shell: pwsh
         run: ./scripts/install-windows-webview2-driver.ps1
       - name: Restore v0.6.94 Windows baseline for managed upgrade/reopen
-        if: ${{ inputs.windows_scenario == 'windows-managed-storage' }}
+        if: ${{ inputs.windows_scenario == 'windows-managed-storage' && inputs.managed_current_only != 'true' }}
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP "Tine_0.6.94_x64-portable.zip"
@@ -146,6 +150,7 @@ jobs:
           E2E_MANAGED_BLOCKS_PER_PAGE: ${{ inputs.managed_blocks_per_page }}
           E2E_MANAGED_TOTAL_FILE_COUNT: ${{ inputs.managed_total_file_count }}
           E2E_MANAGED_ASSET_LOGICAL_BYTES: ${{ inputs.managed_asset_logical_bytes }}
+          E2E_MANAGED_CURRENT_ONLY: ${{ inputs.managed_current_only }}
         run: npm run e2e:windows:smoke -- --scenario=${{ matrix.scenario }}
       - name: Upload Windows E2E evidence
         if: always()

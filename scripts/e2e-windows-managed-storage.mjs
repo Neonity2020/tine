@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Focused Windows proof for GH #292. This is a real WebView2 + Tauri + NTFS
+// Focused Windows proof for GH #292 and #396. This is a real WebView2 + Tauri + NTFS
 // journey, including the native confirmation dialogs and the production
 // Settings action that invokes the managed-storage commands.
 import crypto from "node:crypto";
@@ -32,6 +32,7 @@ const BLOCKS_PER_PAGE = Number(process.env.E2E_MANAGED_BLOCKS_PER_PAGE || 10);
 const TOTAL_FILE_COUNT = Number(process.env.E2E_MANAGED_TOTAL_FILE_COUNT || 25_890);
 const ASSET_LOGICAL_BYTES = Number(process.env.E2E_MANAGED_ASSET_LOGICAL_BYTES || 25_200_000_000);
 const ACTIVATION_TIMEOUT_MS = Number(process.env.E2E_MANAGED_ACTIVATION_TIMEOUT_MS || 30 * 60_000);
+const CURRENT_ONLY = process.env.E2E_MANAGED_CURRENT_ONLY === "true";
 for (const [name, value, minimum] of [
   ["E2E_MANAGED_PAGE_COUNT", PAGE_COUNT, 2],
   ["E2E_MANAGED_BLOCKS_PER_PAGE", BLOCKS_PER_PAGE, 1],
@@ -306,10 +307,42 @@ async function openPage(title, { expectedMarker = nestedMarker, requireHeading =
   if (requireHeading) {
     const heading = await browser.$("h1.page-title");
     await heading.waitForExist({ timeout: 30_000 });
+    await browser.waitUntil(async () => (await heading.getText()).includes(title), {
+      timeout: 30_000,
+      timeoutMsg: `page heading did not switch to ${title}`,
+    });
   }
   if (expectedMarker) {
     await waitForBody(expectedMarker, 30_000, "nested UTF page after activation");
   }
+}
+
+function timingReceipt(samples) {
+  const ordered = [...samples].sort((a, b) => a - b);
+  const p95 = ordered[Math.max(0, Math.ceil(ordered.length * 0.95) - 1)];
+  return {
+    samples: ordered.length,
+    p50Ms: ordered[Math.floor(ordered.length / 2)],
+    p95Ms: p95,
+    maxMs: ordered[ordered.length - 1],
+  };
+}
+
+async function measurePageSwitches(rounds = 8) {
+  const ordinaryTitle = "Windows Managed 00002";
+  const ordinaryMarker = "fixture page 2 block 1";
+  const samples = [];
+  for (let round = 0; round < rounds; round += 1) {
+    // Each measurement is a real transition: callers begin on the nested page,
+    // so visit the ordinary page first and alternate from there.
+    const nested = round % 2 === 1;
+    const started = Date.now();
+    await openPage(nested ? nestedTitle : ordinaryTitle, {
+      expectedMarker: nested ? nestedMarker : ordinaryMarker,
+    });
+    samples.push(Date.now() - started);
+  }
+  return timingReceipt(samples);
 }
 
 async function createManagedPageAndAttemptEdit() {
@@ -428,6 +461,7 @@ const receipt = {
   pageCount: PAGE_COUNT,
   blocksPerPage: BLOCKS_PER_PAGE,
   graph: inventory,
+  candidateOnly: CURRENT_ONLY,
   graphPathKinds: ["nested", "unicode", "markdown", "parseable-non-roundtripping-markdown", "many-assets", "sparse-large-asset"],
   milestones: {},
 };
@@ -435,6 +469,7 @@ try {
   await startJourney(BASELINE_APP, "activation");
   await openPage(nestedTitle);
   receipt.milestones.directFilesOpened = true;
+  receipt.milestones.directFilesPageSwitch = await measurePageSwitches();
 
   await openManagedSettings("Enable Tine-managed storage...");
   const activationStarted = Date.now();
@@ -449,6 +484,9 @@ try {
   // candidate below to serve the actual marker.
   await openPage(nestedTitle, { expectedMarker: null, requireHeading: false });
   receipt.milestones.baselineManagedPageBodyVisible = (await bodyText()).includes(nestedMarker);
+  if (receipt.milestones.baselineManagedPageBodyVisible) {
+    receipt.milestones.managedPageSwitch = await measurePageSwitches();
+  }
   if (receipt.milestones.baselineManagedPageBodyVisible) {
     receipt.milestones.previousPatchEdit = await createManagedPageAndAttemptEdit();
   } else {
@@ -467,7 +505,9 @@ try {
   await startJourney(APP, "candidate-reopen");
   receipt.milestones.candidateReopenMs = Date.now() - reopenStarted;
   await openPage(nestedTitle);
+  receipt.milestones.candidateReopenReadyMs = Date.now() - reopenStarted;
   receipt.milestones.candidateManagedPageOpened = true;
+  receipt.milestones.reopenedManagedPageSwitch = await measurePageSwitches();
 
   const directFilesAction = await openManagedSettings([
     "Return to Direct files",

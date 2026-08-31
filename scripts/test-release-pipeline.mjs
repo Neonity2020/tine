@@ -183,6 +183,11 @@ assert.match(
 assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(uiE2eWorkflow, /actions\/cache\/restore@v4[\s\S]*?windows-gh295-candidate-\$\{\{ inputs\.linux_scenario \}\}/);
 assert.match(uiE2eWorkflow, /actions\/cache\/save@v4[\s\S]*?candidate\/target\/release\/tine\.exe/);
+assert.match(
+  uiE2eWorkflow,
+  /managed_current_only:[\s\S]*?inputs\.windows_scenario == 'windows-managed-storage' && inputs\.managed_current_only != 'true'[\s\S]*?E2E_MANAGED_CURRENT_ONLY: \$\{\{ inputs\.managed_current_only \}\}/,
+  "the focused Windows managed-storage lane cannot compare current-only activation and reopen without restoring the historical binary"
+);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);

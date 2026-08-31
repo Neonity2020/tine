@@ -47269,6 +47269,30 @@ mod tests {
                 0xa0b0 + index as u128 * 0x10,
                 additional_pages,
             );
+            let direct_graph = Graph::open(&fixture.graph_root);
+            direct_graph.warm_cache();
+            let direct_entries = direct_graph
+                .list_pages()
+                .into_iter()
+                .filter(|entry| entry.kind == PageKind::Page)
+                .collect::<Vec<_>>();
+            let sample_count = direct_entries.len().min(64);
+            assert!(sample_count > 0, "scaled fixture has ordinary pages");
+            let page_samples = (0..sample_count)
+                .map(|sample| {
+                    direct_entries[sample.saturating_mul(direct_entries.len()) / sample_count]
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut direct_page_open = Vec::with_capacity(sample_count);
+            for entry in &page_samples {
+                let started = Instant::now();
+                direct_graph
+                    .load_named(&entry.name, entry.kind)
+                    .expect("Direct Files scale receipt page lookup succeeds")
+                    .expect("Direct Files scale receipt page exists");
+                direct_page_open.push(started.elapsed());
+            }
             let receipt = activate_with_scale_receipt(&fixture);
             assert_eq!(receipt.source_files, total_pages, "{receipt:?}");
             assert!(
@@ -47284,15 +47308,40 @@ mod tests {
             let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
             assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
             let cold_ms = cold_started.elapsed().as_millis();
+            let handle = reopened
+                .handle
+                .expect("scaled fixture cold reopen retains its actor");
+            drive_initial_feed_with_turn_budget(&handle, total_pages.saturating_add(128));
+            let mut managed_page_open = Vec::with_capacity(sample_count);
+            for entry in &page_samples {
+                let started = Instant::now();
+                let _ = load_application_logical(&handle, &entry.name, SyncPageKind::Page);
+                managed_page_open.push(started.elapsed());
+            }
+            let direct_page_open_p50 = startup_median(&direct_page_open);
+            let direct_page_open_p95 = startup_p95(&direct_page_open);
+            let managed_page_open_p50 = startup_median(&managed_page_open);
+            let managed_page_open_p95 = startup_p95(&managed_page_open);
             eprintln!(
-                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} source_bytes={} blocks={} phases={:?} clean={:?}",
+                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} page_samples={sample_count} direct_page_open_p50_ms={:.3} direct_page_open_p95_ms={:.3} managed_page_open_p50_ms={:.3} managed_page_open_p95_ms={:.3} source_bytes={} blocks={} phases={:?} clean={:?}",
                 receipt.total_ms,
+                startup_ms(direct_page_open_p50),
+                startup_ms(direct_page_open_p95),
+                startup_ms(managed_page_open_p50),
+                startup_ms(managed_page_open_p95),
                 receipt.source_bytes,
                 receipt.blocks,
                 receipt.phase_ms,
                 receipt.clean,
             );
-            drop(reopened.handle);
+            assert!(
+                managed_page_open_p95 < Duration::from_millis(20),
+                "managed 12k-scale logical page open exceeded the interactive backend budget: p50={managed_page_open_p50:?} p95={managed_page_open_p95:?}"
+            );
+            assert!(matches!(
+                handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
         }
     }
 
