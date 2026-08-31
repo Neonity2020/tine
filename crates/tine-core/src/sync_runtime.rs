@@ -49896,7 +49896,7 @@ mod tests {
         let legacy_baseline_root = fixture
             .request
             .application_runtime_root
-            .join(crate::oplog::sync_layout::RECONCILIATION_DIR)
+            .join(tine_storage::formats::RECONCILIATION_DIR)
             .join(fixture.request.identities.workspace_id.to_string())
             .join(fixture.request.identities.endpoint_id.to_string());
         assert!(

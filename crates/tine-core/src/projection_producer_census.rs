@@ -1522,7 +1522,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.2\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "d963a0a594241fcfe997f885b42d3aab43236070f41c06e1eb61fe9d9a5d9a1a",
+        "8db69f404621b257a404177594a6ba81c0675d8311cd6f2a59ed636fc3db585f",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
