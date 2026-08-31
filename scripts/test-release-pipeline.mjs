@@ -208,6 +208,11 @@ assert.match(
   /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
   "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
 );
+assert.match(
+  windowsManagedScenario,
+  /\.switcher-row:not\(\.block-result\)[\s\S]*?kind === "page" \|\| kind === "journal"[\s\S]*?name === title/,
+  "reporter-scale navigation must choose the exact page result, not a block-search hit containing its title"
+);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);

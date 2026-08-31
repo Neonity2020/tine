@@ -309,9 +309,13 @@ async function openPage(title, { expectedMarker = nestedMarker, requireHeading =
   await input.setValue(title);
   let row;
   await browser.waitUntil(async () => {
-    for (const candidate of await browser.$$(".switcher-row")) {
-      const text = await candidate.getText();
-      if (text.includes(title)) {
+    // Block-search hits can contain the exact page title while still routing
+    // back to the current page. Select the typed page result itself: its kind
+    // is page/journal and its displayed page name is an exact match.
+    for (const candidate of await browser.$$(".switcher-row:not(.block-result)")) {
+      const kind = await candidate.$(".switcher-kind").getText();
+      const name = await candidate.$(".switcher-name").getText();
+      if ((kind === "page" || kind === "journal") && name === title) {
         row = candidate;
         return true;
       }

@@ -1072,7 +1072,8 @@
    "nonRequirements": [
     "Exact native confirmation-dialog appearance, internal private-storage layout, exact progress wording, or equality between Direct Files and Managed Storage timing samples."
    ],
-   "stability": "burn-in"
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-31: MS-17 exhausted the two-attempt hosted Windows E2E stop-loss without completing the current-candidate timing comparison. Run 33349270671 reached exact-candidate managed activation in 99.36 seconds, then the synthetic fixture's accidental 119,990-backlink hub monopolized the serialized actor and blocked the next page load. Run 33350869828 distributed those references but exposed a separate harness selector bug before activation: Ctrl+K chose a block-search hit containing the requested page title instead of the exact page result. The selector is now structurally corrected to require a page/journal row with an exact displayed name, but a prohibited third debugging run was not used to promote unburned evidence. The scenario remains diagnostic and must complete an unchanged-binary Windows burn-in before returning to release-blocking status."
   },
   "scripts/e2e-windows-page-reference-latency.mjs": {
    "contracts": [
