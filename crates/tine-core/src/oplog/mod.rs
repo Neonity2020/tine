@@ -9,7 +9,7 @@
 
 pub(crate) mod absence_decision;
 pub(crate) mod absence_sweep;
-pub mod batch;
+pub(crate) mod batch;
 pub(crate) mod bootstrap_import;
 pub(crate) mod causal_index;
 pub(crate) mod checkpoint_generation;
@@ -20,11 +20,11 @@ pub(crate) mod document_state;
 pub(crate) mod enrollment;
 pub(crate) mod evidence_index;
 pub(crate) mod external_import;
-pub mod hot_engine;
+pub(crate) mod hot_engine;
 #[cfg(test)]
 mod hot_engine_integration_tests;
-pub mod identity;
-pub mod import;
+pub(crate) mod identity;
+pub(crate) mod import;
 #[cfg(test)]
 mod import_integration_tests;
 pub(crate) mod lazy_genesis;
@@ -37,23 +37,23 @@ pub mod object_store;
 pub(crate) mod operational_coordinator;
 pub(crate) mod page_name_index;
 pub(crate) mod portable_path_index;
-pub mod projection;
+pub(crate) mod projection;
 #[cfg(test)]
 mod projection_integration_tests;
-pub mod projection_manifest;
-pub mod projection_store;
+pub(crate) mod projection_manifest;
+pub(crate) mod projection_store;
 pub(crate) mod projection_turn_journal;
-pub mod projection_work;
-pub mod receipt;
+pub(crate) mod projection_work;
+pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
-pub mod reference_catalog;
-pub mod refusal;
+pub(crate) mod reference_catalog;
+pub(crate) mod refusal;
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
-pub mod semantic;
-pub mod sqlite;
+pub(crate) mod semantic;
+pub(crate) mod sqlite;
 mod sqlite_identity;
-pub mod sqlite_materialization;
+pub(crate) mod sqlite_materialization;
 pub mod sync_layout;
 /// The character-level three-way machinery now lives at the crate root
 /// (`crate::text_merge`) because Direct Files' conflict resolver shares it;
@@ -218,3 +218,20 @@ pub use sqlite_materialization::{
     MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
 };
 pub use wire::SHARED_PROVIDER_TREE_NAMESPACES;
+
+#[cfg(test)]
+mod external_surface_tests {
+    #[test]
+    fn oplog_external_module_surface_is_exactly_the_named_consumers() {
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]\nmod external_surface_tests")
+            .next()
+            .unwrap();
+        let public_modules = production
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub mod "))
+            .map(|line| line.trim_end_matches(';'))
+            .collect::<Vec<_>>();
+        assert_eq!(public_modules, ["object_store", "sync_layout"]);
+    }
+}

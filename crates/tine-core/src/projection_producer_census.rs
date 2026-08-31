@@ -1506,11 +1506,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             1,
         ),
         ("crates/tine-core/src/fast_commit.rs", "journal.v1.open", 1),
-        (
-            "crates/tine-core/src/model.rs",
-            "durable_directory.open",
-            5,
-        ),
+        ("crates/tine-core/src/model.rs", "durable_directory.open", 5),
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
