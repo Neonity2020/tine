@@ -59,6 +59,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   resource ceilings. (GH #393)
 
 ### Fixed
+- Diagnostics: Tine no longer claims it "did not close cleanly last time" every launch on iOS, iPadOS and Android. A phone or tablet reclaims a backgrounded app as a matter of course, and Tine counted that as a crash because it had no other way to tell that a mobile session had ended; it now treats going to the background as the end of the session and coming back as the start of a new one, so a crash you actually see is still reported ([GH #426](https://github.com/martinkoutecky/tine/issues/426)). The desktop half of the same report, the warning after an ordinary quit on Linux and Windows, is fixed separately in this release (below). One last warning is expected the first time you open this version, from the marker the previous one left behind.
 - Sidebar: the left sidebar's scrollbar can be grabbed with the mouse again. The drag-to-resize strip along the sidebar's edge was drawn on top of it, so on Windows the sidebar could be resized but never scrolled by dragging; the strip now sits beside the scrollbar rather than over it ([GH #435](https://github.com/martinkoutecky/tine/issues/435)).
 - Outline: clicking a block's fold arrow no longer folds the entire subtree. The guide line beside the children (which folds every descendant) was drawn on top of the fold arrow's leftmost pixels, so an aim that landed slightly left of centre hit the wrong control. The guide now stops at the arrow's edge ([GH #423](https://github.com/martinkoutecky/tine/issues/423)).
 - Theme packaging: `tine-theme.mjs check` no longer certifies a ported theme that Tine then refuses to install. It checked only the upstream source, revision and author list, so an unsupported `portedFrom.ecosystem`, a missing `relationship`, `name` or `license`, or an unknown provenance field passed the registry check and failed on install. The checker now holds `portedFrom` to the same vocabulary the app installs against ([GH #410](https://github.com/martinkoutecky/tine/issues/410)).
@@ -258,7 +259,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - Quitting Tine normally no longer shows a false "Tine did not close cleanly
   last time" warning on the next launch. The clean-shutdown marker was cleared
   in code placed after the app's event loop, which never runs, so every quit
-  since the flight recorder shipped was reported as a crash.
+  since the flight recorder shipped was reported as a crash. This is the
+  desktop half of [GH #426](https://github.com/martinkoutecky/tine/issues/426).
 
 ## [0.6.98] - 2026-08-27
 

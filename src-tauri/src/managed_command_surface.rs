@@ -131,6 +131,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("diagnostic_frontend_event", NoGraphSlot),
     ("diagnostic_ipc_event", NoGraphSlot),
     ("diagnostic_report", NoGraphSlot),
+    ("diagnostic_session_active", NoGraphSlot),
     ("durable_live_save_conflict_diff", Filesystem),
     ("duplicate_journal_diff", Filesystem),
     ("edit_asset_external", Filesystem),

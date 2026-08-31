@@ -8826,7 +8826,9 @@
       "title": "A clean quit is not reported as an unclean close on the next launch",
       "family": "diagnostics",
       "sources": {
-        "issues": [],
+        "issues": [
+          426
+        ],
         "commits": [
           "271885b2"
         ]
@@ -8843,7 +8845,34 @@
         "scenario": "diagnostics.clean-quit-marker",
         "failBefore": "proven"
       },
-      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after."
+      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after. Retrofitted to GH #426 on 2026-08-31: this internal find and the Linux/Windows half of that public report are the same defect, and the reporter's own diagnostics attachment (v0.6.98, build 94579a0, which predates the fix) confirms it \u2014 its previous session records runtime.started and 26 later events but no runtime.clean_shutdown. The mobile half of #426 is a different orderly-end question and is UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426."
+    },
+    {
+      "id": "UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426",
+      "title": "A mobile app the OS reaps while backgrounded is not reported as having closed uncleanly",
+      "family": "diagnostics",
+      "sources": {
+        "issues": [
+          426
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "ios",
+        "android"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/debug.rs",
+          "src/sessionActivity.test.ts"
+        ],
+        "scenario": "diagnostics.mobile-background-session-end",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: backgrounding Tine on a phone or tablet and coming back later does not greet the user with 'Tine did not close cleanly last time'. Classification: blocking stateful UX (a permanent false alarm that trains users to ignore a real crash notice). Root cause: the flight recorder's session-active marker is removed at the one orderly end the app knew about, the desktop event loop's RunEvent::Exit. iOS and Android have no such moment \u2014 the OS suspends a backgrounded app and reaps it later without notice \u2014 so the marker always survived and EVERY launch warned. The reporter said exactly that: 'It does happen every time in iOS/iPadOS. The OS kills the app when in background so I am having this issue all the time.' Fix: on mobile the recorded session follows webview visibility, ending when the app is hidden and restarting when the user returns, so a crash they witness is still reported and a reap they never see is not. Desktop is deliberately excluded, because a minimised window is still a live session and honouring visibility there would hide exactly the background crashes the recorder exists to catch; that exclusion is asserted on both sides (src/sessionActivity.test.ts 'never ends a desktop session on visibility', and the cfg gate pinned by debug.rs 'visibility_ends_a_session_only_where_the_os_reaps_backgrounded_apps'). Fail-before is causal: making the marker removal a no-op turns debug.rs 'a_session_the_os_reaps_after_backgrounding_is_not_reported_unclean' red while its companion 'a_session_that_dies_after_coming_back_is_still_reported_unclean' stays green. EVIDENCE LIMIT: no iOS or Android runtime was available, so the recorder contract and the platform gating are proven at unit layer on Linux and the on-device toast is not; confidence stays moderate. One further warning is expected on the first launch after upgrading, from the marker the previous build left behind."
     },
     {
       "id": "UI-ABSENCE-RESTORE-PANEL-AUTOCLOSE-INTERNAL",

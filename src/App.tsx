@@ -154,6 +154,7 @@ import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 import { endEdit } from "./editorController";
 import { installBackgroundFlush } from "./backgroundFlush";
+import { installSessionActivity } from "./sessionActivity";
 import {
   installFocusFreshnessVerifier,
   installReloadOnFocus,
@@ -1282,6 +1283,14 @@ export function App(): JSX.Element {
     endEdit: () => endEdit("graph-switch"),
     flushAll,
     closeInFlight: () => safeClose.inFlight(),
+  })));
+
+  // GH #426: the same lifecycle edge, read for a different question — on mobile
+  // the OS reaps a backgrounded app routinely, and the next launch must not
+  // call that an unclean exit. Mobile only; see sessionActivity.ts.
+  onMount(() => onCleanup(installSessionActivity({
+    isMobile: isMobilePlatform,
+    setActive: (active) => { void backend().diagnosticSessionActive(active).catch(() => {}); },
   })));
 
   onMount(() => {

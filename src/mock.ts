@@ -2251,6 +2251,9 @@ export function mockBackend(): Backend {
     async onGraphVerificationProgress(): Promise<() => void> {
       return () => {};
     },
+    async diagnosticSessionActive(): Promise<void> {
+      /* no session marker in the browser dev shell */
+    },
     async diagnosticFrontendEvent(): Promise<void> {
       // no-op in the browser mock
     },

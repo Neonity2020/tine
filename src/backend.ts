@@ -779,6 +779,10 @@ export interface Backend {
     updaterStage?: string,
     updaterCause?: string,
   ): Promise<void>;
+  /** Whether the recorded session counts as live from now on. Mobile only: the
+   *  OS reaps a backgrounded app without notice, and that is not a crash
+   *  (GH #426). The backend ignores it on desktop. */
+  diagnosticSessionActive(active: boolean): Promise<void>;
 }
 
 export interface DebugInfo {
@@ -877,6 +881,7 @@ const DIAGNOSTIC_COMMANDS = new Set([
   "debug_log",
   "diagnostic_ipc_event",
   "diagnostic_frontend_event",
+  "diagnostic_session_active",
   "diagnostic_report",
   "save_diagnostic_report",
   "clear_diagnostics",
@@ -1826,6 +1831,9 @@ class TauriBackend implements Backend {
       updaterStage,
       updaterCause,
     });
+  }
+  diagnosticSessionActive(active: boolean) {
+    return this.call<void>("diagnostic_session_active", { active });
   }
   getSmoothScroll() {
     return this.call<boolean>("get_smooth_scroll");
