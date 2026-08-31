@@ -24,12 +24,21 @@ describe("iOS atomic publication platform boundary", () => {
     expect(platformGate).toContain('target_os = "ios"');
   });
 
+  // Named by behaviour, not by shell variable: the probe was refactored into a
+  // per-device smoke_one() function for GH #446 (an iPad has to boot too), and
+  // an assertion on the old UPPERCASE variable names would have failed a
+  // refactor that changed nothing this test cares about.
   it("exercises Guide copy inside the iOS Simulator rather than only launching the app", () => {
     const workflow = readFileSync(".github/workflows/ios-probe.yml", "utf8");
+    // The launch asks the app to copy the Guide in, and the assertion afterwards
+    // proves a non-empty Guide page landed in the container graph.
     expect(workflow).toContain("--tine-ci-copy-guide");
-    expect(workflow).toContain("GUIDE_PAGE");
-    expect(workflow).toContain("'*Tine Guide.md'");
-    expect(workflow).toContain("STALE_GRAPH");
+    expect(workflow).toMatch(/guide_page="?\$\(find .*-name '\*Tine Guide.md'/i);
+    expect(workflow).toMatch(/test -s "\$guide_page"/i);
+    // The launch argument is a container path whose Application UUID is stale,
+    // so the probe also proves the app rebases it instead of trusting it.
+    expect(workflow).toMatch(/stale_graph/i);
+    expect(workflow).toMatch(/00000000-0000-4000-8000-000000000000/);
   });
 
   it("carries an iOS-rebased graph path across the Rust mobile-plugin bridge", () => {
