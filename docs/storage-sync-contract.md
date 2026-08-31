@@ -329,15 +329,13 @@ this state is refused and can Return to Direct Files for a fresh clean
 activation.
 
 MS-14b retired the only production engine constructor that opened the native
-Patricia indexes and removed the bootstrap protocol's representation-only unit
-suite. A mutually recursive detached/inactive-bootstrap implementation closure
-still compiles in `tine-core`, but has no production caller at any of its six
-entry roots; the producer census pins both that zero-caller boundary and the
-single internal edge to each remaining Patricia opener. The closure is a
-mechanical deletion follow-up, not a supported reader, writer, migration, or
-alternate activation route. It remains isolated for now because its types are
-interleaved with the live clean identity semantics named below; those semantic
-halves must not be redesigned merely to make the residual easier to delete.
+Patricia indexes, deleted their physical store/opening branches, and removed
+the detached/inactive-bootstrap protocol closure and its representation-only
+tests. The producer census pins the former entry roots, Patricia openers, and
+`PatriciaIndexStore` absent from production. The live run-local identity maps,
+clean source selection, clean lazy-genesis materialization, and sealed accepted
+history/checkpoint bindings remain; they are semantic runtime state, not a
+reader, writer, migration, or alternate bootstrap activation route.
 
 Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
 `.authority-tmp-`) and `.staging` files have no authority until their named

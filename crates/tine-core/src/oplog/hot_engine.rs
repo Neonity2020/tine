@@ -19,12 +19,7 @@ use tine_storage::{
 use uuid::Uuid;
 
 use super::absence_decision::{AbsenceCompletionAnchor, AbsenceDecision, AbsenceDecisionMap};
-use super::bootstrap_import::{
-    BootstrapImportPartEvidenceV1, BootstrapPartDescriptorV1, BootstrapPartitionProfileV1,
-    BootstrapProfileDigestV1, MAX_OPERATIONS_PER_BOOTSTRAP_PART,
-};
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
-use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
 use super::lazy_genesis::{
     LazyGenesisCandidate, LazyGenesisFrontierBindingV1, LazyGenesisPageInput,
@@ -33,24 +28,17 @@ use super::lazy_genesis::{
 #[cfg(test)]
 use super::local_completion_index::{LocalCompletionFlushStats, LocalCompletionOpenStats};
 use super::local_completion_index::{LocalCompletionIndex, LocalCompletionPruningContext};
-use super::object_store::{
-    BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
-    CompletedDetachedBootstrapPublication, ControlDirectoryIdentity,
-    DetachedBootstrapPublicationSession,
-};
+use super::object_store::{BlockClaimIndexRoot, BlockClaimIndexValue, ControlDirectoryIdentity};
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
     extract_semantic_page_name_observations, extract_validated_catalog_page_names,
-    prepare_authored_page_name_transition, prepare_ephemeral_page_name_transition,
-    prepare_page_name_transition, AuthenticatedCatalogPageNameCheckpointV1,
+    prepare_ephemeral_page_name_transition, AuthenticatedCatalogPageNameCheckpointV1,
     AuthenticatedPageNameExactStateV1, AuthoritativeCatalogPageNameObservationsV1,
-    DetachedBootstrapPageNameCreation, EphemeralPageNameOwnershipStateV1,
-    PageNameConflictEvidenceV1, PageNameOwnershipRootV1, PageNameOwnershipStore,
+    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1, PageNameOwnershipRootV1,
     PageNamePublicationCandidateV1, PageNameTransitionError,
 };
 use super::portable_path_index::{
-    PortablePathIndexRoot, PortablePathIndexStore, PortablePathOccupied, PortablePathRecord,
-    PortablePathReleased,
+    PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
 };
 use super::receiver_absence_summary::ReceiverAbsenceSummary;
 #[cfg(test)]
@@ -68,7 +56,7 @@ use super::semantic::{
     EffectiveExplicitTitleState, LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState,
     PolicyGeneratedAnchorReason,
 };
-use super::uuid_claim_index::{LogseqClaimIndexRoot, LogseqClaimIndexStore};
+use super::uuid_claim_index::LogseqClaimIndexRoot;
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BatchCausalDot, BatchId, BatchInspection,
     BatchOrigin, BlobDescription, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId,
@@ -629,7 +617,6 @@ struct PreparedTransactionParts {
     semantic_effect: SemanticEffect,
     prospective_documents: BTreeMap<DocumentId, LoroDoc>,
     projection_before_snapshots: Option<BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
-    detached_bootstrap: Option<DetachedBootstrapAuthoredState>,
     portable_path_root: PortablePathIndexRoot,
     external_observation: Option<ExternalImportObservationMaterial>,
 }
@@ -638,15 +625,6 @@ struct PreparedTransactionParts {
 enum TransactionCapture {
     None,
     Projection,
-    DetachedBootstrap,
-}
-
-struct DetachedBootstrapAuthoredState {
-    documents: BTreeMap<DocumentId, EngineDocument>,
-    before_snapshots: BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    after_snapshots: BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    before_vectors: BTreeMap<DocumentId, VersionVector>,
-    dependency_heads: BTreeMap<DocumentId, Vec<BatchId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2292,1199 +2270,6 @@ pub(crate) struct LocalAuthorGeneration {
     mutation_token: u64,
 }
 
-/// Canonical accepted-engine material emitted beside one detached bootstrap
-/// part. The later aggregate/history installer can turn this into its prepared
-/// cold-history record without re-running CRDT validation or deriving any
-/// acceptance state from caller assertions.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DetachedBootstrapAcceptedEngineMaterial {
-    no_op: bool,
-    accepted_evidence: AcceptedBatchEvidence,
-    history_binding: super::object_store::EngineHistoryBinding,
-    logseq_claim_root: LogseqClaimIndexRoot,
-    reference_catalog_policy: ReferenceCatalogPolicyV1,
-}
-
-impl DetachedBootstrapAcceptedEngineMaterial {
-    pub(crate) const fn no_op(&self) -> bool {
-        self.no_op
-    }
-
-    pub(crate) const fn accepted_evidence(&self) -> &AcceptedBatchEvidence {
-        &self.accepted_evidence
-    }
-
-    pub(crate) const fn history_binding(&self) -> &super::object_store::EngineHistoryBinding {
-        &self.history_binding
-    }
-
-    pub(crate) const fn logseq_claim_root(&self) -> LogseqClaimIndexRoot {
-        self.logseq_claim_root
-    }
-
-    pub(crate) const fn reference_catalog_policy(&self) -> &ReferenceCatalogPolicyV1 {
-        &self.reference_catalog_policy
-    }
-
-    pub(crate) fn encode_history_record(
-        &self,
-        part: BootstrapPartDescriptorV1,
-        bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
-    ) -> Result<Vec<u8>, EngineError> {
-        if self.accepted_evidence.batch_id != part.batch_id()
-            || self.accepted_evidence.acceptance_sequence != u64::from(part.acceptance_sequence())
-        {
-            return Err(EngineError::Archive(
-                "detached bootstrap material does not match its aggregate part".into(),
-            ));
-        }
-        encode_history_record(&ColdHistoryRecord {
-            schema_version: ENGINE_HISTORY_SCHEMA_VERSION,
-            generation: u64::from(part.acceptance_sequence()),
-            bootstrap: Some(bootstrap),
-            batch_id: part.batch_id(),
-            manifest_fingerprint: self.accepted_evidence.manifest_fingerprint,
-            portable_path_key_version: self.history_binding.portable_path_key_version,
-            portable_path_root: PortablePathIndexRoot::from_digest(
-                self.history_binding.portable_path_root,
-            ),
-            catalog_checkpoint_binding: self.history_binding.catalog_checkpoint_binding,
-            portable_path_conflicts: self.history_binding.portable_path_conflicts.clone(),
-            terminal_evidence: self.history_binding.terminal_evidence,
-            page_names: self.history_binding.page_names.clone(),
-            logseq_claim_root: self.logseq_claim_root,
-            reference_catalog_policy: self.reference_catalog_policy.clone(),
-            status: ArchiveStatus::Accepted {
-                no_op: self.no_op,
-                evidence: self.accepted_evidence.clone(),
-            },
-        })
-    }
-}
-
-/// One fully prepared canonical bootstrap part and the exact detached engine
-/// transition it produced.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DetachedBootstrapAuthoredPart {
-    prepared: PreparedBatch,
-    engine_material: DetachedBootstrapAcceptedEngineMaterial,
-}
-
-impl DetachedBootstrapAuthoredPart {
-    pub(crate) const fn prepared(&self) -> &PreparedBatch {
-        &self.prepared
-    }
-
-    pub(crate) const fn engine_material(&self) -> &DetachedBootstrapAcceptedEngineMaterial {
-        &self.engine_material
-    }
-
-    pub(crate) fn into_parts(self) -> (PreparedBatch, DetachedBootstrapAcceptedEngineMaterial) {
-        (self.prepared, self.engine_material)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DetachedBootstrapContinuity {
-    import_id: super::ImportId,
-    profile_digest: BootstrapProfileDigestV1,
-    part_count: u32,
-}
-
-#[derive(Debug, Default)]
-struct DetachedBootstrapCurrentPathCatalogPlan {
-    rows: BTreeMap<PageId, Option<CurrentPathCatalogStoredRow>>,
-    terminal_part: bool,
-}
-
-#[derive(Debug, Default)]
-struct DetachedBootstrapLogseqClaimPlan {
-    additions: Vec<(LogseqUuid, LogseqClaimIntroduction)>,
-    terminal_part: bool,
-}
-
-#[derive(Debug, Default)]
-struct DetachedBootstrapPortablePathPlan {
-    records: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
-    page_ids: BTreeSet<PageId>,
-    terminal_part: bool,
-}
-
-#[derive(Debug, Default)]
-struct DetachedBootstrapPageNamePlan {
-    creations: BTreeMap<super::PageNameKeyDigest, DetachedBootstrapPageNameCreation>,
-    page_ids: BTreeSet<PageId>,
-    terminal_part: bool,
-}
-
-struct DetachedBootstrapScratchRoot {
-    parent: Dir,
-    root: Dir,
-    name: String,
-}
-
-impl DetachedBootstrapScratchRoot {
-    fn create() -> Result<Self, EngineError> {
-        let parent = Dir::open_ambient_dir(std::env::temp_dir(), ambient_authority())
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let name = format!("tine-detached-bootstrap-{}", Uuid::new_v4());
-        super::object_store::ensure_reconstructible_directory_nofollow(&parent, &name)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let root = super::object_store::open_dir_nofollow(&parent, &name)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(Self { parent, root, name })
-    }
-}
-
-impl Drop for DetachedBootstrapScratchRoot {
-    fn drop(&mut self) {
-        let _ = self.root.remove_dir_all(super::scratch_store::SCRATCH_DIR);
-        let _ = self.parent.remove_dir(&self.name);
-    }
-}
-
-/// Completed inactive detached candidate. This remains crate-private and has no
-/// publication, projection, graph, SQLite, or enrollment capability.
-pub(crate) struct DetachedBootstrapCandidate {
-    // Even an empty engine is large in test/debug builds. Heap ownership keeps
-    // nested direct replay and validation stack-bounded at maximum part width.
-    engine: Box<ShardedHotEngine>,
-    /// The ordinary detached-replay path owns a private temp root. The
-    /// ephemeral recovery path deliberately leaves this `None`: its scratch is
-    /// already an archive-local disposable run whose ownership transfers into
-    /// the enrolled engine rather than being copied into a retained run.
-    scratch_root: Option<DetachedBootstrapScratchRoot>,
-    part_count: u32,
-    last_part: Option<BootstrapPartId>,
-    index_durability: DetachedBootstrapIndexDurability,
-}
-
-/// A one-process bootstrap checkpoint reconstructed directly into an
-/// archive-local **ephemeral** scratch run.
-///
-/// This is intentionally neither `Clone` nor serializable. It carries a live
-/// scratch capability and run-local roots only long enough to hand them to the
-/// same enrolled engine; it never names a retained run, cannot be published as
-/// a resume point, and cannot survive this process. The enrolled restore still
-/// re-authenticates every durable-derived root and the run-local roots before
-/// it skips the already reconstructed bootstrap prefix.
-pub(crate) struct EphemeralBootstrapPredecessor {
-    scratch: Arc<ScratchStore>,
-    block_claim_index: Arc<BlockClaimIndexStore>,
-    // Keep the graph-shaped roots off the caller's recovery frame from the
-    // instant this capability is sealed. This predecessor crosses the
-    // promoted-runtime mint/open seam, whose stack budget must stay constant
-    // for both retained and ephemeral recovery paths.
-    snapshot: Box<RuntimeResumeSnapshot>,
-}
-
-impl EphemeralBootstrapPredecessor {
-    fn into_parts(
-        self,
-    ) -> (
-        Arc<ScratchStore>,
-        Arc<BlockClaimIndexStore>,
-        Box<RuntimeResumeSnapshot>,
-    ) {
-        (self.scratch, self.block_claim_index, self.snapshot)
-    }
-}
-
-enum DetachedBootstrapIndexDurability {
-    Authored(CompletedDetachedBootstrapPublication),
-    ReplayedArchive {
-        workspace_id: WorkspaceId,
-        archive_identity: ControlDirectoryIdentity,
-    },
-}
-
-impl DetachedBootstrapIndexDurability {
-    const fn workspace_id(&self) -> WorkspaceId {
-        match self {
-            Self::Authored(completed) => completed.workspace_id(),
-            Self::ReplayedArchive { workspace_id, .. } => *workspace_id,
-        }
-    }
-
-    const fn archive_identity(&self) -> ControlDirectoryIdentity {
-        match self {
-            Self::Authored(completed) => completed.archive_identity(),
-            Self::ReplayedArchive {
-                archive_identity, ..
-            } => *archive_identity,
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct BootstrapIndexWorkStats {
-    pub(crate) authenticated_page_identity_lookups: usize,
-    pub(crate) full_catalog_author_clones: usize,
-    pub(crate) detached_index_persistent_node_reads: usize,
-    pub(crate) reference_fallback_document_reconstructions: usize,
-}
-
-#[cfg(test)]
-fn bootstrap_index_work_stats(engine: &ShardedHotEngine) -> BootstrapIndexWorkStats {
-    let reference = engine.reference_source_observations.get();
-    let detached_index_persistent_node_reads = engine
-        .portable_path_index
-        .as_ref()
-        .map_or(0, |index| index.stats().reads)
-        .saturating_add(
-            engine
-                .logseq_claim_index
-                .as_ref()
-                .map_or(0, |index| index.stats().reads),
-        )
-        .saturating_add(
-            engine
-                .page_name_index
-                .as_ref()
-                .map_or(0, |index| index.stats().reads),
-        );
-    BootstrapIndexWorkStats {
-        authenticated_page_identity_lookups: reference.authenticated_page_identity_lookups,
-        full_catalog_author_clones: engine.read_only_catalog_clones.get(),
-        detached_index_persistent_node_reads,
-        reference_fallback_document_reconstructions: reference.fallback_document_reconstructions,
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DetachedBootstrapPublicationStats {
-    pub(crate) immutable_publications: usize,
-    pub(crate) verified_existing_publications: usize,
-    pub(crate) successful_batch_completions: usize,
-    pub(crate) packed_immutable_publications: usize,
-    pub(crate) packed_head_transitions: usize,
-    pub(crate) packed_capacity_fallbacks: usize,
-    pub(crate) packed_peak_resident_bytes: usize,
-}
-
-impl DetachedBootstrapCandidate {
-    pub(crate) const fn part_count(&self) -> u32 {
-        self.part_count
-    }
-
-    pub(crate) const fn last_part(&self) -> Option<BootstrapPartId> {
-        self.last_part
-    }
-
-    pub(crate) const fn index_archive_identity(&self) -> ControlDirectoryIdentity {
-        self.index_durability.archive_identity()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn detached_publication_stats(&self) -> Option<DetachedBootstrapPublicationStats> {
-        match &self.index_durability {
-            DetachedBootstrapIndexDurability::Authored(completed) => {
-                let packed = completed
-                    .packed_construction_stats()
-                    .expect("authored candidates retain three Patricia completions");
-                Some(DetachedBootstrapPublicationStats {
-                    immutable_publications: completed.publication_count(),
-                    verified_existing_publications: completed.existing_publication_count(),
-                    successful_batch_completions: 1,
-                    packed_immutable_publications: packed.iter().fold(0_usize, |total, stats| {
-                        total.saturating_add(stats.immutable_publication_calls)
-                    }),
-                    packed_head_transitions: packed.iter().fold(0_usize, |total, stats| {
-                        total.saturating_add(stats.head_transitions)
-                    }),
-                    packed_capacity_fallbacks: packed.iter().fold(0_usize, |total, stats| {
-                        total.saturating_add(stats.capacity_fallbacks)
-                    }),
-                    packed_peak_resident_bytes: packed.iter().fold(0_usize, |total, stats| {
-                        total.saturating_add(stats.peak_resident_bytes)
-                    }),
-                })
-            }
-            DetachedBootstrapIndexDurability::ReplayedArchive { .. } => None,
-        }
-    }
-
-    pub(crate) fn accepted_frontier_root(&self) -> Result<AcceptedFrontierRoot, EngineError> {
-        self.engine.accepted_frontier_root()
-    }
-
-    pub(crate) fn durable_history_binding(&self) -> super::object_store::EngineHistoryBinding {
-        if self.part_count == 0 {
-            super::object_store::EngineHistoryBinding::empty()
-        } else {
-            self.engine.durable_history_binding()
-        }
-    }
-
-    /// Read-only accepted-history authority for consumers that already hold
-    /// the enclosing inactive-bootstrap capability. The candidate remains
-    /// owned by that capability, so no mutation or projection writer can be
-    /// recovered from this borrow.
-    pub(crate) const fn accepted_engine(&self) -> &ShardedHotEngine {
-        &self.engine
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bootstrap_index_work_stats(&self) -> BootstrapIndexWorkStats {
-        bootstrap_index_work_stats(&self.engine)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn corrupt_scratch_for_promotion_test(&self) {
-        self.engine
-            .scratch
-            .as_ref()
-            .expect("detached candidate scratch")
-            .truncate_pages_for_test();
-    }
-
-    /// Migrate this exact live detached candidate into a canonical retained
-    /// archive run and describe it as an authenticated-recovery predecessor.
-    ///
-    /// The returned snapshot is process-only typed evidence. Its durable
-    /// fields come from the freshly opened sealed history, while every
-    /// run-local root comes from this candidate and addresses a byte-for-byte
-    /// copy made under both scratch leases. The ordinary enrolled restore path
-    /// must still re-read the cold head record, validate every durable index
-    /// root, and probe the migrated run before it can skip any generation.
-    pub(crate) fn migrate_for_same_process_promotion(
-        &self,
-        store: &ObjectStore,
-        history: super::object_store::EngineHistoryAuthority,
-        latest_batch_id: BatchId,
-        durable_binding: &super::object_store::EngineHistoryBinding,
-        expected_lineage: LineageDigest,
-        expected_catalog_document_id: DocumentId,
-    ) -> Result<
-        (
-            super::object_store::RetainedEngineScratch,
-            Box<RuntimeResumeSnapshot>,
-        ),
-        EngineError,
-    > {
-        let engine = &self.engine;
-        if self.part_count == 0
-            || history.generation != u64::from(self.part_count)
-            || engine.workspace_id != store.workspace_id()
-            || engine.lineage_digest != expected_lineage
-            || engine.catalog_document_id != expected_catalog_document_id
-            || !engine
-                .durable_history_binding()
-                .same_replay_authority(durable_binding)
-            || engine.history_failure.is_some()
-            || engine.is_blocked()
-            || !engine.portable_path_conflicts.is_empty()
-            || !engine.page_name_conflicts.is_empty()
-            || engine.fatal_evidence.is_some()
-            || engine.has_pending_author_work()
-            || !scratch_roots_are_stage_quiescent(&engine.scratch_roots)
-            || !engine.current_path_catalog.available
-            || engine.current_path_catalog.accepted_frontier_root != engine.accepted_frontier_root
-            || engine.next_acceptance_sequence != engine.accepted_frontier_root.acceptance_sequence
-        {
-            return Err(EngineError::Archive(
-                "detached bootstrap candidate is not an exact quiescent durable predecessor".into(),
-            ));
-        }
-        let (terminal_batch_id, terminal_evidence) = engine
-            .accepted_batch_entry_at(u64::from(self.part_count))?
-            .ok_or_else(|| {
-                EngineError::Archive(
-                    "detached bootstrap candidate has no terminal accepted entry".into(),
-                )
-            })?;
-        let terminal_evidence = terminal_evidence.ok_or_else(|| {
-            EngineError::Archive(
-                "detached bootstrap candidate terminal entry has no accepted evidence".into(),
-            )
-        })?;
-        if terminal_batch_id != latest_batch_id
-            || terminal_evidence.batch_id != latest_batch_id
-            || terminal_evidence.acceptance_sequence != history.generation
-            || terminal_evidence.post_frontier_root != engine.accepted_frontier_root
-        {
-            return Err(EngineError::Archive(
-                "detached bootstrap terminal frontier is not the durable history head".into(),
-            ));
-        }
-        let source = engine.scratch.as_ref().ok_or_else(|| {
-            EngineError::Archive("detached bootstrap candidate has no scratch store".into())
-        })?;
-        let retained = store
-            .create_retained_engine_scratch_from(source)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let snapshot = Box::new(RuntimeResumeSnapshot {
-            history_generation: history.generation,
-            history_index_root: history.index_root,
-            history_latest_batch_id: latest_batch_id,
-            scratch_run_id: retained.run_id(),
-            scratch_binding_digest: retained.binding_digest(),
-            scratch_roots: engine.scratch_roots.clone(),
-            block_claim_root: engine.block_claim_root,
-            accepted_frontier_root: engine.accepted_frontier_root.clone(),
-            next_acceptance_sequence: engine.next_acceptance_sequence,
-            current_path_catalog_root: engine.current_path_catalog.root.clone(),
-            current_path_catalog_available: engine.current_path_catalog.available,
-            current_path_catalog_frontier: engine
-                .current_path_catalog
-                .accepted_frontier_root
-                .clone(),
-            catalog_checkpoint_binding: engine.catalog_checkpoint_binding(),
-        });
-        Ok((retained, snapshot))
-    }
-
-    /// Seal an already reconstructed bootstrap as a one-process ephemeral
-    /// predecessor. Unlike `migrate_for_same_process_promotion`, this creates
-    /// no retained directory and copies no scratch bytes: the candidate was
-    /// authored directly into the archive-local disposable scratch that the
-    /// enrolled engine will consume.
-    pub(crate) fn seal_ephemeral_bootstrap_predecessor(
-        self,
-        history: super::object_store::EngineHistoryAuthority,
-        latest_batch_id: BatchId,
-        durable_binding: &super::object_store::EngineHistoryBinding,
-        expected_lineage: LineageDigest,
-        expected_catalog_document_id: DocumentId,
-    ) -> Result<Box<EphemeralBootstrapPredecessor>, EngineError> {
-        if self.scratch_root.is_some() {
-            return Err(EngineError::Archive(
-                "ephemeral bootstrap predecessor must use archive-local scratch".into(),
-            ));
-        }
-        let engine = self.engine;
-        if self.part_count == 0
-            || history.generation != u64::from(self.part_count)
-            || engine.lineage_digest != expected_lineage
-            || engine.catalog_document_id != expected_catalog_document_id
-            || !engine
-                .durable_history_binding()
-                .same_replay_authority(durable_binding)
-            || engine.history_failure.is_some()
-            || engine.is_blocked()
-            || !engine.portable_path_conflicts.is_empty()
-            || !engine.page_name_conflicts.is_empty()
-            || engine.fatal_evidence.is_some()
-            || engine.has_pending_author_work()
-            || !scratch_roots_are_stage_quiescent(&engine.scratch_roots)
-            || !engine.current_path_catalog.available
-            || engine.current_path_catalog.accepted_frontier_root != engine.accepted_frontier_root
-            || engine.next_acceptance_sequence != engine.accepted_frontier_root.acceptance_sequence
-        {
-            return Err(EngineError::Archive(
-                "ephemeral bootstrap candidate is not an exact quiescent durable predecessor"
-                    .into(),
-            ));
-        }
-        let (terminal_batch_id, terminal_evidence) = engine
-            .accepted_batch_entry_at(u64::from(self.part_count))?
-            .ok_or_else(|| {
-                EngineError::Archive(
-                    "ephemeral bootstrap candidate has no terminal accepted entry".into(),
-                )
-            })?;
-        let terminal_evidence = terminal_evidence.ok_or_else(|| {
-            EngineError::Archive(
-                "ephemeral bootstrap candidate terminal entry has no accepted evidence".into(),
-            )
-        })?;
-        if terminal_batch_id != latest_batch_id
-            || terminal_evidence.batch_id != latest_batch_id
-            || terminal_evidence.acceptance_sequence != history.generation
-            || terminal_evidence.post_frontier_root != engine.accepted_frontier_root
-        {
-            return Err(EngineError::Archive(
-                "ephemeral bootstrap terminal frontier is not the durable history head".into(),
-            ));
-        }
-        let scratch = Arc::clone(engine.scratch.as_ref().ok_or_else(|| {
-            EngineError::Archive("ephemeral bootstrap candidate has no scratch store".into())
-        })?);
-        if scratch.workspace_id() != engine.workspace_id {
-            return Err(EngineError::Archive(
-                "ephemeral bootstrap scratch belongs to another workspace".into(),
-            ));
-        }
-        let block_claim_index = Arc::clone(engine.block_claim_index.as_ref().ok_or_else(|| {
-            EngineError::Archive("ephemeral bootstrap candidate has no block-claim index".into())
-        })?);
-        let snapshot = Box::new(RuntimeResumeSnapshot {
-            history_generation: history.generation,
-            history_index_root: history.index_root,
-            history_latest_batch_id: latest_batch_id,
-            scratch_run_id: scratch.run_id(),
-            scratch_binding_digest: scratch
-                .binding_digest()
-                .map_err(|error| EngineError::Archive(error.to_string()))?,
-            scratch_roots: engine.scratch_roots.clone(),
-            block_claim_root: engine.block_claim_root,
-            accepted_frontier_root: engine.accepted_frontier_root.clone(),
-            next_acceptance_sequence: engine.next_acceptance_sequence,
-            current_path_catalog_root: engine.current_path_catalog.root.clone(),
-            current_path_catalog_available: engine.current_path_catalog.available,
-            current_path_catalog_frontier: engine
-                .current_path_catalog
-                .accepted_frontier_root
-                .clone(),
-            catalog_checkpoint_binding: engine.catalog_checkpoint_binding(),
-        });
-        Ok(Box::new(EphemeralBootstrapPredecessor {
-            scratch,
-            block_claim_index,
-            snapshot,
-        }))
-    }
-}
-
-/// Inactive, single-use multipart bootstrap author. Every candidate mutation
-/// is isolated in a scratch-backed empty engine. Taking the engine before each
-/// part makes every error permanently poison the session.
-///
-/// Scratch isolation covers the candidate's own disposable state — hot shards,
-/// dependency queue, accepted-frontier working roots — and is destroyed with
-/// the session. The reference catalog is deliberately *not* isolated: its root
-/// is bound into every accepted cold history record, so it must be built in the
-/// same durable content-addressed Patricia store the promoted runtime later opens.
-/// The caller therefore supplies an explicit
-/// [`BootstrapAuthoringCapability`] over the target archive.
-pub(crate) struct DetachedBootstrapAuthoringSession {
-    candidate: Option<Box<ShardedHotEngine>>,
-    scratch_root: Option<DetachedBootstrapScratchRoot>,
-    continuity: Option<DetachedBootstrapContinuity>,
-    next_ordinal: u32,
-    last_part: Option<BootstrapPartId>,
-    publication: Option<DetachedBootstrapPublicationSession>,
-    archive_identity: ControlDirectoryIdentity,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(test)]
-pub(crate) struct DetachedBootstrapReplayIdentity {
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    catalog_document_id: DocumentId,
-    reference_catalog_policy: ReferenceCatalogPolicyV1,
-    storage: ProjectionStorageBinding,
-    archive_identity: super::object_store::ControlDirectoryIdentity,
-}
-
-#[cfg(test)]
-impl DetachedBootstrapReplayIdentity {
-    #[cfg(test)]
-    pub(crate) fn new(
-        workspace_id: WorkspaceId,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        reference_catalog_policy: ReferenceCatalogPolicyV1,
-        storage: ProjectionStorageBinding,
-        archive_identity: super::object_store::ControlDirectoryIdentity,
-    ) -> Self {
-        Self {
-            workspace_id,
-            lineage_digest,
-            catalog_document_id,
-            reference_catalog_policy,
-            storage,
-            archive_identity,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn storage(&self) -> ProjectionStorageBinding {
-        self.storage
-    }
-}
-
-impl DetachedBootstrapAuthoringSession {
-    /// `indexes` must be the durable authenticated index capability of the exact
-    /// archive this bootstrap will be installed into and later promoted from.
-    pub(crate) fn new(
-        workspace_id: WorkspaceId,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        reference_catalog_policy: ReferenceCatalogPolicyV1,
-        indexes: &BootstrapAuthoringCapability,
-    ) -> Result<Self, EngineError> {
-        Self::new_with_catalog_mode(
-            workspace_id,
-            lineage_digest,
-            catalog_document_id,
-            reference_catalog_policy,
-            indexes,
-            true,
-            None,
-        )
-    }
-
-    fn new_replay(
-        workspace_id: WorkspaceId,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        reference_catalog_policy: ReferenceCatalogPolicyV1,
-        indexes: &BootstrapAuthoringCapability,
-    ) -> Result<Self, EngineError> {
-        Self::new_with_catalog_mode(
-            workspace_id,
-            lineage_digest,
-            catalog_document_id,
-            reference_catalog_policy,
-            indexes,
-            false,
-            None,
-        )
-    }
-
-    /// Replay into an already-created archive-local ephemeral scratch run.
-    /// The caller owns the only capability that can create this run, and the
-    /// finished candidate transfers the same live scratch into the enrolled
-    /// engine; there is intentionally no clone/migration step.
-    fn new_replay_in_ephemeral_scratch(
-        workspace_id: WorkspaceId,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        reference_catalog_policy: ReferenceCatalogPolicyV1,
-        indexes: &BootstrapAuthoringCapability,
-        scratch: Arc<ScratchStore>,
-        block_claim_index: Arc<BlockClaimIndexStore>,
-    ) -> Result<Self, EngineError> {
-        Self::new_with_catalog_mode(
-            workspace_id,
-            lineage_digest,
-            catalog_document_id,
-            reference_catalog_policy,
-            indexes,
-            false,
-            Some((scratch, block_claim_index)),
-        )
-    }
-
-    fn new_with_catalog_mode(
-        workspace_id: WorkspaceId,
-        lineage_digest: LineageDigest,
-        catalog_document_id: DocumentId,
-        reference_catalog_policy: ReferenceCatalogPolicyV1,
-        indexes: &BootstrapAuthoringCapability,
-        private_construction: bool,
-        ephemeral_scratch: Option<(Arc<ScratchStore>, Arc<BlockClaimIndexStore>)>,
-    ) -> Result<Self, EngineError> {
-        if indexes.workspace_id() != workspace_id {
-            return Err(EngineError::Archive(
-                "detached bootstrap authoring capability belongs to another workspace".into(),
-            ));
-        }
-        let (publication, portable_path_index, logseq_claim_index, page_name_index) =
-            if private_construction {
-                let (publication, indexes) = indexes
-                    .begin_detached_authoring()
-                    .map_err(|error| EngineError::Archive(error.to_string()))?;
-                (
-                    Some(publication),
-                    indexes.portable_path_index(),
-                    indexes.logseq_claim_index(),
-                    indexes.page_name_index(),
-                )
-            } else {
-                (
-                    None,
-                    indexes.portable_path_index(),
-                    indexes.logseq_claim_index(),
-                    indexes.page_name_index(),
-                )
-            };
-        let (scratch_root, scratch, block_claim_index) = match ephemeral_scratch {
-            Some((scratch, block_claim_index)) => {
-                if scratch.workspace_id() != workspace_id {
-                    return Err(EngineError::Archive(
-                        "archive-local ephemeral bootstrap scratch belongs to another workspace"
-                            .into(),
-                    ));
-                }
-                (None, scratch, block_claim_index)
-            }
-            None => {
-                let scratch_root = DetachedBootstrapScratchRoot::create()?;
-                let scratch = Arc::new(
-                    ScratchStore::create_retained(&scratch_root.root, workspace_id)
-                        .map_err(|error| EngineError::Archive(error.to_string()))?,
-                );
-                let block_claim_index = Arc::new(
-                    BlockClaimIndexStore::for_scratch(Arc::clone(&scratch))
-                        .map_err(|error| EngineError::Archive(error.to_string()))?,
-                );
-                (Some(scratch_root), scratch, block_claim_index)
-            }
-        };
-        let mut candidate = Box::new(ShardedHotEngine::new(
-            workspace_id,
-            lineage_digest,
-            catalog_document_id,
-        ));
-        // Run-local derived state stays in the session's own disposable scratch
-        // run — including the block-claim point index, which is scratch-backed
-        // exactly like an enrolled engine's. The bounded in-memory fallback is
-        // a no-store test map whose fixed capacity would cap an importable
-        // graph at a few thousand blocks.
-        candidate.block_claim_index = Some(block_claim_index);
-        candidate.scratch = Some(scratch);
-        // Every authenticated root an accepted bootstrap cold record binds is
-        // built here, in the target archive's durable stores. The promoted
-        // runtime opens the identical stores, so there is one construction.
-        candidate.portable_path_index = Some(portable_path_index);
-        candidate.logseq_claim_index = Some(logseq_claim_index);
-        candidate.page_name_index = Some(page_name_index);
-        candidate.configure_reference_catalog_policy(reference_catalog_policy)?;
-        Ok(Self {
-            candidate: Some(candidate),
-            scratch_root,
-            continuity: None,
-            next_ordinal: 0,
-            last_part: None,
-            publication,
-            archive_identity: indexes.archive_identity(),
-        })
-    }
-
-    pub(crate) fn author_part(
-        &mut self,
-        author: AuthorBatch,
-        transaction: &OperationTransaction,
-        evidence: BootstrapImportPartEvidenceV1,
-    ) -> Result<DetachedBootstrapAuthoredPart, EngineError> {
-        let mut candidate = self.candidate.take().ok_or_else(|| {
-            EngineError::InvalidTransaction(
-                "detached bootstrap authoring session is poisoned or consumed".into(),
-            )
-        })?;
-        let result = (|| {
-            if author.batch_id != evidence.batch_id() {
-                return Err(EngineError::InvalidTransaction(
-                    "bootstrap author batch id does not match part evidence".into(),
-                ));
-            }
-            if evidence.ordinal() != self.next_ordinal {
-                return Err(EngineError::InvalidTransaction(
-                    "bootstrap part ordinal is not the next detached ordinal".into(),
-                ));
-            }
-            if evidence.predecessor() != self.last_part {
-                return Err(EngineError::InvalidTransaction(
-                    "bootstrap part predecessor does not match the detached candidate".into(),
-                ));
-            }
-            let operation_count = u32::try_from(transaction.operations.len()).map_err(|_| {
-                EngineError::InvalidTransaction(
-                    "bootstrap transaction operation count cannot be represented".into(),
-                )
-            })?;
-            if operation_count == 0
-                || operation_count > MAX_OPERATIONS_PER_BOOTSTRAP_PART
-                || operation_count != evidence.operation_root().operation_count()
-            {
-                return Err(EngineError::InvalidTransaction(
-                    "bootstrap transaction does not match the bounded evidence operation count"
-                        .into(),
-                ));
-            }
-            let incoming = DetachedBootstrapContinuity {
-                import_id: evidence.import_id(),
-                profile_digest: evidence.profile_digest(),
-                part_count: evidence.part_count(),
-            };
-            if self.continuity.is_some_and(|bound| bound != incoming) {
-                return Err(EngineError::InvalidTransaction(
-                    "bootstrap part changes the detached import continuity binding".into(),
-                ));
-            }
-
-            let trace_enabled = candidate.activation_trace_enabled;
-            let before_prepare =
-                trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
-            let prepare_started = trace_enabled.then(std::time::Instant::now);
-            let PreparedTransactionParts {
-                prepared,
-                semantic_effect,
-                detached_bootstrap,
-                ..
-            } = candidate.prepare_detached_bootstrap_transaction(author, transaction)?;
-            if trace_enabled {
-                let after_prepare = BootstrapAuthoringTraceSnapshot::new(&candidate);
-                eprintln!(
-                    "bootstrap prepare transaction: ordinal={} operations={} elapsed_ms={:.3} {}",
-                    evidence.ordinal(),
-                    operation_count,
-                    prepare_started
-                        .expect("trace clock exists")
-                        .elapsed()
-                        .as_secs_f64()
-                        * 1_000.0,
-                    after_prepare.delta(before_prepare.as_ref().expect("trace snapshot exists")),
-                );
-            }
-            candidate.configure_detached_bootstrap_terminal_plans(evidence)?;
-            let before_advance =
-                trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
-            let advance_started = trace_enabled.then(std::time::Instant::now);
-            let (prepared, no_op, accepted_evidence) = candidate
-                .advance_authored_detached_bootstrap_candidate(
-                    prepared,
-                    detached_bootstrap.expect("detached preparation returns authored state"),
-                    semantic_effect,
-                )?;
-            if trace_enabled {
-                let after_advance = BootstrapAuthoringTraceSnapshot::new(&candidate);
-                eprintln!(
-                    "bootstrap advance candidate: ordinal={} operations={} elapsed_ms={:.3} {}",
-                    evidence.ordinal(),
-                    operation_count,
-                    advance_started
-                        .expect("trace clock exists")
-                        .elapsed()
-                        .as_secs_f64()
-                        * 1_000.0,
-                    after_advance.delta(before_advance.as_ref().expect("trace snapshot exists")),
-                );
-            }
-            let engine_material = DetachedBootstrapAcceptedEngineMaterial {
-                no_op,
-                accepted_evidence,
-                history_binding: candidate.durable_history_binding(),
-                logseq_claim_root: candidate.logseq_claim_root,
-                reference_catalog_policy: candidate.reference_catalog_policy.clone(),
-            };
-            Ok(DetachedBootstrapAuthoredPart {
-                prepared,
-                engine_material,
-            })
-        })();
-        match result {
-            Ok(part) => {
-                self.continuity.get_or_insert(DetachedBootstrapContinuity {
-                    import_id: evidence.import_id(),
-                    profile_digest: evidence.profile_digest(),
-                    part_count: evidence.part_count(),
-                });
-                self.next_ordinal = self
-                    .next_ordinal
-                    .checked_add(1)
-                    .expect("validated bootstrap part count cannot overflow");
-                self.last_part = Some(evidence.part_id());
-                self.candidate = Some(candidate);
-                Ok(part)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub(crate) fn finish(self) -> Result<DetachedBootstrapCandidate, EngineError> {
-        let candidate = self.candidate.ok_or_else(|| {
-            EngineError::InvalidTransaction(
-                "detached bootstrap authoring session is poisoned or consumed".into(),
-            )
-        })?;
-        if self
-            .continuity
-            .is_some_and(|bound| self.next_ordinal != bound.part_count)
-        {
-            return Err(EngineError::InvalidTransaction(
-                "detached bootstrap authoring session is incomplete".into(),
-            ));
-        }
-        let trace_enabled = candidate.activation_trace_enabled;
-        let portable_started = trace_enabled.then(Instant::now);
-        let portable_path_construction = if let Some(index) = candidate.portable_path_index.as_ref()
-        {
-            index
-                .finish_detached_construction(candidate.portable_path_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-        } else {
-            None
-        };
-        if let Some(started) = portable_started {
-            eprintln!(
-                "bootstrap finish portable paths: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        let logseq_started = trace_enabled.then(Instant::now);
-        let logseq_claim_construction = if let Some(index) = candidate.logseq_claim_index.as_ref() {
-            index
-                .finish_detached_construction(candidate.logseq_claim_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-        } else {
-            None
-        };
-        if let Some(started) = logseq_started {
-            eprintln!(
-                "bootstrap finish Logseq claims: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        let page_name_started = trace_enabled.then(Instant::now);
-        let page_name_construction = if let Some(index) = candidate.page_name_index.as_ref() {
-            index
-                .finish_detached_construction(&candidate.page_name_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-        } else {
-            None
-        };
-        if let Some(started) = page_name_started {
-            eprintln!(
-                "bootstrap finish page names: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        if trace_enabled {
-            eprintln!(
-                "bootstrap construction stats: portable={:?} logseq={:?} page_names={:?}",
-                portable_path_construction
-                    .as_ref()
-                    .map(|completed| completed.stats()),
-                logseq_claim_construction
-                    .as_ref()
-                    .map(|completed| completed.stats()),
-                page_name_construction
-                    .as_ref()
-                    .map(|completed| completed.stats()),
-            );
-        }
-        let publication_started = trace_enabled.then(Instant::now);
-        let index_durability = match self.publication {
-            Some(publication) => {
-                let require_completion =
-                    |completion: Option<super::content_patricia::CompletedPatriciaConstruction>| {
-                        completion.ok_or_else(|| {
-                            EngineError::Archive(
-                                "detached bootstrap Patricia construction is incomplete".into(),
-                            )
-                        })
-                    };
-                let packed_constructions = [
-                    require_completion(portable_path_construction)?,
-                    require_completion(logseq_claim_construction)?,
-                    require_completion(page_name_construction)?,
-                ];
-                DetachedBootstrapIndexDurability::Authored(
-                    publication
-                        .finish(packed_constructions)
-                        .map_err(|error| EngineError::Archive(error.to_string()))?,
-                )
-            }
-            None => DetachedBootstrapIndexDurability::ReplayedArchive {
-                workspace_id: candidate.workspace_id,
-                archive_identity: self.archive_identity,
-            },
-        };
-        if let Some(started) = publication_started {
-            eprintln!(
-                "bootstrap finish immutable publication: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        if index_durability.workspace_id() != candidate.workspace_id {
-            return Err(EngineError::Archive(
-                "detached bootstrap index durability proof belongs to another workspace".into(),
-            ));
-        }
-        Ok(DetachedBootstrapCandidate {
-            engine: candidate,
-            scratch_root: self.scratch_root,
-            part_count: self.next_ordinal,
-            last_part: self.last_part,
-            index_durability,
-        })
-    }
-
-    pub(crate) fn replay_prepared_part(
-        &mut self,
-        descriptor: BootstrapPartDescriptorV1,
-        prepared: PreparedBatch,
-    ) -> Result<DetachedBootstrapAcceptedEngineMaterial, EngineError> {
-        let mut candidate = self.candidate.take().ok_or_else(|| {
-            EngineError::InvalidTransaction(
-                "detached bootstrap replay session is poisoned or consumed".into(),
-            )
-        })?;
-        let result = (|| {
-            let evidence = descriptor.evidence();
-            if evidence.ordinal() != self.next_ordinal
-                || evidence.predecessor() != self.last_part
-                || descriptor.acceptance_sequence() != self.next_ordinal + 1
-                || prepared.manifest().batch_id() != descriptor.batch_id()
-            {
-                return Err(EngineError::Archive(
-                    "direct-loaded bootstrap part is out of aggregate order".into(),
-                ));
-            }
-            let incoming = DetachedBootstrapContinuity {
-                import_id: evidence.import_id(),
-                profile_digest: evidence.profile_digest(),
-                part_count: evidence.part_count(),
-            };
-            if self.continuity.is_some_and(|bound| bound != incoming) {
-                return Err(EngineError::Archive(
-                    "direct-loaded bootstrap part changes aggregate continuity".into(),
-                ));
-            }
-            candidate.configure_detached_bootstrap_terminal_plans(evidence)?;
-            let (no_op, accepted_evidence) =
-                candidate.advance_detached_bootstrap_candidate(prepared)?;
-            Ok(DetachedBootstrapAcceptedEngineMaterial {
-                no_op,
-                accepted_evidence,
-                history_binding: candidate.durable_history_binding(),
-                logseq_claim_root: candidate.logseq_claim_root,
-                reference_catalog_policy: candidate.reference_catalog_policy.clone(),
-            })
-        })();
-        match result {
-            Ok(material) => {
-                let evidence = descriptor.evidence();
-                self.continuity.get_or_insert(DetachedBootstrapContinuity {
-                    import_id: evidence.import_id(),
-                    profile_digest: evidence.profile_digest(),
-                    part_count: evidence.part_count(),
-                });
-                self.next_ordinal += 1;
-                self.last_part = Some(descriptor.part_id());
-                self.candidate = Some(candidate);
-                Ok(material)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn replay_loaded_part(
-        &mut self,
-        descriptor: BootstrapPartDescriptorV1,
-        loaded: super::object_store::LoadedBootstrapPartV1,
-    ) -> Result<(), EngineError> {
-        let prepared = PreparedBatch::new(loaded.manifest().clone(), loaded.objects().to_vec())?;
-        self.replay_prepared_part(descriptor, prepared).map(drop)
-    }
-}
-
-#[cfg(test)]
-fn replay_direct_loaded_bootstrap_with<F>(
-    store: &ObjectStore,
-    publication: &super::object_store::ValidatedBootstrapPublicationV1,
-    preparation: &DetachedBootstrapReplayIdentity,
-    ephemeral_scratch: Option<(Arc<ScratchStore>, Arc<BlockClaimIndexStore>)>,
-    mut validate_part: F,
-) -> Result<DetachedBootstrapCandidate, EngineError>
-where
-    F: FnMut(
-        BootstrapPartDescriptorV1,
-        &DetachedBootstrapAcceptedEngineMaterial,
-    ) -> Result<(), EngineError>,
-{
-    let aggregate = publication.aggregate();
-    if store.workspace_id() != preparation.workspace_id
-        || aggregate.workspace_id() != preparation.workspace_id
-        || aggregate.lineage_digest() != preparation.lineage_digest
-        || store
-            .canonical_archive_identity()
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            != preparation.archive_identity
-    {
-        return Err(EngineError::Archive(
-            "direct bootstrap replay preparation identity mismatch".into(),
-        ));
-    }
-    // Replay reproduces the accepted roots the installed cold records bind, so
-    // it must use the same durable construction authoring used: this exact
-    // archive's content-addressed Patricia stores.
-    let indexes = store
-        .bootstrap_authoring_capability()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let mut session = match ephemeral_scratch {
-        Some((scratch, block_claim_index)) => {
-            DetachedBootstrapAuthoringSession::new_replay_in_ephemeral_scratch(
-                preparation.workspace_id,
-                preparation.lineage_digest,
-                preparation.catalog_document_id,
-                preparation.reference_catalog_policy.clone(),
-                &indexes,
-                scratch,
-                block_claim_index,
-            )?
-        }
-        None => DetachedBootstrapAuthoringSession::new_replay(
-            preparation.workspace_id,
-            preparation.lineage_digest,
-            preparation.catalog_document_id,
-            preparation.reference_catalog_policy.clone(),
-            &indexes,
-        )?,
-    };
-    for (ordinal, descriptor) in aggregate.parts().iter().copied().enumerate() {
-        let loaded = store
-            .load_bootstrap_part(publication, ordinal)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let prepared = PreparedBatch::new(loaded.manifest().clone(), loaded.objects().to_vec())?;
-        let material = session.replay_prepared_part(descriptor, prepared)?;
-        validate_part(descriptor, &material)?;
-    }
-    let candidate = session.finish()?;
-    if candidate.part_count() != aggregate.parts().len() as u32
-        || candidate.last_part() != aggregate.final_frontier().last_part()
-    {
-        return Err(EngineError::Archive(
-            "direct bootstrap replay did not reach the aggregate frontier".into(),
-        ));
-    }
-    Ok(candidate)
-}
-
-#[cfg(test)]
-pub(crate) fn replay_direct_loaded_bootstrap(
-    store: &ObjectStore,
-    publication: &super::object_store::ValidatedBootstrapPublicationV1,
-    preparation: &DetachedBootstrapReplayIdentity,
-) -> Result<DetachedBootstrapCandidate, EngineError> {
-    replay_direct_loaded_bootstrap_with(store, publication, preparation, None, |_, _| Ok(()))
-}
-
-#[cfg(test)]
-pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
-    store: &ObjectStore,
-    publication: &super::object_store::ValidatedBootstrapPublicationV1,
-    preparation: &DetachedBootstrapReplayIdentity,
-    history: &super::object_store::DurableEngineHistoryStore,
-    history_root: ContentDigest,
-    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
-) -> Result<
-    (
-        DetachedBootstrapCandidate,
-        super::object_store::EngineHistoryBinding,
-    ),
-    EngineError,
-> {
-    let mut terminal_history_binding = super::object_store::EngineHistoryBinding::empty();
-    let candidate = replay_direct_loaded_bootstrap_with(
-        store,
-        publication,
-        preparation,
-        None,
-        |descriptor, material| {
-            let found = history
-                .lookup(history_root, descriptor.batch_id())
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::Archive(
-                        "fresh history is missing an aggregate-bound cold record".into(),
-                    )
-                })?;
-            terminal_history_binding = validate_bootstrap_history_record_against_material(
-                descriptor, &found, bootstrap, material,
-            )?;
-            Ok(())
-        },
-    )?;
-    Ok((candidate, terminal_history_binding))
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProjectionEndpointBinding {
     pub(crate) endpoint_id: ProjectionEndpointId,
@@ -4659,7 +3444,6 @@ impl StatusHistorySource {
                         Ok(ColdHistoryRecord {
                             schema_version: ENGINE_HISTORY_SCHEMA_VERSION,
                             generation: 0,
-                            bootstrap: None,
                             batch_id: record.batch_id(),
                             manifest_fingerprint: record.manifest_fingerprint(),
                             portable_path_key_version: super::PORTABLE_PATH_KEY_VERSION,
@@ -4705,7 +3489,6 @@ impl StatusHistorySource {
                     Ok(ColdHistoryRecord {
                         schema_version: ENGINE_HISTORY_SCHEMA_VERSION,
                         generation: 0,
-                        bootstrap: None,
                         batch_id: record.batch_id(),
                         manifest_fingerprint: record.manifest_fingerprint(),
                         portable_path_key_version: super::PORTABLE_PATH_KEY_VERSION,
@@ -4819,7 +3602,6 @@ enum ArchiveStatus {
 struct ColdHistoryRecord {
     schema_version: u32,
     generation: u64,
-    bootstrap: Option<super::object_store::BootstrapAggregateHistoryBindingV1>,
     batch_id: BatchId,
     manifest_fingerprint: ContentDigest,
     portable_path_key_version: u32,
@@ -4831,12 +3613,6 @@ struct ColdHistoryRecord {
     logseq_claim_root: LogseqClaimIndexRoot,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
     status: ArchiveStatus,
-}
-
-fn is_bootstrap_generation(record: &ColdHistoryRecord) -> bool {
-    record.bootstrap.is_some_and(|bootstrap| {
-        record.generation != 0 && record.generation <= u64::from(bootstrap.part_count())
-    })
 }
 
 /// Move-only proof of the current durable authority established by the
@@ -5030,512 +3806,6 @@ pub(crate) const BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT: usize = 32 * 1024 * 10
 /// repeated LSM descent, and a session that never reaches this bound has
 /// already done its job.
 pub(crate) const ACCEPTED_ROOT_LOOKUP_SESSION_BYTES: usize = 32 * 1024 * 1024;
-
-#[derive(Debug)]
-struct BootstrapBulkPage {
-    page: MaterializedPage,
-    dependencies: Vec<DocumentDependencies>,
-}
-
-/// Decoded exact-root documents retained only while one bounded materialization
-/// chunk is completed.
-#[derive(Debug)]
-struct BootstrapBulkChunk {
-    pages: Vec<Option<BootstrapBulkPage>>,
-    documents: BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct BootstrapProjectionClaimResolutionStats {
-    pub(crate) exact_root_resolutions: usize,
-    pub(crate) fallback_resolutions: usize,
-}
-
-/// Process-local materializer for one already-authenticated accepted root.
-///
-/// This capability is deliberately private to bootstrap construction. It
-/// authenticates the root and catalog once, then uses the authenticated LSM
-/// multi-point primitives for each bounded page chunk. No decoded membership
-/// or home document survives a call.
-pub(crate) struct BootstrapBulkMaterializer<'engine> {
-    engine: &'engine ShardedHotEngine,
-    root: AcceptedFrontierRoot,
-    /// Construction-time proof that this exact accepted root is still the
-    /// engine's current claim authority. Historical roots can reuse document
-    /// loading, but must resolve claims through the current fallback.
-    current_claim_root_proven: bool,
-    /// Sequence-zero candidates retained only while rebuilding disposable
-    /// SQLite for a clean lazy-genesis runtime.
-    rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
-    catalog: LoroDoc,
-    catalog_dependencies: DocumentDependencies,
-    exact_document_loads: Cell<usize>,
-    projection_claim_resolutions: Cell<BootstrapProjectionClaimResolutionStats>,
-    accepted_frontier_session: Option<RefCell<ScratchLookupSession>>,
-    external_exact_session: Option<RefCell<ScratchLookupSession>>,
-}
-
-impl BootstrapBulkMaterializer<'_> {
-    pub(crate) fn exact_document_loads(&self) -> usize {
-        self.exact_document_loads.get()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn projection_claim_resolution_stats(
-        &self,
-    ) -> BootstrapProjectionClaimResolutionStats {
-        self.projection_claim_resolutions.get()
-    }
-
-    pub(crate) fn lookup_session_stats(
-        &self,
-    ) -> (ScratchLookupSessionStats, ScratchLookupSessionStats) {
-        (
-            self.accepted_frontier_session
-                .as_ref()
-                .map_or_else(ScratchLookupSessionStats::default, |session| {
-                    session.borrow().stats()
-                }),
-            self.external_exact_session
-                .as_ref()
-                .map_or_else(ScratchLookupSessionStats::default, |session| {
-                    session.borrow().stats()
-                }),
-        )
-    }
-
-    /// Enumerate compact current path rows from the catalog this terminal
-    /// materializer has already authenticated and decoded. Clean lazy-genesis
-    /// rebuilds use this instead of retaining or rebuilding the legacy
-    /// current-path Patricia catalog merely to discover which pages to lower
-    /// into disposable SQLite.
-    pub(crate) fn terminal_current_path_rows(
-        &self,
-    ) -> Result<Vec<CurrentPathCatalogRow>, EngineError> {
-        read_all_pages(&self.catalog).map(|pages| {
-            pages
-                .into_iter()
-                .filter_map(|(page_id, state)| {
-                    current_path_catalog_row_from_page_state(&state).map(|state| {
-                        CurrentPathCatalogRow {
-                            page_id,
-                            path: state.path,
-                            kind: state.kind,
-                            accepted_name_digest: state.accepted_name_digest,
-                        }
-                    })
-                })
-                .collect()
-        })
-    }
-
-    fn materialize_chunk(&self, page_ids: &[PageId]) -> Result<BootstrapBulkChunk, EngineError> {
-        if page_ids.len() > BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES {
-            return Err(EngineError::Archive(format!(
-                "bootstrap materialization chunk has {} pages, bound {}",
-                page_ids.len(),
-                BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES
-            )));
-        }
-        let requested = page_ids.iter().copied().collect::<BTreeSet<_>>();
-        if requested.len() != page_ids.len() {
-            return Err(EngineError::Archive(
-                "bootstrap materialization chunk repeats a page identity".into(),
-            ));
-        }
-
-        let mut page_documents = BTreeMap::<PageId, DocumentId>::new();
-        // Construction proved the complete catalog once. This private
-        // materializer never exposes a mutation-capable catalog handle, so the
-        // proof remains valid for every bounded chunk. Recomputing a Loro
-        // version here was itself proportional to the graph's peer population.
-        let validated_catalog = ValidatedCatalogDocument {
-            catalog_document_id: self.engine.catalog_document_id,
-            document: &self.catalog,
-        };
-        let mut results = page_ids
-            .iter()
-            .map(|page_id| {
-                let state = read_validated_catalog_page(validated_catalog, *page_id)?;
-                if let Some(PageState::Live {
-                    home_document_id, ..
-                }) = state
-                {
-                    page_documents.insert(*page_id, home_document_id);
-                }
-                Ok(None)
-            })
-            .collect::<Result<Vec<Option<BootstrapBulkPage>>, EngineError>>()?;
-        if page_documents.is_empty() {
-            return Ok(BootstrapBulkChunk {
-                pages: results,
-                documents: BTreeMap::new(),
-            });
-        }
-
-        let membership_ids = page_documents
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut accepted_frontier_session = self
-            .accepted_frontier_session
-            .as_ref()
-            .map(RefCell::borrow_mut);
-        let mut external_exact_session = self
-            .external_exact_session
-            .as_ref()
-            .map(RefCell::borrow_mut);
-        let mut documents = self
-            .engine
-            .load_documents_at_authenticated_root_many_with_sessions(
-                &self.root,
-                &membership_ids,
-                accepted_frontier_session.as_deref_mut(),
-                external_exact_session.as_deref_mut(),
-            )?;
-        self.exact_document_loads.set(
-            self.exact_document_loads
-                .get()
-                .saturating_add(membership_ids.len()),
-        );
-        let mut page_homes = BTreeMap::<PageId, BTreeSet<DocumentId>>::new();
-        for (page_id, document_id) in &page_documents {
-            let (_, membership) = documents
-                .get(document_id)
-                .ok_or(EngineError::MissingDocument(*document_id))?;
-            validate_shard(self.engine.catalog_document_id, *document_id, membership)?;
-            if shard_page_id(membership)? != Some(*page_id) {
-                return Err(EngineError::MalformedDocument {
-                    document_id: *document_id,
-                    reason: "membership shard page identity mismatch".into(),
-                });
-            }
-            page_homes.insert(
-                *page_id,
-                read_memberships(*document_id, membership)?
-                    .values()
-                    .map(|claim| claim.home_document_id)
-                    .collect(),
-            );
-        }
-        let missing_homes = page_homes
-            .values()
-            .flatten()
-            .copied()
-            .filter(|document_id| !documents.contains_key(document_id))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        documents.extend(
-            self.engine
-                .load_documents_at_authenticated_root_many_with_sessions(
-                    &self.root,
-                    &missing_homes,
-                    accepted_frontier_session.as_deref_mut(),
-                    external_exact_session.as_deref_mut(),
-                )?,
-        );
-        self.exact_document_loads.set(
-            self.exact_document_loads
-                .get()
-                .saturating_add(missing_homes.len()),
-        );
-
-        for (index, page_id) in page_ids.iter().copied().enumerate() {
-            let Some(page_document_id) = page_documents.get(&page_id).copied() else {
-                continue;
-            };
-            let homes = page_homes
-                .get(&page_id)
-                .expect("every live page has derived home documents");
-            let mut dependencies = Vec::with_capacity(homes.len().saturating_add(2));
-            dependencies.push(self.catalog_dependencies.clone());
-            dependencies.push(
-                documents
-                    .get(&page_document_id)
-                    .ok_or(EngineError::MissingDocument(page_document_id))?
-                    .0
-                    .clone(),
-            );
-            for home_document_id in homes {
-                if *home_document_id == page_document_id {
-                    continue;
-                }
-                dependencies.push(
-                    documents
-                        .get(home_document_id)
-                        .ok_or(EngineError::MissingDocument(*home_document_id))?
-                        .0
-                        .clone(),
-                );
-            }
-            dependencies.sort_unstable_by_key(DocumentDependencies::document_id);
-            dependencies.dedup_by_key(|dependency| dependency.document_id());
-            let page = self.engine.materialize_page_in_catalog_window(
-                Some(validated_catalog),
-                page_id,
-                |document_id| {
-                    if document_id == self.engine.catalog_document_id {
-                        Some(&self.catalog)
-                    } else {
-                        documents.get(&document_id).map(|(_, document)| document)
-                    }
-                },
-            )?;
-            results[index] = Some(BootstrapBulkPage { page, dependencies });
-        }
-        Ok(BootstrapBulkChunk {
-            pages: results,
-            documents,
-        })
-    }
-
-    pub(crate) fn materialize_pages(
-        &self,
-        page_ids: &[PageId],
-    ) -> Result<Vec<Option<MaterializedPage>>, EngineError> {
-        self.materialize_chunk(page_ids).map(|chunk| {
-            chunk
-                .pages
-                .into_iter()
-                .map(|page| page.map(|page| page.page))
-                .collect()
-        })
-    }
-
-    pub(crate) fn materialize_pages_for_projection(
-        &self,
-        page_ids: &[PageId],
-    ) -> Result<Vec<Option<ProjectionPageState>>, EngineError> {
-        let BootstrapBulkChunk { pages, documents } = self.materialize_chunk(page_ids)?;
-        pages
-            .into_iter()
-            .map(|page| {
-                page.map(|page| self.finish_projection_page(page, &documents))
-                    .transpose()
-            })
-            .collect()
-    }
-
-    fn resolve_logseq_uuid_for_projection(
-        &self,
-        logseq_uuid: LogseqUuid,
-        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
-    ) -> Result<
-        (
-            LogseqUuidResolution,
-            Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, DocumentDependencies>,
-        ),
-        EngineError,
-    > {
-        if !self.current_claim_root_proven {
-            return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
-        }
-        let participants = self.engine.projection_claim_participants(
-            logseq_uuid,
-            self.rebuild_claim_source
-                .as_deref()
-                .map(|source| source as &dyn ProjectionClaimSource),
-        )?;
-        if participants.is_empty() {
-            return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
-        }
-
-        if participants
-            .iter()
-            .any(|participant| !documents.contains_key(&participant.home_document_id()))
-        {
-            return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
-        }
-
-        let evidence = ProjectionClaimEvidence::new(logseq_uuid, participants)?;
-        let validated_catalog = ValidatedCatalogDocument {
-            catalog_document_id: self.engine.catalog_document_id,
-            document: &self.catalog,
-        };
-        let resolution = self
-            .engine
-            .resolve_logseq_uuid_from_document_lookup_with_page_state(
-                logseq_uuid,
-                &evidence,
-                |document_id| {
-                    if document_id == self.engine.catalog_document_id {
-                        Some(&self.catalog)
-                    } else {
-                        documents.get(&document_id).map(|(_, document)| document)
-                    }
-                },
-                |page_id| read_validated_catalog_page(validated_catalog, page_id),
-            )?;
-        let dependencies = evidence
-            .participants()
-            .iter()
-            .map(|participant| {
-                let home_document_id = participant.home_document_id();
-                documents
-                    .get(&home_document_id)
-                    .map(|(dependency, _)| (home_document_id, dependency.clone()))
-                    .ok_or(EngineError::MissingDocument(home_document_id))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let mut stats = self.projection_claim_resolutions.get();
-        stats.exact_root_resolutions = stats.exact_root_resolutions.saturating_add(1);
-        self.projection_claim_resolutions.set(stats);
-        Ok((resolution, Some(evidence), dependencies))
-    }
-
-    fn resolve_logseq_uuid_for_projection_current(
-        &self,
-        logseq_uuid: LogseqUuid,
-    ) -> Result<
-        (
-            LogseqUuidResolution,
-            Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, DocumentDependencies>,
-        ),
-        EngineError,
-    > {
-        // A current-root materializer proved this immutable catalog once, and
-        // `materialize_chunk` rechecked its decoded version immediately before
-        // this projection pass. Reuse that window for cross-page UUID claims.
-        // A historical materializer must still ask the current engine for its
-        // current catalog rather than treating the historical page set as live.
-        let catalog = self
-            .current_claim_root_proven
-            .then_some(ValidatedCatalogDocument {
-                catalog_document_id: self.engine.catalog_document_id,
-                document: &self.catalog,
-            });
-        let participants = self.engine.projection_claim_participants(
-            logseq_uuid,
-            self.rebuild_claim_source
-                .as_deref()
-                .map(|source| source as &dyn ProjectionClaimSource),
-        )?;
-        let (resolution, evidence, homes) = self
-            .engine
-            .resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)?;
-        let dependencies = homes
-            .into_iter()
-            .map(|(home_document_id, home)| {
-                self.engine
-                    .current_document_dependencies(home_document_id, &home)
-                    .map(|dependency| (home_document_id, dependency))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let mut stats = self.projection_claim_resolutions.get();
-        stats.fallback_resolutions = stats.fallback_resolutions.saturating_add(1);
-        self.projection_claim_resolutions.set(stats);
-        Ok((resolution, evidence, dependencies))
-    }
-
-    fn finish_projection_page(
-        &self,
-        mut bulk: BootstrapBulkPage,
-        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
-    ) -> Result<ProjectionPageState, EngineError> {
-        let mut frontier_documents = bulk
-            .dependencies
-            .into_iter()
-            .map(|dependency| (dependency.document_id(), dependency))
-            .collect::<BTreeMap<_, _>>();
-        let block_claims: BTreeMap<_, _> = bulk
-            .page
-            .blocks
-            .iter()
-            .filter_map(|block| {
-                block.logseq_uuid.map(|uuid| {
-                    (
-                        uuid,
-                        (
-                            block.block_id,
-                            block.home_document_id,
-                            block.logseq_identity_origin,
-                        ),
-                    )
-                })
-            })
-            .collect();
-        let mut referenced = page_logseq_references(
-            &bulk.page.path,
-            bulk.page.preamble.as_deref(),
-            &bulk.page.blocks,
-        );
-        referenced.extend(block_claims.keys().copied());
-        let mut claim_evidence = Vec::new();
-        for logseq_uuid in referenced {
-            let (resolution, evidence, dependencies) =
-                self.resolve_logseq_uuid_for_projection(logseq_uuid, documents)?;
-            if let Some((block_id, home_document_id, origin)) =
-                block_claims.get(&logseq_uuid).copied()
-            {
-                match resolution {
-                    LogseqUuidResolution::Unique(claim)
-                        if claim.block_id == block_id
-                            && claim.home_document_id == home_document_id
-                            && claim.page_id == bulk.page.page_id
-                            && Some(claim.origin) == origin => {}
-                    LogseqUuidResolution::Ambiguous { claim_count } => {
-                        return Err(EngineError::AmbiguousLogseqUuid {
-                            logseq_uuid,
-                            claim_count,
-                        });
-                    }
-                    LogseqUuidResolution::Unclaimed | LogseqUuidResolution::Unique(_) => {
-                        return Err(EngineError::ProjectionIdentityAuthorityUnavailable {
-                            logseq_uuid,
-                            block_id,
-                        });
-                    }
-                }
-            } else if let LogseqUuidResolution::Ambiguous { claim_count } = resolution {
-                return Err(EngineError::AmbiguousLogseqUuid {
-                    logseq_uuid,
-                    claim_count,
-                });
-            }
-            for dependency in dependencies.into_values() {
-                frontier_documents
-                    .entry(dependency.document_id())
-                    .or_insert(dependency);
-            }
-            if let Some(evidence) = evidence {
-                claim_evidence.push(evidence);
-            }
-        }
-
-        let effective_selection = self.engine.title_selection_at_page_name_root(
-            &self.engine.page_name_root,
-            bulk.page.page_id,
-            &bulk.page.name,
-        )?;
-        let effective_transition = effective_selection
-            .as_ref()
-            .filter(|selection| selection.exact_name() != &bulk.page.name)
-            .map(|selection| {
-                self.engine
-                    .authenticate_selected_title_transition(selection, None)
-            })
-            .transpose()?;
-        if let Some(transition) = &effective_transition {
-            transition.apply_to_materialized(&mut bulk.page)?;
-        }
-        frontier_documents.insert(
-            self.engine.catalog_document_id,
-            self.engine
-                .current_hot_document_dependencies_by_id(self.engine.catalog_document_id)?,
-        );
-        let frontier = FrontierV2::new(frontier_documents.into_values().collect())?;
-        Ok(ProjectionPageState {
-            page: bulk.page,
-            frontier,
-            claim_evidence,
-        })
-    }
-}
 
 impl AcceptedRootMaterializer<'_> {
     pub(crate) const fn exact_document_loads(&self) -> usize {
@@ -6117,108 +4387,6 @@ struct ReplayTimingStats {
     external_record_encoding_nanos: u128,
     external_exact_map_insert_nanos: u128,
     external_current_map_insert_nanos: u128,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BootstrapAuthoringTraceSnapshot {
-    validation_phase_nanos: [u128; 10],
-    replay_timing: ReplayTimingStats,
-    instrumentation: EngineInstrumentation,
-    acceptance_sequence: u64,
-    accepted_documents: u64,
-    visible_document_heads: usize,
-    detached_manifests: usize,
-    #[cfg(test)]
-    index_work: BootstrapIndexWorkStats,
-}
-
-impl BootstrapAuthoringTraceSnapshot {
-    fn new(engine: &ShardedHotEngine) -> Self {
-        Self {
-            validation_phase_nanos: engine.validation_phase_nanos,
-            replay_timing: engine.replay_timing.get(),
-            instrumentation: engine.instrumentation(),
-            acceptance_sequence: engine.next_acceptance_sequence,
-            accepted_documents: engine.accepted_frontier_root.document_count(),
-            visible_document_heads: engine.visible_document_heads.len(),
-            detached_manifests: engine.detached_accepted_manifests.len(),
-            #[cfg(test)]
-            index_work: bootstrap_index_work_stats(engine),
-        }
-    }
-
-    fn delta(&self, before: &Self) -> String {
-        let phase_micros = std::array::from_fn::<_, 10, _>(|index| {
-            self.validation_phase_nanos[index].saturating_sub(before.validation_phase_nanos[index])
-                / 1_000
-        });
-        let replay = self.replay_timing.delta_since(before.replay_timing);
-        let after = self.instrumentation;
-        let before_instrumentation = before.instrumentation;
-        let delta = format!(
-            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} block_claim_validation_us={} block_claim_lookup_us={} block_claim_encode_us={} block_claim_insert_us={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
-            after.prepare_transactions.saturating_sub(before_instrumentation.prepare_transactions),
-            after.prepare_document_head_visits.saturating_sub(before_instrumentation.prepare_document_head_visits),
-            after.author_snapshot_clones.saturating_sub(before_instrumentation.author_snapshot_clones),
-            after.author_snapshot_clone_ops.saturating_sub(before_instrumentation.author_snapshot_clone_ops),
-            after.stage_snapshot_clones.saturating_sub(before_instrumentation.stage_snapshot_clones),
-            after.stage_snapshot_clone_ops.saturating_sub(before_instrumentation.stage_snapshot_clone_ops),
-            after.stage_structural_buffer_reuses.saturating_sub(before_instrumentation.stage_structural_buffer_reuses),
-            after.document_point_reads.saturating_sub(before_instrumentation.document_point_reads),
-            after.state_page_bytes_read.saturating_sub(before_instrumentation.state_page_bytes_read),
-            after.state_page_bytes_written.saturating_sub(before_instrumentation.state_page_bytes_written),
-            after.external_flushes.saturating_sub(before_instrumentation.external_flushes),
-            after.external_point_reads.saturating_sub(before_instrumentation.external_point_reads),
-            after.external_range_scans.saturating_sub(before_instrumentation.external_range_scans),
-            after.scratch_page_reads.saturating_sub(before_instrumentation.scratch_page_reads),
-            after.scratch_page_bytes_read.saturating_sub(before_instrumentation.scratch_page_bytes_read),
-            after.scratch_syncs.saturating_sub(before_instrumentation.scratch_syncs),
-            after
-                .block_claim_validation_nanos
-                .saturating_sub(before_instrumentation.block_claim_validation_nanos)
-                / 1_000,
-            after
-                .block_claim_lookup_nanos
-                .saturating_sub(before_instrumentation.block_claim_lookup_nanos)
-                / 1_000,
-            after
-                .block_claim_encode_nanos
-                .saturating_sub(before_instrumentation.block_claim_encode_nanos)
-                / 1_000,
-            after
-                .block_claim_insert_nanos
-                .saturating_sub(before_instrumentation.block_claim_insert_nanos)
-                / 1_000,
-            self.acceptance_sequence,
-            self.accepted_documents,
-            self.visible_document_heads,
-            self.detached_manifests,
-        );
-        #[cfg(test)]
-        let delta = {
-            let mut delta = delta;
-            let before_index_work = before.index_work;
-            delta.push_str(&format!(
-                " page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} detached_index_persistent_node_reads={}",
-            self.index_work
-                .authenticated_page_identity_lookups
-                .saturating_sub(before_index_work.authenticated_page_identity_lookups),
-            self.index_work
-                .full_catalog_author_clones
-                .saturating_sub(before_index_work.full_catalog_author_clones),
-            self.index_work
-                .reference_fallback_document_reconstructions
-                .saturating_sub(
-                    before_index_work.reference_fallback_document_reconstructions,
-                ),
-            self.index_work
-                .detached_index_persistent_node_reads
-                .saturating_sub(before_index_work.detached_index_persistent_node_reads),
-            ));
-            delta
-        };
-        delta
-    }
 }
 
 #[cfg(test)]
@@ -6853,6 +5021,513 @@ impl RunLocalCatalogHotState {
 /// engine one: only the lifecycle can see whether another retained run could
 /// later be proved unreachable, and an engine that mints one it can never
 /// collect is a permanent archive leak.
+#[derive(Debug)]
+struct CleanProjectionBulkPage {
+    page: MaterializedPage,
+    dependencies: Vec<DocumentDependencies>,
+}
+
+/// Decoded exact-root documents retained only while one bounded materialization
+/// chunk is completed.
+#[derive(Debug)]
+struct CleanProjectionBulkChunk {
+    pages: Vec<Option<CleanProjectionBulkPage>>,
+    documents: BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CleanProjectionClaimResolutionStats {
+    pub(crate) exact_root_resolutions: usize,
+    pub(crate) fallback_resolutions: usize,
+}
+
+/// Process-local materializer for one already-authenticated accepted root.
+///
+/// This capability is deliberately private to bootstrap construction. It
+/// authenticates the root and catalog once, then uses the authenticated LSM
+/// multi-point primitives for each bounded page chunk. No decoded membership
+/// or home document survives a call.
+pub(crate) struct CleanProjectionBulkMaterializer<'engine> {
+    engine: &'engine ShardedHotEngine,
+    root: AcceptedFrontierRoot,
+    /// Construction-time proof that this exact accepted root is still the
+    /// engine's current claim authority. Historical roots can reuse document
+    /// loading, but must resolve claims through the current fallback.
+    current_claim_root_proven: bool,
+    /// Sequence-zero candidates retained only while rebuilding disposable
+    /// SQLite for a clean lazy-genesis runtime.
+    rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
+    catalog: LoroDoc,
+    catalog_dependencies: DocumentDependencies,
+    exact_document_loads: Cell<usize>,
+    projection_claim_resolutions: Cell<CleanProjectionClaimResolutionStats>,
+    accepted_frontier_session: Option<RefCell<ScratchLookupSession>>,
+    external_exact_session: Option<RefCell<ScratchLookupSession>>,
+}
+
+impl CleanProjectionBulkMaterializer<'_> {
+    pub(crate) fn exact_document_loads(&self) -> usize {
+        self.exact_document_loads.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_claim_resolution_stats(&self) -> CleanProjectionClaimResolutionStats {
+        self.projection_claim_resolutions.get()
+    }
+
+    pub(crate) fn lookup_session_stats(
+        &self,
+    ) -> (ScratchLookupSessionStats, ScratchLookupSessionStats) {
+        (
+            self.accepted_frontier_session
+                .as_ref()
+                .map_or_else(ScratchLookupSessionStats::default, |session| {
+                    session.borrow().stats()
+                }),
+            self.external_exact_session
+                .as_ref()
+                .map_or_else(ScratchLookupSessionStats::default, |session| {
+                    session.borrow().stats()
+                }),
+        )
+    }
+
+    /// Enumerate compact current path rows from the catalog this terminal
+    /// materializer has already authenticated and decoded. Clean lazy-genesis
+    /// rebuilds use this instead of retaining or rebuilding the legacy
+    /// current-path Patricia catalog merely to discover which pages to lower
+    /// into disposable SQLite.
+    pub(crate) fn terminal_current_path_rows(
+        &self,
+    ) -> Result<Vec<CurrentPathCatalogRow>, EngineError> {
+        read_all_pages(&self.catalog).map(|pages| {
+            pages
+                .into_iter()
+                .filter_map(|(page_id, state)| {
+                    current_path_catalog_row_from_page_state(&state).map(|state| {
+                        CurrentPathCatalogRow {
+                            page_id,
+                            path: state.path,
+                            kind: state.kind,
+                            accepted_name_digest: state.accepted_name_digest,
+                        }
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn materialize_chunk(
+        &self,
+        page_ids: &[PageId],
+    ) -> Result<CleanProjectionBulkChunk, EngineError> {
+        if page_ids.len() > BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES {
+            return Err(EngineError::Archive(format!(
+                "bootstrap materialization chunk has {} pages, bound {}",
+                page_ids.len(),
+                BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES
+            )));
+        }
+        let requested = page_ids.iter().copied().collect::<BTreeSet<_>>();
+        if requested.len() != page_ids.len() {
+            return Err(EngineError::Archive(
+                "bootstrap materialization chunk repeats a page identity".into(),
+            ));
+        }
+
+        let mut page_documents = BTreeMap::<PageId, DocumentId>::new();
+        // Construction proved the complete catalog once. This private
+        // materializer never exposes a mutation-capable catalog handle, so the
+        // proof remains valid for every bounded chunk. Recomputing a Loro
+        // version here was itself proportional to the graph's peer population.
+        let validated_catalog = ValidatedCatalogDocument {
+            catalog_document_id: self.engine.catalog_document_id,
+            document: &self.catalog,
+        };
+        let mut results = page_ids
+            .iter()
+            .map(|page_id| {
+                let state = read_validated_catalog_page(validated_catalog, *page_id)?;
+                if let Some(PageState::Live {
+                    home_document_id, ..
+                }) = state
+                {
+                    page_documents.insert(*page_id, home_document_id);
+                }
+                Ok(None)
+            })
+            .collect::<Result<Vec<Option<CleanProjectionBulkPage>>, EngineError>>()?;
+        if page_documents.is_empty() {
+            return Ok(CleanProjectionBulkChunk {
+                pages: results,
+                documents: BTreeMap::new(),
+            });
+        }
+
+        let membership_ids = page_documents
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut accepted_frontier_session = self
+            .accepted_frontier_session
+            .as_ref()
+            .map(RefCell::borrow_mut);
+        let mut external_exact_session = self
+            .external_exact_session
+            .as_ref()
+            .map(RefCell::borrow_mut);
+        let mut documents = self
+            .engine
+            .load_documents_at_authenticated_root_many_with_sessions(
+                &self.root,
+                &membership_ids,
+                accepted_frontier_session.as_deref_mut(),
+                external_exact_session.as_deref_mut(),
+            )?;
+        self.exact_document_loads.set(
+            self.exact_document_loads
+                .get()
+                .saturating_add(membership_ids.len()),
+        );
+        let mut page_homes = BTreeMap::<PageId, BTreeSet<DocumentId>>::new();
+        for (page_id, document_id) in &page_documents {
+            let (_, membership) = documents
+                .get(document_id)
+                .ok_or(EngineError::MissingDocument(*document_id))?;
+            validate_shard(self.engine.catalog_document_id, *document_id, membership)?;
+            if shard_page_id(membership)? != Some(*page_id) {
+                return Err(EngineError::MalformedDocument {
+                    document_id: *document_id,
+                    reason: "membership shard page identity mismatch".into(),
+                });
+            }
+            page_homes.insert(
+                *page_id,
+                read_memberships(*document_id, membership)?
+                    .values()
+                    .map(|claim| claim.home_document_id)
+                    .collect(),
+            );
+        }
+        let missing_homes = page_homes
+            .values()
+            .flatten()
+            .copied()
+            .filter(|document_id| !documents.contains_key(document_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        documents.extend(
+            self.engine
+                .load_documents_at_authenticated_root_many_with_sessions(
+                    &self.root,
+                    &missing_homes,
+                    accepted_frontier_session.as_deref_mut(),
+                    external_exact_session.as_deref_mut(),
+                )?,
+        );
+        self.exact_document_loads.set(
+            self.exact_document_loads
+                .get()
+                .saturating_add(missing_homes.len()),
+        );
+
+        for (index, page_id) in page_ids.iter().copied().enumerate() {
+            let Some(page_document_id) = page_documents.get(&page_id).copied() else {
+                continue;
+            };
+            let homes = page_homes
+                .get(&page_id)
+                .expect("every live page has derived home documents");
+            let mut dependencies = Vec::with_capacity(homes.len().saturating_add(2));
+            dependencies.push(self.catalog_dependencies.clone());
+            dependencies.push(
+                documents
+                    .get(&page_document_id)
+                    .ok_or(EngineError::MissingDocument(page_document_id))?
+                    .0
+                    .clone(),
+            );
+            for home_document_id in homes {
+                if *home_document_id == page_document_id {
+                    continue;
+                }
+                dependencies.push(
+                    documents
+                        .get(home_document_id)
+                        .ok_or(EngineError::MissingDocument(*home_document_id))?
+                        .0
+                        .clone(),
+                );
+            }
+            dependencies.sort_unstable_by_key(DocumentDependencies::document_id);
+            dependencies.dedup_by_key(|dependency| dependency.document_id());
+            let page = self.engine.materialize_page_in_catalog_window(
+                Some(validated_catalog),
+                page_id,
+                |document_id| {
+                    if document_id == self.engine.catalog_document_id {
+                        Some(&self.catalog)
+                    } else {
+                        documents.get(&document_id).map(|(_, document)| document)
+                    }
+                },
+            )?;
+            results[index] = Some(CleanProjectionBulkPage { page, dependencies });
+        }
+        Ok(CleanProjectionBulkChunk {
+            pages: results,
+            documents,
+        })
+    }
+
+    pub(crate) fn materialize_pages(
+        &self,
+        page_ids: &[PageId],
+    ) -> Result<Vec<Option<MaterializedPage>>, EngineError> {
+        self.materialize_chunk(page_ids).map(|chunk| {
+            chunk
+                .pages
+                .into_iter()
+                .map(|page| page.map(|page| page.page))
+                .collect()
+        })
+    }
+
+    pub(crate) fn materialize_pages_for_projection(
+        &self,
+        page_ids: &[PageId],
+    ) -> Result<Vec<Option<ProjectionPageState>>, EngineError> {
+        let CleanProjectionBulkChunk { pages, documents } = self.materialize_chunk(page_ids)?;
+        pages
+            .into_iter()
+            .map(|page| {
+                page.map(|page| self.finish_projection_page(page, &documents))
+                    .transpose()
+            })
+            .collect()
+    }
+
+    fn resolve_logseq_uuid_for_projection(
+        &self,
+        logseq_uuid: LogseqUuid,
+        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, DocumentDependencies>,
+        ),
+        EngineError,
+    > {
+        if !self.current_claim_root_proven {
+            return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
+        }
+        let participants = self.engine.projection_claim_participants(
+            logseq_uuid,
+            self.rebuild_claim_source
+                .as_deref()
+                .map(|source| source as &dyn ProjectionClaimSource),
+        )?;
+        if participants.is_empty() {
+            return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
+        }
+
+        if participants
+            .iter()
+            .any(|participant| !documents.contains_key(&participant.home_document_id()))
+        {
+            return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
+        }
+
+        let evidence = ProjectionClaimEvidence::new(logseq_uuid, participants)?;
+        let validated_catalog = ValidatedCatalogDocument {
+            catalog_document_id: self.engine.catalog_document_id,
+            document: &self.catalog,
+        };
+        let resolution = self
+            .engine
+            .resolve_logseq_uuid_from_document_lookup_with_page_state(
+                logseq_uuid,
+                &evidence,
+                |document_id| {
+                    if document_id == self.engine.catalog_document_id {
+                        Some(&self.catalog)
+                    } else {
+                        documents.get(&document_id).map(|(_, document)| document)
+                    }
+                },
+                |page_id| read_validated_catalog_page(validated_catalog, page_id),
+            )?;
+        let dependencies = evidence
+            .participants()
+            .iter()
+            .map(|participant| {
+                let home_document_id = participant.home_document_id();
+                documents
+                    .get(&home_document_id)
+                    .map(|(dependency, _)| (home_document_id, dependency.clone()))
+                    .ok_or(EngineError::MissingDocument(home_document_id))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut stats = self.projection_claim_resolutions.get();
+        stats.exact_root_resolutions = stats.exact_root_resolutions.saturating_add(1);
+        self.projection_claim_resolutions.set(stats);
+        Ok((resolution, Some(evidence), dependencies))
+    }
+
+    fn resolve_logseq_uuid_for_projection_current(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, DocumentDependencies>,
+        ),
+        EngineError,
+    > {
+        // A current-root materializer proved this immutable catalog once, and
+        // `materialize_chunk` rechecked its decoded version immediately before
+        // this projection pass. Reuse that window for cross-page UUID claims.
+        // A historical materializer must still ask the current engine for its
+        // current catalog rather than treating the historical page set as live.
+        let catalog = self
+            .current_claim_root_proven
+            .then_some(ValidatedCatalogDocument {
+                catalog_document_id: self.engine.catalog_document_id,
+                document: &self.catalog,
+            });
+        let participants = self.engine.projection_claim_participants(
+            logseq_uuid,
+            self.rebuild_claim_source
+                .as_deref()
+                .map(|source| source as &dyn ProjectionClaimSource),
+        )?;
+        let (resolution, evidence, homes) = self
+            .engine
+            .resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)?;
+        let dependencies = homes
+            .into_iter()
+            .map(|(home_document_id, home)| {
+                self.engine
+                    .current_document_dependencies(home_document_id, &home)
+                    .map(|dependency| (home_document_id, dependency))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut stats = self.projection_claim_resolutions.get();
+        stats.fallback_resolutions = stats.fallback_resolutions.saturating_add(1);
+        self.projection_claim_resolutions.set(stats);
+        Ok((resolution, evidence, dependencies))
+    }
+
+    fn finish_projection_page(
+        &self,
+        mut bulk: CleanProjectionBulkPage,
+        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+    ) -> Result<ProjectionPageState, EngineError> {
+        let mut frontier_documents = bulk
+            .dependencies
+            .into_iter()
+            .map(|dependency| (dependency.document_id(), dependency))
+            .collect::<BTreeMap<_, _>>();
+        let block_claims: BTreeMap<_, _> = bulk
+            .page
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                block.logseq_uuid.map(|uuid| {
+                    (
+                        uuid,
+                        (
+                            block.block_id,
+                            block.home_document_id,
+                            block.logseq_identity_origin,
+                        ),
+                    )
+                })
+            })
+            .collect();
+        let mut referenced = page_logseq_references(
+            &bulk.page.path,
+            bulk.page.preamble.as_deref(),
+            &bulk.page.blocks,
+        );
+        referenced.extend(block_claims.keys().copied());
+        let mut claim_evidence = Vec::new();
+        for logseq_uuid in referenced {
+            let (resolution, evidence, dependencies) =
+                self.resolve_logseq_uuid_for_projection(logseq_uuid, documents)?;
+            if let Some((block_id, home_document_id, origin)) =
+                block_claims.get(&logseq_uuid).copied()
+            {
+                match resolution {
+                    LogseqUuidResolution::Unique(claim)
+                        if claim.block_id == block_id
+                            && claim.home_document_id == home_document_id
+                            && claim.page_id == bulk.page.page_id
+                            && Some(claim.origin) == origin => {}
+                    LogseqUuidResolution::Ambiguous { claim_count } => {
+                        return Err(EngineError::AmbiguousLogseqUuid {
+                            logseq_uuid,
+                            claim_count,
+                        });
+                    }
+                    LogseqUuidResolution::Unclaimed | LogseqUuidResolution::Unique(_) => {
+                        return Err(EngineError::ProjectionIdentityAuthorityUnavailable {
+                            logseq_uuid,
+                            block_id,
+                        });
+                    }
+                }
+            } else if let LogseqUuidResolution::Ambiguous { claim_count } = resolution {
+                return Err(EngineError::AmbiguousLogseqUuid {
+                    logseq_uuid,
+                    claim_count,
+                });
+            }
+            for dependency in dependencies.into_values() {
+                frontier_documents
+                    .entry(dependency.document_id())
+                    .or_insert(dependency);
+            }
+            if let Some(evidence) = evidence {
+                claim_evidence.push(evidence);
+            }
+        }
+
+        let effective_selection = self.engine.title_selection_at_page_name_root(
+            &self.engine.page_name_root,
+            bulk.page.page_id,
+            &bulk.page.name,
+        )?;
+        let effective_transition = effective_selection
+            .as_ref()
+            .filter(|selection| selection.exact_name() != &bulk.page.name)
+            .map(|selection| {
+                self.engine
+                    .authenticate_selected_title_transition(selection, None)
+            })
+            .transpose()?;
+        if let Some(transition) = &effective_transition {
+            transition.apply_to_materialized(&mut bulk.page)?;
+        }
+        frontier_documents.insert(
+            self.engine.catalog_document_id,
+            self.engine
+                .current_hot_document_dependencies_by_id(self.engine.catalog_document_id)?,
+        );
+        let frontier = FrontierV2::new(frontier_documents.into_values().collect())?;
+        Ok(ProjectionPageState {
+            page: bulk.page,
+            frontier,
+            claim_evidence,
+        })
+    }
+}
+
 pub(crate) enum EngineOpenRetention<'a> {
     /// A disposable run and a full replay. Nothing is retained, so this engine
     /// can neither be resumed from nor publish a resume point.
@@ -6862,20 +5537,6 @@ pub(crate) enum EngineOpenRetention<'a> {
     Retained {
         resume: Option<&'a RuntimeResumeSnapshot>,
     },
-    /// A retained run migrated from the exact same-process detached bootstrap
-    /// candidate. The owned capability prevents a release/re-adopt gap; the
-    /// snapshot still passes through the identical durable restore validator.
-    MigratedBootstrap {
-        retained: Box<super::object_store::RetainedEngineScratch>,
-        resume: Box<RuntimeResumeSnapshot>,
-    },
-    /// A bootstrap reconstructed into the exact archive-local ephemeral scratch
-    /// run this enrolled open will own. This is one-process-only recovery
-    /// acceleration, not runtime-resume adoption: it never mints a retained
-    /// run, publishes a point, or marks the resume observation adopted.
-    EphemeralBootstrap {
-        predecessor: Box<EphemeralBootstrapPredecessor>,
-    },
 }
 
 /// The scratch construction input for one enrolled engine. This is private so
@@ -6883,10 +5544,6 @@ pub(crate) enum EngineOpenRetention<'a> {
 enum EngineScratchOpen {
     Fresh,
     Retained(super::object_store::RetainedEngineScratch),
-    ExistingEphemeral {
-        scratch: Arc<ScratchStore>,
-        block_claim_index: Arc<BlockClaimIndexStore>,
-    },
 }
 
 /// Run-local state that lets one recovery skip a revalidated prefix. The
@@ -6894,7 +5551,6 @@ enum EngineScratchOpen {
 /// snapshots remain borrowed from their authenticated resume point.
 enum RecoveryPredecessor<'a> {
     Retained(&'a RuntimeResumeSnapshot),
-    EphemeralBootstrap(Box<RuntimeResumeSnapshot>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6996,11 +5652,6 @@ thread_local! {
     /// bootstrap predecessor falls back to a fresh ephemeral full replay.
     /// This has no production representation or persistence surface.
     static FAIL_NEXT_EPHEMERAL_BOOTSTRAP_PREDECESSOR_RESTORE: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_ephemeral_bootstrap_predecessor_restore_for_test() {
-    FAIL_NEXT_EPHEMERAL_BOOTSTRAP_PREDECESSOR_RESTORE.set(true);
 }
 
 #[cfg(test)]
@@ -8487,14 +7138,6 @@ pub struct ShardedHotEngine {
     /// only for reads or their first mutation.
     lazy_genesis: Option<Arc<LazyGenesisCandidate>>,
     archive: BTreeMap<BatchId, ValidatedBatch>,
-    // Inactive detached bootstrap authoring retains only canonical manifests
-    // after validation. Prior object envelopes live in neither this map nor
-    // `archive`; sharded candidate documents are carried by run-local scratch.
-    detached_accepted_manifests: BTreeMap<BatchId, OperationBatch>,
-    // Immutable, constant-size manifest bindings retained beside the detached
-    // manifests so checkpoint authentication does not rehash a whole part for
-    // each document materialized from it.
-    detached_accepted_manifest_fingerprints: BTreeMap<BatchId, ContentDigest>,
     /// Authenticated offered batches retained only across bounded slices.
     /// Same-process reconstruction deliberately clears this cache and
     /// reauthenticates once before resuming from the durable queue cursor.
@@ -8566,7 +7209,6 @@ pub struct ShardedHotEngine {
     // Recovery already authenticates every durable history record before
     // staging it. Retain only the exceptional bootstrap classification so
     // projection preparation does not reopen the same record a second time.
-    recovery_bootstrap_projection_batches: BTreeSet<BatchId>,
     precommit_history_publication_failure: Option<EngineError>,
     archive_fingerprints: BTreeMap<BatchId, ContentDigest>,
     persisted_staged: BTreeSet<BatchId>,
@@ -8578,19 +7220,15 @@ pub struct ShardedHotEngine {
     // Authenticated point-validation evidence, never a live owner authority.
     // Store-backed engines retain only this root; the sole live owner remains
     // in the immutable home shard. The bounded map is a no-store test harness.
-    block_claim_index: Option<Arc<BlockClaimIndexStore>>,
     block_claim_root: BlockClaimIndexRoot,
     ephemeral_block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
-    logseq_claim_index: Option<Arc<LogseqClaimIndexStore>>,
     logseq_claim_root: LogseqClaimIndexRoot,
     ephemeral_logseq_claims: BTreeMap<LogseqUuid, LogseqClaimRecord>,
-    portable_path_index: Option<Arc<PortablePathIndexStore>>,
     portable_path_root: PortablePathIndexRoot,
     ephemeral_portable_paths: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
     portable_path_conflicts: BTreeMap<PortablePathKeyDigest, PortablePathConflict>,
     // I4-I6 prepares and advances this run-local derived candidate. I7-I8 own
     // binding it into durable engine history and restoring it at activation.
-    page_name_index: Option<Arc<PageNameOwnershipStore>>,
     page_name_root: PageNameOwnershipRootV1,
     ephemeral_page_names: EphemeralPageNameOwnershipStateV1,
     page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
@@ -8598,10 +7236,6 @@ pub struct ShardedHotEngine {
     // are derived directly into the disposable SQLite projection; they are
     // not duplicated in an engine-owned Patricia authority.
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    detached_bootstrap_current_path_catalog: Option<DetachedBootstrapCurrentPathCatalogPlan>,
-    detached_bootstrap_logseq_claims: Option<DetachedBootstrapLogseqClaimPlan>,
-    detached_bootstrap_portable_paths: Option<DetachedBootstrapPortablePathPlan>,
-    detached_bootstrap_page_names: Option<DetachedBootstrapPageNamePlan>,
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
     visible_documents: BTreeMap<DocumentId, LoroDoc>,
@@ -8772,8 +7406,6 @@ impl ShardedHotEngine {
             catalog_document_id,
             lazy_genesis: None,
             archive: BTreeMap::new(),
-            detached_accepted_manifests: BTreeMap::new(),
-            detached_accepted_manifest_fingerprints: BTreeMap::new(),
             bounded_staging_cache: BTreeMap::new(),
             transient_effective_views: BTreeMap::new(),
             transient_effective_view_order: VecDeque::new(),
@@ -8805,31 +7437,22 @@ impl ShardedHotEngine {
             resume_observation: RuntimeResumeObservation::default(),
             authenticated_replayed_batches: BTreeSet::new(),
             authenticated_replayed_generations: BTreeMap::new(),
-            recovery_bootstrap_projection_batches: BTreeSet::new(),
             precommit_history_publication_failure: None,
             archive_fingerprints: BTreeMap::new(),
             persisted_staged: BTreeSet::new(),
             statuses: BTreeMap::new(),
             staged_batches: BTreeSet::new(),
-            block_claim_index: None,
             block_claim_root: BlockClaimIndexRoot::default(),
             ephemeral_block_claims: AHashMap::new(),
-            logseq_claim_index: None,
             logseq_claim_root,
             ephemeral_logseq_claims: BTreeMap::new(),
-            portable_path_index: None,
             portable_path_root: PortablePathIndexRoot::empty(),
             ephemeral_portable_paths: BTreeMap::new(),
             portable_path_conflicts: BTreeMap::new(),
-            page_name_index: None,
             page_name_root,
             ephemeral_page_names: EphemeralPageNameOwnershipStateV1::default(),
             page_name_conflicts: BTreeMap::new(),
             reference_catalog_policy: ReferenceCatalogPolicyV1::default(),
-            detached_bootstrap_current_path_catalog: None,
-            detached_bootstrap_logseq_claims: None,
-            detached_bootstrap_portable_paths: None,
-            detached_bootstrap_page_names: None,
             fatal_evidence: None,
             fatal_handle: None,
             visible_documents: BTreeMap::new(),
@@ -9824,10 +8447,7 @@ impl ShardedHotEngine {
     }
 
     fn has_native_semantic_index_stores(&self) -> bool {
-        self.block_claim_index.is_some()
-            || self.logseq_claim_index.is_some()
-            || self.portable_path_index.is_some()
-            || self.page_name_index.is_some()
+        false
     }
 
     #[cfg(test)]
@@ -10693,16 +9313,8 @@ impl ShardedHotEngine {
 
     pub fn instrumentation(&self) -> EngineInstrumentation {
         let work = self.history_work.get();
-        let logseq_claims = self
-            .logseq_claim_index
-            .as_ref()
-            .map(|index| index.stats())
-            .unwrap_or_default();
-        let portable_paths = self
-            .portable_path_index
-            .as_ref()
-            .map(|index| index.stats())
-            .unwrap_or_default();
+        let logseq_claims = tine_storage::PatriciaIndexStats::default();
+        let portable_paths = tine_storage::PatriciaIndexStats::default();
         let scratch = self
             .scratch
             .as_ref()
@@ -10899,6 +9511,111 @@ impl ShardedHotEngine {
         self.mint_current_path_cursor(binding, None)
     }
 
+    pub(crate) fn clean_projection_bulk_materializer(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<CleanProjectionBulkMaterializer<'_>, EngineError> {
+        self.clean_projection_bulk_materializer_with_lookup_budget(
+            root,
+            BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+            None,
+        )
+    }
+
+    pub(crate) fn clean_projection_bulk_materializer_with_session_budget(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes_per_root: usize,
+    ) -> Result<CleanProjectionBulkMaterializer<'_>, EngineError> {
+        self.clean_projection_bulk_materializer_with_lookup_budget(
+            root,
+            budget_bytes_per_root,
+            None,
+        )
+    }
+
+    pub(crate) fn clean_projection_bulk_materializer_with_rebuild_claims(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes_per_root: usize,
+        claim_source: Arc<RebuildProjectionClaimSnapshot>,
+    ) -> Result<CleanProjectionBulkMaterializer<'_>, EngineError> {
+        self.clean_projection_bulk_materializer_with_lookup_budget(
+            root,
+            budget_bytes_per_root,
+            Some(claim_source),
+        )
+    }
+
+    fn clean_projection_bulk_materializer_with_lookup_budget(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes_per_root: usize,
+        rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
+    ) -> Result<CleanProjectionBulkMaterializer<'_>, EngineError> {
+        self.begin_point_operation();
+        self.authenticate_accepted_frontier_root(root)?;
+        let current_claim_root_proven = root == &self.accepted_frontier_root;
+        let mut accepted_frontier_session = match (&self.scratch, &root.scratch_root) {
+            (Some(store), Some(scratch_root)) => Some(
+                store
+                    .lookup_session(
+                        scratch_root,
+                        super::scratch_store::ScratchPageKind::AcceptedFrontier,
+                        budget_bytes_per_root,
+                    )
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            ),
+            _ => None,
+        };
+        let mut external_exact_session = match (&self.scratch, &root.scratch_root) {
+            (Some(store), Some(_)) => Some(
+                store
+                    .lookup_session(
+                        &self.scratch_roots.external_document_state_root,
+                        super::scratch_store::ScratchPageKind::DocumentExternalExact,
+                        budget_bytes_per_root,
+                    )
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            ),
+            _ => None,
+        };
+        let mut catalog = self.load_documents_at_authenticated_root_many_with_sessions(
+            root,
+            &[self.catalog_document_id],
+            accepted_frontier_session.as_mut(),
+            external_exact_session.as_mut(),
+        )?;
+        let (catalog_dependencies, catalog) = catalog
+            .remove(&self.catalog_document_id)
+            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        validate_catalog(self.catalog_document_id, &catalog)?;
+        // Bootstrap/rebuild already paid for and authenticated this exact
+        // graph-sized decode. Publish it into the engine's one-entry retained
+        // catalog so the first ordinary derivative after activation does not
+        // repeat the whole-catalog load. A historical materializer binds the
+        // entry to its historical root and therefore cannot be reused by a
+        // different current root.
+        self.retain_accepted_document(
+            root,
+            catalog_dependencies.clone(),
+            catalog_dependencies.causal_state_digest(),
+            &catalog,
+        );
+        Ok(CleanProjectionBulkMaterializer {
+            engine: self,
+            root: root.clone(),
+            current_claim_root_proven,
+            rebuild_claim_source,
+            catalog,
+            catalog_dependencies,
+            exact_document_loads: Cell::new(1),
+            projection_claim_resolutions: Cell::new(CleanProjectionClaimResolutionStats::default()),
+            accepted_frontier_session: accepted_frontier_session.map(RefCell::new),
+            external_exact_session: external_exact_session.map(RefCell::new),
+        })
+    }
+
     pub(crate) fn current_path_catalog_binding(
         &self,
     ) -> Result<CurrentPathCatalogBinding, EngineError> {
@@ -11037,9 +9754,6 @@ impl ShardedHotEngine {
                 "authenticated current-page catalog authority is unavailable or stale".into(),
             ));
         }
-        if let Some(plan) = &self.detached_bootstrap_current_path_catalog {
-            return Ok(plan.rows.get(&page_id).cloned().flatten());
-        }
         #[cfg(test)]
         self.record_authenticated_page_identity_lookup();
         store
@@ -11070,25 +9784,10 @@ impl ShardedHotEngine {
         for _ in page_ids {
             self.record_authenticated_page_identity_lookup();
         }
-        let mut rows = self
-            .detached_bootstrap_current_path_catalog
-            .as_ref()
-            .map(|plan| {
-                page_ids
-                    .iter()
-                    .filter_map(|page_id| {
-                        plan.rows
-                            .get(page_id)
-                            .cloned()
-                            .flatten()
-                            .map(|row| (*page_id, row))
-                    })
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let mut rows = BTreeMap::new();
         let keys = page_ids
             .iter()
-            .filter(|page_id| !rows.contains_key(page_id))
+            .filter(|page_id| !rows.contains_key(*page_id))
             .map(|page_id| page_id.as_uuid().into_bytes())
             .collect();
         let stored = store
@@ -11878,109 +10577,6 @@ impl ShardedHotEngine {
         Ok((Some(accepted_frontier), Some(external_exact)))
     }
 
-    pub(crate) fn bootstrap_bulk_materializer(
-        &self,
-        root: &AcceptedFrontierRoot,
-    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
-        self.bootstrap_bulk_materializer_with_lookup_budget(
-            root,
-            BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
-            None,
-        )
-    }
-
-    pub(crate) fn bootstrap_bulk_materializer_with_session_budget(
-        &self,
-        root: &AcceptedFrontierRoot,
-        budget_bytes_per_root: usize,
-    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
-        self.bootstrap_bulk_materializer_with_lookup_budget(root, budget_bytes_per_root, None)
-    }
-
-    pub(crate) fn bootstrap_bulk_materializer_with_rebuild_claims(
-        &self,
-        root: &AcceptedFrontierRoot,
-        budget_bytes_per_root: usize,
-        claim_source: Arc<RebuildProjectionClaimSnapshot>,
-    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
-        self.bootstrap_bulk_materializer_with_lookup_budget(
-            root,
-            budget_bytes_per_root,
-            Some(claim_source),
-        )
-    }
-
-    fn bootstrap_bulk_materializer_with_lookup_budget(
-        &self,
-        root: &AcceptedFrontierRoot,
-        budget_bytes_per_root: usize,
-        rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
-    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
-        self.begin_point_operation();
-        self.authenticate_accepted_frontier_root(root)?;
-        let current_claim_root_proven = root == &self.accepted_frontier_root;
-        let mut accepted_frontier_session = match (&self.scratch, &root.scratch_root) {
-            (Some(store), Some(scratch_root)) => Some(
-                store
-                    .lookup_session(
-                        scratch_root,
-                        super::scratch_store::ScratchPageKind::AcceptedFrontier,
-                        budget_bytes_per_root,
-                    )
-                    .map_err(|error| EngineError::Archive(error.to_string()))?,
-            ),
-            _ => None,
-        };
-        let mut external_exact_session = match (&self.scratch, &root.scratch_root) {
-            (Some(store), Some(_)) => Some(
-                store
-                    .lookup_session(
-                        &self.scratch_roots.external_document_state_root,
-                        super::scratch_store::ScratchPageKind::DocumentExternalExact,
-                        budget_bytes_per_root,
-                    )
-                    .map_err(|error| EngineError::Archive(error.to_string()))?,
-            ),
-            _ => None,
-        };
-        let mut catalog = self.load_documents_at_authenticated_root_many_with_sessions(
-            root,
-            &[self.catalog_document_id],
-            accepted_frontier_session.as_mut(),
-            external_exact_session.as_mut(),
-        )?;
-        let (catalog_dependencies, catalog) = catalog
-            .remove(&self.catalog_document_id)
-            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
-        validate_catalog(self.catalog_document_id, &catalog)?;
-        // Bootstrap/rebuild already paid for and authenticated this exact
-        // graph-sized decode. Publish it into the engine's one-entry retained
-        // catalog so the first ordinary derivative after activation does not
-        // repeat the whole-catalog load. A historical materializer binds the
-        // entry to its historical root and therefore cannot be reused by a
-        // different current root.
-        self.retain_accepted_document(
-            root,
-            catalog_dependencies.clone(),
-            catalog_dependencies.causal_state_digest(),
-            &catalog,
-        );
-        Ok(BootstrapBulkMaterializer {
-            engine: self,
-            root: root.clone(),
-            current_claim_root_proven,
-            rebuild_claim_source,
-            catalog,
-            catalog_dependencies,
-            exact_document_loads: Cell::new(1),
-            projection_claim_resolutions: Cell::new(
-                BootstrapProjectionClaimResolutionStats::default(),
-            ),
-            accepted_frontier_session: accepted_frontier_session.map(RefCell::new),
-            external_exact_session: external_exact_session.map(RefCell::new),
-        })
-    }
-
     pub(crate) fn materialize_page_at_accepted_root(
         &self,
         root: &AcceptedFrontierRoot,
@@ -12477,92 +11073,6 @@ impl ShardedHotEngine {
                 "authenticated current-path catalog authority is unavailable".into(),
             ));
         }
-        if self.detached_bootstrap_current_path_catalog.is_some() {
-            let prospective_catalog_pages = if effect.pages().is_empty() {
-                None
-            } else {
-                Some(
-                    prospective_catalog_pages
-                        .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
-                )
-            };
-            let mut additions = BTreeMap::new();
-            for delta in effect.pages() {
-                let after = prospective_catalog_pages
-                    .and_then(|pages| pages.get(&delta.page_id))
-                    .and_then(current_path_catalog_row_from_page_state);
-                if let Some(after) = &after {
-                    if after.path.as_str().len() > MAX_CURRENT_PATH_CURSOR_PATH_BYTES {
-                        return Err(EngineError::Archive(format!(
-                            "current-path catalog path for {} exceeds {} bytes",
-                            delta.page_id, MAX_CURRENT_PATH_CURSOR_PATH_BYTES
-                        )));
-                    }
-                }
-                if additions.insert(delta.page_id, after).is_some() {
-                    return Err(EngineError::Archive(
-                        "current-path catalog delta contains a duplicate page".into(),
-                    ));
-                }
-            }
-            let plan = self
-                .detached_bootstrap_current_path_catalog
-                .as_mut()
-                .expect("checked terminal current-path plan");
-            for (page_id, row) in additions {
-                if plan.rows.insert(page_id, row).is_some() {
-                    return Err(EngineError::Archive(
-                        "bootstrap current-path catalog repeats a page across parts".into(),
-                    ));
-                }
-            }
-            if !plan.terminal_part {
-                return Ok(CurrentPathCatalogTransition {
-                    catalog: CurrentPathCatalog {
-                        root: self.current_path_catalog.root.clone(),
-                        available: true,
-                        accepted_frontier_root,
-                    },
-                });
-            }
-            if self.current_path_catalog.root.count() != 0 {
-                return Err(EngineError::Archive(
-                    "terminal bootstrap current-path construction did not start empty".into(),
-                ));
-            }
-            let plan = self
-                .detached_bootstrap_current_path_catalog
-                .take()
-                .expect("terminal current-path plan exists");
-            let upserts = plan
-                .rows
-                .into_iter()
-                .filter_map(|(page_id, row)| {
-                    row.map(|row| {
-                        encode_current_path_catalog_row(&row)
-                            .map(|encoded| (page_id.as_uuid().into_bytes(), encoded))
-                    })
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?;
-            let root = store
-                .authenticated_catalog_upsert_many(
-                    &ScratchAuthenticatedCatalogRoot::default(),
-                    &upserts,
-                )
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            if root.count() > MAX_DOCUMENT_ENTRIES as u64 {
-                return Err(EngineError::Archive(
-                    "current-path catalog entry bound exceeded".into(),
-                ));
-            }
-            return Ok(CurrentPathCatalogTransition {
-                catalog: CurrentPathCatalog {
-                    root,
-                    available: true,
-                    accepted_frontier_root,
-                },
-            });
-        }
         let prospective_catalog_pages = if effect.pages().is_empty() {
             None
         } else {
@@ -12912,162 +11422,6 @@ impl ShardedHotEngine {
         Ok(AcceptedBatchCausalContainment { batch_id, clock })
     }
 
-    /// Read the retired Patricia result for bounded differential tests. No
-    /// production runtime or SQLite rebuild calls this oracle.
-    #[cfg(test)]
-    pub(crate) fn accepted_identity_projection_records(
-        &self,
-        batch_id: BatchId,
-        effect: &SemanticEffect,
-    ) -> Result<AcceptedIdentityProjectionRecords, EngineError> {
-        self.ensure_not_blocked()?;
-        let (Some(page_name_index), Some(portable_path_index), Some(_)) = (
-            &self.page_name_index,
-            &self.portable_path_index,
-            &self.history_store,
-        ) else {
-            // Storeless engines exist only in bounded semantic tests. They do
-            // not provide a historical post-batch root to shadow.
-            return Ok(AcceptedIdentityProjectionRecords::default());
-        };
-        let record = self.sealed_history_record(batch_id)?.ok_or_else(|| {
-            EngineError::Archive(format!(
-                "accepted batch {batch_id} has no sealed identity-history record"
-            ))
-        })?;
-        match &record.status {
-            ArchiveStatus::Accepted { evidence, .. } if evidence.batch_id() == batch_id => {}
-            _ => {
-                return Err(EngineError::Archive(format!(
-                    "batch {batch_id} has no accepted identity-history state"
-                )));
-            }
-        }
-
-        let mut page_name_keys = BTreeSet::new();
-        let mut portable_path_keys = BTreeSet::new();
-        for delta in effect.pages() {
-            for state in [&delta.before, &delta.after].into_iter().flatten() {
-                page_name_keys.insert(state.name().key_digest());
-                if let Some(path) = state.path() {
-                    portable_path_keys.insert(path.portable_key().digest());
-                }
-            }
-        }
-        let page_name_keys = page_name_keys.into_iter().collect::<Vec<_>>();
-        let portable_path_keys = portable_path_keys.into_iter().collect::<Vec<_>>();
-        let old_page_names = page_name_index
-            .lookup_many(&record.page_names.ownership_root, &page_name_keys)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let mut page_names = Vec::with_capacity(old_page_names.len());
-        for (key, old) in old_page_names {
-            let occupied = old
-                .occupied()
-                .map(|occupied| {
-                    Ok::<_, EngineError>(super::sqlite_identity::PageNameIdentityOccupiedV1::new(
-                        occupied.page_id(),
-                        page_name_index
-                            .read_exact_name(key, occupied.exact_name())
-                            .map_err(|error| EngineError::Archive(error.to_string()))?,
-                        super::sqlite_identity::IdentityOriginV1::accepted(
-                            occupied.acquisition_batch(),
-                            occupied.acquisition_dot(),
-                        ),
-                        super::sqlite_identity::IdentityOriginV1::accepted(
-                            occupied.exact_state_batch(),
-                            occupied.exact_state_dot(),
-                        ),
-                    ))
-                })
-                .transpose()?;
-            let latest_release = old
-                .latest_release()
-                .map(|released| {
-                    Ok::<_, EngineError>(super::sqlite_identity::PageNameIdentityReleasedV1::new(
-                        released.prior_page_id(),
-                        page_name_index
-                            .read_exact_name(key, released.prior_exact_name())
-                            .map_err(|error| EngineError::Archive(error.to_string()))?,
-                        super::sqlite_identity::IdentityOriginV1::accepted(
-                            released.prior_acquisition_batch(),
-                            released.prior_acquisition_dot(),
-                        ),
-                        super::sqlite_identity::IdentityOriginV1::accepted(
-                            released.prior_exact_state_batch(),
-                            released.prior_exact_state_dot(),
-                        ),
-                        super::sqlite_identity::IdentityOriginV1::accepted(
-                            released.release_batch(),
-                            released.release_dot(),
-                        ),
-                    ))
-                })
-                .transpose()?;
-            let clean = super::sqlite_identity::PageNameIdentityRecordV1::new(
-                key,
-                occupied,
-                latest_release,
-            )
-            .map_err(EngineError::Archive)?;
-            page_names.push((
-                ContentDigest::from_bytes(*key.as_bytes()),
-                clean.encode().map_err(EngineError::Archive)?,
-            ));
-        }
-        let old_portable_paths = portable_path_index
-            .lookup_many(record.portable_path_root, &portable_path_keys)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let mut portable_paths = Vec::with_capacity(old_portable_paths.len());
-        for (key, old) in old_portable_paths {
-            let occupied = old.occupied().map(|occupied| {
-                super::sqlite_identity::PortablePathIdentityOccupiedV1::new(
-                    occupied.page_id(),
-                    occupied.exact_path().clone(),
-                    super::sqlite_identity::IdentityOriginV1::accepted(
-                        occupied.acquisition_batch(),
-                        occupied.causal_dot(),
-                    ),
-                )
-            });
-            let latest_release = old
-                .latest_release()
-                .map(|released| {
-                    let acquisition_dot = self
-                        .load_observed_manifest(released.prior_acquisition_batch())?
-                        .causal_dot();
-                    Ok::<_, EngineError>(
-                        super::sqlite_identity::PortablePathIdentityReleasedV1::new(
-                            released.prior_page_id(),
-                            released.prior_exact_path().clone(),
-                            super::sqlite_identity::IdentityOriginV1::accepted(
-                                released.prior_acquisition_batch(),
-                                acquisition_dot,
-                            ),
-                            super::sqlite_identity::IdentityOriginV1::accepted(
-                                released.release_batch(),
-                                released.causal_dot(),
-                            ),
-                        ),
-                    )
-                })
-                .transpose()?;
-            let clean = super::sqlite_identity::PortablePathIdentityRecordV1::new(
-                key,
-                occupied,
-                latest_release,
-            )
-            .map_err(EngineError::Archive)?;
-            portable_paths.push((
-                ContentDigest::from_bytes(*key.as_bytes()),
-                clean.encode().map_err(EngineError::Archive)?,
-            ));
-        }
-        Ok(AcceptedIdentityProjectionRecords {
-            page_names,
-            portable_paths,
-        })
-    }
-
     /// The parser-owned reference policy used by both accepted-history
     /// extraction and the disposable SQLite projection.  Exposing the policy,
     /// rather than catalog rows, lets derived projections reproduce semantic
@@ -13087,17 +11441,7 @@ impl ShardedHotEngine {
         name: &LogicalPageName,
     ) -> Result<Option<PageId>, EngineError> {
         self.ensure_not_blocked()?;
-        match &self.page_name_index {
-            Some(index) => index
-                .lookup(&self.page_name_root, name.key_digest())
-                .map(|record| {
-                    record
-                        .and_then(|record| record.occupied().cloned())
-                        .map(|occupied| occupied.page_id())
-                })
-                .map_err(|error| EngineError::Archive(error.to_string())),
-            None => Ok(self.ephemeral_page_names.resolve_current(name.key_digest())),
-        }
+        Ok(self.ephemeral_page_names.resolve_current(name.key_digest()))
     }
 
     pub fn resolve_reference_page_name(
@@ -13105,17 +11449,7 @@ impl ShardedHotEngine {
         fact: &super::PageNameReferenceFactV1,
     ) -> Result<Option<PageId>, EngineError> {
         self.ensure_not_blocked()?;
-        match &self.page_name_index {
-            Some(index) => index
-                .lookup(&self.page_name_root, fact.target_key)
-                .map(|record| {
-                    record
-                        .and_then(|record| record.occupied().cloned())
-                        .map(|occupied| occupied.page_id())
-                })
-                .map_err(|error| EngineError::Archive(error.to_string())),
-            None => Ok(self.ephemeral_page_names.resolve_current(fact.target_key)),
-        }
+        Ok(self.ephemeral_page_names.resolve_current(fact.target_key))
     }
 
     /// Authenticated exact logical-name ownership lookup for sparse import
@@ -13127,17 +11461,7 @@ impl ShardedHotEngine {
     ) -> Result<Option<PageId>, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
-        match &self.page_name_index {
-            Some(index) => index
-                .lookup(&self.page_name_root, name.key_digest())
-                .map(|record| {
-                    record
-                        .and_then(|record| record.occupied().cloned())
-                        .map(|occupied| occupied.page_id())
-                })
-                .map_err(|error| EngineError::Archive(error.to_string())),
-            None => Ok(self.ephemeral_page_names.resolve_current(name.key_digest())),
-        }
+        Ok(self.ephemeral_page_names.resolve_current(name.key_digest()))
     }
 
     fn current_durable_authority_proof_is_live(&self) -> Result<bool, EngineError> {
@@ -13202,11 +11526,6 @@ impl ShardedHotEngine {
             .page_names
             .validate()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if let Some(index) = &self.logseq_claim_index {
-            index
-                .validate_root(self.logseq_claim_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        }
         let current = super::object_store::PageNameDurableBinding {
             ownership_root: self.page_name_root.clone(),
             conflicts: self.page_name_conflicts.values().cloned().collect(),
@@ -13216,13 +11535,6 @@ impl ShardedHotEngine {
                 "run-local page-name authority differs from durable history".into(),
             ));
         }
-        self.page_name_index
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::Archive("enrolled page-name authority has no ownership index".into())
-            })?
-            .validate_root(&binding.page_names.ownership_root)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
         match (generation, latest_batch_id) {
             (0, None) => Ok(()),
             (0, Some(_)) | (_, None) => Err(EngineError::Archive(
@@ -13571,56 +11883,6 @@ impl ShardedHotEngine {
             ));
         };
         self.stage_archive_batch_internal(batch_id, Some(history_record), None)
-    }
-
-    /// Stage one retained immutable bootstrap part during a promoted runtime's
-    /// authenticated recovery replay.
-    ///
-    /// Bootstrap parts are published in the archive's immutable bootstrap
-    /// namespace rather than the ordinary object/manifest namespace, so
-    /// ordinary archive staging cannot see them. The authority is identical:
-    /// the batch must have an authenticated cold history record at the live
-    /// sealed durable root, and the replayed material is validated against that
-    /// record exactly like any other recovered batch. Nothing here consults the
-    /// caller's copy of the aggregate for authority.
-    pub(crate) fn stage_bootstrap_part_for_recovery(
-        &mut self,
-        prepared: PreparedBatch,
-    ) -> Result<StageOutcome, EngineError> {
-        self.begin_point_operation();
-        if !self.authenticated_history_replay {
-            return Err(EngineError::Archive(
-                "recovery bootstrap staging requires an active authenticated history replay".into(),
-            ));
-        }
-        self.ensure_history_store()?;
-        let batch_id = prepared.manifest().batch_id();
-        if prepared.manifest().origin() != BatchOrigin::BootstrapImport {
-            return Err(EngineError::Archive(
-                "recovery bootstrap staging requires a bootstrap-origin manifest".into(),
-            ));
-        }
-        let Some(history_record) = self.authenticated_recovery_history_record(batch_id)? else {
-            return Ok(self.outcome(
-                batch_id,
-                BatchDisposition::Rejected {
-                    error: EngineError::Archive(format!(
-                        "authenticated recovery cannot stage bootstrap part {batch_id} absent from durable history"
-                    )),
-                },
-                Vec::new(),
-            ));
-        };
-        let outcome = self.stage_ready_internal(
-            ValidatedBatch::new(prepared),
-            true,
-            Some(history_record),
-            None,
-            None,
-        );
-        self.resolve_pending_author(batch_id, &outcome.disposition);
-        self.prune_persisted_archive_cache();
-        Ok(outcome)
     }
 
     fn stage_archive_batch_internal(
@@ -14114,18 +12376,6 @@ impl ShardedHotEngine {
             Some(record) => Ok(Some(record)),
             None => self.cold_history_record(offered_batch_id),
         };
-        let replaying_bootstrap_generation = history_record
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .is_some_and(|record| {
-                matches!(record.status, ArchiveStatus::Accepted { .. })
-                    && is_bootstrap_generation(record)
-            });
-        if self.authenticated_history_replay && replaying_bootstrap_generation {
-            self.recovery_bootstrap_projection_batches
-                .insert(offered_batch_id);
-        }
         // Authenticated recovery replays durable accepted history into a fresh
         // scratch run and truthfully reports that reconstruction as Accepted.
         // Ordinary ingress seeing the same durable record is a duplicate even
@@ -14760,11 +13010,9 @@ impl ShardedHotEngine {
             .retain(|batch_id, _| self.statuses.contains_key(batch_id));
     }
 
-    /// Origin-explicit compatibility helper for bootstrap/import fixtures.
-    ///
-    /// Normal local mutation authors must use the speculative draft/finalize
-    /// API so projection evidence is part of the closed manifest object set.
-    pub fn prepare_bootstrap_transaction(
+    /// Test-only transaction fixture that bypasses the admitted-author API.
+    #[cfg(test)]
+    pub(crate) fn prepare_fixture_transaction(
         &self,
         author: AuthorBatch,
         transaction: &OperationTransaction,
@@ -14772,7 +13020,7 @@ impl ShardedHotEngine {
         Ok(self
             .prepare_transaction_core(
                 author,
-                super::BatchOrigin::BootstrapImport,
+                super::BatchOrigin::LocalMutation,
                 transaction,
                 TransactionCapture::None,
                 None,
@@ -14780,672 +13028,6 @@ impl ShardedHotEngine {
                 None,
             )?
             .prepared)
-    }
-
-    fn prepare_detached_bootstrap_transaction(
-        &self,
-        author: AuthorBatch,
-        transaction: &OperationTransaction,
-    ) -> Result<PreparedTransactionParts, EngineError> {
-        self.prepare_transaction_core(
-            author,
-            super::BatchOrigin::BootstrapImport,
-            transaction,
-            TransactionCapture::DetachedBootstrap,
-            None,
-            None,
-            None,
-        )
-    }
-
-    fn configure_detached_bootstrap_terminal_plans(
-        &mut self,
-        evidence: BootstrapImportPartEvidenceV1,
-    ) -> Result<(), EngineError> {
-        let terminal_part = evidence.ordinal().saturating_add(1) == evidence.part_count();
-        let terminal_current_path =
-            BootstrapPartitionProfileV1::uses_terminal_current_path_catalog(
-                evidence.profile_digest(),
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if terminal_current_path {
-            self.detached_bootstrap_current_path_catalog
-                .get_or_insert_with(DetachedBootstrapCurrentPathCatalogPlan::default)
-                .terminal_part = terminal_part;
-        } else if self.detached_bootstrap_current_path_catalog.is_some() {
-            return Err(EngineError::Archive(
-                "bootstrap current-path construction profile changed mid-replay".into(),
-            ));
-        }
-        let terminal_logseq_claims =
-            BootstrapPartitionProfileV1::uses_terminal_logseq_claims(evidence.profile_digest())
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if terminal_logseq_claims {
-            self.detached_bootstrap_logseq_claims
-                .get_or_insert_with(DetachedBootstrapLogseqClaimPlan::default)
-                .terminal_part = terminal_part;
-        } else if self.detached_bootstrap_logseq_claims.is_some() {
-            return Err(EngineError::Archive(
-                "bootstrap Logseq-claim construction profile changed mid-replay".into(),
-            ));
-        }
-        let terminal_portable_paths =
-            BootstrapPartitionProfileV1::uses_terminal_portable_paths(evidence.profile_digest())
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if terminal_portable_paths {
-            self.detached_bootstrap_portable_paths
-                .get_or_insert_with(DetachedBootstrapPortablePathPlan::default)
-                .terminal_part = terminal_part;
-        } else if self.detached_bootstrap_portable_paths.is_some() {
-            return Err(EngineError::Archive(
-                "bootstrap portable-path construction profile changed mid-replay".into(),
-            ));
-        }
-        let terminal_page_names =
-            BootstrapPartitionProfileV1::uses_terminal_page_names(evidence.profile_digest())
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if terminal_page_names {
-            self.detached_bootstrap_page_names
-                .get_or_insert_with(DetachedBootstrapPageNamePlan::default)
-                .terminal_part = terminal_part;
-        } else if self.detached_bootstrap_page_names.is_some() {
-            return Err(EngineError::Archive(
-                "bootstrap page-name construction profile changed mid-replay".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn advance_detached_bootstrap_candidate(
-        &mut self,
-        prepared: PreparedBatch,
-    ) -> Result<(bool, AcceptedBatchEvidence), EngineError> {
-        debug_assert!(self.archive_store.is_none());
-        debug_assert!(self.history_store.is_none());
-        self.begin_point_operation();
-        self.advance_author_mutation_generation();
-        if let Some(error) = &self.history_failure {
-            return Err(error.clone());
-        }
-        let batch = ValidatedBatch::new(prepared);
-        self.check_batch_namespace(&batch)?;
-        if batch.manifest().origin() != BatchOrigin::BootstrapImport {
-            return Err(EngineError::InvalidTransaction(
-                "detached bootstrap admission requires bootstrap-import origin".into(),
-            ));
-        }
-        let batch_id = batch.manifest().batch_id();
-        let manifest = batch.manifest().clone();
-        let manifest_fingerprint = batch_fingerprint_from_manifest(&manifest);
-        if self.cold_history_record(batch_id)?.is_some()
-            || self.archive_fingerprints.contains_key(&batch_id)
-        {
-            return Err(EngineError::BatchCollision(batch_id));
-        }
-
-        let store = Arc::clone(
-            self.scratch
-                .as_ref()
-                .expect("detached bootstrap engine owns scratch"),
-        );
-        let mut accumulated = BTreeMap::<CausalPeerId, u64>::new();
-        for parent in manifest.causal_dependency_heads() {
-            let record = super::causal_index::batch_record(&store, &self.scratch_roots, *parent)
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .ok_or(EngineError::MissingDependency(*parent))?;
-            for (peer, counter) in record.clock() {
-                accumulated
-                    .entry(*peer)
-                    .and_modify(|current| *current = (*current).max(*counter))
-                    .or_insert(*counter);
-            }
-        }
-        let accumulated = accumulated.into_iter().collect::<Vec<_>>();
-        let causal_roots = super::causal_index::insert_batch_accumulated(
-            &store,
-            &self.scratch_roots,
-            &manifest,
-            &accumulated,
-        )
-        .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
-        let event_binding_digest = AcceptedBatchEvidence::binding_digest_for(
-            batch_id,
-            manifest_fingerprint,
-            manifest.semantic_effect_digest(),
-            manifest.dependency_frontier(),
-            manifest.causal_dependency_heads(),
-        )?;
-        self.archive_fingerprints
-            .insert(batch_id, manifest_fingerprint);
-        self.archive.insert(batch_id, batch);
-        self.mark_staged(batch_id);
-        let (no_op, evidence) = match self.validate_and_apply(
-            batch_id,
-            true,
-            Some(causal_roots),
-            Some(event_binding_digest),
-            None,
-        )? {
-            BatchApplication::Accepted { no_op, evidence } => (no_op, evidence),
-            BatchApplication::Quarantined => {
-                return Err(EngineError::InvalidTransaction(
-                    "detached bootstrap part would quarantine the candidate".into(),
-                ));
-            }
-        };
-        let final_status = ArchiveStatus::Accepted {
-            no_op,
-            evidence: evidence.clone(),
-        };
-        self.scratch_roots = super::dependency_queue::record_ordered_final(
-            &store,
-            &self.scratch_roots,
-            batch_id,
-            manifest_fingerprint,
-            event_binding_digest,
-            rejected_dependency_set_commitment(manifest.causal_dependency_heads()),
-            manifest.causal_dependency_heads().len(),
-            encode_archive_status(&final_status)?,
-            super::dependency_queue::FinalDependencyStatus::Satisfied,
-        )
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let evidence = match self.accepted_batch_entry_at(self.next_acceptance_sequence)? {
-            Some((accepted_batch_id, Some(stored)))
-                if accepted_batch_id == batch_id && stored == evidence =>
-            {
-                evidence
-            }
-            _ => {
-                return Err(EngineError::Archive(
-                    "detached accepted bootstrap part has inconsistent accepted evidence".into(),
-                ));
-            }
-        };
-        self.remove_hot_status(batch_id);
-        self.archive_fingerprints.remove(&batch_id);
-        self.archive.remove(&batch_id);
-        self.detached_accepted_manifests.insert(batch_id, manifest);
-        self.detached_accepted_manifest_fingerprints
-            .insert(batch_id, manifest_fingerprint);
-        Ok((no_op, evidence))
-    }
-
-    fn advance_authored_detached_bootstrap_candidate(
-        &mut self,
-        prepared: PreparedBatch,
-        authored: DetachedBootstrapAuthoredState,
-        declared_effect: SemanticEffect,
-    ) -> Result<(PreparedBatch, bool, AcceptedBatchEvidence), EngineError> {
-        let trace_enabled = self.activation_trace_enabled;
-        let admission_started = trace_enabled.then(Instant::now);
-        debug_assert!(self.archive_store.is_none());
-        debug_assert!(self.history_store.is_none());
-        self.begin_point_operation();
-        self.advance_author_mutation_generation();
-        if let Some(error) = &self.history_failure {
-            return Err(error.clone());
-        }
-        let batch = ValidatedBatch::new(prepared);
-        self.check_batch_namespace(&batch)?;
-        if batch.manifest().origin() != BatchOrigin::BootstrapImport {
-            return Err(EngineError::InvalidTransaction(
-                "detached authored admission requires bootstrap-import origin".into(),
-            ));
-        }
-        let batch_id = batch.manifest().batch_id();
-        let manifest = batch.manifest().clone();
-        let manifest_fingerprint = batch_fingerprint_from_manifest(&manifest);
-        if self.cold_history_record(batch_id)?.is_some()
-            || self.archive_fingerprints.contains_key(&batch_id)
-        {
-            return Err(EngineError::BatchCollision(batch_id));
-        }
-
-        let store = Arc::clone(
-            self.scratch
-                .as_ref()
-                .expect("detached bootstrap engine owns scratch"),
-        );
-        let causal_started = trace_enabled.then(Instant::now);
-        let mut accumulated = BTreeMap::<CausalPeerId, u64>::new();
-        for parent in manifest.causal_dependency_heads() {
-            let record = super::causal_index::batch_record(&store, &self.scratch_roots, *parent)
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .ok_or(EngineError::MissingDependency(*parent))?;
-            for (peer, counter) in record.clock() {
-                accumulated
-                    .entry(*peer)
-                    .and_modify(|current| *current = (*current).max(*counter))
-                    .or_insert(*counter);
-            }
-        }
-        let causal_roots = super::causal_index::insert_batch_accumulated(
-            &store,
-            &self.scratch_roots,
-            &manifest,
-            &accumulated.into_iter().collect::<Vec<_>>(),
-        )
-        .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
-        if let Some(started) = causal_started {
-            eprintln!(
-                "bootstrap authored causal preparation: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        let event_binding_digest = AcceptedBatchEvidence::binding_digest_for(
-            batch_id,
-            manifest_fingerprint,
-            manifest.semantic_effect_digest(),
-            manifest.dependency_frontier(),
-            manifest.causal_dependency_heads(),
-        )?;
-        self.archive_fingerprints
-            .insert(batch_id, manifest_fingerprint);
-        self.archive.insert(batch_id, batch);
-        self.mark_staged(batch_id);
-
-        let application_started = trace_enabled.then(Instant::now);
-        let evidence = self.apply_authored_detached_bootstrap(
-            batch_id,
-            event_binding_digest,
-            causal_roots,
-            authored,
-            &declared_effect,
-        )?;
-        if let Some(started) = application_started {
-            eprintln!(
-                "bootstrap authored semantic application: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        let no_op = declared_effect.is_empty();
-        let final_status = ArchiveStatus::Accepted {
-            no_op,
-            evidence: evidence.clone(),
-        };
-        let ordered_final_started = trace_enabled.then(Instant::now);
-        self.scratch_roots = super::dependency_queue::record_ordered_final(
-            &store,
-            &self.scratch_roots,
-            batch_id,
-            manifest_fingerprint,
-            event_binding_digest,
-            rejected_dependency_set_commitment(manifest.causal_dependency_heads()),
-            manifest.causal_dependency_heads().len(),
-            encode_archive_status(&final_status)?,
-            super::dependency_queue::FinalDependencyStatus::Satisfied,
-        )
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if let Some(started) = ordered_final_started {
-            eprintln!(
-                "bootstrap authored ordered-final publication: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        self.remove_hot_status(batch_id);
-        self.archive_fingerprints.remove(&batch_id);
-        let prepared = self
-            .archive
-            .remove(&batch_id)
-            .expect("authored detached batch remains staged until finalization")
-            .into_prepared();
-        self.detached_accepted_manifests.insert(batch_id, manifest);
-        self.detached_accepted_manifest_fingerprints
-            .insert(batch_id, manifest_fingerprint);
-        if let Some(started) = admission_started {
-            eprintln!(
-                "bootstrap authored admission total: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        Ok((prepared, no_op, evidence))
-    }
-
-    fn apply_authored_detached_bootstrap(
-        &mut self,
-        batch_id: BatchId,
-        event_binding_digest: ContentDigest,
-        causal_roots: ScratchRoots,
-        authored: DetachedBootstrapAuthoredState,
-        effect: &SemanticEffect,
-    ) -> Result<AcceptedBatchEvidence, EngineError> {
-        let DetachedBootstrapAuthoredState {
-            documents: mut replacements,
-            before_snapshots,
-            mut after_snapshots,
-            before_vectors,
-            dependency_heads,
-        } = authored;
-        let manifest = self.archive[&batch_id].manifest().clone();
-        let frontier = manifest.dependency_frontier();
-        if replacements
-            .keys()
-            .copied()
-            .ne(dependency_heads.keys().copied())
-            || replacements
-                .keys()
-                .copied()
-                .ne(before_vectors.keys().copied())
-        {
-            return Err(EngineError::Archive(
-                "authored bootstrap document metadata is incomplete".into(),
-            ));
-        }
-        let new_exact_shards = before_vectors
-            .iter()
-            .filter_map(|(document_id, vector)| {
-                (*document_id != self.catalog_document_id && vector.is_empty())
-                    .then_some(*document_id)
-            })
-            .collect::<BTreeSet<_>>();
-        let catalog_pages = after_snapshots
-            .values()
-            .find_map(|snapshot| match snapshot {
-                SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
-                SemanticDocumentSnapshot::Shard { .. } => None,
-            });
-        let validation_started = self.replay_timing_started();
-        self.validate_prospective_references(
-            &replacements,
-            effect,
-            &new_exact_shards,
-            catalog_pages,
-            None,
-        )?;
-        self.record_replay_timing_elapsed(validation_started, |timing, elapsed| {
-            timing.identity_binding_nanos = timing.identity_binding_nanos.saturating_add(elapsed);
-        });
-
-        let portable_paths_started = self.replay_timing_started();
-        let portable_paths = if self.detached_bootstrap_portable_paths.is_some() {
-            self.prepare_detached_bootstrap_portable_path_updates(
-                batch_id,
-                manifest.causal_dot(),
-                effect,
-                catalog_pages,
-            )?
-        } else {
-            self.prepare_portable_path_updates(
-                &causal_roots,
-                batch_id,
-                manifest.causal_dot(),
-                manifest.causal_dependency_heads(),
-                effect,
-                catalog_pages,
-                true,
-            )?
-        };
-        self.validate_manifested_portable_path_binding(
-            batch_id,
-            frontier,
-            &portable_paths,
-            !portable_paths.conflicts.is_empty(),
-        )?;
-        self.record_replay_timing_elapsed(portable_paths_started, |timing, elapsed| {
-            timing.identity_portable_paths_nanos =
-                timing.identity_portable_paths_nanos.saturating_add(elapsed);
-        });
-        let page_names_started = self.replay_timing_started();
-        let page_names = if effect.pages().is_empty() {
-            self.prepare_authored_page_name_updates(
-                &causal_roots,
-                batch_id,
-                manifest.causal_dot(),
-                manifest.causal_dependency_heads(),
-                frontier,
-                effect,
-                &AuthoritativeCatalogPageNameObservationsV1::default(),
-                &AuthoritativeCatalogPageNameObservationsV1::default(),
-                &AuthoritativeCatalogPageNameObservationsV1::default(),
-            )?
-        } else {
-            let requested_page_ids = effect
-                .pages()
-                .iter()
-                .map(|delta| delta.page_id)
-                .collect::<Vec<_>>();
-            let before_catalog = before_snapshots
-                .values()
-                .find_map(|snapshot| match snapshot {
-                    SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
-                    SemanticDocumentSnapshot::Shard { .. } => None,
-                })
-                .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
-            let after_catalog =
-                catalog_pages.ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
-            let exact_before =
-                extract_validated_catalog_page_names(before_catalog, &requested_page_ids)
-                    .map_err(|error| EngineError::Archive(error.to_string()))?;
-            let prospective =
-                extract_validated_catalog_page_names(after_catalog, &requested_page_ids)
-                    .map_err(|error| EngineError::Archive(error.to_string()))?;
-            self.prepare_authored_page_name_updates(
-                &causal_roots,
-                batch_id,
-                manifest.causal_dot(),
-                manifest.causal_dependency_heads(),
-                frontier,
-                effect,
-                &exact_before,
-                &exact_before,
-                &prospective,
-            )?
-        };
-        self.record_replay_timing_elapsed(page_names_started, |timing, elapsed| {
-            timing.identity_page_names_nanos =
-                timing.identity_page_names_nanos.saturating_add(elapsed);
-        });
-        let identity_started = self.replay_timing_started();
-        let identity = self.validate_and_prepare_semantic_roles_and_block_homes(
-            &causal_roots,
-            batch_id,
-            manifest.causal_dot(),
-            manifest.causal_dependency_heads(),
-            effect,
-        )?;
-        self.record_replay_timing_elapsed(identity_started, |timing, elapsed| {
-            timing.identity_roles_nanos = timing.identity_roles_nanos.saturating_add(elapsed);
-        });
-        if identity.blocked
-            || !portable_paths.conflicts.is_empty()
-            || page_names
-                .as_ref()
-                .is_some_and(|candidate| !candidate.conflicts.is_empty())
-            || self.is_blocked()
-        {
-            return Err(EngineError::InvalidTransaction(
-                "authored bootstrap transition conflicts with existing graph identity".into(),
-            ));
-        }
-
-        let semantic_view_started = self.replay_timing_started();
-        let effective_view =
-            self.proposed_effective_semantic_view(batch_id, effect, page_names.as_ref())?;
-        effective_view.apply_to_snapshots(&mut after_snapshots)?;
-        self.record_replay_timing_elapsed(semantic_view_started, |timing, elapsed| {
-            timing.post_identity_conflict_terminal_nanos = timing
-                .post_identity_conflict_terminal_nanos
-                .saturating_add(elapsed);
-        });
-        let claims_started = self.replay_timing_started();
-        let logseq_claims_started = self.activation_trace_enabled.then(Instant::now);
-        let logseq_claim_candidate = self.prepare_logseq_claim_updates(
-            batch_id,
-            manifest.causal_dot(),
-            effective_view.effect(),
-        )?;
-        if let Some(started) = logseq_claims_started {
-            eprintln!(
-                "bootstrap authored Logseq claims: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        let catalog_pages = after_snapshots
-            .values()
-            .find_map(|snapshot| match snapshot {
-                SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
-                SemanticDocumentSnapshot::Shard { .. } => None,
-            });
-        let post_page_name_root = page_names
-            .as_ref()
-            .map(|candidate| candidate.root.clone())
-            .unwrap_or_else(|| self.page_name_root.clone());
-        self.record_replay_timing_elapsed(claims_started, |timing, elapsed| {
-            timing.claim_and_catalog_preparation_nanos = timing
-                .claim_and_catalog_preparation_nanos
-                .saturating_add(elapsed);
-        });
-
-        let replacement_heads = replacements
-            .keys()
-            .map(|document_id| (*document_id, BTreeSet::from([batch_id])))
-            .collect::<BTreeMap<_, _>>();
-        let checkpoint_started = self.replay_timing_started();
-        let candidate_roots = self.prepare_external_document_checkpoints(
-            &identity.scratch_roots,
-            batch_id,
-            &replacements,
-            &replacement_heads,
-            super::document_state::DocumentLane::Visible,
-        )?;
-        self.record_replay_timing_elapsed(checkpoint_started, |timing, elapsed| {
-            timing.exact_checkpoint_preparation_nanos = timing
-                .exact_checkpoint_preparation_nanos
-                .saturating_add(elapsed);
-        });
-        let acceptance_started = self.replay_timing_started();
-        let (post_documents, accepted_evidence, candidate_roots, tip_transition) = self
-            .prepare_acceptance_evidence(
-                batch_id,
-                Some(event_binding_digest),
-                &dependency_heads,
-                &replacements,
-                &replacement_heads,
-                &candidate_roots,
-            )?;
-        self.record_replay_timing_elapsed(acceptance_started, |timing, elapsed| {
-            timing.current_checkpoint_preparation_nanos = timing
-                .current_checkpoint_preparation_nanos
-                .saturating_add(elapsed);
-        });
-        let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
-            effective_view.effect(),
-            catalog_pages,
-            &post_page_name_root,
-            accepted_evidence.post_frontier_root.clone(),
-        )?;
-        let page_name_binding = self.page_name_durable_candidate(page_names.as_ref(), None)?;
-        let catalog_heads = if replacements.contains_key(&self.catalog_document_id) {
-            BTreeSet::from([batch_id])
-        } else {
-            self.visible_document_heads
-                .get(&self.catalog_document_id)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let catalog_binding =
-            self.catalog_checkpoint_binding_for(&candidate_roots, Some(&catalog_heads));
-        let mut binding =
-            self.durable_history_binding_with_page_names(catalog_binding, page_name_binding);
-        binding.portable_path_root = portable_paths.root.digest();
-        if let Some(started) = acceptance_started {
-            eprintln!(
-                "bootstrap authored post-acceptance bindings: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        let fingerprint = self.archive_fingerprints[&batch_id];
-        let durable_history_started = self.replay_timing_started();
-        self.persist_durable_final_status_with_binding(
-            batch_id,
-            fingerprint,
-            ArchiveStatus::Accepted {
-                no_op: effect.is_empty(),
-                evidence: accepted_evidence.clone(),
-            },
-            binding,
-            logseq_claim_candidate.0,
-        )?;
-        self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
-            timing.durable_history_nanos = timing.durable_history_nanos.saturating_add(elapsed);
-        });
-
-        let commit_started = self.replay_timing_started();
-        self.commit_identity_publication(identity);
-        self.commit_logseq_claim_updates(logseq_claim_candidate);
-        self.commit_portable_path_updates(portable_paths);
-        self.commit_page_name_updates(page_names);
-        self.commit_acceptance_evidence(
-            post_documents,
-            accepted_evidence.clone(),
-            candidate_roots,
-            tip_transition,
-        );
-        self.commit_current_path_catalog_transition(current_path_catalog_transition);
-        if let Some(started) = commit_started {
-            eprintln!(
-                "bootstrap authored candidate commit: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-
-        let hot_install_started = self.replay_timing_started();
-        let non_catalog = replacements
-            .keys()
-            .copied()
-            .filter(|document_id| *document_id != self.catalog_document_id)
-            .collect::<Vec<_>>();
-        let keep_hot = (non_catalog.len() >= MAX_HOT_NON_CATALOG_DOCUMENTS).then(|| {
-            non_catalog
-                .into_iter()
-                .rev()
-                .take(MAX_HOT_NON_CATALOG_DOCUMENTS)
-                .collect::<BTreeSet<_>>()
-        });
-        if let Some(keep_hot) = keep_hot {
-            self.visible_documents.retain(|document_id, _| {
-                *document_id == self.catalog_document_id || keep_hot.contains(document_id)
-            });
-            self.visible_document_heads.retain(|document_id, _| {
-                *document_id == self.catalog_document_id || keep_hot.contains(document_id)
-            });
-            self.terminal_documents
-                .retain(|document_id, _| *document_id == self.catalog_document_id);
-            self.terminal_document_heads
-                .retain(|document_id, _| *document_id == self.catalog_document_id);
-            self.spare_documents
-                .borrow_mut()
-                .retain(|document_id, _| keep_hot.contains(document_id));
-            self.visible_document_lru.clear();
-            for (document_id, document) in replacements {
-                if document_id != self.catalog_document_id && !keep_hot.contains(&document_id) {
-                    continue;
-                }
-                self.visible_documents
-                    .insert(document_id, document.into_document());
-                self.visible_document_heads
-                    .insert(document_id, BTreeSet::from([batch_id]));
-                if document_id != self.catalog_document_id {
-                    self.visible_document_lru.push_back(document_id);
-                }
-            }
-        } else {
-            for (document_id, document) in std::mem::take(&mut replacements) {
-                self.visible_documents
-                    .insert(document_id, document.into_document());
-                self.visible_document_heads
-                    .insert(document_id, BTreeSet::from([batch_id]));
-                self.retain_hot_document(document_id);
-            }
-        }
-        self.remember_effective_semantic_view(batch_id, &effective_view);
-        if let Some(started) = hot_install_started {
-            eprintln!(
-                "bootstrap authored hot install: {:.3} ms",
-                started.elapsed().as_secs_f64() * 1_000.0
-            );
-        }
-        Ok(accepted_evidence)
     }
 
     /// Draft one local mutation using identity minted by the live promoted
@@ -18590,11 +16172,9 @@ impl ShardedHotEngine {
                 ));
             }
         }
-        if capture != TransactionCapture::DetachedBootstrap {
-            validate_logseq_identity_mutation_shape(transaction)?;
-        }
+        validate_logseq_identity_mutation_shape(transaction)?;
 
-        if capture != TransactionCapture::DetachedBootstrap {
+        {
             let mut created_block_ids = BTreeSet::new();
             let mut created_blocks = Vec::new();
             for operation in &transaction.operations {
@@ -18629,41 +16209,6 @@ impl ShardedHotEngine {
         let mut before_snapshots = BTreeMap::<DocumentId, SemanticDocumentSnapshot>::new();
         let mut read_only_catalog = AuthorCatalogLookup::default();
         let mut authenticated_direct_heads = BTreeMap::<DocumentId, BTreeSet<BatchId>>::new();
-        if self.scratch.is_some() && origin == BatchOrigin::BootstrapImport {
-            let document_ids =
-                explicit_bootstrap_author_documents(self.catalog_document_id, transaction);
-            for (document_id, (document, direct_heads, _)) in
-                self.load_external_validation_documents_many(&document_ids)?
-            {
-                document
-                    .document()
-                    .set_peer_id(author.crdt_peer_id.as_u64())
-                    .map_err(loro_error)?;
-                before_vectors.insert(document_id, document.document().oplog_vv());
-                #[cfg(test)]
-                let before_snapshot_started = Instant::now();
-                let snapshot = snapshot_document(
-                    self.catalog_document_id,
-                    document_id,
-                    document.document(),
-                    false,
-                )?;
-                #[cfg(test)]
-                note_local_mutation_detail(|detail| {
-                    detail.before_semantic_snapshots_child = detail
-                        .before_semantic_snapshots_child
-                        .saturating_add(before_snapshot_started.elapsed());
-                    detail.before_snapshot_documents =
-                        detail.before_snapshot_documents.saturating_add(1);
-                    detail.before_snapshot_blocks = detail
-                        .before_snapshot_blocks
-                        .saturating_add(semantic_snapshot_block_count(&snapshot));
-                });
-                before_snapshots.insert(document_id, snapshot);
-                authenticated_direct_heads.insert(document_id, direct_heads);
-                working.insert(document_id, document);
-            }
-        }
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
             detail.core_preflight = detail
@@ -19073,8 +16618,7 @@ impl ShardedHotEngine {
         });
         #[cfg(test)]
         let prospective_capture_started = Instant::now();
-        let (prospective_documents, detached_bootstrap, projection_before_snapshots) = match capture
-        {
+        let (prospective_documents, projection_before_snapshots) = match capture {
             TransactionCapture::Projection => (
                 working
                     .iter()
@@ -19082,19 +16626,7 @@ impl ShardedHotEngine {
                         clone_doc(document.document(), 1).map(|copy| (*document_id, copy))
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?,
-                None,
                 Some(before_snapshots),
-            ),
-            TransactionCapture::DetachedBootstrap => (
-                BTreeMap::new(),
-                Some(DetachedBootstrapAuthoredState {
-                    documents: working,
-                    before_snapshots,
-                    after_snapshots,
-                    before_vectors,
-                    dependency_heads: affected_heads,
-                }),
-                None,
             ),
             TransactionCapture::None => {
                 if self.scratch.is_none() {
@@ -19116,7 +16648,7 @@ impl ShardedHotEngine {
                         projection_outcomes: BTreeMap::new(),
                     });
                 }
-                (BTreeMap::new(), None, None)
+                (BTreeMap::new(), None)
             }
         };
         #[cfg(test)]
@@ -19134,7 +16666,6 @@ impl ShardedHotEngine {
             semantic_effect: effect,
             prospective_documents,
             projection_before_snapshots,
-            detached_bootstrap,
             portable_path_root,
             external_observation,
         })
@@ -20208,39 +17739,7 @@ impl ShardedHotEngine {
         if manifested_root == candidate.root {
             return Ok(());
         }
-        let Some(index) = &self.portable_path_index else {
-            return Err(EngineError::ProjectionManifest(
-                "projection intent portable-path index binding mismatch".into(),
-            ));
-        };
-        let changed = candidate
-            .changed
-            .iter()
-            .cloned()
-            .collect::<BTreeMap<_, _>>();
-        let mut bases = Vec::new();
-        for head in declared_batch_heads(frontier) {
-            if let Some(record) = self.sealed_history_record(head)? {
-                if matches!(
-                    record.status,
-                    ArchiveStatus::Accepted { .. } | ArchiveStatus::Quarantined
-                ) && !bases.contains(&record.portable_path_root)
-                {
-                    bases.push(record.portable_path_root);
-                }
-            }
-        }
-        for base in bases {
-            index
-                .validate_root(base)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            let reconstructed = index
-                .insert_many(base, &changed)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            if reconstructed == manifested_root {
-                return Ok(());
-            }
-        }
+        let _ = frontier;
         Err(EngineError::ProjectionManifest(
             "projection intent portable-path index binding mismatch".into(),
         ))
@@ -21858,19 +19357,12 @@ impl ShardedHotEngine {
         root: LogseqClaimIndexRoot,
         logseq_uuid: LogseqUuid,
     ) -> Result<LogseqClaimRecord, EngineError> {
-        let mut introductions = match &self.logseq_claim_index {
-            Some(index) => index
-                .lookup_prefix(root, logseq_uuid.as_uuid().as_bytes())
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .into_iter()
-                .map(|(key, bytes)| decode_logseq_claim_introduction(logseq_uuid, &key, &bytes))
-                .collect::<Result<Vec<_>, _>>()?,
-            None => self
-                .ephemeral_logseq_claims
-                .get(&logseq_uuid)
-                .map(|record| record.introductions.clone())
-                .unwrap_or_default(),
-        };
+        let _ = root;
+        let mut introductions = self
+            .ephemeral_logseq_claims
+            .get(&logseq_uuid)
+            .map(|record| record.introductions.clone())
+            .unwrap_or_default();
         introductions.sort_unstable();
         if !strictly_sorted(&introductions) {
             return Err(EngineError::Archive(
@@ -23124,11 +20616,7 @@ impl ShardedHotEngine {
                 ));
             }
         }
-        if let Some(index) = &self.logseq_claim_index {
-            index
-                .validate_root(logseq_claim_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        }
+        let _ = logseq_claim_root;
         let Some(store) = self.history_store.as_ref().map(Arc::clone) else {
             return match self.durable_authority_mode {
                 DurableAuthorityMode::Ephemeral => Ok(()),
@@ -23495,7 +20983,7 @@ impl ShardedHotEngine {
                 "accepted batch {batch_id} has conflicting sealed durable history"
             )));
         }
-        Ok(Some(record.bootstrap.is_some()))
+        Ok(Some(false))
     }
 
     fn validate_record_catalog_transition(
@@ -23581,7 +21069,6 @@ impl ShardedHotEngine {
                 return Ok(Some(ColdHistoryRecord {
                     schema_version: ENGINE_HISTORY_SCHEMA_VERSION,
                     generation: 0,
-                    bootstrap: None,
                     batch_id,
                     manifest_fingerprint: record.manifest_fingerprint(),
                     portable_path_key_version: super::PORTABLE_PATH_KEY_VERSION,
@@ -24875,66 +22362,21 @@ impl ShardedHotEngine {
             .causal_dependency_heads()
             .to_vec();
         let portable_paths_started = self.replay_timing_started();
-        let portable_paths = if self.detached_bootstrap_portable_paths.is_some() {
-            self.prepare_detached_bootstrap_portable_path_updates(
-                batch_id,
-                causal_dot,
-                &declared_effect,
-                validated_catalog_pages,
-            )?
-        } else {
-            self.prepare_portable_path_updates(
-                &starting_roots,
-                batch_id,
-                causal_dot,
-                &causal_dependency_heads,
-                &declared_effect,
-                validated_catalog_pages,
-                true,
-            )?
-        };
+        let portable_paths = self.prepare_portable_path_updates(
+            &starting_roots,
+            batch_id,
+            causal_dot,
+            &causal_dependency_heads,
+            &declared_effect,
+            validated_catalog_pages,
+            true,
+        )?;
         self.record_replay_timing_elapsed(portable_paths_started, |timing, elapsed| {
             timing.identity_portable_paths_nanos =
                 timing.identity_portable_paths_nanos.saturating_add(elapsed);
         });
         let page_names_started = self.replay_timing_started();
-        let page_names = if self.detached_bootstrap_page_names.is_some() {
-            if declared_effect.pages().is_empty() {
-                let empty = AuthoritativeCatalogPageNameObservationsV1::default();
-                self.prepare_authored_page_name_updates(
-                    &starting_roots,
-                    batch_id,
-                    causal_dot,
-                    &causal_dependency_heads,
-                    &frontier,
-                    &declared_effect,
-                    &empty,
-                    &empty,
-                    &empty,
-                )?
-            } else {
-                let current_page_names = current_catalog_page_names
-                    .as_ref()
-                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
-                let prospective_page_names = extract_validated_catalog_page_names(
-                    validated_catalog_pages
-                        .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
-                    &requested_catalog_page_ids,
-                )
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-                self.prepare_authored_page_name_updates(
-                    &starting_roots,
-                    batch_id,
-                    causal_dot,
-                    &causal_dependency_heads,
-                    &frontier,
-                    &declared_effect,
-                    &exact_page_name_before,
-                    current_page_names,
-                    &prospective_page_names,
-                )?
-            }
-        } else if declared_effect.pages().is_empty() {
+        let page_names = if declared_effect.pages().is_empty() {
             None
         } else {
             let current_page_names = current_catalog_page_names
@@ -25291,133 +22733,30 @@ impl ShardedHotEngine {
         additions.sort_unstable();
         additions.dedup();
 
-        let mut terminal_detached_replay = false;
-        if self.detached_bootstrap_logseq_claims.is_some() {
-            let plan = self
-                .detached_bootstrap_logseq_claims
-                .as_mut()
-                .expect("checked terminal Logseq-claim plan");
-            plan.additions.extend(additions);
-            if !plan.terminal_part {
-                return Ok((self.logseq_claim_root, Vec::new()));
-            }
-            if self.logseq_claim_root != LogseqClaimIndexRoot::empty() {
-                return Err(EngineError::Archive(
-                    "terminal bootstrap Logseq-claim construction did not start empty".into(),
-                ));
-            }
-            additions = self
-                .detached_bootstrap_logseq_claims
-                .take()
-                .expect("terminal Logseq-claim plan exists")
-                .additions;
-            additions.sort_unstable();
-            additions.dedup();
-            if let Some(index) = self.logseq_claim_index.as_ref() {
-                terminal_detached_replay = index
-                    .detached_construction_bulk_record_limit()
-                    .map_err(|error| EngineError::Archive(error.to_string()))?
-                    .is_none();
-            }
-        }
         if additions.is_empty() {
             return Ok((self.logseq_claim_root, Vec::new()));
         }
 
-        if self.logseq_claim_index.is_none() {
-            let existing = self
-                .ephemeral_logseq_claims
-                .values()
-                .map(|record| record.introductions.len())
-                .sum::<usize>();
-            let added = additions
-                .iter()
-                .filter(|(uuid, introduction)| {
-                    !self
-                        .ephemeral_logseq_claims
-                        .get(uuid)
-                        .is_some_and(|record| {
-                            record.introductions.binary_search(introduction).is_ok()
-                        })
-                })
-                .count();
-            if existing.saturating_add(added) > MAX_EPHEMERAL_LOGSEQ_CLAIMS {
-                return Err(EngineError::InvalidTransaction(
-                    "no-store Logseq claim test index reached its fixed capacity".into(),
-                ));
-            }
-            return Ok((self.logseq_claim_root, additions));
+        let existing = self
+            .ephemeral_logseq_claims
+            .values()
+            .map(|record| record.introductions.len())
+            .sum::<usize>();
+        let added = additions
+            .iter()
+            .filter(|(uuid, introduction)| {
+                !self
+                    .ephemeral_logseq_claims
+                    .get(uuid)
+                    .is_some_and(|record| record.introductions.binary_search(introduction).is_ok())
+            })
+            .count();
+        if existing.saturating_add(added) > MAX_EPHEMERAL_LOGSEQ_CLAIMS {
+            return Err(EngineError::InvalidTransaction(
+                "run-local Logseq claim index reached its fixed capacity".into(),
+            ));
         }
-        let index = self
-            .logseq_claim_index
-            .as_ref()
-            .expect("checked store-backed claim index");
-        if terminal_detached_replay {
-            let encoded = additions
-                .iter()
-                .map(|(logseq_uuid, introduction)| {
-                    Ok((
-                        logseq_claim_introduction_key(*logseq_uuid, *introduction),
-                        encode_logseq_claim_introduction(*introduction)?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
-            if self.activation_trace_enabled {
-                eprintln!(
-                    "bootstrap replay deriving terminal Logseq root: additions={} encoded_records={}",
-                    additions.len(),
-                    encoded.len(),
-                );
-            }
-            let root = index.derive_complete_root(&encoded).map_err(|error| {
-                EngineError::Archive(format!(
-                    "terminal bootstrap Logseq root derivation failed for {} records: {error}",
-                    encoded.len(),
-                ))
-            })?;
-            if self.activation_trace_enabled {
-                eprintln!("bootstrap replay terminal Logseq root derived");
-            }
-            return Ok((root, additions));
-        }
-        let mut root = self.logseq_claim_root;
-        let bulk_record_limit = index
-            .detached_construction_bulk_record_limit()
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .unwrap_or_else(|| additions.len().max(1));
-        for (chunk_index, chunk) in additions.chunks(bulk_record_limit).enumerate() {
-            let chunk_started = self.activation_trace_enabled.then(Instant::now);
-            let encoding_started = self.activation_trace_enabled.then(Instant::now);
-            let encoded = chunk
-                .iter()
-                .map(|(logseq_uuid, introduction)| {
-                    Ok((
-                        logseq_claim_introduction_key(*logseq_uuid, *introduction),
-                        encode_logseq_claim_introduction(*introduction)?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
-            let encoding_elapsed = encoding_started.map(|started| started.elapsed());
-            let insertion_started = self.activation_trace_enabled.then(Instant::now);
-            root = index
-                .insert_many(root, &encoded)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            if let Some(started) = chunk_started {
-                eprintln!(
-                    "bootstrap Logseq claim chunk {}: records={} encode_ms={:.3} insert_ms={:.3} total_ms={:.3}",
-                    chunk_index + 1,
-                    chunk.len(),
-                    encoding_elapsed.unwrap_or_default().as_secs_f64() * 1_000.0,
-                    insertion_started
-                        .map(|started| started.elapsed())
-                        .unwrap_or_default()
-                        .as_secs_f64()
-                        * 1_000.0,
-                    started.elapsed().as_secs_f64() * 1_000.0,
-                );
-            }
-        }
-        Ok((root, additions))
+        Ok((self.logseq_claim_root, additions))
     }
 
     fn authenticate_catalog_checkpoint_archive(
@@ -25427,19 +22766,6 @@ impl ShardedHotEngine {
         if let Some((source_batch, manifest_fingerprint, update_digest)) =
             checkpoint.archive_anchor()
         {
-            if self.validate_detached_update_anchor(
-                source_batch,
-                self.catalog_document_id,
-                manifest_fingerprint,
-                update_digest,
-            )? {
-                return Ok(AuthenticatedCatalogCheckpointArchiveProof {
-                    catalog_document_id: checkpoint.document_id(),
-                    catalog_causal_digest: checkpoint.causal_digest(),
-                    checkpoint_binding: checkpoint.checkpoint_binding(),
-                    checkpoint_content_digest: checkpoint.checkpoint_content_digest(),
-                });
-            }
             let manifest = self.load_observed_manifest(source_batch)?;
             let object = self.load_archive_document_object(
                 source_batch,
@@ -25599,39 +22925,19 @@ impl ShardedHotEngine {
                     .map(|manifest| manifest.dependency_frontier().clone())
             }
         };
-        let candidate = if let Some(index) = &self.page_name_index {
-            let exact_checkpoint = authenticated_exact.ok_or_else(|| {
-                EngineError::Archive(
-                    "page-name transition has no authenticated dependency checkpoint".into(),
-                )
-            })?;
-            prepare_page_name_transition(
-                index,
-                &self.page_name_root,
-                batch_id,
-                causal_dot,
-                frontier,
-                &exact_checkpoint,
-                effect.pages(),
-                current_pages.entries(),
-                prospective_pages.entries(),
-                contains,
-                frontier_for_batch,
-            )
-        } else {
-            prepare_ephemeral_page_name_transition(
-                &self.ephemeral_page_names,
-                batch_id,
-                causal_dot,
-                frontier,
-                exact_before,
-                effect.pages(),
-                current_pages.entries(),
-                prospective_pages.entries(),
-                contains,
-                frontier_for_batch,
-            )
-        };
+        let _ = authenticated_exact;
+        let candidate = prepare_ephemeral_page_name_transition(
+            &self.ephemeral_page_names,
+            batch_id,
+            causal_dot,
+            frontier,
+            exact_before,
+            effect.pages(),
+            current_pages.entries(),
+            prospective_pages.entries(),
+            contains,
+            frontier_for_batch,
+        );
         candidate.map(Some).map_err(|error| match error {
             PageNameTransitionError::Store(error) => EngineError::Archive(error.to_string()),
             PageNameTransitionError::MalformedBatch(reason) => {
@@ -25653,87 +22959,6 @@ impl ShardedHotEngine {
         current_pages: &AuthoritativeCatalogPageNameObservationsV1,
         prospective_pages: &AuthoritativeCatalogPageNameObservationsV1,
     ) -> Result<Option<PageNamePublicationCandidateV1>, EngineError> {
-        if self.detached_bootstrap_page_names.is_some() {
-            let mut additions = Vec::with_capacity(effect.pages().len());
-            for delta in effect.pages() {
-                if delta.before.is_some()
-                    || exact_before.entries().get(&delta.page_id) != Some(&None)
-                    || current_pages.entries().get(&delta.page_id) != Some(&None)
-                    || prospective_pages.entries().get(&delta.page_id) != Some(&delta.after)
-                {
-                    return Err(EngineError::Archive(
-                        "terminal bootstrap page-name plan received a non-creation transition"
-                            .into(),
-                    ));
-                }
-                let state = delta.after.as_ref().ok_or_else(|| {
-                    EngineError::Archive(
-                        "terminal bootstrap page-name plan received an absent creation".into(),
-                    )
-                })?;
-                let PageState::Live { name, .. } = state else {
-                    return Err(EngineError::Archive(
-                        "terminal bootstrap page-name plan received a tombstone".into(),
-                    ));
-                };
-                additions.push((
-                    name.key_digest(),
-                    delta.page_id,
-                    DetachedBootstrapPageNameCreation::new(
-                        delta.page_id,
-                        name.clone(),
-                        batch_id,
-                        causal_dot,
-                    ),
-                ));
-            }
-            let terminal_part = self
-                .detached_bootstrap_page_names
-                .as_ref()
-                .expect("checked terminal page-name plan")
-                .terminal_part;
-            {
-                let plan = self
-                    .detached_bootstrap_page_names
-                    .as_mut()
-                    .expect("checked terminal page-name plan");
-                for (key, page_id, creation) in additions {
-                    if !plan.page_ids.insert(page_id)
-                        || plan.creations.insert(key, creation).is_some()
-                    {
-                        return Err(EngineError::Archive(
-                            "terminal bootstrap page-name plan repeats a page or canonical key"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-            if !terminal_part {
-                return Ok(Some(PageNamePublicationCandidateV1::unchanged(
-                    self.page_name_root.clone(),
-                )));
-            }
-            if self.page_name_root != PageNameOwnershipRootV1::empty() {
-                return Err(EngineError::Archive(
-                    "terminal bootstrap page-name construction did not start empty".into(),
-                ));
-            }
-            let plan = self
-                .detached_bootstrap_page_names
-                .take()
-                .expect("terminal bootstrap page-name plan exists");
-            let root = self
-                .page_name_index
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::Archive(
-                        "terminal bootstrap page-name construction has no durable index".into(),
-                    )
-                })?
-                .build_detached_bootstrap_creations(&plan.creations)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            return Ok(Some(PageNamePublicationCandidateV1::unchanged(root)));
-        }
         if effect.pages().is_empty() {
             return Ok(None);
         }
@@ -25765,34 +22990,18 @@ impl ShardedHotEngine {
                     .map(|manifest| manifest.dependency_frontier().clone())
             }
         };
-        let candidate = if let Some(index) = &self.page_name_index {
-            prepare_authored_page_name_transition(
-                index,
-                &self.page_name_root,
-                batch_id,
-                causal_dot,
-                frontier,
-                exact_before,
-                effect.pages(),
-                current_pages.entries(),
-                prospective_pages.entries(),
-                contains,
-                frontier_for_batch,
-            )
-        } else {
-            prepare_ephemeral_page_name_transition(
-                &self.ephemeral_page_names,
-                batch_id,
-                causal_dot,
-                frontier,
-                exact_before,
-                effect.pages(),
-                current_pages.entries(),
-                prospective_pages.entries(),
-                contains,
-                frontier_for_batch,
-            )
-        };
+        let candidate = prepare_ephemeral_page_name_transition(
+            &self.ephemeral_page_names,
+            batch_id,
+            causal_dot,
+            frontier,
+            exact_before,
+            effect.pages(),
+            current_pages.entries(),
+            prospective_pages.entries(),
+            contains,
+            frontier_for_batch,
+        );
         candidate.map(Some).map_err(|error| match error {
             PageNameTransitionError::Store(error) => EngineError::Archive(error.to_string()),
             PageNameTransitionError::MalformedBatch(reason) => {
@@ -25806,11 +23015,8 @@ impl ShardedHotEngine {
             return;
         };
         debug_assert!(candidate.conflicts.is_empty());
-        if self.page_name_index.is_some() {
-            self.page_name_root = candidate.root.clone();
-        } else {
-            self.ephemeral_page_names.commit(candidate);
-        }
+        self.page_name_root = candidate.root.clone();
+        self.ephemeral_page_names.commit(candidate);
     }
 
     fn authenticated_page_name_exact_state(
@@ -25818,15 +23024,10 @@ impl ShardedHotEngine {
         root: &PageNameOwnershipRootV1,
         key: super::PageNameKeyDigest,
     ) -> Result<Option<AuthenticatedPageNameExactStateV1>, EngineError> {
-        match &self.page_name_index {
-            Some(index) => index
-                .authenticated_exact_state(root, key)
-                .map_err(|error| EngineError::Archive(error.to_string())),
-            None => self
-                .ephemeral_page_names
-                .authenticated_exact_state(key)
-                .map_err(|error| EngineError::Archive(error.to_string())),
-        }
+        let _ = root;
+        self.ephemeral_page_names
+            .authenticated_exact_state(key)
+            .map_err(|error| EngineError::Archive(error.to_string()))
     }
 
     fn proposed_page_name_exact_state(
@@ -25834,14 +23035,9 @@ impl ShardedHotEngine {
         candidate: &PageNamePublicationCandidateV1,
         key: super::PageNameKeyDigest,
     ) -> Result<Option<AuthenticatedPageNameExactStateV1>, EngineError> {
-        match &self.page_name_index {
-            Some(index) => index
-                .authenticated_exact_state(&candidate.root, key)
-                .map_err(|error| EngineError::Archive(error.to_string())),
-            None => candidate
-                .authenticated_ephemeral_exact_state(&self.ephemeral_page_names, key)
-                .map_err(|error| EngineError::Archive(error.to_string())),
-        }
+        candidate
+            .authenticated_ephemeral_exact_state(&self.ephemeral_page_names, key)
+            .map_err(|error| EngineError::Archive(error.to_string()))
     }
 
     fn accepted_semantic_effect(
@@ -26903,101 +24099,6 @@ impl ShardedHotEngine {
         Ok(binding)
     }
 
-    fn prepare_detached_bootstrap_portable_path_updates(
-        &mut self,
-        batch_id: BatchId,
-        causal_dot: BatchCausalDot,
-        effect: &SemanticEffect,
-        prospective_pages: Option<&BTreeMap<PageId, PageState>>,
-    ) -> Result<PortablePathPublicationCandidate, EngineError> {
-        let mut additions = Vec::with_capacity(effect.pages().len());
-        for delta in effect.pages() {
-            if delta.before.is_some() {
-                return Err(EngineError::Archive(
-                    "terminal bootstrap portable-path plan received a non-creation transition"
-                        .into(),
-                ));
-            }
-            let state = prospective_pages
-                .and_then(|pages| pages.get(&delta.page_id))
-                .filter(|state| Some(*state) == delta.after.as_ref())
-                .ok_or_else(|| {
-                    EngineError::Archive(
-                        "terminal bootstrap portable-path plan lacks its exact creation state"
-                            .into(),
-                    )
-                })?;
-            let path = state.path().ok_or_else(|| {
-                EngineError::Archive(
-                    "terminal bootstrap portable-path plan received a tombstone".into(),
-                )
-            })?;
-            let key = path.portable_key().digest();
-            let record = PortablePathRecord::new(
-                key,
-                Some(PortablePathOccupied::new(
-                    delta.page_id,
-                    path.clone(),
-                    batch_id,
-                    causal_dot,
-                )),
-                None,
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-            additions.push((key, delta.page_id, record));
-        }
-        let terminal_part = self
-            .detached_bootstrap_portable_paths
-            .as_ref()
-            .expect("checked terminal portable-path plan")
-            .terminal_part;
-        {
-            let plan = self
-                .detached_bootstrap_portable_paths
-                .as_mut()
-                .expect("checked terminal portable-path plan");
-            for (key, page_id, record) in additions {
-                if !plan.page_ids.insert(page_id) || plan.records.insert(key, record).is_some() {
-                    return Err(EngineError::Archive(
-                        "terminal bootstrap portable-path plan repeats a page or portable key"
-                            .into(),
-                    ));
-                }
-            }
-        }
-        if !terminal_part {
-            return Ok(PortablePathPublicationCandidate {
-                root: self.portable_path_root,
-                changed: Vec::new(),
-                conflicts: Vec::new(),
-            });
-        }
-        if self.portable_path_root != PortablePathIndexRoot::empty() {
-            return Err(EngineError::Archive(
-                "terminal bootstrap portable-path construction did not start empty".into(),
-            ));
-        }
-        let plan = self
-            .detached_bootstrap_portable_paths
-            .take()
-            .expect("terminal bootstrap portable-path plan exists");
-        let root = self
-            .portable_path_index
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::Archive(
-                    "terminal bootstrap portable-path construction has no durable index".into(),
-                )
-            })?
-            .build_detached_bootstrap_records(plan.records)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(PortablePathPublicationCandidate {
-            root,
-            changed: Vec::new(),
-            conflicts: Vec::new(),
-        })
-    }
-
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     fn prepare_portable_path_updates(
         &self,
@@ -27189,27 +24290,18 @@ impl ShardedHotEngine {
                 conflicts,
             });
         }
-        if self.portable_path_index.is_none()
-            && self
-                .ephemeral_portable_paths
-                .len()
-                .saturating_add(changed.len())
-                > MAX_EPHEMERAL_PORTABLE_PATHS
+        if self
+            .ephemeral_portable_paths
+            .len()
+            .saturating_add(changed.len())
+            > MAX_EPHEMERAL_PORTABLE_PATHS
         {
             return Err(EngineError::InvalidTransaction(
                 "no-store portable-path test index reached its fixed capacity".into(),
             ));
         }
-        let root = if publish_index {
-            self.portable_path_index
-                .as_ref()
-                .map(|index| index.insert_many(self.portable_path_root, &changed))
-                .transpose()
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .unwrap_or(self.portable_path_root)
-        } else {
-            self.portable_path_root
-        };
+        let _ = publish_index;
+        let root = self.portable_path_root;
         Ok(PortablePathPublicationCandidate {
             root,
             changed: changed.into_iter().collect(),
@@ -27221,28 +24313,21 @@ impl ShardedHotEngine {
         &self,
         keys: &[PortablePathKeyDigest],
     ) -> Result<BTreeMap<PortablePathKeyDigest, PortablePathRecord>, EngineError> {
-        match &self.portable_path_index {
-            Some(index) => index
-                .lookup_many(self.portable_path_root, keys)
-                .map_err(|error| EngineError::Archive(error.to_string())),
-            None => Ok(keys
-                .iter()
-                .filter_map(|key| {
-                    self.ephemeral_portable_paths
-                        .get(key)
-                        .cloned()
-                        .map(|record| (*key, record))
-                })
-                .collect()),
-        }
+        Ok(keys
+            .iter()
+            .filter_map(|key| {
+                self.ephemeral_portable_paths
+                    .get(key)
+                    .cloned()
+                    .map(|record| (*key, record))
+            })
+            .collect())
     }
 
     fn commit_portable_path_updates(&mut self, candidate: PortablePathPublicationCandidate) {
         debug_assert!(candidate.conflicts.is_empty());
         self.portable_path_root = candidate.root;
-        if self.portable_path_index.is_none() {
-            self.ephemeral_portable_paths.extend(candidate.changed);
-        }
+        self.ephemeral_portable_paths.extend(candidate.changed);
     }
 
     fn prepare_terminal_publication(
@@ -27289,20 +24374,18 @@ impl ShardedHotEngine {
         ),
     ) {
         self.logseq_claim_root = root;
-        if self.logseq_claim_index.is_none() {
-            for (logseq_uuid, introduction) in additions {
-                let record = self
-                    .ephemeral_logseq_claims
-                    .entry(logseq_uuid)
-                    .or_insert_with(|| LogseqClaimRecord {
-                        schema_version: LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION,
-                        logseq_uuid,
-                        introductions: Vec::new(),
-                    });
-                match record.introductions.binary_search(&introduction) {
-                    Ok(_) => {}
-                    Err(index) => record.introductions.insert(index, introduction),
-                }
+        for (logseq_uuid, introduction) in additions {
+            let record = self
+                .ephemeral_logseq_claims
+                .entry(logseq_uuid)
+                .or_insert_with(|| LogseqClaimRecord {
+                    schema_version: LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION,
+                    logseq_uuid,
+                    introductions: Vec::new(),
+                });
+            match record.introductions.binary_search(&introduction) {
+                Ok(_) => {}
+                Err(index) => record.introductions.insert(index, introduction),
             }
         }
     }
@@ -27993,15 +25076,6 @@ impl ShardedHotEngine {
         if self.external_anchor_point_cache.borrow().contains(&anchor) {
             return Ok(());
         }
-        if self.validate_detached_update_anchor(
-            record.latest_source_batch(),
-            document_id,
-            record.latest_manifest_fingerprint(),
-            record.latest_update_digest(),
-        )? {
-            self.external_anchor_point_cache.borrow_mut().insert(anchor);
-            return Ok(());
-        }
         let manifest = self.observed_manifest_for_point_operation(record.latest_source_batch())?;
         let object = self.load_archive_document_object(
             record.latest_source_batch(),
@@ -28383,9 +25457,6 @@ impl ShardedHotEngine {
         if let Some(batch) = self.archive.get(&batch_id) {
             return Ok(batch.manifest().clone());
         }
-        if let Some(manifest) = self.detached_accepted_manifests.get(&batch_id) {
-            return Ok(manifest.clone());
-        }
         let store = self
             .archive_store
             .as_ref()
@@ -28408,33 +25479,6 @@ impl ShardedHotEngine {
             });
         }
         Ok(manifest)
-    }
-
-    fn validate_detached_update_anchor(
-        &self,
-        batch_id: BatchId,
-        document_id: DocumentId,
-        manifest_fingerprint: ContentDigest,
-        update_digest: ContentDigest,
-    ) -> Result<bool, EngineError> {
-        let Some(manifest) = self.detached_accepted_manifests.get(&batch_id) else {
-            return Ok(false);
-        };
-        if self.detached_accepted_manifest_fingerprints.get(&batch_id)
-            != Some(&manifest_fingerprint)
-        {
-            return Err(EngineError::Archive(
-                "detached document checkpoint manifest anchor mismatch".into(),
-            ));
-        }
-        let descriptors =
-            manifest.required_objects_for_document_kind(document_id, ObjectKind::CrdtUpdate);
-        if descriptors.len() != 1 || descriptors[0].content_digest() != update_digest {
-            return Err(EngineError::Archive(
-                "detached document checkpoint update anchor mismatch".into(),
-            ));
-        }
-        Ok(true)
     }
 
     fn load_archive_document_object(
@@ -29043,19 +26087,11 @@ impl ShardedHotEngine {
         // batch with the claim that causes the terminal latch and novel IDs
         // first observed after it.
         drop(candidate_keys);
-        let store_backed = self.block_claim_index.is_some();
         let encode_started = Instant::now();
         let mut changed = Vec::with_capacity(candidates.len());
         let mut changed_claims = Vec::with_capacity(candidates.len());
         for (block_key, block_id, claim) in candidates {
             let mut claims = existing_by_key.remove(&block_key).unwrap_or_default();
-            if store_backed && claims.is_empty() {
-                changed.push((
-                    block_id.as_uuid().into_bytes(),
-                    encode_inline_block_claim_index_value(block_id, claim)?,
-                ));
-                continue;
-            }
             claims.insert(claim);
             changed.push((
                 block_id.as_uuid().into_bytes(),
@@ -29067,31 +26103,19 @@ impl ShardedHotEngine {
         let encode_nanos =
             usize::try_from(encode_started.elapsed().as_nanos()).unwrap_or(usize::MAX);
         let insert_started = Instant::now();
-        let mut candidate_block_claim_root = self.block_claim_root;
-        if let Some(index) = &self.block_claim_index {
-            candidate_block_claim_root = match index.insert_many(self.block_claim_root, &changed) {
-                Ok(root) => root,
-                Err(error) => {
-                    let error = EngineError::Archive(error.to_string());
-                    self.history_failure = Some(error.clone());
-                    return Err(error);
-                }
-            };
-        } else {
-            let novel = changed_claims
-                .iter()
-                .filter(|(block_id, _)| {
-                    !self
-                        .ephemeral_block_claims
-                        .contains_key(&block_id.as_uuid().as_u128())
-                })
-                .count();
-            if self.ephemeral_block_claims.len().saturating_add(novel) > MAX_EPHEMERAL_BLOCK_CLAIMS
-            {
-                return Err(EngineError::InvalidTransaction(
-                    "no-store block-claim test index reached its fixed capacity".into(),
-                ));
-            }
+        let candidate_block_claim_root = self.block_claim_root;
+        let novel = changed_claims
+            .iter()
+            .filter(|(block_id, _)| {
+                !self
+                    .ephemeral_block_claims
+                    .contains_key(&block_id.as_uuid().as_u128())
+            })
+            .count();
+        if self.ephemeral_block_claims.len().saturating_add(novel) > MAX_EPHEMERAL_BLOCK_CLAIMS {
+            return Err(EngineError::InvalidTransaction(
+                "run-local block-claim index reached its fixed capacity".into(),
+            ));
         }
         let insert_nanos =
             usize::try_from(insert_started.elapsed().as_nanos()).unwrap_or(usize::MAX);
@@ -29150,14 +26174,10 @@ impl ShardedHotEngine {
         work.block_claim_encode_nanos = work.block_claim_encode_nanos.saturating_add(encode_nanos);
         work.block_claim_insert_nanos = work.block_claim_insert_nanos.saturating_add(insert_nanos);
         self.history_work.set(work);
-        let ephemeral_block_claims = if store_backed {
-            Vec::new()
-        } else {
-            changed_claims
-                .into_iter()
-                .map(|(block_id, claims)| (block_id.as_uuid().as_u128(), claims))
-                .collect()
-        };
+        let ephemeral_block_claims = changed_claims
+            .into_iter()
+            .map(|(block_id, claims)| (block_id.as_uuid().as_u128(), claims))
+            .collect();
         Ok(IdentityPublicationCandidate {
             blocked: candidate_fatal_handle.is_some() || candidate_fatal_evidence.is_some(),
             scratch_roots: candidate_roots,
@@ -29174,32 +26194,6 @@ impl ShardedHotEngine {
     ) -> Result<AHashMap<u128, BTreeSet<ImmutableHomeClaim>>, EngineError> {
         if block_ids.is_empty() {
             return Ok(AHashMap::new());
-        }
-        if let Some(index) = &self.block_claim_index {
-            let mut by_key: Vec<_> = block_ids
-                .iter()
-                .map(|block_id| (block_id.as_uuid().into_bytes(), *block_id))
-                .collect();
-            by_key.sort_unstable_by_key(|(key, _)| *key);
-            let keys: Vec<_> = by_key.iter().map(|(key, _)| *key).collect();
-            let found = index
-                .lookup_many(self.block_claim_root, &keys)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            return found
-                .into_iter()
-                .map(|(key, bytes)| {
-                    let position = by_key
-                        .binary_search_by_key(&key, |(candidate, _)| *candidate)
-                        .expect("found claim key came from the requested set");
-                    let block_id = by_key[position].1;
-                    decode_block_claim_record(block_id, bytes.as_slice()).map(|record| {
-                        (
-                            block_id.as_uuid().as_u128(),
-                            record.claims.into_iter().collect(),
-                        )
-                    })
-                })
-                .collect();
         }
         Ok(block_ids
             .iter()
@@ -30269,51 +27263,6 @@ fn affected_projection_pages(effect: &SemanticEffect) -> BTreeSet<PageId> {
         pages.insert(delta.page_id);
     }
     pages
-}
-
-fn explicit_bootstrap_author_documents(
-    catalog_document_id: DocumentId,
-    transaction: &OperationTransaction,
-) -> Vec<DocumentId> {
-    let mut documents = BTreeSet::new();
-    for operation in &transaction.operations {
-        match operation {
-            SemanticOperation::CreatePage {
-                home_document_id, ..
-            } => {
-                documents.insert(catalog_document_id);
-                documents.insert(*home_document_id);
-            }
-            SemanticOperation::EditPagePath { .. }
-            | SemanticOperation::SetPageKind { .. }
-            | SemanticOperation::DeletePage { .. }
-            | SemanticOperation::RevivePage { .. }
-            | SemanticOperation::ReconcileExternalPageState { .. } => {
-                documents.insert(catalog_document_id);
-            }
-            SemanticOperation::CreateBlock { block, .. }
-            | SemanticOperation::EditBlockContent { block, .. }
-            | SemanticOperation::MutateBlockLogseqIdentity { block, .. } => {
-                documents.insert(block.home_document_id);
-            }
-            SemanticOperation::RenamePagesAndRewriteReferrers { block_rewrites, .. } => {
-                documents.insert(catalog_document_id);
-                documents.extend(
-                    block_rewrites
-                        .iter()
-                        .map(|rewrite| rewrite.block.home_document_id),
-                );
-            }
-            SemanticOperation::RestoreSubtree { blocks, .. } => {
-                documents.extend(blocks.iter().map(|restore| restore.block.home_document_id));
-            }
-            SemanticOperation::SetPagePreamble { .. }
-            | SemanticOperation::MoveSubtree { .. }
-            | SemanticOperation::ReorderBlock { .. }
-            | SemanticOperation::DeleteSubtree { .. } => {}
-        }
-    }
-    documents.into_iter().collect()
 }
 
 fn projection_requirements(
@@ -31735,7 +28684,6 @@ fn new_history_record(
     ColdHistoryRecord {
         schema_version: ENGINE_HISTORY_SCHEMA_VERSION,
         generation,
-        bootstrap: None,
         batch_id,
         manifest_fingerprint,
         portable_path_key_version: binding.portable_path_key_version,
@@ -31833,57 +28781,6 @@ fn decode_authenticated_current_history_leaf(
 }
 
 #[cfg(test)]
-pub(crate) fn validate_bootstrap_history_record(
-    part: BootstrapPartDescriptorV1,
-    bytes: &[u8],
-    binding: super::object_store::BootstrapAggregateHistoryBindingV1,
-) -> Result<super::object_store::EngineHistoryBinding, EngineError> {
-    let record = decode_history_record(part.batch_id(), bytes)?;
-    let ArchiveStatus::Accepted { evidence, .. } = &record.status else {
-        return Err(EngineError::Archive(
-            "bootstrap history record is not an accepted event".into(),
-        ));
-    };
-    if record.bootstrap != Some(binding)
-        || record.generation != u64::from(part.acceptance_sequence())
-        || evidence.acceptance_sequence != record.generation
-        || evidence.batch_id != part.batch_id()
-    {
-        return Err(EngineError::Archive(
-            "bootstrap history record does not match its aggregate binding".into(),
-        ));
-    }
-    Ok(history_record_binding(&record))
-}
-
-#[cfg(test)]
-fn validate_bootstrap_history_record_against_material(
-    part: BootstrapPartDescriptorV1,
-    bytes: &[u8],
-    binding: super::object_store::BootstrapAggregateHistoryBindingV1,
-    material: &DetachedBootstrapAcceptedEngineMaterial,
-) -> Result<super::object_store::EngineHistoryBinding, EngineError> {
-    let record_binding = validate_bootstrap_history_record(part, bytes, binding)?;
-    let mut expected_material = material.clone();
-    // Scratch checkpoint and accepted-frontier page references are freshly
-    // allocated on replay. The catalog binding is normalized explicitly;
-    // `AcceptedFrontierRoot` equality already excludes its run-local scratch
-    // address while comparing every authenticated identity field.
-    expected_material.history_binding.catalog_checkpoint_binding =
-        record_binding.catalog_checkpoint_binding;
-    let expected = expected_material.encode_history_record(part, binding)?;
-    let actual_record = decode_history_record(part.batch_id(), bytes)?;
-    let expected_record = decode_history_record(part.batch_id(), &expected)?;
-    if actual_record != expected_record {
-        return Err(EngineError::Archive(format!(
-            "bootstrap cold record differs from its exact per-part replay authority: {}",
-            cold_history_record_difference(&actual_record, &expected_record),
-        )));
-    }
-    Ok(record_binding)
-}
-
-#[cfg(test)]
 fn cold_history_record_difference(
     actual: &ColdHistoryRecord,
     expected: &ColdHistoryRecord,
@@ -31898,7 +28795,6 @@ fn cold_history_record_difference(
     first_difference!(
         schema_version,
         generation,
-        bootstrap,
         batch_id,
         manifest_fingerprint,
         portable_path_key_version,
@@ -31953,18 +28849,10 @@ fn validate_history_catalog(
     through_generation: u64,
 ) -> Result<(), EngineError> {
     let mut policy = None;
-    let mut bootstrap = None;
     for (index, record) in records.iter().enumerate() {
         if record.generation != index as u64 + 1 {
             return Err(EngineError::Archive(
                 "engine history catalog is incomplete or has duplicate generations".into(),
-            ));
-        }
-        if index == 0 {
-            bootstrap = record.bootstrap;
-        } else if record.bootstrap != bootstrap {
-            return Err(EngineError::Archive(
-                "engine history mixed bootstrap aggregate bindings".into(),
             ));
         }
         if policy
@@ -34201,14 +31089,6 @@ mod validation_tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::oplog::bootstrap_import::{
-        ArchiveLocalFrontierBindingV1, BootstrapAggregateDigestV1, BootstrapAggregateManifestV1,
-        BootstrapImportPartEvidenceV1, BootstrapManifestFingerprintV1, BootstrapPartDescriptorV1,
-        BootstrapPartSpanIndexV1, BootstrapPartitionProfileV1, BootstrapPublicationIdV1,
-        FullObjectDescriptorV1, OperationDigestV1, OperationLeafV1, OperationRootV1,
-        PayloadObjectDescriptorV1, PayloadObjectRootV1, SourceBlobChunkRootV1,
-        SourceInventoryRootV1, SourceSpanRootV1,
-    };
     use crate::oplog::external_import::{
         ExternalImportObservationEntry, ExternalImportObservationState,
     };
@@ -34304,7 +31184,7 @@ mod validation_tests {
             author.batch_id,
             author.author_device_id,
             author.author_session_id,
-            crate::oplog::BatchOrigin::BootstrapImport,
+            crate::oplog::BatchOrigin::LocalMutation,
             BatchCausalDot::new(CausalPeerId::from_device_id(author.author_device_id), 1).unwrap(),
             batch_dependency_heads,
             frontier,
@@ -34351,65 +31231,6 @@ mod validation_tests {
         }
     }
 
-    fn detached_evidence(
-        import_id: ImportId,
-        ordinal: u32,
-        part_count: u32,
-        predecessor: Option<BootstrapPartId>,
-        operation_count: u32,
-    ) -> BootstrapImportPartEvidenceV1 {
-        detached_evidence_with_profile(
-            import_id,
-            BootstrapPartitionProfileV1::current().digest(),
-            ordinal,
-            part_count,
-            predecessor,
-            operation_count,
-        )
-    }
-
-    fn detached_evidence_with_profile(
-        import_id: ImportId,
-        profile: BootstrapProfileDigestV1,
-        ordinal: u32,
-        part_count: u32,
-        predecessor: Option<BootstrapPartId>,
-        operation_count: u32,
-    ) -> BootstrapImportPartEvidenceV1 {
-        let operations = (0..operation_count)
-            .map(|index| {
-                let digest = ContentDigest::of(
-                    format!("detached-bootstrap-operation-{ordinal}-{index}").as_bytes(),
-                );
-                OperationLeafV1::new(
-                    OperationDigestV1::from_bytes(*digest.as_bytes()),
-                    u64::from(index % 17),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        BootstrapImportPartEvidenceV1::new(
-            import_id,
-            profile,
-            ordinal,
-            part_count,
-            SourceSpanRootV1::empty(),
-            OperationRootV1::from_operations(&operations).unwrap(),
-            PayloadObjectRootV1::empty(),
-            predecessor,
-        )
-        .unwrap()
-    }
-
-    fn detached_author(evidence: BootstrapImportPartEvidenceV1, peer: u64) -> AuthorBatch {
-        AuthorBatch {
-            batch_id: evidence.batch_id(),
-            author_device_id: DeviceId::from_uuid(Uuid::from_u128(91_000)),
-            author_session_id: SessionId::from_uuid(Uuid::from_u128(91_001)),
-            crdt_peer_id: CrdtPeerId::from_u64(peer),
-        }
-    }
-
     fn encoded_prepared(prepared: &PreparedBatch) -> (Vec<u8>, Vec<Vec<u8>>) {
         (
             prepared.manifest().encode().unwrap(),
@@ -34419,1540 +31240,6 @@ mod validation_tests {
                 .map(|object| object.encode().unwrap())
                 .collect(),
         )
-    }
-
-    /// A disposable durable archive supplying an explicit reference-catalog
-    /// capability to isolated detached-bootstrap unit tests.
-    ///
-    /// Production authoring is always handed the capability of the archive the
-    /// bootstrap will be installed into and promoted from. These unit tests
-    /// exercise the session in isolation, so they use an explicit temporary
-    /// *durable* store; nothing anywhere selects the ephemeral in-memory root
-    /// construction for a bootstrap.
-    struct TemporaryBootstrapCatalog {
-        root: std::path::PathBuf,
-        capability: BootstrapAuthoringCapability,
-    }
-
-    impl TemporaryBootstrapCatalog {
-        fn create(workspace: WorkspaceId, label: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "tine-detached-bootstrap-catalog-{label}-{}",
-                Uuid::new_v4()
-            ));
-            let capability = ObjectStore::open(&root, workspace)
-                .unwrap()
-                .bootstrap_authoring_capability()
-                .unwrap();
-            Self { root, capability }
-        }
-
-        fn capability(&self) -> &BootstrapAuthoringCapability {
-            &self.capability
-        }
-    }
-
-    impl Drop for TemporaryBootstrapCatalog {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn detached_descriptor(
-        prepared: &PreparedBatch,
-        evidence: BootstrapImportPartEvidenceV1,
-        prior: ArchiveLocalFrontierBindingV1,
-    ) -> BootstrapPartDescriptorV1 {
-        let payloads = prepared
-            .manifest()
-            .required_objects()
-            .iter()
-            .map(|object| {
-                PayloadObjectDescriptorV1::new(
-                    object.content_digest(),
-                    object.encoded_byte_length(),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let spans = BootstrapPartSpanIndexV1::new(evidence.part_id(), Vec::new()).unwrap();
-        let span_bytes = spans.encode().unwrap();
-        BootstrapPartDescriptorV1::accepted(
-            evidence,
-            BootstrapManifestFingerprintV1::from_bytes(
-                *ContentDigest::of(&prepared.manifest().encode().unwrap()).as_bytes(),
-            ),
-            &payloads,
-            &[FullObjectDescriptorV1::manifest_defined(
-                *ContentDigest::of(&span_bytes).as_bytes(),
-                span_bytes.len() as u64,
-            )
-            .unwrap()],
-            prior,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn detached_bootstrap_zero_part_is_canonical_empty() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_010));
-        let lineage = LineageDigest::of(b"detached-bootstrap-zero");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_011));
-        let policy = ReferenceCatalogPolicyV1::default();
-        let mut expected = ShardedHotEngine::new(workspace, lineage, catalog);
-        expected
-            .configure_reference_catalog_policy(policy.clone())
-            .unwrap();
-
-        let durable = TemporaryBootstrapCatalog::create(workspace, "zero-part");
-        let completed = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            policy,
-            durable.capability(),
-        )
-        .unwrap()
-        .finish()
-        .unwrap();
-        assert_eq!(completed.part_count(), 0);
-        assert_eq!(completed.last_part(), None);
-        assert_eq!(
-            completed.accepted_frontier_root().unwrap(),
-            expected.accepted_frontier_root().unwrap()
-        );
-        let engine = &completed.engine;
-        assert!(engine.archive.is_empty());
-        assert!(engine.detached_accepted_manifests.is_empty());
-        assert!(engine.archive_store.is_none());
-        assert!(engine.history_store.is_none());
-    }
-
-    #[test]
-    fn bootstrap_history_schema_13_binds_exact_aggregate_and_retains_no_op() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_015));
-        let lineage = LineageDigest::of(b"bootstrap-history-schema-12");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_016));
-        let import_id = ImportId::from_digest([0x40; 32]);
-        let profile = BootstrapPartitionProfileV1::v1().digest();
-        let effect = SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let effect_bytes = effect.encode().unwrap();
-        let object = OperationObject::new(
-            workspace,
-            catalog,
-            ObjectKind::SemanticEffect,
-            effect_bytes.clone(),
-        )
-        .unwrap();
-        let object_descriptor = object.descriptor().unwrap();
-        let payload_descriptor = PayloadObjectDescriptorV1::new(
-            object_descriptor.content_digest(),
-            object_descriptor.encoded_byte_length(),
-        )
-        .unwrap();
-        let evidence = BootstrapImportPartEvidenceV1::new(
-            import_id,
-            profile,
-            0,
-            1,
-            SourceSpanRootV1::empty(),
-            OperationRootV1::from_operations(&[OperationLeafV1::new(
-                OperationDigestV1::from_bytes([0x40; 32]),
-                0,
-            )
-            .unwrap()])
-            .unwrap(),
-            PayloadObjectRootV1::from_objects(std::slice::from_ref(&payload_descriptor)).unwrap(),
-            None,
-        )
-        .unwrap();
-        let device = DeviceId::from_uuid(Uuid::from_u128(91_017));
-        let manifest = OperationBatch::new_with_causality(
-            workspace,
-            lineage,
-            evidence.batch_id(),
-            device,
-            SessionId::from_uuid(Uuid::from_u128(91_018)),
-            BatchOrigin::BootstrapImport,
-            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
-            Vec::new(),
-            FrontierV2::new(Vec::new()).unwrap(),
-            SemanticEffectDigest::of(&effect_bytes),
-            vec![object_descriptor],
-        )
-        .unwrap();
-        let prepared = PreparedBatch::new(manifest, vec![object]).unwrap();
-        let durable = TemporaryBootstrapCatalog::create(workspace, "history-schema-12");
-        let mut session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let candidate = session.candidate.as_mut().unwrap();
-        let (no_op, accepted_evidence) = candidate
-            .advance_detached_bootstrap_candidate(prepared.clone())
-            .unwrap();
-        let membership_reads_before = candidate.scratch.as_ref().unwrap().stats();
-        assert!(
-            candidate
-                .accepted_frontier_contains_batch_effects(evidence.batch_id())
-                .unwrap(),
-            "accepted no-op bootstrap head vanished from dependency containment"
-        );
-        let membership_reads_after = candidate.scratch.as_ref().unwrap().stats();
-        assert_eq!(
-            membership_reads_after.range_reads, membership_reads_before.range_reads,
-            "accepted membership must not scan accepted documents or history"
-        );
-        assert!(
-            membership_reads_after
-                .page_reads
-                .saturating_sub(membership_reads_before.page_reads)
-                <= 8,
-            "accepted membership exceeded its point-bounded page-read ceiling"
-        );
-        let descriptor = detached_descriptor(
-            &prepared,
-            evidence,
-            ArchiveLocalFrontierBindingV1::initial(import_id, evidence.profile_digest()),
-        );
-        let material = DetachedBootstrapAcceptedEngineMaterial {
-            no_op,
-            accepted_evidence,
-            history_binding: candidate.durable_history_binding(),
-            logseq_claim_root: candidate.logseq_claim_root,
-            reference_catalog_policy: candidate.reference_catalog_policy.clone(),
-        };
-        let binding = super::super::object_store::BootstrapAggregateHistoryBindingV1::new(
-            BootstrapPublicationIdV1::from_bytes([0x11; 32]),
-            BootstrapAggregateDigestV1::from_bytes([0x12; 32]),
-            1,
-            descriptor.post_frontier(),
-        )
-        .unwrap();
-        let bytes = material.encode_history_record(descriptor, binding).unwrap();
-        super::super::object_store::PreparedBootstrapHistoryRecordV1::new(
-            descriptor, &bytes, binding,
-        )
-        .unwrap();
-        let record = decode_history_record(descriptor.batch_id(), &bytes).unwrap();
-        assert_eq!(record.schema_version, ENGINE_HISTORY_SCHEMA_VERSION);
-        assert_eq!(record.bootstrap, Some(binding));
-        assert_eq!(
-            match &record.status {
-                ArchiveStatus::Accepted { no_op, .. } => *no_op,
-                _ => panic!("detached bootstrap record was not accepted"),
-            },
-            material.no_op()
-        );
-        assert_eq!(
-            new_history_record(
-                1,
-                record.batch_id,
-                record.manifest_fingerprint,
-                history_record_binding(&record),
-                record.logseq_claim_root,
-                record.reference_catalog_policy.clone(),
-                record.status.clone(),
-            )
-            .bootstrap,
-            None,
-            "ordinary cold history must never acquire bootstrap authority"
-        );
-
-        let mut prior_schema = record.clone();
-        prior_schema.schema_version = 11;
-        let prior_bytes = encode_history_record(&prior_schema).unwrap();
-        assert!(
-            super::super::object_store::PreparedBootstrapHistoryRecordV1::new(
-                descriptor,
-                &prior_bytes,
-                binding,
-            )
-            .is_err()
-        );
-
-        let other_binding = super::super::object_store::BootstrapAggregateHistoryBindingV1::new(
-            BootstrapPublicationIdV1::from_bytes([0x21; 32]),
-            BootstrapAggregateDigestV1::from_bytes([0x22; 32]),
-            1,
-            descriptor.post_frontier(),
-        )
-        .unwrap();
-        let mut mismatch = record.clone();
-        mismatch.bootstrap = Some(other_binding);
-        let mismatch_bytes = encode_history_record(&mismatch).unwrap();
-        assert!(
-            super::super::object_store::PreparedBootstrapHistoryRecordV1::new(
-                descriptor,
-                &mismatch_bytes,
-                binding,
-            )
-            .is_err()
-        );
-
-        let mut mixed = record.clone();
-        mixed.generation = 2;
-        mixed.bootstrap = Some(other_binding);
-        assert!(validate_history_catalog(&[record, mixed], 2).is_err());
-    }
-
-    #[test]
-    fn detached_bootstrap_one_part_is_deterministic_and_byte_identical_to_helper() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_020));
-        let lineage = LineageDigest::of(b"detached-bootstrap-one");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_021));
-        let page = PageId::from_uuid(Uuid::from_u128(91_022));
-        let home = DocumentId::from_uuid(Uuid::from_u128(91_023));
-        let block = BlockId::from_uuid(Uuid::from_u128(91_024));
-        let transaction = create_page_with_block(page, home, block, "Detached", "pages/d.md");
-        let evidence = detached_evidence(
-            ImportId::from_digest([0x41; 32]),
-            0,
-            1,
-            None,
-            transaction.operations.len() as u32,
-        );
-        let author = detached_author(evidence, 91_025);
-        let policy = ReferenceCatalogPolicyV1::default();
-
-        let mut helper = ShardedHotEngine::new(workspace, lineage, catalog);
-        helper
-            .configure_reference_catalog_policy(policy.clone())
-            .unwrap();
-        let expected = helper
-            .prepare_bootstrap_transaction(author, &transaction)
-            .unwrap();
-
-        let durable = TemporaryBootstrapCatalog::create(workspace, "one-part");
-        let author_once = || {
-            let mut session = DetachedBootstrapAuthoringSession::new(
-                workspace,
-                lineage,
-                catalog,
-                policy.clone(),
-                durable.capability(),
-            )
-            .unwrap();
-            let part = session.author_part(author, &transaction, evidence).unwrap();
-            let completed = session.finish().unwrap();
-            (encoded_prepared(part.prepared()), completed)
-        };
-        let (first, first_completed) = author_once();
-        let (second, second_completed) = author_once();
-        assert_eq!(first, encoded_prepared(&expected));
-        assert_eq!(first, second);
-        assert_eq!(
-            first_completed.accepted_frontier_root().unwrap(),
-            second_completed.accepted_frontier_root().unwrap()
-        );
-        assert_eq!(
-            first_completed
-                .engine
-                .materialize_page(page)
-                .unwrap()
-                .blocks[0]
-                .content,
-            "Detached identity"
-        );
-    }
-
-    #[test]
-    fn detached_bootstrap_multi_part_advances_real_candidate_state() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_030));
-        let lineage = LineageDigest::of(b"detached-bootstrap-multi");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_031));
-        let page = PageId::from_uuid(Uuid::from_u128(91_032));
-        let home = DocumentId::from_uuid(Uuid::from_u128(91_033));
-        let parent = BlockId::from_uuid(Uuid::from_u128(91_034));
-        let child = BlockId::from_uuid(Uuid::from_u128(91_035));
-        let import_id = ImportId::from_digest([0x42; 32]);
-        let first_transaction =
-            create_page_with_block(page, home, parent, "Multipart", "pages/multi.md");
-        let first_evidence = detached_evidence(
-            import_id,
-            0,
-            2,
-            None,
-            first_transaction.operations.len() as u32,
-        );
-        let second_transaction = OperationTransaction::new(vec![
-            SemanticOperation::EditBlockContent {
-                block: BlockLocation {
-                    block_id: parent,
-                    home_document_id: home,
-                },
-                content: "edited in the second part".into(),
-            },
-            SemanticOperation::CreateBlock {
-                block: BlockLocation {
-                    block_id: child,
-                    home_document_id: home,
-                },
-                page_id: page,
-                parent: Some(parent),
-                order: "a".into(),
-                content: "child from the second part".into(),
-            },
-        ])
-        .unwrap();
-        let second_evidence = detached_evidence(
-            import_id,
-            1,
-            2,
-            Some(first_evidence.part_id()),
-            second_transaction.operations.len() as u32,
-        );
-
-        let durable = TemporaryBootstrapCatalog::create(workspace, "multi-part");
-        let mut session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let first = session
-            .author_part(
-                detached_author(first_evidence, 91_036),
-                &first_transaction,
-                first_evidence,
-            )
-            .unwrap();
-        let second = session
-            .author_part(
-                detached_author(second_evidence, 91_036),
-                &second_transaction,
-                second_evidence,
-            )
-            .unwrap();
-        let authored_bytes = (
-            encoded_prepared(first.prepared()),
-            encoded_prepared(second.prepared()),
-        );
-        assert_eq!(
-            second.prepared().manifest().causal_dependency_heads(),
-            &[first.prepared().manifest().batch_id()]
-        );
-        assert_eq!(
-            first.engine_material().history_binding().portable_path_root,
-            PortablePathIndexRoot::empty().digest(),
-            "a nonterminal physical part must not publish an accumulated path prefix"
-        );
-        assert_eq!(
-            first
-                .engine_material()
-                .history_binding()
-                .page_names
-                .ownership_root,
-            PageNameOwnershipRootV1::empty(),
-            "a nonterminal physical part must not publish an accumulated name prefix"
-        );
-        assert_ne!(
-            second
-                .engine_material()
-                .history_binding()
-                .portable_path_root,
-            PortablePathIndexRoot::empty().digest(),
-            "the terminal part must bind the complete portable-path authority"
-        );
-        assert_ne!(
-            second
-                .engine_material()
-                .history_binding()
-                .page_names
-                .ownership_root,
-            PageNameOwnershipRootV1::empty(),
-            "the terminal part must bind the complete page-name authority"
-        );
-        let completed = session.finish().unwrap();
-        assert_eq!(completed.part_count(), 2);
-        // Deliberately the same durable archive: repeating the authoring must
-        // be byte-identical against the catalog nodes the first pass published.
-        let mut repeated = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let repeated_first = repeated
-            .author_part(
-                detached_author(first_evidence, 91_036),
-                &first_transaction,
-                first_evidence,
-            )
-            .unwrap();
-        let repeated_second = repeated
-            .author_part(
-                detached_author(second_evidence, 91_036),
-                &second_transaction,
-                second_evidence,
-            )
-            .unwrap();
-        assert_eq!(
-            authored_bytes,
-            (
-                encoded_prepared(repeated_first.prepared()),
-                encoded_prepared(repeated_second.prepared())
-            )
-        );
-        assert_eq!(
-            completed.accepted_frontier_root().unwrap(),
-            repeated.finish().unwrap().accepted_frontier_root().unwrap()
-        );
-        let materialized = completed.engine.materialize_page(page).unwrap();
-        let blocks = materialized
-            .blocks
-            .into_iter()
-            .map(|block| (block.block_id, (block.parent, block.content)))
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            blocks[&parent].1, "edited in the second part",
-            "part two must edit state accepted from part one"
-        );
-        assert_eq!(blocks[&child].0, Some(parent));
-        let exact_path = ManagedPath::parse("pages/multi.md").unwrap();
-        let portable = completed
-            .engine
-            .portable_path_index
-            .as_ref()
-            .unwrap()
-            .lookup(
-                completed.engine.portable_path_root,
-                exact_path.portable_key().digest(),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(portable.occupied().unwrap().page_id(), page);
-        assert_eq!(portable.occupied().unwrap().exact_path(), &exact_path);
-        let selected = completed
-            .engine
-            .authenticated_page_name_exact_state(
-                &completed.engine.page_name_root,
-                LogicalPageName::parse("Multipart").unwrap().key_digest(),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(selected.page_id(), page);
-        assert_eq!(selected.exact_name().as_str(), "Multipart");
-    }
-
-    #[test]
-    fn detached_bootstrap_terminal_identity_indexes_match_incremental_semantics() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_037));
-        let lineage = LineageDigest::of(b"detached-bootstrap-terminal-identity-differential");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_038));
-        let import_id = ImportId::from_digest([0x4a; 32]);
-        let transactions = [
-            create_page_with_block(
-                PageId::from_uuid(Uuid::from_u128(91_039)),
-                DocumentId::from_uuid(Uuid::from_u128(91_040)),
-                BlockId::from_uuid(Uuid::from_u128(91_041)),
-                "Nested Alpha",
-                "notes/deep/alpha.md",
-            ),
-            create_page_with_block(
-                PageId::from_uuid(Uuid::from_u128(91_042)),
-                DocumentId::from_uuid(Uuid::from_u128(91_043)),
-                BlockId::from_uuid(Uuid::from_u128(91_044)),
-                "Nested Beta",
-                "elsewhere/beta.org",
-            ),
-        ];
-        let terminal_store =
-            TemporaryBootstrapCatalog::create(workspace, "terminal-identity-differential");
-        let incremental_store =
-            TemporaryBootstrapCatalog::create(workspace, "incremental-identity-differential");
-        let author = |capability: &BootstrapAuthoringCapability,
-                      profile: BootstrapProfileDigestV1| {
-            let mut session = DetachedBootstrapAuthoringSession::new(
-                workspace,
-                lineage,
-                catalog,
-                ReferenceCatalogPolicyV1::default(),
-                capability,
-            )
-            .unwrap();
-            let mut predecessor = None;
-            for (ordinal, transaction) in transactions.iter().enumerate() {
-                let evidence = detached_evidence_with_profile(
-                    import_id,
-                    profile,
-                    ordinal as u32,
-                    transactions.len() as u32,
-                    predecessor,
-                    transaction.operations.len() as u32,
-                );
-                session
-                    .author_part(detached_author(evidence, 91_045), transaction, evidence)
-                    .unwrap();
-                predecessor = Some(evidence.part_id());
-            }
-            session.finish().unwrap()
-        };
-        let terminal = author(
-            terminal_store.capability(),
-            BootstrapPartitionProfileV1::current().digest(),
-        );
-        let incremental = author(
-            incremental_store.capability(),
-            BootstrapPartitionProfileV1::v1().digest(),
-        );
-
-        for (name, path, page_id) in [
-            (
-                "Nested Alpha",
-                "notes/deep/alpha.md",
-                PageId::from_uuid(Uuid::from_u128(91_039)),
-            ),
-            (
-                "Nested Beta",
-                "elsewhere/beta.org",
-                PageId::from_uuid(Uuid::from_u128(91_042)),
-            ),
-        ] {
-            let path = ManagedPath::parse(path).unwrap();
-            let path_key = path.portable_key().digest();
-            let name = LogicalPageName::parse(name).unwrap();
-            for candidate in [&terminal, &incremental] {
-                let portable = candidate
-                    .engine
-                    .portable_path_index
-                    .as_ref()
-                    .unwrap()
-                    .lookup(candidate.engine.portable_path_root, path_key)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(portable.occupied().unwrap().page_id(), page_id);
-                assert_eq!(portable.occupied().unwrap().exact_path(), &path);
-                let selected = candidate
-                    .engine
-                    .authenticated_page_name_exact_state(
-                        &candidate.engine.page_name_root,
-                        name.key_digest(),
-                    )
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(selected.page_id(), page_id);
-                assert_eq!(selected.exact_name(), &name);
-                assert_eq!(
-                    candidate.engine.materialize_page(page_id).unwrap().path,
-                    path
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn detached_bootstrap_index_reads_stay_bounded_across_declaration_parts() {
-        const PART_COUNT: u32 = 3;
-        const PAGES_PER_PART: usize = 256;
-
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_040));
-        let lineage = LineageDigest::of(b"detached-bootstrap-index-construction");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_041));
-        let import_id = ImportId::from_digest([0x43; 32]);
-        let durable = TemporaryBootstrapCatalog::create(workspace, "bounded-index-reads");
-        let mut session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let mut predecessor = None;
-        let mut sampled_pages = Vec::new();
-
-        for ordinal in 0..PART_COUNT {
-            let (transaction, pages) =
-                create_page_batch(91_100 + u128::from(ordinal) * 1_000, PAGES_PER_PART);
-            sampled_pages.extend([pages[0].clone(), pages[PAGES_PER_PART - 1].clone()]);
-            let evidence = detached_evidence(
-                import_id,
-                ordinal,
-                PART_COUNT,
-                predecessor,
-                transaction.operations.len() as u32,
-            );
-            session
-                .author_part(detached_author(evidence, 91_042), &transaction, evidence)
-                .unwrap();
-            predecessor = Some(evidence.part_id());
-        }
-
-        let completed = session.finish().unwrap();
-        let work = completed.bootstrap_index_work_stats();
-        let page_count = PART_COUNT as usize * PAGES_PER_PART;
-        assert!(
-            work.detached_index_persistent_node_reads <= page_count * 64,
-            "detached construction exceeded bounded point work per page: {work:?}"
-        );
-        let io = completed.engine.instrumentation();
-        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
-        let queue_roots = &completed.engine.scratch_roots;
-        let empty_roots = ScratchRoots::default();
-        assert_eq!(queue_roots.registering_len, 0);
-        assert_eq!(queue_roots.ready_queue_len, 0);
-        assert_eq!(queue_roots.fanout_head, 0);
-        assert_eq!(queue_roots.fanout_tail, 0);
-        assert_eq!(queue_roots.dependency_root, empty_roots.dependency_root);
-        assert_eq!(
-            queue_roots.unresolved_dependency_root,
-            empty_roots.unresolved_dependency_root
-        );
-        assert_eq!(queue_roots.wait_root, empty_roots.wait_root);
-        assert_eq!(
-            queue_roots.wait_progress_root,
-            empty_roots.wait_progress_root
-        );
-        assert_eq!(queue_roots.fanout_root, empty_roots.fanout_root);
-        assert_eq!(queue_roots.ready_queue_root, empty_roots.ready_queue_root);
-        for batch_id in completed.engine.detached_accepted_manifests.keys() {
-            let record = crate::oplog::dependency_queue::lookup(
-                completed.engine.scratch.as_ref().unwrap(),
-                queue_roots,
-                *batch_id,
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                record.status(),
-                crate::oplog::dependency_queue::CompactBatchStatus::Final
-            );
-        }
-        assert_eq!(
-            scratch.range_reads, 0,
-            "declaration parts must not range-scan cumulative authenticated trees: {scratch:?}"
-        );
-        assert!(
-            io.scratch_page_reads <= page_count,
-            "detached authoring reread cumulative scratch graphs: {io:?}"
-        );
-        assert!(
-            io.scratch_page_bytes_read <= page_count * 32 * 1024,
-            "detached authoring reread cumulative scratch bytes: {io:?}"
-        );
-        assert!(
-            scratch.page_append_batches.saturating_mul(10) < scratch.page_writes,
-            "detached authoring emitted near-record-granularity page writes: {scratch:?}"
-        );
-        assert!(
-            scratch.blob_append_batches.saturating_mul(10) < scratch.blob_writes,
-            "detached authoring emitted near-record-granularity blob writes: {scratch:?}"
-        );
-        for (page_id, expected_content) in sampled_pages {
-            let page = completed.engine.materialize_page(page_id).unwrap();
-            assert_eq!(page.blocks[0].content, expected_content);
-        }
-    }
-
-    #[test]
-    #[ignore = "manual detached-bootstrap authoring scale receipt"]
-    fn detached_bootstrap_authoring_scale_receipt() {
-        let total_pages = std::env::var("TINE_BOOTSTRAP_SCALE_PAGES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(2_000);
-        let pages_per_part = std::env::var("TINE_BOOTSTRAP_SCALE_PART_PAGES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1_000);
-        assert!(total_pages > 0);
-        assert!((256..=2_048).contains(&pages_per_part));
-        let part_count = total_pages.div_ceil(pages_per_part) as u32;
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_050));
-        let lineage = LineageDigest::of(b"detached-bootstrap-scale-receipt");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_051));
-        let import_id = ImportId::from_digest([0x44; 32]);
-        let durable = TemporaryBootstrapCatalog::create(workspace, "scale-receipt");
-        let mut session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let started = std::time::Instant::now();
-        let mut predecessor = None;
-        let mut authored_pages = 0;
-        let mut sample = None;
-        let mut part_author_ms = Vec::with_capacity(part_count as usize);
-        for ordinal in 0..part_count {
-            let count = (total_pages - authored_pages).min(pages_per_part);
-            let (transaction, pages) = create_page_batch(
-                92_000 + u128::from(ordinal) * pages_per_part as u128 * 3,
-                count,
-            );
-            sample = pages.last().cloned();
-            let evidence = detached_evidence(
-                import_id,
-                ordinal,
-                part_count,
-                predecessor,
-                transaction.operations.len() as u32,
-            );
-            session
-                .author_part(detached_author(evidence, 91_052), &transaction, evidence)
-                .unwrap();
-            predecessor = Some(evidence.part_id());
-            authored_pages += count;
-            part_author_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
-        }
-        let authored = started.elapsed();
-        let finish_started = std::time::Instant::now();
-        let completed = session.finish().unwrap();
-        let finished = finish_started.elapsed();
-        let work = completed.bootstrap_index_work_stats();
-        let (sample_page, sample_content) = sample.unwrap();
-        assert_eq!(
-            completed
-                .engine
-                .materialize_page(sample_page)
-                .unwrap()
-                .blocks[0]
-                .content,
-            sample_content
-        );
-        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
-        assert!(
-            scratch.page_append_batches.saturating_mul(100) < scratch.page_writes,
-            "detached bootstrap emitted one physical page write per logical record: {scratch:?}"
-        );
-        assert!(
-            scratch.blob_append_batches.saturating_mul(100) < scratch.blob_writes,
-            "detached bootstrap emitted one physical blob write per logical record: {scratch:?}"
-        );
-        eprintln!(
-            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_page_append_batches={} scratch_blob_append_batches={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} index_work={work:?}",
-            authored.as_secs_f64() * 1_000.0,
-            finished.as_secs_f64() * 1_000.0,
-            scratch.page_reads,
-            scratch.page_writes,
-            scratch.page_append_batches,
-            scratch.blob_append_batches,
-            scratch.range_reads,
-            scratch.page_bytes_read,
-            scratch.page_bytes_written,
-        );
-    }
-
-    #[test]
-    fn detached_content_uses_authenticated_page_identity_without_affecting_catalog() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_070));
-        let lineage = LineageDigest::of(b"detached-content-catalog-cache");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_071));
-        let page = PageId::from_uuid(Uuid::from_u128(91_072));
-        let missing_page = PageId::from_uuid(Uuid::from_u128(91_073));
-        let home = DocumentId::from_uuid(Uuid::from_u128(91_074));
-        let parent = BlockId::from_uuid(Uuid::from_u128(91_075));
-        let children = [
-            BlockId::from_uuid(Uuid::from_u128(91_076)),
-            BlockId::from_uuid(Uuid::from_u128(91_077)),
-            BlockId::from_uuid(Uuid::from_u128(91_078)),
-        ];
-        let import_id = ImportId::from_digest([0x46; 32]);
-        let profile = BootstrapPartitionProfileV1::v1().digest();
-        let declaration = create_page_with_block(
-            page,
-            home,
-            parent,
-            "Cached Catalog",
-            "pages/cached-catalog.md",
-        );
-        let first_evidence = detached_evidence_with_profile(
-            import_id,
-            profile,
-            0,
-            3,
-            None,
-            declaration.operations.len() as u32,
-        );
-        let content = OperationTransaction::new(
-            children
-                .iter()
-                .enumerate()
-                .map(|(index, block_id)| SemanticOperation::CreateBlock {
-                    block: BlockLocation {
-                        block_id: *block_id,
-                        home_document_id: home,
-                    },
-                    page_id: page,
-                    parent: Some(parent),
-                    order: format!("child-{index}"),
-                    content: format!("child {index}"),
-                })
-                .collect(),
-        )
-        .unwrap();
-        let second_evidence = detached_evidence_with_profile(
-            import_id,
-            profile,
-            1,
-            3,
-            Some(first_evidence.part_id()),
-            content.operations.len() as u32,
-        );
-        let deletion =
-            OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id: page }])
-                .unwrap();
-        let third_evidence = detached_evidence_with_profile(
-            import_id,
-            profile,
-            2,
-            3,
-            Some(second_evidence.part_id()),
-            deletion.operations.len() as u32,
-        );
-
-        let durable = TemporaryBootstrapCatalog::create(workspace, "catalog-cache");
-        let mut session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let declaration_before = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .read_only_catalog_clones
-            .get();
-        session
-            .author_part(
-                detached_author(first_evidence, 91_079),
-                &declaration,
-                first_evidence,
-            )
-            .unwrap();
-        let declaration_after = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .read_only_catalog_clones
-            .get();
-        assert_eq!(
-            declaration_after - declaration_before,
-            0,
-            "CreatePage followed by CreateBlock must resolve from the mutable catalog"
-        );
-
-        let content_before = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .reference_source_observations
-            .get();
-        let content_catalog_clones_before = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .read_only_catalog_clones
-            .get();
-        let authored_content = session
-            .author_part(
-                detached_author(second_evidence, 91_079),
-                &content,
-                second_evidence,
-            )
-            .unwrap();
-        let content_after = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .reference_source_observations
-            .get();
-        assert_eq!(
-            content_after.authenticated_page_identity_lookups
-                - content_before.authenticated_page_identity_lookups,
-            2,
-            "authoring and prospective-reference validation each require one authenticated point lookup; derived reference extraction is no longer an engine-authority lookup"
-        );
-        assert_eq!(
-            session
-                .candidate
-                .as_ref()
-                .unwrap()
-                .read_only_catalog_clones
-                .get()
-                - content_catalog_clones_before,
-            0,
-            "block-only detached authoring must not reconstruct the full catalog"
-        );
-        assert_eq!(
-            authored_content
-                .engine_material()
-                .accepted_evidence()
-                .affected_documents()
-                .iter()
-                .map(DocumentDependencies::document_id)
-                .collect::<Vec<_>>(),
-            vec![home]
-        );
-        assert_eq!(
-            authored_content
-                .prepared()
-                .objects()
-                .iter()
-                .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
-                .map(OperationObject::document_id)
-                .collect::<Vec<_>>(),
-            vec![home],
-            "the read-only catalog must not emit a CRDT update"
-        );
-        let effect = authored_content
-            .prepared()
-            .objects()
-            .iter()
-            .find(|object| object.kind() == ObjectKind::SemanticEffect)
-            .map(|object| SemanticEffect::decode(object.payload()).unwrap())
-            .unwrap();
-        assert!(
-            effect.pages().is_empty(),
-            "the read-only catalog must not produce page semantic effects"
-        );
-
-        session
-            .author_part(
-                detached_author(third_evidence, 91_079),
-                &deletion,
-                third_evidence,
-            )
-            .unwrap();
-        let candidate = session.candidate.as_ref().unwrap();
-        let create_on = |page_id, block_id| {
-            OperationTransaction::new(vec![SemanticOperation::CreateBlock {
-                block: BlockLocation {
-                    block_id,
-                    home_document_id: home,
-                },
-                page_id,
-                parent: None,
-                order: "after-delete".into(),
-                content: "must fail".into(),
-            }])
-            .unwrap()
-        };
-        assert!(matches!(
-            candidate.prepare_bootstrap_transaction(
-                test_author(91_080, 91_079),
-                &create_on(page, BlockId::from_uuid(Uuid::from_u128(91_081))),
-            ),
-            Err(EngineError::PageDeleted(found)) if found == page
-        ));
-        assert!(matches!(
-            candidate.prepare_bootstrap_transaction(
-                test_author(91_082, 91_079),
-                &create_on(missing_page, BlockId::from_uuid(Uuid::from_u128(91_083))),
-            ),
-            Err(EngineError::PageNotFound(found)) if found == missing_page
-        ));
-    }
-
-    #[test]
-    fn detached_bootstrap_direct_loaded_replay_matches_zero_and_dependent_authored_state() {
-        let replay_case = |label: &str, multipart: bool| {
-            let workspace = WorkspaceId::from_uuid(Uuid::new_v4());
-            let lineage = LineageDigest::of(label.as_bytes());
-            let catalog = DocumentId::from_uuid(Uuid::new_v4());
-            let import_id = ImportId::from_digest(*ContentDigest::of(label.as_bytes()).as_bytes());
-            let policy = ReferenceCatalogPolicyV1::default();
-            let root = std::env::temp_dir().join(format!(
-                "tine-detached-bootstrap-replay-{label}-{}",
-                Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            let archive = root.join("archive");
-            let store = ObjectStore::open(&archive, workspace).unwrap();
-            // Authoring binds catalog roots that the replay below must reopen
-            // from this exact archive's durable authenticated store.
-            let catalog_capability = store.bootstrap_authoring_capability().unwrap();
-            let profile = BootstrapPartitionProfileV1::v1().digest();
-            let initial = ArchiveLocalFrontierBindingV1::initial(import_id, profile);
-
-            let (aggregate, expected) = if multipart {
-                let device = DeviceId::from_uuid(Uuid::new_v4());
-                let make_no_op = |ordinal: u32,
-                                  predecessor: Option<BootstrapPartId>,
-                                  frontier: FrontierV2,
-                                  dependency_heads: Vec<BatchId>| {
-                    let effect = SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
-                    let effect_bytes = effect.encode().unwrap();
-                    let object = OperationObject::new(
-                        workspace,
-                        catalog,
-                        ObjectKind::SemanticEffect,
-                        effect_bytes.clone(),
-                    )
-                    .unwrap();
-                    let object_descriptor = object.descriptor().unwrap();
-                    let payload_descriptor = PayloadObjectDescriptorV1::new(
-                        object_descriptor.content_digest(),
-                        object_descriptor.encoded_byte_length(),
-                    )
-                    .unwrap();
-                    let evidence = BootstrapImportPartEvidenceV1::new(
-                        import_id,
-                        profile,
-                        ordinal,
-                        2,
-                        SourceSpanRootV1::empty(),
-                        OperationRootV1::from_operations(&[OperationLeafV1::new(
-                            OperationDigestV1::from_bytes([ordinal as u8 + 1; 32]),
-                            0,
-                        )
-                        .unwrap()])
-                        .unwrap(),
-                        PayloadObjectRootV1::from_objects(std::slice::from_ref(
-                            &payload_descriptor,
-                        ))
-                        .unwrap(),
-                        predecessor,
-                    )
-                    .unwrap();
-                    let manifest = OperationBatch::new_with_causality(
-                        workspace,
-                        lineage,
-                        evidence.batch_id(),
-                        device,
-                        SessionId::from_uuid(Uuid::new_v4()),
-                        BatchOrigin::BootstrapImport,
-                        BatchCausalDot::new(
-                            CausalPeerId::from_device_id(device),
-                            u64::from(ordinal) + 1,
-                        )
-                        .unwrap(),
-                        dependency_heads,
-                        frontier,
-                        SemanticEffectDigest::of(&effect_bytes),
-                        vec![object_descriptor],
-                    )
-                    .unwrap();
-                    (
-                        evidence,
-                        PreparedBatch::new(manifest, vec![object]).unwrap(),
-                    )
-                };
-                let mut author = DetachedBootstrapAuthoringSession::new(
-                    workspace,
-                    lineage,
-                    catalog,
-                    policy.clone(),
-                    &catalog_capability,
-                )
-                .unwrap();
-                let (first_evidence, first) =
-                    make_no_op(0, None, FrontierV2::new(Vec::new()).unwrap(), Vec::new());
-                author
-                    .candidate
-                    .as_mut()
-                    .unwrap()
-                    .advance_detached_bootstrap_candidate(first.clone())
-                    .unwrap();
-                let second_frontier = author.candidate.as_ref().unwrap().exact_frontier().unwrap();
-                let (second_evidence, second) = make_no_op(
-                    1,
-                    Some(first_evidence.part_id()),
-                    second_frontier,
-                    vec![first_evidence.batch_id()],
-                );
-                author
-                    .candidate
-                    .as_mut()
-                    .unwrap()
-                    .advance_detached_bootstrap_candidate(second.clone())
-                    .unwrap();
-                let first_descriptor = detached_descriptor(&first, first_evidence, initial);
-                let second_descriptor =
-                    detached_descriptor(&second, second_evidence, first_descriptor.post_frontier());
-                for (part, descriptor) in [(&first, first_descriptor), (&second, second_descriptor)]
-                {
-                    let object_bytes = part
-                        .objects()
-                        .iter()
-                        .map(|object| object.encode().unwrap())
-                        .collect::<Vec<_>>();
-                    for object in &object_bytes {
-                        store.publish_bootstrap_object_bytes(object).unwrap();
-                    }
-                    store
-                        .publish_bootstrap_part_pack_for_test(descriptor, &object_bytes)
-                        .unwrap();
-                    store
-                        .publish_bootstrap_part_artifacts(
-                            descriptor,
-                            &part.manifest().encode().unwrap(),
-                            &BootstrapPartSpanIndexV1::new(descriptor.part_id(), Vec::new())
-                                .unwrap(),
-                        )
-                        .unwrap();
-                }
-                let aggregate = BootstrapAggregateManifestV1::new_for_import(
-                    workspace,
-                    lineage,
-                    crate::oplog::CanonicalGraphResourceId::from_capability_identity(
-                        b"detached-bootstrap-replay",
-                        label.as_bytes(),
-                    ),
-                    import_id,
-                    0,
-                    SourceInventoryRootV1::empty(),
-                    0,
-                    SourceBlobChunkRootV1::empty(),
-                    0,
-                    profile,
-                    vec![first_descriptor, second_descriptor],
-                    initial,
-                    second_descriptor.post_frontier(),
-                )
-                .unwrap();
-                let expected = DetachedBootstrapCandidate {
-                    engine: author.candidate.take().unwrap(),
-                    scratch_root: Some(author.scratch_root.take().unwrap()),
-                    part_count: 2,
-                    last_part: Some(second_descriptor.part_id()),
-                    index_durability: DetachedBootstrapIndexDurability::ReplayedArchive {
-                        workspace_id: workspace,
-                        archive_identity: catalog_capability.archive_identity(),
-                    },
-                };
-                (aggregate, expected)
-            } else {
-                (
-                    BootstrapAggregateManifestV1::empty(
-                        workspace,
-                        lineage,
-                        crate::oplog::CanonicalGraphResourceId::from_capability_identity(
-                            b"detached-bootstrap-replay",
-                            label.as_bytes(),
-                        ),
-                        import_id,
-                    )
-                    .unwrap(),
-                    DetachedBootstrapAuthoringSession::new(
-                        workspace,
-                        lineage,
-                        catalog,
-                        policy.clone(),
-                        &catalog_capability,
-                    )
-                    .unwrap()
-                    .finish()
-                    .unwrap(),
-                )
-            };
-            store
-                .publish_bootstrap_aggregate_prefix(&aggregate)
-                .unwrap();
-            let publication_id = store.commit_bootstrap_aggregate(&aggregate).unwrap();
-            let publication = store.load_bootstrap_publication(publication_id).unwrap();
-            let storage = ProjectionStorageBinding {
-                endpoint: ProjectionEndpointBinding {
-                    endpoint_id: ProjectionEndpointId::from_uuid(Uuid::new_v4()),
-                    device_id: DeviceId::from_uuid(Uuid::new_v4()),
-                    graph_resource_id:
-                        crate::oplog::CanonicalGraphResourceId::from_capability_identity(
-                            b"detached-bootstrap-replay-target",
-                            label.as_bytes(),
-                        ),
-                },
-                receipt_store_id: ProjectionReceiptStoreId::from_capability_identity(
-                    b"detached-bootstrap-replay-target",
-                    label.as_bytes(),
-                ),
-            };
-            let preparation = DetachedBootstrapReplayIdentity::new(
-                workspace,
-                lineage,
-                catalog,
-                policy,
-                storage,
-                store.canonical_archive_identity().unwrap(),
-            );
-            assert_eq!(preparation.storage(), storage);
-            let replayed =
-                replay_direct_loaded_bootstrap(&store, &publication, &preparation).unwrap();
-            assert_eq!(
-                replayed.accepted_frontier_root().unwrap(),
-                expected.accepted_frontier_root().unwrap()
-            );
-            assert_eq!(
-                replayed.engine.canonical_snapshot().unwrap(),
-                expected.engine.canonical_snapshot().unwrap()
-            );
-            assert!(replayed.engine.archive_store.is_none());
-            assert!(replayed.engine.history_store.is_none());
-            drop(replayed);
-            drop(expected);
-            drop(store);
-            crate::test_support::remove_dir_all(root);
-        };
-
-        replay_case("zero", false);
-        replay_case("dependent", true);
-    }
-
-    #[test]
-    fn detached_bootstrap_rejects_bad_parts_and_poisoning_is_irreversible() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_040));
-        let lineage = LineageDigest::of(b"detached-bootstrap-errors");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_041));
-        let page = PageId::from_uuid(Uuid::from_u128(91_042));
-        let home = DocumentId::from_uuid(Uuid::from_u128(91_043));
-        let block = BlockId::from_uuid(Uuid::from_u128(91_044));
-        let transaction = create_page_with_block(page, home, block, "Errors", "pages/errors.md");
-        let evidence = detached_evidence(
-            ImportId::from_digest([0x43; 32]),
-            0,
-            1,
-            None,
-            transaction.operations.len() as u32,
-        );
-
-        let durable = TemporaryBootstrapCatalog::create(workspace, "rejects-bad-parts");
-        let mut wrong_batch = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let mut author = detached_author(evidence, 91_045);
-        author.batch_id = BatchId::from_uuid(Uuid::from_u128(91_046));
-        assert!(wrong_batch
-            .author_part(author, &transaction, evidence)
-            .is_err());
-        assert!(wrong_batch
-            .author_part(detached_author(evidence, 91_045), &transaction, evidence)
-            .is_err());
-        assert!(wrong_batch.finish().is_err());
-
-        let wrong_ordinal_evidence = detached_evidence(
-            ImportId::from_digest([0x44; 32]),
-            1,
-            2,
-            Some(BootstrapPartId::from_digest([0x55; 32])),
-            transaction.operations.len() as u32,
-        );
-        let mut wrong_ordinal = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        assert!(wrong_ordinal
-            .author_part(
-                detached_author(wrong_ordinal_evidence, 91_045),
-                &transaction,
-                wrong_ordinal_evidence,
-            )
-            .is_err());
-
-        let oversized = OperationTransaction {
-            operations: vec![
-                SemanticOperation::EditBlockContent {
-                    block: BlockLocation {
-                        block_id: block,
-                        home_document_id: home,
-                    },
-                    content: "oversized".into(),
-                };
-                MAX_OPERATIONS_PER_BOOTSTRAP_PART as usize + 1
-            ],
-        };
-        let oversized_evidence = detached_evidence(
-            ImportId::from_digest([0x45; 32]),
-            0,
-            1,
-            None,
-            MAX_OPERATIONS_PER_BOOTSTRAP_PART,
-        );
-        let mut oversized_session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        assert!(oversized_session
-            .author_part(
-                detached_author(oversized_evidence, 91_045),
-                &oversized,
-                oversized_evidence,
-            )
-            .is_err());
-
-        let mut invalid_session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        assert!(invalid_session
-            .author_part(detached_author(evidence, 0), &transaction, evidence)
-            .is_err());
-    }
-
-    #[test]
-    fn detached_bootstrap_rejects_wrong_predecessor_and_replay() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_050));
-        let lineage = LineageDigest::of(b"detached-bootstrap-continuity");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_051));
-        let page = PageId::from_uuid(Uuid::from_u128(91_052));
-        let home = DocumentId::from_uuid(Uuid::from_u128(91_053));
-        let block = BlockId::from_uuid(Uuid::from_u128(91_054));
-        let import_id = ImportId::from_digest([0x46; 32]);
-        let first_transaction =
-            create_page_with_block(page, home, block, "Continuity", "pages/continuity.md");
-        let first = detached_evidence(
-            import_id,
-            0,
-            2,
-            None,
-            first_transaction.operations.len() as u32,
-        );
-        let second_transaction =
-            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                block: BlockLocation {
-                    block_id: block,
-                    home_document_id: home,
-                },
-                content: "second".into(),
-            }])
-            .unwrap();
-        let wrong_second = detached_evidence(
-            import_id,
-            1,
-            2,
-            Some(BootstrapPartId::from_digest([0x66; 32])),
-            1,
-        );
-
-        let durable = TemporaryBootstrapCatalog::create(workspace, "wrong-predecessor");
-        let new_session = || {
-            DetachedBootstrapAuthoringSession::new(
-                workspace,
-                lineage,
-                catalog,
-                ReferenceCatalogPolicyV1::default(),
-                durable.capability(),
-            )
-            .unwrap()
-        };
-        let mut predecessor = new_session();
-        predecessor
-            .author_part(detached_author(first, 91_055), &first_transaction, first)
-            .unwrap();
-        assert!(predecessor
-            .author_part(
-                detached_author(wrong_second, 91_055),
-                &second_transaction,
-                wrong_second,
-            )
-            .is_err());
-
-        let mut replay = new_session();
-        replay
-            .author_part(detached_author(first, 91_055), &first_transaction, first)
-            .unwrap();
-        assert!(replay
-            .author_part(detached_author(first, 91_055), &first_transaction, first,)
-            .is_err());
-    }
-
-    #[test]
-    fn detached_bootstrap_retains_no_prior_prepared_payloads_or_live_capabilities() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_060));
-        let lineage = LineageDigest::of(b"detached-bootstrap-retention");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_061));
-        let import_id = ImportId::from_digest([0x47; 32]);
-        let durable = TemporaryBootstrapCatalog::create(workspace, "retention");
-        let mut session = DetachedBootstrapAuthoringSession::new(
-            workspace,
-            lineage,
-            catalog,
-            ReferenceCatalogPolicyV1::default(),
-            durable.capability(),
-        )
-        .unwrap();
-        let mut predecessor = None;
-        for ordinal in 0..3 {
-            let page = PageId::from_uuid(Uuid::from_u128(91_100 + u128::from(ordinal)));
-            let home = DocumentId::from_uuid(Uuid::from_u128(91_200 + u128::from(ordinal)));
-            let block = BlockId::from_uuid(Uuid::from_u128(91_300 + u128::from(ordinal)));
-            let transaction = create_page_with_block(
-                page,
-                home,
-                block,
-                &format!("Retained {ordinal}"),
-                &format!("pages/retained-{ordinal}.md"),
-            );
-            let evidence = detached_evidence(
-                import_id,
-                ordinal,
-                3,
-                predecessor,
-                transaction.operations.len() as u32,
-            );
-            session
-                .author_part(detached_author(evidence, 91_062), &transaction, evidence)
-                .unwrap();
-            predecessor = Some(evidence.part_id());
-            let candidate = session.candidate.as_ref().unwrap();
-            assert!(
-                candidate.archive.is_empty(),
-                "accepted PreparedBatch objects must be released after each part"
-            );
-            assert_eq!(
-                candidate.detached_accepted_manifests.len(),
-                ordinal as usize + 1
-            );
-        }
-        let completed = session.finish().unwrap();
-        let engine = &completed.engine;
-        assert!(engine.archive.is_empty());
-        assert!(engine.archive_store.is_none());
-        assert!(engine.history_store.is_none());
-        assert!(engine.projection_endpoint.is_none());
-        let scratch_root = completed
-            .scratch_root
-            .as_ref()
-            .expect("ordinary detached authoring owns its private scratch root");
-        for forbidden in [
-            "archive",
-            "history",
-            "projection",
-            "engine-history.head",
-            "objects",
-            "manifests",
-        ] {
-            assert!(
-                scratch_root.root.symlink_metadata(forbidden).is_err(),
-                "detached authoring created forbidden live/durable path {forbidden}"
-            );
-        }
-        let parent = scratch_root.parent.try_clone().unwrap();
-        let root_name = scratch_root.name.clone();
-        drop(completed);
-        assert!(
-            parent.symlink_metadata(&root_name).is_err(),
-            "detached scratch root survived candidate drop"
-        );
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -36068,7 +31355,7 @@ mod validation_tests {
     ) -> ShardedHotEngine {
         let archive_path = root.join(replica);
         let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        writer.publish_bootstrap_prepared_for_test(base).unwrap();
+        writer.publish_prepared(base).unwrap();
         let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
             lineage,
@@ -36246,7 +31533,7 @@ mod validation_tests {
             },
         ]);
         let prepared = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(93_012, 93_012),
                 &OperationTransaction::new(operations).unwrap(),
             )
@@ -36259,7 +31546,7 @@ mod validation_tests {
         ));
 
         let root = engine.accepted_frontier_root().unwrap();
-        let materializer = engine.bootstrap_bulk_materializer(&root).unwrap();
+        let materializer = engine.clean_projection_bulk_materializer(&root).unwrap();
         let mut bulk = materializer
             .materialize_pages_for_projection(&[local_page])
             .unwrap()
@@ -36274,7 +31561,7 @@ mod validation_tests {
         assert_eq!(materializer.exact_document_loads(), 2);
         assert_eq!(
             materializer.projection_claim_resolution_stats(),
-            BootstrapProjectionClaimResolutionStats {
+            CleanProjectionClaimResolutionStats {
                 exact_root_resolutions: 2,
                 fallback_resolutions: 1,
             }
@@ -36291,7 +31578,7 @@ mod validation_tests {
         assert_eq!(materializer.exact_document_loads(), 3);
         assert_eq!(
             materializer.projection_claim_resolution_stats(),
-            BootstrapProjectionClaimResolutionStats {
+            CleanProjectionClaimResolutionStats {
                 exact_root_resolutions: 4,
                 fallback_resolutions: 2,
             }
@@ -36390,7 +31677,7 @@ mod validation_tests {
             )
             .unwrap();
 
-        let materializer = engine.bootstrap_bulk_materializer(&r1).unwrap();
+        let materializer = engine.clean_projection_bulk_materializer(&r1).unwrap();
         assert!(!materializer.current_claim_root_proven);
         let mut historical_page = materializer
             .materialize_pages(&[reference_page])
@@ -36438,7 +31725,7 @@ mod validation_tests {
         );
         assert_eq!(
             materializer.projection_claim_resolution_stats(),
-            BootstrapProjectionClaimResolutionStats {
+            CleanProjectionClaimResolutionStats {
                 exact_root_resolutions: 0,
                 fallback_resolutions: 1,
             }
@@ -36483,7 +31770,7 @@ mod validation_tests {
         );
         let genesis = ValidatedBatch::new(
             engine
-                .prepare_bootstrap_transaction(
+                .prepare_fixture_transaction(
                     test_author(93_109, 93_109),
                     &OperationTransaction::new(operations).unwrap(),
                 )
@@ -36499,7 +31786,7 @@ mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
         let left = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(93_110, 93_110),
                 &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
@@ -36514,7 +31801,7 @@ mod validation_tests {
             )
             .unwrap();
         let right = concurrent
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(93_111, 93_111),
                 &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
@@ -36545,7 +31832,7 @@ mod validation_tests {
             }) if logseq_uuid == duplicate
         ));
         let root = engine.accepted_frontier_root().unwrap();
-        let materializer = engine.bootstrap_bulk_materializer(&root).unwrap();
+        let materializer = engine.clean_projection_bulk_materializer(&root).unwrap();
         assert!(matches!(
             materializer.materialize_pages_for_projection(&[page_a, page_b]),
             Err(EngineError::AmbiguousLogseqUuid {
@@ -36555,7 +31842,7 @@ mod validation_tests {
         ));
         assert_eq!(
             materializer.projection_claim_resolution_stats(),
-            BootstrapProjectionClaimResolutionStats {
+            CleanProjectionClaimResolutionStats {
                 exact_root_resolutions: 1,
                 fallback_resolutions: 0,
             }
@@ -36626,78 +31913,20 @@ mod validation_tests {
         transaction: OperationTransaction,
     ) -> BatchId {
         let prepared = engine
-            .prepare_bootstrap_transaction(
-                test_author(author_seed, author_seed as u64),
-                &transaction,
-            )
+            .prepare_fixture_transaction(test_author(author_seed, author_seed as u64), &transaction)
             .unwrap();
         let batch_id = prepared.manifest().batch_id();
         engine
             .archive_store
             .as_ref()
             .unwrap()
-            .publish_bootstrap_prepared_for_test(&prepared)
+            .publish_prepared(&prepared)
             .unwrap();
         assert!(matches!(
             engine.stage_archive_batch(batch_id).unwrap().disposition(),
             BatchDisposition::Accepted { .. }
         ));
         batch_id
-    }
-
-    #[test]
-    fn bootstrap_archive_fixture_requires_test_injector_and_stages_with_bootstrap_semantics() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x51_000));
-        let lineage = LineageDigest::of(b"bootstrap-archive-fixture-injector");
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(0x51_001));
-        let page = PageId::from_uuid(Uuid::from_u128(0x51_002));
-        let root =
-            std::env::temp_dir().join(format!("tine-bootstrap-archive-fixture-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let prepared = ShardedHotEngine::new(workspace, lineage, catalog)
-            .prepare_bootstrap_transaction(
-                test_author(0x51_003, 0x51_003),
-                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                    page_id: page,
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0x51_004)),
-                    name: LogicalPageName::parse("Bootstrap Fixture").unwrap(),
-                    path: ManagedPath::parse("pages/bootstrap-fixture.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                }])
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(prepared.manifest().origin(), BatchOrigin::BootstrapImport);
-        assert!(matches!(
-            writer.publish_prepared(&prepared),
-            Err(super::super::object_store::StoreError::BootstrapBatchRequiresDirectPublication)
-        ));
-        assert!(writer.committed_manifests().unwrap().is_empty());
-
-        writer
-            .publish_bootstrap_prepared_for_test(&prepared)
-            .unwrap();
-        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        assert!(matches!(
-            engine
-                .stage_archive_batch(prepared.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
-        assert_eq!(
-            engine.materialize_page(page).unwrap().name.as_str(),
-            "Bootstrap Fixture"
-        );
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
     }
 
     fn cursor_fixture(
@@ -37151,7 +32380,7 @@ mod validation_tests {
             catalog,
         );
         let create = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(68_004, 68_004),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id,
@@ -37924,7 +33153,7 @@ mod validation_tests {
         let author = test_author(106, 106);
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let original = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 author,
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page_a,
@@ -37938,7 +33167,7 @@ mod validation_tests {
             .unwrap();
         let foreign_engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let foreign = foreign_engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 author,
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page_b,
@@ -37999,7 +33228,7 @@ mod validation_tests {
         let author = test_author(115, 115);
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let _pending = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 author,
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page,
@@ -38013,7 +33242,7 @@ mod validation_tests {
             .unwrap();
         let foreign_engine = ShardedHotEngine::new(foreign_workspace, lineage, catalog);
         let foreign = foreign_engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 author,
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(116)),
@@ -38057,7 +33286,7 @@ mod validation_tests {
         let block_id = BlockId::from_uuid(Uuid::from_u128(126));
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let genesis = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(127, 127),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -38082,7 +33311,7 @@ mod validation_tests {
         engine.stage_ready(genesis.clone());
 
         let local = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(128, 128),
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
@@ -38100,7 +33329,7 @@ mod validation_tests {
         let mut remote = ShardedHotEngine::new(workspace, lineage, catalog);
         remote.stage_ready(genesis);
         let remote_claim = remote
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(129, 129),
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
@@ -38155,7 +33384,7 @@ mod validation_tests {
         let home = DocumentId::from_uuid(Uuid::from_u128(143));
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let prepared = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(144, 144),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page,
@@ -38168,7 +33397,7 @@ mod validation_tests {
             )
             .unwrap();
         assert!(matches!(
-            engine.prepare_bootstrap_transaction(
+            engine.prepare_fixture_transaction(
                 test_author(145, 0),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(146)),
@@ -38196,7 +33425,7 @@ mod validation_tests {
         );
 
         let edited = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(148, 148),
                 &OperationTransaction::new(vec![SemanticOperation::EditPagePath {
                     page_id: page,
@@ -38252,7 +33481,7 @@ mod validation_tests {
         let home_b = DocumentId::from_uuid(Uuid::from_u128(155));
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let first = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(156, 156),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page_a,
@@ -38265,7 +33494,7 @@ mod validation_tests {
             )
             .unwrap();
         let second = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(157, 157),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page_b,
@@ -38516,7 +33745,7 @@ mod validation_tests {
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"mixed-fast-path"), catalog_id);
         let genesis = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(91_510, 1),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -38846,7 +34075,7 @@ mod validation_tests {
         // immutable-home evidence behind. The same identities remain valid for
         // a later coherent batch.
         let coherent = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(54, 54),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -38977,7 +34206,7 @@ mod validation_tests {
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"identity"), catalog_id);
         let genesis = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(200, 200),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page_a,
@@ -39043,7 +34272,7 @@ mod validation_tests {
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"merged-residue"), catalog_id);
         let genesis = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(400, 400),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -39219,7 +34448,7 @@ mod validation_tests {
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog_id);
         let genesis = ValidatedBatch::new(
             engine
-                .prepare_bootstrap_transaction(
+                .prepare_fixture_transaction(
                     test_author(600, 600),
                     &OperationTransaction::new(vec![
                         SemanticOperation::CreatePage {
@@ -39293,7 +34522,7 @@ mod validation_tests {
 
         for (home_document_id, page_id) in [(home_a, page_a), (home_b, page_b)] {
             assert!(matches!(
-                engine.prepare_bootstrap_transaction(
+                engine.prepare_fixture_transaction(
                     test_author(603, 603),
                     &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                         block: BlockLocation {
@@ -39364,7 +34593,7 @@ mod validation_tests {
             .unwrap()
             .is_none());
         let accepted_after_rollback = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(605, 605),
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
@@ -39514,7 +34743,7 @@ mod validation_tests {
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"cross-document"), catalog);
         let genesis = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(7_010, 710),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -39544,7 +34773,7 @@ mod validation_tests {
             .unwrap();
         engine.stage_ready(ValidatedBatch::new(genesis));
         let ancestor = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(7_011, 711),
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
@@ -39561,7 +34790,7 @@ mod validation_tests {
             .unwrap();
         engine.stage_ready(ValidatedBatch::new(ancestor));
         let atomic_parent = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(7_012, 712),
                 &OperationTransaction::new(vec![
                     SemanticOperation::EditBlockContent {
@@ -39588,7 +34817,7 @@ mod validation_tests {
         engine.stage_ready(ValidatedBatch::new(atomic_parent));
 
         let authored_descendant = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(7_014, 714),
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
@@ -39722,7 +34951,7 @@ mod validation_tests {
             };
             let prepare_before = engine.instrumentation();
             let prepared = engine
-                .prepare_bootstrap_transaction(
+                .prepare_fixture_transaction(
                     // A device keeps one stable Loro peer for its sequential
                     // edits. Peer cardinality is a separate legitimate
                     // frontier dimension and is not page-history growth.
@@ -39769,9 +34998,7 @@ mod validation_tests {
             if index >= BATCHES - 16 {
                 late_manifest_sizes.push(manifest_size);
             }
-            writer
-                .publish_bootstrap_prepared_for_test(&prepared)
-                .unwrap();
+            writer.publish_prepared(&prepared).unwrap();
             let work_before = engine.history_work.get();
             let stage_before = engine.instrumentation();
             assert!(matches!(
@@ -40164,7 +35391,7 @@ mod validation_tests {
             "each bootstrap chunk must reuse the catalog proof established once at materializer construction"
         );
         let bootstrap_constructor = function(
-            "bootstrap_bulk_materializer_with_lookup_budget",
+            "clean_projection_bulk_materializer_with_lookup_budget",
             "materialize_page_at_accepted_root",
         );
         assert!(
@@ -40263,7 +35490,7 @@ mod validation_tests {
         let mut intra_engine = ShardedHotEngine::new(workspace, lineage, catalog);
 
         let intra_batch = intra_engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_310, 8_310),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -40301,7 +35528,7 @@ mod validation_tests {
 
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let first = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_320, 8_320),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(8_321)),
@@ -40320,7 +35547,7 @@ mod validation_tests {
         assert_eq!(engine.ephemeral_page_names.record_count(), 1);
         let prior_page_names = engine.ephemeral_page_names.clone();
         let duplicate = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_323, 8_323),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(8_324)),
@@ -40352,7 +35579,7 @@ mod validation_tests {
         let left_author = ShardedHotEngine::new(workspace, lineage, catalog);
         let right_author = ShardedHotEngine::new(workspace, lineage, catalog);
         let left = left_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_410, 8_410),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(8_411)),
@@ -40365,7 +35592,7 @@ mod validation_tests {
             )
             .unwrap();
         let right = right_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_420, 8_420),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(8_421)),
@@ -40407,217 +35634,6 @@ mod validation_tests {
     }
 
     #[test]
-    fn store_backed_page_name_candidate_tracks_names_not_paths_and_requires_exact_checkpoint() {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(8_500));
-        let catalog = DocumentId::from_uuid(Uuid::from_u128(8_501));
-        let first_page = PageId::from_uuid(Uuid::from_u128(8_502));
-        let second_page = PageId::from_uuid(Uuid::from_u128(8_503));
-        let first_home = DocumentId::from_uuid(Uuid::from_u128(8_504));
-        let second_home = DocumentId::from_uuid(Uuid::from_u128(8_505));
-        let lineage = LineageDigest::of(b"page-name-acceptance-seam");
-        let root =
-            std::env::temp_dir().join(format!("tine-oplog-page-name-seam-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let archive_path = root.join("archive");
-        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
-        let reader = ObjectStore::open(&archive_path, workspace).unwrap();
-        let mut engine =
-            ShardedHotEngine::with_clean_archive_store_for_test(reader, lineage, catalog);
-
-        let publish = |engine: &mut ShardedHotEngine,
-                       author: AuthorBatch,
-                       operations: Vec<SemanticOperation>| {
-            let prepared = engine
-                .prepare_bootstrap_transaction(
-                    author,
-                    &OperationTransaction::new(operations).unwrap(),
-                )
-                .unwrap();
-            writer
-                .publish_bootstrap_prepared_for_test(&prepared)
-                .unwrap();
-            assert!(matches!(
-                engine
-                    .stage_archive_batch(prepared.manifest().batch_id())
-                    .unwrap()
-                    .disposition(),
-                BatchDisposition::Accepted { .. }
-            ));
-        };
-
-        publish(
-            &mut engine,
-            test_author(8_510, 8_510),
-            vec![SemanticOperation::CreatePage {
-                page_id: first_page,
-                home_document_id: first_home,
-                name: LogicalPageName::parse("Original Name").unwrap(),
-                path: ManagedPath::parse("pages/original.md").unwrap(),
-                kind: ManagedTextKind::Page,
-            }],
-        );
-        let created_name_root = engine.page_name_index_root().unwrap().clone();
-        let created_path_root = engine.portable_path_index_root().unwrap();
-        assert_eq!(created_name_root.entry_count(), 1);
-
-        publish(
-            &mut engine,
-            test_author(8_511, 8_510),
-            vec![SemanticOperation::EditPagePath {
-                page_id: first_page,
-                path: ManagedPath::parse("deep/physical/move.md").unwrap(),
-            }],
-        );
-        assert_eq!(engine.page_name_index_root().unwrap(), &created_name_root);
-        assert_ne!(
-            engine.portable_path_index_root().unwrap(),
-            created_path_root
-        );
-        let moved_path_root = engine.portable_path_index_root().unwrap();
-
-        publish(
-            &mut engine,
-            test_author(8_512, 8_510),
-            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
-                page_changes: vec![PageRename {
-                    page_id: first_page,
-                    new_name: LogicalPageName::parse("Renamed").unwrap(),
-                    new_path: ManagedPath::parse("deep/physical/move.md").unwrap(),
-                }],
-                block_rewrites: Vec::new(),
-                page_preamble_rewrites: Vec::new(),
-            }],
-        );
-        assert_ne!(engine.page_name_index_root().unwrap(), &created_name_root);
-        assert_eq!(engine.portable_path_index_root().unwrap(), moved_path_root);
-        let renamed_key = LogicalPageName::parse("Renamed").unwrap().key_digest();
-        assert_eq!(
-            engine
-                .page_name_index
-                .as_ref()
-                .unwrap()
-                .lookup(engine.page_name_index_root().unwrap(), renamed_key)
-                .unwrap()
-                .unwrap()
-                .occupied()
-                .unwrap()
-                .page_id(),
-            first_page
-        );
-
-        publish(
-            &mut engine,
-            test_author(8_513, 8_510),
-            vec![SemanticOperation::DeletePage {
-                page_id: first_page,
-            }],
-        );
-        publish(
-            &mut engine,
-            test_author(8_514, 8_510),
-            vec![SemanticOperation::CreatePage {
-                page_id: second_page,
-                home_document_id: second_home,
-                name: LogicalPageName::parse("Renamed").unwrap(),
-                path: ManagedPath::parse("pages/reused.md").unwrap(),
-                kind: ManagedTextKind::Page,
-            }],
-        );
-        assert_eq!(
-            engine
-                .page_name_index
-                .as_ref()
-                .unwrap()
-                .lookup(engine.page_name_index_root().unwrap(), renamed_key)
-                .unwrap()
-                .unwrap()
-                .occupied()
-                .unwrap()
-                .page_id(),
-            second_page
-        );
-
-        let authoritative_root = engine.page_name_index_root().unwrap().clone();
-        let carried = engine
-            .prepare_bootstrap_transaction(
-                test_author(8_515, 8_510),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::RenamePagesAndRewriteReferrers {
-                        page_changes: vec![PageRename {
-                            page_id: second_page,
-                            new_name: LogicalPageName::parse("Carried Proof Tamper").unwrap(),
-                            new_path: ManagedPath::parse("pages/reused.md").unwrap(),
-                        }],
-                        block_rewrites: Vec::new(),
-                        page_preamble_rewrites: Vec::new(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&carried)
-            .unwrap();
-        let exact_root = engine.scratch_roots.external_document_state_root.clone();
-        engine.scratch_roots.external_document_state_root = Default::default();
-        engine
-            .catalog_checkpoint_loads
-            .set(CatalogCheckpointLoadStats::default());
-        let tampered = engine
-            .stage_archive_batch(carried.manifest().batch_id())
-            .unwrap();
-        assert!(matches!(
-            tampered.disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Archive(_),
-            }
-        ));
-        assert_eq!(
-            engine.catalog_checkpoint_loads.get(),
-            CatalogCheckpointLoadStats {
-                authenticated_exact: 1,
-                current: 0,
-            }
-        );
-        let refused = engine
-            .prepare_bootstrap_transaction(
-                test_author(8_516, 8_510),
-                &OperationTransaction::new(vec![
-                    SemanticOperation::RenamePagesAndRewriteReferrers {
-                        page_changes: vec![PageRename {
-                            page_id: second_page,
-                            new_name: LogicalPageName::parse("Must Not Mint").unwrap(),
-                            new_path: ManagedPath::parse("pages/reused.md").unwrap(),
-                        }],
-                        block_rewrites: Vec::new(),
-                        page_preamble_rewrites: Vec::new(),
-                    },
-                ])
-                .unwrap(),
-            )
-            .unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&refused)
-            .unwrap();
-        assert!(matches!(
-            engine
-                .stage_archive_batch(refused.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Archive(_),
-            }
-        ));
-        assert_eq!(engine.page_name_root, authoritative_root);
-        assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
-        engine.scratch_roots.external_document_state_root = exact_root;
-
-        drop(engine);
-        drop(writer);
-        crate::test_support::remove_dir_all(root);
-    }
-
-    #[test]
     fn concurrent_page_name_claims_quarantine_identically_in_both_delivery_orders() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(8_600));
         let catalog = DocumentId::from_uuid(Uuid::from_u128(8_601));
@@ -40640,7 +35656,7 @@ mod validation_tests {
             catalog,
         );
         let base = base_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_610, 8_610),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: seed_page,
@@ -40652,7 +35668,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
+        writer.publish_prepared(&base).unwrap();
         assert!(matches!(
             base_author
                 .stage_archive_batch(base.manifest().batch_id())
@@ -40664,7 +35680,7 @@ mod validation_tests {
         let right_author =
             independent_archive_author(&root, "right-author", workspace, lineage, catalog, &base);
         let left = base_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_611, 8_611),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: left_page,
@@ -40677,7 +35693,7 @@ mod validation_tests {
             )
             .unwrap();
         let right = right_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(8_612, 8_612),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: right_page,
@@ -40689,8 +35705,8 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
+        writer.publish_prepared(&left).unwrap();
+        writer.publish_prepared(&right).unwrap();
 
         let deliver = |first: BatchId, second: BatchId| {
             let mut receiver = ShardedHotEngine::with_clean_archive_store_for_test(
@@ -40788,7 +35804,7 @@ mod validation_tests {
             catalog,
         );
         let base = left_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(87_005, 87_005),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(87_006)),
@@ -40800,7 +35816,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
+        writer.publish_prepared(&base).unwrap();
         assert!(matches!(
             left_author
                 .stage_archive_batch(base.manifest().batch_id())
@@ -40811,7 +35827,7 @@ mod validation_tests {
         let right_author =
             independent_archive_author(&root, "right-author", workspace, lineage, catalog, &base);
         let left = left_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(87_010, 87_010),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(87_011)),
@@ -40824,7 +35840,7 @@ mod validation_tests {
             )
             .unwrap();
         let right = right_author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(87_020, 87_020),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(87_021)),
@@ -40836,8 +35852,8 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
-        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
+        writer.publish_prepared(&left).unwrap();
+        writer.publish_prepared(&right).unwrap();
 
         let mut receiver = ShardedHotEngine::with_clean_archive_store_for_test(
             ObjectStore::open(&archive_path, workspace).unwrap(),
@@ -40946,7 +35962,7 @@ mod validation_tests {
             home_document_id: home,
         };
         let base = author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(98_010, 98_010),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -40967,12 +35983,12 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
+        writer.publish_prepared(&base).unwrap();
         author
             .stage_archive_batch(base.manifest().batch_id())
             .unwrap();
         let parent = author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(98_020, 98_020),
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block,
@@ -40981,14 +35997,14 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
+        writer.publish_prepared(&parent).unwrap();
         author
             .stage_archive_batch(parent.manifest().batch_id())
             .unwrap();
         let mut children = Vec::new();
         for index in 0..CHILDREN {
             let prepared = author
-                .prepare_bootstrap_transaction(
+                .prepare_fixture_transaction(
                     test_author(98_100 + index as u128, 98_100 + index as u64),
                     &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                         block,
@@ -40997,9 +36013,7 @@ mod validation_tests {
                     .unwrap(),
                 )
                 .unwrap();
-            writer
-                .publish_bootstrap_prepared_for_test(&prepared)
-                .unwrap();
+            writer.publish_prepared(&prepared).unwrap();
             children.push(prepared.manifest().batch_id());
         }
 
@@ -41146,7 +36160,7 @@ mod validation_tests {
             ShardedHotEngine::with_clean_archive_store_for_test(reader, lineage, catalog);
 
         let baseline = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(88_100, 1),
                 &OperationTransaction::new(vec![
                     SemanticOperation::CreatePage {
@@ -41170,9 +36184,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&baseline)
-            .unwrap();
+        writer.publish_prepared(&baseline).unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(baseline.manifest().batch_id())
@@ -41212,14 +36224,12 @@ mod validation_tests {
             });
         }
         let rejected = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(88_101, 2),
                 &OperationTransaction::new(operations).unwrap(),
             )
             .unwrap();
-        writer
-            .publish_bootstrap_prepared_for_test(&rejected)
-            .unwrap();
+        writer.publish_prepared(&rejected).unwrap();
         engine.external_publication_failure_index = Some(1);
         let outcome = engine
             .stage_archive_batch(rejected.manifest().batch_id())
@@ -41294,7 +36304,7 @@ mod validation_tests {
 
         let mut author = ShardedHotEngine::new(workspace, lineage, catalog);
         let genesis = author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(97_610, 97_610),
                 &OperationTransaction::new(vec![SemanticOperation::CreatePage {
                     page_id: page,
@@ -41312,7 +36322,7 @@ mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
         let first = author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(97_620, 97_620),
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
@@ -41334,7 +36344,7 @@ mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
         let second = author
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 test_author(97_630, 97_630),
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
@@ -41447,14 +36457,12 @@ mod validation_tests {
                 }
             }
             let prepared = engine
-                .prepare_bootstrap_transaction(
+                .prepare_fixture_transaction(
                     author,
                     &OperationTransaction::new(operations).unwrap(),
                 )
                 .unwrap();
-            writer
-                .publish_bootstrap_prepared_for_test(&prepared)
-                .unwrap();
+            writer.publish_prepared(&prepared).unwrap();
             assert!(matches!(
                 engine
                     .stage_archive_batch(author.batch_id)
@@ -41722,7 +36730,7 @@ mod validation_tests {
         for forbidden in [
             "SemanticOperation",
             "OperationTransaction",
-            "prepare_bootstrap_transaction",
+            "prepare_fixture_transaction",
             "AcceptedBatchEvidence",
             "ProjectionReceipt",
         ] {
@@ -41872,14 +36880,12 @@ mod replay_benchmark {
                 }
             }
             let prepared = evolving
-                .prepare_bootstrap_transaction(
+                .prepare_fixture_transaction(
                     author,
                     &OperationTransaction::new(operations).unwrap(),
                 )
                 .unwrap();
-            writer
-                .publish_bootstrap_prepared_for_test(&prepared)
-                .unwrap();
+            writer.publish_prepared(&prepared).unwrap();
             assert!(matches!(
                 evolving
                     .stage_archive_batch(author.batch_id)
@@ -42180,7 +37186,7 @@ mod replay_benchmark {
             catalog,
         );
         let prepared = engine
-            .prepare_bootstrap_transaction(
+            .prepare_fixture_transaction(
                 AuthorBatch {
                     batch_id: BatchId::from_uuid(Uuid::from_u128(969_010)),
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(969_011)),
@@ -42198,9 +37204,7 @@ mod replay_benchmark {
             )
             .unwrap();
         let batch_id = prepared.manifest().batch_id();
-        writer
-            .publish_bootstrap_prepared_for_test(&prepared)
-            .unwrap();
+        writer.publish_prepared(&prepared).unwrap();
         assert!(matches!(
             engine.stage_archive_batch(batch_id).unwrap().disposition(),
             BatchDisposition::Accepted { .. }

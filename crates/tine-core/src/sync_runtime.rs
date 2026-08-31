@@ -65,12 +65,10 @@ use crate::oplog::hot_engine::{AcceptedFrontierRoot, ShardedHotEngine};
 use crate::oplog::import::{
     commit_clean_activation, open_clean_activation_authority,
     open_or_rebuild_clean_genesis_projection, prepare_clean_activation,
-    BootstrapPreparationProgress, BootstrapPreparationSubphase, BootstrapPreparationSummary,
 };
 #[cfg(test)]
 use crate::oplog::import::{
     BootstrapStreamingImportInstrumentation, CleanActivationInstrumentation,
-    InactiveBootstrapOrchestrationInstrumentation,
 };
 use crate::oplog::lazy_genesis::{
     publish_clean_shared_state, read_activation_marker, read_clean_shared_state,
@@ -118,7 +116,7 @@ use crate::oplog::projection_turn_journal::{
 use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, reset_projection_open_test_observation,
     take_full_digest_scan_instrumentation, take_projection_open_test_observation,
-    BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
+    CleanProjectionRebuildInstrumentation, FullDigestScanInstrumentation,
     ProjectionOpenTestObservation,
 };
 use crate::oplog::sqlite::{
@@ -1360,48 +1358,11 @@ pub enum SyncLocalActivationPhase {
     RetainedRuntimeActorOpen,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncBootstrapPreparationSubphase {
-    SourceProtocol,
-    OperationSpool,
-    Partition,
-    DetachedAuthoring,
-    Sealing,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SyncBootstrapPreparationSummary {
-    pub source_files: u64,
-    pub source_bytes: u64,
-    pub parser_nodes: u64,
-    pub operations: u64,
-    pub parts: u32,
-    pub prepared_bytes: u64,
-    pub operation_builder_retained_bytes: u64,
-    pub operation_builder_spilled: bool,
-    pub source_protocol_micros: u64,
-    pub operation_spool_micros: u64,
-    pub partition_micros: u64,
-    pub detached_authoring_micros: u64,
-    pub sealing_micros: u64,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SyncLocalActivationProgress {
     Phase {
         phase: SyncLocalActivationPhase,
-    },
-    BootstrapPreparationSubphase {
-        subphase: SyncBootstrapPreparationSubphase,
-    },
-    BootstrapDetachedAuthoring {
-        completed: u32,
-        total: u32,
-    },
-    BootstrapPreparationSummary {
-        summary: SyncBootstrapPreparationSummary,
     },
     /// Source-capture metadata retained for the application readiness proof.
     /// It is emitted from the already-built activation record and therefore
@@ -1415,89 +1376,10 @@ impl SyncLocalActivationProgress {
     pub fn diagnostic_name(&self) -> String {
         match self {
             Self::Phase { phase } => phase.diagnostic_name().into(),
-            Self::BootstrapPreparationSubphase { subphase } => format!(
-                "bootstrap preparation: {}",
-                match subphase {
-                    SyncBootstrapPreparationSubphase::SourceProtocol => "source protocol",
-                    SyncBootstrapPreparationSubphase::OperationSpool => "semantic lowering",
-                    SyncBootstrapPreparationSubphase::Partition => "partition",
-                    SyncBootstrapPreparationSubphase::DetachedAuthoring => "detached authoring",
-                    SyncBootstrapPreparationSubphase::Sealing => "sealing",
-                }
-            ),
-            Self::BootstrapDetachedAuthoring { completed, total } => {
-                format!("bootstrap preparation: detached authoring {completed}/{total} parts")
-            }
-            Self::BootstrapPreparationSummary { summary } => format!(
-                "bootstrap preparation complete: source_files={}, source_bytes={}, parser_nodes={}, operations={}, parts={}, prepared_bytes={}, operation_builder_retained_bytes={}, operation_builder_spilled={}, durations_us=source_protocol:{},semantic_lowering:{},partition:{},detached_authoring:{},sealing:{}",
-                summary.source_files,
-                summary.source_bytes,
-                summary.parser_nodes,
-                summary.operations,
-                summary.parts,
-                summary.prepared_bytes,
-                summary.operation_builder_retained_bytes,
-                summary.operation_builder_spilled,
-                summary.source_protocol_micros,
-                summary.operation_spool_micros,
-                summary.partition_micros,
-                summary.detached_authoring_micros,
-                summary.sealing_micros,
-            ),
             Self::ReadinessSample { largest_page_path } => format!(
                 "readiness sample selected: largest_page_path={}",
                 largest_page_path.as_deref().unwrap_or("none")
             ),
-        }
-    }
-}
-
-impl From<BootstrapPreparationSubphase> for SyncBootstrapPreparationSubphase {
-    fn from(subphase: BootstrapPreparationSubphase) -> Self {
-        match subphase {
-            BootstrapPreparationSubphase::SourceProtocol => Self::SourceProtocol,
-            BootstrapPreparationSubphase::OperationSpool => Self::OperationSpool,
-            BootstrapPreparationSubphase::Partition => Self::Partition,
-            BootstrapPreparationSubphase::DetachedAuthoring => Self::DetachedAuthoring,
-            BootstrapPreparationSubphase::Sealing => Self::Sealing,
-        }
-    }
-}
-
-impl From<BootstrapPreparationSummary> for SyncBootstrapPreparationSummary {
-    fn from(summary: BootstrapPreparationSummary) -> Self {
-        Self {
-            source_files: summary.source_files,
-            source_bytes: summary.source_bytes,
-            parser_nodes: summary.parser_nodes,
-            operations: summary.operations,
-            parts: summary.parts,
-            prepared_bytes: summary.prepared_bytes,
-            operation_builder_retained_bytes: summary.operation_builder_retained_bytes,
-            operation_builder_spilled: summary.operation_builder_spilled,
-            source_protocol_micros: summary.source_protocol_micros,
-            operation_spool_micros: summary.operation_spool_micros,
-            partition_micros: summary.partition_micros,
-            detached_authoring_micros: summary.detached_authoring_micros,
-            sealing_micros: summary.sealing_micros,
-        }
-    }
-}
-
-impl From<BootstrapPreparationProgress> for SyncLocalActivationProgress {
-    fn from(progress: BootstrapPreparationProgress) -> Self {
-        match progress {
-            BootstrapPreparationProgress::Subphase(subphase) => {
-                Self::BootstrapPreparationSubphase {
-                    subphase: subphase.into(),
-                }
-            }
-            BootstrapPreparationProgress::DetachedAuthoring { completed, total } => {
-                Self::BootstrapDetachedAuthoring { completed, total }
-            }
-            BootstrapPreparationProgress::Summary(summary) => Self::BootstrapPreparationSummary {
-                summary: summary.into(),
-            },
         }
     }
 }
@@ -46217,48 +46099,6 @@ mod tests {
             observed <= ceiling,
             "scaled activation exceeded the near-linear normalized ceiling: small={small:?}, large={large:?}"
         );
-    }
-
-    #[test]
-    fn detailed_activation_progress_reports_preparation_parts_and_summary_observationally() {
-        let fixture = ActivationFixture::nested_unicode("detailed-progress", 0xa08f);
-        let before = user_graph_bytes(&fixture.graph_root);
-        let mut updates = Vec::new();
-        let activated = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
-            fixture.request.clone(),
-            |update| updates.push(update),
-        );
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
-
-        let phases = updates
-            .iter()
-            .filter_map(|update| match update {
-                SyncLocalActivationProgress::Phase { phase } => Some(*phase),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            phases,
-            vec![
-                SyncLocalActivationPhase::PrivateSetup,
-                SyncLocalActivationPhase::SourceCapture,
-                SyncLocalActivationPhase::BootstrapImportPreparation,
-                SyncLocalActivationPhase::ImmutablePublicationInstall,
-                SyncLocalActivationPhase::SqliteOpenBuild,
-                SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
-            ]
-        );
-        assert!(
-            !updates.iter().any(|update| matches!(
-                update,
-                SyncLocalActivationProgress::BootstrapPreparationSubphase { .. }
-                    | SyncLocalActivationProgress::BootstrapDetachedAuthoring { .. }
-                    | SyncLocalActivationProgress::BootstrapPreparationSummary { .. }
-            )),
-            "clean activation must not report the retired operation-spool, partition, detached-authoring, or sealing pipeline"
-        );
-        drop(activated.handle);
     }
 
     #[test]

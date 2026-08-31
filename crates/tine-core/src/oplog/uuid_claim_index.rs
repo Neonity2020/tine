@@ -1,3 +1,1 @@
-pub(crate) use super::content_patricia::{
-    PatriciaIndexRoot as LogseqClaimIndexRoot, PatriciaIndexStore as LogseqClaimIndexStore,
-};
+pub(crate) use tine_storage::PatriciaIndexRoot as LogseqClaimIndexRoot;
