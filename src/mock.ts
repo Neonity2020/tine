@@ -771,6 +771,7 @@ export function mockBackend(): Backend {
     },
     async bindCaptureGraph() {},
     async forgetKnownGraph() {},
+    async revealKnownGraph() {},
     async appPlatform(): Promise<"android" | "ios" | "desktop"> {
       const requested = new URLSearchParams(globalThis.location?.search ?? "").get("platform");
       if (requested === "android" || requested === "ios") return requested;

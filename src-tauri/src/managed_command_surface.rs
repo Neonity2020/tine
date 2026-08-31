@@ -218,6 +218,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("resolve_vcs_marker_conflict", LegacyOnly),
     ("restore_backup", LegacyOnly),
     ("retire_editor_activation", LegacyOnly),
+    ("reveal_known_graph", NoGraphSlot),
     ("run_advanced_query", ManagedRouted),
     ("run_graph_search", ManagedRouted),
     ("run_query", ManagedRouted),

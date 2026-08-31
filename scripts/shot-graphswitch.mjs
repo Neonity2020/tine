@@ -36,7 +36,10 @@ try {
 
   const name = await page.locator(".graph-switch-name").innerText();
   const before = await page.locator(".graph-switch-menu .ctx-item").count();
-  await page.locator(".sidebar-header").screenshot({ path: `${OUT}/graphswitch-closed.png` });
+  // The workspace switcher added a second .sidebar-header above this one, so the
+  // bare selector became ambiguous under Playwright's strict mode; the graph
+  // control is the lower of the two.
+  await page.locator(".sidebar-header").last().screenshot({ path: `${OUT}/graphswitch-closed.png` });
 
   await page.locator(".graph-switch-btn").click();
   await sleep(200);

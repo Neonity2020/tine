@@ -1025,6 +1025,9 @@ mod tests {
         assert!(page.markdown.contains("available page/tag chips"));
         assert!(page.markdown.contains("**Copy / export**"));
         assert!(page.markdown.contains("dotted underline"));
+        // A `file:` link does something on click (GH #444); say so, because
+        // nothing else in the app tells the reader which link forms are live.
+        assert!(page.markdown.contains("A `file:` link"));
         assert!(page.markdown.contains("alias:: Kitchen sink (features)"));
         assert!(page.markdown.contains("Save page"));
         assert!(page.markdown.contains("tine.view::"));
@@ -1128,6 +1131,10 @@ mod tests {
         assert!(page.markdown.contains("**t r**"));
         assert!(page.markdown.contains("**Shift+?**"));
         assert!(page.markdown.contains("Favorites can be arranged"));
+        // The graph switcher's per-row menu is the discoverable route to a
+        // second window; Shift-click alone is invisible to a new user.
+        assert!(page.markdown.contains("**Open in a new window**"));
+        assert!(page.markdown.contains("**Show in folder**"));
         assert!(page.markdown.contains("[[Welcome to Tine]]"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Features/Tips & shortcuts]]"));

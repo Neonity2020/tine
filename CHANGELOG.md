@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **The graph menu now has a right-click menu on every graph row.** Opening a
+  graph in a second window was reachable only by Shift-clicking a row, which
+  nothing announced. Right-clicking a row now offers **Open in a new window**
+  and **Open here**, plus **Show in folder**, **Copy path**, and **Remove from
+  this list**. The row for the graph this window already has open keeps both
+  open actions visible but inert and says why, so the menu does not change
+  shape from row to row; mobile, which has neither peer windows nor a file
+  manager, shows the actions that apply to it.
+
 - **PDFs are now ordinary pane tabs instead of a separate global side pane.**
   Opening a graph PDF on desktop preserves the source and uses one reusable
   companion pane; the PDF tab can be moved into any existing pane, split, or
@@ -50,6 +59,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   resource ceilings. (GH #393)
 
 ### Fixed
+
+- **Links to local files and folders now open.** A link written the Logseq way
+  (`[Test](file://D:\test.txt)`) or the Obsidian way
+  (`[Test](<file:///D:\test.txt>)`) rendered as a live link but did nothing at
+  all when clicked: the backend refused every scheme but http/https/mailto, and
+  the renderer discarded the refusal so nothing was reported either. `file:`
+  links now go to the OS default application for that file or folder, matching
+  Logseq, and any link that cannot be opened — a bad URL, a path that is no
+  longer there — says so instead of failing silently. Every other scheme stays
+  refused. (GH #444)
 
 - **Editing-toolbar buttons on mobile no longer depend on a WebView emitting a
   click.** On iOS 27 the toolbar appeared but nothing responded to taps, while

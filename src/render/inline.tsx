@@ -493,8 +493,8 @@ function renderLink(
           e.preventDefault();
           e.stopPropagation();
           const rel = assetLinkRel(dest);
-          if (rel !== null) void backend().openAsset(rel);
-          else void backend().openExternal(dest);
+          if (rel !== null) void backend().openAsset(rel).catch((error) => reportLinkOpenFailure(dest, error));
+          else void backend().openExternal(dest).catch((error) => reportLinkOpenFailure(dest, error));
         }}
       >
         <Show when={s.label && s.label.length} fallback={dest}>{renderInlines(s.label!, blockId, spanMode, macroExpansion, format)}</Show>
@@ -502,6 +502,15 @@ function renderLink(
       <CopyButton text={dest} title="Copy link" class="copy-inline" />
     </span>
   );
+}
+
+/** GH #444: a link that cannot be opened has to say so. Every one of these
+ *  paths used to discard the backend's rejection, so a refused scheme, a
+ *  missing file and a platform with no file manager all looked identical to a
+ *  dead link — which is exactly how the reported `file://` failure stayed
+ *  invisible for as long as it did. */
+export function reportLinkOpenFailure(dest: string, error: unknown): void {
+  pushToast(`Couldn't open ${dest}. (${String(error)})`, "error");
 }
 
 function pdfFilenameFromDest(dest: string): string {
@@ -993,8 +1002,8 @@ function MediaEmbed(props: {
   const open = (e: MouseEvent) => {
     e.stopPropagation();
     const r = rel();
-    if (r && !external) void backend().openAsset(r);
-    else void backend().openExternal(props.url);
+    if (r && !external) void backend().openAsset(r).catch((error) => reportLinkOpenFailure(props.url, error));
+    else void backend().openExternal(props.url).catch((error) => reportLinkOpenFailure(props.url, error));
   };
   let tryingBlobFallback = false;
   let blobLease: MediaBlobLease | null = null;

@@ -10,10 +10,12 @@ import {
   setGroupCollapsed,
 } from "../favoritesStore";
 import { itemKind, resolveDrop, visibleRows, type FavRow } from "../favoritesLayout";
-import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, advanceConflictCursor } from "../ui";
+import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, conflictQueue, advanceConflictCursor, openActionContextMenu, type ContextMenuAction } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
-import { backend } from "../backend";
+import { backend, type KnownGraph } from "../backend";
+import { writeClipboardText } from "../clipboard";
+import { isMobilePlatform } from "../nativeChrome";
 import { allPages as allGraphPages, pageListLabels } from "../pages";
 import { EmojiText } from "../render/emoji";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
@@ -523,6 +525,73 @@ export interface KnownGraphOpenDeps {
   openNewWindow(path: string): Promise<LoadGraphPathOutcome>;
 }
 
+export interface GraphRowMenuDeps {
+  openKnown(path: string, newWindow: boolean): Promise<LoadGraphPathOutcome>;
+  reveal(path: string): Promise<void>;
+  copyPath(text: string): Promise<void>;
+  forget(path: string): Promise<void>;
+  /** Peer windows and a file manager both exist only on desktop. */
+  desktop: boolean;
+  isCurrent: boolean;
+}
+
+/** Per-row actions for the graph switcher's right-click menu.
+ *
+ *  Built as a plain array so the menu's contents are testable without a DOM:
+ *  which items a row offers depends on the platform and on whether the row is
+ *  the graph this window already has open, and those are exactly the parts that
+ *  regress silently. Items that cannot act are kept visible and disabled with
+ *  the reason in the label (the `SheetTable` field-header menu does the same) —
+ *  hiding them would make the menu change shape row to row, and discoverability
+ *  is the entire point of this menu.
+ */
+export function graphRowMenuActions(
+  graph: KnownGraph,
+  deps: GraphRowMenuDeps,
+): ContextMenuAction[] {
+  const items: ContextMenuAction[] = [];
+  // Same self-retrying shape as the row's left click: a failed open puts a
+  // sticky Retry toast up that re-runs this exact target, not the last one.
+  const open = (newWindow: boolean) => {
+    const attempt = () => void deps.openKnown(graph.path, newWindow)
+      .catch((error) => reportGraphOpenFailure(error, attempt));
+    attempt();
+  };
+  if (deps.desktop) {
+    items.push({
+      label: deps.isCurrent
+        ? "Open in a new window (already open here)"
+        : "Open in a new window",
+      disabled: deps.isCurrent,
+      run: () => open(true),
+    });
+  }
+  items.push({
+    label: deps.isCurrent ? "Open here (current graph)" : "Open here",
+    disabled: deps.isCurrent,
+    run: () => open(false),
+  });
+  if (deps.desktop) {
+    items.push({
+      label: "Show in folder",
+      run: () => void deps.reveal(graph.path).catch((error) =>
+        pushToast(`Couldn't show the graph folder. (${String(error)})`, "error")),
+    });
+  }
+  items.push({
+    label: "Copy path",
+    run: () => void deps.copyPath(graph.path).catch((error) =>
+      pushToast(`Couldn't copy the path. (${String(error)})`, "error")),
+  });
+  items.push({
+    label: "Remove from this list",
+    danger: true,
+    run: () => void deps.forget(graph.path).catch((error) =>
+      pushToast(`Couldn't remove graph. (${String(error)})`, "error")),
+  });
+  return items;
+}
+
 export function openKnownGraph(
   path: string,
   newWindow: boolean,
@@ -597,6 +666,22 @@ export function GraphSwitcher(props: {
                 class="ctx-item graph-switch-row"
                 classList={{ active: graph.path === graphMeta()?.root }}
                 title={graph.path}
+                onContextMenu={(event) => {
+                  // Local suppression: nothing disables WebKit's own menu
+                  // globally, so without this the native menu appears next to
+                  // ours. stopPropagation keeps the switcher's backdrop handler
+                  // (which closes the switcher) from firing underneath.
+                  event.preventDefault();
+                  event.stopPropagation();
+                  openActionContextMenu(event.clientX, event.clientY, graphRowMenuActions(graph, {
+                    openKnown: props.actions.openKnown,
+                    reveal: (path) => backend().revealKnownGraph(path),
+                    copyPath: writeClipboardText,
+                    forget: (path) => backend().forgetKnownGraph(path).then(() => { void refetch(); }),
+                    desktop: !isMobilePlatform,
+                    isCurrent: graph.path === graphMeta()?.root,
+                  }));
+                }}
                 onClick={(event) => {
                   const newWindow = event.shiftKey;
                   close();

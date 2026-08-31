@@ -234,6 +234,8 @@ export interface Backend {
   bindCaptureGraph(): Promise<void>;
   listKnownGraphs(): Promise<KnownGraph[]>;
   forgetKnownGraph(path: string): Promise<void>;
+  /** Show a known graph's root folder in the OS file manager (desktop only). */
+  revealKnownGraph(path: string): Promise<void>;
   appPlatform(): Promise<"android" | "ios" | "desktop">;
   /** Compile-time process architecture. Used to avoid offering updater targets
    * that the signed release manifest deliberately does not publish. */
@@ -979,6 +981,9 @@ class TauriBackend implements Backend {
   }
   forgetKnownGraph(path: string) {
     return this.call<void>("forget_known_graph", { path });
+  }
+  revealKnownGraph(path: string) {
+    return this.call<void>("reveal_known_graph", { path });
   }
   appPlatform() {
     return this.call<"android" | "ios" | "desktop">("app_platform");
