@@ -1519,10 +1519,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.2\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.10.0\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "8db69f404621b257a404177594a6ba81c0675d8311cd6f2a59ed636fc3db585f",
+        "6619455b9ab6560048658b8bba2d07c5943532d05b4457809021b0c01c287b65",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

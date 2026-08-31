@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::object_store::StoreError;
+use super::uuid_claim_index::SemanticIndexRoot;
 use super::{
     BatchCausalDot, BatchId, ContentDigest, DocumentCausalDigest, DocumentDependencies, DocumentId,
     FrontierV2, LogicalPageName, PageDelta, PageId, PageNameKeyDigest, PageState,
     PAGE_NAME_KEY_VERSION,
 };
-use tine_storage::PatriciaIndexRoot;
 
 pub const EXACT_LOGICAL_PAGE_NAME_BLOB_SCHEMA_VERSION: u32 = 1;
 pub const EXACT_LOGICAL_PAGE_NAME_REF_SCHEMA_VERSION: u32 = 2;
@@ -1424,7 +1424,7 @@ impl PageNameOwnershipRecordV1 {
 pub struct PageNameOwnershipRootV1 {
     schema_version: u32,
     key_version: u32,
-    patricia_root: PatriciaIndexRoot,
+    semantic_root: SemanticIndexRoot,
     entry_count: u64,
 }
 
@@ -1433,7 +1433,7 @@ impl PageNameOwnershipRootV1 {
         Self {
             schema_version: PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION,
             key_version: PAGE_NAME_KEY_VERSION,
-            patricia_root: PatriciaIndexRoot::empty(),
+            semantic_root: SemanticIndexRoot::empty(),
             entry_count: 0,
         }
     }
@@ -1442,8 +1442,8 @@ impl PageNameOwnershipRootV1 {
         self.entry_count
     }
 
-    pub const fn patricia_digest(&self) -> ContentDigest {
-        self.patricia_root.digest()
+    pub const fn semantic_digest(&self) -> ContentDigest {
+        self.semantic_root.digest()
     }
 
     pub fn external_digest(&self) -> Result<ContentDigest, StoreError> {
@@ -1473,7 +1473,7 @@ impl PageNameOwnershipRootV1 {
             PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION,
         )?;
         require_version("page-name key", self.key_version, PAGE_NAME_KEY_VERSION)?;
-        if (self.entry_count == 0) != (self.patricia_root == PatriciaIndexRoot::empty()) {
+        if (self.entry_count == 0) != (self.semantic_root == SemanticIndexRoot::empty()) {
             return Err(StoreError::MalformedPageNameIndex);
         }
         Ok(())

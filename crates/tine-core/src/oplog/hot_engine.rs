@@ -8817,8 +8817,6 @@ impl ShardedHotEngine {
 
     pub fn instrumentation(&self) -> EngineInstrumentation {
         let work = self.history_work.get();
-        let logseq_claims = tine_storage::PatriciaIndexStats::default();
-        let portable_paths = tine_storage::PatriciaIndexStats::default();
         let scratch = self
             .scratch
             .as_ref()
@@ -8901,12 +8899,12 @@ impl ShardedHotEngine {
                 .unwrap_or(0),
             block_claim_hot_entries: self.ephemeral_block_claims.len(),
             logseq_claim_hot_entries: self.ephemeral_logseq_claims.len(),
-            logseq_claim_index_reads: logseq_claims.reads,
-            logseq_claim_index_writes: logseq_claims.writes,
-            portable_path_index_reads: portable_paths.reads,
-            portable_path_index_writes: portable_paths.writes,
-            portable_path_index_bytes_read: portable_paths.bytes_read,
-            portable_path_index_bytes_written: portable_paths.bytes_written,
+            logseq_claim_index_reads: 0,
+            logseq_claim_index_writes: 0,
+            portable_path_index_reads: 0,
+            portable_path_index_writes: 0,
+            portable_path_index_bytes_read: 0,
+            portable_path_index_bytes_written: 0,
             projection_work_node_reads: 0,
             projection_work_root_reads: 0,
             projection_work_prepared_reads: 0,

@@ -3,21 +3,21 @@
 use serde::{Deserialize, Serialize};
 
 use super::object_store::StoreError;
+use super::uuid_claim_index::SemanticIndexRoot;
 use super::{
     BatchCausalDot, BatchId, ContentDigest, ManagedPath, PageId, PortablePathKeyDigest,
     PORTABLE_PATH_KEY_VERSION,
 };
-use tine_storage::PatriciaIndexRoot;
 
 const PORTABLE_PATH_RECORD_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PortablePathIndexRoot(PatriciaIndexRoot);
+pub struct PortablePathIndexRoot(SemanticIndexRoot);
 
 impl PortablePathIndexRoot {
     pub fn empty() -> Self {
-        Self(PatriciaIndexRoot::empty())
+        Self(SemanticIndexRoot::empty())
     }
 
     pub const fn digest(self) -> ContentDigest {
@@ -25,7 +25,7 @@ impl PortablePathIndexRoot {
     }
 
     pub(crate) const fn from_digest(digest: ContentDigest) -> Self {
-        Self(PatriciaIndexRoot::from_digest(digest))
+        Self(SemanticIndexRoot::from_digest(digest))
     }
 }
 
