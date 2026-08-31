@@ -970,6 +970,9 @@ mod tests {
         // GH #463: the keyboard reaches every destination the mouse does.
         assert!(page.markdown.contains("**Ctrl/Cmd+Enter**"));
         assert!(page.markdown.contains("+ New group"));
+        // GH #464: the row's name is the link and the rest of the row is the
+        // drag handle, which is what makes the documented reorder reliable.
+        assert!(page.markdown.contains("the page's name is the link"));
         assert!(page.markdown.contains("copy/export button"));
         assert!(page.markdown.contains("{{query [[Project/Roadmap]]}}"));
         assert!(page
