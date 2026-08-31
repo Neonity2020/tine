@@ -101,6 +101,34 @@ describe("click-to-caret span mapping", () => {
     }
   });
 
+  // GH #465. This is the case that forced the geometric rule: unlike the
+  // trailing link above, the span map here answers, and answers plausibly, so
+  // no "mapping failed" fallback can rescue it. The block ends `…italics.*` and
+  // the caret lands on byte 22, one before the closing delimiter.
+  it("maps the end of trailing italic text to a spot BEFORE the invisible `*`", () => {
+    const raw = "*some text in italics.*";
+    const { root, dispose } = mountedBody(raw);
+    try {
+      const em = root.querySelector("em");
+      expect(em).toBeTruthy();
+      const end = editorOffsetFromRenderedRange(
+        root,
+        textRange(root, "some text in italics.", "some text in italics.".length),
+        raw,
+        isBuiltinHidden,
+      );
+      expect(end).toBe(raw.length - 1);
+      // ...which is why a click past the final glyph must be recognised by where
+      // it landed rather than by what the span map says. Interior precision has
+      // to survive that: a deliberate click inside the italic text still maps
+      // exactly, and must not be swept to the end.
+      expect(editorOffsetFromRenderedRange(root, textRange(root, "some", 2), raw, isBuiltinHidden))
+        .toBe(raw.indexOf("some") + 2);
+    } finally {
+      dispose();
+    }
+  });
+
   it("accounts for hidden property lines between rendered regions", () => {
     const raw = "**bold**\nid:: abc\nplain";
     const { root, dispose } = mountedBody(raw);

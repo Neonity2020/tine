@@ -9430,6 +9430,35 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: the left sidebar's scrollbar can be grabbed and dragged with the mouse. Classification: blocking core operation (the surface is scrollable but its scrollbar is unreachable). Root cause: .sidebar-resizer is position:absolute right:0 width:7px z-index:20 inside .left-sidebar, and .left-sidebar-scroll fills that same box \u2014 so on any platform whose scrollbar consumes layout width (Windows/WebView2 is the reported one) the drag strip was painted over the outer 7px of a 10px scrollbar. Resizing worked; scrolling by mouse did not, which is exactly what two Windows reporters described. Fix: .left-sidebar-scroll reserves a transparent right border of --sidebar-resizer-width, the same token the strip's width now uses, so the scrollbar column and the drag column are disjoint and moving a few pixels left off the strip reaches the bar, as the reporter asked. The border is transparent so the sidebar background is unchanged; the mobile drawer, where the strip is hidden, sets the border back to 0 and keeps its full width. Siblings reviewed: .rs-resizer sits at the RIGHT sidebar's LEFT edge while that pane scrolls on its right, and the main pane's scrollbar ends where the right sidebar begins, so neither pair overlaps \u2014 the left sidebar was the only conflicting pair. The frameless-window .grip-e strip does overlay the rightmost 4px of whatever pane touches the window edge, but that is the ordinary window-edge resize zone every frameless app has, not this defect. Fail-before is quantitative: removing the gutter makes the guard report the strip covering 7.0px of the 10px scrollbar. EVIDENCE LIMIT: no Windows runtime was available. jsdom applies no CSS layout and this headless Chromium always draws overlay scrollbars, so scripts/check-sidebar-resizer-scrollbar.mjs reproduces the Windows condition with scrollbar-gutter:stable in the fixture; the column geometry is proven, the WebView2 bar itself is not, so confidence stays moderate."
+    },
+    {
+      "id": "UI-CLICK-PAST-END-TRAILING-MARKUP-465",
+      "title": "Clicking past the last glyph of a block that ends in hidden markup puts the caret before the closing delimiter",
+      "family": "editor-click-to-caret",
+      "sources": {
+        "issues": [
+          465
+        ],
+        "commits": [],
+        "internal": "Martin, 2026-08-31"
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/spans.test.ts",
+          "src/render/clickSpans.test.tsx",
+          "scripts/e2e-clickcaret-repro.mjs"
+        ],
+        "scenario": "click-caret.past-end-of-block-with-trailing-markup",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: clicking in the empty space to the right of a block's last line puts the caret at the end of what the editor will show, so Enter starts the next block instead of splitting the construct. Classification: blocking stateful UX (the caret is one byte short, inside markup the reader cannot see). Root cause: the click was answered by the span map, which for a trailing construct like *italics* legitimately maps the end of the visible text to the source byte BEFORE the invisible closing delimiter \u2014 a valid interior offset, so the existing 'mapping failed' fallback never ran. Proven at the mapping layer: for `*some text in italics.*` the end of the rendered text maps to 22, one short of the 23-character source. Fix: recognise the click by WHERE it landed, not what it landed on \u2014 beyondFinalGlyph() in src/render/spans.ts asks whether the point lies past the rightmost glyph of the bottom-most line band, and Block.tsx consults it before the span map, returning the end of the editor's VISIBLE value (not raw.length, which counts hidden property lines). Deliberately geometric rather than per-syntax: a rule keyed on emphasis would have to be repeated for bold, inline code, strikethrough and the Org forms, and a rule that snapped any span-end to the construct end would break precise clicks inside formatted text. Siblings preserved: a precise interior click still maps exactly (asserted for the italic body), a click past an EARLIER wrapped line still lands at that line's end rather than the block's, and the trailing-link behaviour of GH #34 is unchanged because there the editable end and the span end coincide. Real-app proof drives WebKitGTK pointer clicks at computed run-out coordinates for three trailing constructs (emphasis, strong, inline code); fail-before was reproduced by running the same extended journey against the pre-fix release binary."
     }
   ]
 }

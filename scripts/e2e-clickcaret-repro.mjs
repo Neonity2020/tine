@@ -35,6 +35,9 @@ const PAGE = `- **bold** rest of line
 - plain target below
 - another plain block
 - before \`a literal block\` after
+- *some text in italics.*
+- **ends in bold**
+- ends in \`code\`
 `;
 
 fs.rmSync(G, { recursive: true, force: true });
@@ -128,6 +131,32 @@ try {
       }
       return { err: "text not found: " + nd };
     }, blockIdx, needle, offset);
+
+  // GH #465: a point in the empty run-out to the RIGHT of the final rendered
+  // glyph on a block's last visual line — where a user clicks meaning "put the
+  // caret at the end of this block".
+  const pastEndPoint = async (blockIdx) =>
+    browser.execute((idx) => {
+      const blocks = [...document.querySelectorAll(".ls-block")];
+      const block = blocks[idx];
+      if (!block) return { err: "no block " + idx };
+      const content = block.querySelector(".block-content");
+      if (!content) return { err: "no .block-content in block " + idx };
+      const r = document.createRange();
+      r.selectNodeContents(content);
+      const rects = [...r.getClientRects()];
+      if (rects.length === 0) return { err: "no line boxes in block " + idx };
+      const bottom = Math.max(...rects.map((b) => b.bottom));
+      const last = rects.filter((b) => b.bottom >= bottom - 0.5);
+      const right = Math.max(...last.map((b) => b.right));
+      const top = Math.min(...last.map((b) => b.top));
+      const host = content.getBoundingClientRect();
+      // Well past the text but still inside the content box, so the click
+      // reaches this block rather than the page background.
+      const x = right + Math.max(12, Math.min(60, (host.right - right) / 2));
+      if (x >= host.right - 1) return { err: "no run-out to the right of block " + idx };
+      return { x, y: (top + bottom) / 2, right, hostRight: host.right };
+    }, blockIdx);
 
   const realClick = async (x, y) => {
     await browser.performActions([{
@@ -257,6 +286,27 @@ try {
   const belowState = await probe("clicked below → expect editor on idx 3");
   if (!belowState.isEditor || belowState.idx !== 3 || !belowState.val.includes("plain target below")) throw new Error("blur-reflow click landed on the wrong block");
   await probe("final state");
+  await browser.keys(["Escape"]); await sleep(400);
+
+  // GH #465: clicking in the empty space after the last glyph means "the end of
+  // this block", including when the block ends in markup the reader cannot see.
+  // Before the fix the caret stopped one byte short, between the last letter and
+  // the closing delimiter, so Enter split the construct instead of leaving it.
+  for (const [idx, raw] of [[6, "*some text in italics.*"], [7, "**ends in bold**"], [8, "ends in `code`"]]) {
+    console.log(`\n=== GH #465: click past the end of ${JSON.stringify(raw)} ===`);
+    const past = await pastEndPoint(idx);
+    console.log("point:", JSON.stringify(past));
+    requirePoint(past, `past-end point for ${raw}`);
+    await realClick(past.x, past.y);
+    expectEditor(await probe(`past end of ${raw}`), idx, raw.length, `past-end click on ${raw}`);
+    await browser.keys(["Escape"]); await sleep(400);
+  }
+
+  console.log("\n=== GH #465 control: a precise click INSIDE the italic still maps exactly ===");
+  p = await charPoint(6, "some text in italics.", 2);
+  console.log("point:", JSON.stringify(p));
+  requirePoint(p, "italic interior point"); await realClick(p.x, p.y);
+  expectEditor(await probe("italic interior +2"), 6, "*some text in italics.*".indexOf("some") + 2, "italic interior click");
   await browser.keys(["Escape"]); await sleep(400);
 
   const realDrag = async (x1, y1, x2, y2) => {

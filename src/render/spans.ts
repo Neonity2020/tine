@@ -243,6 +243,60 @@ export function renderedTextCaret(
   return { text, caret };
 }
 
+/** Rectangles of one rendered block's content, one per visual line box.
+ *  Narrower than `DOMRectList` so tests can hand in plain objects. */
+export interface LineBox {
+  readonly top: number;
+  readonly bottom: number;
+  readonly right: number;
+}
+
+/** True when (x, y) lies horizontally past the last glyph of the FINAL visual
+ *  line of `boxes` — i.e. in the empty run-out at the end of the block.
+ *
+ *  This is the whole of GH #465, and it is deliberately geometric rather than
+ *  syntactic. A block ending in `*text*` renders an `<em>` whose span map stops
+ *  before the closing `*`, so a click past the end maps to a perfectly valid
+ *  interior source offset — one byte before the invisible delimiter — and no
+ *  "mapping failed" fallback ever fires. Asking where the click landed instead
+ *  of what it landed on covers every trailing construct with a hidden closing
+ *  delimiter at once, in Markdown and Org alike, rather than accumulating a
+ *  special case per syntax.
+ *
+ *  Only the final line qualifies: a click past the right edge of an earlier
+ *  wrapped line belongs at that line's end, which the ordinary span mapping
+ *  already gets right. */
+export function beyondFinalGlyph(boxes: ArrayLike<LineBox>, x: number, y: number): boolean {
+  if (boxes.length === 0) return false;
+  // Line boxes arrive in DOM order, which is visual order for text but need not
+  // be once floats or inline-blocks are involved, so find the bottom band by
+  // coordinate rather than by taking the last entry.
+  let bottom = -Infinity;
+  for (let i = 0; i < boxes.length; i++) bottom = Math.max(bottom, boxes[i].bottom);
+  let top = Infinity;
+  let right = -Infinity;
+  for (let i = 0; i < boxes.length; i++) {
+    const box = boxes[i];
+    // Half a pixel of slack: sub-pixel line heights otherwise split one visual
+    // line into two bands that each look like "not the last one".
+    if (box.bottom < bottom - 0.5) continue;
+    top = Math.min(top, box.top);
+    right = Math.max(right, box.right);
+  }
+  return y >= top && y <= bottom && x > right;
+}
+
+/** {@link beyondFinalGlyph} against a live element's rendered line boxes.
+ *  Measures the CONTENTS, not the element: a block-level container is full
+ *  width, so its own border box says nothing about where the text ends. */
+export function clickBeyondRenderedEnd(root: Element, x: number, y: number): boolean {
+  const range = root.ownerDocument.createRange();
+  range.selectNodeContents(root);
+  const boxes = range.getClientRects();
+  range.detach?.();
+  return beyondFinalGlyph(boxes, x, y);
+}
+
 export function editorOffsetFromRenderedRange(
   root: Element,
   range: Pick<Range, "startContainer" | "startOffset">,

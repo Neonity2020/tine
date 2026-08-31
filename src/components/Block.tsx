@@ -132,7 +132,7 @@ import type { Format } from "../render/ast";
 import type { Node as StoreNode } from "../store";
 import { AstBody } from "../render/body";
 import { InlineText, CopyButton } from "../render/inline";
-import { editorOffsetFromRenderedRange } from "../render/spans";
+import { clickBeyondRenderedEnd, editorOffsetFromRenderedRange } from "../render/spans";
 import {
   assetMarkdown,
   assetFileName,
@@ -167,7 +167,7 @@ import {
   caretOffsetOnLastRow,
   textareaCaretPoints,
 } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, type PropFormat } from "../editor/properties";
 import { queryMacroExtents } from "../editor/edn";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence, caretInDisplayMath } from "../editor/fences";
@@ -848,13 +848,23 @@ function Rendered(props: {
   // Anything without trustworthy span data (chips, macro hosts, parser fallback)
   // keeps the old end-of-block behavior.
   let contentRef: HTMLDivElement | undefined;
+  const pageFormat = (): PropFormat => (pageByName(node().page)?.format === "org" ? "org" : "md");
+  // The end of what the textarea will actually hold — NOT `raw.length`, which
+  // counts hidden property lines the editor never shows.
+  const editableEnd = (): number => splitProps(node().raw, isBuiltinHidden, pageFormat()).visible.length;
   const clickOffset = (e: MouseEvent): number | null => {
     if (!contentRef) return null;
+    // GH #465: a click in the empty run-out past the last glyph means "the end",
+    // whatever the block ends with. Answered from the click's position before
+    // consulting the span map, because a trailing construct with an invisible
+    // closing delimiter (`*italic*`) maps that click to a legitimate-looking
+    // interior offset just before the delimiter, so nothing downstream can tell
+    // it apart from a deliberate click there.
+    if (clickBeyondRenderedEnd(contentRef, e.clientX, e.clientY)) return editableEnd();
     const d = document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
     const range = d.caretRangeFromPoint?.(e.clientX, e.clientY);
     if (!range) return null;
-    const fmt = pageByName(node().page)?.format === "org" ? "org" : "md";
-    return editorOffsetFromRenderedRange(contentRef, range, node().raw, isBuiltinHidden, fmt);
+    return editorOffsetFromRenderedRange(contentRef, range, node().raw, isBuiltinHidden, pageFormat());
   };
   // For annotation blocks the editor shows only the highlight text (metadata
   // stays hidden); the colored prefix still jumps to the PDF.
@@ -871,7 +881,7 @@ function Rendered(props: {
     beginEditGesture(
       e,
       props.id,
-      clickOffset(e) ?? node().raw.length,
+      clickOffset(e) ?? editableEnd(),
       props.owner ?? null,
       props.outlineScope ?? null,
     );
