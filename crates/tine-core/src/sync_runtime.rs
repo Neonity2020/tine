@@ -1472,6 +1472,8 @@ pub enum SyncAmbiguousEvidence {
     ArchiveResidue,
     ArchiveNamespace,
     ArchiveBinding,
+    /// The application-level opener found that the archive selected by the
+    /// active runtime does not match the archive it was asked to open.
     ActiveArchiveMismatch,
 }
 
@@ -2824,10 +2826,8 @@ pub enum SyncEditorRefusalCode {
     TrustedLocalPreparationDraft,
     TrustedLocalPreparationCapture,
     TrustedLocalPreparationFinalize,
-    TrustedLocalPreparationTailReservation,
     TrustedLocalPreparationPublication,
     TrustedLocalPreparationArchiveStage,
-    TrustedLocalPreparationTailAdmission,
     TrustedLocalPreparationSqliteDrain,
     TrustedLocalPreparationProjectionDrain,
     TrustedLocalEngineAuthority,
@@ -2853,14 +2853,8 @@ impl SyncEditorRefusalCode {
             Self::TrustedLocalPreparationDraft => "trusted_local.preparation.draft",
             Self::TrustedLocalPreparationCapture => "trusted_local.preparation.capture",
             Self::TrustedLocalPreparationFinalize => "trusted_local.preparation.finalize",
-            Self::TrustedLocalPreparationTailReservation => {
-                "trusted_local.preparation.tail_reservation"
-            }
             Self::TrustedLocalPreparationPublication => "trusted_local.preparation.publication",
             Self::TrustedLocalPreparationArchiveStage => "trusted_local.preparation.archive_stage",
-            Self::TrustedLocalPreparationTailAdmission => {
-                "trusted_local.preparation.tail_admission"
-            }
             Self::TrustedLocalPreparationSqliteDrain => "trusted_local.preparation.sqlite_drain",
             Self::TrustedLocalPreparationProjectionDrain => {
                 "trusted_local.preparation.projection_drain"
@@ -3194,10 +3188,8 @@ pub enum SyncLocalMutationPhase {
     Draft,
     Capture,
     Finalize,
-    TailReservation,
     Publication,
     ArchiveStage,
-    TailAdmission,
     SqliteDrain,
     ProjectionDrain,
 }
@@ -9383,7 +9375,6 @@ fn map_ambiguous_evidence(evidence: AmbiguousEvidence) -> SyncAmbiguousEvidence 
         AmbiguousEvidence::ArchiveResidue => SyncAmbiguousEvidence::ArchiveResidue,
         AmbiguousEvidence::ArchiveNamespace => SyncAmbiguousEvidence::ArchiveNamespace,
         AmbiguousEvidence::ArchiveBinding => SyncAmbiguousEvidence::ArchiveBinding,
-        AmbiguousEvidence::ActiveArchiveMismatch => SyncAmbiguousEvidence::ActiveArchiveMismatch,
     }
 }
 
@@ -12069,19 +12060,6 @@ struct ActorRuntimeBinding {
 }
 
 impl ActorRuntimeBinding {
-    #[cfg(test)]
-    fn from_legacy(binding: &EnrollmentBindingV1) -> Self {
-        Self {
-            workspace_id: binding.workspace_id(),
-            lineage_digest: binding.lineage_digest(),
-            catalog_document_id: binding.catalog_document_id(),
-            endpoint_id: binding.endpoint_id(),
-            device_id: binding.device_id(),
-            graph_resource_id: binding.graph_resource_id(),
-            receipt_store_id: binding.receipt_store_id(),
-        }
-    }
-
     fn from_clean(
         identities: &SyncLocalActivationIdentities,
         endpoint: ProjectionEndpointBinding,
@@ -23255,15 +23233,9 @@ fn trusted_local_preparation_refusal_code(phase: OperationalPhase) -> SyncEditor
         OperationalPhase::Draft => SyncEditorRefusalCode::TrustedLocalPreparationDraft,
         OperationalPhase::Capture => SyncEditorRefusalCode::TrustedLocalPreparationCapture,
         OperationalPhase::Finalize => SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
-        OperationalPhase::TailReservation => {
-            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation
-        }
         OperationalPhase::Publication => SyncEditorRefusalCode::TrustedLocalPreparationPublication,
         OperationalPhase::ArchiveStage => {
             SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage
-        }
-        OperationalPhase::TailAdmission => {
-            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission
         }
         OperationalPhase::SqliteDrain => SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
         OperationalPhase::ProjectionDrain => {
@@ -25158,10 +25130,8 @@ fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
         OperationalPhase::Draft => SyncLocalMutationPhase::Draft,
         OperationalPhase::Capture => SyncLocalMutationPhase::Capture,
         OperationalPhase::Finalize => SyncLocalMutationPhase::Finalize,
-        OperationalPhase::TailReservation => SyncLocalMutationPhase::TailReservation,
         OperationalPhase::Publication => SyncLocalMutationPhase::Publication,
         OperationalPhase::ArchiveStage => SyncLocalMutationPhase::ArchiveStage,
-        OperationalPhase::TailAdmission => SyncLocalMutationPhase::TailAdmission,
         OperationalPhase::SqliteDrain => SyncLocalMutationPhase::SqliteDrain,
         OperationalPhase::ProjectionDrain => SyncLocalMutationPhase::ProjectionDrain,
     }
@@ -25853,10 +25823,8 @@ mod tests {
             SyncEditorRefusalCode::TrustedLocalPreparationDraft,
             SyncEditorRefusalCode::TrustedLocalPreparationCapture,
             SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
-            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
             SyncEditorRefusalCode::TrustedLocalPreparationPublication,
             SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
-            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
             SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
             SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain,
             SyncEditorRefusalCode::TrustedLocalEngineAuthority,
@@ -25933,20 +25901,12 @@ mod tests {
                 SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
             ),
             (
-                OperationalPhase::TailReservation,
-                SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
-            ),
-            (
                 OperationalPhase::Publication,
                 SyncEditorRefusalCode::TrustedLocalPreparationPublication,
             ),
             (
                 OperationalPhase::ArchiveStage,
                 SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
-            ),
-            (
-                OperationalPhase::TailAdmission,
-                SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
             ),
             (
                 OperationalPhase::SqliteDrain,

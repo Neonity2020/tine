@@ -1045,44 +1045,8 @@ impl ObjectStore {
     /// Validate and publish the sole batch commit marker. Missing objects do
     /// not prevent staging the marker and remain invisible until complete.
     pub fn stage_manifest_bytes(&self, bytes: &[u8]) -> Result<BatchId, StoreError> {
-        self.stage_manifest_bytes_impl(bytes, false)
-    }
-
-    /// Receive a manifest through one exact shared-enrollment descriptor.
-    ///
-    /// Historical bootstrap manifests are admitted only on this path. The
-    /// descriptor authority is checked independently of the manifest before
-    /// the ordinary immutable collision and lineage validation runs.
-    pub(crate) fn stage_shared_provider_manifest_bytes(
-        &self,
-        ingress: &super::enrollment::SharedProviderIngressAuthority,
-        bytes: &[u8],
-    ) -> Result<BatchId, StoreError> {
         let manifest = OperationBatch::decode(bytes)?;
-        if ingress.workspace_id() != self.workspace_id
-            || manifest.workspace_id() != ingress.workspace_id()
-        {
-            return Err(StoreError::WorkspaceMismatch {
-                expected: self.workspace_id,
-                found: manifest.workspace_id(),
-            });
-        }
-        if manifest.lineage_digest() != ingress.lineage_digest() {
-            return Err(StoreError::LineageMismatch {
-                expected: ingress.lineage_digest(),
-                found: manifest.lineage_digest(),
-            });
-        }
-        self.stage_manifest_bytes_impl(bytes, true)
-    }
-
-    fn stage_manifest_bytes_impl(
-        &self,
-        bytes: &[u8],
-        allow_bootstrap: bool,
-    ) -> Result<BatchId, StoreError> {
-        let manifest = OperationBatch::decode(bytes)?;
-        if !allow_bootstrap && manifest.origin() == BatchOrigin::BootstrapImport {
+        if manifest.origin() == BatchOrigin::BootstrapImport {
             return Err(StoreError::BootstrapBatchRequiresDirectPublication);
         }
         if manifest.workspace_id() != self.workspace_id {

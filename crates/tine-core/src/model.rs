@@ -2528,18 +2528,12 @@ pub struct Graph {
     /// outside one, and would reopen the whole graph — discarding every cache
     /// it has built — every time the user toggles a star.
     recent_config_write: RwLock<Option<BlobDescription>>,
-    /// Private, process-local graph-text completeness capability. This state is
-    /// neither serialized nor consulted by durable import/projection paths in
-    /// this packet.
-    graph_text_admission: Arc<GraphTextAdmissionControl>,
     /// Unforgeable identity of this exact Graph instance. Reopening the same
     /// resource intentionally produces a different token.
     graph_text_admission_instance: Arc<GraphTextAdmissionInstance>,
     /// Complete graph-text identity evidence retained specifically for ordinary
-    /// guarded writes. Unlike `graph_text_admission`, this generation does not
-    /// claim sparse-runtime feed authority: the legacy watcher owns its external
-    /// observation boundary and records exact paths or uncertainty here before
-    /// its deferred cache reconciliation.
+    /// guarded writes. The legacy watcher records exact paths or uncertainty
+    /// here before its deferred cache reconciliation.
     guarded_graph_text_identity: RwLock<GuardedGraphTextIdentityState>,
     /// Journal date formats (filename + title) resolved from `config.edn`, used to
     /// recognize journal files in the user's format and render new ones. Built once
@@ -2756,10 +2750,6 @@ impl GraphTextExternalObservationTicket {
 #[derive(Debug)]
 struct GraphTextAdmissionInstance;
 
-struct GraphTextAdmissionControl {
-    state: RwLock<GraphTextAdmissionState>,
-}
-
 #[derive(Default)]
 struct GuardedGraphTextIdentityState {
     index: Option<Arc<CompleteGraphTextAdmissionIndex>>,
@@ -2805,14 +2795,6 @@ pub struct GuardedGraphTextIdentityReport {
     pub invalidated: bool,
     pub generation: u64,
     pub last_build: Option<GuardedGraphTextIdentityBuild>,
-}
-
-impl std::ops::Deref for GraphTextAdmissionControl {
-    type Target = RwLock<GraphTextAdmissionState>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
 }
 
 struct GraphTextParseBudgetPermit {
@@ -3105,10 +3087,6 @@ impl<K: Ord, V> PersistentMap<K, V> {
         previous
     }
 
-    fn len(&self) -> usize {
-        Self::node_len(&self.root)
-    }
-
     fn iter(&self) -> PersistentMapIter<'_, K, V> {
         PersistentMapIter::new(self.root.as_deref())
     }
@@ -3184,21 +3162,6 @@ impl<'a, K: Ord, V> IntoIterator for &'a PersistentMap<K, V> {
     }
 }
 
-#[derive(Clone, Debug)]
-struct GraphTextAdmissionFeedFence {
-    last_sequence: u64,
-}
-
-#[derive(Clone, Debug)]
-struct GraphTextAdmissionFeedBinding {
-    instance: Arc<GraphTextAdmissionInstance>,
-    scope_binding: GraphTextScopeBinding,
-    graph_resource: CanonicalGraphResourceId,
-    fence: GraphTextAdmissionFeedFence,
-    #[cfg(test)]
-    legacy_publish_on_build: bool,
-}
-
 /// Terminal reason supplied by a platform exact-feed adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -3258,7 +3221,6 @@ struct CompleteGraphTextAdmissionIndex {
     scope_binding: GraphTextScopeBinding,
     graph_resource: CanonicalGraphResourceId,
     generation: u64,
-    feed: Option<GraphTextAdmissionFeedFence>,
     files_by_exact_path: PersistentMap<ManagedPath, GraphTextAdmissionRecord>,
     paths_by_portable_key: PersistentMap<PortablePathKey, std::collections::BTreeSet<ManagedPath>>,
     paths_by_file_resource: PersistentMap<ContentDigest, std::collections::BTreeSet<String>>,
@@ -3271,29 +3233,6 @@ struct CompleteGraphTextAdmissionIndex {
     permanent_bytes: u64,
     permanent_limit: u64,
     peak_limit: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GraphTextAdmissionDiagnostics {
-    generation: u64,
-    files: usize,
-    directories: usize,
-    permanent_bytes: u64,
-}
-
-enum GraphTextAdmissionState {
-    Unbuilt,
-    Armed(GraphTextAdmissionFeedBinding),
-    Building {
-        armed_feed: Option<GraphTextAdmissionFeedBinding>,
-    },
-    SnapshotComplete(Arc<CompleteGraphTextAdmissionIndex>),
-    CatchingUp(Arc<CompleteGraphTextAdmissionIndex>),
-    Complete(Arc<CompleteGraphTextAdmissionIndex>),
-    Poisoned {
-        last_good: Option<GraphTextAdmissionDiagnostics>,
-        cause: String,
-    },
 }
 
 struct PreparedGraphTextAdmissionUpsert {
@@ -4194,9 +4133,6 @@ fn count_direct_creation_census() {
     });
 }
 
-#[cfg(not(test))]
-fn count_direct_creation_census() {}
-
 #[cfg(test)]
 fn count_direct_creation_file_hashed() {
     GRAPH_TEXT_ADMISSION_TEST_COUNTERS.with(|counters| {
@@ -4205,9 +4141,6 @@ fn count_direct_creation_file_hashed() {
         counters.set(value);
     });
 }
-
-#[cfg(not(test))]
-fn count_direct_creation_file_hashed() {}
 
 #[cfg(test)]
 fn count_graph_text_admission_point_query() {
@@ -5691,9 +5624,6 @@ impl Graph {
                 .map(BlobDescription::of),
             reconciliation_scan_open_config_utf8: config_bytes.is_none() || config_text.is_some(),
             recent_config_write: RwLock::new(None),
-            graph_text_admission: Arc::new(GraphTextAdmissionControl {
-                state: RwLock::new(GraphTextAdmissionState::Unbuilt),
-            }),
             graph_text_admission_instance,
             guarded_graph_text_identity: RwLock::new(GuardedGraphTextIdentityState {
                 observed_resource_epoch: guarded_resource_epoch,
@@ -6712,7 +6642,6 @@ impl Graph {
         let mut replacement = build_graph_text_admission_index(
             self,
             &capture,
-            None,
             INITIAL_SHADOW_LIMITS,
             replacement_peak,
             decode_semantics,
@@ -10254,45 +10183,8 @@ impl Graph {
         &self,
         limits: InitialShadowLimits,
     ) -> io::Result<Vec<(ManagedPath, Vec<u8>)>> {
-        self.build_graph_text_admission_with_limits(limits)
-            .map(initial_shadow_capture_into_raw_inventory)
-    }
-
-    #[cfg(test)]
-    fn build_graph_text_admission_with_limits(
-        &self,
-        limits: InitialShadowLimits,
-    ) -> io::Result<InitialShadowCapture> {
-        require_projection_platform()?;
-        let armed_feed = self.begin_graph_text_admission_build()?;
-        let built: io::Result<(
-            InitialShadowCapture,
-            CompleteGraphTextAdmissionIndex,
-            Option<io::Error>,
-        )> = (|| {
-            let (first, combined_capture_bytes) =
-                self.capture_live_graph_text_admission_with_limits(limits)?;
-            let index = build_graph_text_admission_index(
-                self,
-                &first,
-                armed_feed.as_ref().map(|binding| binding.fence.clone()),
-                limits,
-                combined_capture_bytes,
-                true,
-                None,
-            )?;
-            let collision = initial_shadow_global_collision(&index);
-            Ok((first, index, collision))
-        })();
-        let (first, index, collision) = match built {
-            Ok(built) => built,
-            Err(error) => {
-                self.poison_graph_text_admission(error.to_string());
-                return Err(error);
-            }
-        };
-        self.finish_graph_text_admission_build(index, collision)?;
-        Ok(first)
+        self.capture_initial_shadow_with_limits(limits)
+            .map(|(capture, _)| initial_shadow_capture_into_raw_inventory(capture))
     }
 
     fn capture_initial_shadow_with_limits(
@@ -10324,26 +10216,6 @@ impl Graph {
             return Err(initial_shadow_limit_error("peak build memory"));
         }
         Ok((first, combined_capture_bytes))
-    }
-
-    /// One physical census for the live exact-feed index. Discovery is not
-    /// publication authority: reconciliation recaptures every affected path,
-    /// and absences cross the durable confirmation boundary before admission.
-    /// Bootstrap activation separately seals one initial capture and performs
-    /// one complete live-source comparison immediately before promotion.
-    #[cfg(test)]
-    fn capture_live_graph_text_admission_with_limits(
-        &self,
-        limits: InitialShadowLimits,
-    ) -> io::Result<(InitialShadowCapture, u64)> {
-        require_projection_platform()?;
-        let permit = self.admit_retained_managed_text_writer()?;
-        let capture =
-            collect_initial_shadow_managed_inventory_with_limits(self, &permit, true, limits, 0)?;
-        initial_shadow_revalidation_hook(&self.root)?;
-        self.ensure_projection_root_binding()?;
-        let capture_bytes = capture.peak_build_charge;
-        Ok((capture, capture_bytes))
     }
 
     /// Capture the resource retained by this Graph even when its ambient path
@@ -10415,136 +10287,6 @@ impl Graph {
             return Err(initial_shadow_limit_error("peak build memory"));
         }
         Ok((first, combined_capture_bytes))
-    }
-
-    #[cfg(test)]
-    fn begin_graph_text_admission_build(
-        &self,
-    ) -> io::Result<Option<GraphTextAdmissionFeedBinding>> {
-        let mut state = self.graph_text_admission.write().unwrap();
-        let armed_feed = match &*state {
-            GraphTextAdmissionState::Unbuilt => None,
-            GraphTextAdmissionState::Armed(binding) => Some(binding.clone()),
-            GraphTextAdmissionState::Building { .. } => {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "a second graph-text admission build was attempted".to_owned(),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "index build is already active",
-                ));
-            }
-            GraphTextAdmissionState::SnapshotComplete(_) => {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "a second graph-text admission build was attempted".to_owned(),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "snapshot was already completed",
-                ));
-            }
-            GraphTextAdmissionState::CatchingUp(_) => {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "a second graph-text admission build was attempted".to_owned(),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "authoritative index is catching up",
-                ));
-            }
-            GraphTextAdmissionState::Complete(_) => {
-                poison_graph_text_admission_state(
-                    &mut state,
-                    "a second graph-text admission build was attempted".to_owned(),
-                );
-                return Err(graph_text_admission_unavailable(
-                    "authoritative index was already completed",
-                ));
-            }
-            GraphTextAdmissionState::Poisoned { cause, .. } => {
-                return Err(graph_text_admission_unavailable(cause));
-            }
-        };
-        *state = GraphTextAdmissionState::Building {
-            armed_feed: armed_feed.clone(),
-        };
-        Ok(armed_feed)
-    }
-
-    #[cfg(test)]
-    fn finish_graph_text_admission_build(
-        &self,
-        index: CompleteGraphTextAdmissionIndex,
-        collision: Option<io::Error>,
-    ) -> io::Result<()> {
-        let mut state = self.graph_text_admission.write().unwrap();
-        let GraphTextAdmissionState::Building { armed_feed } = &*state else {
-            poison_graph_text_admission_state(
-                &mut state,
-                "index build state changed before publication".to_owned(),
-            );
-            return Err(graph_text_admission_unavailable(
-                "index build state changed before publication",
-            ));
-        };
-        if armed_feed
-            .as_ref()
-            .map(|binding| binding.fence.last_sequence)
-            != index.feed.as_ref().map(|feed| feed.last_sequence)
-        {
-            *state = GraphTextAdmissionState::Poisoned {
-                last_good: None,
-                cause: "feed fence changed before index publication".to_owned(),
-            };
-            return Err(graph_text_admission_unavailable(
-                "feed fence changed before index publication",
-            ));
-        }
-        if let Some(error) = collision {
-            if index.feed.is_some() {
-                *state = GraphTextAdmissionState::Poisoned {
-                    last_good: Some(index.diagnostics()),
-                    cause: bounded_graph_text_admission_cause(error.to_string()),
-                };
-            } else {
-                *state = GraphTextAdmissionState::SnapshotComplete(Arc::new(index));
-            }
-            return Err(error);
-        }
-        let index = Arc::new(index);
-        #[cfg(not(test))]
-        let catching_up = index.feed.is_some();
-        #[cfg(test)]
-        let catching_up = index.feed.is_some()
-            && !armed_feed
-                .as_ref()
-                .is_some_and(|binding| binding.legacy_publish_on_build);
-        *state = if catching_up {
-            GraphTextAdmissionState::CatchingUp(index)
-        } else if index.feed.is_some() {
-            GraphTextAdmissionState::Complete(index)
-        } else {
-            GraphTextAdmissionState::SnapshotComplete(index)
-        };
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn poison_graph_text_admission(&self, cause: impl Into<String>) {
-        let mut state = self.graph_text_admission.write().unwrap();
-        if matches!(&*state, GraphTextAdmissionState::Poisoned { .. }) {
-            return;
-        }
-        let last_good = match &*state {
-            GraphTextAdmissionState::SnapshotComplete(index)
-            | GraphTextAdmissionState::CatchingUp(index)
-            | GraphTextAdmissionState::Complete(index) => Some(index.diagnostics()),
-            _ => None,
-        };
-        *state = GraphTextAdmissionState::Poisoned {
-            last_good,
-            cause: bounded_graph_text_admission_cause(cause.into()),
-        };
     }
 
     /// Classify one exact feed path without duplicating scope policy.
@@ -28694,17 +28436,6 @@ fn initial_shadow_root_capture_upper_bound() -> io::Result<u64> {
     checked_add_bytes(bytes, 512)
 }
 
-impl CompleteGraphTextAdmissionIndex {
-    fn diagnostics(&self) -> GraphTextAdmissionDiagnostics {
-        GraphTextAdmissionDiagnostics {
-            generation: self.generation,
-            files: self.files_by_exact_path.len(),
-            directories: self.directories_by_exact_relative.len(),
-            permanent_bytes: self.permanent_bytes,
-        }
-    }
-}
-
 fn graph_text_semantic_key(entry: &PageEntry) -> (u8, String) {
     let kind = match entry.kind {
         PageKind::Page => 0,
@@ -28755,7 +28486,6 @@ fn initial_shadow_capture_into_raw_inventory(
 fn build_graph_text_admission_index(
     graph: &Graph,
     capture: &InitialShadowCapture,
-    feed: Option<GraphTextAdmissionFeedFence>,
     limits: InitialShadowLimits,
     combined_capture_bytes: u64,
     decode_semantics: bool,
@@ -28810,7 +28540,6 @@ fn build_graph_text_admission_index(
         scope_binding,
         graph_resource,
         generation: 1,
-        feed,
         files_by_exact_path: PersistentMap::default(),
         paths_by_portable_key: PersistentMap::default(),
         paths_by_file_resource: capture
@@ -29964,22 +29693,6 @@ fn validate_graph_text_event_parent(
         }
     }
     Ok(())
-}
-
-fn poison_graph_text_admission_state(state: &mut GraphTextAdmissionState, cause: String) {
-    if matches!(state, GraphTextAdmissionState::Poisoned { .. }) {
-        return;
-    }
-    let last_good = match state {
-        GraphTextAdmissionState::SnapshotComplete(index)
-        | GraphTextAdmissionState::CatchingUp(index)
-        | GraphTextAdmissionState::Complete(index) => Some(index.diagnostics()),
-        _ => None,
-    };
-    *state = GraphTextAdmissionState::Poisoned {
-        last_good,
-        cause: bounded_graph_text_admission_cause(cause),
-    };
 }
 
 const MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES: usize = 4096;
@@ -45803,10 +45516,6 @@ mod tests {
             fs::read(root.join("pages/nested/inserted.md")).unwrap(),
             b"- inserted\n"
         );
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::SnapshotComplete(_)
-        ));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -45832,10 +45541,6 @@ mod tests {
             }));
         });
         assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&retired);
@@ -45904,10 +45609,7 @@ mod tests {
 
         let graph = Graph::open(&root);
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("unarmed initial build must install SnapshotComplete");
-        };
+        let index = graph.guarded_graph_text_identity_index().unwrap();
         let journal = index
             .files_by_exact_path
             .get(&ManagedPath::parse("archive/Not-A-Date.Markdown").unwrap())
@@ -45922,7 +45624,6 @@ mod tests {
         assert_eq!(page.semantic.name, "Plan");
         assert_eq!(page.semantic.kind, PageKind::Page);
         assert_eq!(page.format, Format::Org);
-        drop(state);
 
         fs::create_dir_all(root.join("create/pages")).unwrap();
         fs::create_dir_all(root.join("create/journals")).unwrap();
@@ -46088,15 +45789,11 @@ mod tests {
         fs::write(root.join("Visible.md"), b"- visible\n").unwrap();
         let graph = Graph::open(&root);
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("expected an unarmed complete snapshot");
-        };
-        assert_eq!(index.files_by_exact_path.len(), 1);
+        let index = graph.guarded_graph_text_identity_index().unwrap();
+        assert_eq!(index.files_by_exact_path.iter().count(), 1);
         assert!(index
             .files_by_exact_path
             .contains_key(&ManagedPath::parse("Visible.md").unwrap()));
-        drop(state);
 
         let invalid = scratch("admission-invalid-utf8");
         fs::write(invalid.join("Bad.md"), [0xff, 0xfe]).unwrap();
@@ -46104,10 +45801,6 @@ mod tests {
         assert!(invalid_graph
             .initial_shadow_raw_managed_text_inventory()
             .is_err());
-        assert!(matches!(
-            &*invalid_graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
 
         let parse = scratch("admission-parse-failure");
         fs::write(parse.join("Bad.md"), b"- valid bytes\n").unwrap();
@@ -46116,10 +45809,6 @@ mod tests {
         assert!(parse_graph
             .initial_shadow_raw_managed_text_inventory()
             .is_err());
-        assert!(matches!(
-            &*parse_graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&invalid);
@@ -46138,10 +45827,7 @@ mod tests {
         .unwrap();
         let graph = Graph::open(&portable);
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("collision evidence must remain in the private snapshot");
-        };
+        let index = graph.guarded_graph_text_identity_index().unwrap();
         assert_eq!(
             index
                 .paths_by_portable_key
@@ -46150,7 +45836,6 @@ mod tests {
                 .len(),
             2
         );
-        drop(state);
 
         let semantic = scratch("admission-semantic-groups");
         fs::create_dir_all(semantic.join("a")).unwrap();
@@ -46159,10 +45844,7 @@ mod tests {
         fs::write(semantic.join("b/Two.org"), b"#+title: Shared\n* two\n").unwrap();
         let graph = Graph::open(&semantic);
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("unarmed semantic collision remains diagnostic-only");
-        };
+        let index = graph.guarded_graph_text_identity_index().unwrap();
         assert_eq!(
             index
                 .paths_by_semantic_key
@@ -46171,53 +45853,9 @@ mod tests {
                 .len(),
             2
         );
-        drop(state);
-
-        let alias = scratch("admission-resource-groups");
-        fs::write(alias.join("Page.md"), b"- same inode\n").unwrap();
-        fs::hard_link(alias.join("Page.md"), alias.join("alias.bin")).unwrap();
-        let graph = Graph::open(&alias);
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("resource collision evidence must remain in the private snapshot");
-        };
-        assert!(index
-            .paths_by_file_resource
-            .values()
-            .any(|members| members.len() == 2
-                && members.contains("Page.md")
-                && members.contains("alias.bin")));
-        drop(state);
-
-        let outside_alias = scratch("admission-resource-outside");
-        let outside = scratch("admission-resource-outside-target");
-        fs::write(outside_alias.join("Only.md"), b"- linked outside\n").unwrap();
-        fs::hard_link(
-            outside_alias.join("Only.md"),
-            outside.join("outside-link.bin"),
-        )
-        .unwrap();
-        let graph = Graph::open(&outside_alias);
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("outside-link proof must remain in the private snapshot");
-        };
-        assert_eq!(
-            index
-                .files_by_exact_path
-                .get(&ManagedPath::parse("Only.md").unwrap())
-                .unwrap()
-                .link_count,
-            2
-        );
 
         let _ = fs::remove_dir_all(&portable);
         let _ = fs::remove_dir_all(&semantic);
-        let _ = fs::remove_dir_all(&alias);
-        let _ = fs::remove_dir_all(&outside_alias);
-        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -46462,10 +46100,7 @@ mod tests {
             counters.persistent_node_allocations < FILES * 256,
             "persistent sealing must stay logarithmic, not clone growing groups: {counters:?}"
         );
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("an unarmed collision build must retain diagnostic evidence");
-        };
+        let index = graph.guarded_graph_text_identity_index().unwrap();
         let first = ManagedPath::parse("Page-0000.md").unwrap();
         let semantic_key =
             graph_text_semantic_key(&index.files_by_exact_path.get(&first).unwrap().semantic);
@@ -46477,7 +46112,6 @@ mod tests {
                 .len(),
             FILES
         );
-        drop(state);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -46534,10 +46168,6 @@ mod tests {
             0,
             "format input and rendered bound must reject before title rendering or parsing"
         );
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -46562,10 +46192,7 @@ mod tests {
             title_format.len() as u64 * MAX_JOURNAL_TITLE_BYTES_PER_FORMAT_BYTE
         );
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("normal configured format must produce a complete snapshot");
-        };
+        let index = graph.guarded_graph_text_identity_index().unwrap();
         let record = index
             .files_by_exact_path
             .get(&ManagedPath::parse("2026_07_25.md").unwrap())
@@ -46575,7 +46202,6 @@ mod tests {
             record.semantic.name.capacity() as u64
                 <= owned_string_len_upper_bound(format_budget.rendered_bytes).unwrap()
         );
-        drop(state);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -46587,14 +46213,11 @@ mod tests {
         fs::write(root.join("Two.md"), b"title:: Two\n").unwrap();
         let graph = Graph::open(&root);
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("unarmed build must retain a complete diagnostic snapshot");
-        };
+        let index = graph.guarded_graph_text_identity_index().unwrap();
         let one = ManagedPath::parse("One.md").unwrap();
         let two = ManagedPath::parse("Two.md").unwrap();
 
-        let mut wrong_semantic = (**index).clone();
+        let mut wrong_semantic = (*index).clone();
         persistent_set_insert(
             &mut wrong_semantic.paths_by_semantic_key,
             graph_text_semantic_key(
@@ -46608,7 +46231,7 @@ mod tests {
         );
         assert!(validate_graph_text_admission_index(&wrong_semantic).is_err());
 
-        let mut wrong_resource = (**index).clone();
+        let mut wrong_resource = (*index).clone();
         let two_resource = wrong_resource
             .files_by_exact_path
             .get(&two)
@@ -46621,13 +46244,12 @@ mod tests {
         );
         assert!(validate_graph_text_admission_index(&wrong_resource).is_err());
 
-        let mut missing_kind = (**index).clone();
+        let mut missing_kind = (*index).clone();
         missing_kind
             .file_is_graph_text_by_exact_relative
             .remove(&"One.md".to_owned());
         assert!(validate_graph_text_admission_index(&missing_kind).is_err());
 
-        drop(state);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -46655,10 +46277,6 @@ mod tests {
             3,
             "live admission must enumerate each graph root once"
         );
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::SnapshotComplete(_)
-        ));
 
         let resource_root = scratch("admission-resource-map-preflight");
         fs::write(
@@ -46719,10 +46337,6 @@ mod tests {
             3,
             "capture-charge overflow must fail after one graph-wide census"
         );
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
-        ));
 
         let _ = fs::remove_dir_all(&capture_root);
         let _ = fs::remove_dir_all(&resource_root);
@@ -46935,10 +46549,6 @@ mod tests {
                 b"- same\n".to_vec(),
             )]
         );
-        assert!(matches!(
-            &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::SnapshotComplete(_)
-        ));
 
         let _ = fs::remove_dir_all(&equal);
         let _ = fs::remove_dir_all(&retarget);
@@ -47069,10 +46679,7 @@ mod tests {
         fs::write(portable.join("pages/foo.md"), b"- lower\n").unwrap();
         let graph = Graph::open(&portable);
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        let state = graph.graph_text_admission.read().unwrap();
-        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
-            panic!("portable collision must remain exact evidence");
-        };
+        let index = graph.guarded_graph_text_identity_index().unwrap();
         assert_eq!(
             index
                 .paths_by_portable_key

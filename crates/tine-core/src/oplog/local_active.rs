@@ -30,7 +30,7 @@ use super::enrollment::VerifiedLocalCompositionError;
 use super::hot_engine::{EngineError, LocalAuthorGeneration, ShardedHotEngine};
 use super::object_store::StoreError;
 use super::sqlite::{
-    LeasedWorkspaceProjection, ProjectionError, SqliteFrontier, TailOverlay, WorkspaceLeaseIdentity,
+    LeasedWorkspaceProjection, ProjectionError, SqliteFrontier, WorkspaceLeaseIdentity,
 };
 use super::{DeviceId, ProjectionEndpointBinding, ProjectionIntentId, SessionId, WorkspaceId};
 
@@ -331,9 +331,6 @@ pub(crate) enum RuntimePromotionError {
     Store(StoreError),
     Engine(EngineError),
     Sqlite(ProjectionError),
-    /// The durable runtime state, clean baseline anchor, or authenticated history
-    /// transition does not authenticate the live runtime.
-    Anchor(&'static str),
     /// This runtime no longer owns the archive-rooted workspace lease and has
     /// latched [`RuntimeRevocation`]. Terminal: recovery is a fresh reopen or
     /// crash takeover, never this runtime.
@@ -351,9 +348,6 @@ impl fmt::Display for RuntimePromotionError {
             Self::Store(error) => error.fmt(formatter),
             Self::Engine(error) => error.fmt(formatter),
             Self::Sqlite(error) => error.fmt(formatter),
-            Self::Anchor(detail) => {
-                write!(formatter, "promoted runtime anchor failed: {detail}")
-            }
             Self::WorkspaceAuthorityRevoked(refusal) => refusal.fmt(formatter),
             Self::WorkspaceAuthorityCheckUnavailable(refusal) => refusal.fmt(formatter),
         }

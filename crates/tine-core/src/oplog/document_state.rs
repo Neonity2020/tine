@@ -719,31 +719,6 @@ pub(crate) fn load_external_current(
     )
 }
 
-/// Load and authenticate only the compact current-state record. The checkpoint
-/// and immutable Loro-history leaves remain lazy until a semantic reader needs
-/// the document itself.
-pub(crate) fn load_external_current_record(
-    store: &Arc<ScratchStore>,
-    roots: &ScratchRoots,
-    lane: DocumentLane,
-    document_id: DocumentId,
-) -> Result<Option<ExternalDocumentStateRecord>, DocumentStateError> {
-    let Some(bytes) = store.lookup(
-        &roots.external_document_current_root,
-        ScratchPageKind::DocumentExternalCurrent,
-        &current_key(lane, document_id),
-    )?
-    else {
-        return Ok(None);
-    };
-    let record: ExternalDocumentStateRecord = decode_canonical(&bytes)?;
-    validate_external_record(store, &record)?;
-    if record.document_id != document_id || record.lane != lane {
-        return Err(DocumentStateError::MisboundRecord);
-    }
-    Ok(Some(record))
-}
-
 pub(crate) fn load_external_current_many(
     store: &Arc<ScratchStore>,
     roots: &ScratchRoots,

@@ -13,23 +13,20 @@ use tine_storage::{LocalJournalError, LocalJournalFrame};
 use uuid::Uuid;
 
 use crate::model::Graph;
-use crate::oplog::batch::ObjectKind;
 use crate::oplog::hot_engine::AcceptedFrontierRoot;
 use crate::oplog::local_active::{LocalRuntimeAdmission, WorkspaceAuthorityBoundary};
 use crate::oplog::object_store::{BatchInspection, StoreError};
 use crate::oplog::{
     decode_managed_local_record, AcceptedBatchEvent, BatchDisposition, BatchId, ContentDigest,
     DeviceId, LineageDigest, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
-    ManifestObjectRef, ManifestProjectionTarget, ObjectStore, PageId, ProjectionEndpointBinding,
-    ProjectionReceiptStore, ProjectionTurn, ProjectionTurnError, ProjectionTurnPayloadKind,
-    ProjectionWork, ProjectionWorkTarget, RebuildSource, SequenceDomain, ShardedHotEngine,
-    SqliteFrontier, TailOverlay, TurnOrigin, TurnPage, TurnPrecondition, TurnTarget, WorkspaceId,
+    ManifestProjectionTarget, ObjectStore, PageId, ProjectionReceiptStore, ProjectionTurn,
+    ProjectionTurnError, ProjectionTurnPayloadKind, SequenceDomain, ShardedHotEngine,
+    SqliteFrontier, TurnOrigin, TurnPage, TurnPrecondition, TurnTarget, WorkspaceId,
     PROJECTION_TURN_DERIVATION_SCHEME_V1, PROJECTION_TURN_SCHEMA_VERSION,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const ENGINE_STAGE_WORK_PER_RESUME: usize = 8;
-const SQLITE_BATCHES_PER_RESUME: usize = 1;
 
 /// Exact point answer derived from the already decoded pending local journal.
 /// The index is rebuildable acceleration state; the journal and hot-prefix
@@ -282,9 +279,7 @@ pub(crate) struct ManagedLocalDerivativeAuthority {
 pub(crate) enum ManagedLocalPublicationState {
     Complete,
     Pending(String),
-    Blocked(String),
     Conflict(String),
-    RecoveryRequired(String),
 }
 
 /// Adapter implemented by the runtime owner of local-authorship receipts and
@@ -514,8 +509,7 @@ pub(crate) fn resume_clean_managed_local_journal_drain(
     )
 }
 
-enum ManagedLocalSqliteMode<'a> {
-    Tail(&'a mut TailOverlay),
+enum ManagedLocalSqliteMode {
     Direct,
 }
 
@@ -526,7 +520,7 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
-    sqlite_mode: ManagedLocalSqliteMode<'_>,
+    sqlite_mode: ManagedLocalSqliteMode,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     superseding_projections: Option<&dyn ManagedLocalSuccessorIndex>,
     checkpoint: &ManagedLocalDrainCheckpoint,
@@ -877,45 +871,6 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
     }
     work_done.accepted_events = 1;
     match sqlite_mode {
-        ManagedLocalSqliteMode::Tail(tail) => {
-            if let Err(error) = tail.try_enqueue(database, engine, &event) {
-                return pending_with_detail(
-                    ManagedLocalDrainStage::TailAndSqlite,
-                    frame,
-                    &record,
-                    error.to_string(),
-                );
-            }
-            if drain_fault!(AfterTailAdmission) {
-                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-            }
-            if let Err(error) =
-                admission.reprove_workspace_authority(WorkspaceAuthorityBoundary::SqliteDrain)
-            {
-                return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string());
-            }
-            let source = match RebuildSource::new(engine, &archive) {
-                Ok(source) => source,
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::TailAndSqlite, error.to_string())
-                }
-            };
-            if drain_fault!(BeforeSqliteCommit) {
-                return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
-            }
-            work_done.sqlite_batches =
-                match tail.drain_ready(database, &source, SQLITE_BATCHES_PER_RESUME) {
-                    Ok(applied) => applied,
-                    Err(error) => {
-                        return pending_with_detail(
-                            ManagedLocalDrainStage::TailAndSqlite,
-                            frame,
-                            &record,
-                            error.to_string(),
-                        )
-                    }
-                };
-        }
         ManagedLocalSqliteMode::Direct => {
             if drain_fault!(AfterTailAdmission) {
                 return pending(ManagedLocalDrainStage::TailAndSqlite, frame, &record);
@@ -1081,18 +1036,8 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         ManagedLocalPublicationState::Pending(_) => {
             return pending(ManagedLocalDrainStage::AuthorshipReceipt, frame, &record)
         }
-        ManagedLocalPublicationState::Blocked(detail) => {
-            return ManagedLocalDrainOutcome::Blocked(ManagedLocalDrainBlock {
-                stage: ManagedLocalDrainStage::AuthorshipReceipt,
-                missing_dependencies: Vec::new(),
-                detail,
-            })
-        }
         ManagedLocalPublicationState::Conflict(detail) => {
             return conflict(ManagedLocalDrainStage::AuthorshipReceipt, detail)
-        }
-        ManagedLocalPublicationState::RecoveryRequired(detail) => {
-            return recovery(ManagedLocalDrainStage::AuthorshipReceipt, detail)
         }
     }
     if drain_fault!(AfterAuthorship) {
@@ -1114,18 +1059,8 @@ fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         ManagedLocalPublicationState::Pending(_) => {
             return pending(ManagedLocalDrainStage::ProviderPublication, frame, &record)
         }
-        ManagedLocalPublicationState::Blocked(detail) => {
-            return ManagedLocalDrainOutcome::Blocked(ManagedLocalDrainBlock {
-                stage: ManagedLocalDrainStage::ProviderPublication,
-                missing_dependencies: Vec::new(),
-                detail,
-            })
-        }
         ManagedLocalPublicationState::Conflict(detail) => {
             return conflict(ManagedLocalDrainStage::ProviderPublication, detail)
-        }
-        ManagedLocalPublicationState::RecoveryRequired(detail) => {
-            return recovery(ManagedLocalDrainStage::ProviderPublication, detail)
         }
     }
     if drain_fault!(AfterProvider) {

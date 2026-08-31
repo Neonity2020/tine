@@ -901,38 +901,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "cap.create_dir",
             1,
         ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "cap.hard_link",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "cap.remove_file",
-            6,
-        ),
-        ("crates/tine-core/src/oplog/enrollment.rs", "cap.rename", 1),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "fs.create_dir_all",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "libc.openat.create",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "libc.renameat2",
-            1,
-        ),
-        ("crates/tine-core/src/oplog/enrollment.rs", "open.create", 1),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "open.create_new",
-            1,
-        ),
         ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
         (
             "crates/tine-core/src/oplog/import.rs",
@@ -1554,7 +1522,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.9.2\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "c0e276af5f4033b9c16eac0b136d71ef297ff0a51f397c8f24ad271e38542c84",
+        "dcfe086b976b2bcb7c6ad9e8b3084943edce1be3dc2c2098c3cabe77c238e43f",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

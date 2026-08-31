@@ -2,20 +2,16 @@
 //!
 //! Discovery is advisory only. It never activates a profile, constructs writer
 //! authority, repairs residue, or transfers an unsafe session. Every later
-//! actor must independently reopen and authenticate the state and acquire the
-//! enrollment/archive writer leases.
+//! actor must independently reopen and authenticate the current runtime state.
 
 use std::path::Path;
 
 use super::enrollment::{
-    inspect_existing_enrollment_at, EnrollmentBindingField, EnrollmentDiscoveryExclusion,
-    EnrollmentDiscoveryHandoff, EnrollmentDiscoveryInspection, EnrollmentDiscoveryLifecycle,
-    EnrollmentError,
+    inspect_existing_enrollment_at, EnrollmentBindingField, EnrollmentDiscoveryInspection,
+    EnrollmentDiscoveryLifecycle, EnrollmentError,
 };
 use super::object_store::{inspect_existing_archive_at, ArchiveDiscoveryInspection, StoreError};
-use super::{
-    CanonicalGraphResourceId, ContentDigest, ImportId, ManagedStorageRefusalScenario, SessionId,
-};
+use super::{CanonicalGraphResourceId, ContentDigest, ManagedStorageRefusalScenario};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartupStorageProfile {
@@ -87,7 +83,6 @@ pub(crate) enum AmbiguousEvidence {
     ArchiveResidue,
     ArchiveNamespace,
     ArchiveBinding,
-    ActiveArchiveMismatch,
 }
 
 /// Classify explicitly supplied graph/runtime/archive identities without
@@ -166,7 +161,7 @@ pub(crate) fn discover_startup(request: &DiscoveryRequest<'_>) -> DiscoveryClass
 pub(crate) fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClassification {
     let detail = error.to_string();
     match error {
-        EnrollmentError::Io(_) | EnrollmentError::InjectedCrashCut(_) => {
+        EnrollmentError::Io(_) => {
             DiscoveryClassification::Retryable(DiscoveryComponent::Enrollment, detail)
         }
         EnrollmentError::UnsupportedAuthoritySchema(_)
@@ -199,9 +194,7 @@ pub(crate) fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClas
                 ManagedStorageRefusalScenario::Bounds,
             )
         }
-        EnrollmentError::AmbiguousInitialCreation
-        | EnrollmentError::AmbiguousRecordPublication
-        | EnrollmentError::AmbiguousAuthorityProvisioning => {
+        EnrollmentError::AmbiguousAuthorityProvisioning => {
             DiscoveryClassification::AmbiguousOrForeignResidue(
                 AmbiguousEvidence::EnrollmentNamespace,
                 ManagedStorageRefusalScenario::CrashTruncated,
@@ -209,11 +202,8 @@ pub(crate) fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClas
         }
         EnrollmentError::BindingMismatch(_)
         | EnrollmentError::UnsupportedArtifact(_)
-        | EnrollmentError::InitialPreparationMismatch
-        | EnrollmentError::LocalActivationReservationMismatch
         | EnrollmentError::PublishedBatchMismatch
         | EnrollmentError::SharedEnrollmentBindingMismatch
-        | EnrollmentError::SharedProjectionBaseMismatch(_)
         | EnrollmentError::SharedEnrollmentDescriptorDigestMismatch
         | EnrollmentError::DirtyUniqueLocalTail => {
             DiscoveryClassification::AmbiguousOrForeignResidue(
@@ -221,15 +211,10 @@ pub(crate) fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClas
                 ManagedStorageRefusalScenario::SyncConflict,
             )
         }
-        EnrollmentError::LeaseContended(_) | EnrollmentError::StaleCompareAndSwap => {
-            DiscoveryClassification::Retryable(DiscoveryComponent::Enrollment, detail)
-        }
         EnrollmentError::AuthorityClaimTooLarge(_)
-        | EnrollmentError::LocalActivationReservationTooLarge(_)
         | EnrollmentError::RecordTooLarge(_)
         | EnrollmentError::JsonDepthExceeded
-        | EnrollmentError::JsonTokenBoundExceeded
-        | EnrollmentError::InvalidPageLimit(_) => DiscoveryClassification::CorruptOrUnreadable(
+        | EnrollmentError::JsonTokenBoundExceeded => DiscoveryClassification::CorruptOrUnreadable(
             DiscoveryComponent::Enrollment,
             ManagedStorageRefusalScenario::Bounds,
         ),

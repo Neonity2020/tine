@@ -13,7 +13,7 @@ use crate::Graph;
 
 use super::absence_sweep::{SweepError, SweepRecorder};
 use super::enrollment::{EnrollmentError, VerifiedLocalCompositionError};
-use super::hot_engine::{EngineError, LocalAuthorCapture, ReconciliationNeeded};
+use super::hot_engine::{LocalAuthorCapture, ReconciliationNeeded};
 use super::import::plan_clean_affected_import;
 use super::local_active::{
     CleanRuntimeSession, LocalRuntimeAdmission, RuntimePromotionError, RuntimeRevocation,
@@ -21,11 +21,11 @@ use super::local_active::{
 };
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
-    ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, LineageDigest, ObjectStore,
-    OperationTransaction, PageId, PreparedBatch, ProjectionEndpointBinding, ProjectionError,
-    ProjectionReceiptStore, ProjectionWork, RebuildSource, SessionId, ShardedHotEngine,
-    SqliteFrontier, TailOverlay, TailReservation,
+    ContentDigest, CrdtPeerId, ImportPlanStatus, OperationTransaction, PageId, PreparedBatch,
+    ProjectionEndpointBinding, ProjectionReceiptStore, SessionId, ShardedHotEngine, SqliteFrontier,
 };
+#[cfg(test)]
+use super::{ObjectStore, RebuildSource, TailOverlay};
 use crate::oplog::projection_turn_journal::ProjectionTurnJournalState;
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
@@ -82,10 +82,8 @@ pub(crate) enum OperationalPhase {
     Draft,
     Capture,
     Finalize,
-    TailReservation,
     Publication,
     ArchiveStage,
-    TailAdmission,
     SqliteDrain,
     ProjectionDrain,
 }
