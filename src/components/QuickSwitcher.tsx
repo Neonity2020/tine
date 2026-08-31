@@ -421,8 +421,16 @@ export function QuickSwitcher(): JSX.Element {
       e.preventDefault();
       const it = flat()[sel()];
       if (it) {
+        // GH #463: the keyboard half of the same ladder the pointer already
+        // implements below. Ctrl/Cmd+Enter was the one rung missing, so it fell
+        // through to plain navigation and the modifier did nothing — while
+        // Ctrl/Cmd+click on the very same row opened a background tab. Like the
+        // click, it leaves the switcher open, so several results can be fanned
+        // out without searching again.
         const shiftOnly = e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+        const cmdCtrlOnly = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
         if (shiftOnly && !switcherEmbryo() && (it.t === "page" || it.t === "block")) chooseSidebar(it);
+        else if (cmdCtrlOnly && (it.t === "page" || it.t === "block")) openInBackground(it);
         else if (e.altKey && !switcherEmbryo()) void chooseOther(it);
         else choose(it);
       }

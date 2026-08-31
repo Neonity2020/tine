@@ -179,6 +179,49 @@ describe("QuickSwitcher modified clicks (GH #288)", () => {
     }
   });
 
+  // GH #463: the keyboard half of the same contract. Ctrl/Cmd+Enter on the
+  // highlighted row must land exactly where Ctrl/Cmd+click on that row lands.
+  it("Ctrl/Cmd+Enter fans a background tab, matching Ctrl/Cmd+click (GH #463)", async () => {
+    for (const mod of [{ ctrlKey: true }, { metaKey: true }]) {
+      const { root, dispose } = mount();
+      setRecentPages([{ name: "Alpha", kind: "page" }]);
+      openSwitcher();
+      await settle();
+      const tabCountBefore = paneRouter("main").tabs().length;
+
+      pressEnter(root, mod);
+      await settle();
+
+      expect(switcherOpen()).toBe(true);
+      const tabs = paneRouter("main").tabs();
+      expect(tabs.length).toBe(tabCountBefore + 1);
+      expect(tabs.some((t) => routeTitle(t.history[t.pos]) === "Alpha")).toBe(true);
+      // The origin pane keeps its own route: the new tab is in the background.
+      expect(routeTitle(paneRouter("main").route())).toBe("Journals");
+
+      dispose();
+      closeSwitcher();
+      setRecentPages([]);
+      resetPaneLayoutToSingle(journalsSnapshot());
+      document.body.innerHTML = "";
+    }
+  });
+
+  it("plain Enter still navigates in place and closes the switcher (GH #463 control)", async () => {
+    const { root } = mount();
+    setRecentPages([{ name: "Alpha", kind: "page" }]);
+    openSwitcher();
+    await settle();
+    const tabCountBefore = paneRouter("main").tabs().length;
+
+    pressEnter(root, {});
+    await settle();
+
+    expect(switcherOpen()).toBe(false);
+    expect(paneRouter("main").tabs().length).toBe(tabCountBefore);
+    expect(routeTitle(paneRouter("main").route())).toBe("Alpha");
+  });
+
   it("Alt+click uses the existing other-pane action and closes the switcher", async () => {
     const { root } = mount();
     setRecentPages([{ name: "Alpha", kind: "page" }]);
