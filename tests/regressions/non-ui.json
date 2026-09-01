@@ -2,6 +2,21 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-SESSION-ATOMIC-DURABILITY-001",
+   "title": "App-private session state is published through a named crash-durable atomic replacement protocol",
+   "family": "app-private-data-safety",
+   "sources": { "issues": [], "commits": [], "internal": "2026-09 invariant sweep B5s" },
+   "platforms": ["all"],
+   "layer": "tauri-native",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/settings.rs"],
+    "scenario": "settings.session-atomic-durable-publication",
+    "failBefore": "proven on exact base 2dcd01341e6797f1223d35bc2d1fdd7a4f98f910 by app_private_durable_publications_stay_on_named_audited_paths"
+   },
+   "notes": "The pre-fix session saver used a bare whole-file temp write followed by rename, without syncing the file or destination directory, while sibling durable settings writers already used audited protocols. The guard requires named audited publication; behavioral tests cover stale-temp isolation, burst-valid atomic replacement, and temp cleanup. Legacy migration receives the same strict directory-barrier error policy."
+  },
+  {
    "id": "REG-MANAGED-REFERRER-BOUNDED-PREFIX-001",
    "title": "Bounded managed block referrers retain the exact Direct Files document-order prefix and result accounting",
    "family": "managed-query-parity",
