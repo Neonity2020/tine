@@ -2914,6 +2914,14 @@ fn advanced_pred(
     current_page: Option<&str>,
     today: JournalDate,
 ) -> (Option<Pred>, Vec<String>, Vec<String>) {
+    // Both limits live here, not only at the two `run_advanced_*` entry points,
+    // because `page_affects_advanced_query` reaches this function directly. It
+    // used to skip the byte ceiling entirely, which made scoped invalidation the
+    // one caller that could hand an unbounded graph-authored string to the
+    // parser — the exact thing QUERY_SOURCE_MAX_BYTES exists to prevent.
+    if !query_source_within_limit(query_src) {
+        return (None, Vec::new(), vec!["query-too-large".to_string()]);
+    }
     if !query_nesting_within_limit(query_src) {
         return (None, Vec::new(), vec!["query-nesting-too-deep".to_string()]);
     }
@@ -5475,6 +5483,20 @@ mod tests {
         let oversized = "x".repeat(QUERY_SOURCE_MAX_BYTES + 1);
         assert!(!query_source_within_limit(&oversized));
         assert!(Pred::parse(&oversized, TODAY).is_none());
+
+        // The advanced parser must fail closed on size too, at `advanced_pred`
+        // itself. `page_affects_advanced_query` calls it directly, so a ceiling
+        // enforced only at the `run_advanced_*` entry points is not the shared
+        // ceiling this module's doc comment promises.
+        let oversized_advanced = format!(
+            "[:find (pull ?b [*]) :where (property ?b :note \"{}\")]",
+            "y".repeat(QUERY_SOURCE_MAX_BYTES)
+        );
+        assert!(!query_source_within_limit(&oversized_advanced));
+        let (rejected, ran, ignored) = advanced_pred(&oversized_advanced, None, TODAY);
+        assert!(rejected.is_none());
+        assert!(ran.is_empty());
+        assert!(ignored.iter().any(|item| item == "query-too-large"));
 
         let harmless = format!("(and (content \"{}\"))", "(".repeat(QUERY_NESTING_MAX + 10));
         assert!(query_nesting_within_limit(&harmless));
