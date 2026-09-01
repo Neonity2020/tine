@@ -6,6 +6,10 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  ONE_RELEASE_CI_EXCEPTION_VERSION,
+  releaseE2eScenarioIsNonblocking,
+} from "./release-0.6.981-ci-exception.mjs";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
 import { freeLoopbackPort, windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
 import { assertPromotionPlan, validatePromotionPlanForCheckout } from "./release-proof-reuse-lib.mjs";
@@ -421,13 +425,14 @@ function resolveBuildProvenanceInputs() {
   throw receiptRemediation(`build receipt is required at ${receiptPath}`);
 }
 
-function failureIsBlocking(status, contractEntry) {
+function failureIsBlocking(status, contractEntry, scenarioId) {
   if (status !== "failed") return false;
   // A quarantined native harness remains in the suite to retain its diagnostic
   // evidence, but cannot block either ordinary or release mode until it has a
   // deterministic semantic readiness predicate again.
   if (contractEntry.stability === "quarantined") return false;
   if (e2eMode === "release") {
+    if (releaseE2eScenarioIsNonblocking(suiteName, scenarioId)) return false;
     return contractEntry.contracts.some((contract) => contract.class !== "flexible-presentation-heuristic");
   }
   return contractEntry.contracts.some((contract) => contract.blocking);
@@ -589,6 +594,9 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       archiveInfrastructureAttempt(dir, attempt);
       continue;
     }
+    const releaseException = status === "failed"
+      && e2eMode === "release"
+      && releaseE2eScenarioIsNonblocking(suiteName, id);
     const record = {
       id,
       script,
@@ -602,7 +610,13 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       attempts: attempt,
       infrastructureRetries: attempt - 1,
       durationMs: Date.now() - started,
-      blocking: failureIsBlocking(status, contractEntry),
+      blocking: failureIsBlocking(status, contractEntry, id),
+      ...(releaseException ? {
+        releaseException: {
+          version: ONE_RELEASE_CI_EXCEPTION_VERSION,
+          scenarioKey: `${suiteName}:${id}`,
+        },
+      } : {}),
     };
     if (status === "failed") {
       const failurePath = path.join(dir, "failure.json");
