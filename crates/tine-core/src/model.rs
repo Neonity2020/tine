@@ -21086,6 +21086,113 @@ impl Graph {
         })
     }
 
+    /// Compose the durable recovery record for one Direct cross-page move
+    /// (packet B2; I-3, I-2). See `crate::direct_move_recovery` and
+    /// `docs/contracts/direct-move-recovery.md`.
+    ///
+    /// The caller has already performed the in-memory move, so `destination`
+    /// and `sources` are the POST-move DTOs. For each participant this resolves
+    /// the exact file the ordinary save will write, reads its current bytes (the
+    /// preimage) and serializes the proposed bytes (the postimage) through the
+    /// SAME `serialize_page_dto_for_path` boundary the save itself uses — so the
+    /// recorded postimage is byte-identical to what the save publishes, which is
+    /// what lets recovery complete the move without a parser (I-4).
+    ///
+    /// `Ok(None)` means "no record is needed": every participant resolves to the
+    /// same file, i.e. the move is degenerate and is a single ordinary save that
+    /// the existing base-revision guard already makes safe. Composition never
+    /// refuses the move — an `Err` here is reported and the move proceeds
+    /// unbracketed, exactly as it did before B2, because refusing to move a page
+    /// because device-private state is unavailable would be an availability bug,
+    /// not hardening (contract §4).
+    pub fn prepare_direct_cross_page_move(
+        &self,
+        destination: &PageDto,
+        sources: &[PageDto],
+    ) -> io::Result<Option<crate::direct_move_recovery::PreparedDirectMove>> {
+        use crate::direct_move_recovery::{
+            DirectMoveRecord, ImageRef, MoveParticipant, ParticipantRole, PreparedDirectMove,
+            RECORD_SCHEMA,
+        };
+
+        let write = self.admit_managed_text_writer()?;
+        let mut images: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut participants: Vec<MoveParticipant> = Vec::new();
+        let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+
+        for (role, page) in std::iter::once((ParticipantRole::Destination, destination))
+            .chain(sources.iter().map(|page| (ParticipantRole::Source, page)))
+        {
+            if page.guide || page.read_only {
+                return Ok(None); // never persisted; a record would name a file that is never written
+            }
+            let (path, _cache) = self.save_target(&write, page)?;
+            if !seen.insert(path.clone()) {
+                // The same physical file on both sides of the move. Degenerate:
+                // one ordinary save, already convergent.
+                return Ok(None);
+            }
+            let existing: Option<String> = match fs::read(&path) {
+                Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "page file is not UTF-8; no move record composed",
+                    )
+                })?),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let (_doc, postimage) =
+                self.serialize_page_dto_for_path(page, &path, existing.as_deref())?;
+
+            let preimage_ref = match &existing {
+                None => ImageRef::Absent,
+                Some(content) => {
+                    let bytes = content.as_bytes().to_vec();
+                    let image = ImageRef::blob_of(&bytes);
+                    if let ImageRef::Blob { sha256, .. } = &image {
+                        images.entry(sha256.clone()).or_insert(bytes);
+                    }
+                    image
+                }
+            };
+            let postimage_bytes = postimage.as_bytes().to_vec();
+            let postimage_ref = ImageRef::blob_of(&postimage_bytes);
+            if let ImageRef::Blob { sha256, .. } = &postimage_ref {
+                images.entry(sha256.clone()).or_insert(postimage_bytes);
+            }
+
+            participants.push(MoveParticipant {
+                role,
+                relative_path: self.rel_path(&path),
+                page_name: page.name.clone(),
+                page_kind: match page.kind {
+                    PageKind::Journal => "journal".to_string(),
+                    PageKind::Page => "page".to_string(),
+                },
+                base_revision: existing.as_deref().map(content_rev),
+                preimage: preimage_ref,
+                postimage: postimage_ref,
+            });
+        }
+
+        if participants.len() < 2 {
+            return Ok(None);
+        }
+
+        Ok(Some(PreparedDirectMove {
+            record: DirectMoveRecord {
+                schema: RECORD_SCHEMA,
+                move_id: crate::direct_move_recovery::new_move_id(),
+                graph_root: self.root.display().to_string(),
+                created_unix_ms: crate::direct_move_recovery::unix_millis_now(),
+                participants,
+            },
+            images,
+        }))
+    }
+
     /// Save a page, refusing to clobber an external change. If the file on disk
     /// no longer matches what Tine last knew (another app or a Syncthing pull
     /// wrote it), returns an `AlreadyExists` "conflict" error WITHOUT writing,

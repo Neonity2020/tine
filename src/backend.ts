@@ -299,6 +299,16 @@ export interface Backend {
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
+  /** Publish the durable recovery record for one Direct cross-page move BEFORE
+   *  the first page is written (packet B2, I-3/I-2). `destination` and
+   *  `sources` are the POST-move DTOs, in the exact order the choreography
+   *  saves them. Resolves to the record id, or `null` when no record was
+   *  composed — a degenerate move, or an unavailable app-private root. `null`
+   *  never refuses the move; see `docs/contracts/direct-move-recovery.md` §4. */
+  beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]): Promise<string | null>;
+  /** Retire that record once every participant is durably terminal. Resolves to
+   *  whether it was retired; a record left behind is converged at the next open. */
+  finishDirectCrossPageMove(moveId: string): Promise<boolean>;
   /** X1 native bridge only. Production gesture routing remains disabled until
    * X2 owns quiescence, leases, publication, and semantic history. */
   moveManagedApplicationSubtrees(
@@ -1094,6 +1104,12 @@ class TauriBackend implements Backend {
         managedConflictObservation,
       })
     );
+  }
+  beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]) {
+    return this.call<string | null>("begin_direct_cross_page_move", { destination, sources });
+  }
+  finishDirectCrossPageMove(moveId: string) {
+    return this.call<boolean>("finish_direct_cross_page_move", { moveId });
   }
   moveManagedApplicationSubtrees(
     bindingGeneration: number,

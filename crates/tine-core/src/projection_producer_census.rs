@@ -911,6 +911,31 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ),
         ("crates/tine-core/src/concord_ledger.rs", "fs.rename", 1),
         ("crates/tine-core/src/concord_ledger.rs", "fs.write", 1),
+        // The Direct cross-page move recovery store (packet B2). Its GRAPH
+        // writes are not here because they are not raw primitives: every page
+        // byte it publishes goes through `model::atomic_write`, which is why
+        // this file appears in the `atomic_write` caller count below. What is
+        // left is the app-private store's own housekeeping — creating its three
+        // subdirectories, retiring a record, dropping an unreferenced blob,
+        // quarantining a malformed record — plus the one primitive an atomic
+        // write cannot express: removing a page file when rolling a move back
+        // to "this page did not exist". See
+        // `docs/contracts/direct-move-recovery.md`.
+        (
+            "crates/tine-core/src/direct_move_recovery.rs",
+            "fs.create_dir_all",
+            5,
+        ),
+        (
+            "crates/tine-core/src/direct_move_recovery.rs",
+            "fs.remove_file",
+            4,
+        ),
+        (
+            "crates/tine-core/src/direct_move_recovery.rs",
+            "fs.rename",
+            1,
+        ),
         (
             "crates/tine-core/src/direct_projection.rs",
             "fs.create_dir_all",
@@ -1297,7 +1322,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("rename_projection_noreplace_platform", 1),
         ("rename_managed_noreplace", 3),
         ("atomic_publish", 2),
-        ("atomic_write", 6),
+        // +4 from `direct_move_recovery.rs` (packet B2): the record, each
+        // content-addressed image blob, a quarantined record, and every page a
+        // recovery completes or rolls back. Recovery writes graph bytes through
+        // the SAME named audited protocol an ordinary save uses.
+        ("atomic_write", 10),
         ("atomic_write_new", 11),
         ("atomic_replace_expected_with_hooks", 1),
         ("atomic_copy", 0),
