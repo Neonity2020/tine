@@ -355,26 +355,47 @@ mod tests {
             let module_directory = module_directory(source_path);
             let mut modules = Vec::new();
             for suffix in source.split("#[cfg(test)]").skip(1) {
-                let declaration = suffix
-                    .trim_start()
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .trim();
-                let declaration = declaration
-                    .strip_prefix("pub(crate) ")
-                    .or_else(|| declaration.strip_prefix("pub "))
-                    .unwrap_or(declaration);
-                let Some(name) = declaration
-                    .strip_prefix("mod ")
-                    .and_then(|name| name.strip_suffix(';'))
-                else {
+                // A test-only module is declared either directly
+                //     #[cfg(test)] mod tests;            -> src/<stem>/tests.rs
+                // or through an explicit sibling path
+                //     #[cfg(test)] #[path = "x_tests.rs"] mod tests;
+                // The sibling form is what the two extracted monster-file test
+                // modules use, because their `include_str!("<own file>.rs")`
+                // source-scan guards resolve relative to the including file and
+                // would silently read the wrong path from a subdirectory.
+                let mut explicit_path: Option<&str> = None;
+                let mut name: Option<&str> = None;
+                for line in suffix.trim_start().lines() {
+                    let line = line.trim();
+                    if let Some(rest) = line
+                        .strip_prefix("#[path = \"")
+                        .and_then(|rest| rest.strip_suffix("\"]"))
+                    {
+                        explicit_path = Some(rest);
+                        continue;
+                    }
+                    let line = line
+                        .strip_prefix("pub(crate) ")
+                        .or_else(|| line.strip_prefix("pub "))
+                        .unwrap_or(line);
+                    name = line
+                        .strip_prefix("mod ")
+                        .and_then(|name| name.strip_suffix(';'));
+                    break;
+                }
+                let Some(name) = name else {
                     continue;
                 };
-                for candidate in [
-                    module_directory.join(format!("{name}.rs")),
-                    module_directory.join(name).join("mod.rs"),
-                ] {
+                let candidates = match explicit_path {
+                    Some(relative) => {
+                        vec![source_path.parent().unwrap().join(relative)]
+                    }
+                    None => vec![
+                        module_directory.join(format!("{name}.rs")),
+                        module_directory.join(name).join("mod.rs"),
+                    ],
+                };
+                for candidate in candidates {
                     if candidate.exists() {
                         modules.push(candidate);
                     }
