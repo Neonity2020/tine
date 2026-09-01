@@ -219,6 +219,9 @@ type SettingSearchEntry = {
   description: string;
   aliases?: string[];
   level?: "advanced" | "experimental";
+  /** The setting itself is rendered only on desktop, so search must not offer a
+   * result that scrolls to nothing on Android/iOS. */
+  desktopOnly?: true;
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "diagnostics", label: "Diagnostic report", description: "bug report flight recorder timings previous run privacy" },
@@ -259,7 +262,7 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "journals", label: "Agenda window", description: "scheduled deadline days" },
   { tab: "files", label: "New asset filename", description: "paste drag media names" },
   { tab: "files", label: "Watch for external edits", description: "inotify polling network filesystem" },
-  { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced" },
+  { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced", desktopOnly: true },
   { tab: "backups", label: "Snapshots to keep", description: "recovery retention conflicts" },
   {
     tab: "backups",
@@ -309,7 +312,9 @@ export function Settings(): JSX.Element {
   const availableTabs = createMemo(() => pluginsAvailable() ? TABS : TABS.filter((entry) => entry.id !== "plugins"));
   const matches = createMemo(() => {
     const query = settingsQuery();
-    return query.trim() ? SETTING_SEARCH.filter((entry) => settingMatches(entry, query)) : [];
+    if (!query.trim()) return [];
+    const desktop = settingsPlatform() === "desktop";
+    return SETTING_SEARCH.filter((entry) => (desktop || !entry.desktopOnly) && settingMatches(entry, query));
   });
   const openSearchResult = (entry: SettingSearchEntry) => {
     setTab(entry.tab);
@@ -3626,6 +3631,15 @@ function reviewInPage(path: string, name: string, kind: "page" | "journal"): voi
 }
 
 function FilesTab(props: { search: string }): JSX.Element {
+  // Unknown platforms fail closed to "not desktop": a section whose backend
+  // command errors on this platform must not be offered.
+  const [filesPlatform] = createResource(async () => {
+    try {
+      return await platformKind();
+    } catch {
+      return undefined;
+    }
+  });
   // Live preview of the asset-name template, on a fixed sample so every token is
   // visible (and the example doesn't jitter by the second). Shows both a named
   // drag/insert and a clipboard paste (which has no name → timestamp fallback).
@@ -3722,9 +3736,18 @@ function FilesTab(props: { search: string }): JSX.Element {
         </div>
       </Field>
 
-      <AdvancedSection tab="files" forceOpen={advancedMatch("files", props.search)}>
-        <MediaEditorsSection />
-      </AdvancedSection>
+      {/* "Desktop only" is a claim about the backend, not a style: both
+          `edit_asset_external` and `detect_media_editor` refuse on mobile
+          (src-tauri/src/commands.rs, `#[cfg(not(desktop))]`). Gate the section
+          rather than only saying so in its hint text. `MediaEditorsSection` is
+          the whole content of Files → Advanced today; if a non-desktop item is
+          ever added there, move this guard onto the section itself.
+          Pinned by Settings.mediaEditors.platform.test.tsx. */}
+      <Show when={filesPlatform() === "desktop"}>
+        <AdvancedSection tab="files" forceOpen={advancedMatch("files", props.search)}>
+          <MediaEditorsSection />
+        </AdvancedSection>
+      </Show>
 
       <AssetsTab />
     </>
