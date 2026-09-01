@@ -71,6 +71,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   containers while leaving invalid math, code spans, Org, and unrelated link
   labels unchanged. ([GH #460](https://github.com/martinkoutecky/tine/issues/460))
 
+- **Typing a PDF page number and pressing Enter now stays on that page.** The
+  input could jump the reader and then immediately restore the old page number
+  when it lost focus, so the requested position was not retained or restored
+  with the PDF tab.
+
 - **Annotating a PDF while its notes page was being saved could freeze Tine
   completely.** The two writers of an `hls__` page took the same two internal
   locks in opposite orders, so each could end up waiting for the other. Because

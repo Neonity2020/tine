@@ -243,6 +243,37 @@
     },
     {
       "section": "Fixed",
+      "text": "**Typing a PDF page number and pressing Enter now stays on that page.** The input could jump the reader and then immediately restore the old page number when it lost focus, so the requested position was not retained or restored with the PDF tab.",
+      "userVisible": true,
+      "regressions": [
+        "UI-PDF-ROUTE-PANE-SESSION-20260830"
+      ],
+      "guide": {
+        "status": "current",
+        "reason": "The canonical Guide already describes the PDF page-number control and restored pane-tab state.",
+        "refs": [
+          "crates/tine-core/src/templates/research-document.md",
+          "crates/tine-core/src/templates/pdf.md"
+        ]
+      },
+      "docs": {
+        "status": "not-applicable",
+        "reason": "No engineering contract or public API changes for this release item.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch item does not require a separate public marketing-site change.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the changelog carries the relevant release detail and Martin excluded Reddit/blog sync.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
       "text": "**Annotating a PDF while its notes page was being saved could freeze Tine completely.** The two writers of an `hls__` page took the same two internal locks in opposite orders, so each could end up waiting for the other. Because one of those locks is shared by the whole graph, the freeze was not confined to that page: once it happened, no further edit anywhere in the graph could be saved until Tine was restarted. Six write paths took the locks in the wrong order — PDF opening and annotation, the three conflict-resolution paths, and one projection-recovery path — and all of them now take them in the order the ordinary page save has always used. A check that walks the source now fails the build if any future write path reintroduces the inversion. Only debug builds ever reported this as an error; release builds, which is what everyone runs, froze silently, which is why it survived so long.",
       "userVisible": true,
       "regressions": [
