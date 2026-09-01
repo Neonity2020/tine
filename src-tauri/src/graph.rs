@@ -1183,7 +1183,8 @@ pub(crate) async fn begin_direct_cross_page_move(
     let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let app_state = app.state::<AppState>();
-        let slot = crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
+        let slot =
+            crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
         let graph = slot.legacy_graph()?;
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             crate::debug::diag(
@@ -1208,7 +1209,7 @@ pub(crate) async fn begin_direct_cross_page_move(
         };
         let store = tine_core::direct_move_recovery::RecoveryStore::new(store_root);
         let move_id = prepared.record.move_id.clone();
-        match store.commit(&prepared.record, &prepared.images) {
+        match store.commit_record(&prepared.record, &prepared.images) {
             Ok(()) => Ok(Some(move_id)),
             Err(error) => {
                 crate::debug::diag(format!(
@@ -1239,7 +1240,8 @@ pub(crate) async fn finish_direct_cross_page_move(
     let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let app_state = app.state::<AppState>();
-        let slot = crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
+        let slot =
+            crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
         let graph = slot.legacy_graph()?;
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             return Ok(false);

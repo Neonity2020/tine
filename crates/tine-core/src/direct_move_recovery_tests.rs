@@ -12,7 +12,6 @@
 //! side of the same claim — that `src/store.ts` really emits that order — is
 //! pinned by `src/directMoveOrder.test.ts`.
 
-use super::*;
 use crate::direct_move_recovery::{
     direct_move_durable_steps, recover_all, retire_if_terminal, DirectMoveRecord, DurableStep,
     ImageRef, MoveParticipant, ParticipantRole, RecordOutcome, RecoveryStore, RECORD_SCHEMA,
@@ -81,7 +80,9 @@ impl Drop for Fixture {
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -138,7 +139,7 @@ fn run_to_cut(
     for step in steps.into_iter().take(cut) {
         match step {
             DurableStep::CommitRecord => store
-                .commit(&prepared.record, &prepared.images)
+                .commit_record(&prepared.record, &prepared.images)
                 .expect("record commits"),
             DurableStep::WriteDestination => {
                 graph
@@ -181,8 +182,14 @@ fn uncrashed_terminal_bytes(tag: &str, build: impl Fn(&Fixture)) -> BTreeMap<Str
 
 fn two_source_graph(fixture: &Fixture) {
     fixture.write("pages/Today.md", "- today keeps this\n");
-    fixture.write("pages/Older.md", "- moves out of older\n- older keeps this\n");
-    fixture.write("pages/Oldest.md", "- moves out of oldest\n- oldest keeps this\n");
+    fixture.write(
+        "pages/Older.md",
+        "- moves out of older\n- older keeps this\n",
+    );
+    fixture.write(
+        "pages/Oldest.md",
+        "- moves out of oldest\n- oldest keeps this\n",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -228,8 +235,14 @@ fn every_crash_cut_of_a_two_source_move_converges_on_reopen() {
         // fails and tells you the matrix has stopped testing anything.
         let mid_crash = fixture.snapshot();
         if (2..=3).contains(&cut) {
-            assert_ne!(mid_crash, before, "cut {cut}: expected a half-move, not the pre-move graph");
-            assert_ne!(mid_crash, after, "cut {cut}: expected a half-move, not a finished move");
+            assert_ne!(
+                mid_crash, before,
+                "cut {cut}: expected a half-move, not the pre-move graph"
+            );
+            assert_ne!(
+                mid_crash, after,
+                "cut {cut}: expected a half-move, not a finished move"
+            );
         }
 
         let report = recover_all(&fixture.store_root, &fixture.graph_root);
@@ -329,7 +342,7 @@ fn a_removal_without_its_addition_is_rolled_back() {
             .unwrap();
         fixture
             .store()
-            .commit(&prepared.record, &prepared.images)
+            .commit_record(&prepared.record, &prepared.images)
             .unwrap();
         // Only the removal lands. The destination never gains the block.
         graph
@@ -342,7 +355,10 @@ fn a_removal_without_its_addition_is_rolled_back() {
     let report = recover_all(&fixture.store_root, &fixture.graph_root);
     assert_eq!(
         report.outcomes,
-        vec![(record.move_id, RecordOutcome::RolledBack { pages_written: 1 })]
+        vec![(
+            record.move_id,
+            RecordOutcome::RolledBack { pages_written: 1 }
+        )]
     );
     assert_eq!(
         fixture.snapshot(),
@@ -357,10 +373,7 @@ fn a_removal_without_its_addition_is_rolled_back() {
 #[test]
 fn an_external_write_to_any_participant_quarantines_instead_of_converging() {
     for victim in ["pages/Today.md", "pages/Older.md", "pages/Oldest.md"] {
-        let fixture = Fixture::new(&format!(
-            "external-{}",
-            victim.replace(['/', '.'], "-")
-        ));
+        let fixture = Fixture::new(&format!("external-{}", victim.replace(['/', '.'], "-")));
         two_source_graph(&fixture);
         let record = {
             let graph = Graph::open(&fixture.graph_root);
@@ -371,7 +384,7 @@ fn an_external_write_to_any_participant_quarantines_instead_of_converging() {
                 .unwrap();
             fixture
                 .store()
-                .commit(&prepared.record, &prepared.images)
+                .commit_record(&prepared.record, &prepared.images)
                 .unwrap();
             graph
                 .save_page(&destination, destination.rev.as_deref())
@@ -432,7 +445,7 @@ fn record_composed_after_the_destination_landed_still_completes_forward() {
             .unwrap();
         fixture
             .store()
-            .commit(&prepared.record, &prepared.images)
+            .commit_record(&prepared.record, &prepared.images)
             .unwrap();
     }
     let report = recover_all(&fixture.store_root, &fixture.graph_root);
@@ -456,10 +469,7 @@ fn a_same_page_move_composes_no_record() {
     let fixture = Fixture::new("degenerate");
     fixture.write("pages/Today.md", "- a\n- b\n");
     let graph = Graph::open(&fixture.graph_root);
-    let mut dto = graph
-        .load_named("Today", PageKind::Page)
-        .unwrap()
-        .unwrap();
+    let mut dto = graph.load_named("Today", PageKind::Page).unwrap().unwrap();
     dto.blocks.swap(0, 1);
     assert!(graph
         .prepare_direct_cross_page_move(&dto, std::slice::from_ref(&dto))
@@ -499,7 +509,10 @@ fn a_journal_and_a_named_page_participate_identically() {
         prepared.record.participants[0].relative_path,
         "journals/2026_09_01.md"
     );
-    assert_eq!(prepared.record.participants[1].relative_path, "pages/Project.md");
+    assert_eq!(
+        prepared.record.participants[1].relative_path,
+        "pages/Project.md"
+    );
 }
 
 /// A move whose destination file does not exist yet: the preimage is genuinely
@@ -522,7 +535,7 @@ fn a_move_into_a_page_with_no_file_rolls_back_by_removing_it() {
         assert_eq!(prepared.record.participants[0].base_revision, None);
         fixture
             .store()
-            .commit(&prepared.record, &prepared.images)
+            .commit_record(&prepared.record, &prepared.images)
             .unwrap();
         // Only the removal lands — the destination file is never created.
         graph.save_page(&source, source.rev.as_deref()).unwrap();
@@ -531,7 +544,10 @@ fn a_move_into_a_page_with_no_file_rolls_back_by_removing_it() {
     let report = recover_all(&fixture.store_root, &fixture.graph_root);
     assert_eq!(
         report.outcomes,
-        vec![(record.move_id, RecordOutcome::RolledBack { pages_written: 1 })]
+        vec![(
+            record.move_id,
+            RecordOutcome::RolledBack { pages_written: 1 }
+        )]
     );
     assert_eq!(fixture.snapshot(), before);
     assert!(!fixture.graph_root.join("pages/Today.md").exists());
@@ -666,7 +682,7 @@ fn both_terminal_states_are_byte_exact_for_every_format_shape() {
                     .unwrap();
                 fixture
                     .store()
-                    .commit(&prepared.record, &prepared.images)
+                    .commit_record(&prepared.record, &prepared.images)
                     .unwrap();
                 graph
                     .save_page(&sources[0], sources[0].rev.as_deref())
@@ -725,13 +741,12 @@ fn duplicate_looking_identities_bind_the_physical_file() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        prepared.record.participants[0].relative_path,
-        "journals/Sep 1st, 2026.md",
+        prepared.record.participants[0].relative_path, "journals/Sep 1st, 2026.md",
         "the record must name the file the editor is pinned to, not the canonical twin"
     );
     fixture
         .store()
-        .commit(&prepared.record, &prepared.images)
+        .commit_record(&prepared.record, &prepared.images)
         .unwrap();
     graph
         .save_page(&destination, destination.rev.as_deref())
@@ -766,7 +781,7 @@ fn every_image_is_durable_before_the_record_names_it() {
         .unwrap();
     fixture
         .store()
-        .commit(&prepared.record, &prepared.images)
+        .commit_record(&prepared.record, &prepared.images)
         .unwrap();
     for participant in &prepared.record.participants {
         for image in [&participant.preimage, &participant.postimage] {
@@ -851,7 +866,7 @@ fn finish_retires_only_a_fully_terminal_move() {
     let store_root = fixture.store_root.clone();
     fixture
         .store()
-        .commit(&prepared.record, &prepared.images)
+        .commit_record(&prepared.record, &prepared.images)
         .unwrap();
     graph
         .save_page(&destination, destination.rev.as_deref())
@@ -898,7 +913,10 @@ fn cleanup_is_bounded_and_reclaims_unreferenced_images() {
 
     store.sweep();
 
-    assert!(!blobs.join(&orphan).exists(), "an unreferenced image is reclaimed");
+    assert!(
+        !blobs.join(&orphan).exists(),
+        "an unreferenced image is reclaimed"
+    );
     let retained = fs::read_dir(&quarantine).unwrap().count();
     assert_eq!(retained, crate::direct_move_recovery::QUARANTINE_RETENTION);
 }

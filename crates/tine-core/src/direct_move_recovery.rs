@@ -159,7 +159,9 @@ impl DirectMoveRecord {
             .filter(|participant| participant.role == ParticipantRole::Destination)
             .count();
         if destinations != 1 {
-            return Err(format!("record names {destinations} destinations, expected 1"));
+            return Err(format!(
+                "record names {destinations} destinations, expected 1"
+            ));
         }
         if self.participants.len() < 2 {
             return Err("record names fewer than two participants".to_string());
@@ -282,7 +284,12 @@ impl RecoveryStore {
     /// crash can never leave a live record pointing at bytes that are not on
     /// stable storage. A crash before the record's own rename leaves orphan
     /// blobs, which the bounded sweep reclaims — the harmless direction.
-    pub fn commit(
+    ///
+    /// Named `commit_record`, not `commit`, deliberately: `commit` is a tracked
+    /// choke-helper name in `projection_producer_census.rs`, whose caller count
+    /// is a load-bearing storage boundary. A second, unrelated `commit` would
+    /// silently inflate that number and make the census lie.
+    pub fn commit_record(
         &self,
         record: &DirectMoveRecord,
         images: &BTreeMap<String, Vec<u8>>,
@@ -294,7 +301,9 @@ impl RecoveryStore {
         fs::create_dir_all(self.records_dir())?;
         for participant in &record.participants {
             for image in [&participant.preimage, &participant.postimage] {
-                let Some(name) = image.blob_name() else { continue };
+                let Some(name) = image.blob_name() else {
+                    continue;
+                };
                 let bytes = images.get(name).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -422,7 +431,9 @@ impl RecoveryStore {
         let encoded = serde_json::to_vec_pretty(&value)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         crate::model::atomic_write(
-            &self.quarantine_dir().join(format!("{}.json", record.move_id)),
+            &self
+                .quarantine_dir()
+                .join(format!("{}.json", record.move_id)),
             &encoded,
         )?;
         self.retire(&record.move_id)
@@ -431,18 +442,17 @@ impl RecoveryStore {
     /// Bounded cleanup (contract §5): keep at most `QUARANTINE_RETENTION`
     /// quarantined records, then reclaim every blob no live record names.
     pub fn sweep(&self) {
-        let mut quarantined: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(
-            self.quarantine_dir(),
-        )
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            path.is_file().then_some((modified, path))
-        })
-        .collect();
+        let mut quarantined: Vec<(std::time::SystemTime, PathBuf)> =
+            fs::read_dir(self.quarantine_dir())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let modified = entry.metadata().ok()?.modified().ok()?;
+                    path.is_file().then_some((modified, path))
+                })
+                .collect();
         quarantined.sort();
         while quarantined.len() > QUARANTINE_RETENTION {
             let (_, path) = quarantined.remove(0);
@@ -469,7 +479,11 @@ impl RecoveryStore {
                 }
             }
         }
-        for entry in fs::read_dir(self.blobs_dir()).into_iter().flatten().flatten() {
+        for entry in fs::read_dir(self.blobs_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -639,12 +653,18 @@ fn classify<'a>(
 ) -> Result<ParticipantStates<'a>, RecordOutcome> {
     let mut states: ParticipantStates<'a> = Vec::with_capacity(record.participants.len());
     for participant in &record.participants {
-        let preimage = store
-            .image_bytes(&participant.preimage)
-            .map_err(|error| RecordOutcome::Failed { error: error.to_string() })?;
-        let postimage = store
-            .image_bytes(&participant.postimage)
-            .map_err(|error| RecordOutcome::Failed { error: error.to_string() })?;
+        let preimage =
+            store
+                .image_bytes(&participant.preimage)
+                .map_err(|error| RecordOutcome::Failed {
+                    error: error.to_string(),
+                })?;
+        let postimage =
+            store
+                .image_bytes(&participant.postimage)
+                .map_err(|error| RecordOutcome::Failed {
+                    error: error.to_string(),
+                })?;
         let path = graph_root.join(
             participant
                 .relative_path
@@ -653,7 +673,11 @@ fn classify<'a>(
         let current = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(RecordOutcome::Failed { error: error.to_string() }),
+            Err(error) => {
+                return Err(RecordOutcome::Failed {
+                    error: error.to_string(),
+                })
+            }
         };
         let state = if current.as_deref() == postimage.as_deref() {
             ParticipantState::Completed
@@ -729,14 +753,20 @@ fn recover_one(
                 .replace('/', std::path::MAIN_SEPARATOR_STR),
         );
         if let Err(error) = apply_image(&path, target.as_deref()) {
-            return RecordOutcome::Failed { error: error.to_string() };
+            return RecordOutcome::Failed {
+                error: error.to_string(),
+            };
         }
         written += 1;
     }
     if forward {
-        RecordOutcome::Completed { pages_written: written }
+        RecordOutcome::Completed {
+            pages_written: written,
+        }
     } else {
-        RecordOutcome::RolledBack { pages_written: written }
+        RecordOutcome::RolledBack {
+            pages_written: written,
+        }
     }
 }
 

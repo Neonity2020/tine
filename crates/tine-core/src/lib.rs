@@ -11,6 +11,9 @@ pub mod config;
 mod config_projection_parity;
 pub mod date;
 pub mod direct_move_recovery;
+#[cfg(test)]
+#[path = "direct_move_recovery_corpus_tests.rs"]
+mod direct_move_recovery_corpus_tests;
 mod direct_projection;
 pub mod doc;
 pub mod edn;
