@@ -67,12 +67,10 @@ export function structuredHtmlOutline(html: string, plain: string, format: Forma
       return format === "org" ? `[[${src}][${alt}]]` : `![${alt}](${src})`;
     },
   });
-  // Tine's clipboard HTML is round-tripped Markdown (our own block copy, or a
-  // rendered Logseq block), so Turndown's default text-node escaping would
-  // double-escape already-literal punctuation — e.g. `a [b] c` -> `a \[b\] c`
-  // (GH: Martin). Keep `[ ] * _ \` # ~` literal; real structure (headings,
-  // lists, links, code) is emitted by dedicated rules, not this text escaper.
-  service.escape = (value: string) => value;
+  // This general clipboard boundary has no authenticated HTML provenance.
+  // Keep Turndown's default escaping so foreign text cannot become Markdown
+  // structure after conversion. Authenticated block-payload paste exits before
+  // this function; equal clipboard text is deliberately not treated as proof.
   let markdown: string;
   try {
     markdown = service.turndown(doc.body).replace(/\n{3,}/g, "\n\n").trim();

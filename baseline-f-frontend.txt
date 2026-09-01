@@ -1,0 +1,8 @@
+Harvest F pre-edit baseline
+base: e19514f98cf1044391f3a3d2f09d2579275353ee
+
+npm test -- --run
+result: exit 0; unit, render, and deploy-profile suites all passed
+
+npx tsc --noEmit
+result: exit 0; TypeScript: No errors found

@@ -144,6 +144,20 @@ describe("mobile external link delegation", () => {
       uninstall();
     }
   });
+
+  it("fails closed on a non-allowlisted anchor scheme on Android", async () => {
+    vi.spyOn(backend(), "appPlatform").mockResolvedValue("android");
+    const openExternal = vi.spyOn(backend(), "openExternal").mockResolvedValue();
+    const uninstall = await installMobileExternalLinkHandler();
+    try {
+      const event = click(addAnchor("javascript:alert(1)"));
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(openExternal).not.toHaveBeenCalled();
+    } finally {
+      uninstall();
+    }
+  });
 });
 
 describe("journal watcher feed reconciliation", () => {

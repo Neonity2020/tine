@@ -24774,7 +24774,7 @@ fn usize_to_u64(value: usize) -> io::Result<u64> {
 /// Managed page input is accepted only through depth 128. All operation-time
 /// nested walks use this fixed root-to-leaf frame ceiling, so traversal does
 /// not consume attacker-controlled call stack or an uncharged all-node stack.
-const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
+pub(crate) const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
 
 #[derive(Clone, Copy)]
 #[cfg(test)]

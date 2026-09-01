@@ -9650,6 +9650,40 @@
       "notes": "The pre-fix highlighted background began in the bullet control track, crowding ordinary dots and numbered ordinals. The shared 22px control track and browser geometry guard now keep the rounded background aligned with the text while leaving the bullet affordance outside it. The render and source-level tests pin the same ownership without treating jsdom as a CSS-layout oracle."
     },
     {
+      "id": "UI-HARVEST-F-MACRO-LINK-BOUNDARY-001",
+      "title": "A malicious graph-authored macro link cannot execute by navigating the privileged WebView",
+      "family": "hostile-content-consumption",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest F macro-link bypass" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Macro.youtubeTimestamp.test.tsx",
+          "src/App.test.tsx",
+          "src/hostileContent.guard.test.ts"
+        ],
+        "scenario": "content.macro-link-native-boundary",
+        "failBefore": "proven"
+      },
+      "notes": "Tweet and video fallback anchors previously emitted graph text as a live href with no click handler. ExternalLink now prevents default navigation and routes through the existing native scheme policy; the mobile capture handler blocks any other explicit scheme."
+    },
+    {
+      "id": "UI-HARVEST-F-HTML-PASTE-STRUCTURE-001",
+      "title": "External HTML clipboard text cannot inject Markdown link or heading structure into a block",
+      "family": "hostile-content-consumption",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest F htmlPaste boundary" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src/editor/htmlPaste.test.tsx"],
+        "scenario": "clipboard.external-html-markdown-escaping",
+        "failBefore": "proven"
+      },
+      "notes": "The general text/html path had disabled Turndown escaping without authenticated provenance. It now keeps escaping on; the private block-payload route already exits earlier. Literal bracket double-escaping is recorded as a future heuristic candidate, not used to weaken this boundary."
+    },
+    {
       "id": "UI-NESTED-EMPHASIS-LATEX-460",
       "title": "Dollar-delimited LaTeX renders as math when it is directly inside ordinary Markdown emphasis",
       "family": "markdown-rendering",

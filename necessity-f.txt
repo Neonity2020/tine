@@ -1,0 +1,27 @@
+Harvest F necessity evidence
+base: e19514f98cf1044391f3a3d2f09d2579275353ee
+
+The following focused assertions were added and run before the product edits.
+Each named boundary failed in its pre-fix state:
+
+- Macro outbound link: clicking {{tweet javascript:alert(1)}} did not prevent
+  the default action and did not call the mocked native openExternal boundary.
+- Mobile navigation: a non-allowlisted explicit scheme was not prevented.
+- Formula evaluation: a depth-129 expression evaluated completely instead of
+  returning the depth error.
+- Query parser: a depth-65 expression parsed completely instead of retaining
+  the over-depth form as raw input.
+- QueryBuilder renderer: a depth-65 tree rendered completely instead of
+  producing the truncation sentinel.
+- PeekPopup: a depth-65 block tree was counted/copied completely instead of
+  truncating without descending the discarded subtree.
+- ExternalLink/QueryBuilder source guards: the shared outbound front door and
+  pinned render cap were absent.
+- Rust backlink filter: an iteratively constructed depth-129 block tree was
+  visited completely rather than being truncated at MAX_MANAGED_BLOCK_DEPTH.
+- HTML paste: the pre-existing literal-bracket assertion pinned the disabled
+  Turndown escaper. Re-enabling the boundary made that assertion fail with the
+  accepted known cost (literal brackets become escaped); the new hostile-link
+  assertion pins the intended escaped output.
+
+No test required or attempted a real stack overflow.

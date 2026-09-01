@@ -22,6 +22,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Harvest F — hostile graph and clipboard content now reaches its existing
+  consumption boundaries instead of bypassing them.** Macro links can no longer
+  navigate the privileged WebView directly, mobile blocks unknown schemes,
+  formula/query/peek/backlink recursion has explicit bounds, and external HTML
+  text can no longer inject Markdown structure through disabled escaping.
+
 - Media (audio/video) assets returned 403 and never loaded when a graph runs under Managed Storage; the native media protocol now serves assets under both storage authorities with unchanged path containment and binding checks (internal B026).
 
 - Managed Storage stopped accepting work at 4,096 lifetime-distinct page
