@@ -1110,9 +1110,14 @@ impl ObjectStore {
     /// The object's own integrity is still checked here (digest + workspace),
     /// because that is O(one object) and keeps the content-addressing contract.
     /// What is dropped is re-proving *batch completeness* per object, which is
-    /// established once at acceptance: `hot_engine.rs:13120-13127` admits a
-    /// batch to the archive only on `BatchInspection::Ready`, and projection
-    /// work rows reach `Ready` only inside `accept_batch_at_history`.
+    /// established once, by [`Self::inspect_batch`]: it reports
+    /// [`BatchInspection::Ready`] only after reading and digesting every object
+    /// its manifest names, and reports [`BatchInspection::Staged`] otherwise.
+    /// Every production path that admits a batch goes through that call and
+    /// refuses anything but `Ready` — the coordinator's projection drain and
+    /// `sync_runtime`'s clean outbound publication both do. A caller reaching
+    /// `read_object` is therefore working inside a batch whose completeness has
+    /// already been proved; only this one object's integrity is left to check.
     pub(crate) fn read_object(&self, digest: ContentDigest) -> Result<OperationObject, StoreError> {
         let objects = self.open_namespace(OBJECTS_DIR)?;
         // Counted on the same counters as `inspect_batch`'s per-object reads.

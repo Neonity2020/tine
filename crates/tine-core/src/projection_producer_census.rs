@@ -17,6 +17,10 @@ use syn::visit::{self, Visit};
 #[derive(Debug)]
 pub(crate) struct ProductionFile {
     pub(crate) relative: String,
+    /// The file exactly as it is on disk, comments and all. Use this to assert
+    /// things about what the source *says*; use [`ProductionFile::code`] to
+    /// assert things about what it *does*.
+    pub(crate) raw: String,
     pub(crate) code: String,
     compact: String,
 }
@@ -572,6 +576,7 @@ fn scan_production_rust() -> Vec<ProductionFile> {
                 .collect();
             ProductionFile {
                 relative,
+                raw: source,
                 code,
                 compact,
             }
@@ -1877,5 +1882,59 @@ fn census_guard_itself_names_every_required_guard() {
         include_str!("oplog/mod.rs")
             .contains("fn oplog_external_module_surface_is_exactly_the_named_consumers()"),
         "G-14b-a public oplog surface guard must remain present"
+    );
+}
+
+/// I-11 guard: a comment may not point at another file by line number.
+///
+/// Line numbers in one file are invalidated by an edit in another, silently and
+/// without a compiler or test noticing. The 2026-09 sweep found this exact rot:
+/// `object_store.rs` and `sqlite.rs` both cited `hot_engine.rs:13120-13127` as
+/// the batch-acceptance gate. That range holds unrelated projection-manifest
+/// encoding today, and the function the same sentence named,
+/// `accept_batch_at_history`, no longer exists anywhere in the crate. Cite the
+/// type, function or module by name instead — a name that disappears is at
+/// least greppable, and often a compile error.
+#[test]
+fn production_comments_cite_names_not_line_numbers() {
+    /// Immutable published third-party sources are addressable by line because
+    /// the exact version is pinned in the same citation.
+    const PINNED_EXTERNAL_CITATIONS: &[(&str, &str)] =
+        &[("src-tauri/src/ios_folder_picker.rs", "tauri-2.11.2")];
+
+    let mut offenders = Vec::new();
+    for file in production_rust() {
+        for (number, line) in file.raw.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("//") || trimmed.starts_with("/*")) {
+                continue;
+            }
+            if PINNED_EXTERNAL_CITATIONS
+                .iter()
+                .any(|(path, marker)| file.relative == *path && line.contains(marker))
+            {
+                continue;
+            }
+            let bytes = line.as_bytes();
+            let cites_a_line = line.match_indices(".rs:").any(|(index, _)| {
+                bytes
+                    .get(index + 4)
+                    .is_some_and(|byte| byte.is_ascii_digit())
+                    && bytes[..index]
+                        .last()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            });
+            if cites_a_line {
+                offenders.push(format!("{}:{}: {}", file.relative, number + 1, trimmed));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these comments cite another file by line number, which rots the moment that \
+         file is edited and no gate notices (invariant I-11: code does not lie about \
+         itself). Cite the type/function/module by name instead. Offenders:\n{}",
+        offenders.join("\n")
     );
 }

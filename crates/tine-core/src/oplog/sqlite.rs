@@ -379,12 +379,13 @@ impl AcceptedBatchEvent {
         // import takes ~n^0.6 slices, so a whole-batch read here is the second
         // half of the O(n^2) the projection executor used to own.
         //
-        // Batch completeness is not re-derived because it was established at
-        // acceptance -- `hot_engine.rs:13120-13127` admits a batch to the
-        // archive only on `BatchInspection::Ready` -- and this constructor is
-        // reached only for a batch the engine reports as accepted (the
-        // `accepted_batch_evidence` lookup above). A missing manifest or object
-        // still fails closed.
+        // Batch completeness is not re-derived because it was established when
+        // the batch was admitted: `ObjectStore::inspect_batch` reports
+        // `BatchInspection::Ready` only after reading and digesting every object
+        // its manifest names, and every production admission path refuses
+        // anything else. This constructor is reached only for a batch the engine
+        // reports as accepted (the `accepted_batch_evidence` lookup above). A
+        // missing manifest or object still fails closed.
         let manifest = store.read_manifest(batch_id)?.ok_or_else(|| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "accepted batch {batch_id} is absent from the object store"
