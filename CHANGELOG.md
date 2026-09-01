@@ -22,6 +22,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Harvest D — asynchronous results stay with the graph and editor that
+  started them.** Quick Switcher creation/search, pinned-tab confirmation,
+  asset imports and recordings, plugin calls, focus rescans, and Settings
+  operations now revalidate graph-binding or operation ownership after waits;
+  display-only repaint changes no longer invalidate plugin work, and desktop
+  media-editor settings remain hidden on mobile.
+
 - Media (audio/video) assets returned 403 and never loaded when a graph runs under Managed Storage; the native media protocol now serves assets under both storage authorities with unchanged path containment and binding checks (internal B026).
 
 - Managed Storage stopped accepting work at 4,096 lifetime-distinct page
