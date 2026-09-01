@@ -62,6 +62,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **LaTeX math now renders inside italic and other emphasized Markdown.** A
+  whole agent response can be italic without turning valid `$…$` or `$$…$$`
+  fragments back into literal dollar text. The shared parser now preserves
+  top-level-valid math through ordinary italic, bold, strike, and highlight
+  containers while leaving invalid math, code spans, Org, and unrelated link
+  labels unchanged. ([GH #460](https://github.com/martinkoutecky/tine/issues/460))
+
 - **Annotating a PDF while its notes page was being saved could freeze Tine
   completely.** The two writers of an `hls__` page took the same two internal
   locks in opposite orders, so each could end up waiting for the other. Because

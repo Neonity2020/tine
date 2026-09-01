@@ -9618,6 +9618,31 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: grabbing a sidebar row to move it does not navigate away, and the empty space to the right of a short page name is not a link. Classification: blocking stateful UX - the reporter lost his place in the graph while reordering, on Windows 10, daily. Root cause: .nav-item/.nav-page painted cursor:pointer across the whole flex row and the click/auxclick handlers lived on the row, so every pixel of it opened a page - including the blank remainder that looks like padding, which is exactly where a drag is grabbed and where a press that falls short of rowReorder's 4px threshold lands. Recent and All-pages rows made it worse: they offer a row-wide link with no drag semantics at all. Fix: the title is its own .nav-page-label element, navigation (click and auxclick) is gated on it in all three lists, the pointer cursor moved to the label, and favourites rows advertise their spare width with grab/grabbing. Context menu deliberately keeps the whole row: it is not navigation and cannot be confused with a drag. The 4px threshold and rowReorder's post-drag click suppression are unchanged - they already worked, and the test proves a title-grabbed drag reorders without navigating. OG provenance: the reporter is right that Logseq makes only the text clickable; the hover highlight still spans the row in both. Evidence at the render layer because what is asserted is which element answers a click and what a drag does to the order, both observable in jsdom; necessity gate: 5 of the 6 assertions fail against pre-fix Sidebar.tsx. Label sizing was checked separately in a real browser (label sized to its text at 80-94px in a 222px row, long names still truncating with an ellipsis, row cursor default and label cursor pointer) - that is presentation and is not a blocking assertion."
+    },
+    {
+      "id": "UI-NESTED-EMPHASIS-LATEX-460",
+      "title": "Dollar-delimited LaTeX renders as math when it is directly inside ordinary Markdown emphasis",
+      "family": "markdown-rendering",
+      "sources": {
+        "issues": [
+          460
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/astRender.test.tsx"
+        ],
+        "scenario": "markdown.nested-emphasis-dollar-math",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: inline and displayed dollar math remains typeset when a whole agent response or another Markdown span is italic, bold, struck, or highlighted. Classification: blocking core operation because the same valid math already renders outside emphasis and formatting surrounding prose must not erase its semantics. Fail-before on exact Tine base d427c43b with the vendored lsdoc v0.5.6 WASM: the focused render test found zero .math descendants and left both delimiters as literal text inside <em>. The parser fix is deliberately lsdoc-only: v0.5.7 recognizes top-level-valid dollar fragments through a root-owned linear index at grammar-bounded nested emphasis sites, while Tine's existing recursive renderer and MathView consume the resulting Latex child unchanged. Org, invalid dollar shapes, code spans, synthetic triple emphasis, and non-emphasis link labels remain unchanged. Anonymized-graph acceptance covered all 1,045 files with freshly rebuilt v0.5.6 and v0.5.7 release parsers: the baseline had zero differences; v0.5.7 produced exactly three, and the fail-closed classifier proved all three as md-nested-dollar-latex with 1, 2, and 3 accepted candidates respectively, leaving zero unclassified corpus changes."
     }
   ]
 }
