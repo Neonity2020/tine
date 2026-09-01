@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+- Media (audio/video) assets returned 403 and never loaded when a graph runs under Managed Storage; the native media protocol now serves assets under both storage authorities with unchanged path containment and binding checks (internal B026).
+
 ### Added
 
 - **The graph menu now has a right-click menu on every graph row.** Opening a
