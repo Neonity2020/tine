@@ -11783,9 +11783,13 @@ impl Graph {
         // a `yyyy_MM_dd` file) must appear ONCE — both files resolve to the same
         // page name, so otherwise the day renders twice. The stray stays visible
         // via journal_conflicts() for reconciliation.
-        let mut js = dedup_journal_days(raw);
-        js.sort_by_key(|e| std::cmp::Reverse(e.date_key.unwrap_or(0)));
-        js
+        //
+        // This dedup/ordering rule is journal_feed's, not this file's: it used to
+        // be a second hand-written copy here, whose canonicality test read only
+        // `path` where journal_feed's reads `rel_path` first. Two copies of the
+        // rule that decides which file represents a day is how a day silently
+        // drops out of a user's history.
+        crate::journal_feed::journal_feed_candidates_desc(raw)
     }
 
     /// Feed membership is narrower than the raw journal inventory: future
@@ -22278,37 +22282,6 @@ fn reserve_asset(assets: &Path, name: &str) -> io::Result<(String, fs::File)> {
             _ => i += 1,
         }
     }
-}
-
-/// Collapse journal entries that resolve to the SAME date down to one (the
-/// canonical `yyyy_MM_dd` file) — a leftover title-named duplicate must not show
-/// the day twice in the feed, quick-switch, or All-Pages. Non-journal entries and
-/// the input order are preserved.
-fn dedup_journal_days(entries: Vec<PageEntry>) -> Vec<PageEntry> {
-    let is_canonical = |e: &PageEntry| {
-        e.path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| JournalDate::from_file_stem(s).is_some())
-    };
-    let mut idx_of: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-    let mut out: Vec<PageEntry> = Vec::new();
-    for e in entries {
-        match e.date_key {
-            Some(k) if e.kind == PageKind::Journal => {
-                if let Some(&i) = idx_of.get(&k) {
-                    if is_canonical(&e) && !is_canonical(&out[i]) {
-                        out[i] = e;
-                    }
-                } else {
-                    idx_of.insert(k, out.len());
-                    out.push(e);
-                }
-            }
-            _ => out.push(e),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

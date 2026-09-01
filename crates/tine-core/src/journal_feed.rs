@@ -2,11 +2,17 @@
 //! what order, and how its day cursor paginates.
 //!
 //! Both storage modes select the feed through the rules here. Direct Files
-//! supplies candidates from its warmed page cache; managed storage supplies
-//! them from the actor's retained journal index. One implementation is the
-//! point: the feed's dedup/ordering/cursor rules are exactly where a silent
-//! divergence would drop a day out of a user's journal history, and two
-//! hand-kept copies agreeing only by inspection is how that happens.
+//! supplies candidates from its warmed page cache (`Graph::journals_desc`, which
+//! calls [`journal_feed_candidates_desc`] below); managed storage supplies them
+//! from the actor's retained journal index. One implementation is the point: the
+//! feed's dedup/ordering/cursor rules are exactly where a silent divergence would
+//! drop a day out of a user's journal history, and two hand-kept copies agreeing
+//! only by inspection is how that happens.
+//!
+//! `model.rs` did carry a second copy (`dedup_journal_days`), and it had already
+//! drifted: its canonicality test read only `path` where
+//! [`canonical_journal_entry`] reads `rel_path` first. `tests::direct_files_journals_desc_uses_this_files_dedup`
+//! is the architectural fact that keeps the delegation in place.
 
 use crate::date::JournalDate;
 use crate::model::{PageDto, PageEntry, PageKind};
@@ -142,6 +148,59 @@ where
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The module header says both storage modes select the feed through this
+    /// file. Direct Files reaches it through `Graph::journals_desc`, which used
+    /// to carry its own copy of the dedup rule instead. A comment cannot hold
+    /// that; this can.
+    #[test]
+    fn direct_files_journals_desc_uses_this_files_dedup() {
+        let model = include_str!("model.rs");
+        assert!(
+            !model.contains("fn dedup_journal_days"),
+            "model.rs has grown a second journal-day dedup implementation; the feed's \
+             representative-file rule must have exactly one owner (this file), or a day \
+             silently drops out of a user's history when the two disagree"
+        );
+        let start = model
+            .find("pub fn journals_desc(&self)")
+            .expect("model.rs must still define Graph::journals_desc");
+        let body = &model[start..start + 2000.min(model.len() - start)];
+        let end = body
+            .find("\n    }")
+            .expect("journals_desc body must terminate within the scanned window");
+        assert!(
+            body[..end].contains("journal_feed_candidates_desc"),
+            "Graph::journals_desc no longer delegates to journal_feed::journal_feed_candidates_desc"
+        );
+    }
+
+    /// `canonical_journal_entry` prefers `rel_path`; the deleted `model.rs` copy
+    /// inspected `path` only. Pin the authority, since that was the live drift.
+    #[test]
+    fn the_representative_file_is_chosen_by_relative_path() {
+        let strayed = PageEntry {
+            name: "Jun 18th, 2026".into(),
+            kind: PageKind::Journal,
+            date_key: Some(20260618),
+            rel_path: "journals/Jun 18th, 2026.md".into(),
+            // A stale/absolute path whose stem WOULD read as canonical must not
+            // win over the entry's own relative path.
+            path: PathBuf::from("/graph/journals/2026_06_18.md"),
+        };
+        assert!(!canonical_journal_entry(&strayed));
+
+        let canonical = PageEntry {
+            rel_path: "journals/2026_06_18.md".into(),
+            path: PathBuf::from("/graph/journals/Jun 18th, 2026.md"),
+            ..strayed.clone()
+        };
+        assert!(canonical_journal_entry(&canonical));
+
+        let deduplicated = journal_feed_candidates_desc(vec![strayed, canonical]);
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].rel_path, "journals/2026_06_18.md");
+    }
 
     fn entry(day: i64) -> PageEntry {
         PageEntry {
