@@ -805,9 +805,108 @@ fn before_overlay_hook() -> Result<(), ManagedLocalRecordError> {
     Ok(())
 }
 
-// Pre-0.7 enrolled fast-commit corpus. The clean runtime does not call this
-// coordinator; retain the production surface only until the compiler-guided
-// retirement wave removes its remaining type references.
+/// The one architectural fact this file's dark test corpus was still carrying.
+///
+/// It lived inside `mod tests` below, which is gated `#[cfg(all(test, any()))]` —
+/// always false, under every configuration — so it had never run. Worse, its own
+/// scan split the source on `"#[cfg(test)]\nmod tests"`, a marker this file does
+/// not contain, so even enabled it would have scanned the test bodies too.
+/// Assert it against the census's definition of production source instead.
+#[cfg(test)]
+mod foreground_source_guard {
+    use crate::projection_producer_census::production_rust;
+
+    /// The foreground trusted-local commit path must not reach back into the old
+    /// terminal pipeline: no coordinator execution, archive staging, SQLite
+    /// frontier, receipt store, or application-page reload. Those are what made
+    /// a keystroke wait on graph-sized work.
+    #[test]
+    fn foreground_source_has_no_old_terminal_pipeline_escape_hatch() {
+        let file = production_rust()
+            .iter()
+            .find(|file| file.relative.ends_with("oplog/trusted_local_commit.rs"))
+            .expect("trusted_local_commit.rs is production source");
+        for forbidden in [
+            "OperationalCoordinator::execute_local",
+            "publish_prepared",
+            "stage_archive_batch",
+            "reserve_bound_mutation",
+            "enqueue_reserved",
+            "drain_ready",
+            "SqliteFrontier",
+            "ProjectionReceiptStore",
+            "record_local_authorship_receipt",
+            "record_provider_publication",
+            "load_current_editor_page",
+            "reload_application_page",
+            "settle_application_publication",
+        ] {
+            assert!(
+                !file.code.contains(forbidden),
+                "forbidden foreground token in trusted_local_commit.rs: {forbidden} -- the \
+                 foreground commit path must not reach the old terminal pipeline"
+            );
+        }
+        for required in [
+            "commit_existing_page_with_journal",
+            "append_managed_local_record",
+            "apply_appended_managed_local_record",
+        ] {
+            assert!(
+                file.code.contains(required),
+                "trusted_local_commit.rs no longer defines {required}; this guard is \
+                 describing a path that moved"
+            );
+        }
+    }
+
+    /// Why `mod tests` below is dark, stated as a fact rather than a comment.
+    ///
+    /// That corpus does not merely fail — it does not COMPILE: it calls
+    /// `TrustedLocalCommitCoordinator::commit`, `restart_projection_input` and
+    /// `recover_projection_after_restart`, and imports
+    /// `hot_engine_integration_tests::hot_overlay_tests`, none of which exist any
+    /// more. Enabling it is not a one-line change, and nobody should read 1,100
+    /// gated lines as coverage.
+    ///
+    /// If any of these names comes back, this fails, and the choice is explicit:
+    /// revive the corpus or delete it.
+    #[test]
+    fn the_dark_test_corpus_still_targets_a_retired_api() {
+        let file = production_rust()
+            .iter()
+            .find(|file| file.relative.ends_with("oplog/trusted_local_commit.rs"))
+            .expect("trusted_local_commit.rs is production source");
+        for retired in [
+            "fn commit(",
+            "fn restart_projection_input(",
+            "fn recover_projection_after_restart(",
+        ] {
+            assert!(
+                !file.code.contains(retired),
+                "trusted_local_commit.rs defines {retired} again. The `#[cfg(all(test, any()))]` \
+                 corpus below was parked because this API was removed; decide now whether to \
+                 revive it or delete it, and say which in the comment above it."
+            );
+        }
+    }
+}
+
+// Pre-0.7 enrolled fast-commit corpus, PARKED AND UNCOMPILABLE — not coverage.
+//
+// `#[cfg(all(test, any()))]` is false under every configuration, `cfg(test)`
+// included, so none of the ~1,100 lines below has run since the gate was added.
+// They cannot run as written: they call `TrustedLocalCommitCoordinator::commit`,
+// `restart_projection_input` and `recover_projection_after_restart`, and import
+// `hot_engine_integration_tests::hot_overlay_tests::OverlayFixture` — four names
+// that no longer exist anywhere in the crate. Enabling the gate produces 18
+// compile errors, not failing tests.
+//
+// The one architectural assertion they carried is now live in
+// `foreground_source_guard` above, and
+// `the_dark_test_corpus_still_targets_a_retired_api` records why this is parked.
+// The retirement wave should delete this module; it is retained only so that
+// deletion is a deliberate act with a reviewer, not a side effect of this sweep.
 #[cfg(all(test, any()))]
 mod tests {
     use std::fs;

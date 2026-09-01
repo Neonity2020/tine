@@ -10,10 +10,16 @@
 //! serialized form, `Clone`, or production mint outside the verified activation
 //! and reopen boundaries in this module.
 //!
-//! `PromotedLocalRuntime` owns the archive-rooted workspace lease together with
-//! the SQLite projection it authorizes. Lease identity is re-proved at
-//! authority-changing coordinator boundaries and failures latch terminal runtime
-//! revocation. Safe handoff remains gated on complete device-local drains.
+//! [`CleanLocalRuntime`] owns the archive-rooted workspace lease together with
+//! the SQLite projection it authorizes ([`LeasedWorkspaceProjection`]). Lease
+//! identity is re-proved at authority-changing coordinator boundaries and
+//! failures latch terminal runtime revocation. Safe handoff remains gated on
+//! complete device-local drains.
+//!
+//! (This paragraph, and two doc comments below, named a `PromotedLocalRuntime` /
+//! `PromotedRuntimeAdmission` pair that the retirement wave removed; the names
+//! survived the types by months. `tests::this_module_documents_only_types_it_defines`
+//! is why that cannot happen again here.)
 //!
 //! Retained resume state is only an accelerator: refusal or damage falls back to
 //! authenticated history replay and cannot become an alternate authority.
@@ -143,11 +149,13 @@ impl From<VerifiedLocalCompositionError> for LocalActivationError {
 /// The value every new-architecture local mutation, projection, import, and
 /// coordinator execution path requires.
 ///
-/// The only production constructor is [`PromotedRuntimeAdmission::admission`],
-/// which is itself derived from both a live [`LocalActiveAuthority`] and the
-/// exact [`PromotedLocalRuntime`] token. Future Tauri wiring therefore cannot
-/// reach a writable runtime without first minting an authority *and* opening
-/// the promoted runtime that authority's durable promotion state authorizes.
+/// The only production constructor is [`CleanRuntimeSession::parts`], which
+/// hands out the admission together with the engine and SQLite frontier only
+/// after re-proving the workspace lease. The session itself comes from a live
+/// [`CleanLocalRuntime`], which cannot exist without the clean activation or
+/// reopen boundary in this module. Tauri wiring therefore cannot reach a
+/// writable runtime without first opening the runtime that authority
+/// authorizes.
 pub(crate) struct LocalRuntimeAdmission<'a> {
     provenance: AdmissionProvenance<'a>,
 }
@@ -199,10 +207,15 @@ impl LocalRuntimeAdmission<'_> {
     /// directly instead of through a bootstrap publication, so no genuine
     /// authority is constructible for them yet.
     ///
-    /// It has no production caller and is therefore `#[cfg(test)]`. Its live
-    /// callers are `operational_coordinator.rs`'s `mod tests`,
-    /// `trusted_local_commit.rs`'s `mod tests`, and
-    /// `hot_engine_integration_tests/hot_overlay_tests.rs`.
+    /// It has no production caller and is therefore `#[cfg(test)]`. It has no
+    /// live TEST caller either: its only two call sites are in
+    /// `trusted_local_commit.rs`'s `mod tests`, which is gated
+    /// `#[cfg(all(test, any()))]` and does not compile. (The list here used to
+    /// name `operational_coordinator.rs`'s tests, which never called it, and a
+    /// `hot_engine_integration_tests/hot_overlay_tests.rs` that does not exist.)
+    /// `tests::the_pre_activation_hatch_has_exactly_the_callers_named_here` keeps
+    /// this current; when the parked corpus is deleted, delete this hatch with
+    /// it.
     ///
     /// Two independent fences keep it away from a user's real graph. It stays
     /// `pub(crate)` — as does [`LocalRuntimeAdmission`] itself — so app startup
@@ -588,10 +601,11 @@ impl RuntimeRevocationLatch {
 
 /// One mutation window for the clean baseline-plus-manifest runtime.
 ///
-/// Unlike [`PromotedRuntimeAdmission`], this carries no enrollment/history or
-/// bootstrap-Patricia proof. Its authority is exactly the live engine
-/// identity, source endpoint, graph resource and the while-held archive-rooted
-/// SQLite workspace lease. The accepted manifest and SQLite frontier are
+/// It carries no enrollment/history or bootstrap-Patricia proof — there is no
+/// second, promoted admission kind, and there has not been one since the
+/// retirement wave. Its authority is exactly the live engine identity, source
+/// endpoint, graph resource and the while-held archive-rooted SQLite workspace
+/// lease. The accepted manifest and SQLite frontier are
 /// checked by [`CleanLocalRuntime::admit_clean_mutation`] before the fields are
 /// split.
 pub(crate) struct CleanRuntimeAdmission<'a> {
@@ -1411,5 +1425,125 @@ mod bounded_admission {
         measured.sqlite_frontier_reads = 0;
         measured.archive_identity_reads = 0;
         measured
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn crate_sources() -> Vec<(String, String)> {
+        fn visit(directory: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("source directory is readable") {
+                let path = entry.expect("readable entry").path();
+                if path.is_dir() {
+                    visit(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        visit(&root, &mut paths);
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("under src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = std::fs::read_to_string(&path).expect("readable source");
+                (relative, source)
+            })
+            .collect()
+    }
+
+    /// Every intra-doc link in this file must name something that exists.
+    ///
+    /// This module's header, and two doc comments in it, described a
+    /// `PromotedLocalRuntime` / `PromotedRuntimeAdmission` pair for months after
+    /// the retirement wave deleted both types — the exact "cites a type that does
+    /// not exist" shape. `cargo doc` would have said so; `cargo test` never did.
+    ///
+    /// The scan reads a link as `[` + backtick + path + backtick + `]`.
+    #[test]
+    fn this_module_documents_only_types_it_defines() {
+        let sources = crate_sources();
+        let whole = &sources
+            .iter()
+            .find(|(relative, _)| relative == "oplog/local_active.rs")
+            .expect("this file")
+            .1;
+        // This test module's own prose contains link-shaped examples; scan the
+        // documentation of the production items only.
+        let source = whole
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .expect("this test module terminates the production source");
+
+        let mut targets = BTreeSet::new();
+        let mut rest = source;
+        while let Some(open) = rest.find("[`") {
+            let after = &rest[open + 2..];
+            let Some(close) = after.find('`') else { break };
+            let link = &after[..close];
+            rest = &after[close + 1..];
+            // `[`X`]`, not a code span that merely follows a bracket.
+            if !rest.starts_with(']') {
+                continue;
+            }
+            let head = link.split("::").next().unwrap_or_default();
+            // Method links on `Self`, and paths into other crates, are not this
+            // file's claim about its own vocabulary.
+            if head.is_empty() || head == "Self" || head == "crate" || head == "std" {
+                continue;
+            }
+            if head.starts_with(|c: char| c.is_ascii_uppercase()) {
+                targets.insert(head.to_owned());
+            }
+        }
+        assert!(
+            targets.len() > 3,
+            "the intra-doc link scan found {} targets -- the scanner broke, not the docs",
+            targets.len()
+        );
+
+        for target in &targets {
+            let defined = sources.iter().any(|(_, text)| {
+                ["struct ", "enum ", "trait ", "type ", "union "]
+                    .iter()
+                    .any(|keyword| text.contains(&format!("{keyword}{target}")))
+            });
+            assert!(
+                defined,
+                "local_active.rs documents `{target}`, which no type in tine-core defines. \
+                 A doc that names a deleted type mistrains every agent that reads it: fix the \
+                 link, or say what actually plays that role now."
+            );
+        }
+    }
+
+    /// `unenrolled_pre_activation`'s doc names its callers. Names go stale; this
+    /// does not.
+    #[test]
+    fn the_pre_activation_hatch_has_exactly_the_callers_named_here() {
+        let callers: BTreeSet<String> = crate_sources()
+            .into_iter()
+            .filter(|(relative, source)| {
+                relative != "oplog/local_active.rs" && source.contains("unenrolled_pre_activation(")
+            })
+            .map(|(relative, _)| relative)
+            .collect();
+        assert_eq!(
+            callers,
+            BTreeSet::from(["oplog/trusted_local_commit.rs".to_owned()]),
+            "the pre-activation escape hatch's caller set changed. Its doc comment names the \
+             callers; update both together, and if the set is now empty delete the hatch and \
+             its AdmissionProvenance variant rather than leaving dead test-only authority."
+        );
     }
 }
