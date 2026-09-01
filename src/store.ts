@@ -34,6 +34,7 @@ import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
 import { clearHeldExternalChanges } from "./conflictPolicy";
 import { managedStorageRuntime } from "./managedStorageRuntime";
+import { dispatchCrossPageMove } from "./storageDispatch";
 import { resetReferenceSectionState } from "./referenceSectionState";
 import {
   isConflicted,
@@ -5932,25 +5933,32 @@ export async function moveBlock(
     ? doc.byId[id].raw
     : rawWithInheritedOrderListType(doc.byId[id].raw, destinationFormat, inheritanceTarget);
   if (newPage !== oldPage) {
-    const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
-    if (!admission || admission.authority === "managed_unavailable") {
-      pushToast("Can't move between pages while managed storage is changing state.", "error");
-      return;
-    }
-    if (admission.authority === "managed_writable") {
-      const rewrites = new Map<string, string>();
-      if (movedRaw !== doc.byId[id].raw) rewrites.set(id, movedRaw);
-      await enqueueManagedCrossPageMove(
-        oldPage,
-        newPage,
-        [id],
-        newParent === null
-          ? { placement: "root", position: index }
-          : { placement: "child", parent_identity: newParent, position: index },
-        rewrites,
-      );
-      return;
-    }
+    // Authority is selected once, by the dispatcher (I-6). The arms below are
+    // the arms this function always had; only the branch moved.
+    const handled = await dispatchCrossPageMove<boolean>(
+      { sourcePages: [oldPage], destinationPage: newPage, roots: [id] },
+      {
+        unavailable: () => true,
+        managed: async () => {
+          const rewrites = new Map<string, string>();
+          if (movedRaw !== doc.byId[id].raw) rewrites.set(id, movedRaw);
+          await enqueueManagedCrossPageMove(
+            oldPage,
+            newPage,
+            [id],
+            newParent === null
+              ? { placement: "root", position: index }
+              : { placement: "child", parent_identity: newParent, position: index },
+            rewrites,
+          );
+          return true;
+        },
+        // Direct falls through to the frontend choreography below, which also
+        // serves the same-page reorder — so it is not lifted into this arm.
+        direct: () => false,
+      },
+    );
+    if (handled) return;
   }
   // Cross-page drag: flush the source while it still holds the block, so a
   // pre-existing pending save can't write the removal before the destination
@@ -6096,104 +6104,121 @@ export async function moveBlocksRelative(
   if (!plan) return false;
 
   const crossSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
-  const relativeAdmission = managedStorageRuntime.snapshot().applicationPageAdmission;
-  if (crossSources.length && (!relativeAdmission || relativeAdmission.authority === "managed_unavailable")) {
-    pushToast("Can't move between pages while managed storage is changing state.", "error");
-    return false;
-  }
-  if (crossSources.length && relativeAdmission?.authority === "direct") {
-    if (!(await prepareCrossPageSources(crossSources))) {
-      pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
-      return false;
-    }
-    const rebuilt = relativeMovePlan(capturedIds, targetId);
-    if (!rebuilt) return false;
-    // Every non-destination source in the rebuilt plan must be one we flushed
-    // while it still contained its roots. A concurrent cross-page reparent is a
-    // safe abort, not permission to mutate a newly unprepared source.
-    const rebuiltCross = rebuilt.sourcePages.filter((page) => page !== rebuilt.destinationPage);
-    if (rebuilt.destinationPage !== plan.destinationPage
-      || rebuilt.roots.length !== plan.roots.length
-      || rebuilt.roots.some((id, index) => id !== plan!.roots[index])
-      || rebuilt.sourcePageByRoot.some((page, index) => page !== plan!.sourcePageByRoot[index])
-      || rebuiltCross.length !== crossSources.length
-      || rebuiltCross.some((page, index) => page !== crossSources[index])) return false;
-    plan = rebuilt;
-  }
 
-  const destinationFormat = formatForPage(plan.destinationPage);
-  const movedRaw = new Map(plan.roots.map((id) => {
-    const sourceRaw = doc.byId[id].raw;
-    const raw = orderListTypeFromRaw(sourceRaw, formatForBlock(id)) !== null
-      ? sourceRaw
-      : rawWithInheritedOrderListType(sourceRaw, destinationFormat, targetId);
-    return [id, raw];
-  }));
-  const affectedPages = [...new Set([plan.destinationPage, ...plan.sourcePages])];
-  if (crossSources.length) {
-    if (relativeAdmission?.authority === "managed_writable") {
-      if (crossSources.length !== 1 || plan.sourcePages.includes(plan.destinationPage)) {
-        pushToast("Managed cross-page moves currently require all selected roots to share one source page.", "error");
-        return false;
+  /** The destination-format raw for each moved root. Pure; both arms read it. */
+  const movedRawFor = (current: RelativeMovePlan): Map<string, string> => {
+    const destinationFormat = formatForPage(current.destinationPage);
+    return new Map(current.roots.map((id) => {
+      const sourceRaw = doc.byId[id].raw;
+      const raw = orderListTypeFromRaw(sourceRaw, formatForBlock(id)) !== null
+        ? sourceRaw
+        : rawWithInheritedOrderListType(sourceRaw, destinationFormat, targetId);
+      return [id, raw];
+    }));
+  };
+
+  /** The in-memory move plus Direct persistence. Unchanged from the tail this
+   *  function always had; it serves the same-page route and the Direct
+   *  cross-page route (which may have rebuilt `plan` first). */
+  const applyRelativeMove = (): boolean => {
+    const movedRaw = movedRawFor(plan!);
+    const affectedPages = [...new Set([plan!.destinationPage, ...plan!.sourcePages])];
+    pushUndo("move-selection-relative", affectedPages);
+    setDoc(produce((state) => {
+      const siblingsFor = (id: string): string[] => {
+        const node = state.byId[id];
+        return node.parent === null
+          ? state.pages.find((page) => page.name === node.page)!.roots
+          : state.byId[node.parent].children;
+      };
+      for (const id of plan!.roots) {
+        const siblings = siblingsFor(id);
+        siblings.splice(siblings.indexOf(id), 1);
       }
-      const target = doc.byId[targetId];
-      const siblings = position === "child"
-        ? target.children
-        : target.parent === null
-          ? pageByName(target.page)!.roots
-          : doc.byId[target.parent].children;
-      const positionIndex = position === "child"
-        ? siblings.length
-        : siblings.indexOf(targetId) + (position === "after" ? 1 : 0);
-      return enqueueManagedCrossPageMove(
-        crossSources[0],
-        plan.destinationPage,
-        plan.roots,
-        position === "child"
-          ? { placement: "child", parent_identity: targetId, position: positionIndex }
+
+      const target = state.byId[targetId];
+      const destinationParent = position === "child" ? targetId : target.parent;
+      const destination = destinationParent === null
+        ? state.pages.find((page) => page.name === target.page)!.roots
+        : state.byId[destinationParent].children;
+      const targetIndex = position === "child" ? destination.length : destination.indexOf(targetId);
+      for (const id of plan!.roots) {
+        state.byId[id].parent = destinationParent;
+        state.byId[id].raw = movedRaw.get(id)!;
+      }
+      destination.splice(targetIndex + (position === "after" ? 1 : 0), 0, ...plan!.roots);
+
+      const reassign = (id: string) => {
+        state.byId[id].page = plan!.destinationPage;
+        for (const child of state.byId[id].children) reassign(child);
+      };
+      for (const id of plan!.roots) reassign(id);
+    }));
+
+    const persistenceSources = plan!.sourcePages.filter((page) => page !== plan!.destinationPage);
+    if (persistenceSources.length) persistCrossPage(plan!.destinationPage, persistenceSources);
+    else markDirty(plan!.destinationPage);
+    return true;
+  };
+
+  if (!crossSources.length) return applyRelativeMove();
+
+  // Authority is selected once, by the dispatcher (I-6). Both arms are the arms
+  // this function always had, including the Managed single-source refusal —
+  // that asymmetry is B2's to lift, not B1's.
+  return dispatchCrossPageMove<boolean>(
+    { sourcePages: crossSources, destinationPage: plan.destinationPage, roots: plan.roots },
+    {
+      unavailable: () => false,
+      managed: () => {
+        const movedRaw = movedRawFor(plan!);
+        if (crossSources.length !== 1 || plan!.sourcePages.includes(plan!.destinationPage)) {
+          pushToast("Managed cross-page moves currently require all selected roots to share one source page.", "error");
+          return false;
+        }
+        const target = doc.byId[targetId];
+        const siblings = position === "child"
+          ? target.children
           : target.parent === null
-            ? { placement: "root", position: positionIndex }
-            : { placement: "child", parent_identity: target.parent, position: positionIndex },
-        movedRaw,
-      );
-    }
-  }
-  pushUndo("move-selection-relative", affectedPages);
-  setDoc(produce((state) => {
-    const siblingsFor = (id: string): string[] => {
-      const node = state.byId[id];
-      return node.parent === null
-        ? state.pages.find((page) => page.name === node.page)!.roots
-        : state.byId[node.parent].children;
-    };
-    for (const id of plan!.roots) {
-      const siblings = siblingsFor(id);
-      siblings.splice(siblings.indexOf(id), 1);
-    }
-
-    const target = state.byId[targetId];
-    const destinationParent = position === "child" ? targetId : target.parent;
-    const destination = destinationParent === null
-      ? state.pages.find((page) => page.name === target.page)!.roots
-      : state.byId[destinationParent].children;
-    const targetIndex = position === "child" ? destination.length : destination.indexOf(targetId);
-    for (const id of plan!.roots) {
-      state.byId[id].parent = destinationParent;
-      state.byId[id].raw = movedRaw.get(id)!;
-    }
-    destination.splice(targetIndex + (position === "after" ? 1 : 0), 0, ...plan!.roots);
-
-    const reassign = (id: string) => {
-      state.byId[id].page = plan!.destinationPage;
-      for (const child of state.byId[id].children) reassign(child);
-    };
-    for (const id of plan!.roots) reassign(id);
-  }));
-
-  const persistenceSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
-  if (persistenceSources.length) persistCrossPage(plan.destinationPage, persistenceSources);
-  else markDirty(plan.destinationPage);
-  return true;
+            ? pageByName(target.page)!.roots
+            : doc.byId[target.parent].children;
+        const positionIndex = position === "child"
+          ? siblings.length
+          : siblings.indexOf(targetId) + (position === "after" ? 1 : 0);
+        return enqueueManagedCrossPageMove(
+          crossSources[0],
+          plan!.destinationPage,
+          plan!.roots,
+          position === "child"
+            ? { placement: "child", parent_identity: targetId, position: positionIndex }
+            : target.parent === null
+              ? { placement: "root", position: positionIndex }
+              : { placement: "child", parent_identity: target.parent, position: positionIndex },
+          movedRaw,
+        );
+      },
+      direct: async () => {
+        if (!(await prepareCrossPageSources(crossSources))) {
+          pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
+          return false;
+        }
+        const rebuilt = relativeMovePlan(capturedIds, targetId);
+        if (!rebuilt) return false;
+        // Every non-destination source in the rebuilt plan must be one we flushed
+        // while it still contained its roots. A concurrent cross-page reparent is a
+        // safe abort, not permission to mutate a newly unprepared source.
+        const rebuiltCross = rebuilt.sourcePages.filter((page) => page !== rebuilt.destinationPage);
+        if (rebuilt.destinationPage !== plan!.destinationPage
+          || rebuilt.roots.length !== plan!.roots.length
+          || rebuilt.roots.some((id, index) => id !== plan!.roots[index])
+          || rebuilt.sourcePageByRoot.some((page, index) => page !== plan!.sourcePageByRoot[index])
+          || rebuiltCross.length !== crossSources.length
+          || rebuiltCross.some((page, index) => page !== crossSources[index])) return false;
+        plan = rebuilt;
+        return applyRelativeMove();
+      },
+    },
+  );
 }
 
 /** Move a block up/down among its siblings (mod+Up/Down). Keyed <For> keeps the
@@ -6907,27 +6932,33 @@ async function moveBlockFeedNow(id: string, dir: 1 | -1): Promise<"within" | "cr
   if (node.parent !== null) return "none"; // nested block at a child-list edge: stop
   const target = await feedNeighbor(node.page, dir);
   if (!target || !pageWritable(target)) return "none";
-  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
-  if (!admission || admission.authority === "managed_unavailable") {
-    pushToast("Can't move between pages while managed storage is changing state.", "error");
-    return "none";
-  }
-  if (admission.authority === "managed_writable") {
-    const position = dir === -1 ? pageByName(target)!.roots.length : 0;
-    const intent = prepareManagedCrossPageMoveIntent(
-      node.page,
-      target,
-      [id],
-      { placement: "root", position },
-      new Map(),
-    );
-    return intent && await runManagedCrossPageMove(intent) ? "crossed" : "none";
-  }
-  if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
-  if (!doc.byId[id]) return "none"; // vanished during the flush
-  pushUndo("move-cross", [node.page, target]);
-  crossMoveBlocks([id], node.page, target, dir);
-  return "crossed";
+  // Authority is selected once, by the dispatcher (I-6). This shape runs INSIDE
+  // the managed move queue (see moveBlockFeed), so its managed arm submits the
+  // intent inline instead of enqueueing a second time.
+  return dispatchCrossPageMove<"within" | "crossed" | "none">(
+    { sourcePages: [node.page], destinationPage: target, roots: [id] },
+    {
+      unavailable: () => "none",
+      managed: async () => {
+        const position = dir === -1 ? pageByName(target)!.roots.length : 0;
+        const intent = prepareManagedCrossPageMoveIntent(
+          node.page,
+          target,
+          [id],
+          { placement: "root", position },
+          new Map(),
+        );
+        return intent && await runManagedCrossPageMove(intent) ? "crossed" : "none";
+      },
+      direct: async () => {
+        if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
+        if (!doc.byId[id]) return "none"; // vanished during the flush
+        pushUndo("move-cross", [node.page, target]);
+        crossMoveBlocks([id], node.page, target, dir);
+        return "crossed";
+      },
+    },
+  );
 }
 
 /** Managed commands are queued before resolving their source/destination. Key
@@ -6985,25 +7016,28 @@ export async function moveSelectionItems(dir: 1 | -1) {
   if (ids.some((id) => doc.byId[id].parent !== null || doc.byId[id].page !== page)) return;
   const target = await feedNeighbor(page, dir);
   if (!target || !pageWritable(target)) return;
-  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
-  if (!admission || admission.authority === "managed_unavailable") {
-    pushToast("Can't move between pages while managed storage is changing state.", "error");
-    return;
-  }
-  if (admission.authority === "managed_writable") {
-    const position = dir === -1 ? pageByName(target)!.roots.length : 0;
-    await enqueueManagedCrossPageMove(
-      page,
-      target,
-      ids,
-      { placement: "root", position },
-      new Map(),
-    );
-    return;
-  }
-  if (!(await prepareCrossPageSources([page]))) return; // source has unsaved edits → abort
-  pushUndo("move-sel-cross", [page, target]);
-  crossMoveBlocks(ids, page, target, dir);
+  // Authority is selected once, by the dispatcher (I-6).
+  await dispatchCrossPageMove<void>(
+    { sourcePages: [page], destinationPage: target, roots: ids },
+    {
+      unavailable: () => {},
+      managed: async () => {
+        const position = dir === -1 ? pageByName(target)!.roots.length : 0;
+        await enqueueManagedCrossPageMove(
+          page,
+          target,
+          ids,
+          { placement: "root", position },
+          new Map(),
+        );
+      },
+      direct: async () => {
+        if (!(await prepareCrossPageSources([page]))) return; // source has unsaved edits → abort
+        pushUndo("move-sel-cross", [page, target]);
+        crossMoveBlocks(ids, page, target, dir);
+      },
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------

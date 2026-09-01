@@ -14,6 +14,7 @@ import {
   prepareCrossPageSources,
 } from "./store";
 import { journalTitle } from "./journal";
+import { dispatchCarryPersist } from "./storageDispatch";
 import { graphBinding } from "./persistence";
 import { carryKeepsContext, carryHeaderText, pushToast } from "./ui";
 import { openJournals } from "./router";
@@ -71,7 +72,19 @@ async function report(n: number, today: string, sources: string[]): Promise<void
   // If a touched page couldn't be saved (conflict / disk error), DON'T reload the
   // journals feed — that would re-read the old files and drop the carried blocks
   // from memory. Leave the move in memory and surface the failure.
-  if (!(await persist(today, sources))) {
+  //
+  // Carry is an N-source cross-page move, so its persistence decision belongs at
+  // the storage-authority front door (I-6) — `src/carry.ts` is INVARIANTS.md's
+  // named specimen precisely because it had no such decision at all. B1 keeps
+  // the behaviour verbatim: `dispatchCarryPersist` records the route and still
+  // runs the Direct choreography on every one of them. Giving carry a managed
+  // arm is B2's work; the asymmetry is asserted in storageDispatch.test.ts so it
+  // cannot go quiet again.
+  const saved = await dispatchCarryPersist(
+    { destinationPage: today, sourcePages: sources },
+    { direct: () => persist(today, sources) },
+  );
+  if (!saved) {
     pushToast("Carry couldn't be saved — resolve the conflict; your moved tasks are kept in the editor.", "error");
     return;
   }
