@@ -3847,11 +3847,10 @@ fn managed_search_reports_building_then_returns_backend_results() {
         } if total > 0
     ));
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while handle.status().unwrap().search_index_building && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!handle.status().unwrap().search_index_building);
+    // Drive the actor by its bounded work contract instead of assuming that a
+    // loaded CI host completes the lazy build within ten wall-clock seconds.
+    // The turn budget still fails closed if indexing stops making progress.
+    drive_search_index_to_ready(&handle, 4096);
     assert!(matches!(
         handle
             .query(SyncRuntimeQueryRequest::Search {
