@@ -8679,9 +8679,7 @@ mod tests {
         let (_, commit) = production
             .split_once("pub(crate) fn commit_clean_activation(")
             .expect("commit_clean_activation is still defined here");
-        let commit = &commit[..commit
-            .find("\npub(crate) fn ")
-            .unwrap_or(commit.len())];
+        let commit = &commit[..commit.find("\npub(crate) fn ").unwrap_or(commit.len())];
 
         for write in [
             "baseline.publish_durable(",
@@ -8703,5 +8701,4 @@ mod tests {
             "the activation pipeline the module doc describes is no longer here."
         );
     }
-
 }

@@ -2838,5 +2838,4 @@ mod tests {
              does not have the capability it needs to build an inventory entry."
         );
     }
-
 }

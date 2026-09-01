@@ -1861,12 +1861,21 @@ fn code_mask_masks_variable_length_character_literals() {
     let masked = code_mask(source);
 
     assert_eq!(masked.len(), source.len(), "the mask must preserve offsets");
-    assert!(!masked.contains('{'), "unmasked char-literal brace: {masked}");
-    assert!(!masked.contains('}'), "unmasked char-literal brace: {masked}");
+    assert!(
+        !masked.contains('{'),
+        "unmasked char-literal brace: {masked}"
+    );
+    assert!(
+        !masked.contains('}'),
+        "unmasked char-literal brace: {masked}"
+    );
     assert!(!masked.contains("0009"));
     assert!(!masked.contains("000d"));
     assert!(!masked.contains("x41"));
-    assert!(!masked.contains('\u{00e9}'), "unmasked multi-byte char literal");
+    assert!(
+        !masked.contains('\u{00e9}'),
+        "unmasked multi-byte char literal"
+    );
     // Code around the literals survives.
     assert!(masked.contains("const R: RangeInclusive<char> ="));
     assert!(masked.contains("..="));

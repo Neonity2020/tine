@@ -723,12 +723,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::projection_producer_census::{call_count, production_rust};
     use crate::oplog::{
         BatchCausalDot, BatchError, BatchOrigin, BlockId, CausalPeerId, DeviceId, FrontierV2,
         LineageDigest, LogseqUuid, SemanticEffectDigest, SessionId, StructuralLocator,
         StructuralSpan,
     };
+    use crate::projection_producer_census::{call_count, production_rust};
 
     #[derive(Clone, Serialize)]
     struct RawObservation {

@@ -784,5 +784,4 @@ mod tests {
              method, rewrite that doc comment (invariant I-11)."
         );
     }
-
 }

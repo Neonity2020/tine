@@ -3,10 +3,9 @@ use tine_core::oplog::{
     AnnotatedIdentity, BatchId, BlobDescription, BlockId, CrdtPeerCounter, CrdtPeerId, DeviceId,
     DocumentDependencies, DocumentId, FrontierV2, ImportId, ImportInventoryEntry,
     ImportInventoryState, ImportLocator, LogseqUuid, ManagedPath, ManagedTextKind, PageId,
-    PortablePathKey,
-    ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion, ProjectionIntent,
-    ProjectionPrecondition, ReceiptError, SessionId, StructuralLocator, StructuralSpan,
-    WorkspaceId, DIFF_SCHEMA_VERSION,
+    PortablePathKey, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion,
+    ProjectionIntent, ProjectionPrecondition, ReceiptError, SessionId, StructuralLocator,
+    StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
 };
 use uuid::Uuid;
 
