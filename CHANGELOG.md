@@ -22,6 +22,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Managed Storage clean reopen no longer semantically reapplies every accepted
+  operation since activation. A crash-durable disposable engine checkpoint now
+  restores the accepted frontier and replays only its unpublished archive tail;
+  damaged checkpoint bytes always fall back to full replay, while missing
+  authoritative manifests or required objects remain visible as archive damage.
+
 - Media (audio/video) assets returned 403 and never loaded when a graph runs under Managed Storage; the native media protocol now serves assets under both storage authorities with unchanged path containment and binding checks (internal B026).
 
 - Managed Storage stopped accepting work at 4,096 lifetime-distinct page

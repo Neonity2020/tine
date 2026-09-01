@@ -8663,6 +8663,8 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
             SyncRuntimeCleanOpenStage::GraphOpen,
             SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
             SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
+            SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
+            SyncRuntimeCleanOpenStage::CleanCheckpointTailDiscovery,
             SyncRuntimeCleanOpenStage::CommittedTailReplay,
             SyncRuntimeCleanOpenStage::ProjectionOpen,
             SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
@@ -8688,6 +8690,376 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+#[test]
+fn second_clean_cold_open_restores_checkpoint_instead_of_full_replay() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-second-open", 0xa178_5000);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    drop(resources);
+
+    let mut first_counters = None;
+    let first = SyncRuntimeHandle::open_with_progress(
+        reopen_request(&fixture.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                first_counters = Some(counters);
+            }
+        },
+    );
+    assert_eq!(first.status, SyncRuntimeOpenStatus::Active);
+    let first_handle = first.handle.expect("first clean cold open succeeds");
+    let first_counters = first_counters.expect("first clean open reports counters");
+    assert_eq!(first_counters.full_replay_opens, 1);
+    assert_eq!(first_counters.checkpoint_opens, 0);
+    drive_initial_feed(&first_handle);
+    let (page, revision) = load_application_exact(&first_handle, "Root.md");
+    let _ = save_application_block_text(
+        &first_handle,
+        page,
+        revision,
+        "checkpointed accepted mutation",
+    );
+    drain_managed_local(&first_handle);
+    // Dropping the actor waits only for its already-backgrounded checkpoint
+    // writer; the next process can never race an unleased writer.
+    drop(first_handle);
+
+    let mut second_counters = None;
+    let second = SyncRuntimeHandle::open_with_progress(
+        reopen_request(&fixture.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                second_counters = Some(counters);
+            }
+        },
+    );
+    assert_eq!(second.status, SyncRuntimeOpenStatus::Active);
+    let second_handle = second.handle.expect("checkpointed clean cold open succeeds");
+    let second_counters = second_counters.expect("second clean open reports counters");
+    assert_eq!(second_counters.checkpoint_opens, 1);
+    assert_eq!(second_counters.full_replay_opens, 0);
+    assert_eq!(second_counters.committed_tail_replayed, 0);
+    assert_eq!(second_counters.checkpoint_roster_entries, 1);
+    assert!(second_counters.checkpoint_payload_bytes > 0);
+    assert_eq!(second_counters.archive_manifest_reads, 0);
+    assert_eq!(second_counters.archive_object_reads, 0);
+    let (restored, _) = load_application_exact(&second_handle, "Root.md");
+    assert_eq!(restored.blocks[0].raw, "checkpointed accepted mutation");
+    assert!(matches!(
+        second_handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn checkpoint_open_matches_sequence_zero_replay_over_generated_crash_histories() {
+    for (case, mutation_count) in [1_usize, 2, 4].into_iter().enumerate() {
+        let fixture = ActivationFixture::nested_unicode(
+            &format!("clean-checkpoint-equivalence-{case}"),
+            0xa178_a000 + case as u128 * 0x100,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let mut handle = activated.handle.expect("equivalence fixture activates");
+        drive_initial_feed(&handle);
+
+        for mutation in 0..mutation_count {
+            let (page, revision) = load_application_exact(&handle, "Root.md");
+            let expected = format!("generated checkpoint history {case}/{mutation}");
+            let _ = save_application_block_text(&handle, page, revision, &expected);
+            drain_managed_local(&handle);
+            if mutation + 1 < mutation_count {
+                // Each prefix is a crash-reopen cut. The prior actor drop waits
+                // only for its disposable writer and never performs Safe.
+                drop(handle);
+                let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+                assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+                handle = reopened.handle.expect("generated crash cut reopens");
+            }
+        }
+        drop(handle);
+
+        let mut checkpoint_counters = None;
+        let checkpoint_open = SyncRuntimeHandle::open_with_progress(
+            reopen_request(&fixture.request),
+            |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                    checkpoint_counters = Some(counters);
+                }
+            },
+        );
+        assert_eq!(checkpoint_open.status, SyncRuntimeOpenStatus::Active);
+        let checkpoint_open = checkpoint_open.handle.expect("checkpoint path opens");
+        assert_eq!(
+            checkpoint_counters.expect("checkpoint counters").checkpoint_opens,
+            1
+        );
+        let checkpoint_state = checkpoint_open.observable_engine_state().unwrap();
+        drop(checkpoint_open);
+
+        let checkpoint_directory = clean_operation_archive_directory(&fixture.request.archive_root)
+            .join("clean-open-checkpoint-v1");
+        fs::remove_dir_all(checkpoint_directory).unwrap();
+        let mut replay_counters = None;
+        let replay_open = SyncRuntimeHandle::open_with_progress(
+            reopen_request(&fixture.request),
+            |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                    replay_counters = Some(counters);
+                }
+            },
+        );
+        assert_eq!(replay_open.status, SyncRuntimeOpenStatus::Active);
+        let replay_open = replay_open.handle.expect("sequence-zero replay opens");
+        assert_eq!(
+            replay_counters.expect("full replay counters").full_replay_opens,
+            1
+        );
+        let replay_state = replay_open.observable_engine_state().unwrap();
+        assert_eq!(checkpoint_state, replay_state, "generated history case {case}");
+        drop(replay_open);
+    }
+}
+
+#[test]
+fn checkpoint_reopen_replays_exactly_the_unpublished_durable_tail() {
+    struct ResetCheckpointFailure;
+    impl Drop for ResetCheckpointFailure {
+        fn drop(&mut self) {
+            crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(false);
+        }
+    }
+    let _reset = ResetCheckpointFailure;
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-tail", 0xa178_6000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let first = activated.handle.expect("checkpoint tail fixture activates");
+    drive_initial_feed(&first);
+    let (page, revision) = load_application_exact(&first, "Root.md");
+    let _ = save_application_block_text(&first, page, revision, "checkpoint frontier one");
+    drain_managed_local(&first);
+    drop(first);
+
+    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(true);
+    let second = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert_eq!(second.status, SyncRuntimeOpenStatus::Active);
+    let second = second.handle.expect("frontier-one checkpoint opens");
+    let (page, revision) = load_application_exact(&second, "Root.md");
+    let _ = save_application_block_text(&second, page, revision, "uncheckpointed frontier two");
+    drain_managed_local(&second);
+    drop(second);
+    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(false);
+
+    let mut counters = None;
+    let third = SyncRuntimeHandle::open_with_progress(
+        reopen_request(&fixture.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters: observed } = progress {
+                counters = Some(observed);
+            }
+        },
+    );
+    assert_eq!(third.status, SyncRuntimeOpenStatus::Active);
+    let third = third.handle.expect("checkpoint plus durable tail opens");
+    let counters = counters.expect("tail reopen reports counters");
+    assert_eq!(counters.checkpoint_opens, 1);
+    assert_eq!(counters.full_replay_opens, 0);
+    assert_eq!(counters.checkpoint_roster_entries, 1);
+    assert_eq!(counters.committed_tail_replayed, 1);
+    let (restored, _) = load_application_exact(&third, "Root.md");
+    assert_eq!(restored.blocks[0].raw, "uncheckpointed frontier two");
+    assert!(matches!(
+        third.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn corrupt_checkpoint_payload_is_discarded_for_total_full_replay() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-corrupt", 0xa178_7000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("checkpoint corruption fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "survives checkpoint damage");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let checkpoint = clean_operation_archive_directory(&fixture.request.archive_root)
+        .join("clean-open-checkpoint-v1");
+    for payload in ["payload-a", "payload-b"] {
+        let path = checkpoint.join(payload);
+        if path.exists() {
+            fs::write(path, b"torn checkpoint payload").unwrap();
+        }
+    }
+    let mut counters = None;
+    let reopened = SyncRuntimeHandle::open_with_progress(
+        reopen_request(&fixture.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters: observed } = progress {
+                counters = Some(observed);
+            }
+        },
+    );
+    assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+    let reopened = reopened.handle.expect("checkpoint damage falls back");
+    let counters = counters.expect("fallback open reports counters");
+    assert_eq!(counters.checkpoint_opens, 0);
+    assert_eq!(counters.full_replay_opens, 1);
+    assert_eq!(counters.committed_tail_replayed, 1);
+    let (page, _) = load_application_exact(&reopened, "Root.md");
+    assert_eq!(page.blocks[0].raw, "survives checkpoint damage");
+    assert!(matches!(
+        reopened.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn corrupt_checkpoint_pointer_and_generation_each_force_total_full_replay() {
+    for (case, damage) in ["pointer", "generation"].into_iter().enumerate() {
+        let fixture = ActivationFixture::nested_unicode(
+            &format!("clean-checkpoint-corrupt-{damage}"),
+            0xa178_b000 + case as u128 * 0x100,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("checkpoint damage fixture activates");
+        drive_initial_feed(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let expected = format!("survives {damage} damage");
+        let _ = save_application_block_text(&handle, page, revision, &expected);
+        drain_managed_local(&handle);
+        drop(handle);
+
+        let checkpoint = clean_operation_archive_directory(&fixture.request.archive_root)
+            .join("clean-open-checkpoint-v1");
+        match damage {
+            "pointer" => fs::write(checkpoint.join("current"), b"bit-flipped pointer").unwrap(),
+            "generation" => {
+                for generation in ["generation-a", "generation-b"] {
+                    let path = checkpoint.join(generation);
+                    if path.exists() {
+                        fs::write(path, b"truncated generation").unwrap();
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        let mut counters = None;
+        let reopened = SyncRuntimeHandle::open_with_progress(
+            reopen_request(&fixture.request),
+            |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters: observed } = progress {
+                    counters = Some(observed);
+                }
+            },
+        );
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("private checkpoint damage falls back");
+        let counters = counters.expect("fallback reports counters");
+        assert_eq!(counters.checkpoint_opens, 0);
+        assert_eq!(counters.full_replay_opens, 1);
+        assert_eq!(counters.committed_tail_replayed, 1);
+        let (page, _) = load_application_exact(&reopened, "Root.md");
+        assert_eq!(page.blocks[0].raw, expected);
+        drop(reopened);
+    }
+}
+
+#[test]
+fn checkpoint_roster_surfaces_missing_authoritative_manifest_immediately() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-missing-manifest", 0xa178_8000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("missing-manifest fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "manifest roster authority");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let batches = clean_operation_archive_directory(&fixture.request.archive_root).join("batches");
+    let manifest = fs::read_dir(&batches)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file() && !path.file_name().unwrap().to_string_lossy().starts_with('.'))
+        .expect("accepted archive has a manifest");
+    fs::remove_file(manifest).unwrap();
+
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(reopened.handle.is_none());
+    assert!(
+        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { ref detail }
+            if detail.contains("checkpoint roster manifest") && detail.contains("missing")),
+        "missing roster authority must surface immediately: {:?}",
+        reopened.status
+    );
+}
+
+#[test]
+fn checkpoint_roster_never_masks_mutated_authoritative_manifest() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-mutated-manifest", 0xa178_c000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("mutated-manifest fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "manifest mutation authority");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let batches = clean_operation_archive_directory(&fixture.request.archive_root).join("batches");
+    let manifest = fs::read_dir(&batches)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file() && !path.file_name().unwrap().to_string_lossy().starts_with('.'))
+        .expect("accepted archive has a manifest");
+    let mut bytes = fs::read(&manifest).unwrap();
+    bytes[0] ^= 0x80;
+    fs::write(manifest, bytes).unwrap();
+
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(reopened.handle.is_none());
+    assert!(
+        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { .. }),
+        "mutated archive authority must retain the pre-existing refusal path: {:?}",
+        reopened.status
+    );
+}
+
+#[test]
+fn checkpoint_roster_surfaces_missing_required_object_immediately() {
+    let fixture = ActivationFixture::nested_unicode("clean-checkpoint-missing-object", 0xa178_9000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("missing-object fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(&handle, page, revision, "object roster authority");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let objects = clean_operation_archive_directory(&fixture.request.archive_root).join("objects");
+    let object = fs::read_dir(&objects)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file() && !path.file_name().unwrap().to_string_lossy().starts_with('.'))
+        .expect("accepted archive has an object");
+    fs::remove_file(object).unwrap();
+
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(reopened.handle.is_none());
+    assert!(
+        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { ref detail }
+            if detail.contains("checkpoint roster object") && detail.contains("missing")),
+        "missing required object must surface immediately: {:?}",
+        reopened.status
+    );
 }
 
 #[test]
@@ -12597,6 +12969,27 @@ fn genuinely_different_concurrent_same_position_creates_keep_both_blocks() {
             contents.contains(&"right-only task"),
             "{label}: {contents:?}"
         );
+    }
+
+    // The two actors admitted the independent provider histories in opposite
+    // orders. Each actor is the sequence-zero execution for that permutation;
+    // its checkpoint restore must reproduce the complete observable projection,
+    // including that accepted sequence (which the archive itself does not name).
+    for (label, fixture, handle) in [
+        ("left", &left, left_handle),
+        ("right", &right, right_handle),
+    ] {
+        let sequence_zero_state = handle.observable_engine_state().unwrap();
+        drop(handle);
+        let checkpoint_open = active_handle(SyncRuntimeHandle::open(reopen_request(
+            &fixture.request,
+        )));
+        let checkpoint_state = checkpoint_open.observable_engine_state().unwrap();
+        assert_eq!(
+            checkpoint_state, sequence_zero_state,
+            "{label} provider-admission permutation"
+        );
+        drop(checkpoint_open);
     }
 }
 
@@ -22277,9 +22670,17 @@ fn managed_open_stage_attribution_manual_benchmark() {
             previous = *elapsed;
         }
         eprintln!(
-            "attribution_counters checkpoint={checkpoint} accepted_batches={} committed_tail_replayed={} sweep_chains={} receipt_evidence_names={} receipt_content_reads={} receipt_full_catalog_passes={} summary_content_reads={} summary_rebuilt={} summary_delta_completions={} summary_delta_intents={} local_completion_names={} local_completion_content_reads={} local_completion_rebuilt={} local_completion_entries={} retired_own_intent_probes={} retired_own_receipt_artifacts={} archive_directory_enumerations={} archive_manifest_reads={} archive_object_reads={} archive_inspected_manifests={} archive_inspected_objects={}",
+            "attribution_counters checkpoint={checkpoint} accepted_batches={} committed_tail_replayed={} checkpoint_opens={} full_replay_opens={} checkpoint_roster_entries={} checkpoint_manifest_names={} checkpoint_required_object_names={} checkpoint_capture_work={} checkpoint_payload_bytes={} checkpoint_durable_lag={} sweep_chains={} receipt_evidence_names={} receipt_content_reads={} receipt_full_catalog_passes={} summary_content_reads={} summary_rebuilt={} summary_delta_completions={} summary_delta_intents={} local_completion_names={} local_completion_content_reads={} local_completion_rebuilt={} local_completion_entries={} retired_own_intent_probes={} retired_own_receipt_artifacts={} archive_directory_enumerations={} archive_manifest_reads={} archive_object_reads={} archive_inspected_manifests={} archive_inspected_objects={}",
             counters.accepted_batches,
             counters.committed_tail_replayed,
+            counters.checkpoint_opens,
+            counters.full_replay_opens,
+            counters.checkpoint_roster_entries,
+            counters.checkpoint_manifest_names,
+            counters.checkpoint_required_object_names,
+            counters.checkpoint_capture_work,
+            counters.checkpoint_payload_bytes,
+            counters.checkpoint_durable_lag,
             counters.sweep_chains,
             counters.receipt_evidence_names,
             counters.receipt_content_reads,

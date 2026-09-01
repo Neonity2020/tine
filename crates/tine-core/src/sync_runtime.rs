@@ -1629,6 +1629,8 @@ pub enum SyncRuntimeCleanOpenStage {
     GraphOpen,
     EndpointAndReceiptOpen,
     ObjectStoreRepairAndValidation,
+    CleanCheckpointOpen,
+    CleanCheckpointTailDiscovery,
     CommittedTailReplay,
     ProjectionOpen,
     EngineIndexesAndSweepsOpen,
@@ -1648,6 +1650,8 @@ impl SyncRuntimeCleanOpenStage {
             Self::GraphOpen => "graph_open",
             Self::EndpointAndReceiptOpen => "endpoint_and_receipt_open",
             Self::ObjectStoreRepairAndValidation => "object_store_repair_and_validation",
+            Self::CleanCheckpointOpen => "clean_checkpoint_open",
+            Self::CleanCheckpointTailDiscovery => "clean_checkpoint_tail_discovery",
             Self::CommittedTailReplay => "committed_tail_replay",
             Self::ProjectionOpen => "projection_open",
             Self::EngineIndexesAndSweepsOpen => "engine_indexes_and_sweeps_open",
@@ -1722,6 +1726,22 @@ pub struct SyncRuntimeCleanOpenCounters {
     pub accepted_batches: usize,
     /// Committed operation manifests replayed onto the immutable baseline.
     pub committed_tail_replayed: usize,
+    /// Exactly one when a durable clean checkpoint restored engine state.
+    pub checkpoint_opens: usize,
+    /// Exactly one when open started from the immutable sequence-zero baseline.
+    pub full_replay_opens: usize,
+    /// Accepted roster rows authenticated through the sealed index.
+    pub checkpoint_roster_entries: usize,
+    /// Archive manifest names compared during checkpoint tail discovery.
+    pub checkpoint_manifest_names: usize,
+    /// Required object names compared without opening object bodies.
+    pub checkpoint_required_object_names: usize,
+    /// Semantic items touched by the actor capture which produced the checkpoint.
+    pub checkpoint_capture_work: u64,
+    /// Canonical checkpoint payload bytes opened before the durable tail.
+    pub checkpoint_payload_bytes: usize,
+    /// Published frontier minus durable checkpoint frontier after open.
+    pub checkpoint_durable_lag: u64,
     /// Sweep chains reconstructed from the private derived root.
     pub sweep_chains: usize,
     /// Receipt evidence FILENAMES observed by the names-only horizon scan.
@@ -4768,6 +4788,23 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn observable_engine_state(
+        &self,
+    ) -> Result<
+        crate::oplog::hot_engine::validation_tests::ObservableEngineState,
+        SyncRuntimeRequestError,
+    > {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ObservableEngineState {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn managed_task_query_overlay_snapshot(
         &self,
     ) -> Result<ManagedTaskQueryOverlaySnapshot, SyncRuntimeRequestError> {
@@ -6708,7 +6745,10 @@ impl CleanOpenStageTrace {
         if self.debug_enabled {
             eprintln!(
                 "[tine] managed clean open counters: accepted_batches={}; \
-committed_tail_replayed={}; sweep_chains={}; receipt_evidence_names={}; \
+committed_tail_replayed={}; checkpoint_opens={}; full_replay_opens={}; \
+checkpoint_roster_entries={}; checkpoint_manifest_names={}; \
+checkpoint_required_object_names={}; checkpoint_capture_work={}; checkpoint_payload_bytes={}; \
+checkpoint_durable_lag={}; sweep_chains={}; receipt_evidence_names={}; \
 receipt_content_reads={}; receipt_full_catalog_passes={}; \
 summary_content_reads={}; summary_rebuilt={}; summary_delta_completions={}; \
 summary_delta_intents={}; local_completion_names={}; \
@@ -6719,6 +6759,14 @@ archive_manifest_reads={}; archive_object_reads={}; \
 archive_inspected_manifests={}; archive_inspected_objects={}",
                 counters.accepted_batches,
                 counters.committed_tail_replayed,
+                counters.checkpoint_opens,
+                counters.full_replay_opens,
+                counters.checkpoint_roster_entries,
+                counters.checkpoint_manifest_names,
+                counters.checkpoint_required_object_names,
+                counters.checkpoint_capture_work,
+                counters.checkpoint_payload_bytes,
+                counters.checkpoint_durable_lag,
                 counters.sweep_chains,
                 counters.receipt_evidence_names,
                 counters.receipt_content_reads,
@@ -6840,16 +6888,89 @@ fn open_clean_runtime_resources_with_progress(
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeTailReplay,
     });
-    let replayed = engine
-        .replay_clean_committed_tail(baseline_claim_source.as_ref())
-        .map_err(display)?;
+    let checkpoint_open = crate::oplog::checkpoint_generation::open_checkpoint(&store);
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
+        stage_progress,
+    );
+    let mut replayed = 0_usize;
+    let mut restored_checkpoint = false;
+    match checkpoint_open {
+        Err(crate::oplog::checkpoint_generation::CleanCheckpointOpenError::ArchiveDamage(
+            error,
+        )) => return Err(error),
+        Err(crate::oplog::checkpoint_generation::CleanCheckpointOpenError::Store(error)) => {
+            eprintln!("clean checkpoint could not be read; using full replay: {error}");
+        }
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Absent) => {}
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Invalid(error)) => {
+            eprintln!("clean checkpoint is disposable and will be rebuilt: {error}");
+        }
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded)) => {
+            counters.checkpoint_roster_entries = loaded.accepted_rows.len();
+            counters.checkpoint_manifest_names = loaded
+                .accepted_rows
+                .len()
+                .saturating_add(loaded.tail.len());
+            counters.checkpoint_required_object_names = loaded.required_objects.len();
+            counters.checkpoint_capture_work = loaded.capture_work;
+            counters.checkpoint_payload_bytes = loaded.payload_bytes;
+            let durable_sequence = loaded.accepted_rows.len() as u64;
+            let tail = loaded.tail.clone();
+            match engine.restore_clean_checkpoint(
+                &loaded.state_bytes,
+                loaded.accepted_rows,
+                loaded.required_objects,
+            ) {
+                Ok(()) => {
+                    engine
+                        .reset_clean_checkpoint_publisher(durable_sequence)
+                        .map_err(display)?;
+                    restored_checkpoint = true;
+                    counters.checkpoint_opens = 1;
+                    match engine.replay_clean_checkpoint_tail(
+                        &tail,
+                        baseline_claim_source.as_ref(),
+                    ) {
+                        Ok(count) => replayed = count,
+                        Err(error) => {
+                            eprintln!(
+                                "clean checkpoint tail admission failed; using sequence-zero replay: {error}"
+                            );
+                            engine
+                                .reset_clean_checkpoint_to_baseline()
+                                .map_err(display)?;
+                            restored_checkpoint = false;
+                            counters.checkpoint_opens = 0;
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "clean checkpoint state validation failed; using full replay: {error}"
+                    );
+                }
+            }
+        }
+    }
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointTailDiscovery,
+        stage_progress,
+    );
+    if !restored_checkpoint {
+        counters.full_replay_opens = 1;
+        replayed = engine
+            .replay_clean_committed_tail(baseline_claim_source.as_ref())
+            .map_err(display)?;
+    }
     counters.committed_tail_replayed = replayed;
+    counters.checkpoint_durable_lag = engine.clean_checkpoint_durable_lag();
     drop(baseline_claim_source);
     trace.phase(
         SyncRuntimeCleanOpenStage::CommittedTailReplay,
         stage_progress,
     );
-    let projection = if replayed == 0 {
+    let projection = if engine.is_clean_genesis_frontier().map_err(display)? {
         let expected = engine.accepted_frontier_root().map_err(display)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
             &request.database_path,
@@ -9727,6 +9848,10 @@ enum ActorRequest {
         reply: mpsc::Sender<ManagedApplicationQueryInstrumentation>,
     },
     #[cfg(test)]
+    ObservableEngineState {
+        reply: mpsc::Sender<crate::oplog::hot_engine::validation_tests::ObservableEngineState>,
+    },
+    #[cfg(test)]
     ManagedTaskQueryOverlaySnapshot {
         reply: mpsc::Sender<ManagedTaskQueryOverlaySnapshot>,
     },
@@ -10144,6 +10269,17 @@ fn run_actor_loop(
             #[cfg(test)]
             ActorRequest::ManagedApplicationQueryInstrumentation { reply } => {
                 let _ = reply.send(actor.managed_application_query_instrumentation());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ObservableEngineState { reply } => {
+                if let Some(clean) = actor.clean.as_ref() {
+                    let _ = reply.send(
+                        crate::oplog::hot_engine::validation_tests::observable_engine_state(
+                            clean.runtime.engine(),
+                        ),
+                    );
+                }
                 false
             }
             #[cfg(test)]

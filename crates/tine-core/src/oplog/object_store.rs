@@ -1,6 +1,6 @@
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
@@ -149,6 +149,13 @@ pub struct ObjectStore {
     workspace_id: WorkspaceId,
     capability: Dir,
     counters: Arc<StoreCounters>,
+    /// Fingerprints collected while the ordinary namespace validator already
+    /// has every manifest body in memory. Checkpoint roster comparison reads
+    /// this cache, never the pre-roster manifest bodies a second time.
+    validated_manifest_fingerprints:
+        Arc<std::sync::RwLock<BTreeMap<BatchId, ContentDigest>>>,
+    validated_manifest_names: Arc<std::sync::RwLock<BTreeSet<BatchId>>>,
+    validated_object_names: Arc<std::sync::RwLock<BTreeSet<ContentDigest>>>,
 }
 
 #[cfg(unix)]
@@ -424,6 +431,9 @@ impl ObjectStore {
             workspace_id,
             capability,
             counters: Arc::new(StoreCounters::default()),
+            validated_manifest_fingerprints: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            validated_manifest_names: Arc::new(std::sync::RwLock::new(BTreeSet::new())),
+            validated_object_names: Arc::new(std::sync::RwLock::new(BTreeSet::new())),
         })
     }
 
@@ -494,6 +504,11 @@ impl ObjectStore {
             workspace_id: self.workspace_id,
             capability: self.capability.try_clone()?,
             counters: Arc::clone(&self.counters),
+            validated_manifest_fingerprints: Arc::clone(
+                &self.validated_manifest_fingerprints,
+            ),
+            validated_manifest_names: Arc::clone(&self.validated_manifest_names),
+            validated_object_names: Arc::clone(&self.validated_object_names),
         })
     }
 
@@ -552,6 +567,10 @@ impl ObjectStore {
             bytes,
             Collision::Object(digest),
         )?;
+        self.validated_object_names
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("object-name cache is poisoned".into()))?
+            .insert(digest);
         Ok(digest)
     }
 
@@ -574,10 +593,12 @@ impl ObjectStore {
         if read_optional_regular(&batches, &filename, MAX_MANIFEST_BYTES as u64, None)?.is_some() {
             self.check_or_establish_lineage(manifest.lineage_digest())?;
             publish_immutable(&batches, &filename, bytes, Collision::Batch(batch_id))?;
+            self.record_validated_manifest_fingerprint(batch_id, ContentDigest::of(bytes))?;
             return Ok(batch_id);
         }
         self.check_or_establish_lineage(manifest.lineage_digest())?;
         publish_immutable(&batches, &filename, bytes, Collision::Batch(batch_id))?;
+        self.record_validated_manifest_fingerprint(batch_id, ContentDigest::of(bytes))?;
         Ok(batch_id)
     }
 
@@ -694,6 +715,7 @@ impl ObjectStore {
         publication.commit().map_err(|error| {
             publication_stage_error("publish operation batch durability", error)
         })?;
+        self.record_validated_manifest_fingerprint(batch_id, ContentDigest::of(&manifest_bytes))?;
         Ok(())
     }
 
@@ -902,6 +924,38 @@ impl ObjectStore {
         self.counters.snapshot()
     }
 
+    fn record_validated_manifest_fingerprint(
+        &self,
+        batch_id: BatchId,
+        fingerprint: ContentDigest,
+    ) -> Result<(), StoreError> {
+        let mut fingerprints = self
+            .validated_manifest_fingerprints
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into()))?;
+        if let Some(existing) = fingerprints.insert(batch_id, fingerprint) {
+            if existing != fingerprint {
+                return Err(StoreError::BatchCollision(batch_id));
+            }
+        }
+        self.validated_manifest_names
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("manifest-name cache is poisoned".into()))?
+            .insert(batch_id);
+        Ok(())
+    }
+
+    /// Fingerprints collected by the already-required namespace validation.
+    /// This is observational cache output only; it grants no archive authority.
+    pub(crate) fn validated_manifest_fingerprints(
+        &self,
+    ) -> Result<BTreeMap<BatchId, ContentDigest>, StoreError> {
+        self.validated_manifest_fingerprints
+            .read()
+            .map(|fingerprints| fingerprints.clone())
+            .map_err(|_| StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into()))
+    }
+
     /// Stable identity of the retained no-follow archive root capability.
     ///
     /// This is derived from the opened directory resource, never from an
@@ -961,6 +1015,56 @@ impl ObjectStore {
             }
         }
         Ok(manifests)
+    }
+
+    /// Enumerate only canonical manifest commit-marker names. No manifest or
+    /// object body is opened or decoded.
+    pub(crate) fn committed_manifest_names(&self) -> Result<BTreeSet<BatchId>, StoreError> {
+        self.validated_manifest_names
+            .read()
+            .map_err(|_| StoreError::UnsafeEntry("manifest-name cache is poisoned".into()))
+            .map(|names| names.clone())
+    }
+
+    /// Enumerate only canonical content-addressed object names. No object body
+    /// is opened or decoded.
+    pub(crate) fn object_names(&self) -> Result<BTreeSet<ContentDigest>, StoreError> {
+        self.validated_object_names
+            .read()
+            .map_err(|_| StoreError::UnsafeEntry("object-name cache is poisoned".into()))
+            .map(|names| names.clone())
+    }
+
+    pub(crate) fn checkpoint_namespace_delta(
+        &self,
+        roster: &BTreeSet<BatchId>,
+        required_objects: &BTreeSet<ContentDigest>,
+    ) -> Result<
+        (
+            BTreeSet<BatchId>,
+            Option<BatchId>,
+            Option<ContentDigest>,
+        ),
+        StoreError,
+    > {
+        let manifests = self
+            .validated_manifest_names
+            .read()
+            .map_err(|_| StoreError::UnsafeEntry("manifest-name cache is poisoned".into()))?;
+        let missing_manifest = roster
+            .iter()
+            .find(|batch_id| !manifests.contains(batch_id))
+            .copied();
+        let tail = manifests.difference(roster).copied().collect();
+        let objects = self
+            .validated_object_names
+            .read()
+            .map_err(|_| StoreError::UnsafeEntry("object-name cache is poisoned".into()))?;
+        let missing_object = required_objects
+            .iter()
+            .find(|digest| !objects.contains(digest))
+            .copied();
+        Ok((tail, missing_manifest, missing_object))
     }
 
     /// Begin an incremental manifest enumeration without opening any manifest
@@ -1231,6 +1335,9 @@ impl ObjectStore {
 
     pub(crate) fn validate_namespace(&self) -> Result<(), StoreError> {
         let mut manifests = Vec::new();
+        let mut manifest_fingerprints = BTreeMap::new();
+        let mut manifest_names = BTreeSet::new();
+        let mut object_names = BTreeSet::new();
         for (directory, kind) in [
             (OBJECTS_DIR, NamespaceKind::Objects),
             (BATCHES_DIR, NamespaceKind::Batches),
@@ -1272,6 +1379,7 @@ impl ObjectStore {
                         if object.encode()?.as_slice() != bytes {
                             return Err(StoreError::ObjectPathMismatch(expected));
                         }
+                        object_names.insert(expected);
                     }
                     NamespaceKind::Batches => {
                         let expected = parse_manifest_filename(name)?;
@@ -1290,6 +1398,8 @@ impl ObjectStore {
                                 found: manifest.workspace_id(),
                             });
                         }
+                        manifest_fingerprints.insert(expected, ContentDigest::of(&bytes));
+                        manifest_names.insert(expected);
                         manifests.push(manifest);
                     }
                 }
@@ -1301,6 +1411,21 @@ impl ObjectStore {
         } else {
             let _ = read_optional_regular(&self.capability, LINEAGE_CLAIM_FILE, 32, Some(32))?;
         }
+        *self
+            .validated_manifest_fingerprints
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into()))? =
+            manifest_fingerprints;
+        *self
+            .validated_manifest_names
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("manifest-name cache is poisoned".into()))? =
+            manifest_names;
+        *self
+            .validated_object_names
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("object-name cache is poisoned".into()))? =
+            object_names;
         Ok(())
     }
 

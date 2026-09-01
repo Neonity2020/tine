@@ -362,6 +362,13 @@ pub(crate) struct EphemeralPageNameOwnershipStateV1 {
     exact_names: BTreeMap<(PageNameKeyDigest, ExactLogicalPageNameRefV1), LogicalPageName>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EphemeralPageNameOwnershipCheckpointSectionV1 {
+    records: BTreeMap<PageNameKeyDigest, PageNameOwnershipRecordV1>,
+    exact_names: BTreeMap<(PageNameKeyDigest, ExactLogicalPageNameRefV1), LogicalPageName>,
+}
+
 #[derive(Debug)]
 struct EphemeralPageNameOwnershipCandidateV1 {
     records: BTreeMap<PageNameKeyDigest, PageNameOwnershipRecordV1>,
@@ -449,6 +456,53 @@ impl AuthenticatedPageNameExactStateV1 {
 }
 
 impl EphemeralPageNameOwnershipStateV1 {
+    /// Encode the exact run-local ownership state as one section of the clean
+    /// engine checkpoint. The enclosing checkpoint owns format/versioning;
+    /// this seam deliberately reuses the page-name index's canonical codec.
+    pub(crate) fn encode_checkpoint_canonical(&self) -> Result<Vec<u8>, StoreError> {
+        encode_canonical(&EphemeralPageNameOwnershipCheckpointSectionV1 {
+            records: self.records.clone(),
+            exact_names: self.exact_names.clone(),
+        })
+    }
+
+    /// Decode and validate the one current checkpoint section. No migration
+    /// or alternate reader exists because the enclosing checkpoint is a
+    /// disposable cache rather than semantic authority.
+    pub(crate) fn decode_checkpoint_canonical(bytes: &[u8]) -> Result<Self, StoreError> {
+        let section: EphemeralPageNameOwnershipCheckpointSectionV1 = decode_canonical(bytes)?;
+        let state = Self {
+            records: section.records,
+            exact_names: section.exact_names,
+        };
+        state.validate_checkpoint_shape()?;
+        Ok(state)
+    }
+
+    fn validate_checkpoint_shape(&self) -> Result<(), StoreError> {
+        let mut required = BTreeSet::new();
+        for (key, record) in &self.records {
+            record.validate_shape(*key)?;
+            if let Some(occupied) = record.occupied() {
+                required.insert((*key, occupied.exact_name().clone()));
+            }
+            if let Some(released) = record.latest_release() {
+                required.insert((*key, released.prior_exact_name().clone()));
+            }
+        }
+        if required.len() != self.exact_names.len()
+            || required
+                .iter()
+                .any(|lookup| !self.exact_names.contains_key(lookup))
+        {
+            return Err(StoreError::MalformedPageNameIndex);
+        }
+        for ((key, name_ref), name) in &self.exact_names {
+            validate_exact_name_ref(*key, name_ref, name)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_current(&self, key: PageNameKeyDigest) -> Option<PageId> {
         self.records
             .get(&key)
@@ -1425,7 +1479,60 @@ fn require_version(store: &'static str, found: u32, current: u32) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::oplog::{BatchCausalDot, BatchId, CausalPeerId, DeviceId, PageId};
     use crate::projection_producer_census::{call_count, production_rust};
+    use uuid::Uuid;
+
+    fn checkpoint_state() -> EphemeralPageNameOwnershipStateV1 {
+        let name = LogicalPageName::parse("Checkpoint Name").unwrap();
+        let key = name.key_digest();
+        let (_, name_ref) = encode_exact_name_blob(&name).unwrap();
+        let batch = BatchId::from_uuid(Uuid::from_u128(0xa500));
+        let dot = BatchCausalDot::new(
+            CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(0xa501))),
+            1,
+        )
+        .unwrap();
+        let record = PageNameOwnershipRecordV1::new(
+            key,
+            Some(PageNameOwnershipOccupiedV1::new(
+                PageId::from_uuid(Uuid::from_u128(0xa502)),
+                name_ref.clone(),
+                batch,
+                dot,
+                batch,
+                dot,
+            )),
+            None,
+        )
+        .unwrap();
+        EphemeralPageNameOwnershipStateV1 {
+            records: BTreeMap::from([(key, record)]),
+            exact_names: BTreeMap::from([((key, name_ref), name)]),
+        }
+    }
+
+    #[test]
+    fn checkpoint_section_round_trips_populated_state_canonically() {
+        let state = checkpoint_state();
+        let encoded = state.encode_checkpoint_canonical().unwrap();
+        assert_eq!(
+            EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(&encoded).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn checkpoint_section_rejects_malformed_and_trailing_bytes() {
+        let mut encoded = checkpoint_state().encode_checkpoint_canonical().unwrap();
+        encoded.push(0);
+        assert!(EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(&encoded).is_err());
+        assert!(
+            EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(b"not-postcard")
+                .is_err()
+        );
+    }
 
     /// `EphemeralPageNameOwnershipStateV1` was described here as a "no-store
     /// page-name test index" and a "no-store test authority". It is neither:
