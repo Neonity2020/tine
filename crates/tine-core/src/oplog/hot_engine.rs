@@ -30073,7 +30073,11 @@ mod validation_tests {
     // are the cheap half of the A4 repro (the cap itself is reached in
     // `oplog::hot_engine_integration_tests`, ignored because it is slow).
     // -----------------------------------------------------------------
-    fn a4_stage(engine: &mut ShardedHotEngine, author: AuthorBatch, operations: Vec<SemanticOperation>) {
+    fn a4_stage(
+        engine: &mut ShardedHotEngine,
+        author: AuthorBatch,
+        operations: Vec<SemanticOperation>,
+    ) {
         let prepared = engine
             .prepare_fixture_transaction(author, &OperationTransaction::new(operations).unwrap())
             .expect("A4 count-semantics transaction drafts");

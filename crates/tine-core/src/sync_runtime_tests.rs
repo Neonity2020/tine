@@ -28431,7 +28431,6 @@ fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equi
     });
 }
 
-
 // ---------------------------------------------------------------------------
 // Harvest A4 — run-local identity-index capacity at the real application
 // boundary (REPRO ONLY, no fix). See
@@ -28645,6 +28644,89 @@ fn a4_repro_import_of_a_graph_larger_than_every_run_local_cap() {
     let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
     eprintln!(
         "a4_import reopen_ms={:.1} reopen_status={:?}",
+        startup_ms(reopen_started.elapsed()),
+        reopened.status
+    );
+}
+
+/// The decisive data-safety probe for the A4 cap family: reach the run-local
+/// BLOCK-claim budget through ordinary application saves and observe what the
+/// store does afterwards.
+///
+/// The block-claim cap is the only member of the family with no
+/// authoring-time pre-check, so its refusal necessarily lands at acceptance —
+/// after `local_journal_drain` has already published the manifest. This test
+/// records, at the real application boundary, whether the save is refused,
+/// whether the graph keeps working, and whether the store still opens.
+#[test]
+#[ignore = "harvest A4 repro: creates >4,096 real blocks through the app (release only)"]
+fn a4_repro_managed_block_budget_and_what_it_does_to_the_next_open() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib a4_repro_managed_block_budget_and_what_it_does_to_the_next_open -- --ignored --nocapture"
+    );
+    let fixture = ActivationFixture::nested_unicode("a4-block-budget", 0xa4f3);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("A4 block-budget fixture activates");
+    drive_initial_feed(&handle);
+
+    const PER_PAGE: usize = 500;
+    let mut blocks_written = 0usize;
+    let mut refusal = None;
+    for page in 0..12usize {
+        let name = format!("A4 Block Budget Page {page}");
+        let blocks: Vec<BlockDto> = (0..PER_PAGE)
+            .map(|index| BlockDto {
+                id: format!("temporary-a4b-{page}-{index}"),
+                raw: format!("a4 block budget {page}-{index}"),
+                ..BlockDto::default()
+            })
+            .collect();
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: name.clone(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(&name, SyncPageKind::Page, None, blocks),
+        });
+        match outcome {
+            Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {
+                blocks_written += PER_PAGE;
+                let mut drained = false;
+                for _ in 0..4096 {
+                    let status = handle.status().unwrap();
+                    if status.managed_local_pending == 0 {
+                        drained = true;
+                        break;
+                    }
+                    handle.tick().unwrap();
+                }
+                let status = handle.status().unwrap();
+                eprintln!(
+                    "a4_blocks page={page} blocks={blocks_written} drained={drained} pending={} status={status:?}",
+                    status.managed_local_pending
+                );
+                if !drained {
+                    refusal = Some(format!("drain never settled: {status:?}"));
+                    break;
+                }
+            }
+            other => {
+                refusal = Some(format!("{other:?}"));
+                eprintln!("a4_blocks page={page} blocks={blocks_written} refusal={other:?}");
+                break;
+            }
+        }
+    }
+    eprintln!("a4_blocks final_blocks={blocks_written} refusal={refusal:?}");
+    eprintln!("a4_blocks status_before_reopen={:?}", handle.status());
+
+    drop(handle);
+    let reopen_started = Instant::now();
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    eprintln!(
+        "a4_blocks reopen_ms={:.1} reopen_status={:?}",
         startup_ms(reopen_started.elapsed()),
         reopened.status
     );

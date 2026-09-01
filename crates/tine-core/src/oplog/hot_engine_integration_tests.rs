@@ -6590,7 +6590,6 @@ fn a4_seed_names(
     accepted
 }
 
-
 /// Q1 — drive lifetime-distinct page names to the cap through ordinary
 /// accepted batches and record exactly what still works afterwards.
 ///
@@ -6780,7 +6779,10 @@ fn a4_repro_reopen_replays_back_to_the_cap_and_the_refusal_is_permanent() {
         );
         replayed += 1;
     }
-    eprintln!("a4_reopen replayed_batches={replayed} manifests={}", manifests.len());
+    eprintln!(
+        "a4_reopen replayed_batches={replayed} manifests={}",
+        manifests.len()
+    );
     assert!(paged_fatal_evidence(&replay).is_none());
 
     // Open succeeded — and the wedge came back with it. The same-path rename
@@ -6828,7 +6830,6 @@ fn a4_repro_reopen_replays_back_to_the_cap_and_the_refusal_is_permanent() {
     }
 }
 
-
 /// The sibling that binds FIRST in ordinary editing, and the one that makes
 /// the family a data-safety question rather than only an availability one.
 ///
@@ -6866,9 +6867,9 @@ fn a4_repro_block_claim_cap_binds_first_and_refuses_only_at_acceptance() {
                 &tx((made..made + CHUNK)
                     .map(|index| SemanticOperation::CreateBlock {
                         block: BlockLocation {
-                            block_id: crate::oplog::BlockId::from_uuid(
-                                uuid(0xa4_c000_0000 + index as u128),
-                            ),
+                            block_id: crate::oplog::BlockId::from_uuid(uuid(
+                                0xa4_c000_0000 + index as u128,
+                            )),
                             home_document_id: a4_home_id(0),
                         },
                         page_id: a4_page_id(0),
@@ -6908,4 +6909,53 @@ fn a4_repro_block_claim_cap_binds_first_and_refuses_only_at_acceptance() {
         ),
         "unexpected block-claim refusal: {error:?}"
     );
+}
+
+/// Q5 — what the run-local page-name index costs on the WAITED OPEN PATH.
+///
+/// `replay_clean_committed_tail` reruns every committed manifest through
+/// `validate_and_apply` at every open, and each replayed batch refills the
+/// page-name (and portable-path, and block-claim) indexes. This test measures
+/// that refill directly at the layer that owns the structure: seed N
+/// lifetime-distinct page names, then replay the whole committed tail into a
+/// fresh sequence-zero engine and report the wall time and the resulting
+/// occupancy.
+///
+/// CHARACTERIZATION of CURRENT behaviour (I-14): the cost is proportional to
+/// lifetime accepted history, not to graph size, and nothing amortizes it.
+#[test]
+#[ignore = "harvest A4 measurement: seeds and replays up to 4,096 page names"]
+fn a4_measure_committed_tail_replay_cost_by_lifetime_page_names() {
+    for names in [512usize, 1_024, 2_048, A4_PAGE_NAME_RECORD_CAP] {
+        let ids = Ids::new();
+        let dir = TestDir::new("a4-replay-cost");
+        let archive = store(&dir, ids);
+        let mut engine = ids.engine();
+        let seed_started = std::time::Instant::now();
+        let batches = a4_seed_names(&mut engine, &archive, 0xa4_0000, names, 256);
+        let seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+
+        let manifests = archive.committed_manifests().unwrap();
+        let mut replay = ids.engine();
+        let replay_started = std::time::Instant::now();
+        for manifest in &manifests {
+            let disposition = replay
+                .stage_from_store(&archive, manifest.batch_id())
+                .unwrap()
+                .disposition;
+            assert!(
+                matches!(disposition, BatchDisposition::Accepted { .. }),
+                "replay of {} was not accepted: {disposition:?}",
+                manifest.batch_id()
+            );
+        }
+        let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "a4_replay names={names} batches={batches} manifests={} seed_ms={seed_ms:.1} \
+             replay_ms={replay_ms:.1} replay_ms_per_name={:.3} block_claim_entries={}",
+            manifests.len(),
+            replay_ms / names as f64,
+            replay.instrumentation().block_claim_hot_entries
+        );
+    }
 }
