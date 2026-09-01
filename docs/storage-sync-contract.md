@@ -195,7 +195,7 @@ interpret the mere presence of the directory as an opt-in marker.
 | `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | publishing device | peer recovery | canonical JSON recovery link v1 | immutable |
 | `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | publishing device | peer recovery | exact manifest bytes | immutable; digest-addressed |
 | `{inbox,outbox}/.part/` | provider transport | provider transport | temporary publication bytes | disposable after recovery |
-| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit | retired provider items | bounded cleanup evidence |
+| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit, and the evidence an exact repeat of a retired rename/remove settles from (§2.10c-i) | retired provider items | bounded cleanup evidence, capped at `MAX_PROVIDER_RESIDUE_ENTRIES` |
 | `{inbox,outbox}/rename-evidence/` | provider transport | provider recovery | interrupted-rename evidence | disposable after recovery |
 
 The device-private provider journal also has `pending-publication-v1/` and
@@ -291,7 +291,7 @@ and manifest tail.
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
-| device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock | private transport recovery; never semantic authority |
+| device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock; `completed/` bounded by live provider state, not store lifetime (§2.10c-i) | private transport recovery; never semantic authority |
 
 Emergency return publishes the sibling app-private selector
 `storage-mode-selections/<graph-digest>.direct-v1.json`. Ordinary startup checks
@@ -1055,11 +1055,13 @@ in this table.
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
 
-One retryable setup refusal is intentionally outside the durable-scenario table:
+Two retryable refusals are intentionally recorded outside the durable-scenario
+table:
 
 | Operation | In-scope scenario | Required response |
 | --- | --- | --- |
 | prepare-share while an absence publication barrier is active | A half-synced folder or dying mount delivers mass absence; publishing the first shared baseline would propagate history-bearing deletions before disposition | Refuse with `external deletions awaiting disposition`; retain all local durability and retry after sweep close/grace expiry or explicit disposition |
+| exact provider removal whose caller requires the source present, on a path that is already absent | Sync-service delivery, an honest concurrent instance, or this device's own earlier completed removal has already taken the path; the completed journal record for that removal has since been compacted against provider state (§2.10c-i) | Report `UnknownProviderPath` for the exact path. This is the same answer the `RequirePresent` policy gives for any absent source; the caller re-observes provider state (the clean provider path walk reads the path before it asks for the removal). A caller whose policy is `SettleIfAbsent` settles instead. |
 
 #### Checks with no in-scope scenario, and what happened to them
 
@@ -2391,6 +2393,83 @@ authoritative oplog bytes. Before 0.7, an unrecognized private Managed Storage
 format is preserved as a backup and rebuilt from Markdown/Org into the sole
 current format. Production does not carry an old-format reader, dual schemas,
 or an in-place migration bridge.
+
+### 2.10c-i The provider retry journal's completed store is bounded by provider state
+
+`ProviderRetryJournal` (`oplog/wire.rs`, device-private, outside the graph)
+keeps one record per provider filesystem operation it performs. Records in
+`records/` describe operations still in flight; records in `completed/` are
+crash-recovery and exact-operation idempotency evidence for operations that
+finished. Both are named by a content-derived operation id — a hash over the
+operation, its binding, its provenance, the paths, and the source length and
+digest — so **neither directory has a chronology**. There is no "oldest"
+completed record, and a time or count window over them could replay or
+suppress the wrong operation after a provider namespace was lost, replaced, or
+rolled back.
+
+**Retention bound.** `completed/` is bounded by *live provider state*, never by
+the lifetime of the store. Before an operation adds a completed record, if the
+store holds `PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER` (64) records or
+more it is first compacted against the provider
+(`reconcile_completed_against_provider`). The structural scan bound
+`MAX_PROVIDER_JOURNAL_COMPLETED` (16,384) remains, and compaction keeps the
+store far below it. The trigger is deliberately small because
+`ProviderRetryJournal::load` decodes and authenticates *every* completed record
+on *every* operation, so the completed count is also the ordinary path's
+per-operation cost; a wider window buys nothing, because what makes an exact
+repeat settle after retirement is provider state, not a retained record.
+Reaching the trigger is an instruction to re-observe the provider, **not** a
+reason to fail the user's next publish, rename or remove.
+
+**What compaction retires, and why each is safe.** The predicate is derived
+from the operation type and current provider state; it never consults age or
+arrival order. It is the generalization of the two `recycle_completed_*`
+functions that already existed for two of these cases.
+
+| Record | Provider-state question | Retired when | Why an exact repeat still reaches the same outcome |
+| --- | --- | --- | --- |
+| `Put` | Is the published destination still present? | Always — present is *reflected*, absent is *moot* | Present: the repeat compares the destination bytes and settles, or refuses `ProviderConflictingBytes` when they differ — the same answer the retained record's `validate_put_destination` gave. Absent: the repeat republishes, which is what `recycle_completed_put_for_absent_destination` already arranged at operation entry. |
+| `Rename` | Is the retired source back? | Always — gone is *reflected*, back is *moot* | The repeat settles from this device's own retirement diagnostic `removed/retired-<operation id>`, whose name is derived from the retired bytes and which must still hold them, with the destination still holding them too. Retaining the record is what would make a repeat over a returned source fail. |
+| `Remove` | Is the removed source back? | Always — gone is *reflected*, back is *moot* | Source back: the repeat settles from the same retirement diagnostic. Source gone: a caller whose missing-source policy is `SettleIfAbsent` settles; a caller whose policy is `RequirePresent` gets `UnknownProviderPath`, the same state-derived answer that policy gives for any absent source (see the refusal row below). |
+
+A record whose `operation_id` also appears in `records/` is never retired: a
+crash can leave the same authenticated Cleanup record in both directories, and
+the pending copy is what the ordinary retry validator reads.
+
+**Compaction commits per record, and needs no generation pointer.** Each
+completed record is *independently* retirable and its retirement is idempotent,
+so a crash part-way through a sweep leaves a prefix retired and the rest
+untouched — a state the next sweep reaches again by itself. There is no mixed
+generation to publish atomically, so the generation-directory/commit-pointer
+shape that multi-file compaction would require does not apply here. Every
+individual removal is a `remove_file` followed by a directory `fsync`.
+`oplog::wire::tests::a_crash_across_completed_record_retirement_reopens_and_still_settles`
+cuts a sweep at the `CompletionRetired` boundary, reopens, and proves both
+operations still settle.
+
+**One publication answers one question.** `SharedProviderTransport::publish`
+and `publish_exact` are one implementation. `publish` used to be a second,
+subtly different answer that refused any destination that already existed, so
+manifest, descriptor and frontier-head publications depended on a retained
+completed record to make an exact repeat settle. They no longer do.
+
+**Proof.** `oplog::wire::tests::provider_journal_completed_records_retire_against_live_provider_state`
+drives 20,000 completed provider operations — past `MAX_PROVIDER_JOURNAL_COMPLETED`
+— and asserts no operation fails and that the steady-state `completed/` count
+stays at or below the trigger.
+`…::retired_completed_provider_records_still_settle_exact_repeat_operations`,
+`…::retired_completed_rename_settles_only_on_its_own_retirement_evidence` and
+`…::retired_completed_remove_settles_for_the_policy_that_tolerates_absence`
+prove exact idempotency after retirement, and that the settle is bound to this
+device's evidence for that exact operation rather than to a destination that
+merely exists.
+
+**Known neighbouring bound, not addressed here.** `{inbox,outbox}/removed/` is
+capped at `MAX_PROVIDER_RESIDUE_ENTRIES` (512) by
+`ensure_provider_diagnostic_capacity`, which refuses beyond it, and nothing
+retires those diagnostics. That is a separate lifetime-growth bound in the
+provider tree rather than in the journal; it is recorded here so the next
+reader does not mistake this section's guarantee for covering it.
 
 ### 2.10d When the graph filesystem folds two page names into one file
 
