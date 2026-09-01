@@ -1420,6 +1420,32 @@ impl SyncRuntimeFacade {
                             diagnostics.replayed_generations,
                         ));
                 }
+                SyncRuntimeOpenProgress::CleanOpenCounters { counters } => {
+                    crate::debug::diag(format!(
+                            "managed storage open: clean open counters accepted_batches={} committed_tail_replayed={} sweep_chains={} receipt_evidence_names={} receipt_content_reads={} receipt_full_catalog_passes={} summary_content_reads={} summary_rebuilt={} summary_delta_completions={} summary_delta_intents={} local_completion_names={} local_completion_content_reads={} local_completion_rebuilt={} local_completion_entries={} retired_own_intent_probes={} retired_own_receipt_artifacts={} archive_directory_enumerations={} archive_manifest_reads={} archive_object_reads={} archive_inspected_manifests={} archive_inspected_objects={}",
+                            counters.accepted_batches,
+                            counters.committed_tail_replayed,
+                            counters.sweep_chains,
+                            counters.receipt_evidence_names,
+                            counters.receipt_content_reads,
+                            counters.receipt_full_catalog_passes,
+                            counters.summary_content_reads,
+                            counters.summary_rebuilt,
+                            counters.summary_delta_completions,
+                            counters.summary_delta_intents,
+                            counters.local_completion_names,
+                            counters.local_completion_content_reads,
+                            counters.local_completion_rebuilt,
+                            counters.local_completion_entries,
+                            counters.retired_own_intent_probes,
+                            counters.retired_own_receipt_artifacts,
+                            counters.archive_directory_enumerations,
+                            counters.archive_manifest_reads,
+                            counters.archive_object_reads,
+                            counters.archive_inspected_manifests,
+                            counters.archive_inspected_objects,
+                        ));
+                }
             }
             progress(update);
         });

@@ -997,8 +997,14 @@ ambiguous baseline claims remain unresolved after reconstruction.
    heartbeat, while native diagnostics emit ordered, content-free completion
    boundaries for baseline authentication, receipt precheck, graph and endpoint
    open, object-store validation, committed-tail replay, projection open,
-   indexes/sweeps, journal open/drain, terminal projection repair, and completion
-   flush. These observations confer no authority.
+   indexes/sweeps, journal open, own-endpoint retirement scan,
+   absence-decision-map open, journal drain, terminal projection repair, and
+   completion flush, followed by one content-free work-counter record
+   (`SyncRuntimeCleanOpenCounters`) attributing that open's counted work —
+   batches replayed, receipt evidence names and content reads, full-catalog
+   passes, summary and local-completion chain reads, and archive
+   inspections. Every counter is produced after the work it describes; no open
+   decision reads one. These observations confer no authority.
 4. Authoritative bytes are append-only or atomically replaced under an exact
    observed-generation/lease check. A cache cannot authorize oplog mutation or
    Markdown overwrite.

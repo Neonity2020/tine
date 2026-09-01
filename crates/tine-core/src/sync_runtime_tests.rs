@@ -8628,11 +8628,18 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
 
     let mut phases = Vec::new();
     let mut recovery_stages = Vec::new();
+    let mut open_counters = None;
     let opened =
         SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
             match progress {
                 SyncRuntimeOpenProgress::Phase { phase, .. } => phases.push(phase),
                 SyncRuntimeOpenProgress::RecoveryStage { stage, .. } => recovery_stages.push(stage),
+                SyncRuntimeOpenProgress::CleanOpenCounters { counters } => {
+                    assert!(
+                        open_counters.replace(counters).is_none(),
+                        "clean open reports its work counters exactly once"
+                    );
+                }
                 SyncRuntimeOpenProgress::Waiting { .. }
                 | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
             }
@@ -8660,11 +8667,22 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
             SyncRuntimeCleanOpenStage::ProjectionOpen,
             SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
             SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
+            SyncRuntimeCleanOpenStage::OwnEndpointRetirementScan,
+            SyncRuntimeCleanOpenStage::AbsenceDecisionMapOpen,
             SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
             SyncRuntimeCleanOpenStage::TerminalProjectionRepair,
             SyncRuntimeCleanOpenStage::CompletionFlush,
         ],
         "clean cold-open diagnostics must identify every bounded recovery boundary"
+    );
+    // The counters exist so a stage time can be attributed to a mechanism.
+    // Instrumentation that is never emitted attributes nothing, so the
+    // emission itself is the architectural fact this asserts.
+    let open_counters = open_counters.expect("a clean cold open reports its work counters");
+    assert!(
+        open_counters.archive_directory_enumerations > 0,
+        "the counters must describe work this open actually performed, not a default value: \
+{open_counters:?}"
     );
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -22129,6 +22147,162 @@ fn managed_twenty_page_history_curve_manual_benchmark() {
         );
     assert!(matches!(
         reopened.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Reproduce the managed crash-reopen aging curve and attribute it to a stage.
+///
+/// The graph stays exactly 20 pages; only accepted history grows, so every
+/// difference between checkpoints is lifetime cost (I-14). One process
+/// invocation walks all checkpoints so per-stage SHARES and growth factors are
+/// comparable even on a machine running other work; absolute milliseconds
+/// across separate runs are not.
+///
+/// `TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS` (default `50,400,800`) sets the
+/// accepted-batch checkpoints. Output lines are prefixed `attribution*` and
+/// are machine-readable for `scripts/harvest-a1-open-attribution.mjs`.
+#[test]
+#[ignore = "manual release benchmark: per-stage attribution of the managed crash-reopen curve"]
+fn managed_open_stage_attribution_manual_benchmark() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib managed_open_stage_attribution_manual_benchmark -- --ignored --nocapture"
+    );
+    let checkpoints = std::env::var("TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS")
+        .unwrap_or_else(|_| "50,400,800".to_owned())
+        .split(',')
+        .filter_map(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    assert!(
+        !checkpoints.is_empty() && checkpoints.windows(2).all(|pair| pair[0] < pair[1]),
+        "checkpoints must be a strictly increasing non-empty list"
+    );
+
+    // nested_unicode contributes exactly three page files; add seventeen more
+    // so graph size stays fixed while only accepted history grows.
+    let fixture = ActivationFixture::scaled("managed-open-attribution-20", 0xa0e8, 17);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let mut handle = activated.handle.expect("20-page graph activates");
+    drive_initial_feed(&handle);
+
+    let pages = match handle.application_page_inventory().unwrap() {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+        other => panic!("managed page inventory did not load: {other:?}"),
+    };
+    assert_eq!(pages.len(), 20, "fixture must remain exactly 20 pages");
+    let mut editable = pages
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .filter(|path| !load_application_exact(&handle, path).0.blocks.is_empty())
+        .collect::<Vec<_>>();
+    editable.sort();
+    assert!(!editable.is_empty(), "20-page fixture has no editable page");
+
+    let mut accepted_rounds = 0_usize;
+    for checkpoint in checkpoints {
+        while accepted_rounds < checkpoint {
+            let path = &editable[accepted_rounds % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("open attribution edit {accepted_rounds}"),
+            );
+            drain_managed_local(&handle);
+            accepted_rounds += 1;
+        }
+
+        // One undrained frame, then a crash: this is the reopen the debt audit
+        // measured, not a clean shutdown.
+        let pending_path = editable[accepted_rounds % editable.len()].clone();
+        let (page, revision) = load_application_exact(&handle, &pending_path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            &format!("open attribution pending edit {accepted_rounds}"),
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drop(handle);
+
+        let mut stages: Vec<(SyncRuntimeCleanOpenStage, Duration)> = Vec::new();
+        let mut counters = None;
+        let started = Instant::now();
+        let reopened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                match progress {
+                    SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed } => {
+                        stages.push((stage, elapsed));
+                    }
+                    SyncRuntimeOpenProgress::CleanOpenCounters { counters: reported } => {
+                        counters = Some(reported);
+                    }
+                    SyncRuntimeOpenProgress::Phase { .. }
+                    | SyncRuntimeOpenProgress::Waiting { .. }
+                    | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
+                }
+            });
+        let reopen_ms = startup_ms(started.elapsed());
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        handle = reopened.handle.expect("the aged managed history reopens");
+        let (page, _) = load_application_exact(&handle, &pending_path);
+        assert_eq!(
+            page.blocks[0].raw,
+            format!("open attribution pending edit {accepted_rounds}"),
+            "the undrained frame must survive the crash reopen"
+        );
+        // The pending frame drained during the reopen just measured.
+        accepted_rounds += 1;
+
+        let counters = counters.expect("a clean crash reopen reports its work counters");
+        let recovery_ms = stages
+            .last()
+            .map_or(0.0, |(_, elapsed)| startup_ms(*elapsed));
+        eprintln!(
+            "attribution checkpoint={checkpoint} reopen_ms={reopen_ms:.3} clean_recovery_ms={recovery_ms:.3} stages={}",
+            stages.len()
+        );
+        let mut previous = Duration::ZERO;
+        for (stage, elapsed) in &stages {
+            eprintln!(
+                "attribution_stage checkpoint={checkpoint} stage={} stage_ms={:.3} cumulative_ms={:.3}",
+                stage.diagnostic_name(),
+                startup_ms(elapsed.saturating_sub(previous)),
+                startup_ms(*elapsed),
+            );
+            previous = *elapsed;
+        }
+        eprintln!(
+            "attribution_counters checkpoint={checkpoint} accepted_batches={} committed_tail_replayed={} sweep_chains={} receipt_evidence_names={} receipt_content_reads={} receipt_full_catalog_passes={} summary_content_reads={} summary_rebuilt={} summary_delta_completions={} summary_delta_intents={} local_completion_names={} local_completion_content_reads={} local_completion_rebuilt={} local_completion_entries={} retired_own_intent_probes={} retired_own_receipt_artifacts={} archive_directory_enumerations={} archive_manifest_reads={} archive_object_reads={} archive_inspected_manifests={} archive_inspected_objects={}",
+            counters.accepted_batches,
+            counters.committed_tail_replayed,
+            counters.sweep_chains,
+            counters.receipt_evidence_names,
+            counters.receipt_content_reads,
+            counters.receipt_full_catalog_passes,
+            counters.summary_content_reads,
+            counters.summary_rebuilt,
+            counters.summary_delta_completions,
+            counters.summary_delta_intents,
+            counters.local_completion_names,
+            counters.local_completion_content_reads,
+            counters.local_completion_rebuilt,
+            counters.local_completion_entries,
+            counters.retired_own_intent_probes,
+            counters.retired_own_receipt_artifacts,
+            counters.archive_directory_enumerations,
+            counters.archive_manifest_reads,
+            counters.archive_object_reads,
+            counters.archive_inspected_manifests,
+            counters.archive_inspected_objects,
+        );
+    }
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
 }

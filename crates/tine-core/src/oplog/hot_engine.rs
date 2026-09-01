@@ -28,8 +28,10 @@ use super::lazy_genesis::{
     LazyGenesisProviderIndexV1,
 };
 #[cfg(test)]
-use super::local_completion_index::{LocalCompletionFlushStats, LocalCompletionOpenStats};
-use super::local_completion_index::{LocalCompletionIndex, LocalCompletionPruningContext};
+use super::local_completion_index::LocalCompletionFlushStats;
+use super::local_completion_index::{
+    LocalCompletionIndex, LocalCompletionOpenStats, LocalCompletionPruningContext,
+};
 use super::page_name_index::{
     extract_authoritative_catalog_page_names, extract_semantic_page_name_observations,
     extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
@@ -41,7 +43,6 @@ use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
 };
 use super::receiver_absence_summary::ReceiverAbsenceSummary;
-#[cfg(test)]
 use super::receiver_absence_summary::ReceiverAbsenceSummaryOpenStats;
 use super::reference_catalog::ReferenceCatalogPolicyV1;
 #[cfg(test)]
@@ -6264,7 +6265,9 @@ pub struct ShardedHotEngine {
     /// Derived receiver half, retained only so post-open completions can append
     /// an install-after-receipt summary generation.
     receiver_absence_summary: RefCell<Option<ReceiverAbsenceSummary>>,
-    #[cfg(test)]
+    /// Permanent, content-free attribution for the last absence-decision-map
+    /// open. Managed cold open reports it as part of its stage counters; it
+    /// records how the summary was reached and never decides anything.
     receiver_absence_summary_open_stats: RefCell<Option<ReceiverAbsenceSummaryOpenStats>>,
     /// Disposable per-open merge of receiver receipt history with the local
     /// completion half. Durable truth remains in those two stores.
@@ -6491,7 +6494,6 @@ impl ShardedHotEngine {
             archive_store: None,
             local_completion_index: None,
             receiver_absence_summary: RefCell::new(None),
-            #[cfg(test)]
             receiver_absence_summary_open_stats: RefCell::new(None),
             absence_decision_map: RefCell::new(None),
             deferred_absence_observations: RefCell::new(BTreeSet::new()),
@@ -7567,16 +7569,23 @@ impl ShardedHotEngine {
         let mut map = if let Some(store) = self.archive_store.as_deref() {
             let opened = ReceiverAbsenceSummary::open(store, receipts)
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
-            #[cfg(test)]
-            {
-                *self.receiver_absence_summary_open_stats.borrow_mut() = Some(opened.stats.clone());
-            }
+            *self.receiver_absence_summary_open_stats.borrow_mut() = Some(opened.stats.clone());
             *self.receiver_absence_summary.borrow_mut() = opened.cache;
             opened.map
         } else {
             let catalog = receipts
                 .validated_catalog()
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            *self.receiver_absence_summary_open_stats.borrow_mut() =
+                Some(ReceiverAbsenceSummaryOpenStats {
+                    receipt_content_reads: catalog
+                        .iter()
+                        .map(|row| usize::from(row.completion.is_some()) + 1)
+                        .sum(),
+                    full_catalog_passes: 1,
+                    rebuilt: true,
+                    ..ReceiverAbsenceSummaryOpenStats::default()
+                });
             let mut map = AbsenceDecisionMap::default();
             for entry in catalog {
                 if entry.completion.is_some() {
@@ -7707,11 +7716,33 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    /// The last absence-decision-map open's attribution, if one has run.
+    pub(crate) fn receiver_absence_summary_open_stats(
+        &self,
+    ) -> Option<ReceiverAbsenceSummaryOpenStats> {
+        self.receiver_absence_summary_open_stats.borrow().clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn receiver_absence_summary_open_stats_for_test(
         &self,
     ) -> Option<ReceiverAbsenceSummaryOpenStats> {
-        self.receiver_absence_summary_open_stats.borrow().clone()
+        self.receiver_absence_summary_open_stats()
+    }
+
+    /// The device-local own-endpoint completion chain's open attribution.
+    pub(crate) fn local_completion_open_stats(&self) -> Option<LocalCompletionOpenStats> {
+        self.local_completion_index
+            .as_ref()
+            .map(|index| index.open_stats().clone())
+    }
+
+    /// How many own-endpoint completion entries the local chain currently
+    /// retains. Counted, never used as a decision input.
+    pub(crate) fn local_completion_entry_count(&self) -> usize {
+        self.local_completion_index
+            .as_ref()
+            .map_or(0, LocalCompletionIndex::completed_entry_count)
     }
 
     pub(crate) fn local_completed_projection_intent_ids(&self) -> BTreeSet<ProjectionIntentId> {
@@ -7813,9 +7844,7 @@ impl ShardedHotEngine {
 
     #[cfg(test)]
     pub(crate) fn local_completion_open_stats_for_test(&self) -> Option<LocalCompletionOpenStats> {
-        self.local_completion_index
-            .as_ref()
-            .map(|index| index.open_stats().clone())
+        self.local_completion_open_stats()
     }
 
     #[cfg(test)]
