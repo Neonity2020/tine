@@ -105,6 +105,13 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("apply_spellcheck", NoGraphSlot),
     ("approve_external_assets", NoGraphSlot),
     ("asset_trash_stats", Filesystem),
+    // The Direct cross-page move recovery bracket (packet B2): compose+commit
+    // the crash record before the first page write, retire it once every
+    // participant is durably terminal. Both take the legacy graph deliberately —
+    // the record exists because a Direct move is N+1 separate file writes, and a
+    // managed cross-page move is one native operation that needs no such record.
+    // The frontend front door never routes a managed binding here.
+    ("begin_direct_cross_page_move", LegacyOnly),
     ("block_ref_counts", ManagedRouted),
     ("block_referrers", ManagedRouted),
     ("cancel_graph_verification", NoGraphSlot),
@@ -141,6 +148,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("empty_asset_trash", TrashWrite),
     ("existing_page_names", ManagedRouted),
     ("export_query_subtrees", ManagedRouted),
+    ("finish_direct_cross_page_move", LegacyOnly),
     ("forget_known_graph", NoGraphSlot),
     ("get_app_bool", NoGraphSlot),
     ("get_app_string", NoGraphSlot),
@@ -314,6 +322,17 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
         "apply_journal_filename_migrations",
         "renaming graph files is the oplog's authority under managed storage, \
          which has no Direct Files journal filenames to repair",
+    ),
+    (
+        "begin_direct_cross_page_move",
+        "a Direct cross-page move is N+1 separate file writes and needs a crash \
+         record to converge; a managed cross-page move is one native operation \
+         the actor commits atomically, so there is nothing to recover",
+    ),
+    (
+        "finish_direct_cross_page_move",
+        "retires the record `begin_direct_cross_page_move` composed, so it is \
+         refused for the same reason",
     ),
     (
         "list_backups",
