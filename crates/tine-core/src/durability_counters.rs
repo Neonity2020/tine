@@ -211,9 +211,14 @@ impl BarrierCounts {
 /// performed — on the actor thread and on the opening thread — without seeing
 /// the barriers of any concurrently running test.
 ///
-/// Dropping the handle detaches the *opening* thread. Threads that inherited it
-/// keep charging to the same counts until they exit, which is what makes an
-/// actor's deferred drain measurable.
+/// Attachment is EXPLICIT in both directions: [`BarrierSession::detach_current_thread`]
+/// is the only way off. Dropping a handle detaches nothing — the type is `Clone`
+/// and [`current_session`] hands out clones precisely so a spawning thread can
+/// pass one to a worker, so a drop-based detach would fire on every such handoff
+/// and silently stop counting the actor it was opened to measure. Threads that
+/// attached keep charging to the same counts until they detach or exit, which is
+/// what makes an actor's deferred drain measurable.
+/// `dropping_a_session_handle_does_not_detach_the_thread` pins this.
 #[derive(Clone, Debug)]
 pub struct BarrierSession {
     counts: SessionCounts,
@@ -662,6 +667,33 @@ mod tests {
         assert_eq!(counts.get(Barrier::File), 1);
         assert_eq!(counts.get(Barrier::Directory), 1);
         BarrierSession::detach_current_thread();
+    }
+
+    /// The doc comment used to say a drop detached the opening thread. No `Drop`
+    /// impl exists, and one would be wrong: `current_session()` clones the handle
+    /// to hand attribution to a spawned actor, so dropping that clone would
+    /// silence the measurement it was created for. Every test in this file already
+    /// calls `detach_current_thread` by hand, which is what a real drop-detach
+    /// would have made redundant.
+    #[test]
+    fn dropping_a_session_handle_does_not_detach_the_thread() {
+        let session = BarrierSession::begin();
+        let observer = session.clone();
+
+        // A clone handed to a worker (the `current_session()` shape) going out of
+        // scope must not detach the thread that opened the session.
+        drop(session);
+        note(Barrier::File);
+        assert_eq!(
+            observer.counts().get(Barrier::File),
+            1,
+            "dropping a session handle detached the opening thread"
+        );
+
+        // Only the explicit call does that.
+        BarrierSession::detach_current_thread();
+        note(Barrier::File);
+        assert_eq!(observer.counts().get(Barrier::File), 1);
     }
 
     #[test]
