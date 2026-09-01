@@ -4111,6 +4111,11 @@ pub(crate) async fn sparse_v2_tick(
 pub(crate) async fn list_absence_sweeps(
     state: crate::state::GraphContext<'_>,
 ) -> Result<Vec<tine_core::sync_runtime::SyncAbsenceSweepEvent>, String> {
+    // managed-command-routing: managed. Absence sweeps exist only under managed
+    // storage and this reaches the sparse actor through `active_handle` +
+    // `ActorRequest`, not `sparse_application_handle`, so the source scanner
+    // cannot see the route. Declaring NoGraphSlot here would be false: restore
+    // and reapply change graph content.
     let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
@@ -4128,6 +4133,11 @@ pub(crate) async fn reapply_absence_sweep(
     sweep_id: String,
     state: crate::state::GraphContext<'_>,
 ) -> Result<tine_core::sync_runtime::SyncAbsenceSweepActionOutcome, String> {
+    // managed-command-routing: managed. Absence sweeps exist only under managed
+    // storage and this reaches the sparse actor through `active_handle` +
+    // `ActorRequest`, not `sparse_application_handle`, so the source scanner
+    // cannot see the route. Declaring NoGraphSlot here would be false: restore
+    // and reapply change graph content.
     let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
@@ -4145,6 +4155,11 @@ pub(crate) async fn restore_absence_sweep(
     sweep_id: String,
     state: crate::state::GraphContext<'_>,
 ) -> Result<tine_core::sync_runtime::SyncAbsenceSweepRestoreOutcome, String> {
+    // managed-command-routing: managed. Absence sweeps exist only under managed
+    // storage and this reaches the sparse actor through `active_handle` +
+    // `ActorRequest`, not `sparse_application_handle`, so the source scanner
+    // cannot see the route. Declaring NoGraphSlot here would be false: restore
+    // and reapply change graph content.
     let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
@@ -4162,6 +4177,11 @@ pub(crate) async fn keep_absence_sweep_deletion(
     sweep_id: String,
     state: crate::state::GraphContext<'_>,
 ) -> Result<(), String> {
+    // managed-command-routing: managed. Absence sweeps exist only under managed
+    // storage and this reaches the sparse actor through `active_handle` +
+    // `ActorRequest`, not `sparse_application_handle`, so the source scanner
+    // cannot see the route. Declaring NoGraphSlot here would be false: restore
+    // and reapply change graph content.
     let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
