@@ -3850,6 +3850,7 @@ fn managed_search_reports_building_then_returns_backend_results() {
     // Drive the actor by its bounded work contract instead of assuming that a
     // loaded CI host completes the lazy build within ten wall-clock seconds.
     // The turn budget still fails closed if indexing stops making progress.
+    // The backend-readiness and result assertions remain unchanged below.
     drive_search_index_to_ready(&handle, 4096);
     assert!(matches!(
         handle
