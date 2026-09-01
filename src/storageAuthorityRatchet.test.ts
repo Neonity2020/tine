@@ -60,7 +60,7 @@ const CENSUS: readonly { file: string; count: number; class: "b" | "c"; why: str
     count: 7,
     class: "b",
     why: "value captures + their I-20 re-checks, all against a stamped admission: "
-      + "buildPageMutationPlan/pageMutationPlanCurrent, "
+      + "createPageMutationPlan/pageMutationPlanCurrent, "
       + "preflightManagedBulkInsertion/consumeManagedBulkInsertionAdmission, "
       + "captureBulkRouteFence/bulkRouteFenceCurrent, and managedMoveAdmission() "
       + "(the managed arm's own writability accessor, used inside the managed "
