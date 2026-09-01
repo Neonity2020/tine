@@ -1536,12 +1536,23 @@ impl ManagedTextWriteGate {
         self.identity_mutation.lock().unwrap().epoch
     }
 
-    fn identity_mutation_epoch_under_authority(&self) -> u64 {
+    /// The resource epoch, read under this thread's own mutation authority.
+    ///
+    /// This is an internal precondition, not a threat-model refusal: a caller
+    /// that does not hold the gate would be comparing two reads of a value
+    /// another thread is free to advance between them, so the comparison means
+    /// nothing. It used to be a `debug_assert`, which does not exist in the
+    /// shipped release profile — see `graph_text_writers_take_the_identity_gate_before_any_page_lock`
+    /// for the static proof that no production path reaches here without it.
+    fn identity_mutation_epoch_under_authority(&self) -> io::Result<u64> {
         let caller = std::thread::current().id();
         let state = self.identity_mutation.lock().unwrap();
-        debug_assert_eq!(state.owner.as_ref(), Some(&caller));
-        debug_assert_ne!(state.depth, 0);
-        state.epoch
+        if state.owner.as_ref() != Some(&caller) || state.depth == 0 {
+            return Err(graph_text_admission_unavailable(
+                "graph-text identity epoch read without this thread's mutation authority",
+            ));
+        }
+        Ok(state.epoch)
     }
 
     fn advance_identity_mutation_epoch(&self) -> u64 {
@@ -6607,7 +6618,7 @@ impl Graph {
         &self,
     ) -> io::Result<Arc<CompleteGraphTextAdmissionIndex>> {
         let binding = self.managed_write_binding()?;
-        let resource_epoch = binding.gate.identity_mutation_epoch_under_authority();
+        let resource_epoch = binding.gate.identity_mutation_epoch_under_authority()?;
         {
             let state = self.guarded_graph_text_identity.read().unwrap();
             if !state.invalidated && state.observed_resource_epoch == Some(resource_epoch) {
@@ -6655,7 +6666,7 @@ impl Graph {
         })?;
         let index_elapsed = index_started.elapsed();
 
-        if binding.gate.identity_mutation_epoch_under_authority() != resource_epoch {
+        if binding.gate.identity_mutation_epoch_under_authority()? != resource_epoch {
             return Err(graph_text_admission_unavailable(
                 "resource epoch changed during guarded graph-text identity rebuild",
             ));
@@ -6779,7 +6790,7 @@ impl Graph {
             .into_iter()
             .map(|path| self.rel_path(path))
             .collect::<Vec<_>>();
-        let prior_resource_epoch = identity.gate.identity_mutation_epoch_under_authority();
+        let prior_resource_epoch = identity.gate.identity_mutation_epoch_under_authority()?;
         // Advance before attempting publication. If the filesystem transition
         // was already committed and any later step fails, every sibling's older
         // epoch is still immediately unusable once this authority is released.
@@ -12324,6 +12335,10 @@ impl Graph {
         pre_choice: &str,
     ) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
+        // Gate order (storage-sync-contract §3 invariant 9): the graph-global
+        // identity gate is taken before any page lock. Inverting it deadlocks
+        // every graph-text write in the process, not just this page.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let path = self
             .resolve_managed_rel(&write, rel)?
             .ok_or_else(bad_path)?;
@@ -12549,6 +12564,10 @@ impl Graph {
         pre_choice: &str,
     ) -> io::Result<PageDto> {
         let write = self.admit_managed_text_writer()?;
+        // Gate order (storage-sync-contract §3 invariant 9): the graph-global
+        // identity gate is taken before any page lock. Inverting it deadlocks
+        // every graph-text write in the process, not just this page.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let (path, _) = self.save_target(&write, page)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
@@ -12926,6 +12945,10 @@ impl Graph {
         pre_choice: &str,
     ) -> io::Result<PageDto> {
         let write = self.admit_managed_text_writer()?;
+        // Gate order (storage-sync-contract §3 invariant 9): the graph-global
+        // identity gate is taken before any page lock. Inverting it deadlocks
+        // every graph-text write in the process, not just this page.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let win = self
             .resolve_managed_rel(&write, winner_rel)?
             .ok_or_else(bad_path)?;
@@ -16702,6 +16725,10 @@ impl Graph {
     /// edit-time migration path can carry their notes forward safely.
     pub fn open_pdf(&self, pdf_filename: &str, label: &str) -> io::Result<crate::pdf::PdfState> {
         let write = self.admit_managed_text_writer()?;
+        // Gate order (storage-sync-contract §3 invariant 9): the graph-global
+        // identity gate is taken before any page lock. Inverting it deadlocks
+        // every graph-text write in the process, not just this page.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let key = crate::pdf::asset_key(pdf_filename);
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let page_lock = self.page_lock(&page_path);
@@ -17105,6 +17132,10 @@ impl Graph {
         base_ids: &[String],
     ) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
+        // Gate order (storage-sync-contract §3 invariant 9): the graph-global
+        // identity gate is taken before any page lock. Inverting it deadlocks
+        // every graph-text write in the process, not just this page.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let key = crate::pdf::asset_key(pdf_filename);
         // Legacy (pre-launch) key. When it differs and only the legacy files
         // exist, we read those as the baseline and migrate them to the new key
@@ -18375,6 +18406,10 @@ impl Graph {
         reservation: &ProjectionAttemptReservation,
         known_attempts: &[ProjectionAttemptReservation],
     ) -> io::Result<ProjectionWriteProof> {
+        // Gate order (storage-sync-contract §3 invariant 9): this delegates to
+        // `write_page_projection_with_attempts` under the page lock below, and
+        // that takes the gate — so it must be taken here, before the page lock.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         require_projection_platform()?;
         let target = self.projection_page_target(relative_path)?;
         validate_projection_attempt(&target, reservation)?;

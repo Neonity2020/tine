@@ -5645,6 +5645,29 @@
     "failBefore": "proven: an exact inotify path under logseq/bak became a ManagedPath observation even though poll/full-scan discovery excluded the same path"
    },
    "notes": "The exact-event lane now consults the same fixed GraphTextScope exclusions as managed poll/full-scan discovery before constructing a watcher observation. The release journey creates the reported logseq/bak/journals/<day>/<timestamp>.Desktop.md shape after activation and then runs the rapid multi-day move stress. As a final presentation backstop, identical visible Managed Storage diagnostic toasts are deduplicated while one remains on screen."
+  },
+  {
+   "id": "REG-GRAPHTEXT-GATE-ORDER-001",
+   "title": "Annotating a PDF while the same hls__ page is being saved no longer wedges every graph-text write in the process",
+   "family": "data-safety",
+   "sources": {
+    "issues": [],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/tests/graph_text_gate_order.rs::saving_and_annotating_the_same_hls_page_never_deadlocks",
+     "crates/tine-core/src/model.rs::tests::graph_text_writers_take_the_identity_gate_before_any_page_lock"
+    ],
+    "scenario": "graph-text.identity-gate-before-page-lock",
+    "failBefore": "proven"
+   },
+   "notes": "Fail-before on 3a123bc1 in the RELEASE profile (the shipped configuration): saving and annotating the same hls__ page hung both writers permanently, 0 of 2 finished in 60s; the same tree passes in 0.51s after the fix. The saver holds the graph-global graph-text identity gate while it waits for the page lock the annotator holds, so no later graph-text write in the process can proceed either. Debug builds hit debug_assert at model.rs:1542 instead and never reached the hang, which is why it survived. Six writers took the two locks in the wrong order: resolve_vcs_marker_conflict, resolve_durable_live_save_conflict, resolve_sync_conflict, open_pdf, write_highlights and confirm_removed_page_projection_with_attempts. All six now take the identity gate before any page lock; the order is proved statically over model.rs's call graph; and the epoch read refuses instead of silently reading without authority."
   }
  ]
 }

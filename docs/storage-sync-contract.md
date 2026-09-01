@@ -1015,6 +1015,24 @@ ambiguous baseline claims remain unresolved after reconstruction.
    private binding or an explicit activation/join command. Its separate
    app-private graph-fact projection contains no managed state and grants no
    authority.
+9. Graph-text writes take two locks, and always in this order: the
+   **graph-text identity-mutation gate** (`ManagedTextWriteGate::lock_identity_mutation`,
+   graph-global, exclusive across threads, re-entrant per thread) first, then the
+   **per-page lock** (`Graph::page_lock`, per path). A writer that holds a page
+   lock and then reaches the gate deadlocks against every writer that takes them
+   the other way round — and because the gate is graph-global and its holder is
+   blocked, the whole process stops publishing graph text, not just that page.
+   The order is a static property of the code and is proved statically, by
+   `graph_text_writers_take_the_identity_gate_before_any_page_lock`, which walks
+   `model.rs`'s call graph and fails on any function holding a page lock that can
+   transitively acquire the gate. `debug_assert` cannot enforce it: the shipped
+   release profile compiles those out, so before 2026-09-01 the release binary
+   reached the deadlock where debug builds reached an assertion.
+   Reading the resource epoch (`identity_mutation_epoch_under_authority`) requires
+   the calling thread to hold the gate; it now refuses with
+   `graph_text_admission_unavailable` rather than reading a value another thread
+   is free to advance. That is an internal precondition, not a threat-model
+   refusal, and no in-scope scenario reaches it once the static order holds.
 
 ### 3.1 Refusal scenarios
 

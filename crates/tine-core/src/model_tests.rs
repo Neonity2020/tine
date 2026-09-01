@@ -20237,3 +20237,155 @@ fn gh254_tokenless_observation_failure_is_retryable_but_not_banner_class() {
     assert!(graph.force_save_page(&page).is_err());
     let _ = fs::remove_dir_all(root);
 }
+
+// P-01 (2026-09-01 debt audit): the graph-text identity gate is graph-global
+// and exclusive across threads; the per-page lock is per-path. Three writers
+// took the gate first and four took the page lock first, so an editor save and
+// a PDF-highlight write of the SAME `hls__` page deadlocked each other — and
+// because the saver holds the graph-global gate while it waits, every later
+// graph-text write in the process wedged too. That is an app-wide hang, and it
+// is invisible to `debug_assert`s: the shipped release profile compiles them
+// out, so the release binary reached the deadlock instead of the assertion.
+//
+// The invariant is an ordering one and therefore static: any function that
+// holds a page lock while it (transitively) acquires the identity gate is a
+// deadlock against every function that takes them the other way round. This
+// guard walks `model.rs`'s call graph and fails on any such function.
+#[test]
+fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
+    use std::collections::{HashMap, HashSet};
+
+    let source = include_str!("model.rs");
+    let lines: Vec<&str> = source.lines().collect();
+    let is_fn_start = |line: &str| {
+        line.starts_with("    fn ")
+            || line.starts_with("    pub fn ")
+            || line.starts_with("    pub(crate) fn ")
+    };
+    let mut starts: Vec<usize> = (0..lines.len())
+        .filter(|i| is_fn_start(lines[*i]))
+        .collect();
+    starts.push(lines.len());
+    assert!(
+        starts.len() > 400,
+        "the function scan found only {} candidates; the source shape changed",
+        starts.len()
+    );
+
+    fn name_of(line: &str) -> &str {
+        let rest = line
+            .trim_start()
+            .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub ")
+            .trim_start_matches("fn ");
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+    fn callees(body: &str) -> HashSet<&str> {
+        let mut found = HashSet::new();
+        let mut rest = body;
+        while let Some(at) = rest.find("self.") {
+            rest = &rest[at + 5..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if rest[end..].starts_with('(') {
+                found.insert(&rest[..end]);
+            }
+        }
+        found
+    }
+
+    let mut bodies: HashMap<&str, Vec<String>> = HashMap::new();
+    for pair in starts.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        bodies
+            .entry(name_of(lines[a]))
+            .or_default()
+            .push(lines[a..b].join("\n"));
+    }
+
+    // Transitive closure of "can acquire the graph-text identity gate".
+    let mut acquires: HashSet<&str> = bodies
+        .iter()
+        .filter(|(_, list)| {
+            list.iter()
+                .any(|body| body.contains("lock_graph_text_identity_mutation()"))
+        })
+        .map(|(name, _)| *name)
+        .collect();
+    // Seeded on the writers that have always taken the gate directly, so this
+    // sanity check cannot silently encode the fix it is guarding.
+    for expected in [
+        "save_page",
+        "force_save_page_at_revision",
+        "merge_pages",
+        "write_page_projection_with_attempts",
+    ] {
+        assert!(
+            acquires.contains(expected),
+            "the gate-acquisition seed is wrong: `{expected}` acquires the identity gate but \
+             the scan did not see it, so this guard would pass vacuously"
+        );
+    }
+    loop {
+        let mut grew = false;
+        for (name, list) in &bodies {
+            if acquires.contains(name) {
+                continue;
+            }
+            if list
+                .iter()
+                .any(|body| callees(body).iter().any(|c| acquires.contains(c)))
+            {
+                acquires.insert(name);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut inversions: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for pair in starts.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let body = lines[a..b].join("\n");
+        let Some(page_lock_at) = body.find("self.page_lock(") else {
+            continue;
+        };
+        checked += 1;
+        let gate_at = body.find("lock_graph_text_identity_mutation");
+        if gate_at.is_some_and(|gate| gate < page_lock_at) {
+            continue;
+        }
+        let under_lock = &body[page_lock_at..];
+        let mut reaching: Vec<&str> = callees(under_lock)
+            .into_iter()
+            .filter(|c| acquires.contains(c))
+            .collect();
+        if reaching.is_empty() {
+            continue;
+        }
+        reaching.sort_unstable();
+        inversions.push(format!(
+            "{} (model.rs:{}) holds a page lock and then reaches the identity gate via {reaching:?}",
+            name_of(lines[a]),
+            a + 1
+        ));
+    }
+    assert!(
+        checked >= 25,
+        "only {checked} page-lock holders were examined; the guard lost its subjects"
+    );
+    assert!(
+        inversions.is_empty(),
+        "graph-text identity gate / page lock order inverted — this deadlocks the whole \
+         process against `save_page`. Take `lock_graph_text_identity_mutation()` before the \
+         page lock, as `save_page`, `force_save_page_at_revision` and `merge_pages` do:\n{}",
+        inversions.join("\n")
+    );
+}

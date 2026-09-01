@@ -41,9 +41,22 @@ export function coverageReferenceProblem(root, reference) {
     // `module::path::test_name` -- the last segment is the item that must exist.
     // Accept a module so a family reference (`doc.rs::org_container_outline_tests`)
     // stays legal, since it names a real Rust item that a rename would break.
+    //
+    // A module declared with an explicit `#[path]` lives in a sibling file
+    // (`model.rs` -> `model_tests.rs`). Those declarations are the ONLY thing
+    // that redirects the search: a catalog reference still names the owning
+    // module's file, as Rust's own `module::path` does, so moving the test bodies
+    // out must not turn every reference into a lie. It did on 2026-09-01, and
+    // five `covered` entries silently stopped being checked.
     const name = escapeRegExp(symbol.split("::").pop());
-    if (new RegExp(`\\bfn\\s+${name}\\b`).test(source)) return null;
-    if (new RegExp(`\\bmod\\s+${name}\\b`).test(source)) return null;
+    const declares = (text) =>
+      new RegExp(`\\bfn\\s+${name}\\b`).test(text) || new RegExp(`\\bmod\\s+${name}\\b`).test(text);
+    if (declares(source)) return null;
+    for (const [, relative] of source.matchAll(/#\[path\s*=\s*"([^"]+)"\]/g)) {
+      const sibling = path.join(path.dirname(absolute), relative);
+      if (!fs.existsSync(sibling)) continue;
+      if (declares(fs.readFileSync(sibling, "utf8"))) return null;
+    }
     return `${file} has no test fn or module named ${symbol.split("::").pop()} (referenced as ${reference})`;
   }
 
