@@ -298,4 +298,12 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn checkpoint_open_counter_distinguishes_checkpoint_from_full_replay() {
+        assert!(
+            false,
+            "pre-fix necessity: no checkpoint-open path or path-discriminating counter exists"
+        );
+    }
 }
