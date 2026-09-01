@@ -1462,9 +1462,7 @@ pub enum StoreError {
         store: &'static str,
         version: u32,
     },
-    MissingLogseqClaimIndexNode(ContentDigest),
-    LogseqClaimIndexPathMismatch(ContentDigest),
-    MalformedLogseqClaimIndex,
+    MalformedPortablePathIndex,
     MissingExactLogicalPageNameBlob(ContentDigest),
     ExactLogicalPageNameBlobPathMismatch(ContentDigest),
     MalformedPageNameIndex,
@@ -1539,18 +1537,8 @@ impl fmt::Display for StoreError {
             Self::UnsupportedStoreVersion { store, version } => {
                 write!(f, "{store} version {version} is unsupported")
             }
-            Self::MissingLogseqClaimIndexNode(digest) => {
-                write!(
-                    f,
-                    "authenticated Logseq claim index node {digest} is missing"
-                )
-            }
-            Self::LogseqClaimIndexPathMismatch(digest) => write!(
-                f,
-                "authenticated Logseq claim index bytes do not match path {digest}"
-            ),
-            Self::MalformedLogseqClaimIndex => {
-                f.write_str("authenticated Logseq claim index is malformed or non-canonical")
+            Self::MalformedPortablePathIndex => {
+                f.write_str("authenticated portable-path index is malformed or non-canonical")
             }
             Self::MissingExactLogicalPageNameBlob(digest) => {
                 write!(f, "exact logical page-name blob {digest} is missing")
