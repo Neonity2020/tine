@@ -194,43 +194,9 @@ impl AdmittedLocalAuthorAuthority<'_> {
 
 enum AdmissionProvenance<'a> {
     Clean(&'a CleanRuntimeAdmission<'a>),
-    /// Retained for the crate-private `#[cfg(test)]` fixture corpus only; see
-    /// [`LocalRuntimeAdmission::unenrolled_pre_activation`].
-    #[cfg(test)]
-    UnenrolledPreActivation,
 }
 
 impl LocalRuntimeAdmission<'_> {
-    /// The pre-activation escape hatch retained only for the crate-private
-    /// deterministic scenario corpus and the coordinator/session/import
-    /// regressions that predate enrollment. Those fixtures build engines
-    /// directly instead of through a bootstrap publication, so no genuine
-    /// authority is constructible for them yet.
-    ///
-    /// It has no production caller and is therefore `#[cfg(test)]`. It has no
-    /// live TEST caller either: its only two call sites are in
-    /// `trusted_local_commit.rs`'s `mod tests`, which is gated
-    /// `#[cfg(all(test, any()))]` and does not compile. (The list here used to
-    /// name `operational_coordinator.rs`'s tests, which never called it, and a
-    /// `hot_engine_integration_tests/hot_overlay_tests.rs` that does not exist.)
-    /// `tests::the_pre_activation_hatch_has_exactly_the_callers_named_here` keeps
-    /// this current; when the parked corpus is deleted, delete this hatch with
-    /// it.
-    ///
-    /// Two independent fences keep it away from a user's real graph. It stays
-    /// `pub(crate)` — as does [`LocalRuntimeAdmission`] itself — so app startup
-    /// and Tauri cannot name or construct one, and outside this crate the only
-    /// way to obtain an admission remains a live runtime permit. And
-    /// [`Self::authorize`] refuses outright when the engine offered is a
-    /// promoted runtime, so even inside the crate this hatch can never
-    /// authorize work over a promoted lineage.
-    #[cfg(test)]
-    pub(crate) const fn unenrolled_pre_activation() -> Self {
-        Self {
-            provenance: AdmissionProvenance::UnenrolledPreActivation,
-        }
-    }
-
     /// Revalidate the live runtime immediately before work is admitted.
     ///
     /// A promoted admission requires the supplied engine to be the exact
@@ -249,8 +215,6 @@ impl LocalRuntimeAdmission<'_> {
     ) -> Result<(), RuntimePromotionError> {
         match &self.provenance {
             AdmissionProvenance::Clean(admission) => admission.authorize_engine(graph, engine),
-            #[cfg(test)]
-            AdmissionProvenance::UnenrolledPreActivation => Ok(()),
         }
     }
 
@@ -273,14 +237,6 @@ impl LocalRuntimeAdmission<'_> {
                 admission.workspace_id,
                 admission.session_id,
             ),
-            #[cfg(test)]
-            AdmissionProvenance::UnenrolledPreActivation => {
-                return Err(RuntimePromotionError::Activation(
-                    LocalActivationError::RuntimeBinding(
-                        "local author identity requires a live managed runtime session".into(),
-                    ),
-                ));
-            }
         };
         if endpoint != admitted_endpoint
             || endpoint.device_id() != admitted_endpoint.device_id()
@@ -326,8 +282,6 @@ impl LocalRuntimeAdmission<'_> {
     ) -> Result<(), WorkspaceAuthorityRefusal> {
         match &self.provenance {
             AdmissionProvenance::Clean(admission) => admission.reprove(boundary),
-            #[cfg(test)]
-            AdmissionProvenance::UnenrolledPreActivation => Ok(()),
         }
     }
 }
@@ -1525,25 +1479,5 @@ mod tests {
                  link, or say what actually plays that role now."
             );
         }
-    }
-
-    /// `unenrolled_pre_activation`'s doc names its callers. Names go stale; this
-    /// does not.
-    #[test]
-    fn the_pre_activation_hatch_has_exactly_the_callers_named_here() {
-        let callers: BTreeSet<String> = crate_sources()
-            .into_iter()
-            .filter(|(relative, source)| {
-                relative != "oplog/local_active.rs" && source.contains("unenrolled_pre_activation(")
-            })
-            .map(|(relative, _)| relative)
-            .collect();
-        assert_eq!(
-            callers,
-            BTreeSet::from(["oplog/trusted_local_commit.rs".to_owned()]),
-            "the pre-activation escape hatch's caller set changed. Its doc comment names the \
-             callers; update both together, and if the set is now empty delete the hatch and \
-             its AdmissionProvenance variant rather than leaving dead test-only authority."
-        );
     }
 }
