@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import {
   LINUX_CORE_RELEASE_FILTERSET,
+  LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
   LINUX_TINE_CORE_SHARD_COUNT,
   KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
   KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES,
@@ -10,11 +11,29 @@ import {
   WINDOWS_CORE_EXACT_TEST_NAMES,
   WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
   WINDOWS_CORE_SMOKE_FILTERSET,
+  WINDOWS_CORE_SMOKE_TEST_NAMES,
   inventoryFromNextestList,
+  linuxCoreReleaseFilterset,
   verifyLinuxReleaseSelection,
   verifyLinuxShardCoverage,
   verifyWindowsCoreSmokeSelection,
+  windowsCoreSmokeTestNames,
 } from "./tine-core-nextest-contract.mjs";
+import {
+  ONE_RELEASE_CI_EXCEPTION,
+  ONE_RELEASE_CI_EXCEPTION_VERSION,
+  PROJECT_VERSION,
+  classifyRetiredManagedV1Problems,
+  linuxReleaseExcludedTestNames,
+  oneReleaseCiExceptionActive,
+  windowsRequiredTestNames,
+} from "./release-0.6.981-ci-exception.mjs";
+
+const NEXT_RELEASE_VERSION = "0.6.982";
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function listedInventory(packageName, testNames) {
   return inventoryFromNextestList(packageName, {
@@ -49,15 +68,15 @@ const releaseSelectedNames = [
 ];
 const coreWithKnownRedOracle = listedInventory("tine-core", [
   ...releaseSelectedNames,
-  ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+  ...LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
 ]);
 const releaseWithoutKnownRedOracle = listedInventory("tine-core", releaseSelectedNames);
 assert.deepEqual(
   verifyLinuxReleaseSelection(coreWithKnownRedOracle, releaseWithoutKnownRedOracle),
   {
-    coreTestCount: releaseSelectedNames.length + KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
+    coreTestCount: releaseSelectedNames.length + LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES.length,
     releaseTestCount: releaseSelectedNames.length,
-    knownRedTestCount: KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length,
+    knownRedTestCount: LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES.length,
   }
 );
 assert.throws(
@@ -70,10 +89,10 @@ assert.throws(
 
 // And a listed exclusion whose test no longer exists must fail too, so the list
 // cannot rot through renames or deletions.
-const staleOracleName = KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES[0];
+const staleOracleName = LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES[0];
 const coreWithoutOneOracleTest = listedInventory("tine-core", [
   ...releaseSelectedNames,
-  ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.filter((name) => name !== staleOracleName),
+  ...LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES.filter((name) => name !== staleOracleName),
 ]);
 assert.throws(
   () => verifyLinuxReleaseSelection(coreWithoutOneOracleTest, releaseWithoutKnownRedOracle),
@@ -87,7 +106,7 @@ assert.throws(
     coreWithKnownRedOracle,
     listedInventory("tine-core", releaseSelectedNames.filter((name) => !name.startsWith("model::tests::")))
   ),
-  /excluded non-oracle test/
+  /Linux release exclusion contract changed.*model::tests::ordinary_semantic_contract/
 );
 const familyNames = Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES).flat();
 assert.deepEqual([...familyNames].sort(), KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES);
@@ -108,10 +127,58 @@ assert.equal(
   KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
 );
 
+assert.equal(PROJECT_VERSION, ONE_RELEASE_CI_EXCEPTION_VERSION);
+assert.equal(oneReleaseCiExceptionActive(), true);
+assert.equal(oneReleaseCiExceptionActive(NEXT_RELEASE_VERSION), false);
+assert.deepEqual(
+  LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
+  linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES)
+);
+assert.equal(
+  LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES.length,
+  KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
+    + ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames.length
+);
+assert.deepEqual(
+  linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, NEXT_RELEASE_VERSION),
+  []
+);
+assert.equal(linuxCoreReleaseFilterset(NEXT_RELEASE_VERSION), "all()");
+const release981OnlyRed = ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames[0];
+assert.match(LINUX_CORE_RELEASE_FILTERSET, new RegExp(`test\\(=${escapeRegExp(release981OnlyRed)}\\)`));
+assert.doesNotMatch(
+  linuxCoreReleaseFilterset(NEXT_RELEASE_VERSION),
+  new RegExp(`test\\(=${escapeRegExp(release981OnlyRed)}\\)`)
+);
+assert.throws(
+  () => verifyLinuxReleaseSelection(
+    listedInventory("tine-core", [
+      ...releaseSelectedNames,
+      ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+      release981OnlyRed,
+    ]),
+    listedInventory("tine-core", [
+      ...releaseSelectedNames,
+      ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+    ]),
+    NEXT_RELEASE_VERSION
+  ),
+  new RegExp(`Linux release exclusion contract changed.*${release981OnlyRed}`)
+);
+assert.deepEqual(
+  verifyLinuxReleaseSelection(coreWithKnownRedOracle, coreWithKnownRedOracle, NEXT_RELEASE_VERSION),
+  {
+    coreTestCount: releaseSelectedNames.length + LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES.length,
+    releaseTestCount: releaseSelectedNames.length + LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES.length,
+    knownRedTestCount: 0,
+  }
+);
+
 assert.match(
   LINUX_CORE_RELEASE_FILTERSET,
-  /not \(test\(=sync_runtime::tests::/
+  /not \(test\(=/
 );
+assert.match(LINUX_CORE_RELEASE_FILTERSET, /test\(=sync_runtime::tests::/);
 assert.doesNotMatch(LINUX_CORE_RELEASE_FILTERSET, /not test\(\/sync_runtime::tests::\/\)/);
 assert.throws(
   () => verifyLinuxShardCoverage(fullCore, [shards[0], shards[1], shards[2], shards[2]]),
@@ -160,32 +227,80 @@ const coreCaptureWitnesses = [
 ];
 assert.deepEqual(WINDOWS_CORE_CAPTURE_WITNESS_NAMES, coreCaptureWitnesses);
 
-const coreSmokeTests = [...new Set([...coreWindowsTests, ...coreLifecycleWitnesses, ...coreCaptureWitnesses])];
+const ordinaryCoreSmokeTests = [...new Set([...coreWindowsTests, ...coreLifecycleWitnesses, ...coreCaptureWitnesses])];
+const currentCoreSmokeTests = windowsCoreSmokeTestNames();
+assert.deepEqual(WINDOWS_CORE_SMOKE_TEST_NAMES, currentCoreSmokeTests);
+assert.deepEqual(
+  currentCoreSmokeTests,
+  windowsRequiredTestNames(ordinaryCoreSmokeTests)
+);
+for (const missingWindowsWitness of ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames) {
+  assert.equal(currentCoreSmokeTests.includes(missingWindowsWitness), false);
+}
+assert.deepEqual(windowsCoreSmokeTestNames(NEXT_RELEASE_VERSION), ordinaryCoreSmokeTests);
 assert.deepEqual(
   verifyWindowsCoreSmokeSelection(
-    listedInventory("tine-core", [...coreSmokeTests, "unselected_platform_neutral_test"]),
-    listedInventory("tine-core", coreSmokeTests)
+    listedInventory("tine-core", [...currentCoreSmokeTests, "unselected_platform_neutral_test"]),
+    listedInventory("tine-core", currentCoreSmokeTests)
   ),
   {
-    coreTestCount: 31,
-    coreSmokeTestCount: 30,
+    coreTestCount: currentCoreSmokeTests.length + 1,
+    coreSmokeTestCount: currentCoreSmokeTests.length,
     windowsNamedCount: 15,
     bootstrapWitnessCount: 8,
   }
 );
 assert.throws(
   () => verifyWindowsCoreSmokeSelection(
-    listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("windows_live_graph"))),
-    listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("windows_live_graph")))
+    listedInventory("tine-core", currentCoreSmokeTests.filter((name) => !name.includes("windows_live_graph"))),
+    listedInventory("tine-core", currentCoreSmokeTests.filter((name) => !name.includes("windows_live_graph")))
   ),
   /Windows-named tine-core test inventory changed/
 );
 assert.throws(
   () => verifyWindowsCoreSmokeSelection(
-    listedInventory("tine-core", coreSmokeTests),
-    listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("inactive_bootstrap_capture_rejects_file_cap")))
+    listedInventory("tine-core", currentCoreSmokeTests),
+    listedInventory("tine-core", currentCoreSmokeTests.filter((name) => !name.includes("inactive_bootstrap_capture_rejects_file_cap")))
   ),
   /Windows core smoke selection omitted required test/
+);
+for (const missingWindowsWitness of ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames) {
+  const nextReleaseWithoutOneWitness = ordinaryCoreSmokeTests.filter((name) => name !== missingWindowsWitness);
+  assert.throws(
+    () => verifyWindowsCoreSmokeSelection(
+      listedInventory("tine-core", nextReleaseWithoutOneWitness),
+      listedInventory("tine-core", nextReleaseWithoutOneWitness),
+      NEXT_RELEASE_VERSION
+    ),
+    new RegExp(`must contain exactly one required test ${missingWindowsWitness}`)
+  );
+}
+assert.deepEqual(
+  verifyWindowsCoreSmokeSelection(
+    listedInventory("tine-core", [...ordinaryCoreSmokeTests, "unselected_platform_neutral_test"]),
+    listedInventory("tine-core", ordinaryCoreSmokeTests),
+    NEXT_RELEASE_VERSION
+  ),
+  {
+    coreTestCount: ordinaryCoreSmokeTests.length + 1,
+    coreSmokeTestCount: ordinaryCoreSmokeTests.length,
+    windowsNamedCount: 15,
+    bootstrapWitnessCount: 8,
+  }
+);
+
+const retired981Problem = ONE_RELEASE_CI_EXCEPTION.retiredManagedV1AllowedProblems[0];
+assert.deepEqual(
+  classifyRetiredManagedV1Problems([retired981Problem]),
+  { allowed: [retired981Problem], unexpected: [] }
+);
+assert.deepEqual(
+  classifyRetiredManagedV1Problems([retired981Problem], NEXT_RELEASE_VERSION),
+  { allowed: [], unexpected: [retired981Problem] }
+);
+assert.deepEqual(
+  classifyRetiredManagedV1Problems([retired981Problem, "new retired-v1 problem"]),
+  { allowed: [retired981Problem], unexpected: ["new retired-v1 problem"] }
 );
 assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_live_graph_root_move_is_denied_without_rebinding\)/);
 assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt\)/);
