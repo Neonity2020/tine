@@ -369,9 +369,11 @@
     "Breakpoint and geometry may evolve, but modal overlay behavior on compact viewports and persistent sidebar behavior on roomy viewports are blocking."
    ],
    "nonRequirements": [
-    "Exact breakpoint pixel value, drawer width, overlay opacity, or transition duration."
+    "Exact breakpoint pixel value, drawer width, overlay opacity, or transition duration.",
+    "Exact pane coordinates or DOM parentage once the persistent-sidebar mode and workspace containment are proven."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-01: the v0.6.981 release gate exhausted the two-attempt stop-loss on presentation-only oracles after the semantic outcomes succeeded. The exact candidate remained in roomy persistent mode with no modal roles, scrims, inert surfaces, or active drawer; the PDF and source panes both remained bounded by the workspace beside the persistent right sidebar. The journey first rejected the sidebar's changed absolute x coordinate and, after that non-requirement was removed, rejected that .pdf-pane was no longer a direct child of .drawer-workspace after the new ordinary-pane PDF route. Keep the compact and roomy state diagnostics selected, but restore blocking only after the final neighbor assertion is expressed through persistent mode and workspace ownership rather than coordinates or DOM ancestry."
   },
   "scripts/e2e-multigraph.mjs": {
    "contracts": [
@@ -536,7 +538,8 @@
    "nonRequirements": [
     "Exact PDF pixels, pane dimensions, DOM nesting, drag geometry, or mobile navigation."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-01: the v0.6.981 release gate first exposed and then verified the fixed typed-page blur race, advancing the journey to its Notes action. At the narrow companion width the direct .pdf-notes-btn probe reports not displayed, while opening More settings leaves the overflow Notes button present but not clickable; this is the same contradictory inline-versus-overflow visibility boundary as the separately quarantined PDF Outline-pointer journey. The stop-loss is exhausted, so the route/tab/page-state diagnostics stay selected but non-blocking. Restore blocking only after one user-pointer strategy can reach Notes at this width and the complete unchanged-binary route/relaunch journey passes burn-in."
   },
   "scripts/e2e-pdf-scroll-resources.mjs": {
    "contracts": [
