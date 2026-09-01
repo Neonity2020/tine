@@ -9620,6 +9620,33 @@
       "notes": "User outcome: grabbing a sidebar row to move it does not navigate away, and the empty space to the right of a short page name is not a link. Classification: blocking stateful UX - the reporter lost his place in the graph while reordering, on Windows 10, daily. Root cause: .nav-item/.nav-page painted cursor:pointer across the whole flex row and the click/auxclick handlers lived on the row, so every pixel of it opened a page - including the blank remainder that looks like padding, which is exactly where a drag is grabbed and where a press that falls short of rowReorder's 4px threshold lands. Recent and All-pages rows made it worse: they offer a row-wide link with no drag semantics at all. Fix: the title is its own .nav-page-label element, navigation (click and auxclick) is gated on it in all three lists, the pointer cursor moved to the label, and favourites rows advertise their spare width with grab/grabbing. Context menu deliberately keeps the whole row: it is not navigation and cannot be confused with a drag. The 4px threshold and rowReorder's post-drag click suppression are unchanged - they already worked, and the test proves a title-grabbed drag reorders without navigating. OG provenance: the reporter is right that Logseq makes only the text clickable; the hover highlight still spans the row in both. Evidence at the render layer because what is asserted is which element answers a click and what a drag does to the order, both observable in jsdom; necessity gate: 5 of the 6 assertions fail against pre-fix Sidebar.tsx. Label sizing was checked separately in a real browser (label sized to its text at 80-94px in a 222px row, long names still truncating with an ellipsis, row cursor default and label cursor pointer) - that is presentation and is not a blocking assertion."
     },
     {
+      "id": "UI-BLOCK-BACKGROUND-BULLET-SPACING-INTERNAL",
+      "title": "A block background keeps a clear gutter around both ordinary bullets and numbered-list ordinals",
+      "family": "block-layout",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "3ce672cee9460dcae70da4a7a56dd72d0ad6bec0"
+        ],
+        "internal": "2026-08-28 highlighted-block bullet crowding"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-block-spacing.mjs",
+          "src/components/Block.backgroundGeometry.test.tsx",
+          "src/styles/blockSpacing.test.ts"
+        ],
+        "scenario": "block-layout.background-bullet-gutter",
+        "failBefore": "proven"
+      },
+      "notes": "The pre-fix highlighted background began in the bullet control track, crowding ordinary dots and numbered ordinals. The shared 22px control track and browser geometry guard now keep the rounded background aligned with the text while leaving the bullet affordance outside it. The render and source-level tests pin the same ownership without treating jsdom as a CSS-layout oracle."
+    },
+    {
       "id": "UI-NESTED-EMPHASIS-LATEX-460",
       "title": "Dollar-delimited LaTeX renders as math when it is directly inside ordinary Markdown emphasis",
       "family": "markdown-rendering",

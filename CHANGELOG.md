@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.981] - 2026-09-01
+
 ### Added
 
 - **The graph menu now has a right-click menu on every graph row.** Opening a
