@@ -112,3 +112,27 @@ JSON, and the legacy migration moves complete bytes to the scoped path.
   `crates/tine-core/src/sync_runtime_tests.rs:27760` is classified as compiled
   legacy-v1 code. That file is outside the B5s write set and absent from this
   lane's diff; the direct catalog validator is green.
+
+## Frontier review (Claude, 2026-09-01)
+
+Verdict: **PASS — approved for integration.**
+
+Reviewed the full lane diff (2dcd0134..dfb97f64) against
+`specs/campaigns/2026-09-invariant-sweep/B5s-dossier.md`:
+
+- `save_session` and the legacy migration now use named audited protocols;
+  `atomic_write_workspaces` collapsed onto `tine_core::model::atomic_write`.
+  Verified in tine-core source that `atomic_write` → `atomic_publish` keeps
+  the DUP-5 directory-barrier error policy (`sync_dir` tolerates
+  unsupported, reports real EIO/ENOSPC) — the collapse loses no semantics.
+- Exactly one raw `std::fs::rename` remains (legacy migration), paired with
+  `sync_dir_for_rename` under `SESSION_LOCK`; the source-scan guard test
+  enforces both facts with rule-stating messages citing I-1/I-2 and the
+  blessed exemplar (house pattern).
+- Burst safety preserved: SESSION_LOCK serialization + atomic_write's unique
+  create-new temps; the 16-writer burst test asserts never-truncated reads
+  and no stray temps.
+- Focused rerun by the reviewer at head dfb97f64: `cargo test -p tine --lib
+  settings::` → 13 passed, 0 failed (includes all four new tests).
+- Lane's full `cargo test -p tine` name-delta was empty both directions
+  (receipt above); catalog entry present in tests/regressions/non-ui.json.
