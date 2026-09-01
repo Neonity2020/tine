@@ -342,13 +342,25 @@
      "userOutcome": "Media fallback and expanded audio remain bounded rather than retaining unbounded whole files.",
      "blocking": true,
      "authority": "Tine media resource-budget contract"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "Graph media is served and plays under a Managed Storage binding through the native media protocol, not only under Direct Files.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "Asset containment and binding authority hold under both authorities: traversal, absolute, and symlink asset paths refuse, and stale or unavailable bindings refuse.",
+     "blocking": true,
+     "authority": "Media protocol containment (Graph::stream_asset_path) and binding-generation gate"
     }
    ],
    "acceptableVariations": [
     "Native codec availability and player chrome may vary for the supported fixture."
    ],
    "nonRequirements": [
-    "Exact playback controls, waveform styling, or decoder implementation."
+    "Exact playback controls, waveform styling, or decoder implementation.",
+    "Exact HTTP status codes for refusals (403 vs 404 split may evolve while refusal itself is blocking)."
    ],
    "stability": "stable"
   },

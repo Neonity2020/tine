@@ -76,6 +76,22 @@ fn response(status: StatusCode, body: Vec<u8>) -> Response<Vec<u8>> {
     Response::builder().status(status).body(body).unwrap()
 }
 
+fn authority_name(authority: crate::state::AssetStreamAuthority) -> &'static str {
+    match authority {
+        crate::state::AssetStreamAuthority::Direct => "direct",
+        crate::state::AssetStreamAuthority::Managed => "managed",
+    }
+}
+
+fn diagnose_status(status: StatusCode, authority: &str) {
+    if crate::debug::debug_enabled() {
+        crate::debug::diag(format!(
+            "media_protocol status={} authority={authority}",
+            status.as_u16()
+        ));
+    }
+}
+
 pub(crate) fn respond<R: Runtime>(
     ctx: UriSchemeContext<'_, R>,
     request: Request<Vec<u8>>,
@@ -91,24 +107,48 @@ pub(crate) fn respond<R: Runtime>(
     };
     let state = ctx.app_handle().state::<crate::state::AppState>();
     let Ok(slot) = crate::state::slot_for_window(&state, ctx.webview_label()) else {
+        diagnose_status(StatusCode::FORBIDDEN, "unbound");
         return response(StatusCode::FORBIDDEN, Vec::new());
     };
+    respond_for_slot(&slot, binding, name, request)
+}
+
+fn respond_for_slot(
+    slot: &crate::state::GraphSlot,
+    binding: u64,
+    name: &str,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
     if slot.binding_generation != binding {
+        diagnose_status(StatusCode::FORBIDDEN, "stale");
         return response(StatusCode::FORBIDDEN, Vec::new());
     }
-    let Ok(graph) = slot.legacy_graph() else {
-        return response(StatusCode::FORBIDDEN, Vec::new());
+    let resolved = match slot.asset_stream_path(name) {
+        Ok(resolved) => resolved,
+        Err(crate::state::AssetStreamError::AuthorityUnavailable(unavailable)) => {
+            let authority = match unavailable {
+                crate::state::AssetStreamUnavailable::DirectRetiring => "direct_retiring",
+                crate::state::AssetStreamUnavailable::ManagedUnavailable => "managed_unavailable",
+            };
+            diagnose_status(StatusCode::FORBIDDEN, authority);
+            return response(StatusCode::FORBIDDEN, Vec::new());
+        }
+        Err(crate::state::AssetStreamError::InvalidAsset { authority }) => {
+            diagnose_status(StatusCode::NOT_FOUND, authority_name(authority));
+            return response(StatusCode::NOT_FOUND, Vec::new());
+        }
     };
-    let Ok(path) = graph.stream_asset_path(name) else {
-        return response(StatusCode::NOT_FOUND, Vec::new());
-    };
-    let Ok(mut file) = File::open(path) else {
+    let authority = authority_name(resolved.authority);
+    let Ok(mut file) = File::open(resolved.path) else {
+        diagnose_status(StatusCode::NOT_FOUND, authority);
         return response(StatusCode::NOT_FOUND, Vec::new());
     };
     let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+        diagnose_status(StatusCode::INTERNAL_SERVER_ERROR, authority);
         return response(StatusCode::INTERNAL_SERVER_ERROR, Vec::new());
     };
     if len == 0 {
+        diagnose_status(StatusCode::OK, authority);
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime(name))
@@ -118,6 +158,7 @@ pub(crate) fn respond<R: Runtime>(
             .unwrap();
     }
     if request.method() == tauri::http::Method::HEAD {
+        diagnose_status(StatusCode::OK, authority);
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime(name))
@@ -129,6 +170,7 @@ pub(crate) fn respond<R: Runtime>(
     let range_header = request.headers().get(header::RANGE);
     let requested = byte_range(range_header, len);
     if range_header.is_some() && requested.is_none() {
+        diagnose_status(StatusCode::RANGE_NOT_SATISFIABLE, authority);
         return Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{len}"))
@@ -137,6 +179,7 @@ pub(crate) fn respond<R: Runtime>(
     }
     let start = requested.map(|range| range.0).unwrap_or(0);
     if start >= len && len != 0 {
+        diagnose_status(StatusCode::RANGE_NOT_SATISFIABLE, authority);
         return Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{len}"))
@@ -151,16 +194,19 @@ pub(crate) fn respond<R: Runtime>(
     if file.seek(SeekFrom::Start(start)).is_err()
         || file.by_ref().take(count).read_to_end(&mut body).is_err()
     {
+        diagnose_status(StatusCode::INTERNAL_SERVER_ERROR, authority);
         return response(StatusCode::INTERNAL_SERVER_ERROR, Vec::new());
     }
     let end = start.saturating_add(count).saturating_sub(1);
     let partial = request.headers().contains_key(header::RANGE) || count < len;
+    let status = if partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    diagnose_status(status, authority);
     let mut builder = Response::builder()
-        .status(if partial {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        })
+        .status(status)
         .header(header::CONTENT_TYPE, mime(name))
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, count);
@@ -173,6 +219,31 @@ pub(crate) fn respond<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::GraphSlot;
+    use tine_core::model::Graph;
+
+    fn direct_slot() -> (tempfile::TempDir, GraphSlot) {
+        let temp = tempfile::tempdir().unwrap();
+        for relative in ["assets", "journals", "logseq", "pages"] {
+            std::fs::create_dir_all(temp.path().join(relative)).unwrap();
+        }
+        std::fs::write(temp.path().join("logseq/config.edn"), b"{}\n").unwrap();
+        std::fs::write(temp.path().join("assets/fixture.mp3"), b"abcdef").unwrap();
+        std::fs::write(temp.path().join("assets/empty.wav"), b"").unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let slot = GraphSlot::new(Graph::open(&root), root);
+        (temp, slot)
+    }
+
+    fn request(method: tauri::http::Method, range: Option<&str>) -> Request<Vec<u8>> {
+        let mut builder = Request::builder()
+            .uri("tine-media://localhost/fixture")
+            .method(method);
+        if let Some(range) = range {
+            builder = builder.header(header::RANGE, range);
+        }
+        builder.body(Vec::new()).unwrap()
+    }
 
     #[test]
     fn decodes_safe_percent_encoded_names() {
@@ -208,5 +279,108 @@ mod tests {
             byte_range(Some(&header::HeaderValue::from_static("bytes=0-")), 0),
             None
         );
+    }
+
+    #[test]
+    fn direct_head_range_mime_zero_length_and_size_behavior_stays_stable() {
+        let (temp, slot) = direct_slot();
+        let generation = slot.binding_generation;
+
+        let head = respond_for_slot(
+            &slot,
+            generation,
+            "fixture.mp3",
+            request(tauri::http::Method::HEAD, None),
+        );
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()[header::CONTENT_TYPE], "audio/mpeg");
+        assert_eq!(head.headers()[header::CONTENT_LENGTH], "6");
+        assert!(head.body().is_empty());
+
+        let range = respond_for_slot(
+            &slot,
+            generation,
+            "fixture.mp3",
+            request(tauri::http::Method::GET, Some("bytes=1-2")),
+        );
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(range.headers()[header::CONTENT_RANGE], "bytes 1-2/6");
+        assert_eq!(range.headers()[header::CONTENT_LENGTH], "2");
+        assert_eq!(range.body(), b"bc");
+
+        let out_of_range = respond_for_slot(
+            &slot,
+            generation,
+            "fixture.mp3",
+            request(tauri::http::Method::GET, Some("bytes=99-")),
+        );
+        assert_eq!(out_of_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(out_of_range.headers()[header::CONTENT_RANGE], "bytes */6");
+
+        let empty = respond_for_slot(
+            &slot,
+            generation,
+            "empty.wav",
+            request(tauri::http::Method::GET, Some("bytes=0-")),
+        );
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert_eq!(empty.headers()[header::CONTENT_TYPE], "audio/wav");
+        assert_eq!(empty.headers()[header::CONTENT_LENGTH], "0");
+        assert!(empty.body().is_empty());
+
+        let oversized = vec![b'x'; usize::try_from(MAX_CHUNK).unwrap() + 3];
+        std::fs::write(temp.path().join("assets/large.webm"), oversized).unwrap();
+        let capped = respond_for_slot(
+            &slot,
+            generation,
+            "large.webm",
+            request(tauri::http::Method::GET, None),
+        );
+        assert_eq!(capped.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(capped.headers()[header::CONTENT_TYPE], "video/webm");
+        assert_eq!(
+            capped.headers()[header::CONTENT_LENGTH],
+            MAX_CHUNK.to_string()
+        );
+        assert_eq!(capped.body().len(), usize::try_from(MAX_CHUNK).unwrap());
+    }
+
+    #[test]
+    fn stale_binding_and_direct_containment_refuse_before_open() {
+        let (temp, slot) = direct_slot();
+        let stale = respond_for_slot(
+            &slot,
+            slot.binding_generation + 1,
+            "fixture.mp3",
+            request(tauri::http::Method::GET, None),
+        );
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+
+        std::fs::write(temp.path().join("outside.mp3"), b"outside").unwrap();
+        for name in ["../outside.mp3", "/outside.mp3"] {
+            let refused = respond_for_slot(
+                &slot,
+                slot.binding_generation,
+                name,
+                request(tauri::http::Method::GET, None),
+            );
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "name={name:?}");
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                temp.path().join("outside.mp3"),
+                temp.path().join("assets/escape.mp3"),
+            )
+            .unwrap();
+            let refused = respond_for_slot(
+                &slot,
+                slot.binding_generation,
+                "escape.mp3",
+                request(tauri::http::Method::GET, None),
+            );
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        }
     }
 }
