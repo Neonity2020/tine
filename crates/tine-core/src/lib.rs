@@ -30,7 +30,7 @@ pub mod org;
 mod outline;
 pub mod pdf;
 #[cfg(test)]
-mod projection_producer_census;
+pub(crate) mod projection_producer_census;
 mod property_line;
 pub mod publish;
 pub mod query;

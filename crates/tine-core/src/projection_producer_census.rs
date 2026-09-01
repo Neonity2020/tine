@@ -15,9 +15,9 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 #[derive(Debug)]
-struct ProductionFile {
-    relative: String,
-    code: String,
+pub(crate) struct ProductionFile {
+    pub(crate) relative: String,
+    pub(crate) code: String,
     compact: String,
 }
 
@@ -219,16 +219,44 @@ fn code_mask(source: &str) -> String {
             None
         };
         if let Some(start) = char_start {
-            let mut cursor = index + usize::from(bytes[index] == b'b') + 1;
-            if bytes.get(cursor) == Some(&b'\\') {
-                cursor += 2;
-            } else {
-                cursor += 1;
-            }
-            if bytes.get(cursor) == Some(&b'\'') {
-                index = cursor + 1;
-                out[start..index].fill(b' ');
-                continue;
+            // The payload is NOT always one or two bytes. `'\\u{000d}'` and `'\\x41'`
+            // are variable-length escapes, and `'\u{00e9}'` written literally is
+            // multi-byte UTF-8. Assuming otherwise left the literal's own bytes --
+            // quote, braces, digits -- unmasked in `code`, so an occurrence inside
+            // an extracted function body would mis-count brace depth.
+            let cursor = index + usize::from(bytes[index] == b'b') + 1;
+            let payload_end = match bytes.get(cursor) {
+                Some(b'\\') => match bytes.get(cursor + 1) {
+                    // `\\u{XXXXXX}`: variable length, terminated by the brace.
+                    Some(b'u') if bytes.get(cursor + 2) == Some(&b'{') => bytes[cursor + 3..]
+                        .iter()
+                        .position(|byte| *byte == b'}')
+                        .map(|offset| cursor + 3 + offset + 1),
+                    // `\\xNN`: always two hex digits.
+                    Some(b'x') => Some(cursor + 4),
+                    // Every other escape is one character after the backslash.
+                    Some(_) => Some(cursor + 2),
+                    None => None,
+                },
+                // A literal character, possibly multi-byte UTF-8.
+                Some(_) => {
+                    let mut end = cursor + 1;
+                    while bytes
+                        .get(end)
+                        .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+                    {
+                        end += 1;
+                    }
+                    Some(end)
+                }
+                None => None,
+            };
+            if let Some(cursor) = payload_end {
+                if bytes.get(cursor) == Some(&b'\'') {
+                    index = cursor + 1;
+                    out[start..index].fill(b' ');
+                    continue;
+                }
             }
         }
         index += 1;
@@ -487,7 +515,21 @@ fn without_test_items(source: &str) -> String {
     String::from_utf8(bytes).expect("blanking preserves UTF-8")
 }
 
-fn production_rust() -> Vec<ProductionFile> {
+/// Every production Rust source in `tine-core` and `src-tauri`, with test items
+/// and comment/literal bytes masked out.
+///
+/// Shared with the rest of the crate so a "no production caller" / "only caller"
+/// claim anywhere can be asserted against the same definition of "production"
+/// this census uses, instead of each site inventing its own file scan.
+///
+/// The scan reads and syntax-parses the whole tree, so it is computed once per
+/// test process rather than once per assertion.
+pub(crate) fn production_rust() -> &'static [ProductionFile] {
+    static SCANNED: std::sync::OnceLock<Vec<ProductionFile>> = std::sync::OnceLock::new();
+    SCANNED.get_or_init(scan_production_rust)
+}
+
+fn scan_production_rust() -> Vec<ProductionFile> {
     let repo = repository_root();
     let roots = [
         repo.join("crates/tine-core/src"),
@@ -706,7 +748,8 @@ fn inventory_digest(inventory: &[(String, String, usize)]) -> String {
         .collect()
 }
 
-fn call_count(files: &[ProductionFile], name: &str) -> usize {
+/// How many times production code calls `name`, not counting its definition.
+pub(crate) fn call_count(files: &[ProductionFile], name: &str) -> usize {
     let call = format!("{name}(");
     let definition = format!("fn {name}(");
     files
@@ -773,7 +816,7 @@ fn function_bodies<'a>(files: &'a [ProductionFile], name: &str) -> Vec<&'a str> 
 #[test]
 fn g_a_mutation_primitive_counts_are_pinned_per_file() {
     let actual = token_inventory(
-        &production_rust(),
+        production_rust(),
         &[
             ("cap.rename", ".rename("),
             ("cap.remove_file", ".remove_file("),
@@ -896,11 +939,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/onboarding.rs", "fs.create_dir_all", 4),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "cap.create_dir",
-            1,
-        ),
         ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
         (
             "crates/tine-core/src/oplog/import.rs",
@@ -1391,11 +1429,11 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
         "#[cfg(all(target_os=\"android\",debug_assertions))]modandroid_managed_storage_smoke;"
     ));
     let folding_callers = files
-        .into_iter()
+        .iter()
         .filter_map(|file| {
             let count = identifier_occurrences(&file.code, "graph_name_folding(")
                 - file.code.matches("fn graph_name_folding(").count();
-            (count != 0).then_some((file.relative, count))
+            (count != 0).then_some((file.relative.clone(), count))
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1693,7 +1731,7 @@ fn g_f_graph_path_process_handoffs_are_pinned() {
 fn g_g_user_selected_report_writes_stay_on_the_atomic_family() {
     let repo = repository_root();
     let save_dialogs = token_inventory(
-        &production_rust(),
+        production_rust(),
         &[("dialog.blocking_save_file", ".blocking_save_file(")],
     );
     assert_eq!(
@@ -1771,6 +1809,27 @@ fn ms14b_retired_patricia_and_detached_bootstrap_routes_are_absent() {
         0
     );
     assert_eq!(call_count(&files, "bootstrap_authoring_capability"), 0);
+}
+
+#[test]
+fn code_mask_masks_variable_length_character_literals() {
+    // `'\u{0009}'..='\u{000d}'` appears verbatim in production sources. The
+    // char-literal branch used to assume a one-or-two-byte payload, so NONE of
+    // these bytes were masked -- the braces and digits reached `code`, and a
+    // brace inside an extracted function body mis-counts depth.
+    let source = "const R: RangeInclusive<char> = '\\u{0009}'..='\\u{000d}';\nlet b = '\\x41';\nlet e = '\u{00e9}';\nlet n = '\\n';\n";
+    let masked = code_mask(source);
+
+    assert_eq!(masked.len(), source.len(), "the mask must preserve offsets");
+    assert!(!masked.contains('{'), "unmasked char-literal brace: {masked}");
+    assert!(!masked.contains('}'), "unmasked char-literal brace: {masked}");
+    assert!(!masked.contains("0009"));
+    assert!(!masked.contains("000d"));
+    assert!(!masked.contains("x41"));
+    assert!(!masked.contains('\u{00e9}'), "unmasked multi-byte char literal");
+    // Code around the literals survives.
+    assert!(masked.contains("const R: RangeInclusive<char> ="));
+    assert!(masked.contains("..="));
 }
 
 #[test]
