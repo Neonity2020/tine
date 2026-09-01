@@ -30064,6 +30064,195 @@ mod validation_tests {
         assert!(source.contains("verify_checkpoints: false"));
         assert!(source.contains("new_verifying(catalog_document_id"));
     }
+
+    // -----------------------------------------------------------------
+    // Harvest A4 — what actually consumes a run-local page-name record.
+    //
+    // CHARACTERIZATION: these assert the CURRENT behavior of the capped,
+    // removal-free `EphemeralPageNameOwnershipStateV1::records` map. They
+    // are the cheap half of the A4 repro (the cap itself is reached in
+    // `oplog::hot_engine_integration_tests`, ignored because it is slow).
+    // -----------------------------------------------------------------
+    fn a4_stage(engine: &mut ShardedHotEngine, author: AuthorBatch, operations: Vec<SemanticOperation>) {
+        let prepared = engine
+            .prepare_fixture_transaction(author, &OperationTransaction::new(operations).unwrap())
+            .expect("A4 count-semantics transaction drafts");
+        let outcome = engine.stage_ready(ValidatedBatch::new(prepared));
+        assert!(
+            matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+            "A4 count-semantics transaction was not accepted: {:?}",
+            outcome.disposition()
+        );
+    }
+
+    #[test]
+    fn a4_page_name_records_count_distinct_names_and_are_never_released() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0xa4_1000));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0xa4_1001));
+        let lineage = LineageDigest::of(b"harvest-a4-count-semantics");
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        assert_eq!(engine.ephemeral_page_names.record_count(), 0);
+
+        // (a) Distinct names: one record per distinct canonical name key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1010, 0xa4_1010),
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1200)),
+                    name: crate::oplog::LogicalPageName::parse("Alpha").unwrap(),
+                    path: ManagedPath::parse("pages/alpha.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1101)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1201)),
+                    name: crate::oplog::LogicalPageName::parse("Beta").unwrap(),
+                    path: ManagedPath::parse("pages/beta.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+            ],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            2,
+            "two distinct page names occupy two records"
+        );
+
+        // (b) A path-only edit is not a name change and consumes nothing.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1011, 0xa4_1011),
+            vec![SemanticOperation::EditPagePath {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                path: ManagedPath::parse("elsewhere/alpha.md").unwrap(),
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 2);
+
+        // (c) A RENAME consumes a SECOND record: the released old key is
+        // retained alongside the newly acquired one. Renaming one page N
+        // times therefore costs N+1 records, not 1.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1012, 0xa4_1012),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha Renamed").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha-renamed.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            3,
+            "a rename retains the released old key AND acquires the new one"
+        );
+
+        // (d) A second rename of the same page costs another record.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1013, 0xa4_1013),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha Again").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha-again.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 4);
+
+        // (e) Renaming BACK to an already-seen name reuses its key: the map
+        // is keyed by canonical name, so the cost is lifetime-DISTINCT names.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1014, 0xa4_1014),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            4,
+            "returning to a previously used name reuses its existing record"
+        );
+
+        // (f) DELETION frees nothing: the tombstoned page's name record stays.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1015, 0xa4_1015),
+            vec![SemanticOperation::DeletePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1101)),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            4,
+            "deleting a page releases no page-name record"
+        );
+
+        // (g) A brand-new page reusing the deleted page's name reuses the key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1016, 0xa4_1016),
+            vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1102)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1202)),
+                name: crate::oplog::LogicalPageName::parse("Beta").unwrap(),
+                path: ManagedPath::parse("pages/beta-2.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 4);
+
+        // (h) Case-folding twins share one canonical key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1017, 0xa4_1017),
+            vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1103)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1203)),
+                name: crate::oplog::LogicalPageName::parse("Gamma").unwrap(),
+                path: ManagedPath::parse("pages/gamma.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 5);
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1018, 0xa4_1018),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1103)),
+                    new_name: crate::oplog::LogicalPageName::parse("GAMMA").unwrap(),
+                    new_path: ManagedPath::parse("pages/GAMMA.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            5,
+            "a case-only rename stays inside the same canonical key"
+        );
+
+        // (i) Block-only work never touches the page-name index.
+        assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
+    }
 }
 
 #[cfg(test)]

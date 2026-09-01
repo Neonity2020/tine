@@ -6464,3 +6464,448 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
         .unwrap()
         .is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Harvest A4 — the run-local page-name index capacity (repro, NOT a fix).
+//
+// `MAX_EPHEMERAL_PAGE_NAME_RECORDS` (`page_name_index.rs`) caps
+// `EphemeralPageNameOwnershipStateV1::records`, the ONLY page-name ownership
+// index there is: `prepare_page_name_transition_core` has exactly one
+// `PageNameTransitionAccess` implementation, and `ShardedHotEngine` holds the
+// map run-locally with no removal path. Every test below is a
+// CHARACTERIZATION test: it asserts the CURRENT (defective) behavior so the
+// suite stays green while the defect is pinned. When A4's fix lands these
+// flip to asserting the fixed behavior.
+// ---------------------------------------------------------------------------
+
+/// Mirror of the private `page_name_index::MAX_EPHEMERAL_PAGE_NAME_RECORDS`.
+/// A production edit to that constant must move this one; the guard below
+/// fails if the source no longer spells this value.
+const A4_PAGE_NAME_RECORD_CAP: usize = 4_096;
+
+/// The exact refusal text a caller sees at the page-name cap.
+const A4_CAP_REFUSAL: &str = "no-store page-name test index reached its fixed capacity";
+
+/// The sibling caps' refusal texts. The portable-path index is checked BEFORE
+/// the page-name index on both the authoring and the acceptance path, so an
+/// ordinary page creation reports this one first even though both indexes are
+/// full at the same moment.
+const A4_PORTABLE_PATH_CAP_REFUSAL: &str =
+    "no-store portable-path test index reached its fixed capacity";
+const A4_BLOCK_CLAIM_CAP_REFUSAL: &str = "run-local block-claim index reached its fixed capacity";
+
+#[test]
+fn a4_run_local_identity_caps_are_a_family_of_four_at_the_same_value() {
+    let index_source = include_str!("page_name_index.rs");
+    let engine_source = include_str!("hot_engine.rs");
+    assert!(
+        index_source.contains("const MAX_EPHEMERAL_PAGE_NAME_RECORDS: usize = 4_096;"),
+        "the page-name record cap moved; update A4_PAGE_NAME_RECORD_CAP"
+    );
+    assert_eq!(A4_PAGE_NAME_RECORD_CAP, 4_096);
+    assert!(index_source.contains(A4_CAP_REFUSAL));
+    // There is exactly one page-name transition access implementation, so the
+    // "no-store ... test index" wording names the ONLY page-name index Tine
+    // has, not a test-only auxiliary structure.
+    assert_eq!(
+        index_source
+            .matches("impl PageNameTransitionAccess for")
+            .count(),
+        1,
+        "a second page-name transition access would change what the cap governs"
+    );
+    // A4 is one of FOUR run-local identity indexes with the same fixed
+    // capacity, all rebuilt from accepted history at open and none of which
+    // ever releases an entry. Retiring only the page-name cap changes nothing
+    // a user can observe.
+    for sibling in [
+        "pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;",
+        "const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;",
+        "const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;",
+    ] {
+        assert!(
+            engine_source.contains(sibling),
+            "the run-local cap family changed; A4's findings assume {sibling}"
+        );
+    }
+    for sibling_refusal in [
+        A4_PORTABLE_PATH_CAP_REFUSAL,
+        A4_BLOCK_CLAIM_CAP_REFUSAL,
+        "run-local Logseq claim index reached its fixed capacity",
+    ] {
+        assert!(engine_source.contains(sibling_refusal));
+    }
+}
+
+fn a4_page_id(index: usize) -> PageId {
+    PageId::from_uuid(uuid(0xa4_0000_0000 + index as u128))
+}
+
+fn a4_home_id(index: usize) -> DocumentId {
+    DocumentId::from_uuid(uuid(0xa4_4000_0000 + index as u128))
+}
+
+fn a4_create_pages(
+    engine: &ShardedHotEngine,
+    batch: u128,
+    range: std::ops::Range<usize>,
+) -> Result<PreparedBatch, EngineError> {
+    engine.prepare_fixture_transaction(
+        author(batch, batch as u64),
+        &tx(range
+            .map(|index| SemanticOperation::CreatePage {
+                page_id: a4_page_id(index),
+                home_document_id: a4_home_id(index),
+                name: crate::oplog::LogicalPageName::parse(&format!("A4 Page {index}")).unwrap(),
+                path: path(&format!("pages/a4-{index}.md")),
+                kind: ManagedTextKind::Page,
+            })
+            .collect()),
+    )
+}
+
+/// Accept `count` distinct page names in chunks and return the number of
+/// accepted batches.
+fn a4_seed_names(
+    engine: &mut ShardedHotEngine,
+    archive: &ObjectStore,
+    batch_base: u128,
+    count: usize,
+    chunk: usize,
+) -> usize {
+    let mut accepted = 0;
+    let mut index = 0;
+    while index < count {
+        let end = (index + chunk).min(count);
+        let prepared = a4_create_pages(engine, batch_base + accepted as u128, index..end)
+            .unwrap_or_else(|error| panic!("seeding names {index}..{end} refused: {error:?}"));
+        let disposition = engine.stage_ready(ready(archive, &prepared)).disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "seeding names {index}..{end} was not accepted: {disposition:?}"
+        );
+        accepted += 1;
+        index = end;
+    }
+    accepted
+}
+
+
+/// Q1 — drive lifetime-distinct page names to the cap through ordinary
+/// accepted batches and record exactly what still works afterwards.
+///
+/// CHARACTERIZATION of the CURRENT defect: at 4,096 lifetime-distinct page
+/// names the engine refuses every operation that would introduce a 4,097th,
+/// permanently, with no removal path. It is `#[ignore]`d only because seeding
+/// 4,096 real pages takes ~15s in a debug build.
+#[test]
+#[ignore = "harvest A4 repro: seeds 4,096 real page names (~15s debug)"]
+fn a4_repro_lifetime_distinct_page_names_wedge_at_the_cap() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-cap-wedge");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+
+    let seeded_batches = a4_seed_names(
+        &mut engine,
+        &archive,
+        0xa4_0000,
+        A4_PAGE_NAME_RECORD_CAP,
+        256,
+    );
+    eprintln!("a4_cap seeded_names={A4_PAGE_NAME_RECORD_CAP} seeded_batches={seeded_batches}");
+    assert!(paged_fatal_evidence(&engine).is_none());
+
+    // The 4,097th lifetime-distinct page is refused at DRAFT time, before any
+    // batch exists. The refusal is a plain InvalidTransaction, so it surfaces
+    // to the user as an ordinary save failure, not as a blocked workspace.
+    //
+    // CORRECTION to the A4 premise: creating a page consumes a page-name
+    // record AND a portable-path record in lockstep, and the portable-path
+    // index is checked first, so the message a user actually sees at the cap
+    // names the SIBLING index. The page-name cap is real but is not the one
+    // that reports.
+    let refusal = a4_create_pages(
+        &engine,
+        0xa4_9000,
+        A4_PAGE_NAME_RECORD_CAP..A4_PAGE_NAME_RECORD_CAP + 1,
+    )
+    .expect_err("the 4,097th distinct page must be refused");
+    match &refusal {
+        EngineError::InvalidTransaction(message) => {
+            assert_eq!(
+                message, A4_PORTABLE_PATH_CAP_REFUSAL,
+                "unexpected cap refusal text"
+            );
+        }
+        other => panic!("unexpected cap refusal: {other:?}"),
+    }
+
+    // Isolate the page-name index: rename an existing page to a brand-new
+    // NAME while keeping its EXISTING path. The portable-path index sees no
+    // new key, so this reaches, and is refused by, the A4 cap itself.
+    let isolated = engine.prepare_fixture_transaction(
+        author(0xa4_9500, 0xa4_9500),
+        &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+            page_changes: vec![crate::oplog::PageRename {
+                page_id: a4_page_id(0),
+                new_name: crate::oplog::LogicalPageName::parse("A4 Isolated New Name").unwrap(),
+                new_path: path("pages/a4-0.md"),
+            }],
+            block_rewrites: Vec::new(),
+            page_preamble_rewrites: Vec::new(),
+        }]),
+    );
+    assert!(
+        matches!(
+            isolated,
+            Err(EngineError::InvalidTransaction(ref message)) if message == A4_CAP_REFUSAL
+        ),
+        "same-path rename at the page-name cap: {isolated:?}"
+    );
+    assert!(
+        paged_fatal_evidence(&engine).is_none(),
+        "the cap refusal must not blame the workspace"
+    );
+
+    // What still works at the cap: block-level work only. Block deltas never
+    // touch either identity index (until the block-claim sibling fills too).
+    let block_edit = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9001, 0xa4_9001),
+            &tx(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: crate::oplog::BlockId::from_uuid(uuid(0xa4_8000)),
+                    home_document_id: a4_home_id(0),
+                },
+                page_id: a4_page_id(0),
+                parent: None,
+                order: "a".into(),
+                content: "at-cap block write".into(),
+            }]),
+        )
+        .expect("block-only work never touches the page-name index");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &block_edit)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // What does NOT work: every page-level operation, including the two a
+    // user would reach for to make room. DELETING a page is refused, because
+    // the portable-path check adds the batch's whole changed set to the
+    // occupancy rather than only its novel keys.
+    let delete = engine.prepare_fixture_transaction(
+        author(0xa4_9002, 0xa4_9002),
+        &tx(vec![SemanticOperation::DeletePage {
+            page_id: a4_page_id(1),
+        }]),
+    );
+    assert!(
+        matches!(
+            delete,
+            Err(EngineError::InvalidTransaction(ref message))
+                if message == A4_PORTABLE_PATH_CAP_REFUSAL
+        ),
+        "deleting a page at the cap: {delete:?}"
+    );
+
+    // Renaming a page back to a name it already held is refused too.
+    let rename_back = engine.prepare_fixture_transaction(
+        author(0xa4_9003, 0xa4_9003),
+        &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+            page_changes: vec![crate::oplog::PageRename {
+                page_id: a4_page_id(0),
+                new_name: crate::oplog::LogicalPageName::parse("A4 Page 0").unwrap(),
+                new_path: path("pages/a4-0.md"),
+            }],
+            block_rewrites: Vec::new(),
+            page_preamble_rewrites: Vec::new(),
+        }]),
+    );
+    assert!(
+        matches!(rename_back, Err(EngineError::InvalidTransaction(_))),
+        "renaming back to an already-held name at the cap: {rename_back:?}"
+    );
+
+    // No user action releases a record: the state is terminal for every
+    // page-level operation (I-10).
+    assert!(paged_fatal_evidence(&engine).is_none());
+}
+
+/// Q2 — reopen behavior at the cap.
+///
+/// CHARACTERIZATION: replaying the accepted tail into a fresh engine refills
+/// the run-local index to exactly the same occupancy, so open SUCCEEDS and the
+/// refusal survives the restart unchanged. The state is permanent (I-10):
+/// nothing a user can do — restart, delete pages, rename back — releases a
+/// record. Additionally, a batch that legitimately acquired a new name on a
+/// PEER is REJECTED by a receiver whose index is full; that same rejection on
+/// the replay path (`replay_clean_committed_tail`) is an open failure, so the
+/// cap is also a would-be sync/portability hazard.
+#[test]
+#[ignore = "harvest A4 repro: seeds 4,096 real page names twice (~30s debug)"]
+fn a4_repro_reopen_replays_back_to_the_cap_and_the_refusal_is_permanent() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-cap-reopen");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+    a4_seed_names(
+        &mut engine,
+        &archive,
+        0xa4_0000,
+        A4_PAGE_NAME_RECORD_CAP,
+        256,
+    );
+    assert!(a4_create_pages(
+        &engine,
+        0xa4_9000,
+        A4_PAGE_NAME_RECORD_CAP..A4_PAGE_NAME_RECORD_CAP + 1
+    )
+    .is_err());
+
+    // Reopen: replay every committed manifest into a fresh sequence-zero
+    // engine, exactly as `replay_clean_committed_tail` does at open.
+    let mut replay = ids.engine();
+    let manifests = archive.committed_manifests().unwrap();
+    let mut replayed = 0;
+    for manifest in &manifests {
+        let disposition = replay
+            .stage_from_store(&archive, manifest.batch_id())
+            .unwrap()
+            .disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "replay of {} was not accepted: {disposition:?}",
+            manifest.batch_id()
+        );
+        replayed += 1;
+    }
+    eprintln!("a4_reopen replayed_batches={replayed} manifests={}", manifests.len());
+    assert!(paged_fatal_evidence(&replay).is_none());
+
+    // Open succeeded — and the wedge came back with it. The same-path rename
+    // isolates the page-name index from its portable-path sibling.
+    let after_reopen = replay.prepare_fixture_transaction(
+        author(0xa4_9100, 0xa4_9100),
+        &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+            page_changes: vec![crate::oplog::PageRename {
+                page_id: a4_page_id(0),
+                new_name: crate::oplog::LogicalPageName::parse("A4 Post Reopen Name").unwrap(),
+                new_path: path("pages/a4-0.md"),
+            }],
+            block_rewrites: Vec::new(),
+            page_preamble_rewrites: Vec::new(),
+        }]),
+    );
+    assert!(
+        matches!(
+            after_reopen,
+            Err(EngineError::InvalidTransaction(ref message)) if message == A4_CAP_REFUSAL
+        ),
+        "the reopened engine must be wedged at the same cap: {after_reopen:?}"
+    );
+
+    // A peer that is NOT at the cap can legitimately author a new name. The
+    // full receiver rejects that already-valid batch outright.
+    let peer = ids.engine();
+    let peer_batch = a4_create_pages(&peer, 0xa4_9200, 900_000..900_001)
+        .expect("an empty peer engine can still acquire a new page name");
+    let peer_dir = TestDir::new("a4-cap-peer");
+    let peer_archive = ObjectStore::open(&peer_dir.path().join("store"), ids.workspace).unwrap();
+    let delivered = replay
+        .stage_ready(ready(&peer_archive, &peer_batch))
+        .disposition;
+    match delivered {
+        BatchDisposition::Rejected { error } => assert!(
+            matches!(
+                error,
+                EngineError::InvalidTransaction(ref message)
+                    if message == A4_CAP_REFUSAL || message == A4_PORTABLE_PATH_CAP_REFUSAL
+            ),
+            "unexpected rejection of a peer-authored name: {error:?}"
+        ),
+        other => panic!("a full receiver accepted a 4,097th name: {other:?}"),
+    }
+}
+
+
+/// The sibling that binds FIRST in ordinary editing, and the one that makes
+/// the family a data-safety question rather than only an availability one.
+///
+/// `MAX_EPHEMERAL_BLOCK_CLAIMS` counts every lifetime-distinct block ever
+/// created (`None -> Some` block deltas). Unlike the page-name and
+/// portable-path caps it has NO authoring-time pre-check: the draft succeeds
+/// and the batch is refused only at ACCEPT. Tine's clean foreground save path
+/// (`accept_clean_prepared_below_managed_local_overlay`) publishes the
+/// manifest BEFORE it accepts, and `replay_clean_committed_tail` treats a
+/// committed manifest that does not accept as archive corruption — so a
+/// refusal here can land on already-durable history.
+///
+/// CHARACTERIZATION of current behavior.
+#[test]
+#[ignore = "harvest A4 repro: creates 4,096 real blocks (~15s debug)"]
+fn a4_repro_block_claim_cap_binds_first_and_refuses_only_at_acceptance() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-block-claims");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+    let seed = a4_create_pages(&engine, 0xa4_0000, 0..1).unwrap();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &seed)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    const CHUNK: usize = 256;
+    let mut made = 0usize;
+    let mut batch = 0xa4_b000u128;
+    let mut refusal = None;
+    while made < A4_PAGE_NAME_RECORD_CAP * 2 {
+        let prepared = engine
+            .prepare_fixture_transaction(
+                author(batch, batch as u64),
+                &tx((made..made + CHUNK)
+                    .map(|index| SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: crate::oplog::BlockId::from_uuid(
+                                uuid(0xa4_c000_0000 + index as u128),
+                            ),
+                            home_document_id: a4_home_id(0),
+                        },
+                        page_id: a4_page_id(0),
+                        parent: None,
+                        order: format!("{index:08}").into(),
+                        content: format!("a4 block {index}"),
+                    })
+                    .collect()),
+            )
+            .expect("the block-claim cap has NO authoring-time pre-check");
+        match engine.stage_ready(ready(&archive, &prepared)).disposition {
+            BatchDisposition::Accepted { .. } => {
+                made += CHUNK;
+                batch += 1;
+            }
+            BatchDisposition::Rejected { error } => {
+                refusal = Some((made, error));
+                break;
+            }
+            other => panic!("unexpected block-claim disposition: {other:?}"),
+        }
+    }
+    let (accepted_blocks, error) = refusal.expect("the block-claim cap must refuse");
+    assert_eq!(
+        accepted_blocks, A4_PAGE_NAME_RECORD_CAP,
+        "exactly 4,096 lifetime blocks are accepted before the refusal"
+    );
+    assert_eq!(
+        engine.instrumentation().block_claim_hot_entries,
+        A4_PAGE_NAME_RECORD_CAP,
+        "the run-local block-claim index is full at exactly 4,096 lifetime blocks"
+    );
+    assert!(
+        matches!(
+            error,
+            EngineError::InvalidTransaction(ref message) if message == A4_BLOCK_CLAIM_CAP_REFUSAL
+        ),
+        "unexpected block-claim refusal: {error:?}"
+    );
+}
