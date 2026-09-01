@@ -64,6 +64,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Open tabs and pane state now survive a crash immediately after an autosave.**
+  Session and workspace files now use the same durable atomic replacement
+  protocol as other app-private settings, including file and directory
+  barriers; bursts of tab actions are serialized, and the one-time legacy
+  session move receives the same directory durability check.
+
 - **LaTeX math now renders inside italic and other emphasized Markdown.** A
   whole agent response can be italic without turning valid `$…$` or `$$…$$`
   fragments back into literal dollar text. The shared parser now preserves
