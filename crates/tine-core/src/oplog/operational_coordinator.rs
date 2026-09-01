@@ -197,12 +197,24 @@ impl std::error::Error for OperationalCoordinatorError {}
 /// Re-derive archive-rooted workspace authority immediately before one
 /// authority-changing boundary, and report a refusal as that exact phase.
 ///
-/// The five side-effect call sites below are the coordinator's complete set of
-/// boundaries that take, change, or externalize authority: immutable
-/// publication, accepted-history archive staging, tail admission, the SQLite
-/// advance, and each manifested Markdown projection step.
-/// Every one of them is already an [`OperationalPhase`], so a lost workspace
-/// stays diagnosable by phase rather than collapsing into one generic error.
+/// Six call sites below are this coordinator's complete set of boundaries that
+/// take, change, or externalize authority:
+///
+/// - [`WorkspaceAuthorityBoundary::WindowAuthorization`], once, in
+///   `authorize_coordinator` — and therefore on every coordinator entry point;
+/// - [`WorkspaceAuthorityBoundary::Publication`], three times, one per
+///   immutable publication path (`execute_clean_local_inner`,
+///   `ingest_clean_prepared`, `execute_clean_external`);
+/// - [`WorkspaceAuthorityBoundary::SqliteDrain`], once, at the SQLite advance;
+/// - [`WorkspaceAuthorityBoundary::ProjectionDrain`], once per manifested
+///   Markdown projection step.
+///
+/// Each names its own [`OperationalPhase`], so a lost workspace stays
+/// diagnosable by phase rather than collapsing into one generic error.
+/// `the_documented_authority_boundaries_are_the_complete_set` pins that
+/// enumeration. The remaining two coordinator boundaries, `ArchiveStage` and
+/// `TailAdmission`, belong to the sibling drain in `local_journal_drain.rs`;
+/// this list previously named them, having drifted from that file's.
 ///
 /// The proof is one held-handle stat plus one no-follow resolution of the lease
 /// pathname — a few per external reconciliation, and none on the keystroke
@@ -1557,6 +1569,7 @@ fn operational_fault_error(point: OperationalFaultPoint) -> OperationalCoordinat
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -3179,4 +3192,54 @@ mod tests {
         walk(root, root, &mut output);
         output
     }
+
+    /// Guards the "complete set" enumeration in `reprove_workspace_authority`'s
+    /// doc comment. That sentence drifted once already: it named the five
+    /// boundaries of `local_journal_drain.rs` while this file was calling six
+    /// with a different mix, so the one call site reached from every entry
+    /// point went uncounted.
+    #[test]
+    fn the_documented_authority_boundaries_are_the_complete_set() {
+        let source = include_str!("operational_coordinator.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+
+        let mut used: BTreeMap<&str, usize> = BTreeMap::new();
+        for line in production.lines() {
+            let Some((_, rest)) = line.split_once("WorkspaceAuthorityBoundary::") else {
+                continue;
+            };
+            if line.trim_start().starts_with("///") {
+                continue;
+            }
+            let boundary = rest.trim_end_matches(&[',', ')', ';'][..]);
+            *used.entry(boundary).or_default() += 1;
+        }
+
+        let documented = BTreeMap::from([
+            ("WindowAuthorization", 1),
+            ("Publication", 3),
+            ("SqliteDrain", 1),
+            ("ProjectionDrain", 1),
+        ]);
+        assert_eq!(
+            used, documented,
+            "the coordinator's authority boundaries no longer match the enumeration in \
+             reprove_workspace_authority's doc comment. Update that list — including its \
+             count and the entry points it names — in the same change (invariant I-11: \
+             code does not lie about itself)."
+        );
+
+        let calls = production.matches("reprove_workspace_authority(").count();
+        assert_eq!(
+            calls,
+            documented.values().sum::<usize>() + 2,
+            "reprove_workspace_authority's own definition, its inner admission call and \
+             one call per documented boundary are all this file should contain; a new \
+             call site must be added to that doc comment's enumeration too (I-11)."
+        );
+    }
+
 }
