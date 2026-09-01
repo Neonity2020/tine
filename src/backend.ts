@@ -861,8 +861,13 @@ export function isTauri(): boolean {
  * to a `Graph` that no longer exists once they return.
  *
  * Kept as an explicit list because it is a claim about the backend: each of
- * these was verified to reach `refresh_graph`. Adding a command that reopens the
- * graph without adding it here reintroduces the round-15 blockers.
+ * these reaches `refresh_graph`. Adding a command that reopens the graph without
+ * adding it here reintroduces the round-15 blockers.
+ *
+ * The claim is checked, not asserted: `backend_command_parity.rs`'s
+ * `rebinding_commands_are_exactly_the_commands_that_reopen_the_graph` re-derives
+ * the set by scanning every `#[tauri::command]` in `src-tauri/src` for a
+ * `refresh_graph(` call and fails on any difference in either direction.
  */
 const REBINDING_COMMANDS = new Set([
   "set_default_home",

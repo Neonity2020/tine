@@ -170,6 +170,124 @@ fn line_containing(source: &str, char_index: usize) -> String {
     source[start..end].trim().to_owned()
 }
 
+/// Every `#[tauri::command]` in `src-tauri/src` whose body reaches
+/// `state::refresh_graph` — i.e. every command that REOPENS the graph.
+///
+/// `src/backend.ts` keeps its own hand-written copy of this set
+/// (`REBINDING_COMMANDS`) and its comment claimed each entry "was verified to
+/// reach `refresh_graph`". Nothing checked it. A new Rust command that reopens
+/// the graph and is not added to that set stops the frontend rebinding its
+/// graph-scoped state — resolved paths and editor activations that belong to a
+/// `Graph` which no longer exists.
+///
+/// The directory is walked rather than listed, because a list of sources is the
+/// same hole one level up: a command added in a NEW file would be invisible.
+#[cfg(test)]
+fn commands_that_reopen_the_graph() -> BTreeSet<String> {
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&source_dir)
+        .expect("src-tauri/src must be readable")
+        .map(|entry| entry.expect("readable directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    entries.sort();
+    assert!(
+        entries.len() > 10,
+        "the src-tauri/src scan found {} sources -- the scanner broke, not the code",
+        entries.len()
+    );
+
+    let mut names = BTreeSet::new();
+    for path in entries {
+        let source = std::fs::read_to_string(&path).expect("readable source");
+        for (name, body) in tauri_command_bodies(&source) {
+            if body.contains("refresh_graph(") {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
+/// `(command name, function body)` for every `#[tauri::command]` in one source.
+#[cfg(test)]
+fn tauri_command_bodies(source: &str) -> Vec<(String, String)> {
+    const ATTRIBUTE: &str = "#[tauri::command]";
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    // Only a line that IS the attribute counts. The same text appears inside doc
+    // comments and assertion messages -- including in this very module.
+    let mut attributes: Vec<usize> = Vec::new();
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        if line.trim() == ATTRIBUTE {
+            attributes.push(line_start + line.len());
+        }
+        line_start += line.len();
+    }
+    for search in attributes {
+        // The name: the first `fn <ident>` after the attribute (any further
+        // attributes, `pub(crate)`, `async` and so on lie between).
+        let Some(fn_offset) = source[search..].find("fn ") else {
+            continue;
+        };
+        let name_start = search + fn_offset + "fn ".len();
+        let name_end = source[name_start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|end| name_start + end)
+            .unwrap_or(source.len());
+        let name = source[name_start..name_end].to_owned();
+
+        // The body: the first `{` after the argument list and any return type,
+        // then balanced braces. String and comment contents are not skipped;
+        // this pins call sites, and a stray brace inside one would only ever
+        // end a body early, which the assertion below would surface as a
+        // missing command rather than a silent pass.
+        let Some(open) = source[name_end..].find('{').map(|at| name_end + at) else {
+            continue;
+        };
+        let mut depth = 0i32;
+        let mut end = open;
+        for (at, byte) in bytes[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + at;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push((name, source[open..=end].to_owned()));
+    }
+    out
+}
+
+/// The command names `src/backend.ts` lists in `REBINDING_COMMANDS`.
+#[cfg(test)]
+fn rebinding_commands(source: &str) -> BTreeSet<String> {
+    let start = source
+        .find("const REBINDING_COMMANDS = new Set([")
+        .expect("src/backend.ts must declare REBINDING_COMMANDS as a literal Set");
+    let open = start + source[start..].find('[').expect("checked above");
+    let end = open
+        + source[open..]
+            .find("])")
+            .expect("unterminated REBINDING_COMMANDS literal");
+    let mut names = BTreeSet::new();
+    let mut rest = &source[open..end];
+    while let Some(quote) = rest.find('"') {
+        let after = &rest[quote + 1..];
+        let close = after.find('"').expect("unterminated string literal");
+        names.insert(after[..close].to_owned());
+        rest = &after[close + 1..];
+    }
+    names
+}
+
 /// Every command registered in `tauri::generate_handler![…]`, with module
 /// paths (`android_media::capture_photo`) reduced to the IPC name Tauri
 /// actually exposes, and `#[cfg(…)]`-gated entries included regardless of the
@@ -263,6 +381,53 @@ mod tests {
             stale.is_empty(),
             "NOT_CALLED_FROM_BACKEND_TS entries that are no longer true (unregistered, or now \
              called from backend.ts): {stale:?}"
+        );
+    }
+
+    /// `REBINDING_COMMANDS` is a claim about the backend: "each of these was
+    /// verified to reach `refresh_graph`". Verify it, both ways. A command that
+    /// reopens the graph but is missing here leaves the frontend holding
+    /// graph-scoped state for a `Graph` that no longer exists; a stale entry
+    /// makes the frontend throw away live state for no reason.
+    #[test]
+    fn rebinding_commands_are_exactly_the_commands_that_reopen_the_graph() {
+        let declared = rebinding_commands(BACKEND_TS);
+        let actual = commands_that_reopen_the_graph();
+        assert!(
+            !actual.is_empty(),
+            "no command was found to call refresh_graph -- the scanner broke, not the code"
+        );
+
+        let missing: Vec<&String> = actual.difference(&declared).collect();
+        assert!(
+            missing.is_empty(),
+            "these #[tauri::command]s reopen the graph but are not in \
+             REBINDING_COMMANDS in src/backend.ts, so the frontend never rebinds \
+             its graph-scoped state after they return: {missing:?}"
+        );
+
+        let stale: Vec<&String> = declared.difference(&actual).collect();
+        assert!(
+            stale.is_empty(),
+            "these REBINDING_COMMANDS entries no longer reach refresh_graph; the \
+             frontend discards live graph-scoped state for nothing: {stale:?}"
+        );
+    }
+
+    /// Every registered command must be one the graph-reopening scan could see.
+    /// If a rebinding command is ever registered under a name the scan does not
+    /// produce, the guard above is checking a set that does not exist.
+    #[test]
+    fn every_graph_reopening_command_is_actually_registered() {
+        let registered = registered_handlers(LIB_RS);
+        let reopening = commands_that_reopen_the_graph();
+        let unregistered: Vec<&String> = reopening
+            .iter()
+            .filter(|name| !registered.contains(*name))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "commands that call refresh_graph but are not in generate_handler!: {unregistered:?}"
         );
     }
 
