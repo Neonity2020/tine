@@ -774,6 +774,126 @@
         "reason": "Patch release; the changelog carries the relevant release detail.",
         "refs": []
       }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Built-in themes now recolor the main page in dark mode** (GH #401). The no-flash startup frame now yields its high-specificity viewport colors to the active theme tokens after startup, so Nord, Solarized, and Gruvbox apply consistently to the page and sidebar while `custom.css` remains the final user override.",
+      "userVisible": true,
+      "regressions": [
+        "UI-THEME-BUILTIN-VIEWPORT-401"
+      ],
+      "guide": {
+        "status": "current",
+        "reason": "The Guide already describes built-in themes applying to the whole window with custom.css as the final override; this restores the behaviour it documents rather than changing it.",
+        "refs": [
+          "crates/tine-core/src/templates/extend-tine.md"
+        ]
+      },
+      "docs": {
+        "status": "not-applicable",
+        "reason": "No engineering contract governs the startup frame's CSS specificity; the invariant is held by the regression row instead.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch item does not require a separate public marketing-site change.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the changelog carries the relevant release detail.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**An exact `#` or `[[` page match no longer hides other matching pages** (GH #186). The exact page remains the first/default result and suppresses the redundant Create row, while prefix, substring, and fuzzy matches remain available in the existing bounded literal autocomplete pool.",
+      "userVisible": true,
+      "regressions": [
+        "UI-AUTOCOMPLETE-EXACT-RETAINS-MATCHES-186"
+      ],
+      "guide": {
+        "status": "current",
+        "reason": "The Guide's linking and search page already describes the autocomplete offering matching pages with the exact match first; the fix restores that described behaviour.",
+        "refs": [
+          "crates/tine-core/src/templates/pages-links-references-search.md"
+        ]
+      },
+      "docs": {
+        "status": "not-applicable",
+        "reason": "Autocomplete ranking has no engineering contract doc; the user outcome is pinned by the regression row.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch item does not require a separate public marketing-site change.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the changelog carries the relevant release detail.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**A journal-feed read failure is no longer misreported as an empty graph** (GH #385). The initial Journals view now shows the actual bounded backend error, while a transient refresh failure still keeps an already visible feed intact and retries later. This makes cloud-filesystem and access failures diagnosable without mistaking present journal files for no journals.",
+      "userVisible": true,
+      "regressions": [
+        "REG-JOURNAL-FEED-READ-ERROR-385"
+      ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "No Guide page described the misreported empty state, and the replacement is a self-describing in-app error message; there is nothing the Guide now states incorrectly.",
+        "refs": []
+      },
+      "docs": {
+        "status": "not-applicable",
+        "reason": "The change is a frontend error-surface distinction, not a storage layout, state machine or public-surface change.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch item does not require a separate public marketing-site change.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the changelog carries the relevant release detail.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Unlinked References no longer falls back to a whole-graph scan while an ordinary edit's one-page SQLite update is already in flight** (GH #400). Reference reads wait for that bounded background delta, then use the exact current candidate set; an unavailable or failed disposable projection still falls back to the parser. Exact Direct Files byte conflicts remain unchanged and continue to preserve both the disk version and the unsaved draft.",
+      "userVisible": true,
+      "regressions": [
+        "REG-DIRECT-REFERENCE-DELTA-HANDOFF-400"
+      ],
+      "guide": {
+        "status": "current",
+        "reason": "The Guide already describes Unlinked References and its results; the workflow and controls are unchanged and only the read's freshness and cost improve.",
+        "refs": [
+          "crates/tine-core/src/templates/pages-links-references-search.md"
+        ]
+      },
+      "docs": {
+        "status": "current",
+        "reason": "The storage/sync contract already states that the SQLite projection is a disposable cache with a parser fallback, which is the boundary this handoff respects.",
+        "refs": [
+          "docs/storage-sync-contract.md"
+        ]
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch item does not require a separate public marketing-site change.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the changelog carries the relevant release detail.",
+        "refs": []
+      }
     }
   ]
 }
