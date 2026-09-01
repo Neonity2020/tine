@@ -864,9 +864,9 @@ mod foreground_source_guard {
     ///
     /// That corpus does not merely fail — it does not COMPILE: it calls
     /// `TrustedLocalCommitCoordinator::commit`, `restart_projection_input` and
-    /// `recover_projection_after_restart`, and imports
-    /// `hot_engine_integration_tests::hot_overlay_tests`, none of which exist any
-    /// more. Enabling it is not a one-line change, and nobody should read 1,100
+    /// `recover_projection_after_restart`, and imports an `OverlayFixture` from
+    /// a `hot_overlay_tests` module of `hot_engine_integration_tests`, none of
+    /// which exist any more. Enabling it is not a one-line change, and nobody should read 1,100
     /// gated lines as coverage.
     ///
     /// If any of these names comes back, this fails, and the choice is explicit:
@@ -898,8 +898,9 @@ mod foreground_source_guard {
 // included, so none of the ~1,100 lines below has run since the gate was added.
 // They cannot run as written: they call `TrustedLocalCommitCoordinator::commit`,
 // `restart_projection_input` and `recover_projection_after_restart`, and import
-// `hot_engine_integration_tests::hot_overlay_tests::OverlayFixture` — four names
-// that no longer exist anywhere in the crate. Enabling the gate produces 18
+// an `OverlayFixture` from a `hot_overlay_tests` module of
+// `hot_engine_integration_tests` — four names that no longer exist anywhere in
+// the crate. Enabling the gate produces 18
 // compile errors, not failing tests.
 //
 // The one architectural assertion they carried is now live in

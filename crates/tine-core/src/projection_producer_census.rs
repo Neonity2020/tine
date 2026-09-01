@@ -533,6 +533,41 @@ pub(crate) fn production_rust() -> &'static [ProductionFile] {
     SCANNED.get_or_init(scan_production_rust)
 }
 
+/// Every Rust source in the two crates the census walks, tests included, as
+/// `(repository-relative path, raw source)`.
+///
+/// [`production_rust`] deliberately drops test-only files; a guard that has to
+/// ask "does the thing this comment names exist anywhere?" needs them back.
+pub(crate) fn repository_rust_sources() -> &'static [(String, String)] {
+    static SCANNED: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    SCANNED.get_or_init(|| {
+        let repo = repository_root();
+        let mut paths = Vec::new();
+        for root in [
+            repo.join("crates/tine-core/src"),
+            repo.join("crates/tine-core/tests"),
+            repo.join("src-tauri/src"),
+        ] {
+            if root.is_dir() {
+                visit_rs(&root, &mut paths);
+            }
+        }
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let relative = path
+                    .strip_prefix(&repo)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = fs::read_to_string(&path).expect("Rust source is readable");
+                (relative, source)
+            })
+            .collect()
+    })
+}
+
 fn scan_production_rust() -> Vec<ProductionFile> {
     let repo = repository_root();
     let roots = [
@@ -1935,6 +1970,55 @@ fn production_comments_cite_names_not_line_numbers() {
         "these comments cite another file by line number, which rots the moment that \
          file is edited and no gate notices (invariant I-11: code does not lie about \
          itself). Cite the type/function/module by name instead. Offenders:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// I-11 guard: a comment may not name a test that does not exist.
+///
+/// A comment saying that some named guard "is the architectural fact that says
+/// so" is a promise that the guard is running. The 2026-09 sweep found two comments pointing at
+/// `no_production_path_appends_a_turn` and
+/// `no_production_path_opens_or_appends_a_projection_turn` — neither had ever
+/// existed, and both were asserting that nothing in production opened the
+/// projection-turn journal while `sync_runtime.rs` was opening and draining it.
+/// A named guard is only worth citing if citing it is checked.
+#[test]
+fn comments_that_cite_a_test_name_a_test_that_exists() {
+    let sources = repository_rust_sources();
+    let mut offenders = Vec::new();
+    for (relative, source) in sources {
+        for (number, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("//") || trimmed.starts_with("*")) {
+                continue;
+            }
+            for (index, _) in line.match_indices("tests::") {
+                let cited = line[index + "tests::".len()..]
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect::<String>();
+                if cited.is_empty() {
+                    continue;
+                }
+                let defined = sources.iter().any(|(_, other)| {
+                    other.contains(&format!("fn {cited}("))
+                        || other.contains(&format!("mod {cited} "))
+                        || other.contains(&format!("mod {cited};"))
+                });
+                if !defined {
+                    offenders.push(format!("{relative}:{}: tests::{cited}", number + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these comments cite a test or test module that does not exist anywhere in the \
+         crate, so the architectural fact they promise is not actually being asserted \
+         (invariant I-11: code does not lie about itself). Write the guard, or cite the \
+         one that really covers the claim. Offenders:\n{}",
         offenders.join("\n")
     );
 }

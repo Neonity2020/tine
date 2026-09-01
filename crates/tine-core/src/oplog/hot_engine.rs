@@ -5512,11 +5512,16 @@ fn managed_local_record_from_prepared(
 // ---------------------------------------------------------------------------
 // Projection turn record (journal-universal durability design v4, §3.2–§3.6).
 //
-// NOTHING IN PRODUCTION WRITES OR READS A TURN YET. This section defines the
-// record, its canonical encoding, its two sequence domains and the byte-level
-// name derivation so the later producer conversion has one authority to move
-// to. The architectural fact that no producer is wired is asserted by
-// `oplog::projection_turn_journal::tests::no_production_path_appends_a_turn`.
+// Production writes and reads turns. This section defines the record, its
+// canonical encoding, its two sequence domains and the byte-level name
+// derivation; `projection_turn_journal.rs` appends and drains them, the
+// operational coordinator produces them, and `local_journal_drain.rs` decodes
+// them. The architectural fact is
+// `every_projection_only_producer_reaches_the_projection_turn_journal`, at the
+// end of `projection_turn_journal.rs`.
+//
+// This header claimed the opposite until 2026-09, citing a guard that had never
+// been written; the producers landed and the sentence did not move.
 // ---------------------------------------------------------------------------
 
 /// On-disk format tag of [`ProjectionTurn`].
