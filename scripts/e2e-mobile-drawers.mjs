@@ -520,7 +520,7 @@ await withApp(2, false, async (browser) => {
   const pdf = await snapshot(browser);
   const pdfParent = await browser.execute(() => document.querySelector(".pdf-pane")?.parentElement?.classList.contains("drawer-workspace") ?? false);
   assert(pdfParent && pdf.pdf.x >= pdf.workspace.x - 1 && pdf.pdf.right <= pdf.workspace.right + 1
-    && Math.abs(pdf.right.x - rightBeforeNeighbors.x) <= 1,
+    && pdf.right && pdf.rightRole === null && pdf.rightModal === null && pdf.scrims === 0,
   "persistent sidebar restructuring displaced the PDF neighbor", pdf);
   proof.artifacts.regular = path.join(ARTIFACT, "regular-wide-split-pdf.png");
   // Xvfb's root surface is only 1280px wide even though WebKit can own a wider

@@ -1991,11 +1991,14 @@
       "layer": "native",
       "status": "fixing",
       "coverage": {
-        "tests": [],
+        "tests": [
+          "src/components/PdfViewer.test.tsx",
+          "scripts/e2e-pdf-routes.mjs"
+        ],
         "scenario": "pdf.route-pane-session-migration",
-        "failBefore": "inferred"
+        "failBefore": "proven"
       },
-      "notes": "Default open-beside preserves the source; Notes uses the structural companion; the old dedicated pane and width authority are removed in the atomic route flip. The first release permits at most one visible view per document."
+      "notes": "Default open-beside preserves the source; Notes uses the structural companion; the old dedicated pane and width authority are removed in the atomic route flip. The first release permits at most one visible view per document. The v0.6.981 release gate proved a native page-jump race: Enter assigned scrollTop for page 2, then the input blur restored the still-old page 1 signal before the scroll observer ran."
     },
     {
       "id": "UI-PDF-MULTIVIEW-SHARED-ANNOTATIONS-20260830",
