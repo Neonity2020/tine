@@ -1529,9 +1529,10 @@ pub(crate) enum EnrollmentDiscoveryInspection {
 ///
 /// The path is opened as an existing no-follow directory. A present head is
 /// decoded through the canonical authority-claim and record decoders and
-/// authenticated through the same bounded checkpoint/chain validation as
-/// [`EnrollmentReader::open_existing`]. The lease file is read only for its
-/// physical identity and is never locked.
+/// authenticated through the same bounded checkpoint/chain validation every
+/// other reader here uses — [`open_discovered_enrollment_authority`] followed by
+/// [`read_head_and_chain`]. The lease file is read only for its physical
+/// identity and is never locked.
 pub(crate) fn inspect_existing_enrollment_at(
     root_path: &Path,
     expected_graph_resource: CanonicalGraphResourceId,
@@ -1539,7 +1540,7 @@ pub(crate) fn inspect_existing_enrollment_at(
     let Some(root) = open_existing_application_root(root_path)? else {
         return Ok(EnrollmentDiscoveryInspection::Absent);
     };
-    let Some(directories) = open_directories(&root, expected_graph_resource, false)? else {
+    let Some(directories) = open_directories(&root, expected_graph_resource)? else {
         return Ok(EnrollmentDiscoveryInspection::Absent);
     };
     validate_namespaces(&directories)?;
@@ -1671,7 +1672,7 @@ fn open_existing_application_root(
     })?;
     let canonical_parent = fs::canonicalize(parent)?;
     let parent = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
-    let Some(directory) = open_component(&parent, name, false)? else {
+    let Some(directory) = open_component(&parent, name)? else {
         return Ok(None);
     };
     validate_private_directory(&directory, "private enrollment application root")?;
@@ -2195,36 +2196,41 @@ fn regular_entry(entry: &cap_std::fs::DirEntry) -> Result<bool, EnrollmentError>
     Ok(cap_metadata_is_authoritative_file(&entry.metadata()?))
 }
 
+/// Open the existing enrollment namespace, or report its absence.
+///
+/// There is deliberately no `create` here: this module is read-only
+/// classification, and a creation flag is how that stops being true one caller
+/// at a time. `tests::the_enrollment_namespace_has_no_creation_authority` is the
+/// architectural fact.
 fn open_directories(
     root: &EnrollmentApplicationRoot,
     graph_resource: CanonicalGraphResourceId,
-    create: bool,
 ) -> Result<Option<EnrollmentDirectories>, EnrollmentError> {
     #[cfg(test)]
     count(&ENROLLMENT_DIRECTORY_OPENS);
     let root_dir = Dir::open_ambient_dir(root.path(), ambient_authority())?;
-    let sparse = open_component(&root_dir, SPARSE_STORAGE_DIRECTORY, create)?;
+    let sparse = open_component(&root_dir, SPARSE_STORAGE_DIRECTORY)?;
     let Some(sparse) = sparse else {
         return Ok(None);
     };
-    let version = open_component(&sparse, STORAGE_VERSION_DIRECTORY, create)?;
+    let version = open_component(&sparse, STORAGE_VERSION_DIRECTORY)?;
     let Some(version) = version else {
         return Ok(None);
     };
-    let local = open_component(&version, LOCAL_DIRECTORY, create)?;
+    let local = open_component(&version, LOCAL_DIRECTORY)?;
     let Some(local) = local else {
         return Ok(None);
     };
     let graph_name = graph_resource.to_string();
-    let graph = open_component(&local, &graph_name, create)?;
+    let graph = open_component(&local, &graph_name)?;
     let Some(graph) = graph else {
         return Ok(None);
     };
-    let enrollment = open_component(&graph, ENROLLMENT_DIRECTORY, create)?;
+    let enrollment = open_component(&graph, ENROLLMENT_DIRECTORY)?;
     let Some(enrollment) = enrollment else {
         return Ok(None);
     };
-    let records = open_component(&enrollment, RECORDS_DIRECTORY, create)?;
+    let records = open_component(&enrollment, RECORDS_DIRECTORY)?;
     let Some(records) = records else {
         return Err(EnrollmentError::UnsafeNamespace(
             "enrollment exists without its records directory".into(),
@@ -2236,8 +2242,14 @@ fn open_directories(
     }))
 }
 
-fn open_component(parent: &Dir, name: &str, create: bool) -> Result<Option<Dir>, EnrollmentError> {
-    let created;
+/// Open one existing component of the enrollment namespace, no-follow.
+///
+/// Absence is `Ok(None)`, never a repair. This function used to take
+/// `create: bool` and, when true, `mkdir` + `fchmod(0o700)` + fsync the parent —
+/// live writer authority behind a plain flag, in a module whose header says none
+/// remains. Every live caller passed `false`; the branch is gone rather than
+/// dormant, because a dormant one is an invitation.
+fn open_component(parent: &Dir, name: &str) -> Result<Option<Dir>, EnrollmentError> {
     match parent.symlink_metadata(name) {
         Ok(metadata)
             if metadata.file_type().is_symlink()
@@ -2248,32 +2260,12 @@ fn open_component(parent: &Dir, name: &str, create: bool) -> Result<Option<Dir>,
                 "{name} is not a real no-follow directory"
             )));
         }
-        Ok(_) => created = false,
-        Err(error) if error.kind() == ErrorKind::NotFound && !create => return Ok(None),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            match parent.create_dir(name) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(EnrollmentError::UnsafeNamespace(error.to_string())),
-            }
-            crate::filesystem_durability::sync_reconstructible_directory(parent)
-                .map_err(|error| EnrollmentError::UnsafeNamespace(error.to_string()))?;
-            created = true;
-        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     }
     let directory = open_dir_nofollow(parent, name)
         .map_err(|error| EnrollmentError::UnsafeNamespace(error.to_string()))?;
-    #[cfg(all(unix, not(target_os = "android")))]
-    if created {
-        let descriptor = directory.try_clone()?.into_std_file();
-        // SAFETY: this changes the exact retained directory descriptor.
-        if unsafe { libc::fchmod(descriptor.as_raw_fd(), 0o700) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    #[cfg(target_os = "android")]
-    let _ = created;
     validate_private_directory(&directory, name)?;
     Ok(Some(directory))
 }
@@ -2880,5 +2872,58 @@ impl std::error::Error for EnrollmentError {}
 impl From<std::io::Error> for EnrollmentError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The module header says "No writer, lease, transition, or recovery
+    /// authority remains." It was prose only: `open_component` carried a live
+    /// `mkdir` + `fchmod(0o700)` + fsync branch behind a `create: bool` that every
+    /// caller passed `false`, so nothing but inspection stopped the next caller
+    /// passing `true`. The branch is gone; this keeps it gone.
+    ///
+    /// A new primitive here is not necessarily wrong — but it contradicts the
+    /// header, so it is a deliberate edit of both, not an addition nobody notices.
+    #[test]
+    fn the_enrollment_namespace_has_no_creation_authority() {
+        const WRITE_PRIMITIVES: &[&str] = &[
+            "create_dir",
+            "create_new",
+            "remove_file",
+            "remove_dir",
+            "write_all",
+            "set_permissions",
+            "fchmod",
+            "sync_all",
+            "sync_data",
+            "sync_reconstructible_directory",
+            "lock_exclusive",
+            "try_lock",
+            "O_CREAT",
+            "O_WRONLY",
+            "O_RDWR",
+        ];
+        // Comments describe the retired branch on purpose, and this module's own
+        // list names every primitive verbatim; scan the production code only.
+        let source = include_str!("enrollment.rs");
+        let production = source
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .expect("this test module terminates the production source");
+        let code: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for primitive in WRITE_PRIMITIVES {
+            assert!(
+                !code.contains(primitive),
+                "enrollment.rs uses `{primitive}`, but its header says no writer, lease, \
+                 transition, or recovery authority remains. Either the authority is real \
+                 (fix the header, and say which in-scope failure the write defends against) \
+                 or the call is a mistake."
+            );
+        }
     }
 }
