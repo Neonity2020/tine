@@ -734,6 +734,37 @@ describe("PdfViewer OG state and reference behavior", () => {
     }
   });
 
+  it("keeps a typed page jump after Enter blurs the page field", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [],
+      page: 1,
+      scale: 1,
+    });
+    vi.spyOn(backend(), "writePdfViewState").mockResolvedValue(undefined);
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    getDocumentMock.mockReturnValue({
+      promise: Promise.resolve(documentWithPages([page(612, 792), page(612, 792)])),
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <PdfViewer filename="paper.pdf" label="Paper" />, host);
+    try {
+      await flush();
+      const input = host.querySelector(".pdf-page-input") as HTMLInputElement;
+      input.focus();
+      input.value = "2";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await flush();
+
+      expect(document.activeElement).not.toBe(input);
+      expect(input.value).toBe("2");
+    } finally {
+      dispose();
+    }
+  });
+
   it("lets route-owned page and scale override the shared sidecar and publishes per-view changes", async () => {
     vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
       highlights: [],

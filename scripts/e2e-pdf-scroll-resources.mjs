@@ -246,6 +246,11 @@ try {
   assert(ready.canvasCount < PAGE_COUNT / 2, "opening a long PDF rendered distant offscreen pages", ready.canvasCount);
   assert(ready.canvasPixels <= 52_000_000, "PDF canvases exceeded the desktop backing-store budget", ready.canvasPixels);
 
+  // The app deliberately gives Ctrl/Cmd +/- to whichever pane the user most
+  // recently focused. Opening a companion PDF preserves focus in the source
+  // pane, so select the reader before exercising its keyboard zoom contract.
+  await click(browser, ".pdf-scroll");
+
   // A retained ordinary canvas is already width/height:100% of its page
   // wrapper. During optimistic zoom it must never receive a second scale
   // transform: the released failure made one Ctrl+ step overshoot, then visibly

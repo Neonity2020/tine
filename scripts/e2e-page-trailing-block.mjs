@@ -76,8 +76,11 @@ async function openPage(name) {
   await browser.waitUntil(async () => (await browser.$$(".nav-page")).length > 0, { timeout: 15_000, timeoutMsg: "page index did not load" });
   const result = await browser.execute((wanted) => {
     const row = [...document.querySelectorAll(".nav-page")].find((element) => element.textContent?.trim() === wanted);
-    if (!row) return { ok: false, names: [...document.querySelectorAll(".nav-page")].map((element) => element.textContent?.trim()) };
-    row.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+    const label = row?.querySelector(".nav-page-label");
+    if (!label) return { ok: false, names: [...document.querySelectorAll(".nav-page")].map((element) => element.textContent?.trim()) };
+    // GH #464 deliberately made only the title a navigation target; the spare
+    // row width is reorder grab space. Drive the real user link, not the row.
+    label.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
     return { ok: true, names: [] };
   }, name);
   if (!result.ok) throw new Error(`missing page ${name}: ${JSON.stringify(result.names)}`);

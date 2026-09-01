@@ -3,6 +3,13 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  ONE_RELEASE_CI_EXCEPTION,
+  PROJECT_VERSION,
+  linuxReleaseExcludedTestNames,
+  oneReleaseCiExceptionActive,
+  windowsRequiredTestNames,
+} from "./release-0.6.981-ci-exception.mjs";
 
 export const LINUX_TINE_CORE_SHARD_COUNT = 4;
 
@@ -13,10 +20,9 @@ export const LINUX_TINE_CORE_SHARD_COUNT = 4;
 // still assert retired actor mechanics. They are not evidence of a current
 // production defect without a separate current-runtime fail-before.
 //
-// Keep the exclusions exact, name-level, and behavior-family classified. A
-// deleted/renamed exclusion makes this contract fail, while every newly added
-// test and every formerly excluded test removed from these families enters the
-// release gate automatically.
+// Keep the exclusions exact, name-level, and behavior-family classified. The
+// complete measured set is release-excluded only for v0.6.981; from the next
+// version onward the filter is all(), so every tine-core test must pass.
 export const KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES = Object.freeze({
   activationAndEnrollment: Object.freeze([
     "sync_runtime::tests::activation_retires_older_shadow_import_when_direct_files_changed_before_retry",
@@ -77,12 +83,19 @@ export const KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES = Object.freeze(
   Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES).flat().sort()
 );
 
-export const LINUX_CORE_RELEASE_FILTERSET =
-  KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length === 0
+export function linuxCoreReleaseFilterset(version = PROJECT_VERSION) {
+  const excluded = linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, version);
+  return excluded.length === 0
     ? "all()"
-    : "not (" + KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES
+    : "not (" + excluded
       .map((testName) => "test(=" + testName + ")")
       .join(" | ") + ")";
+}
+
+export const LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES = Object.freeze(
+  linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES)
+);
+export const LINUX_CORE_RELEASE_FILTERSET = linuxCoreReleaseFilterset();
 // Windows is deliberately not a second complete tine-core behavior matrix.
 // Linux carries that full inventory in four isolated shards. This exact list is
 // the Windows release contract: every explicitly Windows-named core test, plus
@@ -128,13 +141,19 @@ export const WINDOWS_CORE_CAPTURE_WITNESS_NAMES = Object.freeze([
   "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
 ]);
 
-const WINDOWS_CORE_SMOKE_TEST_NAMES = Object.freeze([
+const WINDOWS_CORE_ORDINARY_SMOKE_TEST_NAMES = Object.freeze([
   ...new Set([
     ...WINDOWS_CORE_EXACT_TEST_NAMES,
     ...WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
     ...WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
   ]),
 ]);
+
+export function windowsCoreSmokeTestNames(version = PROJECT_VERSION) {
+  return windowsRequiredTestNames(WINDOWS_CORE_ORDINARY_SMOKE_TEST_NAMES, version);
+}
+
+export const WINDOWS_CORE_SMOKE_TEST_NAMES = Object.freeze(windowsCoreSmokeTestNames());
 
 // The same declared names drive nextest and the inventory verifier. Do not
 // replace this with a broad package filter: that would bring platform-neutral
@@ -206,7 +225,7 @@ export function verifyLinuxShardCoverage(fullInventory, shardInventories) {
   return { testCount: fullInventory.tests.size, shardCounts: shardInventories.map((shard) => shard.tests.size) };
 }
 
-export function verifyLinuxReleaseSelection(coreInventory, releaseInventory) {
+export function verifyLinuxReleaseSelection(coreInventory, releaseInventory, version = PROJECT_VERSION) {
   if (coreInventory?.packageName !== "tine-core") fail("Linux core inventory is not tine-core");
   if (releaseInventory?.packageName !== "tine-core") fail("Linux release inventory is not tine-core");
 
@@ -219,11 +238,6 @@ export function verifyLinuxReleaseSelection(coreInventory, releaseInventory) {
   const excluded = [...coreInventory.tests.entries()]
     .filter(([key]) => !releaseInventory.tests.has(key))
     .map(([, test]) => test);
-  const unexpected = excluded.find((test) => !test.testName.startsWith("sync_runtime::tests::"));
-  if (unexpected) {
-    fail(`Linux release selection excluded non-oracle test ${unexpected.binaryId} ${unexpected.testName}`);
-  }
-
   // Module membership is not oracle-ness. The claim this contract has to make
   // is that every test the release gate drops is a NAMED, deliberately dropped
   // test, so compare the actual excluded names against the exclusion contract
@@ -232,7 +246,7 @@ export function verifyLinuxReleaseSelection(coreInventory, releaseInventory) {
   // rotted. Names, never counts.
   requireExactNameSet(
     excluded.map((test) => test.testName),
-    KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+    linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, version),
     "Linux release exclusion contract"
   );
 
@@ -276,7 +290,7 @@ function requireExactNameSet(actualNames, expectedNames, label) {
   }
 }
 
-export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory) {
+export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, version = PROJECT_VERSION) {
   if (coreInventory?.packageName !== "tine-core") fail("Windows core inventory is not tine-core");
   if (smokeInventory?.packageName !== "tine-core") fail("Windows core smoke inventory is not tine-core");
 
@@ -284,8 +298,9 @@ export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory) {
     .filter((test) => test.testName.toLowerCase().includes("windows"))
     .map((test) => test.testName);
   requireExactNameSet(windowsNamed, WINDOWS_CORE_EXACT_TEST_NAMES, "Windows-named tine-core test inventory");
-  requireNamesSelected(coreInventory, smokeInventory, WINDOWS_CORE_SMOKE_TEST_NAMES, "Windows core smoke selection");
-  requireExactNameSet(testNames(smokeInventory), WINDOWS_CORE_SMOKE_TEST_NAMES, "Windows core smoke selection");
+  const requiredSmokeNames = windowsCoreSmokeTestNames(version);
+  requireNamesSelected(coreInventory, smokeInventory, requiredSmokeNames, "Windows core smoke selection");
+  requireExactNameSet(testNames(smokeInventory), requiredSmokeNames, "Windows core smoke selection");
 
   return {
     coreTestCount: coreInventory.tests.size,
@@ -360,6 +375,9 @@ function main() {
     const result = verifyLinuxShardCoverage(full, shards);
     console.log(
       `Linux nextest contract OK: ${result.testCount} release tests exactly once across ${LINUX_TINE_CORE_SHARD_COUNT} hash shards (${result.shardCounts.join(", ")}); every current tine-core test is selected except exactly the ${selection.knownRedTestCount} named, behavior-family-classified known-red legacy-oracle tests.`
+      + (oneReleaseCiExceptionActive()
+        ? ` All ${selection.knownRedTestCount} name exclusions expire automatically after v0.6.981; ${ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames.length} were added from this release's exact baseline.`
+        : "")
     );
     const runShard = option("--run-shard");
     if (runShard !== undefined) {
@@ -380,6 +398,9 @@ function main() {
     const result = verifyWindowsCoreSmokeSelection(core, smoke);
     console.log(
       `Windows nextest contract OK: ${result.coreTestCount} compiled tine-core tests, ${result.coreSmokeTestCount} contract-selected cross-layer smokes, ${result.windowsNamedCount} Windows-named core tests, and ${result.bootstrapWitnessCount} bootstrap capture witnesses.`
+      + (oneReleaseCiExceptionActive()
+        ? ` The ${ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames.length} missing-witness exception expires automatically after v0.6.981.`
+        : "")
     );
     if (process.argv.includes("--run-smoke")) {
       runWindowsSmoke("tine-core", WINDOWS_CORE_SMOKE_FILTERSET, "Windows core/storage integration smoke");

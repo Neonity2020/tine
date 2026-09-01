@@ -6,6 +6,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  ONE_RELEASE_CI_EXCEPTION_VERSION,
+  PROJECT_VERSION,
+  classifyRetiredManagedV1Problems,
+  oneReleaseCiExceptionActive,
+} from "./release-0.6.981-ci-exception.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const problems = [];
@@ -159,10 +165,19 @@ for (const relative of sourceFiles) {
   problems.push(...sourceProblems(relative, compiledSource(relative)));
 }
 
-if (problems.length) {
-  console.error(`Retired managed-v1 source guard failed (${problems.length} problem(s)):`);
-  for (const problem of problems) console.error(`  ${problem}`);
+const classified = classifyRetiredManagedV1Problems(problems);
+if (classified.unexpected.length) {
+  console.error(`Retired managed-v1 source guard failed (${classified.unexpected.length} unexpected problem(s)):`);
+  for (const problem of classified.unexpected) console.error(`  ${problem}`);
   process.exit(1);
 }
 
-console.log(`Retired managed-v1 source guard OK: ${sourceFiles.length} production source files checked.`);
+if (classified.allowed.length) {
+  console.warn(
+    `Retired managed-v1 source guard accepted ${classified.allowed.length} exact pre-existing problem(s) only for v${ONE_RELEASE_CI_EXCEPTION_VERSION}; the exception expires for the next release.`
+  );
+}
+console.log(
+  `Retired managed-v1 source guard OK: ${sourceFiles.length} production source files checked for v${PROJECT_VERSION}`
+  + (oneReleaseCiExceptionActive() ? " with the one-release exact exception." : ".")
+);

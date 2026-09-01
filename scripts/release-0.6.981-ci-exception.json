@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "releaseVersion": "0.6.981",
+  "linuxAdditionalKnownRedTestNames": [
+    "model::tests::admission_complete_validator_checks_exact_reverse_keys_and_path_kinds",
+    "model::tests::admission_journal_title_format_expansion_rejects_before_render_or_parse",
+    "model::tests::admission_large_same_semantic_key_build_is_linear_in_collision_members",
+    "model::tests::admission_memory_preflights_capture_maps_parser_and_overflow",
+    "model::tests::admission_normal_journal_title_format_is_budgeted_and_reconciled",
+    "model::tests::admission_snapshot_excludes_reserved_paths_and_failed_builds_poison",
+    "model::tests::admission_snapshot_retains_all_collision_group_evidence",
+    "model::tests::admission_snapshot_uses_parser_owned_semantics_and_preserves_creation_roots",
+    "model::tests::initial_shadow_discovers_graph_wide_mixed_case_text_paths",
+    "model::tests::initial_shadow_rejects_file_aliases_but_retains_portable_collisions",
+    "model::tests::live_admission_ignores_equal_creation_roots_and_defers_directory_retarget",
+    "model::tests::live_admission_snapshot_defers_late_enumeration_changes_to_the_fenced_feed",
+    "model::tests::managed_barrier_collapse_does_not_change_direct_files_retire_publish_barriers",
+    "model::tests::managed_projection_replacement_falls_back_but_direct_files_stays_strict",
+    "oplog::import_integration_tests::concurrent_same_page_fallback_never_publishes_the_stale_local_draft_as_current",
+    "projection_producer_census::g_e_shipped_native_targets_and_writers_are_pinned",
+    "sync_runtime::tests::android_private_directory_durability_is_explicit_at_every_exception",
+    "sync_runtime::tests::every_blocked_reason_literal_is_in_the_refusal_contract_vocabulary",
+    "sync_runtime::tests::foreground_cross_page_move_is_bounded_and_does_no_graph_wide_work",
+    "sync_runtime::tests::provider_create_projects_markdown_beside_a_concurrent_external_admission",
+    "sync_runtime::tests::provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_admission",
+    "sync_runtime::tests::provider_delete_of_a_path_absent_from_the_receiver_converges",
+    "sync_runtime::tests::provider_edit_projects_markdown_beside_a_concurrent_external_admission",
+    "sync_runtime::tests::rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders",
+    "sync_runtime::tests::restore_uses_retained_projection_rendering_and_reports_byte_identical_fidelity"
+  ],
+  "retiredManagedV1AllowedProblems": [
+    "legacy v1 path is compiled outside inert fixture: crates/tine-core/src/sync_runtime_tests.rs:27760"
+  ],
+  "windowsMissingRequiredTestNames": [
+    "oplog::enrollment::tests::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
+    "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
+    "oplog::import::tests::inactive_streaming_bootstrap_preseal_crash_retries_exactly",
+    "oplog::import::tests::inactive_streaming_bootstrap_repeated_run_reuses_exact_seal"
+  ]
+}

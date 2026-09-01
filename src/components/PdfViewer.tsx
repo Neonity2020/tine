@@ -1378,6 +1378,11 @@ export function PdfViewer(props: {
     const np = numPages() || 1;
     const p = Math.max(1, Math.min(np, Math.floor(n) || 1));
     if (pageEls[p]) scrollRef.scrollTop = pageEls[p].offsetTop;
+    // A typed page jump blurs the input immediately after assigning scrollTop.
+    // Publish the requested page synchronously so that blur cannot restore the
+    // previous observer-derived value before the next scroll rAF runs.
+    setCurPage(p);
+    setPageField(String(p));
   };
   const activateOutlineItem = async (item: PdfOutlineItem) => {
     const doc = pdfDoc;
