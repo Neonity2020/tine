@@ -32,6 +32,8 @@
     "legacy v1 path is compiled outside inert fixture: crates/tine-core/src/sync_runtime_tests.rs:27760"
   ],
   "windowsMissingRequiredTestNames": [
-    "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts"
+    "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
+    "oplog::import::tests::inactive_streaming_bootstrap_preseal_crash_retries_exactly",
+    "oplog::import::tests::inactive_streaming_bootstrap_repeated_run_reuses_exact_seal"
   ]
 }

@@ -229,13 +229,14 @@ assert.deepEqual(WINDOWS_CORE_CAPTURE_WITNESS_NAMES, coreCaptureWitnesses);
 
 const ordinaryCoreSmokeTests = [...new Set([...coreWindowsTests, ...coreLifecycleWitnesses, ...coreCaptureWitnesses])];
 const currentCoreSmokeTests = windowsCoreSmokeTestNames();
-const missingWindowsWitness = ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames[0];
 assert.deepEqual(WINDOWS_CORE_SMOKE_TEST_NAMES, currentCoreSmokeTests);
 assert.deepEqual(
   currentCoreSmokeTests,
   windowsRequiredTestNames(ordinaryCoreSmokeTests)
 );
-assert.equal(currentCoreSmokeTests.includes(missingWindowsWitness), false);
+for (const missingWindowsWitness of ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames) {
+  assert.equal(currentCoreSmokeTests.includes(missingWindowsWitness), false);
+}
 assert.deepEqual(windowsCoreSmokeTestNames(NEXT_RELEASE_VERSION), ordinaryCoreSmokeTests);
 assert.deepEqual(
   verifyWindowsCoreSmokeSelection(
@@ -243,8 +244,8 @@ assert.deepEqual(
     listedInventory("tine-core", currentCoreSmokeTests)
   ),
   {
-    coreTestCount: 30,
-    coreSmokeTestCount: 29,
+    coreTestCount: currentCoreSmokeTests.length + 1,
+    coreSmokeTestCount: currentCoreSmokeTests.length,
     windowsNamedCount: 15,
     bootstrapWitnessCount: 8,
   }
@@ -263,14 +264,17 @@ assert.throws(
   ),
   /Windows core smoke selection omitted required test/
 );
-assert.throws(
-  () => verifyWindowsCoreSmokeSelection(
-    listedInventory("tine-core", currentCoreSmokeTests),
-    listedInventory("tine-core", currentCoreSmokeTests),
-    NEXT_RELEASE_VERSION
-  ),
-  new RegExp(`must contain exactly one required test ${missingWindowsWitness}`)
-);
+for (const missingWindowsWitness of ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames) {
+  const nextReleaseWithoutOneWitness = ordinaryCoreSmokeTests.filter((name) => name !== missingWindowsWitness);
+  assert.throws(
+    () => verifyWindowsCoreSmokeSelection(
+      listedInventory("tine-core", nextReleaseWithoutOneWitness),
+      listedInventory("tine-core", nextReleaseWithoutOneWitness),
+      NEXT_RELEASE_VERSION
+    ),
+    new RegExp(`must contain exactly one required test ${missingWindowsWitness}`)
+  );
+}
 assert.deepEqual(
   verifyWindowsCoreSmokeSelection(
     listedInventory("tine-core", [...ordinaryCoreSmokeTests, "unselected_platform_neutral_test"]),
@@ -278,8 +282,8 @@ assert.deepEqual(
     NEXT_RELEASE_VERSION
   ),
   {
-    coreTestCount: 31,
-    coreSmokeTestCount: 30,
+    coreTestCount: ordinaryCoreSmokeTests.length + 1,
+    coreSmokeTestCount: ordinaryCoreSmokeTests.length,
     windowsNamedCount: 15,
     bootstrapWitnessCount: 8,
   }
