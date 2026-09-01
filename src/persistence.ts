@@ -4,9 +4,11 @@
 // from being lost, clobbered, or written into the wrong graph.
 //
 // store.ts owns the doc tree and calls markDirty(page) on every mutation; this
-// module decides WHEN and HOW that reaches disk. It depends on store only for a
-// page snapshot (pageToDto) and the loaded flag (doc.loaded) — used at call time,
-// so the store↔persistence import cycle resolves cleanly.
+// module decides WHEN and HOW that reaches disk. Its whole dependency on store is
+// the named import below, and every binding in it is read at call time rather
+// than at module scope, so the store↔persistence import cycle resolves cleanly.
+// `persistence.storeSurface.test.ts` pins that import list: it is the coupling
+// this split exists to bound, so it may not grow unnoticed.
 
 import {
   doc,
