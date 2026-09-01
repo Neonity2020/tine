@@ -51,7 +51,7 @@ const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.e
 await sleep(3000);
 
 async function newSession() {
-  return remote({
+  const browser = await remote({
     hostname: "127.0.0.1",
     port: DRIVER_PORT,
     path: "/",
@@ -60,6 +60,10 @@ async function newSession() {
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
   });
+  // Keep a genuinely spacious desktop pane for Concord's review-width
+  // contract; narrow-pane behavior has its own container-query coverage.
+  await browser.setWindowSize(1400, 900);
+  return browser;
 }
 
 async function openNote(browser) {
@@ -88,6 +92,27 @@ async function assertLiveConflict(browser, phase) {
   }, { timeout: 20_000, timeoutMsg: `${phase}: resolver did not retain both sides` });
   if (await browser.$(".conflict-banner").isExisting()) {
     throw new Error(`${phase}: legacy Direct Files conflict bar appeared`);
+  }
+  const geometry = await browser.execute(() => {
+    const pane = document.querySelector(".main-content");
+    const inner = document.querySelector(".main-content-inner");
+    const panel = document.querySelector(".page-conflict");
+    if (!(pane instanceof HTMLElement)
+      || !(inner instanceof HTMLElement)
+      || !(panel instanceof HTMLElement)) return null;
+    const style = getComputedStyle(inner);
+    return {
+      panelWidth: panel.getBoundingClientRect().width,
+      usablePaneWidth: pane.getBoundingClientRect().width
+        - parseFloat(style.paddingLeft)
+        - parseFloat(style.paddingRight),
+    };
+  });
+  if (!geometry || Math.abs(geometry.panelWidth - geometry.usablePaneWidth) > 2) {
+    throw new Error(`${phase}: Concord did not span the pane's usable width: ${JSON.stringify(geometry)}`);
+  }
+  if (phase === "initial conflict") {
+    await browser.saveScreenshot("/tmp/e2e-concord-live-save-width.png");
   }
 }
 

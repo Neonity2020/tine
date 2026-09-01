@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Concord now uses the full pane width while you review a conflict.** The
+  ordinary reading-width limit left both versions and their decision controls
+  cramped and wrapping in a spacious window unless you happened to discover
+  wide mode. A mounted resolver now uses that pane's wide content width
+  automatically, then restores the usual reading width when the conflict is
+  resolved; narrow and split panes keep their responsive layout.
+
 ## [0.6.981] - 2026-09-01
 
 ### Added

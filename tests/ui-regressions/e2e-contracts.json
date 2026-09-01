@@ -1239,6 +1239,12 @@
      "class": "stateful-ux",
      "userOutcome": "Direct Files conflicts use the in-page resolver and queue, never the retired global Keep mine / Use current bar.",
      "blocking": true
+    },
+    {
+     "class": "flexible-presentation-heuristic",
+     "authority": "Martin's 2026-09-01 Concord review-width requirement.",
+     "userOutcome": "In a spacious desktop pane, Concord uses the pane's usable content width automatically instead of inheriting the prose reading cap or requiring wide mode.",
+     "blocking": false
     }
    ],
    "acceptableVariations": [
@@ -1246,7 +1252,7 @@
     "Labels and explanatory wording may evolve while both texts remain visible and the guarded apply remains explicit."
    ],
    "nonRequirements": [
-    "Exact conflict colors, row geometry, button ordering, DOM nesting, or animation.",
+    "Exact conflict colors, internal row geometry, button ordering, DOM nesting, or animation; the overall full-pane review width remains required.",
     "Exact generated block identities or save debounce duration."
    ],
    "stability": "stable",
