@@ -2,12 +2,29 @@
 # only after the candidate SHA is frozen; release.yml independently verifies that
 # this exact SHA has successful evidence from every full job before packaging.
 # Focused scopes remain available between releases for platform/performance work.
-# Pull requests get one lightweight Linux validation job and docs-only PRs skip it.
+#
+# The lightweight Linux validation job runs on pull requests AND on every push to
+# `master`. The push trigger is load-bearing, not redundant: AGENTS.md section 6
+# integration fast-forwards `master` from a topic branch without ever opening a
+# pull request, so a pull-request-only gate never observes the code that actually
+# lands. Between 2026-08-25 and 2026-09-01 that gap let the tine-core failure set
+# grow from its documented 45 known-red tests to 84 with nobody notified. Do not
+# narrow this trigger back to pull requests alone.
 name: ci
 
-run-name: ci / ${{ github.event_name == 'workflow_dispatch' && (inputs.windows_test_name != '' && format('focused Windows / {0}', inputs.windows_test_name) || format('full suite / {0}', inputs.scope)) || 'pull-request / full suite' }} / ${{ github.sha }}
+run-name: ci / ${{ github.event_name == 'workflow_dispatch' && (inputs.windows_test_name != '' && format('focused Windows / {0}', inputs.windows_test_name) || format('full suite / {0}', inputs.scope)) || (github.event_name == 'push' && 'master push / linux validation' || 'pull-request / linux validation') }} / ${{ github.sha }}
 
 on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**/*.png"
+      - "docs/**/*.jpg"
+      - "docs/**/*.jpeg"
+      - "docs/**/*.gif"
+      - "docs/**/*.webp"
   pull_request:
     paths-ignore:
       - "**/*.md"
@@ -44,8 +61,8 @@ permissions:
 
 jobs:
   pr-validation:
-    name: PR validation / Linux unit and contract checks
-    if: github.event_name == 'pull_request'
+    name: Landed-code validation / Linux unit and contract checks
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5

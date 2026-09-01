@@ -587,7 +587,35 @@ assert.match(websitePrivacy, /mailto:support@tine\.page/);
 // binary before it can be staged for the atomic assembler/publisher. Windows
 // consumes the staged portable binary in independent advisory jobs that neither
 // serialize assembly nor hide one runner-wide 0/N failure.
-assert.doesNotMatch(ciWorkflow, /\n  push:/, "ordinary CI still runs automatically on pushes");
+// Cost policy: a push may start ONLY the lightweight Linux validation job. The
+// expensive platform/performance matrix stays manual. This replaced a blanket
+// "ci.yml has no push trigger" assertion on 2026-09-01: that guard encoded the
+// cost rule by forbidding the trigger outright, which also removed the only
+// automatic gate on landed code, because section 6 integration fast-forwards
+// `master` without a pull request. The failure set drifted 45 -> 84 unseen.
+// Pinned both ways: the push trigger must EXIST and stay scoped to `master`,
+// and every expensive job must stay `workflow_dispatch`-only.
+assert.match(
+  ciWorkflow,
+  /\non:\n  push:\n    branches:\n      - master\n/,
+  "ci.yml must gate landed master code with the lightweight validation job"
+);
+for (const [jobId, condition] of [
+  ["test", "inputs.scope == 'full'"],
+  ["linux-core-nextest", "inputs.scope == 'full'"],
+  ["windows-compile", "inputs.scope == 'windows'"],
+  ["android-core-compile", "inputs.scope == 'full'"],
+  ["bench", "inputs.scope == 'full'"],
+]) {
+  const job = new RegExp(`\\n  ${jobId}:\\n[\\s\\S]*?\\n    if: ([^\\n]*)\\n`);
+  const found = ciWorkflow.match(job);
+  assert.ok(found, `ci.yml no longer defines the ${jobId} job`);
+  assert.ok(
+    found[1].includes("github.event_name == 'workflow_dispatch'"),
+    `ci.yml job ${jobId} must remain manual-dispatch only; a push must never start it`
+  );
+  assert.ok(found[1].includes(condition.split(" ==")[0]), `ci.yml job ${jobId} lost its scope selection`);
+}
 assert.match(
   ciWorkflow,
   /workflow_dispatch:[\s\S]*?scope:[\s\S]*?options:[\s\S]*?- full[\s\S]*?- windows[\s\S]*?- android[\s\S]*?- performance/,

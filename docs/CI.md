@@ -9,9 +9,9 @@ The frozen release candidate receives the exhaustive pass.
 
 | Event | Automatic work | Purpose |
 | --- | --- | --- |
-| Non-doc pull request | `ci` → `PR validation / Linux unit and contract checks` | TypeScript, frontend, the same curated `tine-core` nextest release selection the release shards run (unsharded, `ci` profile), plugin SDK, plus cheap generated-artifact/release contract guards. No Windows, Android, performance, Flatpak build, or release packaging. |
+| Non-doc pull request | `ci` → `Landed-code validation / Linux unit and contract checks` | TypeScript, frontend, the same curated `tine-core` nextest release selection the release shards run (unsharded, `ci` profile), plugin SDK, plus cheap generated-artifact/release contract guards. No Windows, Android, performance, Flatpak build, or release packaging. |
 | Docs/image-only pull request | No app CI | Avoid runner work for prose and image-only changes. A Flatpak/website metadata PR still gets its path-specific lightweight validator. |
-| Push to `master` | No app test/build workflow | Merging does not repeat CI after the reviewed commit. Website pushes may still deploy Pages; issue automation is separate from app CI. |
+| Non-doc push to `master` | `ci` → `Landed-code validation / Linux unit and contract checks` | The same lightweight Linux job the pull-request path runs. Section 6 integration fast-forwards `master` without opening a pull request, so this is the only automatic gate that observes landed code; a pull-request-only trigger let the `tine-core` failure set drift from 45 to 84 unnoticed (2026-08-25 → 2026-09-01). Website pushes may still deploy Pages; issue automation is separate from app CI. |
 | Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards, Windows compile-all `tine-core` targets + contract-selected cross-layer integration smoke, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence against the certified `tine-storage` pin. |
 | Manual `ci`, focused scope | Only `windows`, `android`, `android-runtime`, `android-ui-runtime`, or `performance` | Platform/performance proof while developing relevant changes. A focused run never satisfies the release gate. |
 | Manual `ui-e2e` | Complete or scenario-focused Linux/Windows real-app proof | UI/harness debugging between releases without starting ordinary full CI. |
@@ -19,8 +19,8 @@ The frozen release candidate receives the exhaustive pass.
 | Manual `release`, `mode=build` | Exact-SHA CI evidence check, release preflight, real Flatpak, desktop/Android packages, release E2E, candidate assembly | Expensive release proof. It fails before packaging if the exact candidate lacks successful full CI evidence. With `publish=false` it creates an immutable private candidate and receipt. |
 | Manual `release`, `mode=promote` | Verify a successful no-publication source run, classify source-to-target, rerun every registered affected proof against the retained exact binary, verify candidate and promotion receipts, optionally publish | The normal same-commit publication path and the narrowly allowlisted proof-only reuse path. It never rebuilds platform packages. |
 
-The lightweight pull-request path is a useful early signal, not release
-evidence. Platform-native or observation-boundary proof remains necessary when
+The lightweight pull-request and `master`-push path is a useful early signal and
+the drift alarm for landed code, not release evidence. Platform-native or observation-boundary proof remains necessary when
 the changed behavior requires it.
 
 ## Frozen-candidate sequence
