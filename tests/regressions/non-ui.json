@@ -2,6 +2,21 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-HARVEST-B3-LIVE-CONFLICT-CAPSULE-001",
+   "title": "Live-save conflict drafts survive restart through one durable app-private capsule protocol on Direct Files and Managed Storage",
+   "family": "live-save-conflict-data-safety",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest B3"},
+   "platforms": ["all"],
+   "layer": "tauri-native-and-frontend",
+   "status": "fixing",
+   "coverage": {
+    "tests": [],
+    "scenario": "harvest-b3.live-conflict-capsule-restart-parity",
+    "failBefore": "source-proven"
+   },
+   "notes": "Before Harvest B3, Direct Files retained the only copy of a refused live draft in localStorage, which WebKitGTK does not persist, while the Managed Storage conflict branch retained no restart capsule at all. The replacement must use a graph-keyed app-private atomic publication and retirement protocol, restore exact draft bytes and binding on both backends, and require Managed authority to be re-observed after restart."
+  },
+  {
    "id": "REG-MANAGED-REFERRER-BOUNDED-PREFIX-001",
    "title": "Bounded managed block referrers retain the exact Direct Files document-order prefix and result accounting",
    "family": "managed-query-parity",
