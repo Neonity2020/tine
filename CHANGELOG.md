@@ -72,6 +72,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Managed Storage stopped accepting work at 4,096 lifetime-distinct page
+  names, and at 4,096 lifetime blocks a save could report success and then
+  leave the store permanently unable to open. Four internal fixed-capacity
+  limits on run-local identity indexes were removed; the indexes now simply
+  grow with the graph's lifetime history (internal A4, Harvest sweep).
 - **LaTeX math now renders inside italic and other emphasized Markdown.** A
   whole agent response can be italic without turning valid `$…$` or `$$…$$`
   fragments back into literal dollar text. The shared parser now preserves

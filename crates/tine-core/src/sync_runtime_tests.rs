@@ -28432,16 +28432,15 @@ fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equi
 }
 
 // ---------------------------------------------------------------------------
-// Harvest A4 — run-local identity-index capacity at the real application
-// boundary (REPRO ONLY, no fix). See
-// `crates/tine-core/src/oplog/hot_engine_integration_tests.rs` for the
-// engine-level half and `RECEIPT.md` for the findings.
-//
-// The engine holds four run-local, never-released identity maps, each capped
-// at 4_096 entries and each rebuilt from zero by replaying accepted history at
-// every open: page names (A4's subject), portable paths, block claims and
-// Logseq claims. Nothing in the product releases an entry, so their occupancy
-// is a monotone function of the graph's POST-ACTIVATION lifetime.
+// Harvest A4 — run-local identity indexes at the real application boundary.
+// These are observational RECEIPTS (release-only, env-bounded, `#[ignore]`d),
+// written for the repro phase and kept as probes. The capacity they originally
+// demonstrated was REMOVED by the A4 fix (see A4-fix-dossier.md and
+// RECEIPT-repro.md): the four run-local identity maps (page names, portable
+// paths, block claims, Logseq claims) now simply grow with lifetime-distinct
+// identities, bounded by archive rebaselining (SPEC-A A5 decision block). The
+// fast guards for the fixed behavior live in
+// `crates/tine-core/src/oplog/hot_engine_integration_tests.rs`.
 // ---------------------------------------------------------------------------
 
 /// Q1/Q2 at the application boundary: create new pages through the ordinary

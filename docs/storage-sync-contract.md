@@ -1039,6 +1039,18 @@ ambiguous baseline claims remain unresolved after reconstruction.
    `graph_text_admission_unavailable` rather than reading a value another thread
    is free to advance. That is an internal precondition, not a threat-model
    refusal, and no in-scope scenario reaches it once the static order holds.
+10. The hot engine's four run-local identity indexes (page names, portable
+   paths, block claims, Logseq claims) have NO fixed capacity and never refuse
+   for occupancy. They grow with lifetime-DISTINCT identities (a rename
+   retains the released old key; deletion frees nothing) and are rebuilt from
+   accepted history at every open; the stated bound on that growth is archive
+   rebaselining (SPEC-A A5 decision record). The removed 4,096-entry caps
+   named no in-scope scenario and were a permanent wedge across reopen — the
+   block-claim member refused only at acceptance, after the drain had
+   published the manifest, turning a reported save into a permanently
+   unopenable store. Guarded by
+   `a4_run_local_identity_indexes_have_no_fixed_capacity` and the `a4_*`
+   past-capacity tests (`hot_engine_integration_tests.rs`).
 
 ### 3.1 Refusal scenarios
 
