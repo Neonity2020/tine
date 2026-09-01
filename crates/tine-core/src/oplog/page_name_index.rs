@@ -379,7 +379,8 @@ pub(crate) struct PageNamePublicationCandidateV1 {
 ///
 /// The fields stay private so callers cannot manufacture an exact-title
 /// selection without reading it through an ownership root (or the bounded
-/// no-store test authority).
+/// run-local ephemeral index that mirrors it, which is live production state —
+/// see `the_ephemeral_page_name_index_is_live_production_state`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedPageNameExactStateV1 {
     canonical_key: PageNameKeyDigest,
@@ -970,7 +971,7 @@ pub(crate) fn prepare_ephemeral_page_name_transition(
         .count();
     if state.records.len().saturating_add(additions) > MAX_EPHEMERAL_PAGE_NAME_RECORDS {
         return Err(PageNameTransitionError::MalformedBatch(
-            "no-store page-name test index reached its fixed capacity",
+            "run-local page-name index reached its fixed capacity",
         ));
     }
     let ephemeral = if candidate.conflicts.is_empty() {
@@ -1431,4 +1432,40 @@ fn require_version(store: &'static str, found: u32, current: u32) -> Result<(), 
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::projection_producer_census::{call_count, production_rust};
+
+    /// `EphemeralPageNameOwnershipStateV1` was described here as a "no-store
+    /// page-name test index" and a "no-store test authority". It is neither:
+    /// `ShardedHotEngine` holds one unconditionally and every accepted batch
+    /// prepares and commits into it, so a reader who believed the old wording
+    /// would have read a live capacity refusal as harness noise. "Ephemeral"
+    /// means run-local rather than store-backed; it does not mean test-only.
+    #[test]
+    fn the_ephemeral_page_name_index_is_live_production_state() {
+        let production = production_rust();
+        assert!(
+            call_count(production, "prepare_ephemeral_page_name_transition") > 0,
+            "the ephemeral page-name transition has no production caller any more. If it \
+             really became test-only, say so here; until then this index is production \
+             state and must not be documented as a test harness (invariant I-11)."
+        );
+
+        let source = include_str!("page_name_index.rs");
+        let production_prefix = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+        for wording in ["test index", "test authority", "test harness"] {
+            assert!(
+                !production_prefix.contains(wording),
+                "this file describes its own live run-local state as a {wording:?}. It is \
+                 reached from every accepted batch; call it run-local or ephemeral, not a \
+                 test (invariant I-11: code does not lie about itself)."
+            );
+        }
+    }
 }
