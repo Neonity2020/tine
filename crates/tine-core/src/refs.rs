@@ -1,6 +1,20 @@
-//! Reference extraction from block text: `[[page]]`, `#tag` (and `#[[multi
-//! word]]`), and `((block-uuid))`. Used for the backlink index and queries.
-//! UTF-8 safe (advances by char boundaries).
+//! Page-name identity, reference REWRITING, and the code/org fence machinery
+//! the rewriting needs. UTF-8 safe (advances by char boundaries).
+//!
+//! This file does NOT extract references. It said it did until 2026-09, long
+//! after the hand-rolled `page_refs`/`block_refs`/`block_ref_ids`/
+//! `references_page` were deleted as a dead second copy (see the note above
+//! `block_id`); OG-faithful extraction lives in lsdoc's `render::block_refs`,
+//! reaches `doc.rs`'s `projection()`, and is what every query and backlink
+//! reads. A stale header here is not cosmetic — it is what sends the next
+//! change to the wrong file, which is exactly how that second copy came to
+//! exist. `this_module_does_not_extract_references` keeps the boundary.
+//!
+//! What IS here: the one page-name fold ([`page_key`], [`normalize`],
+//! [`same_page`]), the reference-source exclusions, the rename rewriters
+//! ([`rename_refs`], [`rename_tags_property`] and their multi/format
+//! variants), [`block_id`], and the bracket-link/block-ref readers shared with
+//! `publish.rs`.
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -756,4 +770,34 @@ mod tests {
             "tags:: New\n```\ntags:: Old\n```\n"
         );
     }
+
+    /// The module doc above claims this file rewrites references but does not
+    /// extract them. The extractors it once held were a dead second copy that
+    /// only tests called, and their removal is the reason the boundary exists:
+    /// a reader who believes the old header edits reference behaviour here and
+    /// changes nothing a user can see.
+    #[test]
+    fn this_module_does_not_extract_references() {
+        let source = include_str!("refs.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+        for extractor in [
+            "fn page_refs(",
+            "fn block_refs(",
+            "fn block_ref_ids(",
+            "fn references_page(",
+        ] {
+            assert!(
+                !production.contains(extractor),
+                "refs.rs defines {extractor} again. Reference extraction belongs to \
+                 lsdoc's render::block_refs, consumed through doc.rs's projection(); a \
+                 copy here is a second answer to one question that no query reads \
+                 (invariants I-11, I-12). If this really moved back, rewrite the module \
+                 doc in the same change."
+            );
+        }
+    }
+
 }
