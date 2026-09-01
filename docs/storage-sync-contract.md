@@ -997,8 +997,14 @@ ambiguous baseline claims remain unresolved after reconstruction.
    heartbeat, while native diagnostics emit ordered, content-free completion
    boundaries for baseline authentication, receipt precheck, graph and endpoint
    open, object-store validation, committed-tail replay, projection open,
-   indexes/sweeps, journal open/drain, terminal projection repair, and completion
-   flush. These observations confer no authority.
+   indexes/sweeps, journal open, own-endpoint retirement scan,
+   absence-decision-map open, journal drain, terminal projection repair, and
+   completion flush, followed by one content-free work-counter record
+   (`SyncRuntimeCleanOpenCounters`) attributing that open's counted work —
+   batches replayed, receipt evidence names and content reads, full-catalog
+   passes, summary and local-completion chain reads, and archive
+   inspections. Every counter is produced after the work it describes; no open
+   decision reads one. These observations confer no authority.
 4. Authoritative bytes are append-only or atomically replaced under an exact
    observed-generation/lease check. A cache cannot authorize oplog mutation or
    Markdown overwrite.
@@ -1033,6 +1039,18 @@ ambiguous baseline claims remain unresolved after reconstruction.
    `graph_text_admission_unavailable` rather than reading a value another thread
    is free to advance. That is an internal precondition, not a threat-model
    refusal, and no in-scope scenario reaches it once the static order holds.
+10. The hot engine's four run-local identity indexes (page names, portable
+   paths, block claims, Logseq claims) have NO fixed capacity and never refuse
+   for occupancy. They grow with lifetime-DISTINCT identities (a rename
+   retains the released old key; deletion frees nothing) and are rebuilt from
+   accepted history at every open; the stated bound on that growth is archive
+   rebaselining (SPEC-A A5 decision record). The removed 4,096-entry caps
+   named no in-scope scenario and were a permanent wedge across reopen — the
+   block-claim member refused only at acceptance, after the drain had
+   published the manifest, turning a reported save into a permanently
+   unopenable store. Guarded by
+   `a4_run_local_identity_indexes_have_no_fixed_capacity` and the `a4_*`
+   past-capacity tests (`hot_engine_integration_tests.rs`).
 
 ### 3.1 Refusal scenarios
 

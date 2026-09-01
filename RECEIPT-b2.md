@@ -1,5 +1,7 @@
 # Harvest B2 — N-page convergent Direct move
 
+Preserved as `RECEIPT-b2.md` by the cumulative Wave 1 integration merge.
+
 Branch `batch/harvest-b2`, on top of B1 (`5a590368`). Five commits:
 
 | SHA | What |

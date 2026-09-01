@@ -6464,3 +6464,389 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
         .unwrap()
         .is_empty());
 }
+// ---------------------------------------------------------------------------
+// Harvest A4 — run-local identity indexes have NO fixed capacity (FIXED).
+//
+// Four run-local identity maps (page names, portable paths, block claims,
+// Logseq claims) were introduced with a shared fixed capacity of 4,096 and
+// refused when full. The budgets counted lifetime-DISTINCT identities with no
+// removal path, so the refusal was permanent across reopen (I-10), and the
+// block-claim member refused only at ACCEPTANCE — after the drain had
+// published the manifest — turning a reported save into a permanently
+// unopenable store. No refusal in the family ever named an in-scope threat
+// scenario (I-8), so the fix REMOVED all four caps; the maps grow with
+// lifetime-distinct identities, bounded by archive rebaselining (SPEC-A A5
+// decision block). See A4-fix-dossier.md and RECEIPT-repro.md.
+//
+// The tests below guard the FIXED behavior by driving every path past the
+// removed capacity value.
+// ---------------------------------------------------------------------------
+
+/// The removed caps' shared value. Tests drive past it so any reintroduced
+/// fixed capacity at or below this scale fails them.
+const A4_REMOVED_CAP: usize = 4_096;
+
+#[test]
+fn a4_run_local_identity_indexes_have_no_fixed_capacity() {
+    let index_source = include_str!("page_name_index.rs");
+    let engine_source = include_str!("hot_engine.rs");
+    for (name, source) in [
+        ("page_name_index.rs", index_source),
+        ("hot_engine.rs", engine_source),
+    ] {
+        assert!(
+            !source.contains("MAX_EPHEMERAL"),
+            "{name} reintroduced a run-local identity capacity. Run-local identity \
+             indexes must not refuse at a fixed capacity: such a refusal names no \
+             in-scope threat scenario (I-8) and is permanent across reopen because \
+             replay refills the maps to identical occupancy (I-10). See \
+             specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md."
+        );
+        assert!(
+            !source.contains("reached its fixed capacity"),
+            "{name} reintroduced a fixed-capacity refusal (I-8/I-10; see \
+             A4-fix-dossier.md)"
+        );
+    }
+    // There is exactly one page-name transition access implementation, so the
+    // guards above cover the ONLY page-name index Tine has.
+    assert_eq!(
+        index_source
+            .matches("impl PageNameTransitionAccess for")
+            .count(),
+        1,
+        "a second page-name transition access would change what these guards cover"
+    );
+}
+
+fn a4_page_id(index: usize) -> PageId {
+    PageId::from_uuid(uuid(0xa4_0000_0000 + index as u128))
+}
+
+fn a4_home_id(index: usize) -> DocumentId {
+    DocumentId::from_uuid(uuid(0xa4_4000_0000 + index as u128))
+}
+
+fn a4_create_pages(
+    engine: &ShardedHotEngine,
+    batch: u128,
+    range: std::ops::Range<usize>,
+) -> Result<PreparedBatch, EngineError> {
+    engine.prepare_fixture_transaction(
+        author(batch, batch as u64),
+        &tx(range
+            .map(|index| SemanticOperation::CreatePage {
+                page_id: a4_page_id(index),
+                home_document_id: a4_home_id(index),
+                name: crate::oplog::LogicalPageName::parse(&format!("A4 Page {index}")).unwrap(),
+                path: path(&format!("pages/a4-{index}.md")),
+                kind: ManagedTextKind::Page,
+            })
+            .collect()),
+    )
+}
+
+/// Accept `count` distinct page names in chunks and return the number of
+/// accepted batches.
+fn a4_seed_names(
+    engine: &mut ShardedHotEngine,
+    archive: &ObjectStore,
+    batch_base: u128,
+    count: usize,
+    chunk: usize,
+) -> usize {
+    let mut accepted = 0;
+    let mut index = 0;
+    while index < count {
+        let end = (index + chunk).min(count);
+        let prepared = a4_create_pages(engine, batch_base + accepted as u128, index..end)
+            .unwrap_or_else(|error| panic!("seeding names {index}..{end} refused: {error:?}"));
+        let disposition = engine.stage_ready(ready(archive, &prepared)).disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "seeding names {index}..{end} was not accepted: {disposition:?}"
+        );
+        accepted += 1;
+        index = end;
+    }
+    accepted
+}
+
+/// Past the removed cap, every page-level operation keeps working: create,
+/// same-path rename (page-name index only), delete, and rename back. Before
+/// the fix, all of these were refused at 4,096 lifetime-distinct names with
+/// no removal path (see RECEIPT-repro.md).
+#[test]
+#[ignore = "harvest A4 guard: seeds 4,096 real page names (~15s debug)"]
+fn a4_page_operations_continue_past_the_removed_cap() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-cap-wedge");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+
+    let seeded_batches = a4_seed_names(&mut engine, &archive, 0xa4_0000, A4_REMOVED_CAP, 256);
+    eprintln!("a4_cap seeded_names={A4_REMOVED_CAP} seeded_batches={seeded_batches}");
+    assert!(paged_fatal_evidence(&engine).is_none());
+
+    // The 4,097th lifetime-distinct page must draft AND be accepted; this
+    // consumes both a page-name and a portable-path record past the old caps.
+    let past_cap = a4_create_pages(&engine, 0xa4_9000, A4_REMOVED_CAP..A4_REMOVED_CAP + 1)
+        .expect("the 4,097th distinct page must draft (I-8/I-10, A4-fix-dossier.md)");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &past_cap)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Same-path rename to a brand-new NAME touches ONLY the page-name index.
+    let isolated = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9500, 0xa4_9500),
+            &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![crate::oplog::PageRename {
+                    page_id: a4_page_id(0),
+                    new_name: crate::oplog::LogicalPageName::parse("A4 Isolated New Name").unwrap(),
+                    new_path: path("pages/a4-0.md"),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }]),
+        )
+        .expect("a same-path rename past the removed page-name cap must draft");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &isolated)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Block-level work keeps working too.
+    let block_edit = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9001, 0xa4_9001),
+            &tx(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: crate::oplog::BlockId::from_uuid(uuid(0xa4_8000)),
+                    home_document_id: a4_home_id(0),
+                },
+                page_id: a4_page_id(0),
+                parent: None,
+                order: "a".into(),
+                content: "past-cap block write".into(),
+            }]),
+        )
+        .expect("block-only work drafts past the removed caps");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &block_edit)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Deleting a page works (the removed portable-path check used to charge
+    // the batch's whole changed set and refused even deletes).
+    let delete = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9002, 0xa4_9002),
+            &tx(vec![SemanticOperation::DeletePage {
+                page_id: a4_page_id(1),
+            }]),
+        )
+        .expect("deleting a page past the removed caps must draft");
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &delete)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // Renaming back to an already-held name works.
+    let rename_back = engine
+        .prepare_fixture_transaction(
+            author(0xa4_9003, 0xa4_9003),
+            &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![crate::oplog::PageRename {
+                    page_id: a4_page_id(0),
+                    new_name: crate::oplog::LogicalPageName::parse("A4 Page 0").unwrap(),
+                    new_path: path("pages/a4-0.md"),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }]),
+        )
+        .expect("renaming back past the removed caps must draft");
+    assert!(matches!(
+        engine
+            .stage_ready(ready(&archive, &rename_back))
+            .disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(paged_fatal_evidence(&engine).is_none());
+}
+
+/// Reopen behavior past the removed cap: replaying the accepted tail into a
+/// fresh engine succeeds, post-reopen page work succeeds, and a peer-authored
+/// new name is ACCEPTED by a receiver whose indexes are past the old cap
+/// (before the fix the peer batch was rejected — a sync/portability hazard).
+#[test]
+#[ignore = "harvest A4 guard: seeds 4,097 real page names twice (~30s debug)"]
+fn a4_reopen_replays_past_the_removed_cap_and_accepts_peer_names() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-cap-reopen");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+    a4_seed_names(&mut engine, &archive, 0xa4_0000, A4_REMOVED_CAP + 1, 256);
+
+    // Reopen: replay every committed manifest into a fresh sequence-zero
+    // engine, exactly as `replay_clean_committed_tail` does at open.
+    let mut replay = ids.engine();
+    let manifests = archive.committed_manifests().unwrap();
+    let mut replayed = 0;
+    for manifest in &manifests {
+        let disposition = replay
+            .stage_from_store(&archive, manifest.batch_id())
+            .unwrap()
+            .disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "replay of {} was not accepted: {disposition:?}",
+            manifest.batch_id()
+        );
+        replayed += 1;
+    }
+    eprintln!(
+        "a4_reopen replayed_batches={replayed} manifests={}",
+        manifests.len()
+    );
+    assert!(paged_fatal_evidence(&replay).is_none());
+
+    // Post-reopen page-name work succeeds.
+    let after_reopen = replay
+        .prepare_fixture_transaction(
+            author(0xa4_9100, 0xa4_9100),
+            &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![crate::oplog::PageRename {
+                    page_id: a4_page_id(0),
+                    new_name: crate::oplog::LogicalPageName::parse("A4 Post Reopen Name").unwrap(),
+                    new_path: path("pages/a4-0.md"),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }]),
+        )
+        .expect("post-reopen rename past the removed cap must draft");
+    assert!(matches!(
+        replay
+            .stage_ready(ready(&archive, &after_reopen))
+            .disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // A peer legitimately authors a new name; the receiver must accept it.
+    let peer = ids.engine();
+    let peer_batch = a4_create_pages(&peer, 0xa4_9200, 900_000..900_001)
+        .expect("an empty peer engine can acquire a new page name");
+    let peer_dir = TestDir::new("a4-cap-peer");
+    let peer_archive = ObjectStore::open(&peer_dir.path().join("store"), ids.workspace).unwrap();
+    let delivered = replay
+        .stage_ready(ready(&peer_archive, &peer_batch))
+        .disposition;
+    assert!(
+        matches!(delivered, BatchDisposition::Accepted { .. }),
+        "a receiver past the removed cap must accept a peer-authored name: {delivered:?}"
+    );
+}
+
+/// The block-claim member of the removed family: before the fix it had no
+/// authoring-time pre-check, so its refusal landed at ACCEPTANCE — after the
+/// drain had published the manifest — and the store became permanently
+/// unopenable (`OpenRefused`) from ordinary editing. Past the removed cap,
+/// every batch must be accepted and the index simply grows.
+#[test]
+#[ignore = "harvest A4 guard: creates 8,192 real blocks (~30s debug)"]
+fn a4_block_claims_grow_past_the_removed_cap_through_acceptance() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a4-block-claims");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+    let seed = a4_create_pages(&engine, 0xa4_0000, 0..1).unwrap();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &seed)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    const CHUNK: usize = 256;
+    let target = A4_REMOVED_CAP * 2;
+    let mut made = 0usize;
+    let mut batch = 0xa4_b000u128;
+    while made < target {
+        let prepared = engine
+            .prepare_fixture_transaction(
+                author(batch, batch as u64),
+                &tx((made..made + CHUNK)
+                    .map(|index| SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: crate::oplog::BlockId::from_uuid(uuid(
+                                0xa4_c000_0000 + index as u128,
+                            )),
+                            home_document_id: a4_home_id(0),
+                        },
+                        page_id: a4_page_id(0),
+                        parent: None,
+                        order: format!("{index:08}").into(),
+                        content: format!("a4 block {index}"),
+                    })
+                    .collect()),
+            )
+            .expect("block creation past the removed cap must draft");
+        let disposition = engine.stage_ready(ready(&archive, &prepared)).disposition;
+        assert!(
+            matches!(disposition, BatchDisposition::Accepted { .. }),
+            "block batch at {made} lifetime blocks was not accepted \
+             (I-8/I-10, A4-fix-dossier.md): {disposition:?}"
+        );
+        made += CHUNK;
+        batch += 1;
+    }
+    assert_eq!(
+        engine.instrumentation().block_claim_hot_entries,
+        target,
+        "the run-local block-claim index simply grows with lifetime blocks"
+    );
+}
+
+/// What the run-local page-name index costs on the WAITED OPEN PATH
+/// (measurement, unchanged by the fix): `replay_clean_committed_tail` reruns
+/// every committed manifest through `validate_and_apply` at every open, and
+/// each replayed batch refills the identity indexes. Cost is proportional to
+/// lifetime accepted history (I-14); the stated bound is archive rebaselining
+/// (SPEC-A A5 decision block).
+#[test]
+#[ignore = "harvest A4 measurement: seeds and replays up to 4,096 page names"]
+fn a4_measure_committed_tail_replay_cost_by_lifetime_page_names() {
+    for names in [512usize, 1_024, 2_048, A4_REMOVED_CAP] {
+        let ids = Ids::new();
+        let dir = TestDir::new("a4-replay-cost");
+        let archive = store(&dir, ids);
+        let mut engine = ids.engine();
+        let seed_started = std::time::Instant::now();
+        let batches = a4_seed_names(&mut engine, &archive, 0xa4_0000, names, 256);
+        let seed_ms = seed_started.elapsed().as_secs_f64() * 1000.0;
+
+        let manifests = archive.committed_manifests().unwrap();
+        let mut replay = ids.engine();
+        let replay_started = std::time::Instant::now();
+        for manifest in &manifests {
+            let disposition = replay
+                .stage_from_store(&archive, manifest.batch_id())
+                .unwrap()
+                .disposition;
+            assert!(
+                matches!(disposition, BatchDisposition::Accepted { .. }),
+                "replay of {} was not accepted: {disposition:?}",
+                manifest.batch_id()
+            );
+        }
+        let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "a4_replay names={names} batches={batches} manifests={} seed_ms={seed_ms:.1} \
+             replay_ms={replay_ms:.1} replay_ms_per_name={:.3} block_claim_entries={}",
+            manifests.len(),
+            replay_ms / names as f64,
+            replay.instrumentation().block_claim_hot_entries
+        );
+    }
+}

@@ -52,6 +52,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Managed-storage startup diagnostics now say which stage did the work, and
+  how much.** `TINE_DEBUG=1` already printed a per-stage timing line for a
+  managed cold open, but a slow stage could not be attributed to a mechanism.
+  The open now also emits one content-free work-counter record — batches
+  replayed, receipt evidence names and content reads, full-catalog passes,
+  summary and own-completion chain reads, archive inspections — and splits the
+  old journal-drain boundary into own-endpoint retirement scan and
+  absence-decision-map open. Diagnostics only: nothing in the open path reads a
+  counter, and no user-visible behavior changes.
+
 - **Settings remembers whether you maximized it.** The maximize control added in v0.6.95 reset on every open, so anyone who prefers the wide dialog had to press it again each time. Settings now opens at the size you last left it, on this device, across restarts. If you have never pressed the control, nothing changes ([GH #427](https://github.com/martinkoutecky/tine/issues/427)).
 
 - **PDF rendering now uses PDF.js's maintained page-view lifecycle under one
@@ -64,6 +74,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Managed Storage stopped accepting work at 4,096 lifetime-distinct page
+  names, and at 4,096 lifetime blocks a save could report success and then
+  leave the store permanently unable to open. Four internal fixed-capacity
+  limits on run-local identity indexes were removed; the indexes now simply
+  grow with the graph's lifetime history (internal A4, Harvest sweep).
 - **LaTeX math now renders inside italic and other emphasized Markdown.** A
   whole agent response can be italic without turning valid `$…$` or `$$…$$`
   fragments back into literal dollar text. The shared parser now preserves

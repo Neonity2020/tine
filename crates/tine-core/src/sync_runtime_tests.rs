@@ -8628,11 +8628,18 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
 
     let mut phases = Vec::new();
     let mut recovery_stages = Vec::new();
+    let mut open_counters = None;
     let opened =
         SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
             match progress {
                 SyncRuntimeOpenProgress::Phase { phase, .. } => phases.push(phase),
                 SyncRuntimeOpenProgress::RecoveryStage { stage, .. } => recovery_stages.push(stage),
+                SyncRuntimeOpenProgress::CleanOpenCounters { counters } => {
+                    assert!(
+                        open_counters.replace(counters).is_none(),
+                        "clean open reports its work counters exactly once"
+                    );
+                }
                 SyncRuntimeOpenProgress::Waiting { .. }
                 | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
             }
@@ -8660,11 +8667,22 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
             SyncRuntimeCleanOpenStage::ProjectionOpen,
             SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
             SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
+            SyncRuntimeCleanOpenStage::OwnEndpointRetirementScan,
+            SyncRuntimeCleanOpenStage::AbsenceDecisionMapOpen,
             SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
             SyncRuntimeCleanOpenStage::TerminalProjectionRepair,
             SyncRuntimeCleanOpenStage::CompletionFlush,
         ],
         "clean cold-open diagnostics must identify every bounded recovery boundary"
+    );
+    // The counters exist so a stage time can be attributed to a mechanism.
+    // Instrumentation that is never emitted attributes nothing, so the
+    // emission itself is the architectural fact this asserts.
+    let open_counters = open_counters.expect("a clean cold open reports its work counters");
+    assert!(
+        open_counters.archive_directory_enumerations > 0,
+        "the counters must describe work this open actually performed, not a default value: \
+{open_counters:?}"
     );
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -22133,6 +22151,162 @@ fn managed_twenty_page_history_curve_manual_benchmark() {
     ));
 }
 
+/// Reproduce the managed crash-reopen aging curve and attribute it to a stage.
+///
+/// The graph stays exactly 20 pages; only accepted history grows, so every
+/// difference between checkpoints is lifetime cost (I-14). One process
+/// invocation walks all checkpoints so per-stage SHARES and growth factors are
+/// comparable even on a machine running other work; absolute milliseconds
+/// across separate runs are not.
+///
+/// `TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS` (default `50,400,800`) sets the
+/// accepted-batch checkpoints. Output lines are prefixed `attribution*` and
+/// are machine-readable for `scripts/harvest-a1-open-attribution.mjs`.
+#[test]
+#[ignore = "manual release benchmark: per-stage attribution of the managed crash-reopen curve"]
+fn managed_open_stage_attribution_manual_benchmark() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib managed_open_stage_attribution_manual_benchmark -- --ignored --nocapture"
+    );
+    let checkpoints = std::env::var("TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS")
+        .unwrap_or_else(|_| "50,400,800".to_owned())
+        .split(',')
+        .filter_map(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    assert!(
+        !checkpoints.is_empty() && checkpoints.windows(2).all(|pair| pair[0] < pair[1]),
+        "checkpoints must be a strictly increasing non-empty list"
+    );
+
+    // nested_unicode contributes exactly three page files; add seventeen more
+    // so graph size stays fixed while only accepted history grows.
+    let fixture = ActivationFixture::scaled("managed-open-attribution-20", 0xa0e8, 17);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let mut handle = activated.handle.expect("20-page graph activates");
+    drive_initial_feed(&handle);
+
+    let pages = match handle.application_page_inventory().unwrap() {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+        other => panic!("managed page inventory did not load: {other:?}"),
+    };
+    assert_eq!(pages.len(), 20, "fixture must remain exactly 20 pages");
+    let mut editable = pages
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .filter(|path| !load_application_exact(&handle, path).0.blocks.is_empty())
+        .collect::<Vec<_>>();
+    editable.sort();
+    assert!(!editable.is_empty(), "20-page fixture has no editable page");
+
+    let mut accepted_rounds = 0_usize;
+    for checkpoint in checkpoints {
+        while accepted_rounds < checkpoint {
+            let path = &editable[accepted_rounds % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("open attribution edit {accepted_rounds}"),
+            );
+            drain_managed_local(&handle);
+            accepted_rounds += 1;
+        }
+
+        // One undrained frame, then a crash: this is the reopen the debt audit
+        // measured, not a clean shutdown.
+        let pending_path = editable[accepted_rounds % editable.len()].clone();
+        let (page, revision) = load_application_exact(&handle, &pending_path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            &format!("open attribution pending edit {accepted_rounds}"),
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drop(handle);
+
+        let mut stages: Vec<(SyncRuntimeCleanOpenStage, Duration)> = Vec::new();
+        let mut counters = None;
+        let started = Instant::now();
+        let reopened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                match progress {
+                    SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed } => {
+                        stages.push((stage, elapsed));
+                    }
+                    SyncRuntimeOpenProgress::CleanOpenCounters { counters: reported } => {
+                        counters = Some(reported);
+                    }
+                    SyncRuntimeOpenProgress::Phase { .. }
+                    | SyncRuntimeOpenProgress::Waiting { .. }
+                    | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
+                }
+            });
+        let reopen_ms = startup_ms(started.elapsed());
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        handle = reopened.handle.expect("the aged managed history reopens");
+        let (page, _) = load_application_exact(&handle, &pending_path);
+        assert_eq!(
+            page.blocks[0].raw,
+            format!("open attribution pending edit {accepted_rounds}"),
+            "the undrained frame must survive the crash reopen"
+        );
+        // The pending frame drained during the reopen just measured.
+        accepted_rounds += 1;
+
+        let counters = counters.expect("a clean crash reopen reports its work counters");
+        let recovery_ms = stages
+            .last()
+            .map_or(0.0, |(_, elapsed)| startup_ms(*elapsed));
+        eprintln!(
+            "attribution checkpoint={checkpoint} reopen_ms={reopen_ms:.3} clean_recovery_ms={recovery_ms:.3} stages={}",
+            stages.len()
+        );
+        let mut previous = Duration::ZERO;
+        for (stage, elapsed) in &stages {
+            eprintln!(
+                "attribution_stage checkpoint={checkpoint} stage={} stage_ms={:.3} cumulative_ms={:.3}",
+                stage.diagnostic_name(),
+                startup_ms(elapsed.saturating_sub(previous)),
+                startup_ms(*elapsed),
+            );
+            previous = *elapsed;
+        }
+        eprintln!(
+            "attribution_counters checkpoint={checkpoint} accepted_batches={} committed_tail_replayed={} sweep_chains={} receipt_evidence_names={} receipt_content_reads={} receipt_full_catalog_passes={} summary_content_reads={} summary_rebuilt={} summary_delta_completions={} summary_delta_intents={} local_completion_names={} local_completion_content_reads={} local_completion_rebuilt={} local_completion_entries={} retired_own_intent_probes={} retired_own_receipt_artifacts={} archive_directory_enumerations={} archive_manifest_reads={} archive_object_reads={} archive_inspected_manifests={} archive_inspected_objects={}",
+            counters.accepted_batches,
+            counters.committed_tail_replayed,
+            counters.sweep_chains,
+            counters.receipt_evidence_names,
+            counters.receipt_content_reads,
+            counters.receipt_full_catalog_passes,
+            counters.summary_content_reads,
+            counters.summary_rebuilt,
+            counters.summary_delta_completions,
+            counters.summary_delta_intents,
+            counters.local_completion_names,
+            counters.local_completion_content_reads,
+            counters.local_completion_rebuilt,
+            counters.local_completion_entries,
+            counters.retired_own_intent_probes,
+            counters.retired_own_receipt_artifacts,
+            counters.archive_directory_enumerations,
+            counters.archive_manifest_reads,
+            counters.archive_object_reads,
+            counters.archive_inspected_manifests,
+            counters.archive_inspected_objects,
+        );
+    }
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
 const MANAGED_CRASH_REOPEN_GATE_ROUNDS: usize = 800;
 const MANAGED_CRASH_REOPEN_BUDGET_SECONDS: u64 = 5;
 
@@ -28255,4 +28429,304 @@ fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equi
                  across Graph, authoritative oplog replay, SQLite, and restart"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Harvest A4 — run-local identity indexes at the real application boundary.
+// These are observational RECEIPTS (release-only, env-bounded, `#[ignore]`d),
+// written for the repro phase and kept as probes. The capacity they originally
+// demonstrated was REMOVED by the A4 fix (see A4-fix-dossier.md and
+// RECEIPT-repro.md): the four run-local identity maps (page names, portable
+// paths, block claims, Logseq claims) now simply grow with lifetime-distinct
+// identities, bounded by archive rebaselining (SPEC-A A5 decision block). The
+// fast guards for the fixed behavior live in
+// `crates/tine-core/src/oplog/hot_engine_integration_tests.rs`.
+// ---------------------------------------------------------------------------
+
+/// Q1/Q2 at the application boundary: create new pages through the ordinary
+/// managed application save path until the run-local budget refuses, then
+/// reopen and observe whether the refusal survives.
+///
+/// `TINE_A4_MAX_PAGES` (default 4_400) bounds the loop.
+#[test]
+#[ignore = "harvest A4 repro: thousands of real application page creations (release only)"]
+fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib a4_repro_managed_page_creation_wedges_at_the_run_local_budget -- --ignored --nocapture"
+    );
+    let limit = std::env::var("TINE_A4_MAX_PAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4_400);
+    let fixture = ActivationFixture::nested_unicode("a4-page-budget", 0xa4f1);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("A4 budget fixture activates");
+    drive_initial_feed(&handle);
+
+    let started = Instant::now();
+    let mut created = 0usize;
+    let mut refusal = None;
+    while created < limit {
+        let name = format!("A4 Budget Page {created}");
+        let blocks = vec![BlockDto {
+            id: format!("temporary-a4-{created}"),
+            raw: format!("a4 budget block {created}"),
+            ..BlockDto::default()
+        }];
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: name.clone(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(&name, SyncPageKind::Page, None, blocks),
+        });
+        match outcome {
+            Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {
+                created += 1;
+                drain_managed_local(&handle);
+            }
+            other => {
+                refusal = Some(format!("{other:?}"));
+                break;
+            }
+        }
+    }
+    eprintln!(
+        "a4_budget created_pages={created} elapsed_ms={:.1} refusal={refusal:?}",
+        startup_ms(started.elapsed())
+    );
+    let status = handle.status().unwrap();
+    eprintln!("a4_budget status_after_refusal={status:?}");
+
+    // Reopen and report whether the store still opens and whether the refusal
+    // survived the restart. This is the I-10 question: is the state permanent?
+    drop(handle);
+    let mut stages: Vec<(SyncRuntimeCleanOpenStage, Duration)> = Vec::new();
+    let mut counters = None;
+    let reopen_started = Instant::now();
+    let reopened =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            match progress {
+                SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed } => {
+                    stages.push((stage, elapsed));
+                }
+                SyncRuntimeOpenProgress::CleanOpenCounters { counters: reported } => {
+                    counters = Some(reported);
+                }
+                SyncRuntimeOpenProgress::Phase { .. }
+                | SyncRuntimeOpenProgress::Waiting { .. }
+                | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {}
+            }
+        });
+    eprintln!(
+        "a4_budget reopen_ms={:.1} reopen_status={:?}",
+        startup_ms(reopen_started.elapsed()),
+        reopened.status
+    );
+    let mut previous = Duration::ZERO;
+    for (stage, elapsed) in &stages {
+        eprintln!(
+            "a4_budget_stage stage={} stage_ms={:.3} cumulative_ms={:.3}",
+            stage.diagnostic_name(),
+            startup_ms(elapsed.saturating_sub(previous)),
+            startup_ms(*elapsed),
+        );
+        previous = *elapsed;
+    }
+    if let Some(counters) = counters {
+        eprintln!(
+            "a4_budget_counters created_pages={created} accepted_batches={} committed_tail_replayed={} archive_manifest_reads={} archive_object_reads={}",
+            counters.accepted_batches,
+            counters.committed_tail_replayed,
+            counters.archive_manifest_reads,
+            counters.archive_object_reads,
+        );
+    }
+    let Some(reopened) = reopened.handle else {
+        panic!("A4 budget store no longer opens: {:?}", reopened.status);
+    };
+    let name = format!("A4 Budget Page {created}");
+    let after_reopen = reopened.save_application_page(SyncApplicationPageSaveRequest {
+        target: SyncApplicationPageSaveTarget::New {
+            name: name.clone(),
+            page_kind: SyncPageKind::Page,
+        },
+        page: new_application_page(
+            &name,
+            SyncPageKind::Page,
+            None,
+            vec![BlockDto {
+                id: "temporary-a4-after-reopen".into(),
+                raw: "a4 post-reopen block".into(),
+                ..BlockDto::default()
+            }],
+        ),
+    });
+    eprintln!("a4_budget after_reopen_save={after_reopen:?}");
+}
+
+/// Q3 — import reachability. Activate a synthetic graph that is larger than
+/// every run-local index cap and record whether activation succeeds and
+/// whether the store reopens afterwards.
+///
+/// The fixture is SYNTHETIC (generated below); no real graph is read.
+/// `TINE_A4_IMPORT_PAGES` (default 5_000) sets the page count.
+#[test]
+#[ignore = "harvest A4 repro: activates a synthetic >4,096-page graph (release only)"]
+fn a4_repro_import_of_a_graph_larger_than_every_run_local_cap() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib a4_repro_import_of_a_graph_larger_than_every_run_local_cap -- --ignored --nocapture"
+    );
+    let pages = std::env::var("TINE_A4_IMPORT_PAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5_000);
+    let fixture = ActivationFixture::empty("a4-large-import", 0xa4f2);
+    for page in 0..pages {
+        let directory = fixture.graph_root.join(format!("notes/a4/{}", page % 32));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!("A4-Import-{page}.md")),
+            format!("title:: A4 Import {page}\n\n- a4 import block {page}\n"),
+        )
+        .unwrap();
+    }
+    let started = Instant::now();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    eprintln!(
+        "a4_import pages={pages} activation_ms={:.1} status={:?}",
+        startup_ms(started.elapsed()),
+        activated.status
+    );
+    let Some(handle) = activated.handle else {
+        eprintln!("a4_import activation produced no handle");
+        return;
+    };
+    drive_initial_feed(&handle);
+    let inventory = handle.application_page_inventory().unwrap();
+    let imported = match &inventory {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages.len(),
+        other => panic!("a4 import inventory did not load: {other:?}"),
+    };
+    eprintln!("a4_import imported_pages={imported}");
+
+    // One ordinary post-import page creation: does a >4,096-page graph still
+    // accept new work, or is the run-local budget already exhausted?
+    let save = handle.save_application_page(SyncApplicationPageSaveRequest {
+        target: SyncApplicationPageSaveTarget::New {
+            name: "A4 Import Post Page".into(),
+            page_kind: SyncPageKind::Page,
+        },
+        page: new_application_page(
+            "A4 Import Post Page",
+            SyncPageKind::Page,
+            None,
+            vec![BlockDto {
+                id: "temporary-a4-import-post".into(),
+                raw: "a4 post-import block".into(),
+                ..BlockDto::default()
+            }],
+        ),
+    });
+    eprintln!("a4_import post_import_save={save:?}");
+    if matches!(save, Ok(SyncApplicationPageSaveOutcome::Saved { .. })) {
+        drain_managed_local(&handle);
+    }
+
+    // Reopen: does replaying the accepted tail over a >4,096-page graph
+    // succeed, or does the run-local refill refuse and strand the store?
+    drop(handle);
+    let reopen_started = Instant::now();
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    eprintln!(
+        "a4_import reopen_ms={:.1} reopen_status={:?}",
+        startup_ms(reopen_started.elapsed()),
+        reopened.status
+    );
+}
+
+/// The decisive data-safety probe for the A4 cap family: reach the run-local
+/// BLOCK-claim budget through ordinary application saves and observe what the
+/// store does afterwards.
+///
+/// The block-claim cap is the only member of the family with no
+/// authoring-time pre-check, so its refusal necessarily lands at acceptance —
+/// after `local_journal_drain` has already published the manifest. This test
+/// records, at the real application boundary, whether the save is refused,
+/// whether the graph keeps working, and whether the store still opens.
+#[test]
+#[ignore = "harvest A4 repro: creates >4,096 real blocks through the app (release only)"]
+fn a4_repro_managed_block_budget_and_what_it_does_to_the_next_open() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this receipt is release-only; run cargo test -p tine-core --release --lib a4_repro_managed_block_budget_and_what_it_does_to_the_next_open -- --ignored --nocapture"
+    );
+    let fixture = ActivationFixture::nested_unicode("a4-block-budget", 0xa4f3);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("A4 block-budget fixture activates");
+    drive_initial_feed(&handle);
+
+    const PER_PAGE: usize = 500;
+    let mut blocks_written = 0usize;
+    let mut refusal = None;
+    for page in 0..12usize {
+        let name = format!("A4 Block Budget Page {page}");
+        let blocks: Vec<BlockDto> = (0..PER_PAGE)
+            .map(|index| BlockDto {
+                id: format!("temporary-a4b-{page}-{index}"),
+                raw: format!("a4 block budget {page}-{index}"),
+                ..BlockDto::default()
+            })
+            .collect();
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: name.clone(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(&name, SyncPageKind::Page, None, blocks),
+        });
+        match outcome {
+            Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {
+                blocks_written += PER_PAGE;
+                let mut drained = false;
+                for _ in 0..4096 {
+                    let status = handle.status().unwrap();
+                    if status.managed_local_pending == 0 {
+                        drained = true;
+                        break;
+                    }
+                    handle.tick().unwrap();
+                }
+                let status = handle.status().unwrap();
+                eprintln!(
+                    "a4_blocks page={page} blocks={blocks_written} drained={drained} pending={} status={status:?}",
+                    status.managed_local_pending
+                );
+                if !drained {
+                    refusal = Some(format!("drain never settled: {status:?}"));
+                    break;
+                }
+            }
+            other => {
+                refusal = Some(format!("{other:?}"));
+                eprintln!("a4_blocks page={page} blocks={blocks_written} refusal={other:?}");
+                break;
+            }
+        }
+    }
+    eprintln!("a4_blocks final_blocks={blocks_written} refusal={refusal:?}");
+    eprintln!("a4_blocks status_before_reopen={:?}", handle.status());
+
+    drop(handle);
+    let reopen_started = Instant::now();
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    eprintln!(
+        "a4_blocks reopen_ms={:.1} reopen_status={:?}",
+        startup_ms(reopen_started.elapsed()),
+        reopened.status
+    );
 }

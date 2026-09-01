@@ -28,8 +28,10 @@ use super::lazy_genesis::{
     LazyGenesisProviderIndexV1,
 };
 #[cfg(test)]
-use super::local_completion_index::{LocalCompletionFlushStats, LocalCompletionOpenStats};
-use super::local_completion_index::{LocalCompletionIndex, LocalCompletionPruningContext};
+use super::local_completion_index::LocalCompletionFlushStats;
+use super::local_completion_index::{
+    LocalCompletionIndex, LocalCompletionOpenStats, LocalCompletionPruningContext,
+};
 use super::page_name_index::{
     extract_authoritative_catalog_page_names, extract_semantic_page_name_observations,
     extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
@@ -41,7 +43,6 @@ use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
 };
 use super::receiver_absence_summary::ReceiverAbsenceSummary;
-#[cfg(test)]
 use super::receiver_absence_summary::ReceiverAbsenceSummaryOpenStats;
 use super::reference_catalog::ReferenceCatalogPolicyV1;
 #[cfg(test)]
@@ -102,9 +103,6 @@ const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 14;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
 pub(crate) const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 9;
 pub(crate) const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 8;
-pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
-const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
-const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 
 /// Test-only, per-thread attribution for the ordinary trusted-local authoring
 /// path.  This is deliberately an observation receipt, not engine state: it
@@ -4047,7 +4045,6 @@ struct HistoryWorkStats {
     block_claim_validation_nanos: usize,
     block_claim_lookup_nanos: usize,
     block_claim_encode_nanos: usize,
-    block_claim_insert_nanos: usize,
 }
 
 /// Opt-in causal accounting for managed activation replay. Test builds keep
@@ -4229,7 +4226,6 @@ pub struct EngineInstrumentation {
     pub block_claim_validation_nanos: usize,
     pub block_claim_lookup_nanos: usize,
     pub block_claim_encode_nanos: usize,
-    pub block_claim_insert_nanos: usize,
     pub store: super::ObjectStoreStats,
 }
 
@@ -6269,7 +6265,9 @@ pub struct ShardedHotEngine {
     /// Derived receiver half, retained only so post-open completions can append
     /// an install-after-receipt summary generation.
     receiver_absence_summary: RefCell<Option<ReceiverAbsenceSummary>>,
-    #[cfg(test)]
+    /// Permanent, content-free attribution for the last absence-decision-map
+    /// open. Managed cold open reports it as part of its stage counters; it
+    /// records how the summary was reached and never decides anything.
     receiver_absence_summary_open_stats: RefCell<Option<ReceiverAbsenceSummaryOpenStats>>,
     /// Disposable per-open merge of receiver receipt history with the local
     /// completion half. Durable truth remains in those two stores.
@@ -6496,7 +6494,6 @@ impl ShardedHotEngine {
             archive_store: None,
             local_completion_index: None,
             receiver_absence_summary: RefCell::new(None),
-            #[cfg(test)]
             receiver_absence_summary_open_stats: RefCell::new(None),
             absence_decision_map: RefCell::new(None),
             deferred_absence_observations: RefCell::new(BTreeSet::new()),
@@ -7572,16 +7569,23 @@ impl ShardedHotEngine {
         let mut map = if let Some(store) = self.archive_store.as_deref() {
             let opened = ReceiverAbsenceSummary::open(store, receipts)
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
-            #[cfg(test)]
-            {
-                *self.receiver_absence_summary_open_stats.borrow_mut() = Some(opened.stats.clone());
-            }
+            *self.receiver_absence_summary_open_stats.borrow_mut() = Some(opened.stats.clone());
             *self.receiver_absence_summary.borrow_mut() = opened.cache;
             opened.map
         } else {
             let catalog = receipts
                 .validated_catalog()
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            *self.receiver_absence_summary_open_stats.borrow_mut() =
+                Some(ReceiverAbsenceSummaryOpenStats {
+                    receipt_content_reads: catalog
+                        .iter()
+                        .map(|row| usize::from(row.completion.is_some()) + 1)
+                        .sum(),
+                    full_catalog_passes: 1,
+                    rebuilt: true,
+                    ..ReceiverAbsenceSummaryOpenStats::default()
+                });
             let mut map = AbsenceDecisionMap::default();
             for entry in catalog {
                 if entry.completion.is_some() {
@@ -7712,11 +7716,33 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    /// The last absence-decision-map open's attribution, if one has run.
+    pub(crate) fn receiver_absence_summary_open_stats(
+        &self,
+    ) -> Option<ReceiverAbsenceSummaryOpenStats> {
+        self.receiver_absence_summary_open_stats.borrow().clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn receiver_absence_summary_open_stats_for_test(
         &self,
     ) -> Option<ReceiverAbsenceSummaryOpenStats> {
-        self.receiver_absence_summary_open_stats.borrow().clone()
+        self.receiver_absence_summary_open_stats()
+    }
+
+    /// The device-local own-endpoint completion chain's open attribution.
+    pub(crate) fn local_completion_open_stats(&self) -> Option<LocalCompletionOpenStats> {
+        self.local_completion_index
+            .as_ref()
+            .map(|index| index.open_stats().clone())
+    }
+
+    /// How many own-endpoint completion entries the local chain currently
+    /// retains. Counted, never used as a decision input.
+    pub(crate) fn local_completion_entry_count(&self) -> usize {
+        self.local_completion_index
+            .as_ref()
+            .map_or(0, LocalCompletionIndex::completed_entry_count)
     }
 
     pub(crate) fn local_completed_projection_intent_ids(&self) -> BTreeSet<ProjectionIntentId> {
@@ -7818,9 +7844,7 @@ impl ShardedHotEngine {
 
     #[cfg(test)]
     pub(crate) fn local_completion_open_stats_for_test(&self) -> Option<LocalCompletionOpenStats> {
-        self.local_completion_index
-            .as_ref()
-            .map(|index| index.open_stats().clone())
+        self.local_completion_open_stats()
     }
 
     #[cfg(test)]
@@ -8280,7 +8304,6 @@ impl ShardedHotEngine {
             block_claim_validation_nanos: work.block_claim_validation_nanos,
             block_claim_lookup_nanos: work.block_claim_lookup_nanos,
             block_claim_encode_nanos: work.block_claim_encode_nanos,
-            block_claim_insert_nanos: work.block_claim_insert_nanos,
             store: self
                 .archive_store
                 .as_ref()
@@ -18798,25 +18821,6 @@ impl ShardedHotEngine {
             return Ok((self.logseq_claim_root, Vec::new()));
         }
 
-        let existing = self
-            .ephemeral_logseq_claims
-            .values()
-            .map(|record| record.introductions.len())
-            .sum::<usize>();
-        let added = additions
-            .iter()
-            .filter(|(uuid, introduction)| {
-                !self
-                    .ephemeral_logseq_claims
-                    .get(uuid)
-                    .is_some_and(|record| record.introductions.binary_search(introduction).is_ok())
-            })
-            .count();
-        if existing.saturating_add(added) > MAX_EPHEMERAL_LOGSEQ_CLAIMS {
-            return Err(EngineError::InvalidTransaction(
-                "run-local Logseq claim index reached its fixed capacity".into(),
-            ));
-        }
         let mut records = self.ephemeral_logseq_claims.clone();
         for (logseq_uuid, introduction) in &additions {
             let record = records
@@ -20167,17 +20171,6 @@ impl ShardedHotEngine {
                 conflicts,
             });
         }
-        if self
-            .ephemeral_portable_paths
-            .len()
-            .saturating_add(self.local_overlay.portable_paths.len())
-            .saturating_add(changed.len())
-            > MAX_EPHEMERAL_PORTABLE_PATHS
-        {
-            return Err(EngineError::InvalidTransaction(
-                "no-store portable-path test index reached its fixed capacity".into(),
-            ));
-        }
         let _ = publish_index;
         let root = semantic_portable_path_root_after_changes(base_root, &base_records, &changed)?;
         Ok(PortablePathPublicationCandidate {
@@ -21172,23 +21165,6 @@ impl ShardedHotEngine {
         }
         let encode_nanos =
             usize::try_from(encode_started.elapsed().as_nanos()).unwrap_or(usize::MAX);
-        let insert_started = Instant::now();
-        let novel = changed_claims
-            .iter()
-            .filter(|(block_id, _)| {
-                !self
-                    .ephemeral_block_claims
-                    .contains_key(&block_id.as_uuid().as_u128())
-            })
-            .count();
-        if self.ephemeral_block_claims.len().saturating_add(novel) > MAX_EPHEMERAL_BLOCK_CLAIMS {
-            return Err(EngineError::InvalidTransaction(
-                "run-local block-claim index reached its fixed capacity".into(),
-            ));
-        }
-        let insert_nanos =
-            usize::try_from(insert_started.elapsed().as_nanos()).unwrap_or(usize::MAX);
-
         let novel_conflicts: Vec<_> = changed_claims
             .iter()
             .filter_map(|(block_id, claims)| {
@@ -21222,7 +21198,6 @@ impl ShardedHotEngine {
         );
         work.block_claim_lookup_nanos = work.block_claim_lookup_nanos.saturating_add(lookup_nanos);
         work.block_claim_encode_nanos = work.block_claim_encode_nanos.saturating_add(encode_nanos);
-        work.block_claim_insert_nanos = work.block_claim_insert_nanos.saturating_add(insert_nanos);
         self.history_work.set(work);
         let ephemeral_block_claims = changed_claims
             .into_iter()
@@ -27487,7 +27462,11 @@ mod validation_tests {
     }
 
     #[test]
-    fn no_store_block_claim_capacity_rejects_before_candidate_mutation() {
+    fn block_claim_index_grows_past_any_fixed_capacity() {
+        // Guard for the A4 fix: run-local identity indexes must never refuse
+        // at a capacity (I-8: a refusal with no in-scope threat scenario is an
+        // availability bug; I-10: the refusal was permanent across reopen).
+        // See specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md.
         let catalog = DocumentId::from_uuid(Uuid::from_u128(115_001));
         let mut engine = ShardedHotEngine::new(
             WorkspaceId::from_uuid(Uuid::from_u128(115_000)),
@@ -27495,7 +27474,7 @@ mod validation_tests {
             catalog,
         );
         let retained_home = DocumentId::from_uuid(Uuid::from_u128(115_002));
-        for key in 0..MAX_EPHEMERAL_BLOCK_CLAIMS {
+        for key in 0..4_096usize {
             engine.ephemeral_block_claims.insert(
                 key as u128,
                 BTreeSet::from([ImmutableHomeClaim::new(
@@ -27504,9 +27483,6 @@ mod validation_tests {
                 )]),
             );
         }
-        let before_claims = engine.ephemeral_block_claims.clone();
-        let before_fatal_evidence = engine.fatal_evidence.clone();
-        let before_fatal_handle = engine.fatal_handle;
         let block_id = BlockId::from_uuid(Uuid::from_u128(115_010));
         let home = DocumentId::from_uuid(Uuid::from_u128(115_011));
         let effect = SemanticEffect::new(
@@ -27525,24 +27501,28 @@ mod validation_tests {
             Vec::new(),
         )
         .unwrap();
-        let result = engine.validate_and_prepare_semantic_roles_and_block_homes(
-            BatchId::from_uuid(Uuid::from_u128(115_012)),
-            BatchCausalDot::new(
-                CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(115_013))),
-                1,
+        let candidate = engine
+            .validate_and_prepare_semantic_roles_and_block_homes(
+                BatchId::from_uuid(Uuid::from_u128(115_012)),
+                BatchCausalDot::new(
+                    CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(115_013))),
+                    1,
+                )
+                .unwrap(),
+                &[],
+                &effect,
             )
-            .unwrap(),
-            &[],
-            &effect,
+            .expect(
+                "a 4,097th lifetime block claim must validate: run-local identity \
+                 indexes have no fixed capacity (I-8/I-10, A4-fix-dossier.md)",
+            );
+        assert!(
+            candidate
+                .ephemeral_block_claims
+                .iter()
+                .any(|(key, _)| *key == block_id.as_uuid().as_u128()),
+            "the candidate must carry the new claim for insertion"
         );
-        assert!(matches!(
-            result,
-            Err(EngineError::InvalidTransaction(message))
-                if message.contains("fixed capacity")
-        ));
-        assert_eq!(engine.ephemeral_block_claims, before_claims);
-        assert_eq!(engine.fatal_evidence, before_fatal_evidence);
-        assert_eq!(engine.fatal_handle, before_fatal_handle);
     }
 
     #[test]
@@ -30040,6 +30020,199 @@ mod validation_tests {
         assert!(source.contains("verify_checkpoints: false"));
         assert!(source.contains("new_verifying(catalog_document_id"));
     }
+
+    // -----------------------------------------------------------------
+    // Harvest A4 — what actually consumes a run-local page-name record.
+    //
+    // CHARACTERIZATION: these assert the CURRENT behavior of the capped,
+    // removal-free `EphemeralPageNameOwnershipStateV1::records` map. They
+    // are the cheap half of the A4 repro (the cap itself is reached in
+    // `oplog::hot_engine_integration_tests`, ignored because it is slow).
+    // -----------------------------------------------------------------
+    fn a4_stage(
+        engine: &mut ShardedHotEngine,
+        author: AuthorBatch,
+        operations: Vec<SemanticOperation>,
+    ) {
+        let prepared = engine
+            .prepare_fixture_transaction(author, &OperationTransaction::new(operations).unwrap())
+            .expect("A4 count-semantics transaction drafts");
+        let outcome = engine.stage_ready(ValidatedBatch::new(prepared));
+        assert!(
+            matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+            "A4 count-semantics transaction was not accepted: {:?}",
+            outcome.disposition()
+        );
+    }
+
+    #[test]
+    fn a4_page_name_records_count_distinct_names_and_are_never_released() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0xa4_1000));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0xa4_1001));
+        let lineage = LineageDigest::of(b"harvest-a4-count-semantics");
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        assert_eq!(engine.ephemeral_page_names.record_count(), 0);
+
+        // (a) Distinct names: one record per distinct canonical name key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1010, 0xa4_1010),
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1200)),
+                    name: crate::oplog::LogicalPageName::parse("Alpha").unwrap(),
+                    path: ManagedPath::parse("pages/alpha.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1101)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1201)),
+                    name: crate::oplog::LogicalPageName::parse("Beta").unwrap(),
+                    path: ManagedPath::parse("pages/beta.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+            ],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            2,
+            "two distinct page names occupy two records"
+        );
+
+        // (b) A path-only edit is not a name change and consumes nothing.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1011, 0xa4_1011),
+            vec![SemanticOperation::EditPagePath {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                path: ManagedPath::parse("elsewhere/alpha.md").unwrap(),
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 2);
+
+        // (c) A RENAME consumes a SECOND record: the released old key is
+        // retained alongside the newly acquired one. Renaming one page N
+        // times therefore costs N+1 records, not 1.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1012, 0xa4_1012),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha Renamed").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha-renamed.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            3,
+            "a rename retains the released old key AND acquires the new one"
+        );
+
+        // (d) A second rename of the same page costs another record.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1013, 0xa4_1013),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha Again").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha-again.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 4);
+
+        // (e) Renaming BACK to an already-seen name reuses its key: the map
+        // is keyed by canonical name, so the cost is lifetime-DISTINCT names.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1014, 0xa4_1014),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            4,
+            "returning to a previously used name reuses its existing record"
+        );
+
+        // (f) DELETION frees nothing: the tombstoned page's name record stays.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1015, 0xa4_1015),
+            vec![SemanticOperation::DeletePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1101)),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            4,
+            "deleting a page releases no page-name record"
+        );
+
+        // (g) A brand-new page reusing the deleted page's name reuses the key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1016, 0xa4_1016),
+            vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1102)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1202)),
+                name: crate::oplog::LogicalPageName::parse("Beta").unwrap(),
+                path: ManagedPath::parse("pages/beta-2.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 4);
+
+        // (h) Case-folding twins share one canonical key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1017, 0xa4_1017),
+            vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1103)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1203)),
+                name: crate::oplog::LogicalPageName::parse("Gamma").unwrap(),
+                path: ManagedPath::parse("pages/gamma.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 5);
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1018, 0xa4_1018),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1103)),
+                    new_name: crate::oplog::LogicalPageName::parse("GAMMA").unwrap(),
+                    new_path: ManagedPath::parse("pages/GAMMA.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            5,
+            "a case-only rename stays inside the same canonical key"
+        );
+
+        // (i) Block-only work never touches the page-name index.
+        assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
+    }
 }
 
 #[cfg(test)]
@@ -30293,7 +30466,7 @@ mod replay_benchmark {
             .saturating_add(replay_timing.checkpoint_blob_append_nanos)
             .saturating_add(replay_timing.checkpoint_whole_digest_nanos);
         eprintln!(
-            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_insert_ms={:.3} claim_hot_entries={} owned_semantic_snapshot_entries={}",
+            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_hot_entries={} owned_semantic_snapshot_entries={}",
             replay.status().accepted_batch_ids().unwrap().len(),
             elapsed.as_secs_f64() * 1_000.0,
             inspection_elapsed.as_secs_f64() * 1_000.0,
@@ -30302,7 +30475,6 @@ mod replay_benchmark {
             instrumentation.block_claim_validation_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_lookup_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_encode_nanos as f64 / 1_000_000.0,
-            instrumentation.block_claim_insert_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_hot_entries,
             owned_semantic_snapshot_entries(),
         );

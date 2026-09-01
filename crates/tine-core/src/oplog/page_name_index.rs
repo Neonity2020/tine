@@ -24,7 +24,6 @@ pub const PAGE_NAME_CONFLICT_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PAGE_NAME_POINT_BATCH: usize = 100_000;
 pub const MAX_PAGE_NAME_CONFLICT_PARTICIPANTS: usize = 100_000;
 pub const MAX_PAGE_NAME_CONFLICT_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_EPHEMERAL_PAGE_NAME_RECORDS: usize = 4_096;
 
 const MAX_EXACT_NAME_BLOB_BYTES: u64 = 4 * 1024 * 1024 + 1024;
 const MAX_INLINE_EXACT_NAME_BYTES: usize = 64 * 1024;
@@ -964,16 +963,6 @@ pub(crate) fn prepare_ephemeral_page_name_transition(
         contains,
         frontier_for_batch,
     )?;
-    let additions = candidate
-        .changed
-        .keys()
-        .filter(|key| !state.records.contains_key(key))
-        .count();
-    if state.records.len().saturating_add(additions) > MAX_EPHEMERAL_PAGE_NAME_RECORDS {
-        return Err(PageNameTransitionError::MalformedBatch(
-            "run-local page-name index reached its fixed capacity",
-        ));
-    }
     let ephemeral = if candidate.conflicts.is_empty() {
         let staged = access.staged_exact_names.into_inner();
         let required_exact_names = candidate
