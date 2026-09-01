@@ -603,14 +603,78 @@ pub fn retire_if_terminal(store_root: &Path, graph_root: &Path, move_id: &str) -
     else {
         return false;
     };
-    match recover_one(&store, graph_root, &record) {
-        RecordOutcome::AlreadyComplete => store.retire(&record.move_id).is_ok(),
-        RecordOutcome::Quarantined { reason } => {
-            let _ = store.quarantine(&record, &reason);
+    // Classify ONLY. `recover_one` writes, and calling it here would force a move
+    // forward whose source save is sitting behind a live conflict banner — which
+    // is precisely the decision that belongs to the user, not to a cleanup call.
+    match classify(&store, graph_root, &record) {
+        Err(outcome) => {
+            if let RecordOutcome::Quarantined { reason } = &outcome {
+                let _ = store.quarantine(&record, reason);
+            }
             false
         }
-        _ => false,
+        Ok(states) => {
+            let terminal = states
+                .iter()
+                .all(|(_, state, _, _)| *state == ParticipantState::Completed);
+            terminal && store.retire(&record.move_id).is_ok()
+        }
     }
+}
+
+/// Read every participant's current bytes and place it against the two recorded
+/// images. `Err` is an outcome that needs no further decision (a divergence, or
+/// an unreadable image); `Ok` hands back the states for the caller to act on.
+type ParticipantStates<'a> = Vec<(
+    &'a MoveParticipant,
+    ParticipantState,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+)>;
+
+fn classify<'a>(
+    store: &RecoveryStore,
+    graph_root: &Path,
+    record: &'a DirectMoveRecord,
+) -> Result<ParticipantStates<'a>, RecordOutcome> {
+    let mut states: ParticipantStates<'a> = Vec::with_capacity(record.participants.len());
+    for participant in &record.participants {
+        let preimage = store
+            .image_bytes(&participant.preimage)
+            .map_err(|error| RecordOutcome::Failed { error: error.to_string() })?;
+        let postimage = store
+            .image_bytes(&participant.postimage)
+            .map_err(|error| RecordOutcome::Failed { error: error.to_string() })?;
+        let path = graph_root.join(
+            participant
+                .relative_path
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
+        let current = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(RecordOutcome::Failed { error: error.to_string() }),
+        };
+        let state = if current.as_deref() == postimage.as_deref() {
+            ParticipantState::Completed
+        } else if current.as_deref() == preimage.as_deref() {
+            ParticipantState::Pending
+        } else {
+            // Deliberately does NOT name the page: this reason is retained in
+            // app-private state and echoed into the always-on diagnostic record.
+            return Err(RecordOutcome::Quarantined {
+                reason: format!(
+                    "a {} page's bytes match neither the recorded preimage nor the recorded postimage",
+                    match participant.role {
+                        ParticipantRole::Destination => "destination",
+                        ParticipantRole::Source => "source",
+                    }
+                ),
+            });
+        };
+        states.push((participant, state, preimage, postimage));
+    }
+    Ok(states)
 }
 
 fn recover_one(
@@ -618,48 +682,10 @@ fn recover_one(
     graph_root: &Path,
     record: &DirectMoveRecord,
 ) -> RecordOutcome {
-    let mut states = Vec::with_capacity(record.participants.len());
-    for participant in &record.participants {
-        let preimage = match store.image_bytes(&participant.preimage) {
-            Ok(bytes) => bytes,
-            Err(error) => return RecordOutcome::Failed { error: error.to_string() },
-        };
-        let postimage = match store.image_bytes(&participant.postimage) {
-            Ok(bytes) => bytes,
-            Err(error) => return RecordOutcome::Failed { error: error.to_string() },
-        };
-        let path = graph_root.join(participant.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let current = match fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return RecordOutcome::Failed { error: error.to_string() },
-        };
-        let state = if current.as_deref() == postimage.as_deref() {
-            ParticipantState::Completed
-        } else if current.as_deref() == preimage.as_deref() {
-            ParticipantState::Pending
-        } else {
-            ParticipantState::Diverged
-        };
-        states.push((participant, state, preimage, postimage));
-    }
-
-    if let Some((participant, _, _, _)) = states
-        .iter()
-        .find(|(_, state, _, _)| *state == ParticipantState::Diverged)
-    {
-        // Deliberately does NOT name the page: this reason is retained in
-        // app-private state and echoed into the always-on diagnostic record.
-        return RecordOutcome::Quarantined {
-            reason: format!(
-                "a {} page's bytes match neither the recorded preimage nor the recorded postimage",
-                match participant.role {
-                    ParticipantRole::Destination => "destination",
-                    ParticipantRole::Source => "source",
-                }
-            ),
-        };
-    }
+    let states = match classify(store, graph_root, record) {
+        Ok(states) => states,
+        Err(outcome) => return outcome,
+    };
 
     if states
         .iter()
@@ -697,8 +723,11 @@ fn recover_one(
             (false, ParticipantState::Completed) => preimage,
             _ => continue,
         };
-        let path =
-            graph_root.join(participant.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let path = graph_root.join(
+            participant
+                .relative_path
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
         if let Err(error) = apply_image(&path, target.as_deref()) {
             return RecordOutcome::Failed { error: error.to_string() };
         }
@@ -788,3 +817,7 @@ pub fn unix_millis_now() -> u64 {
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "direct_move_recovery_tests.rs"]
+mod tests;
