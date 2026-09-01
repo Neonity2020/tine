@@ -1,0 +1,312 @@
+//! App-private durable retention for unresolved live-save conflicts.
+//!
+//! Harvest B3 names this protocol because the retained editor draft exists
+//! nowhere in the graph. Its graph-keyed v1 envelope is atomically replaced or
+//! retired through the same durability primitive as other audited native state.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use tauri::Manager;
+
+const ENVELOPE_VERSION: u64 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConflictCapsuleEnvelope {
+    version: u64,
+    capsules: Vec<Value>,
+}
+
+fn graph_key(root: &Path) -> String {
+    let text = root.to_string_lossy();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("graph")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+    format!("{name}-{hash:016x}")
+}
+
+fn capsule_path(app_data: &Path, root: &Path) -> PathBuf {
+    app_data
+        .join("conflict-capsules")
+        .join(format!("{}.v1.json", graph_key(root)))
+}
+
+static CONFLICT_CAPSULE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn capsule_page_name(capsule: &Value) -> Result<&str, String> {
+    let source = capsule
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or("conflict capsule requires a source")?;
+    if source != "live-save" {
+        return Err("conflict capsule source must be live-save".into());
+    }
+    capsule
+        .get("page_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "conflict capsule requires a page_name".into())
+}
+
+fn reclaim_torn_temps(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err("conflict capsule has no parent directory".into());
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err("conflict capsule name is not UTF-8".into());
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let prefix = format!(".{name}.");
+    let mut reclaimed = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.starts_with(&prefix) && file_name.ends_with(".tmp") {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => reclaimed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    if reclaimed {
+        tine_core::model::sync_dir_for_rename(parent).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn load_unlocked(path: &Path) -> Result<Vec<Value>, String> {
+    reclaim_torn_temps(path)?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let envelope: ConflictCapsuleEnvelope =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if envelope.version != ENVELOPE_VERSION {
+        return Err(format!(
+            "unsupported conflict capsule version {}",
+            envelope.version
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    for capsule in &envelope.capsules {
+        let name = capsule_page_name(capsule)?;
+        if !names.insert(name.to_owned()) {
+            return Err(format!("duplicate conflict capsule for {name}"));
+        }
+    }
+    Ok(envelope.capsules)
+}
+
+fn load_at(path: &Path) -> Result<Vec<Value>, String> {
+    let _guard = CONFLICT_CAPSULE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_unlocked(path)
+}
+
+fn write_unlocked(path: &Path, capsules: Vec<Value>) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("conflict capsule has no parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&ConflictCapsuleEnvelope {
+        version: ENVELOPE_VERSION,
+        capsules,
+    })
+    .map_err(|error| error.to_string())?;
+    // Named audited B3 conflict-capsule publication protocol (I-1/I-2):
+    // unique create-new temp, complete file barrier, atomic replacement,
+    // failed-temp cleanup, and strict directory-barrier error reporting.
+    tine_core::model::atomic_write(path, &bytes).map_err(|error| error.to_string())
+}
+
+fn upsert_at(path: &Path, capsule: Value) -> Result<(), String> {
+    let page_name = capsule_page_name(&capsule)?.to_owned();
+    let _guard = CONFLICT_CAPSULE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut capsules = load_unlocked(path)?;
+    if let Some(existing) = capsules
+        .iter_mut()
+        .find(|existing| capsule_page_name(existing).ok() == Some(page_name.as_str()))
+    {
+        *existing = capsule;
+    } else {
+        capsules.push(capsule);
+    }
+    write_unlocked(path, capsules)
+}
+
+fn retire_at(path: &Path, page_name: &str) -> Result<(), String> {
+    let _guard = CONFLICT_CAPSULE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut capsules = load_unlocked(path)?;
+    let prior = capsules.len();
+    capsules.retain(|capsule| capsule_page_name(capsule).ok() != Some(page_name));
+    if capsules.len() == prior {
+        return Ok(());
+    }
+    if !capsules.is_empty() {
+        return write_unlocked(path, capsules);
+    }
+    let parent = path
+        .parent()
+        .ok_or("conflict capsule has no parent directory")?;
+    match std::fs::remove_file(path) {
+        Ok(()) => tine_core::model::sync_dir_for_rename(parent).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn app_capsule_path(app: &tauri::AppHandle, root: &str) -> Result<PathBuf, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    Ok(capsule_path(&app_data, Path::new(root)))
+}
+
+#[tauri::command]
+pub(crate) fn load_conflict_capsules(
+    root: String,
+    app: tauri::AppHandle,
+) -> Result<Vec<Value>, String> {
+    load_at(&app_capsule_path(&app, &root)?)
+}
+
+#[tauri::command]
+pub(crate) fn store_conflict_capsule(
+    root: String,
+    capsule: Value,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    upsert_at(&app_capsule_path(&app, &root)?, capsule)
+}
+
+#[tauri::command]
+pub(crate) fn retire_conflict_capsule(
+    root: String,
+    page_name: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    retire_at(&app_capsule_path(&app, &root)?, &page_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capsule(page: &str, draft: &str) -> Value {
+        serde_json::json!({
+            "id": format!("live:{page}"),
+            "source": "live-save",
+            "page_name": page,
+            "page_path": format!("pages/{page}.md"),
+            "kind": "page",
+            "sides": [],
+            "live": {
+                "page": { "name": page, "blocks": [{ "raw": draft }] },
+                "base_rev": "base",
+                "conflict_epoch": 7,
+                "draft_version": 1
+            }
+        })
+    }
+
+    #[test]
+    fn native_channel_publishes_the_exact_retained_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = capsule_path(temp.path(), Path::new("/graphs/alpha"));
+        upsert_at(&path, capsule("Note", "exact retained bytes")).unwrap();
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(bytes.contains("exact retained bytes"));
+        assert_eq!(load_at(&path).unwrap()[0]["page_name"], "Note");
+    }
+
+    #[test]
+    fn torn_temp_is_ignored_and_reclaimed_without_inventing_a_capsule() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = capsule_path(temp.path(), Path::new("/graphs/alpha"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let torn = path.parent().unwrap().join(format!(
+            ".{}.999.1.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&torn, b"{\"version\":1,\"capsules\":[").unwrap();
+        assert!(load_at(&path).unwrap().is_empty());
+        assert!(!torn.exists());
+    }
+
+    #[test]
+    fn torn_replacement_keeps_the_previous_complete_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = capsule_path(temp.path(), Path::new("/graphs/alpha"));
+        upsert_at(&path, capsule("Note", "previous")).unwrap();
+        let torn = path.parent().unwrap().join(format!(
+            ".{}.999.2.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&torn, b"replacement not complete").unwrap();
+        assert_eq!(
+            load_at(&path).unwrap()[0]["live"]["page"]["blocks"][0]["raw"],
+            "previous"
+        );
+        assert!(!torn.exists());
+    }
+
+    #[test]
+    fn replacement_and_retirement_reopen_as_complete_transitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = capsule_path(temp.path(), Path::new("/graphs/alpha"));
+        upsert_at(&path, capsule("One", "first")).unwrap();
+        upsert_at(&path, capsule("Two", "second")).unwrap();
+        upsert_at(&path, capsule("One", "replacement")).unwrap();
+        let reopened = load_at(&path).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert!(reopened
+            .iter()
+            .any(|value| value["live"]["page"]["blocks"][0]["raw"] == "replacement"));
+        retire_at(&path, "One").unwrap();
+        let reopened = load_at(&path).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0]["page_name"], "Two");
+    }
+
+    #[test]
+    fn retiring_the_last_capsule_durably_removes_the_graph_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = capsule_path(temp.path(), Path::new("/graphs/alpha"));
+        upsert_at(&path, capsule("Note", "draft")).unwrap();
+        retire_at(&path, "Note").unwrap();
+        assert!(!path.exists());
+        assert!(load_at(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn graph_keys_separate_same_named_roots_and_match_the_session_shape() {
+        assert_ne!(
+            graph_key(Path::new("/one/graph")),
+            graph_key(Path::new("/two/graph"))
+        );
+        assert!(graph_key(Path::new("/one/my graph")).starts_with("my_graph-"));
+    }
+}

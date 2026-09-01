@@ -1,0 +1,1086 @@
+> vitest run && vitest run --config vitest.render.config.ts && node scripts/test-deploy-profile.mjs
+ RUN  v3.2.7 /aux/koutecky/logseq/tine-agent-worktrees/batch-harvest-b3
+ ✓ src/persistenceConflictRetry.test.ts (10 tests) 361ms
+ ✓ src/router.mobile-history.test.ts (4 tests) 1213ms
+   ✓ mobile History API bridge > does not touch browser history on desktop  883ms
+ ✓ src/sheet/queryHydration.test.ts (8 tests) 324ms
+ ✓ src/clipboard.payload.test.ts (5 tests) 379ms
+   ✓ clipboard payload builder > rejects a forest over 10,000 blocks  342ms
+ ✓ src/pages.inventory.test.ts (5 tests) 1634ms
+   ✓ GH #229 complete page-name inventory > keeps All Pages physical-only while physical spelling wins its reference-only fold  895ms
+ ✓ src/androidBack.test.ts (11 tests) 272ms
+ ✓ src/plugins/manager.test.ts (13 tests) 277ms
+ ✓ src/sheet/mutations.test.ts (61 tests) 288ms
+ ✓ src/themes/themeCheckerCli.test.ts (5 tests) 1678ms
+   ✓ theme port provenance (GH #410) > keeps the published schema, the checker and the app on one vocabulary  666ms
+   ✓ theme port provenance (GH #410) > never certifies a port record the app would refuse to install  721ms
+ ✓ src/plugins/startup.test.ts (13 tests) 316ms
+ ✓ src/activationNeighbors.test.ts (9 tests) 172ms
+ ✓ src/editorController.contract.test.ts (1 test) 112ms
+ ✓ src/clipboard.guard.test.ts (3 tests) 1412ms
+   ✓ clipboard writer facade guard > has no application clipboard transport calls outside the facade/definitions/mocks  1399ms
+ ✓ src/update.test.ts (21 tests) 259ms
+ ✓ src/editor/templateVars.test.ts (5 tests) 140ms
+ ✓ src/render/facets.test.ts (7 tests) 129ms
+ ✓ src/clipboard.paste.test.ts (54 tests) 1764ms
+   ✓ F3 batched loaded identity collision receipt > does one loaded-document pass for 200+ preserved-ID paste candidates  585ms
+ ✓ src/launcherRanking.test.ts (5 tests) 94ms
+ ✓ src/sheet/formula/parser.test.ts (6 tests) 85ms
+ ✓ src/sheet/conversions.test.ts (15 tests) 102ms
+ ✓ src/filedrop.test.ts (5 tests) 98ms
+ ✓ src/sheet/matrix.test.ts (11 tests) 76ms
+ ✓ src/conflictAuthority.guard.test.ts (8 tests) 2196ms
+   ✓ only a backend save refusal may raise a conflict banner > has no markConflict call outside the save-result path  2193ms
+ ✓ src/keybindings.test.ts (36 tests) 226ms
+ ✓ src/instanceReplacement.test.ts (22 tests) 105ms
+ ✓ src/nativeChrome.test.ts (8 tests) 103ms
+ ✓ src/sheet/selection.test.ts (15 tests) 69ms
+ ✓ src/webkitCompat.test.ts (1 test) 69ms
+ ✓ src/sheet/fields.test.ts (19 tests) 80ms
+ ✓ src/homePage.test.ts (4 tests) 65ms
+ ✓ src/assetCache.test.ts (4 tests) 43ms
+ ✓ src/sheet/restructure.test.ts (5 tests) 58ms
+ ✓ src/editor/autocomplete.test.ts (67 tests) 44ms
+ ✓ src/historyParity.test.ts (5 tests) 50ms
+ ✓ src/editingBoundary.regression.test.ts (17 tests) 69ms
+ ✓ src/editor/exportText.test.ts (19 tests) 62ms
+ ✓ src/selectionExpand.test.ts (8 tests) 39ms
+ ✓ src/plugins/registry.test.ts (5 tests) 34ms
+ ✓ src/navModel.contract.test.ts (10 tests) 52ms
+ ✓ src/keybindings.goJournal.test.ts (9 tests) 39ms
+ ✓ src/editor/calc.test.ts (25 tests) 55ms
+ ✓ src/render/hiccup.test.ts (18 tests) 31ms
+ ✓ src/sheet/config.test.ts (16 tests) 41ms
+ ✓ src/outlineScope.nav.test.ts (5 tests) 41ms
+ ✓ src/editor/planning.test.ts (9 tests) 33ms
+ ✓ src/logbook.test.ts (1 test) 24ms
+ ✓ src/sheet/formulaEval.test.ts (3 tests) 38ms
+ ✓ src/sheet/review-regressions.test.ts (3 tests) 34ms
+ ✓ src/devtools/lsdoc-diff/oracle-sync.test.ts (7 tests) 43ms
+ ✓ src/pageExistsBatch.test.ts (10 tests) 31ms
+ ✓ src/safeClose.test.ts (14 tests) 39ms
+ ✓ src/panes.test.ts (46 tests) 32ms
+ ✓ src/pages.test.ts (6 tests) 28ms
+ ✓ src/startupRecovery.test.ts (8 tests) 26ms
+ ✓ src/sheet/formula/eval.test.ts (8 tests) 30ms
+ ✓ src/iosAtomicPublicationContract.test.ts (4 tests) 33ms
+ ✓ src/router.test.ts (29 tests) 30ms
+ ✓ src/editor/queryBuilder.test.ts (36 tests) 20ms
+ ✓ src/favoritesStore.test.ts (18 tests) 12ms
+ ✓ src/paneSelect.test.ts (13 tests) 15ms
+ ✓ src/graphVerification.test.ts (4 tests) 11ms
+ ✓ src/editor/properties.test.ts (29 tests) 12ms
+ ✓ src/workspaces.test.ts (6 tests) 17ms
+ ✓ src/editorActivationWiring.test.ts (8 tests) 13ms
+ ✓ src/session.test.ts (16 tests) 14ms
+ ✓ src/sheet/renameField.test.ts (18 tests) 12ms
+ ✓ src/plugins/guest.test.ts (3 tests) 9ms
+ ✓ src/editor/searchQuery.corpus.test.ts (46 tests) 13ms
+ ✓ src/plugins/revocationFixture.test.ts (3 tests) 13ms
+ ✓ src/favoritesLayout.test.ts (29 tests) 12ms
+ ✓ src/managedStorageRuntime.test.ts (15 tests) 17ms
+ ✓ src/editor/queryBuilder.advanced.test.ts (3 tests) 9ms
+ ✓ src/guide.test.ts (4 tests) 9ms
+ ✓ src/store.test.ts (241 tests) 4192ms
+   ✓ selection move burst history (F2) > keeps 200-root 20-nudge direction--1 bursts visibly immediate but one Undo/Redo unit  1061ms
+   ✓ selection move burst history (F2) > keeps 200-root 20-nudge direction-1 bursts visibly immediate but one Undo/Redo unit  952ms
+ ✓ src/media.test.ts (14 tests) 8ms
+ ✓ src/markers.test.ts (22 tests) 8ms
+ ✓ src/managedDiagnostics.test.ts (15 tests) 13ms
+ ✓ src/devtools/lsdoc-diff/engine.test.ts (15 tests) 12ms
+ ✓ src/sheet/formula/deparse.test.ts (1 test) 9ms
+ ✓ src/clipboard.test.ts (9 tests) 13ms
+ ✓ src/editor/searchQuery.test.ts (14 tests) 10ms
+ ✓ src/journal.test.ts (7 tests) 17ms
+ ✓ src/plugins/runtime.test.ts (1 test) 9ms
+ ✓ src/render/block.test.ts (13 tests) 7ms
+ ✓ src/editor/format.test.ts (34 tests) 8ms
+ ✓ src/editor/codeFence.test.ts (24 tests) 9ms
+ ✓ src/persistenceAppendOutcomeUnknown.test.ts (2 tests) 7ms
+ ✓ src/render/spans.test.ts (15 tests) 8ms
+ ✓ src/mock.test.ts (5 tests) 7ms
+ ✓ src/guideResolve.test.ts (5 tests) 7ms
+ ✓ src/editor/autopair.test.ts (16 tests) 12ms
+ ✓ src/pdfOwnership.test.ts (4 tests) 6ms
+ ✓ src/persistence.test.ts (8 tests) 8ms
+ ✓ src/persistenceMoveBarrier.test.ts (2 tests) 14ms
+ ✓ src/followLink.test.ts (7 tests) 6ms
+ ✓ src/render/emoji.test.ts (9 tests) 6ms
+ ✓ src/components/Sidebar.graphSwitcher.test.ts (10 tests) 13ms
+ ✓ src/backgroundFlush.test.ts (8 tests) 7ms
+ ✓ src/editor/linkDefault.test.ts (5 tests) 8ms
+ ✓ src/mediaCaptureNative.test.ts (2 tests) 7ms
+ ✓ src/editableEmojiFont.test.ts (3 tests) 6ms
+ ✓ src/pageSelect.test.ts (1 test) 6ms
+ ✓ src/sparseV2Boundary.test.ts (4 tests) 7ms
+ ✓ src/pdfRenderCoordinator.test.ts (3 tests) 8ms
+ ✓ src/persistenceDebounceCeiling.test.ts (3 tests) 8ms
+ ✓ src/favoritesArrangementContract.test.ts (12 tests) 6ms
+ ✓ src/styles/pdfToolbarOverflow.test.ts (1 test) 3ms
+ ✓ src/freshnessBarrier.test.ts (2 tests) 8ms
+ ✓ src/editor/annotation.test.ts (9 tests) 7ms
+ ✓ src/components/Namespace.test.ts (6 tests) 12ms
+ ✓ src/plugins/manifest.test.ts (8 tests) 14ms
+ ✓ src/editor/nearestLink.test.ts (11 tests) 5ms
+ ✓ src/editor/repeat.test.ts (11 tests) 11ms
+ ✓ src/graphConfigChange.test.ts (5 tests) 8ms
+ ✓ src/interFont.test.ts (1 test) 6ms
+ ✓ src/themes/manifest.test.ts (6 tests) 9ms
+ ✓ src/queryResultCache.test.ts (4 tests) 6ms
+ ✓ src/router.recent.test.ts (5 tests) 6ms
+ ✓ src/editor/queryAggregate.test.ts (9 tests) 4ms
+ ✓ src/ui.toast.test.ts (1 test) 2ms
+ ✓ src/editor/outline.test.ts (10 tests) 6ms
+ ✓ src/editor/dateExpr.test.ts (7 tests) 6ms
+ ✓ src/zoom.test.ts (5 tests) 6ms
+ ✓ src/plugins/settings.test.ts (4 tests) 4ms
+ ✓ src/startupReveal.test.ts (7 tests) 5ms
+ ✓ src/mobileDrawers.test.ts (5 tests) 4ms
+ ✓ src/sheet/aggregate.test.ts (6 tests) 4ms
+ ✓ src/pdf.test.ts (6 tests) 4ms
+ ✓ src/mediaEditors.test.ts (5 tests) 9ms
+ ✓ src/render/typography.test.ts (10 tests) 4ms
+ ✓ src/navProtocol.test.ts (6 tests) 4ms
+ ✓ src/sheet/formula/encode.test.ts (4 tests) 4ms
+ ✓ src/styles/paneSlack.test.ts (6 tests) 4ms
+ ✓ src/sheet/formula/lexer.test.ts (4 tests) 5ms
+ ✓ src/captureVisibility.test.ts (7 tests) 4ms
+ ✓ src/editor/selectionActions.test.ts (11 tests) 5ms
+ ✓ src/styles/uiChromeSelection.test.ts (6 tests) 10ms
+ ✓ src/editor/marker.test.ts (9 tests) 5ms
+ ✓ src/favoritesIdentity.test.ts (6 tests) 5ms
+ ✓ src/pdfRendererBoundary.test.ts (4 tests) 3ms
+ ✓ src/mobileSafeArea.test.ts (3 tests) 8ms
+ ✓ src/storageBenchPolicy.test.ts (3 tests) 6ms
+ ✓ src/devtools/lsdoc-diff/oracle-artifacts.test.ts (3 tests) 3ms
+ ✓ src/version-code.test.ts (3 tests) 4ms
+ ✓ src/render/htmlSanitizeLocal.test.ts (9 tests) 5ms
+ ✓ src/lsShim.test.ts (3 tests) 4ms
+ ✓ src/sessionActivity.test.ts (5 tests) 4ms
+ ✓ src/workspaceMount.test.ts (1 test) 3ms
+ ✓ src/captureSeed.test.ts (2 tests) 10ms
+ ✓ src/editor/exportHtml.test.ts (2 tests) 3ms
+ ✓ src/pdfjsContract.test.ts (6 tests) 4ms
+ ✓ src/blockId.test.ts (6 tests) 3ms
+ ✓ src/absenceSweeps.test.ts (3 tests) 3ms
+ ✓ src/referenceSectionState.test.ts (4 tests) 4ms
+ ✓ src/sheet/tsv.test.ts (5 tests) 3ms
+ ✓ src/plugins/ownership.test.ts (2 tests) 4ms
+ ✓ src/editor/edn.test.ts (4 tests) 3ms
+ ✓ src/sheet/formulaFields.test.ts (3 tests) 3ms
+ ✓ src/styles/settingsMaximize.test.ts (3 tests) 3ms
+ ✓ src/queryWorkspaceStyle.test.ts (1 test) 3ms
+ ✓ src/warmCache.test.ts (3 tests) 3ms
+ ✓ src/uiStateRegistry.test.ts (2 tests) 3ms
+ ✓ src/components/linkedReferencesFilterContract.test.ts (4 tests) 3ms
+ ✓ src/mockTags.test.ts (3 tests) 3ms
+ ✓ src/editorController.test.ts (4 tests) 3ms
+ ✓ src/pageDeleteTrace.test.ts (1 test) 3ms
+ ✓ src/overscrollStyle.test.ts (2 tests) 3ms
+ ✓ src/editor/exportOpml.test.ts (2 tests) 6ms
+ ✓ src/searchEntry.test.ts (2 tests) 3ms
+ ✓ src/scrollbarStyle.test.ts (3 tests) 3ms
+ ✓ src/tags.test.ts (2 tests) 2ms
+ ✓ src/blockIdentity.test.ts (5 tests) 3ms
+ ✓ src/pageActionsStyle.test.ts (3 tests) 2ms
+ ✓ src/quickCaptureAck.test.ts (2 tests) 2ms
+ ✓ src/styles/mainContentFocus.test.ts (2 tests) 2ms
+ ✓ src/styles/blockSpacing.test.ts (2 tests) 3ms
+ ✓ src/plugins/capabilityBoundary.test.ts (1 test) 3ms
+ ✓ src/systemInsets.test.ts (5 tests) 2ms
+ ✓ src/gpu.test.ts (4 tests) 2ms
+ ✓ src/editor/blockDrag.test.ts (2 tests) 3ms
+ ✓ src/storageTransitionRuntime.test.ts (1 test) 2ms
+ ✓ src/styles/tabBarChrome.test.ts (2 tests) 2ms
+ ✓ src/sheet/typed.test.ts (1 test) 2ms
+ ✓ src/graphStartup.test.ts (1 test) 2ms
+ ✓ src/issue248Probe.test.ts (1 test) 2ms
+ ✓ src/captureStyle.test.ts (1 test) 2ms
+ ✓ src/pdfTileRenderer.test.ts (6 tests) 33ms
+stdout | src/pdfRenderer.test.ts
+Warning: Please use the `legacy` build in Node.js environments.
+ ✓ src/graphOpenTrace.test.ts (3 tests) 13ms
+ ✓ src/pdfRenderer.test.ts (9 tests) 29ms
+ ✓ src/editor/caretRows.test.ts (1 test) 4ms
+ ✓ src/contentWidth.test.ts (3 tests) 6ms
+ ✓ src/systemBars.test.ts (3 tests) 742ms
+   ✓ Android system-bar theme synchronization > sends the resolved startup and toggled appearance to the native host  697ms
+ ✓ src/zoomPlatform.test.ts (2 tests) 11ms
+ ✓ src/systemTheme.test.ts (6 tests) 973ms
+   ✓ System appearance choice (GH #193) > resolves the saved manual preference exactly as before  758ms
+ ✓ src/inpageFind.test.ts (9 tests) 144ms
+ ✓ src/deferredStampMatrix.test.ts (1361 tests) 25486ms
+ Test Files  196 passed (196)
+      Tests  3278 passed (3278)
+   Start at  20:09:40
+   Duration  26.87s (transform 8.53s, setup 0ms, collect 33.51s, tests 47.66s, environment 6.34s, prepare 13.49s)
+ RUN  v3.2.7 /aux/koutecky/logseq/tine-agent-worktrees/batch-harvest-b3
+stdout | src/graph.test.tsx > mobile graph folder picker > opens a picked graph from Tine's iOS Documents container
+[tine/ios] pickGraphFolder → picked
+[tine/ios] loadGraphPath: start
+stdout | src/graph.test.tsx > mobile graph folder picker > opens a picked graph from Tine's iOS Documents container
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > mobile graph folder picker > opens a picked graph from Tine's iOS Documents container
+[tine] frontend graph open: native binding ready at 1 ms
+stdout | src/graph.test.tsx > mobile graph folder picker > opens a picked graph from Tine's iOS Documents container
+[tine] frontend graph open: session restored at 11 ms
+[tine] frontend graph open: interactive at 11 ms
+stdout | src/graph.test.tsx > mobile graph folder picker > opens a picked graph from Tine's iOS Documents container
+[tine/ios] loadGraphPath: done
+stdout | src/graph.test.tsx > mobile graph folder picker > opens the rebased iOS container path after an app update
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > mobile graph folder picker > opens the rebased iOS container path after an app update
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > mobile graph folder picker > opens the rebased iOS container path after an app update
+[tine] frontend graph open: session restored at 2 ms
+[tine] frontend graph open: interactive at 2 ms
+stdout | src/graph.test.tsx > mobile graph folder picker > shows a clear refusal when iOS returns an outside-container folder
+[tine/ios] pickGraphFolder → refused
+stdout | src/graph.test.tsx > mobile graph folder picker > prepares the chosen iCloud location before creating an iOS graph
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > mobile graph folder picker > prepares the chosen iCloud location before creating an iOS graph
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > mobile graph folder picker > prepares the chosen iCloud location before creating an iOS graph
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > mobile graph folder picker > refuses an iOS graph before native graph inspection when its container is outside scope
+[tine/ios] pickGraphFolder → picked
+[tine/ios] loadGraphPath: start
+stdout | src/graph.test.tsx > mobile graph folder picker > refuses an iOS graph before native graph inspection when its container is outside scope
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > mobile graph folder picker > refuses an iOS graph before native graph inspection when its container is outside scope
+[tine/ios] loadGraphPath: done
+stdout | src/graph.test.tsx > mobile graph folder picker > keeps a partial-provider picked graph failure sticky and retries the same target
+[tine/android] pickGraphFolder → picked
+[tine/android] loadGraphPath: start
+stdout | src/graph.test.tsx > mobile graph folder picker > keeps a partial-provider picked graph failure sticky and retries the same target
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > mobile graph folder picker > keeps a partial-provider picked graph failure sticky and retries the same target
+[tine/android] loadGraphPath: done
+stdout | src/graph.test.tsx > mobile graph folder picker > keeps a partial-provider picked graph failure sticky and retries the same target
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > loads real page identities once and lets them win colliding aliases
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > loads real page identities once and lets them win colliding aliases
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > loads real page identities once and lets them win colliding aliases
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > refreshes real-page precedence after a same-session page creation
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > refreshes real-page precedence after a same-session page creation
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > refreshes real-page precedence after a same-session page creation
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > folds NFD alias keys before real-page precedence is applied
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > folds NFD alias keys before real-page precedence is applied
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > folds NFD alias keys before real-page precedence is applied
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > discards an older same-epoch page-inventory response
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > discards an older same-epoch page-inventory response
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > discards an older same-epoch page-inventory response
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > materializes on the visible-journal request without reopening the graph
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > materializes on the visible-journal request without reopening the graph
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > materializes on the visible-journal request without reopening the graph
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > routes default-journal template blocks through the shared variable expander
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > routes default-journal template blocks through the shared variable expander
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > routes default-journal template blocks through the shared variable expander
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > uses an empty journal's revision as the conflict baseline
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > uses an empty journal's revision as the conflict baseline
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > uses an empty journal's revision as the conflict baseline
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > never overwrites a journal that already has content
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > never overwrites a journal that already has content
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > never overwrites a journal that already has content
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > default journal template graph bind > drops template work that becomes stale across an in-place graph switch
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > drops template work that becomes stale across an in-place graph switch
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > drops template work that becomes stale across an in-place graph switch
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+ ✓ src/editor/htmlPaste.test.tsx (9 tests) 1005ms
+   ✓ structuredHtmlOutline > falls back for non-semantic, malformed, deep, and oversized payloads  952ms
+stdout | src/graph.test.tsx > default journal template graph bind > does no journal I/O when the loaded graph has no configured template
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > default journal template graph bind > does no journal I/O when the loaded graph has no configured template
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > default journal template graph bind > does no journal I/O when the loaded graph has no configured template
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > external assets trust > approves the exact resolved target before loading the graph
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > external assets trust > approves the exact resolved target before loading the graph
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > external assets trust > approves the exact resolved target before loading the graph
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > external assets trust > does not bind a graph when external assets access is declined
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > drains and retires the old PDF owner before binding another graph
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > drains and retires the old PDF owner before binding another graph
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > PDF graph ownership > drains and retires the old PDF owner before binding another graph
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > PDF graph ownership > drains and retires the old PDF owner before binding another graph
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > drains and retires the old PDF owner before binding another graph
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > PDF graph ownership > drains and retires the old PDF owner before binding another graph
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > PDF graph ownership > keeps the old graph bound and viewer live when PDF drain fails
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > keeps the old graph bound and viewer live when PDF drain fails
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > PDF graph ownership > keeps the old graph bound and viewer live when PDF drain fails
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > PDF graph ownership > keeps the old graph bound and viewer live when PDF drain fails
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > publishes a fresh PDF generation for a same-root force refresh
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > publishes a fresh PDF generation for a same-root force refresh
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > PDF graph ownership > publishes a fresh PDF generation for a same-root force refresh
+[tine] frontend graph open: session restored at 0 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > PDF graph ownership > publishes a fresh PDF generation for a same-root force refresh
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > publishes a fresh PDF generation for a same-root force refresh
+[tine] frontend graph open: native binding ready at 0 ms
+[tine] frontend graph open: session restored at 0 ms
+[tine] frontend graph open: interactive at 0 ms
+stdout | src/graph.test.tsx > PDF graph ownership > restores fresh old-graph ownership while route state remains installed when rebind fails
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > PDF graph ownership > restores fresh old-graph ownership while route state remains installed when rebind fails
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > PDF graph ownership > restores fresh old-graph ownership while route state remains installed when rebind fails
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > PDF graph ownership > restores fresh old-graph ownership while route state remains installed when rebind fails
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > graph home page (GH #245) > opens the configured home page in place on an ordinary first load
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > graph home page (GH #245) > opens the configured home page in place on an ordinary first load
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > opens the configured home page in place on an ordinary first load
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > keeps the ordinary landing when the configured page no longer resolves — nothing is created
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > graph home page (GH #245) > keeps the ordinary landing when the configured page no longer resolves — nothing is created
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > keeps the ordinary landing when the configured page no longer resolves — nothing is created
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not navigate when no home page is configured
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not navigate when no home page is configured
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not navigate when no home page is configured
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not home-navigate on a same-graph force refresh
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not home-navigate on a same-graph force refresh
+[tine] frontend graph open: native binding ready at 0 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not home-navigate on a same-graph force refresh
+[tine] frontend graph open: session restored at 1 ms
+[tine] frontend graph open: interactive at 1 ms
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not home-navigate on a same-graph force refresh
+[tine] frontend graph open: begin path=explicit
+stdout | src/graph.test.tsx > graph home page (GH #245) > does not home-navigate on a same-graph force refresh
+[tine] frontend graph open: native binding ready at 0 ms
+[tine] frontend graph open: session restored at 0 ms
+[tine] frontend graph open: interactive at 0 ms
+ ✓ src/graph.test.tsx (29 tests) 1839ms
+   ✓ mobile graph folder picker > opens a picked graph from Tine's iOS Documents container  532ms
+ ✓ src/components/Block.multilinePaste.test.tsx (28 tests) 1528ms
+   ✓ multiline paste into editor-visible empty blocks > refuses a managed 512th plain outline before the editor commits  468ms
+   ✓ multiline paste into editor-visible empty blocks > refuses a managed 512th Org outline before the editor commits  458ms
+   ✓ multiline paste into editor-visible empty blocks > refuses a managed 512th structured HTML outline before the editor commits  446ms
+ ✓ src/components/LinkedReferences.test.tsx (18 tests) 1590ms
+   ✓ Linked References filters > normalizes each native search corpus once instead of once per search evaluation  465ms
+   ✓ Linked References facet chips follow the text query (GH #173) > drops facets whose only backlinks no longer match the typed text  315ms
+ ✓ src/components/QuickSwitcher.test.tsx (20 tests) 2569ms
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > mounts the Android/narrow composition rather than a desktop one
+[tine] frontend graph open: begin path=explicit
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > mounts the Android/narrow composition rather than a desktop one
+[tine] frontend graph open: native binding ready at 7 ms
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > mounts the Android/narrow composition rather than a desktop one
+[tine] frontend graph open: session restored at 13 ms
+[tine] frontend graph open: interactive at 13 ms
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > peels recording, then the search query, then closes — three presses, never the history rung
+[tine] frontend graph open: begin path=explicit
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > peels recording, then the search query, then closes — three presses, never the history rung
+[tine] frontend graph open: native binding ready at 2 ms
+[tine] frontend graph open: session restored at 4 ms
+[tine] frontend graph open: interactive at 4 ms
+ ✓ src/components/SheetGrid.interact.test.tsx (46 tests) 2163ms
+   ✓ SheetGrid interaction > bounds initial work for duplicate 100k-row Grids and reuses navigation metadata  759ms
+   ✓ SheetGrid interaction > selects first-column sticky cells visibly and walks the left ladder through them  577ms
+ ✓ src/components/QuickSwitcher.modifiedClicks.test.tsx (13 tests) 1118ms
+   ✓ QuickSwitcher modified clicks (GH #288) > Ctrl/Shift+click on a create row keep only its safe ordinary action  385ms
+ ✓ src/components/SheetVirtualization.test.tsx (5 tests) 1517ms
+   ✓ sheet lazy-mount virtualization > caps the mounted table matrix and offers progressive disclosure  1435ms
+ ✓ src/components/SheetGrid.test.tsx (12 tests) 2507ms
+   ✓ SheetGrid > caps and progressively discloses a very wide grid  1272ms
+   ✓ SheetGrid > progressively discovers and discloses a large ragged grid without mounting its full rectangle  649ms
+ ✓ src/components/Page.test.tsx (56 tests) 2558ms
+   ✓ Journals feed generation lifecycle > defers a dirty feed gate then retries on its real release  759ms
+   ✓ Journals feed generation lifecycle > defers a saving feed gate then retries on its real release  760ms
+ ✓ src/components/SheetBoard.test.tsx (43 tests) 3161ms
+   ✓ SheetBoard > extends the query window before a refreshed off-window card can move  517ms
+   ✓ SheetBoard > clears a stale coordinate-only selection after query pagination resets instead of moving a hidden card  384ms
+   ✓ SheetBoard > uses the 100k membership index for repeated cellForBlock nested-ascent lookups without rescanning  988ms
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > reaches the history rung on a plain page with nothing open
+[tine] frontend graph open: begin path=explicit
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > reaches the history rung on a plain page with nothing open
+[tine] frontend graph open: native binding ready at 2 ms
+[tine] frontend graph open: session restored at 3 ms
+[tine] frontend graph open: interactive at 3 ms
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > closes the modal even while a mobile drawer is open underneath it
+[tine] frontend graph open: begin path=explicit
+stdout | src/androidBack.settings.test.tsx > Android Back and the Settings modal > closes the modal even while a mobile drawer is open underneath it
+[tine] frontend graph open: native binding ready at 10 ms
+[tine] frontend graph open: session restored at 11 ms
+[tine] frontend graph open: interactive at 11 ms
+ ✓ src/components/SheetTable.test.tsx (69 tests) 3290ms
+   ✓ SheetTable > uses the cached row index for repeated navigation in a large query table  740ms
+   ✓ SheetTable > extends the query window before a refreshed off-window range can edit  492ms
+   ✓ SheetTable > uses the 100k row index for repeated cellForBlock nested-ascent lookups without rescanning  791ms
+ ✓ src/androidBack.settings.test.tsx (4 tests) 2009ms
+   ✓ Android Back and the Settings modal > peels recording, then the search query, then closes — three presses, never the history rung  1606ms
+ ✓ src/components/Block.referenceAuthoring.test.tsx (8 tests) 1050ms
+ ✓ src/components/Block.embedHierarchy.test.tsx (7 tests) 624ms
+ ✓ src/components/Settings.test.tsx (32 tests) 821ms
+ ✓ src/components/Block.templateVars.test.tsx (2 tests) 796ms
+   ✓ refuses an overflowing template before it removes the slash trigger  622ms
+ ✓ src/components/ConflictBar.test.tsx (16 tests) 980ms
+ ✓ src/render/astRender.test.tsx (83 tests) 729ms
+   ✓ renderInlines > serializes whole-file audio fallback, bounds it globally, and releases bytes on unmount  313ms
+ ✓ src/components/Block.propertyAutocomplete.test.tsx (4 tests) 1035ms
+   ✓ property name/value autocomplete > keeps the OG line-opening :: workflow live through name and comma-separated values (GH #306)  462ms
+ ✓ src/components/QueryMacro.test.tsx (13 tests) 688ms
+ ✓ src/components/linkGestureSurfaces.test.tsx (12 tests) 648ms
+ ✓ src/components/LiveRefGroup.nav.test.tsx (6 tests) 758ms
+   ✓ arrow navigation inside ref/query/embed groups (GH #341) > ArrowDown moves to the next rendered sibling inside the group  314ms
+ ✓ src/components/Block.embedDepth.test.tsx (5 tests) 818ms
+   ✓ shared embed/ref render depth (GH #206) > stops a finite embed chain deeper than five  520ms
+ ✓ src/components/Lightbox.customCss.test.tsx (1 test) 654ms
+   ✓ lightbox geometry under graph custom.css (GH #319) > keeps the full-screen image auto-sized when a later generic img rule fixes thumbnail width  653ms
+ ✓ src/components/RightSidebar.r1.closeSafety.test.tsx (14 tests) 517ms
+ ✓ src/components/TabBar.test.tsx (16 tests) 401ms
+ ✓ src/components/PdfViewer.test.tsx (38 tests) 452ms
+ ✓ src/components/Sidebar.p4.navigation.test.tsx (1 test) 367ms
+   ✓ GH #161 successful left-navigation boundary > closes and focuses only after a mounted active in-window destination succeeds  367ms
+ ✓ src/components/Block.codeFenceAutocomplete.test.tsx (3 tests) 399ms
+ ✓ src/components/Settings.homePage.test.tsx (2 tests) 450ms
+   ✓ Settings home page row (GH #245) > picks an existing page and persists it per graph  380ms
+ ✓ src/components/LiveRefGroup.activation.test.tsx (4 tests) 489ms
+ ✓ src/components/Block.thatdaySlash.test.tsx (3 tests) 389ms
+ ✓ src/components/linkModifiedClicks.test.tsx (17 tests) 409ms
+ ✓ src/App.test.tsx (29 tests) 387ms
+ ✓ src/components/Settings.p1a1.recording.test.tsx (2 tests) 362ms
+ ✓ src/components/ConflictResolution.test.tsx (19 tests) 294ms
+ ✓ src/components/ContextMenu.test.tsx (22 tests) 325ms
+ ✓ src/components/Block.embedExitUp.test.tsx (2 tests) 312ms
+stdout | src/App.startupRecovery.test.tsx > missing remembered graph recovery (GH #250) > keeps the failed target actionable and offers a usable graph chooser
+[tine] frontend graph open: begin path=explicit
+ ✓ src/components/Block.selectionWrap.test.tsx (25 tests) 337ms
+ ✓ src/components/Block.arrowNavigation.test.tsx (4 tests) 315ms
+ ✓ src/components/Block.youtubeTimestampCommand.test.tsx (2 tests) 300ms
+ ✓ src/components/BeginQuery.test.tsx (7 tests) 292ms
+ ✓ src/components/BlockReferences.test.tsx (5 tests) 313ms
+stdout | src/App.startupRecovery.test.tsx > missing remembered graph recovery (GH #250) > routes the recovery-screen escape immediately without a native confirmation dependency
+[tine] frontend graph open: begin path=explicit
+stdout | src/App.startupRecovery.test.tsx > missing remembered graph recovery (GH #250) > routes the recovery-screen escape immediately without a native confirmation dependency
+[tine] frontend graph open: begin path=explicit
+stdout | src/App.startupRecovery.test.tsx > missing remembered graph recovery (GH #250) > routes the recovery-screen escape immediately without a native confirmation dependency
+[tine] frontend graph open: native binding ready at 2 ms
+stdout | src/App.startupRecovery.test.tsx
+[tine] frontend graph open: session restored at 9 ms
+[tine] frontend graph open: interactive at 9 ms
+ ✓ src/App.startupRecovery.test.tsx (2 tests) 253ms
+ ✓ src/components/Block.embedCollapse.test.tsx (4 tests) 327ms
+ ✓ src/components/Block.pluginOwnership.test.tsx (2 tests) 309ms
+ ✓ src/components/Block.taskSlash.test.tsx (2 tests) 283ms
+ ✓ src/components/RightSidebar.test.tsx (8 tests) 275ms
+ ✓ src/components/Block.mobileSelectionToolbar.test.tsx (2 tests) 224ms
+ ✓ src/components/transientRegistry.p1d1.hierarchy.test.tsx (5 tests) 218ms
+ ✓ src/components/QueryMacro.currentPage.test.tsx (8 tests) 257ms
+ ✓ src/components/Block.autopairMatrix.test.tsx (16 tests) 222ms
+ ✓ src/router.revealBlock.test.tsx (3 tests) 257ms
+ ✓ src/components/Block.advancedCommandAutocomplete.test.tsx (1 test) 261ms
+ ✓ src/render/pagePeek.test.tsx (11 tests) 172ms
+ ✓ src/render/blockRefLive.test.tsx (2 tests) 251ms
+ ✓ src/components/ReferenceExportChooser.test.tsx (5 tests) 232ms
+ ✓ src/mobileDrawers.shell.test.tsx (4 tests) 214ms
+ ✓ src/components/QueryWorkspace.test.tsx (15 tests) 160ms
+ ✓ src/reloadOnFocus.test.tsx (8 tests) 212ms
+ ✓ src/components/DiagnosticsTab.test.tsx (3 tests) 195ms
+ ✓ src/components/Block.calcBlur.test.tsx (2 tests) 189ms
+ ✓ src/components/Sidebar.favReorder.test.tsx (7 tests) 161ms
+ ✓ src/components/Sidebar.graphRowMenu.test.tsx (3 tests) 202ms
+ ✓ src/components/transientRegistry.p1d1.focus.test.tsx (20 tests) 170ms
+ ✓ src/render/skeleton-drift.test.tsx (26 tests) 168ms
+ ✓ src/components/Block.assetPaste.test.tsx (10 tests) 182ms
+ ✓ src/components/UnlinkedReferences.test.tsx (7 tests) 203ms
+ ✓ src/components/Block.payloadPaste.test.tsx (7 tests) 199ms
+ ✓ src/components/Settings.maximize.test.tsx (3 tests) 147ms
+ ✓ src/components/MobileKeyboardToolbar.test.tsx (7 tests) 272ms
+ ✓ src/components/Sidebar.rowHitbox.test.tsx (6 tests) 188ms
+ ✓ src/components/FormulaEditor.test.tsx (14 tests) 184ms
+ ✓ src/components/ImproveTab.test.tsx (2 tests) 196ms
+ ✓ src/components/TabBar.p1e.overview.test.tsx (8 tests) 165ms
+ ✓ src/components/Settings.tabSwitch.test.tsx (4 tests) 186ms
+ ✓ src/components/Block.tabOwnership.test.tsx (2 tests) 199ms
+ ✓ src/components/Sidebar.favGroups.test.tsx (7 tests) 189ms
+ ✓ src/render/clickSpans.test.tsx (10 tests) 174ms
+ ✓ src/components/Block.todaySlash.test.tsx (1 test) 195ms
+ ✓ src/components/Sidebar.test.tsx (2 tests) 164ms
+ ✓ src/components/RightSidebar.reorder.test.tsx (4 tests) 162ms
+ ✓ src/components/transientFallbacks.p1d2.test.tsx (8 tests) 193ms
+ ✓ src/components/PdfViewer.mobile.test.tsx (3 tests) 142ms
+ ✓ src/components/transientDispatch.p1.test.tsx (5 tests) 149ms
+ ✓ src/components/Block.tagAutocomplete.test.tsx (1 test) 158ms
+ ✓ src/components/Block.copyEmbed.test.tsx (3 tests) 163ms
+ ✓ src/components/Block.headingAuto.test.tsx (9 tests) 148ms
+ ✓ src/components/PaneTree.test.tsx (7 tests) 152ms
+ ✓ src/components/Block.boundaryHorizontal.test.tsx (9 tests) 151ms
+ ✓ src/components/transientRegistry.p1d1.lifecycle.test.tsx (6 tests) 123ms
+ ✓ src/render/assetLinkOpen.test.tsx (21 tests) 163ms
+ ✓ src/components/DiffRows.test.tsx (30 tests) 146ms
+ ✓ src/components/SheetTable.addRow227.test.tsx (4 tests) 147ms
+stdout | src/App.topbar.test.tsx > topbar workspace placement > puts the full workspace switcher in the sidebar and only mounts a compact fallback while it is closed
+[tine] frontend graph open: begin path=explicit
+stdout | src/App.topbar.test.tsx > topbar workspace placement > puts the full workspace switcher in the sidebar and only mounts a compact fallback while it is closed
+[tine] frontend graph open: native binding ready at 5 ms
+stdout | src/App.topbar.test.tsx
+[tine] frontend graph open: session restored at 13 ms
+[tine] frontend graph open: interactive at 13 ms
+ ✓ src/App.topbar.test.tsx (1 test) 106ms
+ ✓ src/App.bulk.test.tsx (6 tests) 100ms
+ ✓ src/components/Block.mathBlockEnter.test.tsx (6 tests) 130ms
+ ✓ src/components/Block.codeFenceEnter.test.tsx (7 tests) 131ms
+ ✓ src/components/Block.codeBodyEdit.test.tsx (6 tests) 139ms
+ ✓ src/components/LiveRefGroup.context.test.tsx (3 tests) 116ms
+ ✓ src/components/Block.numberedList.test.tsx (8 tests) 151ms
+ ✓ src/components/AudioOverlay.test.tsx (3 tests) 120ms
+ ✓ src/components/ConflictResolution.duplicateJournal.test.tsx (5 tests) 113ms
+ ✓ src/components/renderedSelectionDelete.test.tsx (7 tests) 111ms
+ ✓ src/render/annotationRef.test.tsx (4 tests) 85ms
+ ✓ src/components/CalendarJump.test.tsx (5 tests) 91ms
+ ✓ src/components/Settings.backups.test.tsx (1 test) 99ms
+ ✓ src/components/WorkspaceSwitcher.test.tsx (2 tests) 101ms
+ ✓ src/components/Block.imeComposition.test.tsx (5 tests) 106ms
+ ✓ src/components/Block.backgroundGeometry.test.tsx (1 test) 117ms
+ ✓ src/components/Settings.communityRegistry.fdroid.test.tsx (2 tests) 95ms
+ ✓ src/components/ExportModal.test.tsx (4 tests) 111ms
+ ✓ src/components/Block.collapse.test.tsx (2 tests) 99ms
+ ✓ src/print.security.test.tsx (1 test) 99ms
+ ✓ src/components/Settings.communityRegistry.test.tsx (2 tests) 116ms
+ ✓ src/components/Block.selectAll.test.tsx (2 tests) 99ms
+ ✓ src/components/AbsenceSweepCenter.test.tsx (5 tests) 64ms
+ ✓ src/components/RefBlocks.test.tsx (12 tests) 85ms
+ ✓ src/components/Macro.youtubeTimestamp.test.tsx (4 tests) 72ms
+ ✓ src/render/mobileContextMenu.test.tsx (2 tests) 87ms
+ ✓ src/render/tableV2.test.tsx (6 tests) 97ms
+ ✓ src/components/Block.docModeEnter.test.tsx (3 tests) 93ms
+ ✓ src/components/Welcome.p1d3.test.tsx (5 tests) 59ms
+ ✓ src/components/Block.enterLineBoundary.test.tsx (3 tests) 75ms
+ ✓ src/components/QuickSwitcher.p1c-q.test.tsx (5 tests) 103ms
+ ✓ src/render/body.test.tsx (11 tests) 70ms
+ ✓ src/components/Block.pagePropertyEnter.test.tsx (2 tests) 96ms
+ ✓ src/render/htmlSanitize.test.tsx (21 tests) 76ms
+ ✓ src/components/ConflictResolution.syncMergeSuggestions.test.tsx (2 tests) 80ms
+ ✓ src/components/Block.codeFenceEdit.test.tsx (5 tests) 80ms
+ ✓ src/components/Settings.iosPlugins.test.tsx (1 test) 84ms
+ ✓ src/components/Block.selectionDrag.test.tsx (2 tests) 87ms
+ ✓ src/components/MacroHiccupSurfaces.test.tsx (2 tests) 71ms
+ ✓ src/keybindings.p1a1.globalCapture.test.tsx (5 tests) 73ms
+ ✓ src/components/Block.bulletModifiedClick.test.tsx (4 tests) 78ms
+ ✓ src/components/Block.blockRefsCountPlacement.test.tsx (3 tests) 60ms
+ ✓ src/components/LiveRefGroup.pruning.test.tsx (1 test) 66ms
+ ✓ src/components/Block.codeFenceScaffold.test.tsx (3 tests) 66ms
+ ✓ src/inpageFind.dom.test.tsx (3 tests) 101ms
+ ✓ src/components/QueryBuilder.transient.test.tsx (2 tests) 65ms
+ ✓ src/components/TopbarOverflowMenu.test.tsx (4 tests) 50ms
+ ✓ src/mediaCapture.test.tsx (2 tests) 57ms
+ ✓ src/components/AboutTab.test.tsx (5 tests) 45ms
+ ✓ src/render/PageRefLongPress.test.tsx (6 tests) 60ms
+ ✓ src/components/Block.schedule.test.tsx (1 test) 51ms
+ ✓ src/components/Block.mouseDownEdit.test.tsx (1 test) 73ms
+ ✓ src/components/Block.markerClick.test.tsx (2 tests) 49ms
+ ✓ src/render/calcCopy.test.tsx (3 tests) 43ms
+ ✓ src/components/Settings.conflictInventory.test.tsx (3 tests) 57ms
+ ✓ src/components/StartupRecovery.test.tsx (2 tests) 46ms
+ ✓ src/components/Block.journalEmptyDay.test.tsx (1 test) 42ms
+ ✓ src/themeGallery.test.tsx (8 tests) 48ms
+ ✓ src/components/Block.pluginDecorations.test.tsx (1 test) 50ms
+ ✓ src/render/ast-contract.test.tsx (30 tests) 44ms
+ ✓ src/render/renderedText.test.tsx (16 tests) 25ms
+ ✓ src/render/headingBody.test.tsx (5 tests) 44ms
+ ✓ src/paneTracker.test.tsx (6 tests) 46ms
+ ✓ src/render/calcTrailingLines.test.tsx (2 tests) 39ms
+ ✓ src/components/Namespace.inventory.test.tsx (1 test) 36ms
+ ✓ src/components/TodayTaskSummary.test.tsx (1 test) 32ms
+ ✓ src/components/SearchResultRow.test.tsx (3 tests) 43ms
+ ✓ src/components/ConflictQueueBadge.test.tsx (7 tests) 30ms
+ ✓ src/components/Page.carryActionsRollover.test.tsx (5 tests) 32ms
+ ✓ src/render/showBrackets.test.tsx (4 tests) 27ms
+ ✓ src/components/Welcome.test.tsx (2 tests) 24ms
+ ✓ src/components/ReferenceEvidence.test.tsx (2 tests) 22ms
+ ✓ src/keybindings.p1a1.drawerFocus.test.tsx (2 tests) 19ms
+ ✓ src/render/longPress.test.tsx (6 tests) 22ms
+ ✓ src/components/Block.sheetSlash.test.tsx (2 tests) 23ms
+ ✓ src/render/propertyKeyNorm.test.tsx (3 tests) 16ms
+ ✓ src/blockRefCounts.test.tsx (2 tests) 11ms
+ ✓ src/render/parseReinstantiate.test.tsx (1 test) 12ms
+ ✓ src/components/Block.contextMenu.test.tsx (1 test) 11ms
+ ✓ src/render/parseCrashGuard.mock.test.tsx (1 test) 8ms
+ ✓ src/backend.clipboard.test.tsx (2 tests) 6ms
+ ✓ src/components/ExportModal.queryBudget.test.tsx (1 test) 10ms
+ ✓ src/components/HelpShortcuts.test.tsx (3 tests) 4ms
+ ✓ src/components/contextMenuPlace.test.tsx (6 tests) 2ms
+ Test Files  179 passed (179)
+      Tests  1463 passed (1463)
+   Start at  20:10:08
+   Duration  28.24s (transform 17.08s, setup 20.35s, collect 74.25s, tests 59.20s, environment 111.91s, prepare 11.18s)
+deploy profile contract OK: deterministic default, explicit fast-local opt-in
+stderr | src/update.test.ts > update checks > does not offer an impossible native install to an unsupported x86 build (GH #241)
+[update] self-update failed: automatic updater target unavailable for x86
+stderr | src/editingBoundary.regression.test.ts > editing/collapse boundary regressions > read-only pages cannot enter the dirty/save pipeline even through a direct call
+Refusing to persist read-only page Org
+stderr | src/graph.test.tsx > mobile graph folder picker > opens a picked graph from Tine's iOS Documents container
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/androidBack.settings.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/LinkedReferences.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/graph.test.tsx > mobile graph folder picker > opens the rebased iOS container path after an app update
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/components/Page.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.multilinePaste.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/graph.test.tsx > mobile graph folder picker > shows a clear refusal when iOS returns an outside-container folder
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > mobile graph folder picker > prepares the chosen iCloud location before creating an iOS graph
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > mobile graph folder picker > refuses an iOS graph before native graph inspection when its container is outside scope
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > mobile graph folder picker > keeps a partial-provider picked graph failure sticky and retries the same target
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > page rename collisions > asks before merging into a real existing page and carries rename identities
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/components/SheetBoard.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/QuickSwitcher.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/SheetTable.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/SheetGrid.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/SheetGrid.interact.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/graph.test.tsx > page rename collisions > cancels without mutating either page
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > page rename collisions > keeps the ordinary rename path when the destination has no file
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > loads real page identities once and lets them win colliding aliases
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > refreshes real-page precedence after a same-session page creation
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > folds NFD alias keys before real-page precedence is applied
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > discards an older same-epoch page-inventory response
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > materializes on the visible-journal request without reopening the graph
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > routes default-journal template blocks through the shared variable expander
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > uses an empty journal's revision as the conflict baseline
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > never overwrites a journal that already has content
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > drops template work that becomes stale across an in-place graph switch
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > default journal template graph bind > does no journal I/O when the loaded graph has no configured template
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > external assets trust > approves the exact resolved target before loading the graph
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > external assets trust > does not bind a graph when external assets access is declined
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > PDF graph ownership > drains and retires the old PDF owner before binding another graph
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > PDF graph ownership > keeps the old graph bound and viewer live when PDF drain fails
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > PDF graph ownership > publishes a fresh PDF generation for a same-root force refresh
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > PDF graph ownership > restores fresh old-graph ownership while route state remains installed when rebind fails
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > graph home page (GH #245) > opens the configured home page in place on an ordinary first load
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > graph home page (GH #245) > keeps the ordinary landing when the configured page no longer resolves — nothing is created
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > graph home page (GH #245) > does not navigate when no home page is configured
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/graph.test.tsx > graph home page (GH #245) > does not home-navigate on a same-graph force refresh
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/components/SheetVirtualization.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/QuickSwitcher.modifiedClicks.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/SheetGrid.test.tsx > SheetGrid > caps and progressively discloses a very wide grid
+[csstree-match] BREAK after 15000 iterations
+stderr | src/components/Block.referenceAuthoring.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.propertyAutocomplete.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ConflictBar.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.embedHierarchy.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.templateVars.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/astRender.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/QueryMacro.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/linkGestureSurfaces.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/LiveRefGroup.nav.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.embedDepth.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Lightbox.customCss.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/TabBar.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/RightSidebar.r1.closeSafety.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/LiveRefGroup.activation.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.codeFenceAutocomplete.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.homePage.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/linkModifiedClicks.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/PdfViewer.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/App.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Sidebar.p4.navigation.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.thatdaySlash.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/PdfViewer.test.tsx > PdfViewer resource safety > rejects unsafe dimensions discovered on a later page
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+stderr | src/components/PdfViewer.test.tsx > PdfViewer OG state and reference behavior > offers OG reference actions for existing text and area highlights
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+stderr | src/components/PdfViewer.test.tsx > PdfViewer OG state and reference behavior > caps PDF Find occurrences and labels the result as truncated
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+stderr | src/components/Settings.p1a1.recording.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.embedExitUp.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ConflictResolution.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.selectionWrap.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.arrowNavigation.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.youtubeTimestampCommand.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ContextMenu.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/App.startupRecovery.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/BlockReferences.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/BeginQuery.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.embedCollapse.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.pluginOwnership.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.taskSlash.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/RightSidebar.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/QueryMacro.currentPage.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/router.revealBlock.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.advancedCommandAutocomplete.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.autopairMatrix.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/transientRegistry.p1d1.hierarchy.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/blockRefLive.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.mobileSelectionToolbar.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/pagePeek.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ReferenceExportChooser.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.autopairMatrix.test.tsx > auto-pair matrix — ON by default (GH #291 OG parity) > pair decision is on with no persisted preference, and an explicit opt-out persists
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/components/Block.autopairMatrix.test.tsx > auto-pair matrix — ON by default (GH #291 OG parity) > pair decision is on with no persisted preference, and an explicit opt-out persists
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.autopairMatrix.test.tsx > auto-pair matrix — ON by default (GH #291 OG parity) > pair decision is on with no persisted preference, and an explicit opt-out persists
+You appear to have multiple instances of Solid. This can lead to unexpected behavior.
+stderr | src/components/Block.autopairMatrix.test.tsx > auto-pair matrix — ON by default (GH #291 OG parity) > pair decision is on with no persisted preference, and an explicit opt-out persists
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/mobileDrawers.shell.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.calcBlur.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/skeleton-drift.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/QueryWorkspace.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/reloadOnFocus.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/transientRegistry.p1d1.focus.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/DiagnosticsTab.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Sidebar.graphRowMenu.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/UnlinkedReferences.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.assetPaste.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Sidebar.favReorder.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.payloadPaste.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.maximize.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/MobileKeyboardToolbar.test.tsx > MobileKeyboardToolbar > renders the confirmed scroll strip and pinned hide button on Android
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Sidebar.rowHitbox.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.tabOwnership.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.tabSwitch.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/FormulaEditor.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ImproveTab.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/TabBar.p1e.overview.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/clickSpans.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Sidebar.favGroups.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.todaySlash.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Sidebar.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/RightSidebar.reorder.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/PaneTree.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/transientFallbacks.p1d2.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/transientDispatch.p1.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.copyEmbed.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.tagAutocomplete.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/PdfViewer.mobile.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.headingAuto.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.boundaryHorizontal.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/assetLinkOpen.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/transientRegistry.p1d1.lifecycle.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/SheetTable.addRow227.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/assetLinkOpen.test.tsx > asset link opens through the OS opener > a non-asset relative link is untouched by the asset route
+Not implemented: Window's open() method
+stderr | src/App.bulk.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/App.topbar.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.mathBlockEnter.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.codeBodyEdit.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.codeFenceEnter.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/LiveRefGroup.context.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.numberedList.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/AudioOverlay.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/AudioOverlay.test.tsx > AudioOverlay resource lifecycle > cancels a queued Blob fallback and releases it when the panel closes
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+stderr | VirtualConsole.forward (/aux/koutecky/logseq/tine-master/node_modules/jsdom/lib/jsdom/virtual-console.js:28:20)
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+stderr | src/components/renderedSelectionDelete.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/annotationRef.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ConflictResolution.duplicateJournal.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.backups.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.imeComposition.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.backgroundGeometry.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/WorkspaceSwitcher.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/CalendarJump.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.communityRegistry.fdroid.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ExportModal.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.collapse.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/print.security.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.communityRegistry.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.selectAll.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/RefBlocks.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Macro.youtubeTimestamp.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/mobileContextMenu.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/tableV2.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.docModeEnter.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.enterLineBoundary.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/AbsenceSweepCenter.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Welcome.p1d3.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/QuickSwitcher.p1c-q.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/body.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.pagePropertyEnter.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.codeFenceEdit.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.selectionDrag.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/MacroHiccupSurfaces.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ConflictResolution.syncMergeSuggestions.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.iosPlugins.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/keybindings.p1a1.globalCapture.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.bulletModifiedClick.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.blockRefsCountPlacement.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/LiveRefGroup.pruning.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.codeFenceScaffold.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/inpageFind.dom.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/PageRefLongPress.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/QueryBuilder.transient.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.mouseDownEdit.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.schedule.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.markerClick.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/calcCopy.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Settings.conflictInventory.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.journalEmptyDay.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.pluginDecorations.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/headingBody.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/calcTrailingLines.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/paneTracker.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Namespace.inventory.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Page.carryActionsRollover.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/TodayTaskSummary.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ConflictQueueBadge.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/showBrackets.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/Block.sheetSlash.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ReferenceEvidence.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/keybindings.p1a1.drawerFocus.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/propertyKeyNorm.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/blockRefCounts.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/ExportModal.queryBudget.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/render/parseCrashGuard.mock.test.tsx
+lsdoc-wasm tag mismatch: wasm=v0.4.1 bytes=v0.5.7
+stderr | src/components/HelpShortcuts.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed
+stderr | src/components/contextMenuPlace.test.tsx
+computations created outside a `createRoot` or `render` will never be disposed

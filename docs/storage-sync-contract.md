@@ -275,6 +275,19 @@ root, `lazy-genesis.marker` is the sole managed-authority commit marker. All
 projection and query state may be reconstructed from the immutable baseline
 and manifest tail.
 
+Live-save conflicts use a storage-mode-independent app-private protocol beside
+those managed components: `<app-data>/conflict-capsules/<graph-key>.v1.json`,
+where `graph-key` is the session-style sanitized graph basename plus FNV-1a of
+the root path. `ConflictCapsuleEnvelopeV1` contains the exact retained PageDto,
+its load baseline, and page binding, but never Managed replacement authority.
+The whole graph envelope is replaced through `atomic_write` (unique create-new
+temporary file, file barrier, atomic rename, directory barrier); stale torn
+temporaries are ignored and reclaimed on reopen. Explicit resolution re-proves
+the active backend's authority and durably rewrites the envelope, or removes
+and directory-syncs the final file, before the frontend acknowledges success.
+This state is recovery material only: it grants neither graph authority nor a
+Managed storage selection, and no byte is written into the user's graph.
+
 | Path below the graph's private root | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; its app-private name is retired with the whole private root on Return to Direct Files |
