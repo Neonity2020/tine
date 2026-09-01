@@ -10,6 +10,7 @@ pub mod config;
 #[cfg(test)]
 mod config_projection_parity;
 pub mod date;
+pub mod direct_move_recovery;
 mod direct_projection;
 pub mod doc;
 pub mod edn;

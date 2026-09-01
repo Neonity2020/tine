@@ -565,6 +565,25 @@ pub(crate) fn prepare_direct_files_open(
 ) -> Result<PreparedDirectFilesOpen, String> {
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
+    // Convergent cross-page moves (packet B2, I-3/I-2). A move writes N+1 files
+    // and the process may die between any two of them. The durable record that
+    // makes that convergent is retired here, BEFORE a single page is parsed, so
+    // no reader ever observes the half-move: the next open either completes it
+    // or rolls it back. This is the layer that owns the app-private root —
+    // `Graph` is never handed one, which is exactly why recovery cannot live
+    // inside it. See `docs/contracts/direct-move-recovery.md` §3.
+    match crate::backup::direct_move_recovery_dir(app, &root_key) {
+        Some(store_root) => {
+            let report = tine_core::direct_move_recovery::recover_all(&store_root, &root_key);
+            if !report.is_empty() {
+                crate::debug::diag(report.summary());
+            }
+        }
+        None => crate::debug::diag(
+            "Direct move recovery store unavailable; a crashed cross-page move cannot converge"
+                .to_string(),
+        ),
+    }
     let LoadedGraph { graph, meta } = open_graph_for_load(&root, approved_assets.as_deref())?;
     match direct_files_projection_path(app, &root_key) {
         Ok(path) => {
@@ -1136,6 +1155,103 @@ pub(crate) fn create_graph(dir: String) -> Result<String, String> {
     tine_core::onboarding::create_demo_graph(&root)
         .map_err(|e| format!("couldn't create the demo graph: {e}"))?;
     Ok(root.display().to_string())
+}
+
+/// Compose and durably publish the recovery record for one Direct cross-page
+/// move, BEFORE the frontend writes the first page (packet B2; I-3, I-2).
+///
+/// `destination` and `sources` are the POST-move DTOs — the exact DTOs the
+/// choreography is about to save, in the order it will save them. The record
+/// binds every participant's path, page identity, base revision, preimage bytes
+/// and proposed postimage bytes, so recovery can complete the move OR roll it
+/// back from the record alone.
+///
+/// Returns the record identifier, or `null` when no record was composed. `null`
+/// is NOT a failure and never refuses the move: a degenerate move (every
+/// participant resolves to one file) needs no record because the ordinary
+/// base-revision guard already makes a single save safe, and an unavailable
+/// app-private root leaves the move exactly as convergent as it was before B2
+/// rather than making a page unmovable on a box whose data home is unwritable
+/// (`docs/contracts/direct-move-recovery.md` §4 — preferring degraded recovery
+/// to a refusal with no in-scope threat scenario).
+#[tauri::command]
+pub(crate) async fn begin_direct_cross_page_move(
+    destination: tine_core::model::PageDto,
+    sources: Vec<tine_core::model::PageDto>,
+    state: crate::state::GraphContext<'_>,
+) -> Result<Option<String>, String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_state = app.state::<AppState>();
+        let slot = crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
+            crate::debug::diag(
+                "Direct move recovery store unavailable; this cross-page move is unbracketed"
+                    .to_string(),
+            );
+            return Ok(None);
+        };
+        let prepared = match graph.prepare_direct_cross_page_move(&destination, &sources) {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                // Composition failed (an unreadable file, or the serializer's own
+                // corruption firewall). The save about to run will report the real
+                // error itself; do not turn a diagnostic into a refusal.
+                crate::debug::diag(format!(
+                    "Direct move record not composed; move proceeds unbracketed: {}",
+                    error.kind()
+                ));
+                return Ok(None);
+            }
+        };
+        let store = tine_core::direct_move_recovery::RecoveryStore::new(store_root);
+        let move_id = prepared.record.move_id.clone();
+        match store.commit(&prepared.record, &prepared.images) {
+            Ok(()) => Ok(Some(move_id)),
+            Err(error) => {
+                crate::debug::diag(format!(
+                    "Direct move record not published; move proceeds unbracketed: {}",
+                    error.kind()
+                ));
+                Ok(None)
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Retire a move record once every participant is durably terminal.
+///
+/// Retires ONLY when the whole move has landed. A record whose participants are
+/// not all terminal is deliberately left in place: either a page save is still
+/// conflicted — in which case the live conflict UI owns the decision and
+/// recovery must not silently overwrite the user's page — or the process is
+/// about to die, and the next open converges it. Returns whether the record was
+/// retired.
+#[tauri::command]
+pub(crate) async fn finish_direct_cross_page_move(
+    move_id: String,
+    state: crate::state::GraphContext<'_>,
+) -> Result<bool, String> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_state = app.state::<AppState>();
+        let slot = crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
+        let graph = slot.legacy_graph()?;
+        let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
+            return Ok(false);
+        };
+        Ok(tine_core::direct_move_recovery::retire_if_terminal(
+            &store_root,
+            &graph.root,
+            &move_id,
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

@@ -34,6 +34,7 @@ import {
   pageByName,
   resetStore,
   selectBlock,
+  settleDirectMovesForTest,
 } from "./store";
 import { insertDroppedFiles } from "./filedrop";
 import { carryDay } from "./carry";
@@ -206,6 +207,7 @@ describe("cross-page move dispatch — the four move shapes", () => {
       const save = vi.spyOn(backend(), "savePage").mockResolvedValue(null as any);
 
       await moveBlock("source", null, 1, "Destination");
+      await settleDirectMovesForTest();
 
       expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
       expect(pageByName("Source")!.roots).toEqual([]);
@@ -440,10 +442,12 @@ describe("dropped-file insertion dispatch", () => {
   });
 });
 
-describe("carry persistence dispatch — the recorded B2 gap", () => {
-  // Carry is an N-source cross-page move with no managed arm. B1 does not add
-  // one; it makes the decision visible at the front door. These assertions pin
-  // the CURRENT behaviour, so B2 must change them deliberately.
+describe("carry dispatch — B2 gave carry a route", () => {
+  // B1 asserted the opposite of these: carry ran the Direct choreography under a
+  // managed binding and B1 pinned that gap so B2 had to delete the assertion
+  // deliberately. It is deleted here. The refusal is taken at the OPERATION
+  // boundary, before the in-memory carry, so a managed binding is never left
+  // holding a mutation storage did not accept.
   async function loadCarryDays(): Promise<string> {
     const today = journalTitle(new Date());
     const yesterday = "Aug 31st, 2026";
@@ -456,33 +460,35 @@ describe("carry persistence dispatch — the recorded B2 gap", () => {
     return yesterday;
   }
 
-  it("records a carry-persist dispatch on the managed route and still runs the Direct choreography", async () => {
+  it("refuses under a managed binding: no Direct write, and memory is untouched", async () => {
     const yesterday = await loadCarryDays();
     managedWritable();
     const save = vi.spyOn(backend(), "savePage").mockResolvedValue(null as any);
 
     await carryDay(yesterday);
 
-    expect(storageDispatchCounters("carry-persist")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
-    expect(lastStorageDispatch("carry-persist")).toEqual({
-      operation: "carry-persist",
+    expect(storageDispatchCounters("carry")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
+    expect(lastStorageDispatch("carry")).toEqual({
+      operation: "carry",
       route: "managed",
       request: { destinationPage: journalTitle(new Date()), sourcePages: [yesterday] },
     });
-    // The carry really happened — the task is on today and off its source day.
-    expect(pageByName(journalTitle(new Date()))!.roots).toContain("task");
-    expect(pageByName(yesterday)!.roots).toEqual([]);
-    // KNOWN GAP (B2): the Direct save path ran under a managed binding. When B2
-    // gives carry a managed arm this expectation flips to `not.toHaveBeenCalled`.
-    expect(save).toHaveBeenCalled();
+    // I-6: a managed-bound slot must never reach Direct persistence.
+    expect(save).not.toHaveBeenCalled();
+    // And the refusal is taken BEFORE `carryUnfinished`, so the editor is not
+    // left holding a move managed storage never accepted.
+    expect(pageByName(yesterday)!.roots).toEqual(["task"]);
+    expect(pageByName(journalTitle(new Date()))!.roots).not.toContain("task");
   });
 
-  it("records the direct route under a Direct binding", async () => {
+  it("records the direct route under a Direct binding and really carries", async () => {
     const yesterday = await loadCarryDays();
     vi.spyOn(backend(), "savePage").mockResolvedValue(null as any);
 
     await carryDay(yesterday);
 
-    expect(storageDispatchCounters("carry-persist")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+    expect(storageDispatchCounters("carry")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+    expect(pageByName(journalTitle(new Date()))!.roots).toContain("task");
+    expect(pageByName(yesterday)!.roots).toEqual([]);
   });
 });

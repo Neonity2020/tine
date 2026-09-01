@@ -923,6 +923,12 @@ export function mockBackend(): Backend {
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
       return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
     },
+    async beginDirectCrossPageMove(_destination: PageDto, _sources: PageDto[]): Promise<string | null> {
+      return null; // the browser mock has no app-private root and no durable graph
+    },
+    async finishDirectCrossPageMove(_moveId: string): Promise<boolean> {
+      return false;
+    },
     async moveManagedApplicationSubtrees(
       bindingGeneration: number,
       request: ManagedApplicationMoveSubtreesRequest,

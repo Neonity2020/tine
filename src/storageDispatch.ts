@@ -37,10 +37,15 @@
 //                                              `applicationPageAdmission`
 //                                              readers.
 //
-// **B1 is behaviour-preserving.** Every arm below is the arm that ran before,
-// verbatim; the asymmetries (Direct's N-source choreography, Managed's
-// single-source refusal, carry's missing managed arm) are recorded here and
-// changed by B2/B3, not by this module.
+// **History.** B1 introduced this module behaviour-preservingly and recorded
+// three asymmetries. B2 closed one of them: carry no longer runs the Direct
+// choreography under a managed binding — `dispatchCarry` refuses there with the
+// shared multi-source message, and the decision is taken before the in-memory
+// carry rather than at persistence time. Direct's N-source choreography is now
+// convergent on crash (`withDirectMoveRecord` in `src/store.ts`,
+// `docs/contracts/direct-move-recovery.md`). Managed's single-source refusal
+// remains an argued, tested difference: lifting it is an undecided product
+// question, not an implementation gap.
 
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import { pushToast } from "./ui";
@@ -67,7 +72,7 @@ export type StorageRoute = "managed" | "direct" | "unavailable";
 export type SemanticStorageOperation =
   | "cross-page-move"
   | "dropped-file-insertion"
-  | "carry-persist";
+  | "carry";
 
 export interface StorageRouteDecision {
   readonly route: StorageRoute;
@@ -91,7 +96,7 @@ export interface StorageDispatchRecord {
 const OPERATIONS: readonly SemanticStorageOperation[] = [
   "cross-page-move",
   "dropped-file-insertion",
-  "carry-persist",
+  "carry",
 ];
 
 function emptyCounters(): StorageDispatchCounters {
@@ -176,6 +181,20 @@ export const CROSS_PAGE_MOVE_UNAVAILABLE_TOAST =
   "Can't move between pages while managed storage is changing state.";
 
 /**
+ * The one refusal for a cross-page move a managed binding has no arm for.
+ *
+ * Managed storage's native move takes exactly ONE source page, so a move that
+ * spans several — a multi-source relative move, and every carry, which gathers
+ * N journal days into today — has no managed arm at all. Lifting that limit is
+ * an undecided product question (spec B, packet B2), so the honest behaviour is
+ * to refuse rather than to run the Direct choreography underneath a managed
+ * binding, which is what `carry.ts` did until B2 and what I-6 names as its
+ * specimen: Direct writes bypassing Managed Storage entirely.
+ */
+export const MANAGED_MULTI_SOURCE_MOVE_UNAVAILABLE_TOAST =
+  "Managed cross-page moves currently require all selected roots to share one source page.";
+
+/**
  * What the caller wants to happen, stated in domain terms. The dispatcher does
  * not act on it today beyond routing — it is the seed of the storage API's
  * cross-page-move request (spec B north star), so the next operation added here
@@ -254,40 +273,54 @@ export async function dispatchDroppedFileInsertion<T>(
 }
 
 // ---------------------------------------------------------------------------
-// Carry persistence
+// Carry
 // ---------------------------------------------------------------------------
 
-export interface CarryPersistRequest {
+export interface CarryRequest {
   /** Today's journal — the ADDITION side, saved first. */
   readonly destinationPage: string;
   /** The source days losing tasks — the REMOVAL side, saved only after today lands. */
   readonly sourcePages: readonly string[];
 }
 
-export interface CarryPersistArms<T> {
-  /** Direct Files choreography: destination first, then the N sources. */
+export interface CarryArms<T> {
+  /** Direct Files: the in-memory carry plus its destination-first choreography. */
   readonly direct: () => T | Promise<T>;
+  /**
+   * Managed storage has no carry arm. Carry is an N-source cross-page move and
+   * the native move accepts one source page, so this arm REFUSES with the
+   * shared multi-source message — it must never fall through to Direct.
+   */
+  readonly managed: (admission: ManagedWritableAdmission) => T | Promise<T>;
+  /** No writer for this binding. The shared refusal toast has already been raised. */
+  readonly unavailable: () => T | Promise<T>;
 }
 
 /**
- * **KNOWN GAP, recorded not fixed (packet B2).** Carry is an N-source
- * cross-page move, but it has never had a managed arm: `carry.ts` ran the
- * Direct choreography under every admission, including a managed binding —
- * `INVARIANTS.md` names `src/carry.ts` as the I-6 specimen precisely because it
- * mentions neither "managed" nor "authority" and every audit that searched
- * outward from Managed Storage missed it.
+ * Route one carry.
  *
- * B1 is behaviour-preserving, so this front door still runs the Direct arm on
- * every route. What it adds is visibility: the decision is now made at ONE site
- * that says out loud which route it took, `storageDispatchCounters` records it,
- * and `src/storageDispatchRoutes.test.ts` asserts this exact asymmetry — so B2
- * has to delete that assertion deliberately when it gives carry its managed
- * arm, instead of the gap staying invisible for another campaign.
+ * **B2 fixed the route, not the arm.** Until B2 this front door had a single
+ * `direct` arm and ran it under EVERY admission — `carry.ts` mutated a managed
+ * graph and then wrote its journal files directly, bypassing Managed Storage.
+ * `INVARIANTS.md` names `src/carry.ts` as the I-6 specimen precisely because it
+ * mentions neither "managed" nor "authority", so every audit that searched
+ * outward from Managed Storage was structurally unable to reach it.
+ *
+ * The decision is taken BEFORE the in-memory carry runs, not at persistence
+ * time: refusing after `carryUnfinished` had already moved blocks would leave
+ * the editor holding a mutation managed storage never accepted.
  */
-export async function dispatchCarryPersist<T>(
-  request: CarryPersistRequest,
-  arms: CarryPersistArms<T>,
+export async function dispatchCarry<T>(
+  request: CarryRequest,
+  arms: CarryArms<T>,
 ): Promise<T> {
-  selectStorageRoute("carry-persist", request);
+  const decision = selectStorageRoute("carry", request);
+  if (decision.route === "unavailable") {
+    pushToast(CROSS_PAGE_MOVE_UNAVAILABLE_TOAST, "error");
+    return arms.unavailable();
+  }
+  if (decision.route === "managed") {
+    return arms.managed(decision.admission as ManagedWritableAdmission);
+  }
   return arms.direct();
 }

@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import {
   CROSS_PAGE_MOVE_UNAVAILABLE_TOAST,
-  dispatchCarryPersist,
+  dispatchCarry,
   dispatchCrossPageMove,
   dispatchDroppedFileInsertion,
   lastStorageDispatch,
@@ -200,21 +200,47 @@ describe("dispatchDroppedFileInsertion", () => {
   });
 });
 
-describe("dispatchCarryPersist — the recorded B2 gap", () => {
+describe("dispatchCarry — B2 gave carry a route", () => {
   const request = { destinationPage: "Sep 1st, 2026", sourcePages: ["Aug 31st, 2026"] };
 
-  // KNOWN ASYMMETRY, deliberately asserted so B2 has to delete this test rather
-  // than discover the gap again: carry has never had a managed arm. B1 keeps
-  // that behaviour verbatim and only makes the decision visible.
-  for (const { name, admission, route } of ADMISSIONS) {
-    it(`runs the Direct choreography under ${name} (route recorded as ${route})`, async () => {
-      bind(admission);
-      expect(await dispatchCarryPersist(request, { direct: () => "direct" as const })).toBe("direct");
-      expect(lastStorageDispatch("carry-persist")).toEqual({
-        operation: "carry-persist",
-        route,
-        request,
-      });
-    });
-  }
+  // B1 asserted the opposite of this on purpose: carry ran the Direct
+  // choreography under EVERY admission, and that assertion existed so B2 had to
+  // delete it deliberately rather than rediscover the gap. It is deleted here.
+  it("runs the Direct choreography only under a Direct binding", async () => {
+    bind(DIRECT);
+    expect(
+      await dispatchCarry(request, {
+        direct: () => "direct" as const,
+        managed: unreachable("managed"),
+        unavailable: unreachable("unavailable"),
+      }),
+    ).toBe("direct");
+    expect(lastStorageDispatch("carry")).toEqual({ operation: "carry", route: "direct", request });
+  });
+
+  it("refuses under a managed binding instead of writing Direct", async () => {
+    bind(MANAGED_WRITABLE);
+    expect(
+      await dispatchCarry(request, {
+        direct: unreachable("Direct"),
+        managed: () => "managed" as const,
+        unavailable: unreachable("unavailable"),
+      }),
+    ).toBe("managed");
+    expect(lastStorageDispatch("carry")).toEqual({ operation: "carry", route: "managed", request });
+  });
+
+  it("refuses with the shared toast when no writer is bound", async () => {
+    bind(null);
+    expect(
+      await dispatchCarry(request, {
+        direct: unreachable("Direct"),
+        managed: unreachable("managed"),
+        unavailable: () => "unavailable" as const,
+      }),
+    ).toBe("unavailable");
+    expect(toasts().map((toast) => [toast.message, toast.kind])).toEqual([
+      [CROSS_PAGE_MOVE_UNAVAILABLE_TOAST, "error"],
+    ]);
+  });
 });

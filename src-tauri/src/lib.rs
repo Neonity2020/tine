@@ -76,7 +76,8 @@ use debug::{
     flight_init, install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
 };
 use graph::{
-    app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
+    app_platform, approve_external_assets, begin_direct_cross_page_move, capture_graph_binding,
+    capture_target, create_graph, finish_direct_cross_page_move,
     default_graph_parent, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
     warm_done,
 };
@@ -750,6 +751,8 @@ pub fn run() {
             load_graph,
             inspect_graph_access,
             approve_external_assets,
+            begin_direct_cross_page_move,
+            finish_direct_cross_page_move,
             open_graph_window,
             startup_graph_path,
             capture_target,
