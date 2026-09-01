@@ -1231,10 +1231,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/plugins.rs", "fs.rename", 1),
         ("src-tauri/src/plugins.rs", "fs.write", 2),
         ("src-tauri/src/settings.rs", "fs.create_dir_all", 3),
-        ("src-tauri/src/settings.rs", "fs.remove_file", 1),
-        ("src-tauri/src/settings.rs", "fs.rename", 3),
-        ("src-tauri/src/settings.rs", "fs.write", 1),
-        ("src-tauri/src/settings.rs", "open.create_new", 1),
+        // Packet B5s collapses the settings, workspace, and session publishers
+        // onto the shared atomic writer. Only the audited legacy-session move
+        // still needs a raw rename in this file.
+        ("src-tauri/src/settings.rs", "fs.rename", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 3),
         ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 3),
@@ -1326,7 +1326,9 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         // content-addressed image blob, a quarantined record, and every page a
         // recovery completes or rolls back. Recovery writes graph bytes through
         // the SAME named audited protocol an ordinary save uses.
-        ("atomic_write", 10),
+        // +2 from `settings.rs` (packet B5s): the workspace registry and scoped
+        // session saves now use that same named audited protocol.
+        ("atomic_write", 12),
         ("atomic_write_new", 11),
         ("atomic_replace_expected_with_hooks", 1),
         ("atomic_copy", 0),
