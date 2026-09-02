@@ -29856,7 +29856,7 @@ pub(crate) mod validation_tests {
     fn stage_ready_with_claim_source_has_exactly_the_three_clean_entry_points() {
         let source = include_str!("hot_engine.rs");
         let production = source
-            .split("#[cfg(test)]\nmod validation_tests")
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
             .next()
             .expect("the hot-engine production half remains identifiable");
         let mut enclosing = "<file scope>";
@@ -29891,7 +29891,7 @@ pub(crate) mod validation_tests {
         assert_eq!(
             callers,
             vec![
-                "replay_clean_committed_tail",
+                "replay_clean_committed_batch_ids",
                 "commit_clean_prepared",
                 "accept_clean_prepared_below_managed_local_overlay",
             ],
@@ -30085,7 +30085,7 @@ pub(crate) mod validation_tests {
         );
 
         let production = source
-            .split("#[cfg(test)]\nmod validation_tests")
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
             .next()
             .expect("production half remains identifiable");
         assert_eq!(

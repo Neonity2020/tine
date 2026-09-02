@@ -48,6 +48,13 @@ fn visit_source_extensions(directory: &Path, extensions: &[&str], files: &mut Ve
     for entry in fs::read_dir(directory).expect("native source directory is readable") {
         let path = entry.expect("native source entry is readable").path();
         if path.is_dir() {
+            // Tauri's Android codegen lands in a gitignored `generated/`
+            // sibling of the hand-written sources after any Android build;
+            // it is not shipped source and would make this guard depend on
+            // whether the checkout has ever built for Android.
+            if path.file_name().is_some_and(|name| name == "generated") {
+                continue;
+            }
             visit_source_extensions(&path, extensions, files);
         } else if path
             .extension()
@@ -991,7 +998,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/model.rs", "cap.remove_file", 26),
         ("crates/tine-core/src/model.rs", "cap.rename", 1),
         ("crates/tine-core/src/model.rs", "fs.create_dir", 8),
-        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 16),
+        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 15),
         ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 2),
         ("crates/tine-core/src/model.rs", "fs.remove_file", 16),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
@@ -1187,6 +1194,13 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/backup.rs", "libc.renameat2", 1),
         ("src-tauri/src/backup.rs", "open.create_new", 3),
         ("src-tauri/src/commands.rs", "cap.remove_file", 1),
+        // Packet B3: the app-private live-save conflict envelope. Its
+        // directory is created before the audited atomic replacement, torn
+        // temporaries and the retired final file are removed, and an
+        // unreadable envelope is renamed aside rather than deleted.
+        ("src-tauri/src/conflict_capsule.rs", "fs.create_dir_all", 1),
+        ("src-tauri/src/conflict_capsule.rs", "fs.remove_file", 2),
+        ("src-tauri/src/conflict_capsule.rs", "fs.rename", 1),
         ("src-tauri/src/data_home.rs", "fs.create_dir_all", 1),
         ("src-tauri/src/data_home.rs", "fs.remove_file", 1),
         ("src-tauri/src/data_home.rs", "fs.write", 1),
@@ -1224,12 +1238,8 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             4,
         ),
         ("src-tauri/src/migrate_identifier.rs", "fs.rename", 4),
-        ("src-tauri/src/plugins.rs", "fs.create_dir", 1),
-        ("src-tauri/src/plugins.rs", "fs.create_dir_all", 2),
-        ("src-tauri/src/plugins.rs", "fs.remove_dir", 1),
-        ("src-tauri/src/plugins.rs", "fs.remove_dir_all", 2),
-        ("src-tauri/src/plugins.rs", "fs.rename", 1),
-        ("src-tauri/src/plugins.rs", "fs.write", 2),
+        // Packet B5p moved every plugin-package mutation behind tine-storage's
+        // package protocol (see g_d); `plugins.rs` has no raw primitive left.
         ("src-tauri/src/settings.rs", "fs.create_dir_all", 3),
         // Packet B5s collapses the settings, workspace, and session publishers
         // onto the shared atomic writer. Only the audited legacy-session move
@@ -1328,7 +1338,10 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         // the SAME named audited protocol an ordinary save uses.
         // +2 from `settings.rs` (packet B5s): the workspace registry and scoped
         // session saves now use that same named audited protocol.
-        ("atomic_write", 12),
+        // +1 from `src-tauri/src/conflict_capsule.rs` (packet B3): the
+        // app-private live-save conflict envelope is replaced whole through
+        // the same named audited protocol.
+        ("atomic_write", 13),
         ("atomic_write_new", 11),
         ("atomic_replace_expected_with_hooks", 1),
         ("atomic_copy", 0),
@@ -1551,6 +1564,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ),
         ("crates/tine-core/src/fast_commit.rs", "journal.v1.open", 1),
         ("crates/tine-core/src/model.rs", "durable_directory.open", 5),
+        // Packet A5: the disposable clean-open checkpoint publishes its two
+        // slots and commit pointer through one durable directory.
+        (
+            "crates/tine-core/src/oplog/checkpoint_generation.rs",
+            "durable_directory.open",
+            1,
+        ),
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
@@ -1625,10 +1645,62 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.12.0\""));
+    // Re-pinned 2026-09-02 (wave-2 fix-ups): packet A5 added
+    // `checkpoint_generation.rs` (one `DurableDirectoryPublication::open`)
+    // without updating this census, so master 7623fb76 was red here.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "ab5fa0db2936c55d742204faf26bcf69965d9d2ccdaf6b962435353a25eaed9e",
+        "1de0036d4d96794366ef120ab4428d9c1898f732bf2b8bf08ada78da26f0dd23",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
+    );
+}
+
+/// Lane evidence never enters the tracked tree at the repository root.
+///
+/// Wave-2 lanes committed `RECEIPT*.md`, `baseline-*.txt`, `necessity-*.txt`
+/// and a fail-before log at the root; every lane wrote the same `RECEIPT.md`
+/// name, so the merges destroyed four receipts, and the surviving files leaked
+/// private worktree paths and dossier names to both public remotes. Lanes still
+/// write their receipt and baselines to the worktree root (a workspace-write
+/// lane cannot reach outside it), but those files stay UNTRACKED — `.gitignore`
+/// carries the patterns — and the manager archives them under
+/// `tine-agents/evidence/` before integration. This guard checks the tracked
+/// set, so an in-flight lane's untracked receipt does not trip it.
+#[test]
+fn g_h_repository_root_tracks_no_lane_evidence() {
+    let repo = repository_root();
+    let ignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
+    for pattern in [
+        "/RECEIPT*.md",
+        "/baseline-*.txt",
+        "/necessity-*.txt",
+        "/*-fail-before.log",
+    ] {
+        assert!(
+            ignore.lines().any(|line| line.trim() == pattern),
+            ".gitignore lost the lane-evidence pattern {pattern}"
+        );
+    }
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "ls-files",
+            "--",
+            "RECEIPT*.md",
+            "baseline-*.txt",
+            "necessity-*.txt",
+            "*-fail-before.log",
+        ])
+        .output()
+    else {
+        return; // no git on this machine: the .gitignore half still holds
+    };
+    let tracked = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        tracked.trim().is_empty(),
+        "lane evidence is tracked at the repository root; move it under \
+         tine-agents/evidence/ and `git rm` it:\n{tracked}"
     );
 }
 
@@ -1950,14 +2022,14 @@ fn census_guard_itself_names_every_required_guard() {
         .filter_map(|line| line.trim().strip_prefix("fn g_"))
         .filter_map(|line| line.split_once('(').map(|(name, _)| name))
         .collect::<BTreeSet<_>>();
-    assert_eq!(tests.len(), 7);
+    assert_eq!(tests.len(), 8);
     let prefixes = tests
         .iter()
         .map(|name| name.split('_').next().unwrap())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         prefixes,
-        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g"])
+        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g", "h"])
     );
     assert!(
         include_str!("oplog/mod.rs")

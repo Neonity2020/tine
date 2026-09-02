@@ -8693,6 +8693,16 @@ mod tests {
                  change — it names this function as the reason the file is not read-only \
                  (invariant I-11)."
             );
+            // Harvest H 3a: no activation marker and no authoritative baseline
+            // publication happens BEFORE `commit_clean_activation`. Pin the
+            // invariant itself, not its converse: every production occurrence
+            // of each publication token lives inside the commit slice.
+            assert_eq!(
+                production.matches(write).count(),
+                commit.matches(write).count(),
+                "{write} is invoked outside commit_clean_activation; the preparation half \
+                 must stay free of authority-changing publication (Harvest H 3a, I-7)"
+            );
         }
 
         assert!(

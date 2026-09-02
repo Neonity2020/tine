@@ -3148,6 +3148,10 @@ mod tests {
         let mut names = fs::read_dir(root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
+            // The clean-open checkpoint (Harvest A5) is a disposable
+            // acceleration cache the engine may write at any time; it is not
+            // part of the immutable publication surface this image compares.
+            .filter(|name| name != "clean-open-checkpoint-v1")
             .collect::<Vec<_>>();
         names.sort_unstable();
         image.push((

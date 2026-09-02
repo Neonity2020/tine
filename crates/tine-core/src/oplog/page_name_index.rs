@@ -384,7 +384,7 @@ pub(crate) struct PageNamePublicationCandidateV1 {
 /// Authenticated exact-name provenance for one occupied canonical key.
 ///
 /// The fields stay private so callers cannot manufacture an exact-title
-/// selection without reading it through an ownership root (or the bounded
+/// selection without reading it through an ownership root (or the unbounded
 /// run-local ephemeral index that mirrors it, which is live production state —
 /// see `the_ephemeral_page_name_index_is_live_production_state`).
 #[derive(Clone, Debug, Eq, PartialEq)]

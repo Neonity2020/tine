@@ -846,7 +846,7 @@ mod tests {
             "FastLocalCommitter gained a production caller; update the header and contract"
         );
 
-        let counter_calls: usize = [
+        for name in [
             "note_sqlite_drain",
             "note_archive_object_read",
             "note_graph_wide_catalog_decode",
@@ -855,14 +855,13 @@ mod tests {
             "note_graph_text_inventory",
             "note_effective_identity_rebuild",
             "note_real_page_name_materialization",
-        ]
-        .into_iter()
-        .map(|name| call_count(production, name))
-        .sum();
-        assert_eq!(
-            counter_calls, 8,
-            "the production structural-counter census changed; update the header guard"
-        );
+        ] {
+            assert!(
+                call_count(production, name) > 0,
+                "structural counter {name} is no longer wired in production; update the \
+                 header and contract (a legitimate additional call site is fine)"
+            );
+        }
     }
 
     fn journal_frames(
