@@ -39,6 +39,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Bulk insertions now keep one storage authority from admission through
+  publication.** Clipboard, quick-capture, template, HTML, and dropped-file
+  insertions route through the shared storage front door; managed limit tokens
+  retain their binding-generation re-check so a late result cannot land after a
+  backend switch.
+
+- **Android: saving a page in Direct Files works again** (GH #466). 0.6.981
+  failed every Direct Files save on Android with "unknown: Permission denied
+  (os error 13)", because page publication had been moved onto a
+  hard-link-based no-clobber move that Android's shared storage refuses. Direct
+  Files pages are published again with the same no-clobber rename 0.6.98 used
+  on every platform, keeping the exact-byte checks around it; a refused
+  filesystem call now names itself in the error instead of showing a bare
+  errno.
+
 - **Conflicted pages no longer rewrite their restart-recovery capsule for every
   save attempt.** Identical retained drafts skip the atomic envelope write, and
   changed drafts use a capsule-specific debounce so continued editing preserves

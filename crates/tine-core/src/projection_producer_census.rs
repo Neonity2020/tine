@@ -1563,7 +1563,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             1,
         ),
         ("crates/tine-core/src/fast_commit.rs", "journal.v1.open", 1),
-        ("crates/tine-core/src/model.rs", "durable_directory.open", 5),
+        // GH #466: the three Direct Files graph-text sites (create, validated
+        // write, bounded replace) left this boundary — its Android arm is a
+        // hard link that shared storage refuses — for the graph tree's own
+        // no-clobber rename (`move_graph_text_exact_no_replace`). The two
+        // remaining opens are the app-private durable authorities.
+        ("crates/tine-core/src/model.rs", "durable_directory.open", 2),
         // Packet A5: the disposable clean-open checkpoint publishes its two
         // slots and commit pointer through one durable directory.
         (
@@ -1649,9 +1654,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
     // The write-crossing table above remains unchanged.
+    // Re-pinned 2026-09-02 (GH #466): the five Direct Files graph-text
+    // `publication.move_exact_no_replace` receiver calls in `model.rs` left the
+    // tine-storage boundary for `move_graph_text_exact_no_replace` (see the
+    // `durable_directory.open` row for `model.rs`, 5 → 2, and the guard
+    // `direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename`).
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "fc5d7b6b196ba0336e0d36cec9ed5f1a440ecbd90fda2b0ddebe09c8c731e49b",
+        "7b608e3e7eaf068b69dc990349563059731ffb5022b6c1010dc5e6ede4538e46",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

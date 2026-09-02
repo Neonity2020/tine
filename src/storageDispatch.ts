@@ -3,8 +3,9 @@
 // **The rule (I-6 — storage authority is selected in one place, then flows as a
 // value).** The decision "which authority governs this graph" is made once, by
 // the native slot, and published as `applicationPageAdmission`. A semantic
-// storage operation — a cross-page move, a dropped-file insertion, a carry —
-// must NOT re-implement the branch-and-dispatch choreography at its call site.
+// storage operation — a cross-page move, a dropped-file insertion, a bulk
+// insertion, a carry — must NOT re-implement the branch-and-dispatch
+// choreography at its call site.
 // It states its intent here and hands over the arms; THIS module reads the
 // admission snapshot exactly once per operation, maps it to an exhaustive
 // route, and invokes exactly one arm. Call sites never see a second authority
@@ -33,9 +34,9 @@
 //                                              (dispatch counters) and a managed
 //                                              binding never reaches Direct
 //                                              persistence (`savePage`/dirty).
-//   - `src/storageAuthorityRatchet.test.ts`  — source-scan ratchet over
-//                                              `applicationPageAdmission`
-//                                              readers.
+//   - `src/storageAuthorityRatchet.test.ts`  — exact source-scan ratchet over
+//                                              every managed-runtime snapshot
+//                                              reader.
 //
 // **History.** B1 introduced this module behaviour-preservingly and recorded
 // three asymmetries. B2 closed one of them: carry no longer runs the Direct
@@ -72,6 +73,7 @@ export type StorageRoute = "managed" | "direct" | "unavailable";
 export type SemanticStorageOperation =
   | "cross-page-move"
   | "dropped-file-insertion"
+  | "bulk-insertion"
   | "carry";
 
 export interface StorageRouteDecision {
@@ -96,6 +98,7 @@ export interface StorageDispatchRecord {
 const OPERATIONS: readonly SemanticStorageOperation[] = [
   "cross-page-move",
   "dropped-file-insertion",
+  "bulk-insertion",
   "carry",
 ];
 
@@ -140,8 +143,9 @@ export function lastStorageDispatch(
 
 /**
  * The ONE read of `applicationPageAdmission` made for the purpose of deciding
- * where a semantic storage operation runs. Every other read in `src/` is either
- * a value capture or an I-20 staleness re-check, and is listed in the census.
+ * where a semantic storage operation runs. Every other authority-bearing read
+ * in `src/` is a value capture or an I-20 staleness re-check; display-only
+ * runtime readers are classified separately. All are listed in the census.
  */
 function readApplicationPageAdmission(): ApplicationPageAdmission | null {
   return managedStorageRuntime.snapshot().applicationPageAdmission;
@@ -265,6 +269,47 @@ export async function dispatchDroppedFileInsertion<T>(
   arms: DroppedFileInsertionArms<T>,
 ): Promise<T> {
   const decision = selectStorageRoute("dropped-file-insertion", request);
+  if (decision.route === "unavailable") return arms.unavailable();
+  if (decision.route === "managed") {
+    return arms.managed(decision.admission as ManagedWritableAdmission);
+  }
+  return arms.direct();
+}
+
+// ---------------------------------------------------------------------------
+// Bulk insertion
+// ---------------------------------------------------------------------------
+
+export interface BulkInsertionRequest {
+  /** The block receiving the inserted outline, or null for an empty page. */
+  readonly targetId: string | null;
+  /** The page receiving an insertion when it does not yet have an anchor. */
+  readonly targetPageName?: string;
+}
+
+export interface BulkInsertionArms<T> {
+  /** Managed limit check. Receives the exact admission selected above it. */
+  readonly managed: (admission: ManagedWritableAdmission) => T;
+  /** Direct Files has no managed page limits. */
+  readonly direct: () => T;
+  /** No writer is currently available; the caller owns the existing toast. */
+  readonly unavailable: () => T;
+}
+
+/**
+ * Route one synchronous bulk-insertion admission.
+ *
+ * This front door deliberately stays synchronous: clipboard Cut grants and
+ * editor completions must be admitted before any continuation or mutation can
+ * run. The managed arm receives the dispatcher's admission as a value; its
+ * eventual token consumption independently re-proves `binding_generation`
+ * immediately before publication (I-20).
+ */
+export function dispatchBulkInsertion<T>(
+  request: BulkInsertionRequest,
+  arms: BulkInsertionArms<T>,
+): T {
+  const decision = selectStorageRoute("bulk-insertion", request);
   if (decision.route === "unavailable") return arms.unavailable();
   if (decision.route === "managed") {
     return arms.managed(decision.admission as ManagedWritableAdmission);

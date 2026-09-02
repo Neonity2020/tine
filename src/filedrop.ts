@@ -17,6 +17,7 @@ import {
   doc,
   formatForBlock,
   insertOutlineAfter,
+  MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST,
   managedBulkOutlinePlan,
   pageByName,
   preflightManagedBulkInsertion,
@@ -149,16 +150,9 @@ export async function insertDroppedFiles(afterId: string, paths: readonly string
       {
         direct: () => insertDroppedFilesDirect(afterId, paths),
         unavailable: () => {
-          const admission = preflightManagedBulkInsertion(afterId, () => ({
-            insertedDescendants: 0,
-            removedOrReusedDescendants: 0,
-            insertionRootDepth: depthOf(afterId) + 1,
-            maximumInputRelativeDepth: 0,
-            insertedRawTextUtf8Bytes: 0,
-          }));
-          if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
+          reportManagedBulkInsertionRefusal(MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST);
         },
-        managed: async () => {
+        managed: async (managedAdmission) => {
           const plan = await planManagedDrop(paths);
           if (!plan.length) return;
           const plannedNodes = plan.map((item): OutlineNode => item.kind === "grid"
@@ -166,12 +160,16 @@ export async function insertDroppedFiles(afterId: string, paths: readonly string
             // Generated asset filename/path bytes are actor-authoritative. The one
             // reference node is still a certain block-count fact before import.
             : { raw: "", children: [] });
-          const admission = preflightManagedBulkInsertion(afterId, (limits) => managedBulkOutlinePlan(
-            plannedNodes,
-            depthOf(afterId) + 1,
-            0,
-            limits,
-          ));
+          const admission = preflightManagedBulkInsertion(
+            managedAdmission,
+            afterId,
+            (limits) => managedBulkOutlinePlan(
+              plannedNodes,
+              depthOf(afterId) + 1,
+              0,
+              limits,
+            ),
+          );
           if (admission.kind === "refused") {
             reportManagedBulkInsertionRefusal(admission.toast);
             return;

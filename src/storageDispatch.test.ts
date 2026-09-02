@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import {
   CROSS_PAGE_MOVE_UNAVAILABLE_TOAST,
+  dispatchBulkInsertion,
   dispatchCarry,
   dispatchCrossPageMove,
   dispatchDroppedFileInsertion,
@@ -85,6 +86,7 @@ describe("selectStorageRoute", () => {
     expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 1, direct: 1, unavailable: 1 });
     // Sibling operations keep their own counters.
     expect(storageDispatchCounters("dropped-file-insertion")).toEqual({ managed: 0, direct: 0, unavailable: 0 });
+    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 0, direct: 0, unavailable: 0 });
   });
 });
 
@@ -197,6 +199,43 @@ describe("dispatchDroppedFileInsertion", () => {
       unavailable: () => null,
     });
     expect(toasts()).toEqual([]);
+  });
+});
+
+describe("dispatchBulkInsertion", () => {
+  const request = { targetId: "block-1", targetPageName: "Page" };
+
+  for (const { name, admission, route } of ADMISSIONS) {
+    it(`reaches only the ${route} arm under ${name}`, () => {
+      bind(admission);
+      const arms = {
+        managed: route === "managed" ? () => "managed" as const : unreachable("managed"),
+        direct: route === "direct" ? () => "direct" as const : unreachable("Direct"),
+        unavailable: route === "unavailable" ? () => "unavailable" as const : unreachable("unavailable"),
+      };
+      expect(dispatchBulkInsertion(request, arms)).toBe(route);
+      expect(storageDispatchCounters("bulk-insertion")).toEqual({
+        managed: route === "managed" ? 1 : 0,
+        direct: route === "direct" ? 1 : 0,
+        unavailable: route === "unavailable" ? 1 : 0,
+      });
+      expect(lastStorageDispatch("bulk-insertion")).toEqual({
+        operation: "bulk-insertion",
+        route,
+        request,
+      });
+    });
+  }
+
+  it("passes the exact selected managed admission into the managed limit check", () => {
+    bind(MANAGED_WRITABLE);
+    const seen: ApplicationPageAdmission[] = [];
+    dispatchBulkInsertion(request, {
+      managed: (admission) => seen.push(admission),
+      direct: unreachable("Direct"),
+      unavailable: unreachable("unavailable"),
+    });
+    expect(seen).toEqual([MANAGED_WRITABLE]);
   });
 });
 

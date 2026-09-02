@@ -34,7 +34,12 @@ import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
 import { clearHeldExternalChanges } from "./conflictPolicy";
 import { managedStorageRuntime } from "./managedStorageRuntime";
-import { dispatchCrossPageMove, MANAGED_MULTI_SOURCE_MOVE_UNAVAILABLE_TOAST } from "./storageDispatch";
+import {
+  dispatchBulkInsertion,
+  dispatchCrossPageMove,
+  MANAGED_MULTI_SOURCE_MOVE_UNAVAILABLE_TOAST,
+  type ManagedWritableAdmission,
+} from "./storageDispatch";
 import { resetReferenceSectionState } from "./referenceSectionState";
 import {
   isConflicted,
@@ -2553,15 +2558,18 @@ interface InternalBulkInsertionAdmission extends BulkInsertionAdmission {
   insertionRootDepthOffset: number;
 }
 
-export type ManagedBulkInsertionPreflight =
-  | { kind: "direct" }
+export type ManagedBulkInsertionLimitCheck =
   | { kind: "admitted"; token: BulkInsertionAdmission }
   | { kind: "refused"; toast: string };
+
+export type ManagedBulkInsertionPreflight =
+  | { kind: "direct" }
+  | ManagedBulkInsertionLimitCheck;
 
 const managedBulkOverflowToast = (limit: number): string =>
   `Can't insert: this page would exceed Tine-managed storage's ${limit}-block or request-size limit. Nothing was changed.`;
 
-const managedBulkUnavailableToast =
+export const MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST =
   "Can't insert while Tine-managed storage is changing state. Nothing was changed.";
 
 interface BoundedPageCensus {
@@ -2647,31 +2655,29 @@ function bulkInsertionOverflows(
 }
 
 /**
- * Advisory, side-effect-free preflight for one selected bulk route. Direct
- * bindings return before the caller builds its plan; managed records only
- * reject a known lower-bound overflow and leave the native actor authoritative.
+ * Advisory, side-effect-free limit check for a bulk route already selected as
+ * managed. The exact dispatcher-provided admission is stamped into the token;
+ * consumption re-proves it immediately before publication (I-20).
  */
 export function preflightManagedBulkInsertion(
+  admission: ManagedWritableAdmission,
   targetId: string | null,
   buildPlan: (limits: ManagedBulkAdmissionLimits) => ManagedBulkInsertionPlan,
   targetPageName?: string,
-): ManagedBulkInsertionPreflight {
-  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
-  if (admission?.authority === "direct") return { kind: "direct" };
-  if (!admission) return { kind: "refused", toast: managedBulkUnavailableToast };
-  if (admission.authority !== "managed_writable") {
-    return { kind: "refused", toast: managedBulkUnavailableToast };
-  }
-
+): ManagedBulkInsertionLimitCheck {
   const target = targetId === null ? null : doc.byId[targetId];
   if (targetId !== null && (!target || !blockWritable(targetId))) {
-    return { kind: "refused", toast: managedBulkUnavailableToast };
+    return { kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST };
   }
   const pageName = target?.page ?? targetPageName;
-  if (!pageName || !pageWritable(pageName)) return { kind: "refused", toast: managedBulkUnavailableToast };
+  if (!pageName || !pageWritable(pageName)) {
+    return { kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST };
+  }
   const page = pageByName(pageName);
   const targetGeneration = pageInstanceGeneration(pageName);
-  if (!page || targetGeneration === null) return { kind: "refused", toast: managedBulkUnavailableToast };
+  if (!page || targetGeneration === null) {
+    return { kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST };
+  }
   const limits: ManagedBulkAdmissionLimits = {
     applicationSavePageBlocks: admission.application_save_page_blocks,
     applicationPageRequestTextBytes: admission.application_page_request_text_bytes,
@@ -4150,12 +4156,23 @@ export function pasteClipboardPayload(
   // into (GH #322). Assuming the host survives keeps the admitted block count an
   // upper bound on the realized one either way; the cost is refusing a paste
   // into an empty host on a page already exactly at the limit.
-  const admission = preflightManagedBulkInsertion(targetId, (limits) => managedBulkOutlinePlan(
-    slot.blocks,
-    depthOf(targetId) + 1,
-    0,
-    limits,
-  ));
+  const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+    { targetId },
+    {
+      direct: () => ({ kind: "direct" }),
+      unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
+      managed: (managedAdmission) => preflightManagedBulkInsertion(
+        managedAdmission,
+        targetId,
+        (limits) => managedBulkOutlinePlan(
+          slot.blocks,
+          depthOf(targetId) + 1,
+          0,
+          limits,
+        ),
+      ),
+    },
+  );
   if (admission.kind === "refused") {
     reportManagedBulkInsertionRefusal(admission.toast);
     return Promise.resolve(null);
@@ -4275,15 +4292,23 @@ async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNo
   const page = pageByName(name);
   if (!page || !pageWritable(name)) return false;
   const insertionTarget = page.roots.length ? page.roots[page.roots.length - 1] : null;
-  const admission = preflightManagedBulkInsertion(
-    insertionTarget,
-    (limits) => managedBulkOutlinePlan(
-      nodes,
-      insertionTarget === null ? 1 : depthOf(insertionTarget) + 1,
-      0,
-      limits,
-    ),
-    name,
+  const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+    { targetId: insertionTarget, targetPageName: name },
+    {
+      direct: () => ({ kind: "direct" }),
+      unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
+      managed: (managedAdmission) => preflightManagedBulkInsertion(
+        managedAdmission,
+        insertionTarget,
+        (limits) => managedBulkOutlinePlan(
+          nodes,
+          insertionTarget === null ? 1 : depthOf(insertionTarget) + 1,
+          0,
+          limits,
+        ),
+        name,
+      ),
+    },
   );
   if (admission.kind === "refused") {
     reportManagedBulkInsertionRefusal(admission.toast);
