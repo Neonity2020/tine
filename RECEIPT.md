@@ -1,75 +1,62 @@
-# Harvest D receipt — stale async landing
+# Harvest A5 implementation receipt
 
 ## Contract and pinned base
 
-Harvest D implements I-20 for the dossier's full frontend sweep: graph-scoped
-async work captures `graphBinding()` plus the graph root before its first await,
-rechecks at every landing boundary, and never treats the render epoch as graph
-identity. User actions fail visibly; background work retires silently and
-queues replacement work where required.
+A5 implements the disposable clean-open checkpoint from SPEC-A r4: authoritative operation history remains the sole truth; a valid checkpoint restores observable engine state and replays only the dependency-staged archive tail; every checkpoint failure recovers by predecessor generation or sequence-zero full replay, except authoritative archive damage remains surfaced through the existing archive-damage path.
 
-Pinned cumulative Wave-1 base:
-`e19514f98cf1044391f3a3d2f09d2579275353ee`.
+Pinned cumulative Wave-1 base (authorized as satisfying the code-availability precondition without claiming master integration): `e19514f98cf1044391f3a3d2f09d2579275353ee`.
 
-## Owned surface
+## Launch preconditions
 
-- `src/landAsync.ts` and its tests/guard
-- QuickSwitcher resource/create landing
-- pinned tab/PDF close confirmation
-- all eight Block asset initiators and their required editor/graph token
-- plugin invocation ownership
-- reload-on-focus graph retirement and replacement scheduling
-- Settings plugin/backup busy ownership and the mobile media-editor gate
-- `docs/contracts/frontend-staleness.md`, the Harvest D catalog rows, and
-  CHANGELOG
+- A1 steps 1+2 and its benchmark driver are present on the pinned base.
+- A4 cap removal is present on the pinned base.
+- No A3 worktree/lane was running when A5 started.
+- Coordinator background check allowed work. Master and the active release candidate were not touched.
 
-No Rust, backend, persistence, ui, graph, or native source was changed.
+## Pre-edit baseline
 
-## Baseline and necessity
+`cargo test -p tine-core -- --list` on the exact base enumerated 2,041 tests (1,992 ordinary, 43 ignored, 6 doc-tests) with sorted-name SHA-256 `fd63531732250e14a7b5d5a44abc9ccfd6fa19e24a715a9a8a53009d8d603ee4`.
 
-The prior executor committed the implementation without preserving baseline
-artifacts. Before sealing the packet, both required commands were reconstructed
-in a detached worktree at the exact parent: `npm test -- --run` passed in full,
-and `npx tsc --noEmit` reported no errors. See
-`baseline-d-npm-test.txt` and `baseline-d-tsc.txt`.
+`cargo test -p tine-core` on the exact base completed green: 1,992 passed, 0 failed, 43 ignored, plus 6 green doc-tests.
 
-Necessity was independently reconstructed by applying the D helper and D tests,
-but none of the D production-site changes, to that exact parent. The unit and
-render invocations both failed at the intended assertions: stale QuickSwitcher
-navigation, tab loss after confirmation, wrong-editor asset insertion,
-render-epoch plugin invalidation, missing replacement focus refresh, and a
-prematurely re-enabled backup button. The source guard also caught the old
-graph-epoch comparison and missing switcher binding. See `necessity-d.txt`.
+## Owned implementation
 
-## Gates
+- `crates/tine-core/src/oplog/checkpoint.rs`: v1 checkpoint payload, canonical validation, atomic current/predecessor generation publication, crash cuts, fallback/open selection, checkpoint capture, and checkpoint-first reopen.
+- `crates/tine-core/src/oplog/checkpoint_generation.rs`: the authorized `pub(crate)` codec seam, strictly composing `AcceptedBatchEvidence::encode_canonical` and `decode_canonical`; no new codec or public surface.
+- `crates/tine-core/src/oplog/mod.rs`: module registration and crate-private checkpoint test/support exports.
+- `crates/tine-core/src/oplog/hot_engine.rs`: crate-private accepted-evidence codec visibility needed by the seam, checkpoint restoration/capture, replay pruning, fingerprint validation, cleanup, and force-flush integration.
+- `crates/tine-core/src/oplog/import.rs`: checkpoint-aware open routed through the existing clean-activation reopen path, with full replay still the fallback.
+- `crates/tine-core/src/sync_runtime.rs`: runtime-open state threads the checkpoint-backed engine and open telemetry without a second reopen route.
+- `crates/tine-core/src/oplog/oplog_bench.rs`: binding A5 scale measurement and checkpoint payload/work receipts.
+- `crates/tine-core/src/measure.rs`: A5 stage names and checkpoint payload/work counters.
+- `crates/tine-core/src/projection_producer_census.rs`: source guard for checkpoint access through existing clean-open and public-boundary guard.
+- `crates/tine-core/src/oplog/operational_coordinator.rs`: removal of the final independent clean-runtime open, so checkpoint ownership remains single-path.
+- `crates/tine-core/src/lib.rs`: no public export; test-only benchmark harness wiring.
+- Contract/catalog/changelog and root evidence files.
 
-- `npm test -- --run`: PASS in full after adding graph identity to the existing
-  modified-click render harness.
-- `npx tsc --noEmit`: PASS.
-- `npm run build`: PASS.
-- `node scripts/check-regression-catalog.mjs`: PASS, 391 entries and 252 GitHub
-  issues.
-- `npm run check:regressions`: inherited red floor only. Its catalog and index
-  checks pass, then the retired-managed-v1 guard flags
-  `crates/tine-core/src/sync_runtime_tests.rs:27934`. That Rust file is bytewise
-  unchanged from the pinned parent, and the flagged inert-v1 fixture is already
-  present there; D neither owns nor alters it.
-- `git diff --check`: PASS at seal time.
+## Correctness and crash evidence
 
-## Forks resolved
+- Focused checkpoint tests: 22 passed.
+- Storage/open integration tests: 8 passed.
+- Checkpoint tests cover no-tail equality, dependency-staged tail replay, zero-tail replay, corrupt payload and corrupt current-generation fallback, interrupted publication at every directory-name transition, predecessor fallback, archive rebaselining invalidation, sequence/watermark binding, fingerprint tamper rejection, roster enforcement, status/evidence restoration, duplicate causal rows, replay-plan mismatches, and scale workload validation.
+- The accepted-evidence seam is a section of the existing canonical codec; its source guard and public-boundary test prove no parallel encoding and no public exposure.
+- Authoritative archive damage remains an archive error; checkpoint damage remains disposable and never becomes a refusal surface.
 
-- Graph identity is the existing `graphBindingRev`, not a new counter and not
-  `graphEpoch`.
-- Block asset scope is captured at each initiator, not after latency at the
-  sink; the sink argument is required.
-- A graph change during focus refresh queues exactly one non-overlapping
-  replacement after the stale tail settles.
-- QuickSwitcher render tests now mount the graph-scoped component with the
-  production-equivalent graph owner instead of a null graph.
+## Numeric gate evidence
+
+The final quiet release measurement used the binding command and medians of three after eliminating construction garbage, per-row proof repetition, duplicate payload allocations, and duplicate namespace enumeration:
+
+| metric | N=50 | N=400 | N=800 | N=800 / N=50 | gate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A5-owned sum (`clean_checkpoint_open` + `clean_checkpoint_tail_discovery` + `committed_tail_replay`) | 4.3 ms | 17.7 ms | 34.2 ms | 7.95x | 1.25x |
+| whole reopen | 60.9 ms | 119.7 ms | 180.9 ms | 2.97x | 2.507x |
+| checkpoint payload | 185,185 B | 992,594 B | 1,994,339 B | 10.77x | reported |
+| capture work | 349 | 2,099 | 4,099 | 11.74x | not superlinear versus 16x history growth |
+
+The residual A5 stages are the required linear decode/restore of the exact accepted sequence, statuses/evidence, causal rows, fingerprints, required-object roster, and semantic runtime state. §A5 explicitly requires those lifetime-proportional components in v1 and forbids a parallel roster; the implementation has no remaining redundant I/O or superseded sealed nodes to remove. Therefore the primary 1.25x gate and the authorized secondary 2.507x gate both fail on the required empirical shape.
+
+Required authorization to continue: manager sign-off must either (1) accept these measured gates for the empirical A5 design while retaining archive rebaselining as the terminal bound, or (2) replace the v1 shape with a strict O(tail) design and authorize the resulting scope expansion (durable acceptance sequencing/incremental state outside the current packet). No code change can honestly claim the current 1.25x gate without changing one of those contract decisions.
 
 ## Verdict
 
-**IMPLEMENTED AND VERIFIED WITH ONE INHERITED OUT-OF-SCOPE GUARD FAILURE.** All
-D-owned tests, full frontend tests, typecheck, build, catalog validation, source
-guard, contract doc, and catalog rows are green. The only composed regression
-command failure is unchanged at the exact parent and outside D's write set.
+**CHECKPOINTED AT NUMERIC FORK — not integrated.** Correctness, crash, authority, and focused compile/test gates are green; the binding performance gates above are red and require manager authorization before final formatting, full baseline-by-name suite comparison, npm bench, anonymized-graph acceptance, catalog status promotion, or packet verdict. Receipt-retention, archive rebaselining/compaction, validation checks, and app-layer files were not touched.

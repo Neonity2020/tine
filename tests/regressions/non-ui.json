@@ -2,6 +2,21 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-MANAGED-CLEAN-OPEN-CHECKPOINT-001",
+   "title": "Clean Managed Storage reopen restores a disposable checkpoint and semantically replays only its uncheckpointed tail",
+   "family": "managed-storage-lifetime-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest A5"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "fixing",
+   "coverage": {
+    "tests": ["crates/tine-core/src/oplog/checkpoint_generation.rs", "crates/tine-core/src/oplog/hot_engine.rs", "crates/tine-core/src/sync_runtime.rs"],
+    "scenario": "managed-clean-open.disposable-checkpoint-tail-only",
+    "failBefore": "at e19514f98cf1044391f3a3d2f09d2579275353ee, oplog::checkpoint_generation::tests::checkpoint_open_counter_distinguishes_checkpoint_from_full_replay failed because no checkpoint-open path or path-discriminating counter existed"
+   },
+   "notes": "Before Harvest A5 every clean reopen semantically reapplies every accepted batch onto sequence-zero genesis: N=800 committed_tail_replay measured 1253.5 ms and 90.0% of clean recovery. The checkpoint must remain disposable, compare its roster/fingerprints against authoritative archive evidence, existence-check required objects by name, and fall back without introducing a new refusal."
+  },
+  {
    "id": "REG-SESSION-ATOMIC-DURABILITY-001",
    "title": "App-private session state is published through a named crash-durable atomic replacement protocol",
    "family": "app-private-data-safety",

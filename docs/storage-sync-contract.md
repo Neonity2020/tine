@@ -296,6 +296,7 @@ Managed storage selection, and no byte is written into the user's graph.
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4, page capsule v4/v5, plus commit v1 | authoritative baseline; new writes use capsule v5, readers retain receiptless-v4 recovery; installed before the marker and never mutated |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
+| `archive/operations/clean-open-checkpoint-v1/{current,payload-{a,b},generation-{a,b}}` | clean engine actor plus one coalesced background writer | clean managed open | current canonical checkpoint v1; two bounded replaceable slots and one durable commit pointer; accepted roster encoded by `tine-storage` sealed accepted index | disposable acceleration only; absent, stale, torn, wrong-format, oversized, or internally damaged state full-replays and rewrites without refusal; no migration or backup |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
 | `archive/operations/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
 | `archive/operations/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
@@ -787,6 +788,66 @@ touch only one semantic region while its projection post-state includes an
 otherwise unrelated page creation, and projection validation reconstructs that
 larger frontier. A merely durable pre-shutdown status or an effect-equivalent
 accepted prefix cannot make an unreplayed manifest ready.
+
+Clean open first attempts the disposable `clean-open-checkpoint-v1` state. Its
+single `current` pointer is the commit point; payload and generation bytes land
+completely in the inactive one of two bounded slots before that pointer changes.
+An interrupted write therefore leaves the prior pointed generation complete.
+Every create and replacement uses the audited durable directory-publication
+boundary. There is exactly one current format, no migration reader, and no
+preserved backup for rejected checkpoint bytes because the operation archive is
+the sole semantic authority.
+
+The checkpoint contains every clean-runtime field that changes later
+admission, conflict, or query decisions, including the exact ephemeral
+page-name ownership state, current path/name/UUID claims and conflicts,
+accepted frontier and resident CRDT documents, projection-head batch locators,
+and the accepted sequence. The accepted roster is not a parallel list: it is
+the canonical `tine-storage` sealed accepted index with exact accepted evidence,
+causal records, status map and sequence root. The checkpoint also records each
+roster manifest fingerprint and the union of object names those manifests
+require. Run-local capabilities, cursor nonces, timing counters, LRU-only
+caches, attached graph/receipt handles, and an unaccepted foreground journal
+overlay are excluded; they are newly minted, rebuilt, or replayed by their own
+authority before use.
+
+On open, ordinary archive namespace validation still reads, digests and decodes
+every manifest and object exactly as before. During that existing manifest read
+the store retains a disposable fingerprint map. Checkpoint tail discovery then
+does names-only enumeration: roster members are neither reopened nor
+semantically replayed. A roster fingerprint mismatch discards the checkpoint
+and sequence-zero full-replays so the live archive wins. A roster-referenced
+manifest missing from the names set, an undecodable manifest found by ordinary
+namespace validation, or a required object missing from the object-name set is
+authoritative archive damage and surfaces immediately through the existing
+managed-open archive-damage path; discarding the checkpoint cannot repair it.
+The detection-latency change is therefore narrow: semantic re-application of
+pre-roster history moves from every open to checkpoint fallback/repair, while
+manifest decoding/identity binding, object digest validation, and required-name
+existence detection remain on every open.
+
+After checkpoint restore, only archive manifest names outside its roster enter
+the same dependency-staged fixed point described above. A failure to admit that
+tail discards the restored state and retries from sequence zero. The SQLite
+genesis choice reads the engine's accepted-frontier predicate directly; an
+empty tail is not evidence of genesis. Open counters distinguish checkpoint
+and full-replay paths and report roster/name work, checkpoint capture work and
+payload bytes, the actual tail replayed, and durable lag.
+
+Snapshot capture is coherent on the owning actor. It uses the full-capture,
+adaptive-cadence option: K=1 through the measured N=800 range, then
+`ceil(retained_items / 800)` capped at 64; durable lag above 64 forces an
+immediate elevated-priority capture. Each capture hands immutable canonical
+bytes to at most one background writer; one newest snapshot replaces any
+queued snapshot. This
+coalescing bounds memory, not freshness. Publication failure is logged and the
+next trigger retries without affecting correctness. Durable lag has no hard
+bound and never applies foreground backpressure: a crash replays exactly the
+unpublished tail. Lag above 64 marks the next coalesced rewrite elevated and
+immediate, still off the waited path. Archive rebaselining, co-designed with
+0.7 sync, is the committed terminal bound that will reduce the roster,
+namespace scans, and checkpoint state to graph-proportional plus recent tail;
+this checkpoint does not compact or delete authoritative history.
 
 An unrelated accepted batch may advance a page's causal frontier without
 changing its rendered bytes. A concurrent merge can also change those bytes
