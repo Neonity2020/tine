@@ -1421,6 +1421,25 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_supported_graph_text() {
 }
 
 #[test]
+fn managed_path_identity_matches_graphwide_filename_decoder() {
+    let dir = TestDir::new("managed-path-filename-identity");
+    for path in ["pages/2026_09_01.md", "journals/Foo.md"] {
+        write(dir.path(), path, b"- identity probe\n");
+    }
+    let graph = Graph::open(dir.path());
+
+    for path in ["pages/2026_09_01.md", "journals/Foo.md"] {
+        let managed = graph
+            .managed_entry_for_managed_path(&ManagedPath::parse(path).unwrap())
+            .unwrap();
+        let graphwide = graph.entry_for_path(&dir.path().join(path)).unwrap();
+        assert_eq!(managed.name, graphwide.name, "logical name for {path}");
+        assert_eq!(managed.kind, graphwide.kind, "page kind for {path}");
+        assert_eq!(managed.date_key, graphwide.date_key, "date key for {path}");
+    }
+}
+
+#[test]
 fn attack_external_title_change_at_exact_path_updates_logical_page_name() {
     let fixture = AuthorityFixture::one_page(
         "attack-exact-path-title-change",

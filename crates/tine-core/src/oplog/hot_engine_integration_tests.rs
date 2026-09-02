@@ -2727,6 +2727,41 @@ fn sparse_archive_open_cost_is_independent_of_unrelated_batch_count() {
 }
 
 #[test]
+fn materialization_block_collection_has_one_owner_and_no_owned_arena() {
+    let source = include_str!("hot_engine.rs");
+    let start = source
+        .find("    fn materialize_page_from_state")
+        .expect("the shared state materializer remains present");
+    let end = source[start..]
+        .find("\n    fn projection_frontier_contains_path_acquisition")
+        .map(|offset| start + offset)
+        .expect("the materialization region remains bounded");
+    let region = &source[start..end];
+
+    assert_eq!(
+        region.matches("let members = read_memberships(").count(),
+        1,
+        "the from-state and hot paths must share one membership/block collection loop"
+    );
+    assert_eq!(
+        region.matches("let mut by_home =").count(),
+        1,
+        "the home grouping loop must have one owner"
+    );
+    assert_eq!(
+        region.matches("self.materialize_page_blocks(").count(),
+        2,
+        "both materializers must delegate to the one collection helper"
+    );
+    assert!(region.contains("MaterializationDocument::Owned(home)"));
+    assert!(region.contains(".then(|| document(*home_document_id))"));
+    assert!(
+        !region.contains("BTreeMap<DocumentId, MaterializationDocument"),
+        "a fold must not retain an all-home owned arena on the hot path"
+    );
+}
+
+#[test]
 fn incomplete_store_batch_becomes_ready_without_early_visibility() {
     let ids = Ids::new();
     let dir = TestDir::new("incomplete");

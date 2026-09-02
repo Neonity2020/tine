@@ -18,20 +18,7 @@ struct ConflictCapsuleEnvelope {
 }
 
 fn graph_key(root: &Path) -> String {
-    let text = root.to_string_lossy();
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let name = root
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("graph")
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect::<String>();
-    format!("{name}-{hash:016x}")
+    crate::settings::graph_storage_key(root)
 }
 
 fn capsule_path(app_data: &Path, root: &Path) -> PathBuf {
@@ -371,11 +358,18 @@ mod tests {
     }
 
     #[test]
-    fn graph_keys_separate_same_named_roots_and_match_the_session_shape() {
+    fn graph_keys_equal_the_session_key_for_distinct_path_shapes() {
+        for root in [
+            Path::new("/one/graph"),
+            Path::new("/two/graph"),
+            Path::new("/one/my graph"),
+            Path::new("/"),
+        ] {
+            assert_eq!(graph_key(root), crate::settings::graph_storage_key(root));
+        }
         assert_ne!(
             graph_key(Path::new("/one/graph")),
             graph_key(Path::new("/two/graph"))
         );
-        assert!(graph_key(Path::new("/one/my graph")).starts_with("my_graph-"));
     }
 }

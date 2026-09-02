@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Core duplicate paths now share their canonical converters.** Static query
+  lists and query-backed sheets hydrate from one source-graph boundary, hot and
+  borrowed-state page materialization share one allocation-neutral block
+  collector, and graph-keyed conflict capsules use the session key helper.
+
 - **Sheets, serialized writes, and local screenshot harnesses now share their
   canonical implementations.** Board and table field rendering use the same
   facet readers, query DTO facets are memoized by DTO identity, shared-key
@@ -56,6 +61,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   counter, and no user-visible behavior changes.
 
 ### Fixed
+
+- **Static publishing no longer exposes a private page whose malformed
+  `public::true` line is rejected by Logseq.** Publication now uses the shared
+  lsdoc-transcribed property recognizer, including its exact whitespace rules.
+
+- Managed inventory now determines Page-versus-Journal identity from the
+  decoded filename exactly like Logseq, rather than from the containing
+  configured directory.
 
 - **Bulk insertions now keep one storage authority from admission through
   publication.** Clipboard, quick-capture, template, HTML, and dropped-file

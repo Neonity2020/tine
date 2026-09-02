@@ -781,6 +781,15 @@ One canonical activation-record pass fans each parsed page into both the
 baseline pack and bounded SQLite materialization chunks. Neither candidate is
 published by that construction pass, and SQLite does not re-read, re-parse, or
 replay the graph to derive the same terminal state a second time.
+Managed inventory derives Page-versus-Journal identity from the decoded file
+name and configured journal title format, matching Logseq's
+`convert-page-if-journal`; the containing configured pages/journals directory
+is path ownership, not semantic-kind evidence. Both current-hot and
+caller-borrowed materialization use one membership/block collector. The hot
+arm clones at most one non-page home at a time (no all-home arena), preserves
+the existing distinct-home statistics, and alone applies the current accepted
+exact-title selection; historical and prospective state materialization does
+not consult that later root.
 The single catalog checkpoint is constructed by the same direct terminal-state
 builder, and the sealed manifest binds its non-derivable catalog document ID.
 These checkpoints are baseline semantic/causal state, not fabricated interactive

@@ -14073,9 +14073,9 @@ fn configured_root_helper_stays_inert_while_private_present_decoder_uses_bytes()
     let path = ManagedPath::parse("content/pages/25-07-2026.md").unwrap();
 
     let configured = graph.managed_entry_for_managed_path(&path).unwrap();
-    assert_eq!(configured.kind, PageKind::Page);
-    assert_eq!(configured.name, "25-07-2026");
-    assert_eq!(configured.date_key, None);
+    assert_eq!(configured.kind, PageKind::Journal);
+    assert_eq!(configured.name, "2026-07-25");
+    assert!(configured.date_key.is_some());
 
     let bytes = b"title:: 26-07-2026\n\n- parser-owned title\n";
     let content = std::str::from_utf8(bytes).unwrap();
@@ -14864,7 +14864,7 @@ fn initial_shadow_handles_overlapping_roots_in_both_directions() {
             "content",
             "content/journals",
             vec![
-                ("content/journals/archive.org", PageKind::Journal),
+                ("content/journals/archive.org", PageKind::Page),
                 ("content/project.md", PageKind::Page),
             ],
         ),
@@ -14873,7 +14873,7 @@ fn initial_shadow_handles_overlapping_roots_in_both_directions() {
             "content/pages",
             "content",
             vec![
-                ("content/archive.org", PageKind::Journal),
+                ("content/archive.org", PageKind::Page),
                 ("content/pages/project.md", PageKind::Page),
             ],
         ),

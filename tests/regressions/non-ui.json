@@ -2,6 +2,21 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-W3-CC-PUBLISH-PUBLIC-PROPERTY-001",
+   "title": "Static publication recognizes public pages through the same property-line grammar as Logseq",
+   "family": "static-publication-privacy",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 Cc item C5a; DUP-7"},
+   "platforms": ["all"],
+   "layer": "rust-core-publish",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/publish.rs::tests::publish_macros_never_expand_private_graph_content"],
+    "scenario": "publish.public-property-lsdoc-boundary",
+    "failBefore": "cc-c5a-fail-before-full.txt at ae3d97da170c2aaef41a3cb64b3e574f26a8ca58: a page containing public::true was published even though lsdoc rejects that line as a property; a SUB-indented valid public property was omitted"
+   },
+   "notes": "page_is_public delegates to the shared parse_property_line transcription of lsdoc markdown_property_line and normalizes the key through doc::property_key_norm. The publisher never falls back to its former starts_with/trim recognizer. This is a privacy and interoperability boundary."
+  },
+  {
    "id": "REG-W3-P0-TERMINAL-BOOTSTRAP-DEAD-ENCODE-001",
    "title": "Terminal SQLite bootstrap encodes only the exact terminal frontier instead of replay intermediates",
    "family": "managed-storage-lifetime-cost",

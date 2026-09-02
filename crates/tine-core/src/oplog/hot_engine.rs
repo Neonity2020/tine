@@ -628,6 +628,26 @@ enum TransactionCapture {
     Projection,
 }
 
+/// One document borrowed from a caller-owned state map or cloned from the hot
+/// engine for exactly one block-collection iteration. The owned arm replaces
+/// the tempting all-homes arena: it adds no heap allocation and drops each hot
+/// clone before the next home is loaded.
+enum MaterializationDocument<'a> {
+    Borrowed(&'a LoroDoc),
+    Owned(LoroDoc),
+}
+
+impl std::ops::Deref for MaterializationDocument<'_> {
+    type Target = LoroDoc;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(document) => document,
+            Self::Owned(document) => document,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EffectiveTitleTransitionSeal {
     Authenticated,
@@ -17611,6 +17631,47 @@ impl ShardedHotEngine {
             });
         }
         let preamble = read_page_preamble(page_document_id, page_document)?;
+        let (blocks, distinct_home_documents) = self.materialize_page_blocks(
+            page_id,
+            page_document_id,
+            page_document,
+            |document_id| {
+                document(document_id)
+                    .map(MaterializationDocument::Borrowed)
+                    .ok_or(EngineError::MissingDocument(document_id))
+            },
+        )?;
+        Ok(MaterializedPage {
+            page_id,
+            home_document_id: page_document_id,
+            name,
+            path,
+            kind,
+            preamble,
+            blocks,
+            stats: MaterializationStats {
+                catalog_documents_loaded,
+                membership_documents_loaded: 1,
+                home_documents_loaded: distinct_home_documents.len(),
+                distinct_home_documents,
+                physical_manifest_reads: 0,
+                physical_object_reads: 0,
+            },
+        })
+    }
+
+    /// Collect the membership-selected blocks once for both caller-borrowed
+    /// snapshots and the hot engine's one-at-a-time owned clones. This helper
+    /// intentionally does not apply the current accepted title selection:
+    /// `materialize_page_from_state` also serves historical and prospective
+    /// states, while `materialize_page_inner` alone owns that current-root step.
+    fn materialize_page_blocks<'document>(
+        &self,
+        page_id: PageId,
+        page_document_id: DocumentId,
+        page_document: &LoroDoc,
+        mut document: impl FnMut(DocumentId) -> Result<MaterializationDocument<'document>, EngineError>,
+    ) -> Result<(Vec<MaterializedBlock>, Vec<DocumentId>), EngineError> {
         let members = read_memberships(page_document_id, page_document)?;
         let mut by_home = BTreeMap::<DocumentId, Vec<(BlockId, MembershipClaim)>>::new();
         for (block_id, claim) in members {
@@ -17621,8 +17682,10 @@ impl ShardedHotEngine {
         }
         let mut blocks = Vec::new();
         for (home_document_id, claims) in &by_home {
-            let home = document(*home_document_id)
-                .ok_or(EngineError::MissingDocument(*home_document_id))?;
+            let loaded = (*home_document_id != page_document_id)
+                .then(|| document(*home_document_id))
+                .transpose()?;
+            let home = loaded.as_deref().unwrap_or(page_document);
             validate_shard(self.catalog_document_id, *home_document_id, home)?;
             for (block_id, claim) in claims {
                 let Some(state) = read_block_state(*home_document_id, home, *block_id)? else {
@@ -17647,23 +17710,7 @@ impl ShardedHotEngine {
         blocks.sort_unstable_by(|left, right| {
             (&left.order, left.block_id).cmp(&(&right.order, right.block_id))
         });
-        Ok(MaterializedPage {
-            page_id,
-            home_document_id: page_document_id,
-            name,
-            path,
-            kind,
-            preamble,
-            blocks,
-            stats: MaterializationStats {
-                catalog_documents_loaded,
-                membership_documents_loaded: 1,
-                home_documents_loaded: by_home.len(),
-                distinct_home_documents: by_home.keys().copied().collect(),
-                physical_manifest_reads: 0,
-                physical_object_reads: 0,
-            },
-        })
+        Ok((blocks, by_home.keys().copied().collect()))
     }
 
     fn materialize_page_inner(
@@ -17710,72 +17757,21 @@ impl ShardedHotEngine {
         }
         let preamble = read_page_preamble(page_document_id, &page_document)?;
 
-        let members = read_memberships(page_document_id, &page_document)?;
-        let mut by_home = BTreeMap::<DocumentId, Vec<(BlockId, MembershipClaim)>>::new();
-        for (block_id, claim) in members {
-            by_home
-                .entry(claim.home_document_id)
-                .or_default()
-                .push((block_id, claim));
-        }
-        let mut blocks = Vec::new();
-        for (home_document_id, claims) in &by_home {
-            if *home_document_id == page_document_id {
-                validate_shard(self.catalog_document_id, *home_document_id, &page_document)?;
-                for (block_id, claim) in claims {
-                    let Some(state) =
-                        read_block_state(*home_document_id, &page_document, *block_id)?
-                    else {
-                        return Err(EngineError::MalformedDocument {
-                            document_id: *home_document_id,
-                            reason: format!("membership references missing block {block_id}"),
-                        });
-                    };
-                    if state.owner == BlockOwner::Page(page_id) {
-                        blocks.push(MaterializedBlock {
-                            block_id: *block_id,
-                            home_document_id: *home_document_id,
-                            parent: claim.parent,
-                            order: claim.order.clone(),
-                            logseq_uuid: state.logseq_uuid,
-                            logseq_identity_origin: state.logseq_identity_origin,
-                            content: state.content,
-                        });
-                    }
+        let (blocks, distinct_home_documents) = self.materialize_page_blocks(
+            page_id,
+            page_document_id,
+            &page_document,
+            |home_document_id| {
+                let home = self.clone_current_hot_document(home_document_id, 1)?;
+                if include_frontier {
+                    frontier_documents.insert(
+                        home_document_id,
+                        self.current_hot_document_dependencies(home_document_id, &home)?,
+                    );
                 }
-                continue;
-            }
-            let home = self.clone_current_hot_document(*home_document_id, 1)?;
-            validate_shard(self.catalog_document_id, *home_document_id, &home)?;
-            if include_frontier {
-                frontier_documents.insert(
-                    *home_document_id,
-                    self.current_hot_document_dependencies(*home_document_id, &home)?,
-                );
-            }
-            for (block_id, claim) in claims {
-                let Some(state) = read_block_state(*home_document_id, &home, *block_id)? else {
-                    return Err(EngineError::MalformedDocument {
-                        document_id: *home_document_id,
-                        reason: format!("membership references missing block {block_id}"),
-                    });
-                };
-                if state.owner == BlockOwner::Page(page_id) {
-                    blocks.push(MaterializedBlock {
-                        block_id: *block_id,
-                        home_document_id: *home_document_id,
-                        parent: claim.parent,
-                        order: claim.order.clone(),
-                        logseq_uuid: state.logseq_uuid,
-                        logseq_identity_origin: state.logseq_identity_origin,
-                        content: state.content,
-                    });
-                }
-            }
-        }
-        blocks.sort_unstable_by(|left, right| {
-            (&left.order, left.block_id).cmp(&(&right.order, right.block_id))
-        });
+                Ok(MaterializationDocument::Owned(home))
+            },
+        )?;
         let mut claim_evidence = Vec::new();
         if include_frontier {
             let block_claims: BTreeMap<_, _> = blocks
@@ -17852,8 +17848,8 @@ impl ShardedHotEngine {
             stats: MaterializationStats {
                 catalog_documents_loaded: 1,
                 membership_documents_loaded: 1,
-                home_documents_loaded: by_home.len(),
-                distinct_home_documents: by_home.keys().copied().collect(),
+                home_documents_loaded: distinct_home_documents.len(),
+                distinct_home_documents,
                 physical_manifest_reads: reads_after
                     .manifest_reads
                     .saturating_sub(reads_before.manifest_reads),

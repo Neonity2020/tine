@@ -1377,10 +1377,21 @@ fn collect_wanted_doc_blocks<'a>(
     }
 }
 
+struct HydratedQueryBlock<'a> {
+    page: &'a str,
+    block: &'a DocBlock,
+}
+
 /// Query DTOs intentionally carry shallow membership rows. Static publishing
 /// has the source graph in-process, so hydrate each result subtree directly from
 /// its page once instead of shipping/caching overlapping owned DTO trees.
-fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx: &Ctx, depth: u8) {
+/// A result without a source in this exact projection has no publication
+/// capability. Never fall back to cached DTO bytes.
+fn with_hydrated_query_groups(
+    graph: &Graph,
+    groups: &[RefGroup],
+    action: impl FnOnce(&[HydratedQueryBlock<'_>]),
+) {
     graph.with_pages(|pages| {
         // One lookup index for the complete query avoids O(pages * groups)
         // source-page scans during static/print export.
@@ -1388,10 +1399,9 @@ fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx
             .iter()
             .map(|(entry, doc)| ((entry.name.as_str(), entry.kind), doc.as_ref()))
             .collect::<std::collections::HashMap<_, _>>();
+        let mut hydrated = Vec::new();
         for group in groups {
             let Some(doc) = page_by_key.get(&(group.page.as_str(), group.kind)) else {
-                // A result without a source in this exact projection has no
-                // publication capability. Never fall back to cached DTO bytes.
                 continue;
             };
             let wanted = group
@@ -1403,9 +1413,21 @@ fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx
             collect_wanted_doc_blocks(&doc.roots, &wanted, &mut found);
             for block in &group.blocks {
                 if let Some(source) = found.get(block.id.as_str()) {
-                    render_embedded_block(source, out, ctx, depth);
+                    hydrated.push(HydratedQueryBlock {
+                        page: group.page.as_str(),
+                        block: source,
+                    });
                 }
             }
+        }
+        action(&hydrated);
+    });
+}
+
+fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx: &Ctx, depth: u8) {
+    with_hydrated_query_groups(graph, groups, |hydrated| {
+        for row in hydrated {
+            render_embedded_block(row.block, out, ctx, depth);
         }
     });
 }
@@ -2706,32 +2728,20 @@ fn render_query_sheet(
             return;
         }
     };
-    graph.with_pages(|pages| {
-        let page_by_key: HashMap<(&str, PageKind), &doc::Document> = pages
+    with_hydrated_query_groups(graph, &outcome.groups, |hydrated| {
+        let rows = hydrated
             .iter()
-            .map(|(entry, doc)| ((entry.name.as_str(), entry.kind), doc.as_ref()))
-            .collect();
-        let mut rows: Vec<SheetRow> = Vec::new();
-        for group in &outcome.groups {
-            let Some(doc) = page_by_key.get(&(group.page.as_str(), group.kind)) else {
-                continue;
-            };
-            let wanted: HashSet<&str> = group.blocks.iter().map(|b| b.id.as_str()).collect();
-            let mut found: HashMap<&str, &DocBlock> = HashMap::with_capacity(wanted.len());
-            collect_wanted_doc_blocks(&doc.roots, &wanted, &mut found);
-            for block in &group.blocks {
-                if let Some(source) = found.get(block.id.as_str()) {
-                    rows.push(SheetRow {
-                        block: source,
-                        page: Some(group.page.as_str()),
-                    });
-                }
-            }
-        }
+            .map(|row| SheetRow {
+                block: row.block,
+                page: Some(row.page),
+            })
+            .collect::<Vec<_>>();
         let mut counter = 0u32;
         let mut sink = Vec::new(); // query results are not indexed (macro parity)
         match cfg.view {
-            SheetView::Table => render_sheet_table(cfg, &rows, emit, true, &mut counter, &mut sink, out),
+            SheetView::Table => {
+                render_sheet_table(cfg, &rows, emit, true, &mut counter, &mut sink, out)
+            }
             SheetView::Board => render_sheet_board(
                 cfg,
                 &rows,
@@ -4012,9 +4022,10 @@ const APP_JS: &str = r#"(function () {
 /// True if a page's property pre-block marks it `public:: true`.
 fn page_is_public(pre_block: Option<&str>) -> bool {
     let Some(pre) = pre_block else { return false };
-    pre.lines().any(|l| {
-        let t = l.trim();
-        t.starts_with("public::") && t["public::".len()..].trim() == "true"
+    pre.lines().any(|line| {
+        crate::doc::parse_property_line(line).is_some_and(|(key, value)| {
+            crate::doc::property_key_norm(key) == "public" && value == "true"
+        })
     })
 }
 
@@ -4921,12 +4932,28 @@ mod tests {
             "- PRIVATE_NAMESPACE_TOKEN\n",
         )
         .unwrap();
+        fs::write(
+            dir.join("pages/MalformedPrivate.md"),
+            "public::true\n- PRIVATE_MALFORMED_PROPERTY_TOKEN\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/SubVisible.md"),
+            "\x1apublic:: true\n- SUB_VISIBLE_PROPERTY_TOKEN\n",
+        )
+        .unwrap();
 
         let graph = Graph::open(&dir);
         let (outdir, count) = publish_graph(&graph).unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
         let dashboard =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
+        assert!(!std::path::Path::new(&outdir)
+            .join("malformedprivate.html")
+            .exists());
+        assert!(std::path::Path::new(&outdir)
+            .join("subvisible.html")
+            .exists());
         assert!(!dashboard.contains("PRIVATE_QUERY_AND_EMBED_TOKEN"));
         assert!(!dashboard.contains("PRIVATE_NAMESPACE_TOKEN"));
         assert!(!dashboard.contains("PrivateNS/Child"));
@@ -4936,6 +4963,39 @@ mod tests {
             "private macro targets should fail closed: {dashboard}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_hydration_has_one_shared_source_owner() {
+        let source = include_str!("publish.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("publish tests module marker")
+            .0;
+        assert_eq!(
+            production.matches("fn with_hydrated_query_groups(").count(),
+            1,
+            "query hydration must have one implementation"
+        );
+        assert_eq!(
+            production.matches("with_hydrated_query_groups(").count(),
+            3,
+            "one definition plus the flat-query and sheet callers"
+        );
+        assert_eq!(production.matches("let page_by_key =").count(), 1);
+        assert_eq!(
+            production
+                .matches("collect_wanted_doc_blocks(&doc.roots")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches("Never fall back to cached DTO bytes.")
+                .count(),
+            1,
+            "the publication-capability rationale belongs to the shared boundary"
+        );
     }
 
     #[test]

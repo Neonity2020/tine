@@ -391,7 +391,7 @@ fn legacy_session_path(app: &tauri::AppHandle) -> Option<PathBuf> {
         .map(|d| d.join("tine-session.json"))
 }
 
-fn session_id(root: &std::path::Path) -> String {
+pub(crate) fn graph_storage_key(root: &std::path::Path) -> String {
     // Stable FNV-1a over the canonical path. The readable basename is cosmetic;
     // the hash prevents two same-named graphs in different folders colliding.
     let text = root.to_string_lossy();
@@ -407,7 +407,11 @@ fn session_id(root: &std::path::Path) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect::<String>();
-    format!("{name}-{hash:016x}.json")
+    format!("{name}-{hash:016x}")
+}
+
+fn session_id(root: &std::path::Path) -> String {
+    format!("{}.json", graph_storage_key(root))
 }
 
 fn session_path(app: &tauri::AppHandle, root: &std::path::Path) -> Option<PathBuf> {

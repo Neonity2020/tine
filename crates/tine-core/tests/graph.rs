@@ -24,6 +24,25 @@ fn demo_graph() -> Graph {
 }
 
 #[test]
+#[ignore = "manual Wave 3 gate: aggregate managed-inventory kinds on the anonymized corpus"]
+fn managed_inventory_kind_census() {
+    let root = std::env::var("TINE_MANAGED_INVENTORY_CENSUS_GRAPH")
+        .expect("TINE_MANAGED_INVENTORY_CENSUS_GRAPH must name the corpus");
+    let inventory = Graph::open(root).list_pages();
+    let pages = inventory
+        .iter()
+        .filter(|entry| entry.kind == tine_core::PageKind::Page)
+        .count();
+    let journals = inventory.len() - pages;
+    eprintln!(
+        "managed_inventory_kind_census total={} pages={} journals={}",
+        inventory.len(),
+        pages,
+        journals
+    );
+}
+
+#[test]
 fn lists_journals_and_pages() {
     let g = demo_graph();
     let pages = g.list_pages();

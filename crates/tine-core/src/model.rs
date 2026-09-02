@@ -7700,29 +7700,12 @@ impl Graph {
         &self,
         path: &ManagedPath,
     ) -> Result<PageEntry, ReceiptError> {
-        let kind = match self.classify_managed_text_path(path) {
-            Ok(ManagedTextKind::Page) => PageKind::Page,
-            Ok(ManagedTextKind::Journal) => PageKind::Journal,
+        match self.classify_managed_text_path(path) {
+            Ok(ManagedTextKind::Page | ManagedTextKind::Journal) => {}
             Err(outside) => return self.unmanaged_graph_text_entry(path, outside),
-        };
-        let filename = path.file_name();
-        let stem = split_logseq_text_filename(filename)
-            .map(|(stem, _)| stem)
-            .ok_or_else(|| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))?;
-        let (name, date_key) = match kind {
-            PageKind::Journal => match self.journal_format.parse(stem) {
-                Some(date) => (self.journal_format.title(date), Some(date.ordinal_key())),
-                None => (stem.to_owned(), None),
-            },
-            PageKind::Page => (decode_page_name(stem, self.config.file_name_format), None),
-        };
-        Ok(PageEntry {
-            name,
-            kind,
-            date_key,
-            rel_path: path.as_str().to_owned(),
-            path: self.root.join(path.as_str()),
-        })
+        }
+        self.graph_entry_for_relative_path(path.as_str())
+            .map_err(|_| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))
     }
 
     /// OG-compatible decode for supported graph text that no configured root
