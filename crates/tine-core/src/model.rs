@@ -5824,6 +5824,78 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
 
+    fn direct_projection_page_ref_query(
+        &self,
+        plan: &crate::query::SimpleQueryCandidatePlan,
+        query_src: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Option<crate::query::BoundedGroups> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let paths = projection.simple_query_candidate_paths(generation, plan)?;
+        let pages = self.direct_projection_pages_for_paths(generation, paths)?;
+        let pages = pages
+            .into_iter()
+            .map(|(entry, document)| {
+                let page = page_dto_checked(&entry, &document).ok()?;
+                Some(crate::query::ApplicationQueryPage {
+                    page,
+                    roots: Arc::new(document.roots.clone()),
+                    recency: self.journal_format.page_recency_secs(
+                        entry.kind == PageKind::Journal,
+                        &entry.name,
+                        &entry.path,
+                    ),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let result = crate::query::run_application_query_pages_bounded(
+            &pages, query_src, max_rows, max_bytes,
+        );
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+    }
+
+    fn direct_projection_property_facets(
+        &self,
+        autocomplete: bool,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let result = projection.property_facets(
+            generation,
+            autocomplete,
+            &self.config.block_hidden_properties,
+            max_items,
+            max_bytes,
+        )?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+    }
+
+    fn direct_projection_note_fallback_read(&self) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.note_fallback_read();
+        }
+    }
+
     fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let projection = self
@@ -6009,6 +6081,15 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map_or(0, |projection| projection.indexed_reads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_fallback_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.fallback_reads())
     }
 
     #[cfg(test)]
@@ -15225,6 +15306,22 @@ impl Graph {
                     )
             });
         }
+        let plan = crate::query::simple_query_candidate_plan(query_src);
+        if plan.is_page_ref_only() {
+            if self.direct_projection_ready() {
+                return self.derived_memo(format!("q\0{query_src}"), || {
+                    self.direct_projection_page_ref_query(&plan, query_src, usize::MAX, usize::MAX)
+                        .map_or_else(
+                            || {
+                                self.direct_projection_note_fallback_read();
+                                crate::query::run_query(self, query_src)
+                            },
+                            |result| result.groups,
+                        )
+                });
+            }
+            self.direct_projection_note_fallback_read();
+        }
         self.derived_memo(format!("q\0{query_src}"), || {
             crate::query::run_query(self, query_src)
         })
@@ -15257,6 +15354,24 @@ impl Graph {
                         })
                 },
             );
+        }
+        let plan = crate::query::simple_query_candidate_plan(query_src);
+        if plan.is_page_ref_only() {
+            if self.direct_projection_ready() {
+                return self.derived_memo_bounded(
+                    format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"),
+                    || {
+                        self.direct_projection_page_ref_query(&plan, query_src, max_rows, max_bytes)
+                            .unwrap_or_else(|| {
+                                self.direct_projection_note_fallback_read();
+                                crate::query::run_query_bounded(
+                                    self, query_src, max_rows, max_bytes,
+                                )
+                            })
+                    },
+                );
+            }
+            self.direct_projection_note_fallback_read();
         }
         self.derived_memo_bounded(format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"), || {
             crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
@@ -16201,7 +16316,38 @@ impl Graph {
     /// query builder's property-filter autocomplete. Excludes internal/metadata
     /// properties (id, collapsed, hl-*, …).
     pub fn property_facets(&self) -> Vec<(String, Vec<String>)> {
-        crate::query::property_facets(self)
+        self.property_facets_bounded(usize::MAX, usize::MAX).0
+    }
+
+    pub fn property_facets_bounded(
+        &self,
+        max_values: usize,
+        max_bytes: usize,
+    ) -> (Vec<(String, Vec<String>)>, bool) {
+        if self.direct_projection_ready() {
+            if let Some(result) =
+                self.direct_projection_property_facets(false, max_values, max_bytes)
+            {
+                return result;
+            }
+        }
+        self.direct_projection_note_fallback_read();
+        crate::query::property_facets_bounded(self, max_values, max_bytes)
+    }
+
+    pub fn autocomplete_property_facets_bounded(
+        &self,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> (Vec<(String, Vec<String>)>, bool) {
+        if self.direct_projection_ready() {
+            if let Some(result) = self.direct_projection_property_facets(true, max_items, max_bytes)
+            {
+                return result;
+            }
+        }
+        self.direct_projection_note_fallback_read();
+        crate::query::autocomplete_property_facets_bounded(self, max_items, max_bytes)
     }
 
     // ---- Assets & PDF highlights ----

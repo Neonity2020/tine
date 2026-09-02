@@ -15131,21 +15131,16 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
-        use crate::query::{
-            SimpleQueryCandidatePlan as Plan, SimpleQueryCandidateSource as Source,
-        };
+        use crate::query::SimpleQueryCandidatePlan as Plan;
 
-        let (sources, scan_all) = match crate::query::simple_query_candidate_plan(query) {
-            Plan::Empty => {
-                return Ok(SyncApplicationBoundedRefGroups {
-                    groups: Vec::new(),
-                    total: 0,
-                    exceeded: false,
-                })
-            }
-            Plan::Indexed(sources) => (sources, false),
-            Plan::All => (Vec::new(), true),
-        };
+        let plan = crate::query::simple_query_candidate_plan(query);
+        if matches!(plan, Plan::Empty) {
+            return Ok(SyncApplicationBoundedRefGroups {
+                groups: Vec::new(),
+                total: 0,
+                exceeded: false,
+            });
+        }
 
         // Every open of a page carrying this query recomputes an identical
         // answer from identical durable evidence, at one whole-page hydration
@@ -15193,183 +15188,34 @@ impl RuntimeActor {
             masked_page_ids.extend(rows.into_iter().map(|page| page.page_id));
         }
 
-        const BATCH: usize = 512;
-        let mut candidate_page_ids = BTreeSet::new();
-        for source in &sources {
-            match source {
-                Source::Task(marker) => {
-                    let mut cursor = None;
-                    loop {
-                        let rows = read
-                            .task_candidate_pages_after(marker, cursor, BATCH)
-                            .map_err(|_| {
-                                SyncApplicationPageRequestError::ActorRefusedAt(
-                                    "application_simple_query_task_scan",
-                                )
-                            })?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        let len = rows.len();
-                        for row in rows {
-                            cursor = Some(row.page_id);
-                            if !masked_page_ids.contains(&row.page_id) {
-                                candidate_page_ids.insert(row.page_id);
-                            }
-                        }
-                        if len < BATCH {
-                            break;
-                        }
-                    }
-                }
-                Source::PageRef(normalized) => {
-                    let mut cursor = None;
-                    loop {
-                        let rows = read
-                            .page_referrer_candidates_after(normalized, cursor, BATCH)
-                            .map_err(|_| {
-                                SyncApplicationPageRequestError::ActorRefusedAt(
-                                    "application_simple_query_page_referrer_scan",
-                                )
-                            })?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        let len = rows.len();
-                        for row in rows {
-                            cursor = Some((row.source_page_id, row.source));
-                            if !masked_page_ids.contains(&row.source_page_id) {
-                                candidate_page_ids.insert(row.source_page_id);
-                            }
-                        }
-                        if len < BATCH {
-                            break;
-                        }
-                    }
-                }
-                Source::BlockProperty(normalized) => {
-                    let mut cursor = None;
-                    loop {
-                        let rows = read
-                            .block_property_candidates_after(normalized, cursor, BATCH)
-                            .map_err(|_| {
-                                SyncApplicationPageRequestError::ActorRefusedAt(
-                                    "application_simple_query_block_property_scan",
-                                )
-                            })?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        let len = rows.len();
-                        for row in rows {
-                            cursor = Some((row.page_id, row.block_id));
-                            if !masked_page_ids.contains(&row.page_id) {
-                                candidate_page_ids.insert(row.page_id);
-                            }
-                        }
-                        if len < BATCH {
-                            break;
-                        }
-                    }
-                }
-                Source::PageProperty(_)
-                | Source::Page(_)
-                | Source::Namespace(_)
-                | Source::Journal => {}
-            }
-        }
-
-        let page_property_keys = sources
+        let masked_physical_page_ids = masked_page_ids
             .iter()
-            .filter_map(|source| match source {
-                Source::PageProperty(key) => Some(key.as_str()),
-                _ => None,
-            })
+            .map(|page_id| page_id.as_uuid().into_bytes())
             .collect::<HashSet<_>>();
-        if !page_property_keys.is_empty() {
-            let mut cursor = None;
-            loop {
-                let rows = read
-                    .property_facet_rows_after(false, cursor.clone(), BATCH)
-                    .map_err(|_| {
-                        SyncApplicationPageRequestError::ActorRefusedAt(
-                            "application_simple_query_property_facet_scan",
-                        )
-                    })?;
-                if rows.is_empty() {
-                    break;
-                }
-                let len = rows.len();
-                for row in rows {
-                    cursor = Some((row.owner, row.source_name.clone(), row.ordinal));
-                    if matches!(row.owner, MaterializedEntityId::Page(_))
-                        && page_property_keys.contains(row.normalized_name.as_str())
-                        && !masked_page_ids.contains(&row.page_id)
-                    {
-                        candidate_page_ids.insert(row.page_id);
-                    }
-                }
-                if len < BATCH {
-                    break;
-                }
-            }
+        let lowered = crate::oplog::query_lowering::lower_simple_query_candidate_plan(
+            &read,
+            &plan,
+            &masked_physical_page_ids,
+        )
+        .map_err(|error| {
+            use crate::oplog::query_lowering::SimpleQueryLoweringError as Error;
+            SyncApplicationPageRequestError::ActorRefusedAt(match error {
+                Error::Task(_) => "application_simple_query_task_scan",
+                Error::PageRef(_) => "application_simple_query_page_referrer_scan",
+                Error::BlockProperty(_) => "application_simple_query_block_property_scan",
+                Error::PageProperty(_) => "application_simple_query_property_facet_scan",
+                Error::Navigation(_) => "application_simple_query_navigation_scan",
+            })
+        })?;
+        #[cfg(test)]
+        if lowered.inventory_scanned {
+            self.note_managed_application_query_inventory_pass(lowered.inventory_pages);
         }
-
-        let needs_inventory = scan_all
-            || sources.iter().any(|source| {
-                matches!(
-                    source,
-                    Source::PageRef(_) | Source::Page(_) | Source::Namespace(_) | Source::Journal
-                )
-            });
-        if needs_inventory {
-            #[cfg(test)]
-            let mut inventory_pages = 0_usize;
-            let mut cursor: Option<(ManagedPath, PageId)> = None;
-            loop {
-                let rows = read
-                    .navigation_pages_after(
-                        cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
-                        BATCH,
-                    )
-                    .map_err(|_| {
-                        SyncApplicationPageRequestError::ActorRefusedAt(
-                            "application_simple_query_navigation_scan",
-                        )
-                    })?;
-                if rows.is_empty() {
-                    break;
-                }
-                let len = rows.len();
-                for row in rows {
-                    #[cfg(test)]
-                    {
-                        inventory_pages = inventory_pages.saturating_add(1);
-                    }
-                    cursor = Some((row.path.clone(), row.page_id));
-                    if masked_page_ids.contains(&row.page_id) {
-                        continue;
-                    }
-                    let matches = scan_all
-                        || sources.iter().any(|source| match source {
-                            Source::PageRef(name) | Source::Page(name) => row.name_key == *name,
-                            Source::Namespace(namespace) => {
-                                row.name_key.starts_with(&format!("{namespace}/"))
-                            }
-                            Source::Journal => row.kind == ManagedTextKind::Journal,
-                            _ => false,
-                        });
-                    if matches {
-                        candidate_page_ids.insert(row.page_id);
-                    }
-                }
-                if len < BATCH {
-                    break;
-                }
-            }
-            #[cfg(test)]
-            self.note_managed_application_query_inventory_pass(inventory_pages);
-        }
+        let candidate_page_ids = lowered
+            .page_ids
+            .into_iter()
+            .map(|page_id| PageId::from_uuid(Uuid::from_bytes(page_id)))
+            .collect::<BTreeSet<_>>();
         drop(read);
 
         #[cfg(test)]

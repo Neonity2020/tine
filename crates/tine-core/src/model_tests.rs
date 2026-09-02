@@ -12988,8 +12988,7 @@ fn direct_query_latency_manual_benchmark() {
     let before = direct_query_bench_prime_invalidation(&graph);
     let generation_before = graph.cache_generation();
     let mut new_page = direct_save_bench_new_page("B4 Measurement New Page");
-    new_page.blocks[0].id =
-        Uuid::from_u128(0xb400_0000_0000_0000_0000_0000_0000_0001).to_string();
+    new_page.blocks[0].id = Uuid::from_u128(0xb400_0000_0000_0000_0000_0000_0000_0001).to_string();
     graph.save_page(&new_page, None).unwrap();
     let after = direct_query_bench_cache_keys(&graph);
     direct_query_bench_report_invalidation(
@@ -13032,6 +13031,10 @@ fn direct_query_latency_manual_benchmark() {
     assert_eq!(facet_sizes.len(), 2, "facet benchmark requires two sizes");
     for size in facet_sizes {
         let (facet_dir, facet_graph) = direct_save_bench_graph("direct-query-facets", size);
+        facet_graph
+            .attach_direct_projection(facet_dir.join(".b4-facets/projection.sqlite"))
+            .unwrap();
+        wait_for_direct_query_projection(&facet_graph);
         let facet_blocks = size.saturating_mul(24).saturating_add(1);
         let mut query_facets = Vec::with_capacity(rounds);
         let mut autocomplete = Vec::with_capacity(rounds);
@@ -13040,11 +13043,9 @@ fn direct_query_latency_manual_benchmark() {
             std::hint::black_box(facet_graph.property_facets());
             query_facets.push(started.elapsed());
             let started = Instant::now();
-            std::hint::black_box(crate::query::autocomplete_property_facets_bounded(
-                &facet_graph,
-                usize::MAX,
-                usize::MAX,
-            ));
+            std::hint::black_box(
+                facet_graph.autocomplete_property_facets_bounded(usize::MAX, usize::MAX),
+            );
             autocomplete.push(started.elapsed());
         }
         for (family, samples) in [

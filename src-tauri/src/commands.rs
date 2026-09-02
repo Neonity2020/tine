@@ -2128,18 +2128,15 @@ pub(crate) async fn query_facets(
             None => {
                 let graph = slot.legacy_graph()?;
                 if autocomplete {
-                    return Ok(tine_core::query::autocomplete_property_facets_bounded(
-                        &graph,
-                        AUTOCOMPLETE_FACET_MAX_ITEMS,
-                        AUTOCOMPLETE_FACET_MAX_BYTES,
-                    )
-                    .0);
+                    return Ok(graph
+                        .autocomplete_property_facets_bounded(
+                            AUTOCOMPLETE_FACET_MAX_ITEMS,
+                            AUTOCOMPLETE_FACET_MAX_BYTES,
+                        )
+                        .0);
                 }
-                let (facets, exceeded) = tine_core::query::property_facets_bounded(
-                    &graph,
-                    RESULT_BRIDGE_MAX_ROWS,
-                    RESULT_BRIDGE_MAX_BYTES,
-                );
+                let (facets, exceeded) =
+                    graph.property_facets_bounded(RESULT_BRIDGE_MAX_ROWS, RESULT_BRIDGE_MAX_BYTES);
                 if exceeded {
                     Err("result-too-large: property facets exceed the construction budget".into())
                 } else {

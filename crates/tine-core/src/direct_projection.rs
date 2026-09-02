@@ -3,6 +3,7 @@ use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::query::{
     run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
     ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
+    PropertyFacetAccumulator, SimpleQueryCandidatePlan,
 };
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
@@ -68,6 +69,8 @@ struct ProjectionShared {
     #[cfg(test)]
     indexed_reads: AtomicU64,
     #[cfg(test)]
+    fallback_reads: AtomicU64,
+    #[cfg(test)]
     referenced_name_reads: AtomicU64,
     #[cfg(test)]
     fuzzy_candidate_reads: AtomicU64,
@@ -97,6 +100,8 @@ impl DirectProjection {
             worker_busy: AtomicBool::new(false),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
             referenced_name_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -311,6 +316,102 @@ impl DirectProjection {
             self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
         }
         current
+    }
+
+    pub(crate) fn simple_query_candidate_paths(
+        &self,
+        cache_generation: u64,
+        plan: &SimpleQueryCandidatePlan,
+    ) -> Option<std::collections::BTreeSet<PathBuf>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let lowered = crate::oplog::query_lowering::lower_simple_query_candidate_plan(
+            &read,
+            plan,
+            &std::collections::HashSet::new(),
+        )
+        .ok()?;
+        let mut paths = std::collections::BTreeSet::new();
+        for page_id in lowered.page_ids {
+            let page = read
+                .page_with_header_validation(page_id, |_, kind| match kind {
+                    0 | 1 => Ok(()),
+                    _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
+                        format!("unknown Direct Files text kind {kind}"),
+                    )),
+                })
+                .ok()??;
+            paths.insert(PathBuf::from(page.path));
+        }
+        let current = self.ready_at(cache_generation).then_some(paths);
+        #[cfg(test)]
+        if current.is_some() {
+            self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        current
+    }
+
+    pub(crate) fn property_facets(
+        &self,
+        cache_generation: u64,
+        autocomplete: bool,
+        hidden_properties: &[String],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut accumulator = if autocomplete {
+            PropertyFacetAccumulator::autocomplete(hidden_properties, max_items, max_bytes)
+        } else {
+            PropertyFacetAccumulator::query_builder(max_items, max_bytes)
+        };
+        const INITIAL_BATCH: usize = 512;
+        let mut batch = INITIAL_BATCH;
+        let mut cursor = None;
+        loop {
+            let rows =
+                loop {
+                    match read.property_facet_rows_after(!autocomplete, cursor.clone(), batch) {
+                        Ok(rows) => break rows,
+                        Err(tine_storage::sqlite::MaterializationError::ResourceLimit {
+                            ..
+                        }) if batch > 1 => batch = (batch / 2).max(1),
+                        Err(_) => return None,
+                    }
+                };
+            let len = rows.len();
+            for row in rows {
+                cursor = Some((row.owner, row.source_name, row.ordinal));
+                accumulator.offer(&row.normalized_name, &row.value);
+            }
+            if len < batch {
+                break;
+            }
+        }
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        #[cfg(test)]
+        self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
+        Some(accumulator.finish())
+    }
+
+    pub(crate) fn note_fallback_read(&self) {
+        #[cfg(test)]
+        self.shared.fallback_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn referenced_page_names(&self, cache_generation: u64) -> Option<Vec<String>> {
@@ -669,6 +770,11 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn indexed_reads(&self) -> u64 {
         self.shared.indexed_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fallback_reads(&self) -> u64 {
+        self.shared.fallback_reads.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1335,6 +1441,160 @@ mod tests {
     }
 
     #[test]
+    fn b4_page_ref_and_property_facets_record_indexed_reads() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("b4-indexed-reads");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/source.md"),
+            "- points to [[Target]]\n  status:: active\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        for query in [
+            "(page-ref Target)",
+            "(and (page-ref Target) \"points\")",
+            "(and \"points\" (page-ref Target))",
+        ] {
+            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
+            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
+            assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
+            assert_eq!(
+                (indexed.total, indexed.exceeded),
+                (oracle.total, oracle.exceeded)
+            );
+        }
+        assert_eq!(
+            graph.property_facets(),
+            crate::query::property_facets(&graph)
+        );
+        assert_eq!(
+            graph.autocomplete_property_facets_bounded(100, 1_000_000),
+            crate::query::autocomplete_property_facets_bounded(&graph, 100, 1_000_000)
+        );
+        assert!(
+            graph.direct_projection_indexed_reads_test() >= indexed_before + 5,
+            "PageRef and both property-facet entry points must use the generation-bound SQLite read"
+        );
+
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.direct_projection_mark_stale_test();
+        let fallback_query = "(and (page-ref Target) (not (page Missing)))";
+        let oracle = crate::query::run_query_bounded(&graph, fallback_query, 100, 1_000_000);
+        let fallback = graph.run_query_bounded(fallback_query, 100, 1_000_000);
+        assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
+        assert_eq!(
+            graph.property_facets(),
+            crate::query::property_facets(&graph)
+        );
+        assert!(
+            graph.direct_projection_fallback_reads_test() >= fallback_before + 2,
+            "stale PageRef and facet reads must record parser fallbacks"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "manual B4 corpus gate; set TINE_B4_QUERY_CORPUS"]
+    fn b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence() {
+        fn copy_tree(source: &Path, target: &Path) {
+            std::fs::create_dir_all(target).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                let destination = target.join(entry.file_name());
+                if kind.is_dir() {
+                    copy_tree(&entry.path(), &destination);
+                } else if kind.is_file() {
+                    std::fs::copy(entry.path(), destination).unwrap();
+                }
+            }
+        }
+
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let source = PathBuf::from(
+            std::env::var("TINE_B4_QUERY_CORPUS").expect("TINE_B4_QUERY_CORPUS is required"),
+        );
+        let root = scratch("b4-corpus");
+        if source.is_dir() {
+            copy_tree(&source, &root);
+        } else {
+            std::fs::create_dir_all(root.join("pages")).unwrap();
+            std::fs::copy(&source, root.join("pages/corpus-fixture.md")).unwrap();
+        }
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/B4 Indexed Source.md"),
+            "- synthetic [[B4 Indexed Target]]\n  b4-facet:: yes\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pages/B4 Indexed Target.md"),
+            "- synthetic target\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join(".b4-private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let query = "(page-ref \"B4 Indexed Target\")";
+        let oracle = crate::query::run_query_bounded(&graph, query, 20_000, 32 * 1024 * 1024);
+        let indexed = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
+        assert!(
+            signature(&indexed.groups) == signature(&oracle.groups),
+            "corpus PageRef indexed result differs from the parser oracle"
+        );
+        assert!(
+            graph.property_facets() == crate::query::property_facets(&graph),
+            "corpus query-builder facets differ from the parser oracle"
+        );
+        assert!(
+            graph.autocomplete_property_facets_bounded(20_000, 32 * 1024 * 1024)
+                == crate::query::autocomplete_property_facets_bounded(
+                    &graph,
+                    20_000,
+                    32 * 1024 * 1024,
+                ),
+            "corpus autocomplete facets differ from the parser oracle"
+        );
+        assert!(graph.direct_projection_indexed_reads_test() >= 3);
+
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.direct_projection_mark_stale_test();
+        let fallback_query = "(and (page-ref \"B4 Indexed Target\") \"synthetic\")";
+        let oracle =
+            crate::query::run_query_bounded(&graph, fallback_query, 20_000, 32 * 1024 * 1024);
+        let fallback = graph.run_query_bounded(fallback_query, 20_000, 32 * 1024 * 1024);
+        assert!(
+            signature(&fallback.groups) == signature(&oracle.groups),
+            "corpus stale fallback differs from the parser oracle"
+        );
+        assert!(graph.direct_projection_fallback_reads_test() > fallback_before);
+
+        let pages = graph.with_pages(|pages| pages.len());
+        println!(
+            "b4_corpus_gate pages={pages} indexed_reads={} fallback_reads={}",
+            graph.direct_projection_indexed_reads_test(),
+            graph.direct_projection_fallback_reads_test()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("search-reference-parity");
@@ -1931,6 +2191,9 @@ mod tests {
         let contract = include_str!("../../../docs/storage-sync-contract.md");
         assert!(contract.contains("direct-files-projections/<canonical-graph-path-digest>.sqlite"));
         assert!(contract.contains("sparse_task_query_eligibility"));
+        assert!(contract.contains("shared\nproperty-facet rows"));
+        assert!(contract.contains("PageRef simple-query candidate plan"));
+        assert!(contract.contains("same SQL read family in\nboth storage regimes"));
         assert!(contract.contains("literal fuzzy-search candidate"));
         assert!(contract.contains("referenced-page\ninventory"));
         assert!(contract.contains("retains no separate semantic memo"));

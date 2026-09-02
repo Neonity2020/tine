@@ -1747,6 +1747,22 @@ pub(crate) enum SimpleQueryCandidatePlan {
     All,
 }
 
+impl SimpleQueryCandidatePlan {
+    /// B4 admits only the first ranked grammar class on Direct Files. Boolean
+    /// composition remains eligible when the planner proved PageRef is the
+    /// complete narrowing source; mixed-source unions stay on the full walk.
+    pub(crate) fn is_page_ref_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Indexed(sources)
+                if !sources.is_empty()
+                    && sources
+                        .iter()
+                        .all(|source| matches!(source, SimpleQueryCandidateSource::PageRef(_)))
+        )
+    }
+}
+
 /// Exact marker streams a managed sparse task-query reader may enumerate.
 ///
 /// This is deliberately narrower than [`SimpleQueryCandidatePlan`]: the latter

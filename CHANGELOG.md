@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Direct Files property facets and PageRef queries now use the same SQLite
+  read families as Managed Storage.** One shared plan-to-SQL lowering narrows
+  PageRef candidates before the existing parser evaluator runs, while stale or
+  unavailable projections keep the exact full-walk fallback. No schema, index,
+  or query-result cache was added.
+
 - Added internal release-only benchmark drivers for query, facet, invalidation,
   and managed save-versus-drain attribution; production behavior is unchanged.
 

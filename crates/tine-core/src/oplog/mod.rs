@@ -37,6 +37,7 @@ pub(crate) mod projection_manifest;
 pub(crate) mod projection_store;
 pub(crate) mod projection_turn_journal;
 pub(crate) mod projection_work;
+pub(crate) mod query_lowering;
 pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub(crate) mod reference_catalog;
