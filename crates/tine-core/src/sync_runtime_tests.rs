@@ -8853,14 +8853,15 @@ fn checkpoint_open_matches_sequence_zero_replay_over_generated_crash_histories()
 
 #[test]
 fn checkpoint_reopen_replays_exactly_the_unpublished_durable_tail() {
-    struct ResetCheckpointFailure;
+    struct ResetCheckpointFailure(std::path::PathBuf);
     impl Drop for ResetCheckpointFailure {
         fn drop(&mut self) {
-            crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(false);
+            crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(&self.0, false);
         }
     }
-    let _reset = ResetCheckpointFailure;
     let fixture = ActivationFixture::nested_unicode("clean-checkpoint-tail", 0xa178_6000);
+    let checkpoint_store = clean_operation_archive_directory(&fixture.request.archive_root);
+    let _reset = ResetCheckpointFailure(checkpoint_store.clone());
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     assert_eq!(activated.status, SyncLocalActivationStatus::Active);
     let first = activated.handle.expect("checkpoint tail fixture activates");
@@ -8870,7 +8871,7 @@ fn checkpoint_reopen_replays_exactly_the_unpublished_durable_tail() {
     drain_managed_local(&first);
     drop(first);
 
-    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(true);
+    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(&checkpoint_store, true);
     let second = SyncRuntimeHandle::open(reopen_request(&fixture.request));
     assert_eq!(second.status, SyncRuntimeOpenStatus::Active);
     let second = second.handle.expect("frontier-one checkpoint opens");
@@ -8878,7 +8879,7 @@ fn checkpoint_reopen_replays_exactly_the_unpublished_durable_tail() {
     let _ = save_application_block_text(&second, page, revision, "uncheckpointed frontier two");
     drain_managed_local(&second);
     drop(second);
-    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(false);
+    crate::oplog::checkpoint_generation::fail_checkpoint_writes_for_test(&checkpoint_store, false);
 
     let mut counters = None;
     let third =

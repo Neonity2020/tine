@@ -28,11 +28,21 @@ const MAX_CHECKPOINT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const CLEAN_CHECKPOINT_LAG_MAX: u64 = 64;
 
 #[cfg(test)]
-static FAIL_CHECKPOINT_WRITES: AtomicBool = AtomicBool::new(false);
+static FAIL_CHECKPOINT_WRITE_ROOTS: Mutex<BTreeSet<std::path::PathBuf>> =
+    Mutex::new(BTreeSet::new());
 
 #[cfg(test)]
-pub(crate) fn fail_checkpoint_writes_for_test(fail: bool) {
-    FAIL_CHECKPOINT_WRITES.store(fail, Ordering::Release);
+pub(crate) fn fail_checkpoint_writes_for_test(store_root: &std::path::Path, fail: bool) {
+    let root = std::fs::canonicalize(store_root)
+        .expect("the checkpoint failure fixture has opened its archive root");
+    let mut roots = FAIL_CHECKPOINT_WRITE_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if fail {
+        roots.insert(root);
+    } else {
+        roots.remove(&root);
+    }
 }
 
 pub(crate) struct TineAcceptedEvidenceDecoder;
@@ -595,7 +605,11 @@ fn install_replaceable_exact(
 
 fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Result<u64, String> {
     #[cfg(test)]
-    if FAIL_CHECKPOINT_WRITES.load(Ordering::Acquire) {
+    if FAIL_CHECKPOINT_WRITE_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(store.root_path())
+    {
         return Err("deterministic checkpoint publication failure".into());
     }
     let predecessor = read_current_payload_for_extension(store)?;
