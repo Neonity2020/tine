@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **The pinned `tine-storage` release now certifies every shipped platform.**
+  Version 0.12.2 preserves complete plugin packages that contain harmless extra
+  files, strengthens interrupted-install recovery checks, and gives Linux and
+  Windows directory publication one audited implementation each. Its immutable
+  receipt names Linux, Windows, Android, macOS, iOS, and API-semver jobs.
+
 - **Direct Files property facets and PageRef queries now use the same SQLite
   read families as Managed Storage.** One shared plan-to-SQL lowering narrows
   PageRef candidates before the existing parser evaluator runs, while stale or

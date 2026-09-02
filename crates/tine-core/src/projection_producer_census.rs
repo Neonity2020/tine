@@ -1649,7 +1649,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.12.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.12.2\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -1659,6 +1659,8 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // tine-storage boundary for `move_graph_text_exact_no_replace` (see the
     // `durable_directory.open` row for `model.rs`, 5 → 2, and the guard
     // `direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename`).
+    // Re-pinned 2026-09-02 (wave-3 packet S): the certified dependency moved
+    // from v0.12.0 to v0.12.2; the audited call surface remains unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "7b608e3e7eaf068b69dc990349563059731ffb5022b6c1010dc5e6ede4538e46",
