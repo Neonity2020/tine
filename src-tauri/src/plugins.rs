@@ -209,8 +209,29 @@ fn plugins_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map(|dir| dir.join("plugins"))
         .map_err(|_| "no app-data dir".to_string())?;
-    recover_plugin_store_at(&root)?;
+    recover_plugin_store_once(&root)?;
     Ok(root)
+}
+
+/// Store roots this process has already recovered.
+static RECOVERED_PLUGIN_STORES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Reclaim interrupted staging/retirement residue once per process per store
+/// root, at first use. Running recovery on every command let one honest
+/// instance's read-only plugin listing delete another live instance's
+/// in-flight `.install-*` staging directory (in-scope: honest concurrent
+/// instances; wave-2 review F-8). A crash-cut from a previous process is still
+/// reclaimed at the next first use.
+fn recover_plugin_store_once(root: &Path) -> Result<(), String> {
+    let mut recovered = RECOVERED_PLUGIN_STORES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if recovered.iter().any(|known| known == root) {
+        return Ok(());
+    }
+    recover_plugin_store_at(root)?;
+    recovered.push(root.to_path_buf());
+    Ok(())
 }
 
 fn recover_plugin_store_at(root: &Path) -> Result<(), String> {
@@ -548,6 +569,27 @@ mod tests {
         std::fs::write(package.join("manifest.json"), test_manifest(id, version)).unwrap();
         std::fs::write(package.join("plugin.wasm"), b"\0asm\x01\0\0\0").unwrap();
         package
+    }
+
+    #[test]
+    fn store_recovery_runs_once_per_process_so_a_second_command_cannot_reclaim_live_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plugins");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale = root.join(".install-dev.tine.example-0.1.0-1-1");
+        std::fs::create_dir_all(&stale).unwrap();
+        recover_plugin_store_once(&root).unwrap();
+        assert!(!stale.exists(), "first use reclaims crash-cut residue");
+
+        // A concurrent honest instance's in-flight staging directory appears
+        // after this process has already recovered the store.
+        let live = root.join(".install-dev.tine.example-0.1.0-2-1");
+        std::fs::create_dir_all(&live).unwrap();
+        recover_plugin_store_once(&root).unwrap();
+        assert!(
+            live.exists(),
+            "later commands must not reclaim another process's staging"
+        );
     }
 
     #[test]
