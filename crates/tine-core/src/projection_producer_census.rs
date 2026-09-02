@@ -1172,7 +1172,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/sync_runtime.rs",
             "fs.create_dir_all",
-            4,
+            5,
         ),
         (
             "crates/tine-core/src/sync_runtime.rs",
@@ -1663,7 +1663,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // from v0.12.0 to v0.12.2; the audited call surface remains unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "7b608e3e7eaf068b69dc990349563059731ffb5022b6c1010dc5e6ede4538e46",
+        "ec01efb9d3f89d8f3369f46f9f1a46382772bcceb16268d4a62f571d915d7ed1",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
