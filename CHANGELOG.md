@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- Added internal release-only benchmark drivers for query, facet, invalidation,
+  and managed save-versus-drain attribution; production behavior is unchanged.
+
 - **Repeated performance work is cut from four storage and query paths.**
   Terminal SQLite bootstrap no longer encodes every replay intermediate into a
   dead map; managed projection completion carries its already-authorized plan

@@ -12707,6 +12707,366 @@ fn direct_save_latency_manual_benchmark() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn direct_query_bench_fixture_bytes() -> &'static [u8] {
+    b"title:: B4 Measurement Target\ncategory:: work\ntags:: work\n\n- TODO needle [[B4 Measurement Target]] #work\n  status:: active\n"
+}
+
+fn direct_query_bench_open() -> (PathBuf, Graph, usize, usize) {
+    let dir = match std::env::var("TINE_DIRECT_QUERY_BENCH_GRAPH_COPY") {
+        Ok(source) => {
+            let dir = scratch("direct-query-bench-copy");
+            copy_directory_tree(Path::new(&source), &dir);
+            dir
+        }
+        Err(_) => {
+            let pages = std::env::var("TINE_DIRECT_QUERY_BENCH_PAGES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1_000);
+            let (dir, graph) = direct_save_bench_graph("direct-query-bench", pages);
+            drop(graph);
+            dir
+        }
+    };
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::write(
+        dir.join("pages/B4 Measurement Target.md"),
+        direct_query_bench_fixture_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/B4 Measurement Unrelated.md"),
+        b"- b4-unrelated-before\n",
+    )
+    .unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join(".b4-measurement/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_for_direct_query_projection(&graph);
+    let (pages, blocks) = graph.with_pages(|pages| {
+        fn count_blocks(blocks: &[DocBlock]) -> usize {
+            blocks
+                .iter()
+                .map(|block| 1 + count_blocks(&block.children))
+                .sum()
+        }
+        (
+            pages.len(),
+            pages
+                .iter()
+                .map(|(_, document)| count_blocks(&document.roots))
+                .sum(),
+        )
+    });
+    (dir, graph, pages, blocks)
+}
+
+fn wait_for_direct_query_projection(graph: &Graph) {
+    let started = Instant::now();
+    while !graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "Direct query benchmark projection did not converge"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn direct_query_bench_edit(graph: &Graph, serial: usize) {
+    let mut page = graph
+        .load_by_path("pages/B4 Measurement Target.md")
+        .unwrap()
+        .unwrap();
+    page.blocks[0].raw =
+        format!("TODO needle [[B4 Measurement Target]] #work variant-{serial}\nstatus:: active");
+    graph
+        .save_page(&page, page.rev.as_deref())
+        .expect("Direct query benchmark content-only save");
+}
+
+fn direct_query_bench_sample(graph: &Graph, query: &str) -> Duration {
+    let started = Instant::now();
+    let result = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
+    std::hint::black_box((result.total, result.exceeded));
+    started.elapsed()
+}
+
+fn direct_query_bench_report(
+    class: &str,
+    phase: &str,
+    samples: &mut [Duration],
+    pages: usize,
+    blocks: usize,
+    indexed_reads: u64,
+) {
+    samples.sort();
+    let ms = |duration: Duration| duration.as_secs_f64() * 1_000.0;
+    println!(
+        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} indexed_reads={indexed_reads}",
+        ms(samples[samples.len() / 2]),
+        ms(samples[samples.len() * 95 / 100]),
+        ms(samples[samples.len() - 1]),
+        samples.len(),
+    );
+}
+
+fn direct_query_bench_cache_keys(graph: &Graph) -> std::collections::BTreeSet<String> {
+    graph
+        .derived_cache
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|cache| cache.results.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn direct_query_bench_prime_invalidation(graph: &Graph) -> std::collections::BTreeSet<String> {
+    *graph.derived_cache.write().unwrap() = None;
+    for query in [
+        "(task TODO)",
+        "\"b4-unrelated-before\"",
+        "\"b4-never-present\"",
+        "(page-ref \"B4 Measurement Target\")",
+    ] {
+        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
+    }
+    let keys = direct_query_bench_cache_keys(graph);
+    assert_eq!(keys.len(), 4, "the invalidation probe must seed four memos");
+    keys
+}
+
+fn direct_query_bench_report_invalidation(
+    edit: &str,
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+    generation_before: u64,
+    generation_after: u64,
+) {
+    let retained = before.intersection(after).count();
+    let evicted = before.difference(after).count();
+    println!(
+        "b4_invalidation edit={edit} before={} retained={retained} evicted={evicted} cache_gen_before={generation_before} cache_gen_after={generation_after}",
+        before.len(),
+    );
+}
+
+/// B4 step 0 measurement. This release-only ignored benchmark compares memo
+/// hits with invalidated evaluation for one representative of each sequencing
+/// class, measures projection readiness immediately after a Direct delta, and
+/// records scoped memo retention. Point it at a copied graph with
+/// TINE_DIRECT_QUERY_BENCH_GRAPH_COPY; graph content is never printed.
+#[test]
+#[ignore = "manual benchmark: Direct query classes, facets, and invalidation"]
+fn direct_query_latency_manual_benchmark() {
+    assert!(
+        !cfg!(debug_assertions),
+        "release-only; run cargo test -p tine-core --release --lib direct_query_latency_manual_benchmark -- --ignored --nocapture --test-threads=1"
+    );
+    let rounds = std::env::var("TINE_DIRECT_QUERY_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(9)
+        .max(3);
+    let (dir, graph, pages, blocks) = direct_query_bench_open();
+    let classes = [
+        ("sparse_task", "(task TODO)"),
+        ("page_ref", "(page-ref \"B4 Measurement Target\")"),
+        ("block_property", "(property \"status\" \"active\")"),
+        ("page_property", "(page-property \"category\" \"work\")"),
+        ("page_tags", "(page-tags \"work\")"),
+        ("plain_text", "\"needle\""),
+        ("friendly_search", "(search \"needle\")"),
+        (
+            "boolean_composition",
+            "(and \"needle\" (page-ref \"B4 Measurement Target\"))",
+        ),
+    ];
+    let mut serial = 0;
+    for (class, query) in classes {
+        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
+        let mut memo = (0..rounds)
+            .map(|_| direct_query_bench_sample(&graph, query))
+            .collect::<Vec<_>>();
+        direct_query_bench_report(class, "memo", &mut memo, pages, blocks, 0);
+
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let mut invalidated = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            serial += 1;
+            direct_query_bench_edit(&graph, serial);
+            wait_for_direct_query_projection(&graph);
+            invalidated.push(direct_query_bench_sample(&graph, query));
+        }
+        let indexed_reads = graph
+            .direct_projection_indexed_reads_test()
+            .saturating_sub(indexed_before);
+        direct_query_bench_report(
+            class,
+            "invalidated_ready",
+            &mut invalidated,
+            pages,
+            blocks,
+            indexed_reads,
+        );
+    }
+
+    let mut ready_hits = 0_usize;
+    let mut ready_misses = 0_usize;
+    let indexed_before = graph.direct_projection_indexed_reads_test();
+    let mut immediate = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        serial += 1;
+        direct_query_bench_edit(&graph, serial);
+        if graph.direct_projection_ready_test() {
+            ready_hits += 1;
+        } else {
+            ready_misses += 1;
+        }
+        immediate.push(direct_query_bench_sample(&graph, "(task TODO)"));
+        wait_for_direct_query_projection(&graph);
+    }
+    let indexed_reads = graph
+        .direct_projection_indexed_reads_test()
+        .saturating_sub(indexed_before);
+    direct_query_bench_report(
+        "sparse_task",
+        "data_rev_immediate",
+        &mut immediate,
+        pages,
+        blocks,
+        indexed_reads,
+    );
+    println!(
+        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} indexed_reads={indexed_reads}",
+        ready_hits + ready_misses,
+    );
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    let generation_before = graph.cache_generation();
+    let mut unrelated = graph
+        .load_by_path("pages/B4 Measurement Unrelated.md")
+        .unwrap()
+        .unwrap();
+    unrelated.blocks[0].raw = "b4-unrelated-after".into();
+    graph
+        .save_page(&unrelated, unrelated.rev.as_deref())
+        .unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "content_only",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert_eq!((after.len(), before.difference(&after).count()), (2, 2));
+    wait_for_direct_query_projection(&graph);
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    let generation_before = graph.cache_generation();
+    let mut unrelated = graph
+        .load_by_path("pages/B4 Measurement Unrelated.md")
+        .unwrap()
+        .unwrap();
+    unrelated.pre_block = Some("alias:: B4 Measurement Alias\n".into());
+    graph
+        .save_page(&unrelated, unrelated.rev.as_deref())
+        .unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "alias_change",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert!(after.is_empty());
+    wait_for_direct_query_projection(&graph);
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    let generation_before = graph.cache_generation();
+    let mut new_page = direct_save_bench_new_page("B4 Measurement New Page");
+    new_page.blocks[0].id =
+        Uuid::from_u128(0xb400_0000_0000_0000_0000_0000_0000_0001).to_string();
+    graph.save_page(&new_page, None).unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "page_set_change",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert!(after.is_empty());
+    wait_for_direct_query_projection(&graph);
+
+    let before = direct_query_bench_prime_invalidation(&graph);
+    graph.derived_cache.write().unwrap().as_mut().unwrap().today -= 1;
+    let generation_before = graph.cache_generation();
+    let mut unrelated = graph
+        .load_by_path("pages/B4 Measurement Unrelated.md")
+        .unwrap()
+        .unwrap();
+    unrelated.blocks[0].raw = "b4-unrelated-day-rollover".into();
+    graph
+        .save_page(&unrelated, unrelated.rev.as_deref())
+        .unwrap();
+    let after = direct_query_bench_cache_keys(&graph);
+    direct_query_bench_report_invalidation(
+        "day_rollover_simulated",
+        &before,
+        &after,
+        generation_before,
+        graph.cache_generation(),
+    );
+    assert!(after.is_empty());
+    wait_for_direct_query_projection(&graph);
+
+    let facet_sizes = std::env::var("TINE_DIRECT_QUERY_BENCH_FACET_SIZES")
+        .unwrap_or_else(|_| "1000,4000".into())
+        .split(',')
+        .map(|value| value.trim().parse::<usize>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(facet_sizes.len(), 2, "facet benchmark requires two sizes");
+    for size in facet_sizes {
+        let (facet_dir, facet_graph) = direct_save_bench_graph("direct-query-facets", size);
+        let facet_blocks = size.saturating_mul(24).saturating_add(1);
+        let mut query_facets = Vec::with_capacity(rounds);
+        let mut autocomplete = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let started = Instant::now();
+            std::hint::black_box(facet_graph.property_facets());
+            query_facets.push(started.elapsed());
+            let started = Instant::now();
+            std::hint::black_box(crate::query::autocomplete_property_facets_bounded(
+                &facet_graph,
+                usize::MAX,
+                usize::MAX,
+            ));
+            autocomplete.push(started.elapsed());
+        }
+        for (family, samples) in [
+            ("query_facets", &mut query_facets),
+            ("autocomplete_property_facets", &mut autocomplete),
+        ] {
+            samples.sort();
+            println!(
+                "b4_facet family={family} pages={} blocks={facet_blocks} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={}",
+                size + 1,
+                samples[samples.len() / 2].as_secs_f64() * 1_000.0,
+                samples[samples.len() * 95 / 100].as_secs_f64() * 1_000.0,
+                samples[samples.len() - 1].as_secs_f64() * 1_000.0,
+                samples.len(),
+            );
+        }
+        let _ = fs::remove_dir_all(&facet_dir);
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn copy_directory_tree(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {

@@ -28958,11 +28958,160 @@ fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equi
 // `crates/tine-core/src/oplog/hot_engine_integration_tests.rs`.
 // ---------------------------------------------------------------------------
 
+fn emit_a4_save_attribution_checkpoint(
+    cadence: &str,
+    checkpoint: usize,
+    save: Duration,
+    cumulative_save: Duration,
+    cumulative_drain: Duration,
+    elapsed: Duration,
+    pending: usize,
+    stages: ManagedApplicationSaveStageTimings,
+    drain_stages: Option<crate::oplog::local_journal_drain::ManagedLocalDrainStageTimings>,
+) {
+    eprintln!(
+        "a4_save_checkpoint cadence={cadence} checkpoint={checkpoint} save_ms={:.6} cumulative_save_ms={:.6} cumulative_drain_ms={:.6} elapsed_ms={:.6} pending={pending}",
+        startup_ms(save),
+        startup_ms(cumulative_save),
+        startup_ms(cumulative_drain),
+        startup_ms(elapsed),
+    );
+    macro_rules! stage_rows {
+        ($($field:ident),+ $(,)?) => {
+            $(eprintln!(
+                "a4_save_stage cadence={cadence} checkpoint={checkpoint} stage={} stage_ms={:.6}",
+                stringify!($field),
+                startup_ms(stages.$field),
+            );)+
+        };
+    }
+    stage_rows!(
+        actor_total,
+        application_prepare_turn,
+        application_request_build,
+        exact_page_load,
+        editor_prepare_turn,
+        editor_total,
+        editor_transaction_build,
+        editor_current_page_admission,
+        editor_page_id_and_block_id_resolution,
+        editor_requested_page_build,
+        editor_exact_base_read,
+        editor_projection_preparation,
+        editor_accepted_projection_render,
+        editor_target_projection_render,
+        editor_target_byte_clone,
+        editor_accepted_baseline_parse,
+        editor_requested_target_parse,
+        editor_identity_and_rename_kind_checks,
+        editor_target_dto_and_response_evidence,
+        editor_affine_artifact_and_reply_assembly,
+        transaction_current_map_and_existing_validation,
+        transaction_desired_memberships,
+        transaction_outline_depths,
+        transaction_create_scan_sort_emit,
+        transaction_edit_scan_emit,
+        transaction_reorder_scan_sort_emit,
+        transaction_preamble_check_emit,
+        transaction_delete_sets_scan_sort_emit,
+        transaction_inner_finish_validate,
+        transaction_outer_merge_finish_validate,
+        editor_request_remainder,
+        promoted_mutation_admission,
+        application_outcome,
+    );
+    macro_rules! counter_rows {
+        ($($field:ident),+ $(,)?) => {
+            $(eprintln!(
+                "a4_save_counter cadence={cadence} checkpoint={checkpoint} counter={} value={}",
+                stringify!($field),
+                stages.$field,
+            );)+
+        };
+    }
+    counter_rows!(
+        hot_application_save_attempts,
+        hot_application_save_reuses,
+        response_target_parses,
+        response_target_dto_conversions,
+        response_target_exact_dto_reparses,
+        editor_block_id_resolution_passes,
+        editor_block_ids_visited,
+        editor_requested_current_map_builds,
+        editor_requested_current_map_entries,
+        editor_requested_membership_derivations,
+        editor_requested_membership_entries,
+        editor_accepted_renders,
+        editor_accepted_rendered_blocks,
+        editor_target_renders,
+        editor_target_rendered_blocks,
+        editor_accepted_parses,
+        editor_accepted_parse_bytes,
+        editor_target_parses,
+        editor_target_parse_bytes,
+        editor_target_dto_converted_blocks,
+        transaction_current_map_builds,
+        transaction_current_map_entries,
+        transaction_membership_derivations,
+        transaction_membership_entries,
+        transaction_outline_depth_derivations,
+        transaction_outline_depth_entries,
+        transaction_create_scan_passes,
+        transaction_create_scan_entries,
+        transaction_edit_scan_passes,
+        transaction_edit_scan_entries,
+        transaction_reorder_scan_passes,
+        transaction_reorder_scan_entries,
+        transaction_delete_desired_set_scans,
+        transaction_delete_desired_set_entries,
+        transaction_delete_current_set_scans,
+        transaction_delete_current_set_entries,
+        transaction_delete_root_scans,
+        transaction_delete_root_entries,
+        transaction_emitted_create,
+        transaction_emitted_edit,
+        transaction_emitted_reorder,
+        transaction_emitted_delete,
+        transaction_emitted_preamble,
+        transaction_emitted_rename,
+        transaction_emitted_kind,
+        transaction_inner_validations,
+        transaction_inner_validation_operations,
+        transaction_outer_validations,
+        transaction_outer_validation_operations,
+    );
+    if let Some(drain) = drain_stages {
+        macro_rules! drain_rows {
+            ($($field:ident),+ $(,)?) => {
+                $(eprintln!(
+                    "a4_drain_stage cadence={cadence} checkpoint={checkpoint} stage={} stage_ms={:.6}",
+                    stringify!($field),
+                    startup_ms(drain.$field),
+                );)+
+            };
+        }
+        drain_rows!(
+            authenticate,
+            archive_publication,
+            engine_acceptance,
+            tail_and_sqlite,
+            projection_adoption,
+            authorship_receipt,
+            provider_publication,
+            checkpoint,
+            total,
+        );
+    }
+}
+
 /// Q1/Q2 at the application boundary: create new pages through the ordinary
 /// managed application save path until the run-local budget refuses, then
 /// reopen and observe whether the refusal survives.
 ///
 /// `TINE_A4_MAX_PAGES` (default 4_400) bounds the loop.
+/// `TINE_A4_DRAIN_CADENCE` is `never`, `every`, or a positive page count and
+/// defaults to `every`, preserving the original repro. Attribution rows are
+/// emitted at `TINE_A4_ATTRIBUTION_CHECKPOINTS` (default 50,200,400).
 #[test]
 #[ignore = "harvest A4 repro: thousands of real application page creations (release only)"]
 fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
@@ -28974,6 +29123,32 @@ fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4_400);
+    let drain_cadence = std::env::var("TINE_A4_DRAIN_CADENCE").unwrap_or_else(|_| "every".into());
+    let drain_every = match drain_cadence.as_str() {
+        "never" | "0" => None,
+        "every" | "every_page" | "1" => Some(1),
+        value => Some(
+            value
+                .parse::<usize>()
+                .expect("TINE_A4_DRAIN_CADENCE must be never, every, or a positive integer")
+                .max(1),
+        ),
+    };
+    let cadence_label = match drain_every {
+        None => "never".to_owned(),
+        Some(1) => "every_page".to_owned(),
+        Some(value) => format!("every_{value}_pages"),
+    };
+    let checkpoints = std::env::var("TINE_A4_ATTRIBUTION_CHECKPOINTS")
+        .unwrap_or_else(|_| "50,200,400".into())
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .expect("A4 attribution checkpoints must be positive integers")
+        })
+        .collect::<Vec<_>>();
     let fixture = ActivationFixture::nested_unicode("a4-page-budget", 0xa4f1);
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     assert_eq!(activated.status, SyncLocalActivationStatus::Active);
@@ -28983,6 +29158,8 @@ fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
     let started = Instant::now();
     let mut created = 0usize;
     let mut refusal = None;
+    let mut cumulative_save = Duration::ZERO;
+    let mut cumulative_drain = Duration::ZERO;
     while created < limit {
         let name = format!("A4 Budget Page {created}");
         let blocks = vec![BlockDto {
@@ -28990,6 +29167,7 @@ fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
             raw: format!("a4 budget block {created}"),
             ..BlockDto::default()
         }];
+        let save_started = Instant::now();
         let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
             target: SyncApplicationPageSaveTarget::New {
                 name: name.clone(),
@@ -28997,10 +29175,33 @@ fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
             },
             page: new_application_page(&name, SyncPageKind::Page, None, blocks),
         });
+        let save_elapsed = save_started.elapsed();
         match outcome {
             Ok(SyncApplicationPageSaveOutcome::Saved { .. }) => {
                 created += 1;
-                drain_managed_local(&handle);
+                cumulative_save += save_elapsed;
+                let drained = drain_every.is_some_and(|cadence| created % cadence == 0);
+                if drained {
+                    let drain_started = Instant::now();
+                    drain_managed_local(&handle);
+                    cumulative_drain += drain_started.elapsed();
+                }
+                if checkpoints.contains(&created) {
+                    let instrumentation = handle
+                        .managed_application_save_instrumentation()
+                        .expect("A4 attribution reads save-stage instrumentation");
+                    emit_a4_save_attribution_checkpoint(
+                        &cadence_label,
+                        created,
+                        save_elapsed,
+                        cumulative_save,
+                        cumulative_drain,
+                        started.elapsed(),
+                        instrumentation.managed_local_pending,
+                        instrumentation.application_stages,
+                        drained.then_some(instrumentation.derivative_stages),
+                    );
+                }
             }
             other => {
                 refusal = Some(format!("{other:?}"));
@@ -29009,9 +29210,19 @@ fn a4_repro_managed_page_creation_wedges_at_the_run_local_budget() {
         }
     }
     eprintln!(
-        "a4_budget created_pages={created} elapsed_ms={:.1} refusal={refusal:?}",
-        startup_ms(started.elapsed())
+        "a4_budget cadence={cadence_label} created_pages={created} elapsed_ms={:.1} cumulative_save_ms={:.6} cumulative_drain_ms={:.6} refusal={refusal:?}",
+        startup_ms(started.elapsed()),
+        startup_ms(cumulative_save),
+        startup_ms(cumulative_drain),
     );
+    if drain_every.is_none() && handle.status().unwrap().managed_local_pending > 0 {
+        let final_settle_started = Instant::now();
+        drain_managed_local(&handle);
+        eprintln!(
+            "a4_final_settle cadence={cadence_label} drain_ms={:.6}",
+            startup_ms(final_settle_started.elapsed()),
+        );
+    }
     let status = handle.status().unwrap();
     eprintln!("a4_budget status_after_refusal={status:?}");
 

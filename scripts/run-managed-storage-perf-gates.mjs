@@ -88,6 +88,25 @@ const runs = [
     test: "managed_reconciliation_and_shutdown_manual_benchmark",
     env: { TINE_MANAGED_RECONCILIATION_BENCH_PAGES: "10000" },
   },
+  {
+    name: "b4-query-attribution",
+    test: "scripts/harvest-b4-query-attribution.mjs",
+    command: [
+      process.execPath,
+      "scripts/harvest-b4-query-attribution.mjs",
+      "--graph",
+      realGraph,
+      "--runs",
+      "3",
+    ],
+    env: {},
+  },
+  {
+    name: "a4-save-attribution",
+    test: "scripts/harvest-a4-save-attribution.mjs",
+    command: [process.execPath, "scripts/harvest-a4-save-attribution.mjs", "--runs", "3"],
+    env: {},
+  },
 ];
 
 const manifest = {
@@ -101,7 +120,7 @@ const manifest = {
 };
 
 for (const entry of runs) {
-  const command = ["cargo", ...common, entry.test, "--", "--ignored", "--nocapture"];
+  const command = entry.command ?? ["cargo", ...common, entry.test, "--", "--ignored", "--nocapture"];
   console.log(`\n==> ${entry.name}: ${command.join(" ")}`);
   const started = Date.now();
   const result = spawnSync(command[0], command.slice(1), {
@@ -125,13 +144,15 @@ for (const entry of runs) {
   if (result.status !== 0) {
     throw new Error(`${entry.name} failed with status ${result.status}; see ${receipt.log}`);
   }
-  const passed = [...output.matchAll(/test result: ok\. (\d+) passed/g)]
-    .reduce((total, match) => total + Number(match[1]), 0);
-  if (passed !== 1) {
-    throw new Error(
-      `${entry.name} matched ${passed} tests instead of exactly one; `
-      + `the release gate name is stale or ambiguous; see ${receipt.log}`,
-    );
+  if (!entry.command) {
+    const passed = [...output.matchAll(/test result: ok\. (\d+) passed/g)]
+      .reduce((total, match) => total + Number(match[1]), 0);
+    if (passed !== 1) {
+      throw new Error(
+        `${entry.name} matched ${passed} tests instead of exactly one; `
+        + `the release gate name is stale or ambiguous; see ${receipt.log}`,
+      );
+    }
   }
 }
 
