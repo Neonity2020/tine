@@ -151,7 +151,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const read = vi
       .spyOn(backend(), "getPageByPath")
       .mockResolvedValue(page("Target", "pages/other/Target.md", "requested"));
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
 
     await persistBlockRefTarget("uuid-3", "Target", "page", "pages/other/Target.md");
     expect(read).toHaveBeenCalledTimes(1);
@@ -207,7 +207,7 @@ describe("replacing a loaded instance (GH #304)", () => {
         releaseRead = r as (dto: unknown) => void;
       }) as never,
     );
-    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
     vi.spyOn(backend(), "deletePage").mockResolvedValue(undefined as never);
     release();
     await new Promise((r) => setTimeout(r, 0));
@@ -239,7 +239,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const read = vi
       .spyOn(backend(), "getPageByPath")
       .mockResolvedValue(page("Target", "pages/other/Target.md", "survivor"));
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
     vi.spyOn(backend(), "deletePage").mockResolvedValue(undefined as never);
 
     // The retained request targets the OTHER file of that name.
@@ -269,7 +269,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const read = vi
       .spyOn(backend(), "getPageByPath")
       .mockResolvedValue(page("Target", "pages/other/Target.md", "survivor"));
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
 
     await persistBlockRefTarget("uuid-9", "Target", "page", "pages/other/Target.md");
     expect(read).toHaveBeenCalledTimes(1); // refused by the lease, request retained
@@ -315,7 +315,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const { persistBlockRefTarget, deletePage, resetStore, doc: liveDoc } = await import("./store");
     await ensurePageLoaded(page("Target", "pages/old/Target.md", "old"));
     vi.spyOn(backend(), "deletePage").mockResolvedValue(undefined as never);
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
     await deletePage("Target", "page", "pages/old/Target.md");
 
     resetStore();
@@ -353,7 +353,7 @@ describe("replacing a loaded instance (GH #304)", () => {
 
     const survivor = page("Target", "pages/Target.md", "survivor");
     const read = vi.spyOn(backend(), "getPage").mockResolvedValue(survivor as never);
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
     vi.spyOn(backend(), "deletePage").mockResolvedValue(undefined as never);
 
     // No path: the request can only name the page.
@@ -434,7 +434,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const read = vi
       .spyOn(backend(), "getPageByPath")
       .mockResolvedValue(page("Target", "pages/other/Target.md", "requested"));
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
 
     await persistBlockRefTarget("uuid-13", "Target", "page", "pages/other/Target.md");
     expect(read).toHaveBeenCalledTimes(1);
@@ -568,7 +568,7 @@ describe("replacing a loaded instance (GH #304)", () => {
         handOver = r as (h: unknown) => void;
       }) as never,
     );
-    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
 
     const saving = flushPage("Target");
     await new Promise((r) => setTimeout(r, 0));

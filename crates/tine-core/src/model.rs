@@ -16539,6 +16539,44 @@ impl Graph {
         Ok(format!("{key}/{name}"))
     }
 
+    fn move_pdf_area_image_to_trash(
+        &self,
+        source_key: &str,
+        page: i64,
+        id: &str,
+        stamp: i64,
+    ) -> io::Result<Option<(PathBuf, PathBuf)>> {
+        let name = format!("{page}_{id}_{stamp}.png");
+        top_level_asset_name(&name)?;
+        let source = self.assets_path().join(source_key).join(&name);
+        if !source.exists() {
+            return Ok(None);
+        }
+        self.ensure_asset_write_target(&source)?;
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
+        self.ensure_trash_write_target(&trash)?;
+        let trash_name = format!("{}__pdf-area__{}__{name}", trash_stamp(), source_key);
+        top_level_asset_name(&trash_name)?;
+        let destination = trash.join(trash_name);
+        move_to_trash(&source, &destination, &trash)?;
+        Ok(Some((source, destination)))
+    }
+
+    /// Roll back a crop written before its highlight sidecar transaction failed.
+    /// The nested source path is derived from the same PDF tuple as the writer;
+    /// callers never receive a general nested-asset deletion capability.
+    pub fn rollback_pdf_area_image(
+        &self,
+        pdf_filename: &str,
+        page: i64,
+        id: &str,
+        stamp: i64,
+    ) -> io::Result<()> {
+        let key = crate::pdf::asset_key(pdf_filename);
+        self.move_pdf_area_image_to_trash(&key, page, id, stamp)?;
+        Ok(())
+    }
+
     /// After the highlight sidecar + hls page pair is durably committed, move
     /// deleted area crops to recoverable asset trash. OG removes this exact crop
     /// with its highlight (`extensions/pdf/core.cljs:155-159` and
@@ -16560,7 +16598,6 @@ impl Graph {
         if deleted.is_empty() {
             return;
         }
-        let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
         for highlight in deleted {
             let Some(stamp) = highlight.image else {
                 continue;
@@ -16585,26 +16622,11 @@ impl Graph {
                 continue;
             }
 
-            let name = format!("{}_{}_{}.png", highlight.page, highlight.id, stamp);
-            if top_level_asset_name(&name).is_err() {
+            let Ok(Some((source, destination))) =
+                self.move_pdf_area_image_to_trash(source_key, highlight.page, &highlight.id, stamp)
+            else {
                 continue;
-            }
-            let source = self.assets_path().join(source_key).join(&name);
-            if !source.is_file()
-                || self.ensure_asset_write_target(&source).is_err()
-                || self.ensure_trash_write_target(&trash).is_err()
-                || fs::create_dir_all(&trash).is_err()
-            {
-                continue;
-            }
-            let trash_name = format!("{}__pdf-area__{}__{name}", trash_stamp(), source_key);
-            if top_level_asset_name(&trash_name).is_err() {
-                continue;
-            }
-            let destination = trash.join(trash_name);
-            if move_to_trash(&source, &destination, &trash).is_err() {
-                continue;
-            }
+            };
 
             // A non-cooperating writer can change the sidecar between the
             // last-moment read and rename. Put the crop back if that happened.

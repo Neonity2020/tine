@@ -286,7 +286,7 @@ describe("deferred block-ref stamp — enumerated interleavings (GH #254 increme
       const targetDto = page("Target", TARGET, "target body", UUID);
       const byPath = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(targetDto);
       const byName = vi.spyOn(backend(), "getPage").mockResolvedValue(targetDto as never);
-      const saved = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+      const saved = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
       vi.spyOn(backend(), "deletePage").mockResolvedValue(undefined as never);
 
       if (c.incumbent === "saving") {
@@ -373,7 +373,7 @@ describe("deferred block-ref stamp — enumerated interleavings (GH #254 increme
           // a page that is not saving — which silently skipped the progress
           // assertion across the whole suite and cost this matrix its round-10
           // coverage without a single test going red.
-          saved.mockResolvedValue("rev-2");
+          saved.mockResolvedValue({ revision: "rev-2" });
           landSave("rev-2");
           await new Promise((r) => setTimeout(r, 0));
         }
@@ -408,7 +408,7 @@ describe("deferred block-ref stamp — enumerated interleavings (GH #254 increme
         store.sweepReplaceable();
       }
       if (c.release === "save-lands") {
-        saved.mockResolvedValue("rev-2");
+        saved.mockResolvedValue({ revision: "rev-2" });
         landSave("rev-2");
         await new Promise((r) => setTimeout(r, 0));
       }

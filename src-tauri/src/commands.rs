@@ -4638,6 +4638,32 @@ mod application_page_authority_tests {
     }
 
     #[test]
+    fn pdf_area_rollback_moves_the_real_nested_crop_to_typed_asset_trash() {
+        let (temp, graph) = graph_with_files(&[]);
+        let stored = graph
+            .write_pdf_area_image("paper.pdf", 3, "area-id", 42, b"png")
+            .unwrap();
+        assert!(
+            stored.contains('/'),
+            "the fixture must exercise the nested OG layout"
+        );
+        let source = graph.assets_path().join(&stored);
+        assert!(source.is_file());
+
+        rollback_pdf_area_image_at(&graph, "paper.pdf", 3, "area-id", 42).unwrap();
+
+        assert!(!source.exists());
+        let trash = temp.path().join("logseq/.tine-trash/assets");
+        let names = std::fs::read_dir(trash)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+        assert!(names[0].contains("__pdf-area__"));
+        assert!(names[0].ends_with("__3_area-id_42.png"));
+    }
+
+    #[test]
     fn sparse_load_mapping_sets_actor_revision_and_fails_closed() {
         let loaded = map_sparse_page_load(SyncApplicationPageLoadOutcome::Loaded {
             page: page("Loaded", PageKind::Page, "pages/Loaded.md", "- body"),
@@ -5222,6 +5248,38 @@ pub(crate) fn save_pdf_area_image(
             .map_err(|e| e.to_string())?;
         crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
         Ok(stored)
+    })
+}
+
+fn rollback_pdf_area_image_at(
+    graph: &tine_core::model::Graph,
+    pdf: &str,
+    page: i64,
+    id: &str,
+    stamp: i64,
+) -> Result<(), String> {
+    graph
+        .rollback_pdf_area_image(pdf, page, id, stamp)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn rollback_pdf_area_image(
+    pdf: String,
+    page: i64,
+    id: String,
+    stamp: i64,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let window_label = state.window.label().to_string();
+    with_trash_graph(&state, |graph| {
+        let source = graph
+            .assets_path()
+            .join(tine_core::pdf::asset_key(&pdf))
+            .join(format!("{page}_{id}_{stamp}.png"));
+        rollback_pdf_area_image_at(graph, &pdf, page, &id, stamp)?;
+        crate::watcher::note_asset_self_write(&window_label, &source);
+        Ok(())
     })
 }
 

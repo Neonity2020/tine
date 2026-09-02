@@ -41,7 +41,7 @@ vi.mock("./backend", () => ({
   backend: () => ({
     savePage: (page: { name: string }) => {
       saved.push(page.name);
-      return Promise.resolve("rev-after");
+      return Promise.resolve({ revision: "rev-after" });
     },
   }),
 }));

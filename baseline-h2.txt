@@ -1,0 +1,34 @@
+Harvest H2 composed-base failure floor
+======================================
+
+Base: batch/harvest-wave2 at b792327, plus the composed-integration identity fix
+32f2d425a924b08ee744eea6771074f12cb746c2.
+
+Pre-H2 gates
+------------
+- cargo test -p tine: 366 passed, 2 ignored
+- npm test: green
+- npx tsc --noEmit: green
+- cargo test -p tine-core: 1777 passed, 79 failed, 52 ignored
+- exact sorted failure-name set SHA-256:
+  4997c01a27cb3265cf4de90cee1eed9658d3cf6ab98af5314df158aaf0edd7f1
+- retained raw log:
+  /home/koutecky/.local/share/rtk/tee/1788311022_cargo_test.log
+
+Post-H2 comparison
+------------------
+- cargo test -p tine-core, two full runs: 1776 passed, 80 failed, 52 ignored
+- exact sorted failure-name set SHA-256 on the clean rerun:
+  99f583dcb39124c89f8c6158f6c13c9c4a2fe7b7826b11c7e183a8f887fdb223
+- retained raw rerun log:
+  /home/koutecky/.local/share/rtk/tee/1788312762_cargo_test.log
+- set difference: one added name, zero removed names:
+  sync_runtime::tests::checkpoint_roster_surfaces_missing_authoritative_manifest_immediately
+- that A5-owned test passed immediately with `--exact --nocapture`; H2 does not
+  edit sync_runtime.rs or its test sibling. Both full parallel runs printed the
+  test's pre-existing global deterministic checkpoint hook firing, so this is
+  recorded as an inherited full-suite scheduling collision, not promoted into
+  H2's allowed write set.
+
+The exact name sets can be reconstructed from either retained log with:
+  rg '^---- .* stdout ----$' LOG | sed -E 's/^---- (.*) stdout ----$/\1/' | sort

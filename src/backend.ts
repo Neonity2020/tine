@@ -201,15 +201,35 @@ export interface PluginRegistryCacheEnvelope {
   signature: string;
 }
 
-export interface LegacyPluginRegistryCache {
-  indexJson: string;
-  signature: string;
+/** A Direct Files revision conflict, classified once at the Tauri wire boundary.
+ * Callers branch on this tag and never inspect arbitrary backend prose. */
+export class SaveConflictError extends Error {
+  readonly kind = "save-conflict";
+
+  constructor(readonly epoch: number | null) {
+    super(epoch === null ? "conflict" : `conflict:${epoch}`);
+    this.name = "SaveConflictError";
+  }
+}
+
+export function isSaveConflictError(error: unknown): error is SaveConflictError {
+  return error instanceof SaveConflictError;
+}
+
+export function classifySaveConflictWire(error: unknown): SaveConflictError | null {
+  const message = typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : null;
+  if (message === "conflict") return new SaveConflictError(null);
+  const match = message?.match(/^conflict:(\d+)$/);
+  return match ? new SaveConflictError(Number(match[1])) : null;
 }
 
 export type PluginRegistryCacheLoad =
   | { kind: "absent" }
   | { kind: "envelope"; envelope: PluginRegistryCacheEnvelope }
-  | { kind: "legacy"; indexJson: string; signature: string }
   | { kind: "unsafe"; reason: string };
 
 export type LoadGraphResult =
@@ -262,8 +282,7 @@ export interface Backend {
   loadPluginRegistryCache(): Promise<PluginRegistryCacheLoad>;
   storePluginRegistryCache(
     indexJson: string,
-    signature: string,
-    expectedLegacy?: LegacyPluginRegistryCache
+    signature: string
   ): Promise<void>;
   /** Keep Android's edge-to-edge status/navigation icon appearance readable
    *  against Tine's explicit in-app theme. Other platforms are a no-op. */
@@ -709,6 +728,8 @@ export interface Backend {
    *  (non-dedup — the filename links the `.edn` `:image <stamp>` to the file).
    *  Returns the assets-relative path. */
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array): Promise<string>;
+  /** Move a just-written area crop to recoverable trash when its sidecar write fails. */
+  rollbackPdfAreaImage(pdf: string, page: number, id: string, stamp: number): Promise<void>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
   /** Subscribe to coalesced external bulk revisions (Concord P2): one event
@@ -1059,13 +1080,11 @@ class TauriBackend implements Backend {
   }
   storePluginRegistryCache(
     indexJson: string,
-    signature: string,
-    expectedLegacy?: LegacyPluginRegistryCache
+    signature: string
   ) {
     return this.call<void>("store_plugin_registry_cache", {
       indexJson,
       signature,
-      expectedLegacy: expectedLegacy ?? null,
     });
   }
   setSystemBarAppearance(dark: boolean) {
@@ -1109,22 +1128,28 @@ class TauriBackend implements Backend {
   graphSourceFiles(includeJournals: boolean) {
     return this.call<GraphSourceFile[]>("graph_source_files", { includeJournals });
   }
-  savePage(
+  async savePage(
     page: PageDto,
     baseRev: string | null,
     force = false,
     conflictEpoch: number | null = null,
     managedConflictObservation: { path: string; revision: string } | null = null,
   ) {
-    return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
-      this.call<SavePageResult>("save_page", {
-        page,
-        baseRev,
-        force,
-        conflictEpoch,
-        managedConflictObservation,
-      })
-    );
+    try {
+      return await measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
+        this.call<SavePageResult>("save_page", {
+          page,
+          baseRev,
+          force,
+          conflictEpoch,
+          managedConflictObservation,
+        })
+      );
+    } catch (error) {
+      const conflict = classifySaveConflictWire(error);
+      if (conflict) throw conflict;
+      throw error;
+    }
   }
   beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]) {
     return this.call<string | null>("begin_direct_cross_page_move", { destination, sources });
@@ -1785,6 +1810,9 @@ class TauriBackend implements Backend {
       stamp,
       bytesB64: bytesToBase64(bytes),
     });
+  }
+  rollbackPdfAreaImage(pdf: string, page: number, id: string, stamp: number) {
+    return this.call<void>("rollback_pdf_area_image", { pdf, page, id, stamp });
   }
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");

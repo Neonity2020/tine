@@ -4,7 +4,7 @@ import { ConflictBar } from "./ConflictBar";
 import { Block } from "./Block";
 import { PageView } from "./Page";
 import { conflicts, clearConflict } from "../ui";
-import { backend } from "../backend";
+import { backend, SaveConflictError } from "../backend";
 import { loadSingle, resetStore, pageByName, doc, setRaw } from "../store";
 import {
   canForceSave,
@@ -65,7 +65,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     // authority that ConflictBar presents: an editor activation and the shown
     // observation minted by the refused guarded save.
     const savePage = vi.spyOn(backend(), "savePage")
-      .mockRejectedValueOnce(new Error("conflict:41"));
+      .mockRejectedValueOnce(new SaveConflictError(41));
     expect(await flushPage(sharedName)).toBe(false);
     expect(conflicts()).toEqual([sharedName]);
     expect(isDirty(sharedName)).toBe(false);
@@ -82,7 +82,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     expect(loaded).toBeDefined();
     setRaw(loaded!.roots[0], "the retained local draft");
     const savePage = vi.spyOn(backend(), "savePage")
-      .mockRejectedValueOnce(new Error("conflict:41"));
+      .mockRejectedValueOnce(new SaveConflictError(41));
     expect(await flushPage(dto.name)).toBe(false);
     expect(conflicts()).toEqual([dto.name]);
     return savePage;
@@ -106,7 +106,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     // This is what the defective re-observing route would write. Leaving it
     // available makes the regression prove that no post-click save is issued,
     // rather than passing because an unexpected write happened to throw.
-    savePage.mockResolvedValue("rev-of-retained-draft");
+    savePage.mockResolvedValue({ revision: "rev-of-retained-draft" });
     const saveCallsBeforeClick = savePage.mock.calls.length;
 
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
@@ -128,7 +128,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     const divergent = page(strayPath, "a newer winner that was never authorised");
     vi.spyOn(backend(), "presentConflictOverride").mockResolvedValue("withdrawn");
     vi.spyOn(backend(), "getPageByPath").mockResolvedValue(divergent);
-    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+    savePage.mockRejectedValueOnce(new SaveConflictError(42));
 
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
 
@@ -151,7 +151,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
       }),
     );
     const retire = vi.spyOn(backend(), "retireEditorActivation").mockResolvedValue(true);
-    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+    savePage.mockRejectedValueOnce(new SaveConflictError(42));
 
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
     await vi.waitFor(() => expect(activate).toHaveBeenCalledTimes(1));
@@ -204,7 +204,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     getPageByPath.mockResolvedValue({ ...diskBaseline, rev: "disk-winner", blocks: [
       { id: "disk-title-winner", raw: "the disk winner", collapsed: false, children: [], properties: [] },
     ] });
-    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+    savePage.mockRejectedValueOnce(new SaveConflictError(42));
 
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
     await vi.waitFor(() => expect(backend().activateEditor).toHaveBeenCalled());
@@ -245,7 +245,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
       releasePresentation = resolve;
     });
     const present = vi.spyOn(backend(), "presentConflictOverride").mockReturnValue(presentation);
-    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+    savePage.mockRejectedValueOnce(new SaveConflictError(42));
 
     mounted.root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
     await vi.waitFor(() => expect(present).toHaveBeenCalledTimes(1));
@@ -288,7 +288,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
       releasePresentation = resolve;
     });
     const present = vi.spyOn(backend(), "presentConflictOverride").mockReturnValue(presentation);
-    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+    savePage.mockRejectedValueOnce(new SaveConflictError(42));
 
     mounted.root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
     await vi.waitFor(() => expect(present).toHaveBeenCalledTimes(1));
@@ -481,7 +481,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
       .mockResolvedValue("superseded");
     const getPageByPath = vi.spyOn(backend(), "getPageByPath")
       .mockResolvedValue(page(strayPath, "newer disk bytes must not be installed"));
-    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+    savePage.mockRejectedValueOnce(new SaveConflictError(42));
 
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
 
@@ -511,7 +511,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     const { notifyGraphRebound } = await import("../modeHooks");
 
     const { root, dispose, savePage } = await mountWithObservedDirectConflict();
-    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+    savePage.mockRejectedValueOnce(new SaveConflictError(42));
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
     await Promise.resolve();
 
@@ -580,7 +580,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     loadSingle(withoutPath);
     const loaded = pageByName(sharedName)!;
     setRaw(loaded.roots[0], "the retained local draft");
-    vi.spyOn(backend(), "savePage").mockRejectedValueOnce(new Error("conflict:41"));
+    vi.spyOn(backend(), "savePage").mockRejectedValueOnce(new SaveConflictError(41));
     expect(await flushPage(sharedName)).toBe(false);
     const getPageByPath = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(null);
     const getPage = vi.spyOn(backend(), "getPage")

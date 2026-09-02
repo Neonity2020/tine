@@ -616,10 +616,13 @@ function actorReasonCode(message: string): string {
  *  could not name, so no override may be presented for it. Returns null when the
  *  error is not banner class at all, and -1 for the unnameable legacy shape. */
 function conflictObservationEpoch(error: unknown): number | null {
-  const message = String(error).replace(/^Error: /, "");
-  if (message === "conflict") return -1;
-  const match = /^conflict:(\d+)$/.exec(message);
-  return match ? Number(match[1]) : null;
+  if (typeof error !== "object" || error === null || !("kind" in error) || error.kind !== "save-conflict") {
+    return null;
+  }
+  if (!("epoch" in error) || error.epoch === null) return -1;
+  return typeof error.epoch === "number" && Number.isSafeInteger(error.epoch) && error.epoch >= 0
+    ? error.epoch
+    : null;
 }
 
 /** Whether a save failed because the page revision changed underneath it.
@@ -982,7 +985,7 @@ async function doSave(
         observation?.kind === "managed" ? observation.observation : null,
       )
     );
-    const rev = typeof saved === "string" ? saved : saved.revision;
+    const rev = saved.revision;
     // A reload/rename/delete/rebind while savePage was in flight invalidates the
     // retirement proof even if those bytes landed. Never let that stale success
     // authorize identity reuse or update the replacement instance's baseline.
@@ -991,7 +994,7 @@ async function doSave(
       && graphBindingRev === bindingAtStart
       && peekPageInstanceGeneration(name) === issuingInstance
       && editorActivationFor(name) === issuingActivation;
-    if (typeof saved !== "string" && saved.activation) {
+    if (saved.activation) {
       if (exactIssuerStillLive) {
         // A first-create response may resolve/retarget the activation. It belongs
         // only to the exact page instance and graph binding that issued this save;

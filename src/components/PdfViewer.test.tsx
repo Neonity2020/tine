@@ -676,6 +676,33 @@ describe("PdfViewer OG area-highlight selection", () => {
       dispose();
     }
   });
+
+  it("rolls a nested area crop back to trash when the sidecar write fails", async () => {
+    const id = "44444444-4444-4444-8444-444444444444";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
+    vi.spyOn(Date, "now").mockReturnValue(5678);
+    vi.spyOn(backend(), "savePdfAreaImage").mockResolvedValue("paper/1_crop.png");
+    vi.spyOn(backend(), "writeHighlights").mockRejectedValue(new Error("sidecar refused"));
+    const rollback = vi.spyOn(backend(), "rollbackPdfAreaImage").mockResolvedValue(undefined);
+    const writeText = vi.spyOn(backend(), "writeText").mockResolvedValue(undefined);
+    const { host, wrap, dispose } = await mountAreaViewer();
+    try {
+      (host.querySelector('button[title^="Area highlight"]') as HTMLButtonElement).click();
+      dragArea(wrap, { x: 45, y: 55 });
+      await flush();
+      host.querySelectorAll<HTMLButtonElement>(".pdf-color-swatch")[2]
+        .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true }));
+      await flush();
+      await expect(drainPdfWork()).resolves.toBe(false);
+
+      expect(rollback).toHaveBeenCalledOnce();
+      expect(rollback).toHaveBeenCalledWith("paper.pdf", 1, id, 5678);
+      expect(writeText).not.toHaveBeenCalled();
+      expect(host.querySelector(`[data-highlight-id="${id}"]`)).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
 });
 
 describe("PdfViewer OG state and reference behavior", () => {

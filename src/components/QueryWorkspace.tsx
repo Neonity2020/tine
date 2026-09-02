@@ -137,7 +137,7 @@ export async function materializeQueryWorkspace(
       }],
     };
     const saved = await deps.savePage(page, null, false);
-    const rev = typeof saved === "string" ? saved : saved.revision;
+    const rev = saved.revision;
     bumpPageInventoryRev();
     return { ok: true, name, page, rev };
   } catch (error) {

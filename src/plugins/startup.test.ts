@@ -156,63 +156,13 @@ describe("community extension startup revocations", () => {
     expect(verify).not.toHaveBeenCalled();
   });
 
-  it("uses a verified legacy pair immediately and migrates it through one guarded atomic call", async () => {
-    const api = backend();
-    vi.spyOn(api, "loadPluginRegistryCache").mockResolvedValue({
-      kind: "legacy",
-      indexJson: cachedIndex,
-      signature: " valid-signature ",
-    });
-    vi.spyOn(api, "verifyPluginRegistry").mockResolvedValue();
-    const store = vi.spyOn(api, "storePluginRegistryCache").mockRejectedValue(new Error("disk full"));
-
-    const loaded = await loadVerifiedCachedRegistry(100);
-
-    expect(loaded).toMatchObject({ kind: "verified", source: "legacy" });
-    expect(store).toHaveBeenCalledTimes(1);
-    expect(store).toHaveBeenCalledWith(cachedIndex, " valid-signature ", {
-      indexJson: cachedIndex,
-      signature: " valid-signature ",
-    });
-    expect(registryPersistenceError()).toContain("disk full");
-  });
-
-  it("finishes guarded legacy migration before any live refresh can publish", async () => {
-    const api = backend();
-    vi.spyOn(api, "loadPluginRegistryCache").mockResolvedValue({
-      kind: "legacy",
-      indexJson: cachedIndex,
-      signature: "valid-signature",
-    });
-    vi.spyOn(api, "verifyPluginRegistry").mockResolvedValue();
-    let finishMigration!: () => void;
-    const store = vi.spyOn(api, "storePluginRegistryCache").mockImplementationOnce(() => new Promise<void>((resolve) => {
-      finishMigration = resolve;
-    })).mockResolvedValue(undefined);
-    vi.spyOn(api, "appPlatform").mockResolvedValue("desktop");
-    vi.spyOn(api, "listInstalledPlugins").mockResolvedValue([]);
-    vi.spyOn(api, "getAppString").mockImplementation(async (key, fallback) => key === "theme.packages.v1" ? "[]" : fallback);
-    const fetch = vi.fn(async (url: string | URL | Request) =>
-      new Response(String(url).endsWith(".sig") ? "live-signature" : cachedIndex)
-    );
-    vi.stubGlobal("fetch", fetch);
-
-    const starting = startCommunityExtensions({ cacheTimeoutMs: 100, networkTimeoutMs: 100 });
-    await vi.waitFor(() => expect(store).toHaveBeenCalledTimes(1));
-    expect(fetch).not.toHaveBeenCalled();
-    finishMigration();
-    const startup = await starting;
-    await startup.liveRefresh;
-    expect(fetch).toHaveBeenCalledTimes(2);
-  });
-
   it("classifies torn, malformed, unreadable, and timed-out cache loads as unsafe", async () => {
     const api = backend();
     const load = vi.spyOn(api, "loadPluginRegistryCache");
-    load.mockResolvedValueOnce({ kind: "unsafe", reason: "legacy registry cache is torn" });
+    load.mockResolvedValueOnce({ kind: "unsafe", reason: "registry cache envelope is malformed" });
     await expect(loadVerifiedCachedRegistry(100)).resolves.toEqual({
       kind: "unsafe",
-      reason: "legacy registry cache is torn",
+      reason: "registry cache envelope is malformed",
     });
     load.mockRejectedValueOnce(new Error("settings unreadable"));
     await expect(loadVerifiedCachedRegistry(100)).resolves.toEqual({ kind: "unsafe", reason: "settings unreadable" });
@@ -222,7 +172,7 @@ describe("community extension startup revocations", () => {
 
   it("holds every persisted guest on an unsafe cache without clearing user intent", async () => {
     const api = backend();
-    vi.spyOn(api, "loadPluginRegistryCache").mockResolvedValue({ kind: "unsafe", reason: "legacy cache torn" });
+    vi.spyOn(api, "loadPluginRegistryCache").mockResolvedValue({ kind: "unsafe", reason: "cache envelope torn" });
     vi.spyOn(api, "appPlatform").mockResolvedValue("desktop");
     vi.spyOn(api, "listInstalledPlugins").mockResolvedValue([installedRecord("page.tine.unsafe-held")]);
     vi.spyOn(api, "getAppString").mockImplementation(async (key, fallback) => key === "theme.packages.v1" ? "[]" : fallback);

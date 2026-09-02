@@ -48,7 +48,7 @@ describe("editor activation wiring (GH #254 increment 3)", () => {
 
     const { markDirty, flushPage } = await import("./persistence");
     markDirty("Note");
-    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
     await flushPage("Note");
 
     expect(activate).toHaveBeenCalledWith("pages/Note.md", "replace", "rev-1");
@@ -65,7 +65,7 @@ describe("editor activation wiring (GH #254 increment 3)", () => {
 
     const { markDirty, flushPage } = await import("./persistence");
     markDirty("Note");
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
     await flushPage("Note");
 
     // Churning the token would strand the identity a live banner is bound to.
@@ -168,7 +168,7 @@ describe("editor activation wiring (GH #254 increment 3)", () => {
       prospective: true,
     });
     await loadRoutedPage({ ...page("New", ""), path: "", rev: null });
-    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
+    const saved = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-2" });
 
     const { markDirty, flushPage } = await import("./persistence");
     markDirty("New");

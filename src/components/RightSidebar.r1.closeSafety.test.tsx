@@ -269,7 +269,7 @@ describe("GH #161 R1 right-sidebar close safety", () => {
     const diskPage = join(dir, "page.json");
     vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
       writeFileSync(diskPage, JSON.stringify(dto));
-      return "r1-disk-rev";
+      return { revision: "r1-disk-rev" };
     });
     const text = "Pending edit persisted across right close";
     await beginEdit(root, text);

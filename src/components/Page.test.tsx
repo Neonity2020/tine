@@ -146,7 +146,7 @@ describe("Journals feed generation lifecycle", () => {
     };
     vi.spyOn(backend(), "journalFeedPage").mockImplementation(() => new Promise(() => {}));
     vi.spyOn(backend(), "getPage").mockResolvedValue(existing);
-    const save = vi.spyOn(backend(), "savePage").mockResolvedValue("sparse-saved-rev");
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "sparse-saved-rev" });
     const mounted = mount(() => <PageView />);
     try {
       await flushMicrotasks();
@@ -305,7 +305,7 @@ describe("Journals feed generation lifecycle", () => {
     const save = vi.spyOn(backend(), "savePage").mockImplementation(() =>
       new Promise((resolve) => {
         events.push("save");
-        releaseSave = () => resolve("rollover-rev");
+        releaseSave = () => resolve({ revision: "rollover-rev" });
       })
     );
     const mounted = mount(() => <PageView />);
@@ -449,7 +449,7 @@ describe("Journals feed generation lifecycle", () => {
     let saved: Promise<boolean> | null = null;
     let releaseSave: (() => void) | null = null;
     if (gate === "saving") {
-      vi.spyOn(backend(), "savePage").mockImplementation(() => new Promise((resolve) => { releaseSave = () => resolve("rev"); }));
+      vi.spyOn(backend(), "savePage").mockImplementation(() => new Promise((resolve) => { releaseSave = () => resolve({ revision: "rev" }); }));
       saved = flushPage(today);
       await flushMicrotasks();
     }
@@ -463,7 +463,7 @@ describe("Journals feed generation lifecycle", () => {
       if (gate === "dirty") {
         // Saving is the real dirty release and bumps dataRev after the backend
         // accepts it; leave the PageView retry effect to consume that event.
-        vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+        vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev" });
         await flushPage(today);
         await new Promise<void>((resolve) => setTimeout(resolve, 750));
       }
@@ -799,7 +799,7 @@ describe("tag-page table", () => {
       },
     ];
     vi.spyOn(backend(), "runQuery").mockResolvedValue(groups);
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev1");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev1" });
 
     const tagPage = pageByName("Tag")!;
     const { root, dispose } = mount(() => (
@@ -903,7 +903,7 @@ describe("zoomed block view", () => {
     const read = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
     let finishSave = () => {};
     vi.spyOn(backend(), "savePage").mockImplementation(() => new Promise((resolve) => {
-      finishSave = () => resolve("saved-rev");
+      finishSave = () => resolve({ revision: "saved-rev" });
     }));
     mainPaneRouter.openFile(path, dto.name, dto.kind, { inPlace: true });
 

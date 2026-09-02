@@ -246,6 +246,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("retire_editor_activation", LegacyOnly),
     ("retire_conflict_capsule", NoGraphSlot),
     ("reveal_known_graph", NoGraphSlot),
+    ("rollback_pdf_area_image", TrashWrite),
     ("run_advanced_query", ManagedRouted),
     ("run_graph_search", ManagedRouted),
     ("run_query", ManagedRouted),
