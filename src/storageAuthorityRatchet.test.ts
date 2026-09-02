@@ -1,4 +1,4 @@
-// Source-scan ratchet over `applicationPageAdmission` readers (I-6).
+// Source-scan ratchet over `managedStorageRuntime.snapshot(` readers (I-6).
 //
 // House pattern: the `hmac::verify` source-count guard. This is the CHEAP half
 // of the guard pair — it cannot prove reachability (aliasing evades a grep), so
@@ -7,10 +7,13 @@
 // `src/storageDispatch.test.ts` (route level) and
 // `src/storageDispatchRoutes.test.ts` (the real store/filedrop/carry paths).
 //
-// The allowlist below IS packet B1's census, in code. Every entry is a
-// legitimate NON-dispatch read: a value capture, or an I-20 staleness re-check
-// in an async continuation. A read that decides where a semantic storage
-// operation runs does not belong in any of these files.
+// Equality is deliberate: deleting a legitimate reader must force a census
+// edit too, so a refactor cannot silently trade that deletion for a new reader
+// elsewhere and keep the same total. The allowlist below IS the census, in
+// code. Every entry is either the front door's single selection read, an
+// authority value capture / I-20 staleness re-check, or a display-only status
+// reader. A read that decides where a semantic storage operation runs does not
+// belong outside `storageDispatch.ts`.
 
 import { describe, it, expect } from "vitest";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -19,7 +22,7 @@ import { fileURLToPath } from "node:url";
 
 const SRC = fileURLToPath(new URL(".", import.meta.url));
 
-const SYMBOL = "applicationPageAdmission";
+const SYMBOL = "managedStorageRuntime.snapshot(";
 
 /**
  * Files that are allowed to name the symbol because they OWN it, not because
@@ -29,40 +32,49 @@ const SYMBOL = "applicationPageAdmission";
 const OWNERS = new Set([
   // Publishes the snapshot: binds it, validates the envelope, revokes writability.
   "managedStorageRuntime.ts",
-  // The one place a semantic storage operation's authority branch may live.
-  "storageDispatch.ts",
 ]);
 
 /**
- * The B1 census: every remaining production reader, with the class that makes
+ * The exact production census, with the class that makes
  * it legitimate. `count` is the number of times the symbol appears in the file.
  *
- * class (b) = value capture / I-20 staleness re-check against a stamped value.
- * class (c) = neither a dispatch nor a staleness check.
+ * class (b) = authority selection/capture or I-20 re-check against a stamp.
+ * class (c) = display, notice, or search-index status only; no write routing.
  */
 const CENSUS: readonly { file: string; count: number; class: "b" | "c"; why: string }[] = [
   {
     file: "App.tsx",
-    count: 1,
-    class: "c",
-    why: "sweepScopeAuthority memo — a reactive SCOPE key for the absence-sweep "
-      + "subscription. It decides whether to listen, not where a write goes.",
-  },
-  {
-    file: "mock.ts",
     count: 3,
     class: "c",
-    why: "the browser mock backend CONSTRUCTS the native envelope; it is a "
-      + "producer of the value, like managedStorageRuntime's own source.",
+    why: "the generation/authority memos scope the absence-sweep subscription, "
+      + "and the notice effect displays runtime feedback; none routes a write.",
+  },
+  {
+    file: "components/QuickSwitcher.tsx",
+    count: 1,
+    class: "c",
+    why: "reads search-index-building status to render search feedback only.",
+  },
+  {
+    file: "components/Settings.tsx",
+    count: 2,
+    class: "c",
+    why: "reads managed runtime status and error for the settings status panel only.",
+  },
+  {
+    file: "storageDispatch.ts",
+    count: 1,
+    class: "b",
+    why: "the one sanctioned authority-selection read for semantic storage operations.",
   },
   {
     file: "store.ts",
     count: 7,
     class: "b",
-    why: "value captures + their I-20 re-checks, all against a stamped admission: "
+    why: "the test-only Direct bootstrap plus value captures and their I-20 re-checks: "
       + "createPageMutationPlan/pageMutationPlanCurrent, "
-      + "preflightManagedBulkInsertion/consumeManagedBulkInsertionAdmission, "
-      + "captureBulkRouteFence/bulkRouteFenceCurrent, and managedMoveAdmission() "
+      + "consumeManagedBulkInsertionAdmission, captureBulkRouteFence/bulkRouteFenceCurrent, "
+      + "and managedMoveAdmission() "
       + "(the managed arm's own writability accessor, used inside the managed "
       + "choreography after the route is already chosen).",
   },
@@ -97,13 +109,15 @@ function occurrences(): Map<string, number> {
 const RULE =
   `I-6 — storage authority is selected in ONE place and then flows as a value.\n`
   + `A semantic storage operation must state its intent to src/storageDispatch.ts `
-  + `(the exemplar to imitate: dispatchCrossPageMove / dispatchDroppedFileInsertion) `
+  + `(the exemplars to imitate: dispatchCrossPageMove / dispatchDroppedFileInsertion / `
+  + `dispatchBulkInsertion) `
   + `instead of reading \`${SYMBOL}\` and branching at its own call site — that is how `
   + `four cross-page-move forks drifted apart (audit UI-3).\n`
-  + `If your read is genuinely a value capture or an I-20 staleness re-check, add it `
-  + `to the CENSUS table in this file with its class and the reason.`;
+  + `If your read is genuinely an authority capture/re-check or a display-only status reader, `
+  + `add its exact per-file count to the CENSUS table with its class and reason; equality is `
+  + `intentional, so deletions require a census edit too.`;
 
-describe("applicationPageAdmission reader ratchet", () => {
+describe("managedStorageRuntime snapshot reader ratchet", () => {
   it("has exactly the censused production readers, and no others", () => {
     const found = occurrences();
     const expected = new Map(CENSUS.map((row) => [row.file, row.count]));

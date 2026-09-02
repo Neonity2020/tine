@@ -20,18 +20,23 @@ import { initParser } from "./render/parse";
 import { backend } from "./backend";
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import {
+  dispatchBulkInsertion,
   lastStorageDispatch,
   resetStorageDispatchCounters,
   storageDispatchCounters,
 } from "./storageDispatch";
 import {
   __setStoreMutationObserverForTest,
+  captureToPage,
+  consumeManagedBulkInsertionAdmission,
   loadFeed,
+  managedBulkOutlinePlan,
   moveBlock,
   moveBlockFeed,
   moveBlocksRelative,
   moveSelectionItems,
   pageByName,
+  preflightManagedBulkInsertion,
   resetStore,
   selectBlock,
   settleDirectMovesForTest,
@@ -397,6 +402,93 @@ describe("stale binding across an async managed move (I-20)", () => {
     expect(pageByName("Destination")!.roots).toEqual(["target"]);
     // The route was still decided once, on the admission live at the time.
     expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
+  });
+});
+
+describe("bulk insertion dispatch", () => {
+  async function loadBulkTarget(): Promise<void> {
+    await loadFeed([page("Bulk", "pages/bulk.md", "bulk-r1", [block("target", "target")])]);
+  }
+
+  it("routes a real Direct capture through the bulk verb", async () => {
+    await loadBulkTarget();
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "direct-r2" });
+
+    expect(await captureToPage("Bulk", "- direct child")).toBe(true);
+
+    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+    expect(lastStorageDispatch("bulk-insertion")).toEqual({
+      operation: "bulk-insertion",
+      route: "direct",
+      request: { targetId: "target", targetPageName: "Bulk" },
+    });
+    expect(pageByName("Bulk")!.roots).toHaveLength(2);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes a real managed capture through the bulk verb", async () => {
+    await loadBulkTarget();
+    managedWritable();
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "managed-r2" });
+
+    expect(await captureToPage("Bulk", "- managed child")).toBe(true);
+
+    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
+    expect(lastStorageDispatch("bulk-insertion")).toEqual({
+      operation: "bulk-insertion",
+      route: "managed",
+      request: { targetId: "target", targetPageName: "Bulk" },
+    });
+    expect(pageByName("Bulk")!.roots).toHaveLength(2);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes an unavailable capture through the bulk verb and refuses without mutation", async () => {
+    await loadBulkTarget();
+    managedUnavailable();
+    const save = vi.spyOn(backend(), "savePage");
+
+    expect(await captureToPage("Bulk", "- refused child")).toBe(false);
+
+    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 0, direct: 0, unavailable: 1 });
+    expect(lastStorageDispatch("bulk-insertion")).toEqual({
+      operation: "bulk-insertion",
+      route: "unavailable",
+      request: { targetId: "target", targetPageName: "Bulk" },
+    });
+    expect(pageByName("Bulk")!.roots).toEqual(["target"]);
+    expect(save).not.toHaveBeenCalled();
+    expect(toasts()).toHaveLength(1);
+  });
+
+  it("refuses a managed token minted at generation g when consumed at g+1 (I-20)", async () => {
+    await loadBulkTarget();
+    managedWritable();
+    const admission = dispatchBulkInsertion(
+      { targetId: "target" },
+      {
+        direct: () => null,
+        unavailable: () => null,
+        managed: (managedAdmission) => preflightManagedBulkInsertion(
+          managedAdmission,
+          "target",
+          (limits) => managedBulkOutlinePlan(
+            [{ raw: "late child", children: [] }],
+            2,
+            0,
+            limits,
+          ),
+        ),
+      },
+    );
+    expect(admission?.kind).toBe("admitted");
+    if (!admission || admission.kind !== "admitted") throw new Error("expected managed admission token");
+
+    managedWritable(GENERATION + 1);
+
+    expect(consumeManagedBulkInsertionAdmission(admission.token, "target")).toBe(false);
+    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
+    expect(pageByName("Bulk")!.roots).toEqual(["target"]);
   });
 });
 
