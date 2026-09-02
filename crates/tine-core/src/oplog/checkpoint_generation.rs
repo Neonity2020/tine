@@ -346,18 +346,64 @@ fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> R
     Ok(value)
 }
 
-fn build_payload(capture: CleanCheckpointCapture) -> Result<(u64, Vec<u8>), String> {
+fn build_payload(
+    capture: CleanCheckpointCapture,
+    predecessor: Option<(u64, CheckpointPayloadV1)>,
+) -> Result<(u64, Vec<u8>), String> {
     use tine_storage::sealed_accepted_index::{
         AcceptedSequenceEntryV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
         AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
         SealedAcceptedIndexWriter,
     };
 
-    let mut store = CheckpointSealedStore::default();
-    let mut batch_map = AuthenticatedMapRootV1::empty();
-    let mut status_map = AuthenticatedMapRootV1::empty();
-    let mut sequence_root = AcceptedSequenceRootV2::empty();
+    let (
+        mut store,
+        mut batch_map,
+        mut status_map,
+        mut sequence_root,
+        mut required_objects,
+    ) = match predecessor {
+        Some((sequence, payload)) => {
+            if payload.schema_version != CHECKPOINT_SCHEMA_VERSION
+                || sequence < capture.base_sequence
+                || sequence > capture.target_sequence
+            {
+                return Err("clean checkpoint predecessor frontier is incompatible".into());
+            }
+            let roots = roots_from_wire(payload.roster_roots)?;
+            if roots.sequence.len != sequence {
+                return Err("clean checkpoint predecessor roster frontier differs".into());
+            }
+            (
+                CheckpointSealedStore {
+                    objects: payload.sealed_objects,
+                },
+                roots.batch_map,
+                roots.status_map,
+                roots.sequence,
+                payload.required_objects.into_iter().collect::<BTreeSet<_>>(),
+            )
+        }
+        None => {
+            if capture.base_sequence != 0 {
+                return Err("clean checkpoint delta has no durable predecessor".into());
+            }
+            (
+                CheckpointSealedStore::default(),
+                AuthenticatedMapRootV1::empty(),
+                AuthenticatedMapRootV1::empty(),
+                AcceptedSequenceRootV2::empty(),
+                BTreeSet::new(),
+            )
+        }
+    };
     for row in &capture.accepted_rows {
+        if row.evidence.acceptance_sequence() <= sequence_root.len {
+            continue;
+        }
+        if row.evidence.acceptance_sequence() != sequence_root.len.saturating_add(1) {
+            return Err("clean checkpoint delta sequence is not contiguous".into());
+        }
         let batch_id = row.evidence.batch_id().as_uuid().into_bytes();
         let causal = SealedAcceptedCausalRecordV2 {
             batch_id,
@@ -413,8 +459,11 @@ fn build_payload(capture: CleanCheckpointCapture) -> Result<(u64, Vec<u8>), Stri
             )
             .map_err(|error| error.to_string())?;
     }
-    let sequence = u64::try_from(capture.accepted_rows.len())
-        .map_err(|_| "clean checkpoint roster exceeds u64".to_owned())?;
+    let sequence = capture.target_sequence;
+    if sequence_root.len != sequence {
+        return Err("clean checkpoint delta does not reach its target frontier".into());
+    }
+    required_objects.extend(capture.required_objects.iter().copied());
     let roots = tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2 {
         batch_map,
         status_map,
@@ -427,12 +476,16 @@ fn build_payload(capture: CleanCheckpointCapture) -> Result<(u64, Vec<u8>), Stri
     // every final membership proof and keep exactly what it actually reads.
     let recorder = RecordingCheckpointSealedStore::new(&store);
     let reader = tine_storage::sealed_accepted_index::SealedAcceptedIndexReader::new(&recorder);
-    for row in &capture.accepted_rows {
+    for expected_sequence in 1..=sequence {
+        let entry = reader
+            .sequence_entry(roots.sequence, expected_sequence)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "final clean checkpoint sequence is incomplete".to_owned())?;
         let proof = reader
             .prove_membership(
                 roots,
-                row.evidence.acceptance_sequence(),
-                row.evidence.batch_id().as_uuid().into_bytes(),
+                expected_sequence,
+                entry.batch_id,
                 &TineAcceptedEvidenceDecoder,
             )
             .map_err(|error| error.to_string())?;
@@ -457,7 +510,7 @@ fn build_payload(capture: CleanCheckpointCapture) -> Result<(u64, Vec<u8>), Stri
                 root_digest: roots.sequence.root_digest,
             },
         },
-        required_objects: capture.required_objects.into_iter().collect(),
+        required_objects: required_objects.into_iter().collect(),
         capture_work: capture.capture_work,
     };
     Ok((sequence, encode_canonical(&payload)?))
@@ -470,6 +523,61 @@ fn checkpoint_directory(store: &ObjectStore) -> Result<cap_std::fs::Dir, String>
     tine_storage::ensure_directory_nofollow(&root, CHECKPOINT_DIRECTORY)
         .map_err(|error| error.to_string())?;
     tine_storage::open_dir_nofollow(&root, CHECKPOINT_DIRECTORY).map_err(|error| error.to_string())
+}
+
+fn read_current_payload_for_extension(
+    store: &ObjectStore,
+) -> Result<Option<(u64, CheckpointPayloadV1)>, String> {
+    let directory = checkpoint_directory(store)?;
+    let Some(pointer_bytes) = tine_storage::read_optional_regular(
+        &directory,
+        CHECKPOINT_POINTER,
+        4 * 1024,
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let pointer: CheckpointPointerV1 = decode_canonical(&pointer_bytes)?;
+    if pointer.schema_version != CHECKPOINT_SCHEMA_VERSION || pointer.slot >= 2 {
+        return Err("clean checkpoint predecessor pointer is invalid".into());
+    }
+    let slot = pointer.slot as usize;
+    let generation_bytes = tine_storage::read_optional_regular(
+        &directory,
+        CHECKPOINT_GENERATION_NAMES[slot],
+        16 * 1024,
+        None,
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "clean checkpoint predecessor generation is missing".to_owned())?;
+    if ContentDigest::of(&generation_bytes) != pointer.generation_digest {
+        return Err("clean checkpoint predecessor generation digest differs".into());
+    }
+    let generation: CheckpointGenerationV1 = decode_canonical(&generation_bytes)?;
+    if generation.schema_version != CHECKPOINT_SCHEMA_VERSION
+        || generation.slot != pointer.slot
+        || generation.sequence != pointer.sequence
+    {
+        return Err("clean checkpoint predecessor generation is invalid".into());
+    }
+    let payload_bytes = tine_storage::read_optional_regular(
+        &directory,
+        CHECKPOINT_PAYLOAD_NAMES[slot],
+        MAX_CHECKPOINT_BYTES,
+        Some(generation.payload_len),
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "clean checkpoint predecessor payload is missing".to_owned())?;
+    if ContentDigest::of(&payload_bytes) != generation.payload_digest {
+        return Err("clean checkpoint predecessor payload digest differs".into());
+    }
+    let payload: CheckpointPayloadV1 = decode_canonical(&payload_bytes)?;
+    if payload.schema_version != CHECKPOINT_SCHEMA_VERSION {
+        return Err("clean checkpoint predecessor payload schema differs".into());
+    }
+    Ok(Some((generation.sequence, payload)))
 }
 
 fn install_replaceable_exact(
@@ -496,7 +604,8 @@ fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Resu
     if FAIL_CHECKPOINT_WRITES.load(Ordering::Acquire) {
         return Err("deterministic checkpoint publication failure".into());
     }
-    let (sequence, payload_bytes) = build_payload(capture)?;
+    let predecessor = read_current_payload_for_extension(store)?;
+    let (sequence, payload_bytes) = build_payload(capture, predecessor)?;
     let payload_len = u64::try_from(payload_bytes.len())
         .map_err(|_| "clean checkpoint payload length exceeds u64".to_owned())?;
     if payload_len > MAX_CHECKPOINT_BYTES {
@@ -851,7 +960,7 @@ impl CleanCheckpointPublisher {
     }
 
     pub(crate) fn enqueue(&self, capture: CleanCheckpointCapture) {
-        let sequence = u64::try_from(capture.accepted_rows.len()).unwrap_or(u64::MAX);
+        let sequence = capture.target_sequence;
         if sequence.saturating_sub(self.durable_sequence()) > CLEAN_CHECKPOINT_LAG_MAX {
             self.inner
                 .elevated_rewrite_observed
@@ -866,7 +975,7 @@ impl CleanCheckpointPublisher {
             if state
                 .queued
                 .as_ref()
-                .is_none_or(|queued| queued.accepted_rows.len() <= capture.accepted_rows.len())
+                .is_none_or(|queued| queued.target_sequence <= capture.target_sequence)
             {
                 state.queued = Some(capture);
             }
@@ -1018,6 +1127,21 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![(batch_id, digest(0x81))],
+            0,
+        )
+    }
+
+    fn evidence_after(prior: &AcceptedBatchEvidence) -> AcceptedBatchEvidence {
+        let first = prior.batch_id();
+        let batch_id = BatchId::from_uuid(uuid::Uuid::from_bytes([0x52; 16]));
+        AcceptedBatchEvidence::for_test(
+            batch_id,
+            digest(0x62),
+            digest(0x72),
+            prior.post_frontier_root().clone(),
+            Vec::new(),
+            Vec::new(),
+            vec![(first, digest(0x81)), (batch_id, digest(0x82))],
             0,
         )
     }
@@ -1179,6 +1303,8 @@ mod tests {
         let peer =
             CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
         let capture = CleanCheckpointCapture {
+            base_sequence: 0,
+            target_sequence: 1,
             state_bytes: b"state".to_vec(),
             accepted_rows: vec![CleanCheckpointAcceptedRow {
                 no_op: false,
@@ -1189,7 +1315,7 @@ mod tests {
             required_objects: BTreeSet::from([digest(0x91)]),
             capture_work: 3,
         };
-        let (sequence, bytes) = build_payload(capture).unwrap();
+        let (sequence, bytes) = build_payload(capture, None).unwrap();
         assert_eq!(sequence, 1);
         let payload: CheckpointPayloadV1 = decode_canonical(&bytes).unwrap();
         assert_eq!(payload.state_bytes, b"state");
@@ -1206,6 +1332,61 @@ mod tests {
             proof.status.exact_evidence_bytes,
             evidence.encode_canonical().unwrap()
         );
+    }
+
+    #[test]
+    fn checkpoint_payload_extends_the_durable_frontier_from_one_row_delta() {
+        let first = evidence();
+        let second = evidence_after(&first);
+        let peer =
+            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
+        let first_capture = CleanCheckpointCapture {
+            base_sequence: 0,
+            target_sequence: 1,
+            state_bytes: b"frontier-one".to_vec(),
+            accepted_rows: vec![CleanCheckpointAcceptedRow {
+                no_op: false,
+                evidence: first.clone(),
+                causal_dot: BatchCausalDot::new(peer, 7).unwrap(),
+                canonical_causal_clock: vec![(peer, 7)],
+            }],
+            required_objects: BTreeSet::from([digest(0x91)]),
+            capture_work: 3,
+        };
+        let (_, first_bytes) = build_payload(first_capture, None).unwrap();
+        let first_payload: CheckpointPayloadV1 = decode_canonical(&first_bytes).unwrap();
+        let second_capture = CleanCheckpointCapture {
+            base_sequence: 1,
+            target_sequence: 2,
+            state_bytes: b"frontier-two".to_vec(),
+            accepted_rows: vec![CleanCheckpointAcceptedRow {
+                no_op: false,
+                evidence: second,
+                causal_dot: BatchCausalDot::new(peer, 8).unwrap(),
+                canonical_causal_clock: vec![(peer, 8)],
+            }],
+            required_objects: BTreeSet::from([digest(0x92)]),
+            capture_work: 4,
+        };
+        let (sequence, second_bytes) =
+            build_payload(second_capture, Some((1, first_payload))).unwrap();
+        assert_eq!(sequence, 2);
+        let payload: CheckpointPayloadV1 = decode_canonical(&second_bytes).unwrap();
+        assert_eq!(payload.state_bytes, b"frontier-two");
+        assert_eq!(payload.required_objects, vec![digest(0x91), digest(0x92)]);
+        assert_eq!(payload.capture_work, 4);
+        let roots = roots_from_wire(payload.roster_roots).unwrap();
+        assert_eq!(roots.sequence.len, 2);
+        let store = CheckpointSealedStore {
+            objects: payload.sealed_objects,
+        };
+        let reader = SealedAcceptedIndexReader::new(&store);
+        for (sequence, batch_id) in [(1, [0x51; 16]), (2, [0x52; 16])] {
+            assert!(reader
+                .prove_membership(roots, sequence, batch_id, &TineAcceptedEvidenceDecoder)
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[test]
@@ -1227,6 +1408,8 @@ mod tests {
             canonical_causal_clock: vec![(peer, 7)],
         };
         publisher.enqueue(CleanCheckpointCapture {
+            base_sequence: 0,
+            target_sequence: CLEAN_CHECKPOINT_LAG_MAX + 1,
             state_bytes: Vec::new(),
             accepted_rows: vec![row; CLEAN_CHECKPOINT_LAG_MAX as usize + 1],
             required_objects: BTreeSet::new(),
@@ -1250,6 +1433,8 @@ mod tests {
 
     fn empty_capture(state: &[u8]) -> CleanCheckpointCapture {
         CleanCheckpointCapture {
+            base_sequence: 0,
+            target_sequence: 0,
             state_bytes: state.to_vec(),
             accepted_rows: Vec::new(),
             required_objects: BTreeSet::new(),
@@ -1277,7 +1462,7 @@ mod tests {
         assert_eq!(loaded_state(&store), b"predecessor");
 
         let slot = 1 - predecessor.slot as usize;
-        let (sequence, payload) = build_payload(empty_capture(b"successor")).unwrap();
+        let (sequence, payload) = build_payload(empty_capture(b"successor"), None).unwrap();
         std::fs::write(directory.join(CHECKPOINT_PAYLOAD_NAMES[slot]), &payload).unwrap();
         assert_eq!(loaded_state(&store), b"predecessor");
 

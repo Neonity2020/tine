@@ -26,6 +26,12 @@ function flag(name, fallback) {
 const runs = Number.parseInt(flag("runs", "3"), 10);
 const checkpoints = flag("checkpoints", "50,400,800");
 const testName = "managed_open_stage_attribution_manual_benchmark";
+// Martin accepted the measured A5 open ratios on 2026-09-02 with archive
+// rebaselining (D-5) as the terminal lifetime bound. Capture remains a hard
+// per-save delta bound and is not rebaselined by that decision.
+const A5_ACCEPTED_OWNED_STAGE_RATIO = 7.95;
+const A5_ACCEPTED_WHOLE_REOPEN_RATIO = 2.97;
+const A5_ACCEPTED_CAPTURE_RATIO = 1.25;
 
 function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -122,13 +128,15 @@ const report = [];
 report.push(`# runs=${runs} checkpoints=${order.join(",")}`);
 report.push("");
 report.push("## Whole reopen (median of runs, ms)");
-report.push("| N | reopen_ms | clean_recovery_ms | growth vs N=" + base + " |");
-report.push("| --- | --- | --- | --- |");
+report.push("| N | reopen_ms | clean_recovery_ms | capture | growth vs N=" + base + " |");
+report.push("| --- | --- | --- | --- | --- |");
 const baseReopen = median(observed.get(base).reopen);
+const counterMedian = (checkpoint, name) =>
+  median((observed.get(checkpoint).counters.get(name) ?? []).map(Number));
 for (const checkpoint of order) {
   const entry = observed.get(checkpoint);
   report.push(
-    `| ${checkpoint} | ${median(entry.reopen).toFixed(1)} | ${median(entry.recovery).toFixed(1)} | ${(median(entry.reopen) / baseReopen).toFixed(2)}x |`,
+    `| ${checkpoint} | ${median(entry.reopen).toFixed(1)} | ${median(entry.recovery).toFixed(1)} | ${counterMedian(checkpoint, "checkpoint_capture_work")} | ${(median(entry.reopen) / baseReopen).toFixed(2)}x |`,
   );
 }
 report.push("");
@@ -183,4 +191,9 @@ for (const stage of stageNames) {
   });
   report.push(`- ${stage}: ${spans.join(" ")}`);
 }
+report.push("");
+report.push("## Accepted ratios (Martin, option (a), 2026-09-02)");
+report.push(`- A5-owned open stages: ${A5_ACCEPTED_OWNED_STAGE_RATIO.toFixed(2)}x`);
+report.push(`- whole reopen: ${A5_ACCEPTED_WHOLE_REOPEN_RATIO.toFixed(2)}x`);
+report.push(`- per-save capture: ${A5_ACCEPTED_CAPTURE_RATIO.toFixed(2)}x`);
 process.stdout.write(`${report.join("\n")}\n`);

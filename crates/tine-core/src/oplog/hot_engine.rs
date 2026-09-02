@@ -6245,6 +6245,8 @@ pub(crate) struct CleanCheckpointAcceptedRow {
 }
 
 pub(crate) struct CleanCheckpointCapture {
+    pub(crate) base_sequence: u64,
+    pub(crate) target_sequence: u64,
     pub(crate) state_bytes: Vec<u8>,
     pub(crate) accepted_rows: Vec<CleanCheckpointAcceptedRow>,
     pub(crate) required_objects: BTreeSet<ContentDigest>,
@@ -6449,6 +6451,12 @@ pub struct ShardedHotEngine {
     /// Union of immutable object names required by the accepted checkpoint
     /// roster. Updated from each already validated manifest in O(batch delta).
     clean_checkpoint_required_objects: BTreeSet<ContentDigest>,
+    /// Per-accept additions to the required-object union. Checkpoint capture
+    /// reads only the rows after its durable frontier; the publisher folds
+    /// them into the preceding v1 payload without introducing a second disk
+    /// format.
+    clean_checkpoint_required_objects_by_sequence:
+        BTreeMap<u64, BTreeSet<ContentDigest>>,
     ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
     ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
     ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
@@ -6605,6 +6613,7 @@ impl ShardedHotEngine {
             ephemeral_causal_clocks: BTreeMap::new(),
             clean_checkpoint_causal_dots: BTreeMap::new(),
             clean_checkpoint_required_objects: BTreeSet::new(),
+            clean_checkpoint_required_objects_by_sequence: BTreeMap::new(),
             ephemeral_accepted_batch_entries: BTreeMap::new(),
             ephemeral_accepted_document_root: RunLocalAuthenticatedMap::default(),
             ephemeral_accepted_batch_root: RunLocalAuthenticatedMap::default(),
@@ -6958,38 +6967,11 @@ impl ShardedHotEngine {
         let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
             return;
         };
-        let cadence = self.clean_checkpoint_capture_cadence();
-        let lag = publisher.durable_lag(self.next_acceptance_sequence);
-        if self.next_acceptance_sequence % cadence != 0
-            && lag <= super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX
-        {
-            return;
-        }
-        match self.capture_clean_checkpoint() {
+        let durable_sequence = publisher.durable_sequence();
+        match self.capture_clean_checkpoint(durable_sequence) {
             Ok(capture) => publisher.enqueue(capture),
             Err(error) => eprintln!("clean checkpoint capture skipped: {error}"),
         }
-    }
-
-    /// Full checkpoint capture is deliberately the spec's adaptive-cadence
-    /// option: K=1 through the measured N=800 gate, then grows with retained
-    /// state up to the durable-lag escalation horizon. The worst capture, not
-    /// an amortized mean, remains reported by `capture_work`.
-    fn clean_checkpoint_capture_cadence(&self) -> u64 {
-        let retained_items = self
-            .statuses
-            .len()
-            .saturating_add(self.accepted_frontier.len())
-            .saturating_add(self.ephemeral_block_claims.len())
-            .saturating_add(self.ephemeral_logseq_claims.len())
-            .saturating_add(self.ephemeral_portable_paths.len())
-            .saturating_add(self.current_path_catalog.rows.len());
-        let cadence = retained_items.saturating_add(799) / 800;
-        u64::try_from(cadence.clamp(
-            1,
-            super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX as usize,
-        ))
-        .unwrap_or(super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX)
     }
 
     pub(crate) fn clean_checkpoint_durable_lag(&self) -> u64 {
@@ -7206,7 +7188,10 @@ impl ShardedHotEngine {
     /// Capture the exact semantic clean-runtime state at the current accepted
     /// frontier. Serialization happens here, on the owning actor, so the
     /// background publisher never observes concurrently mutating engine data.
-    pub(crate) fn capture_clean_checkpoint(&self) -> Result<CleanCheckpointCapture, EngineError> {
+    pub(crate) fn capture_clean_checkpoint(
+        &self,
+        durable_sequence: u64,
+    ) -> Result<CleanCheckpointCapture, EngineError> {
         if self.lazy_genesis.is_none()
             || self.archive_store.is_none()
             || self.has_native_semantic_index_stores()
@@ -7221,8 +7206,15 @@ impl ShardedHotEngine {
             ));
         }
 
-        let mut accepted_rows = Vec::with_capacity(self.accepted_sequence.len());
-        for sequence in 1..=self.next_acceptance_sequence {
+        if durable_sequence > self.next_acceptance_sequence {
+            return Err(EngineError::Archive(
+                "clean checkpoint durable frontier is ahead of the engine".into(),
+            ));
+        }
+        let delta_len = self.next_acceptance_sequence - durable_sequence;
+        let mut accepted_rows = Vec::with_capacity(usize::try_from(delta_len).unwrap_or(0));
+        let mut required_objects = BTreeSet::new();
+        for sequence in durable_sequence.saturating_add(1)..=self.next_acceptance_sequence {
             let batch_id = self
                 .accepted_sequence
                 .get(&sequence)
@@ -7264,6 +7256,17 @@ impl ShardedHotEngine {
                 causal_dot,
                 canonical_causal_clock,
             });
+            required_objects.extend(
+                self.clean_checkpoint_required_objects_by_sequence
+                    .get(&sequence)
+                    .ok_or_else(|| {
+                        EngineError::Archive(format!(
+                            "clean checkpoint sequence {sequence} has no required-object delta"
+                        ))
+                    })?
+                    .iter()
+                    .copied(),
+            );
         }
 
         let encode_documents = |documents: &BTreeMap<DocumentId, LoroDoc>| {
@@ -7325,7 +7328,7 @@ impl ShardedHotEngine {
             state.clean_projection_head_batches.len(),
             state.current_path_rows.len(),
             accepted_rows.len(),
-            self.clean_checkpoint_required_objects.len(),
+            required_objects.len(),
         ]
         .into_iter()
         .try_fold(0_u64, |total, count| {
@@ -7336,9 +7339,11 @@ impl ShardedHotEngine {
                 .ok_or_else(|| EngineError::Archive("clean checkpoint work overflowed".into()))
         })?;
         Ok(CleanCheckpointCapture {
+            base_sequence: durable_sequence,
+            target_sequence: self.next_acceptance_sequence,
             state_bytes,
             accepted_rows,
-            required_objects: self.clean_checkpoint_required_objects.clone(),
+            required_objects,
             capture_work,
         })
     }
@@ -7541,6 +7546,7 @@ impl ShardedHotEngine {
         self.ephemeral_causal_clocks = causal_clocks;
         self.clean_checkpoint_causal_dots = causal_dots;
         self.clean_checkpoint_required_objects = required_objects;
+        self.clean_checkpoint_required_objects_by_sequence.clear();
         self.ephemeral_accepted_batch_entries = accepted_batch_entries;
         self.ephemeral_accepted_document_root = accepted_document_root;
         self.ephemeral_accepted_batch_root = accepted_batch_root;
@@ -10067,7 +10073,7 @@ impl ShardedHotEngine {
             .required_objects()
             .iter()
             .map(|descriptor| descriptor.content_digest())
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         let clock = self
             .derive_ephemeral_causal_clock(manifest)
             .expect("accepted inline causal clock was validated");
@@ -10086,7 +10092,11 @@ impl ShardedHotEngine {
         self.clean_checkpoint_causal_dots
             .insert(evidence.batch_id, checkpoint_causal_dot);
         self.clean_checkpoint_required_objects
-            .extend(checkpoint_required_objects);
+            .extend(checkpoint_required_objects.iter().copied());
+        self.clean_checkpoint_required_objects_by_sequence.insert(
+            evidence.acceptance_sequence,
+            checkpoint_required_objects,
+        );
         self.ephemeral_accepted_batch_entries
             .insert(evidence.batch_id, record_digest);
         self.ephemeral_accepted_batch_root
