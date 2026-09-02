@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Browser geometry and screenshot proof for GH #205.
 // Usage: npm run build && node scripts/shot-topbar-responsive.mjs
 import { chromium } from "playwright";
@@ -35,14 +36,6 @@ const server = process.env.TINE_SHOT_URL
   ? undefined
   : spawn("npx", ["vite", "preview", ...configArgs, "--host", "127.0.0.1", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 
-async function waitForServer() {
-  if (!server) return;
-  for (let i = 0; i < 60; i++) {
-    try { if ((await fetch(`http://127.0.0.1:${PORT}/`)).ok) return; } catch {}
-    await sleep(200);
-  }
-  throw new Error("preview server did not start");
-}
 
 function measureTopbar() {
   const topbar = document.querySelector("header.topbar");
@@ -86,7 +79,7 @@ function measureTopbar() {
 
 let browser;
 try {
-  await waitForServer();
+  if (server) await waitForHttpServer(`http://127.0.0.1:${PORT}/`, 60, 200, { failureMessage: "preview server did not start" });
   browser = await chromium.launch({
     chromiumSandbox: false,
     args: [

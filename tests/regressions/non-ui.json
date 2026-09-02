@@ -5717,10 +5717,10 @@
    "sources": {"issues": [], "commits": [], "internal": "MS-19 final data-safety audit"},
    "platforms": ["windows", "linux", "macos", "android"],
    "layer": "rust-core-storage",
-   "status": "covered",
+   "status": "needs-revalidation",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/model.rs::tests::direct_files_name_publication_stays_on_the_typed_durable_boundary",
+     "crates/tine-core/src/model.rs::tests::direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename",
      "crates/tine-core/src/model.rs::tests::a_same_bytes_external_replace_does_not_strand_the_editor",
      "crates/tine-core/src/model.rs::tests::a_changed_bytes_external_replace_still_conflicts",
      "crates/tine-core/src/model.rs::tests::checked_open_retries_editor_retired_cleanup_without_restoring_it",
@@ -5729,7 +5729,7 @@
     "scenario": "direct-files.windows-write-through-create-replace-retire-restore",
     "failBefore": "proven from the literal Windows path: Direct Files used raw NtSetInformationFile name changes and the following directory sync was a successful no-op"
    },
-   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside now use tine-storage's certified DurableDirectoryPublication boundary. The v0.9.2 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed. A post-publication .editor-retired entry is cleanup-only, never document authority; the bounded checked-open walk retries an interrupted or failed unlink without restoring its displaced bytes."
+   "notes": "Direct Files remains independent of the managed journal/SQLite/oplog. Its create, expected-owner retirement, staged publication, recovery restore and recovery set-aside carry an exact-byte protocol over the graph tree's own no-clobber rename (on Windows FileRenameInformation with ReplaceIfExists=false plus the required directory barrier); GH #466 moved them off tine-storage's DurableDirectoryPublication, whose Android arm is hard-link based and refused by shared storage, so the Windows write-through evidence below predates that move and this row is needs-revalidation until the Windows physical suite runs on the current primitive. The v0.9.2 Windows physical suite exercises MoveFileExW write-through behavior; same-inode interrupted move recovery on macOS/Android is idempotent while foreign same-bytes targets fail closed. A post-publication .editor-retired entry is cleanup-only, never document authority; the bounded checked-open walk retries an interrupted or failed unlink without restoring its displaced bytes."
   },
   {
    "id": "REG-STORAGE-MODE-SELECTOR-DURABILITY-001",
@@ -5932,6 +5932,30 @@
     "failBefore": "b4-indexed-routes-fail-before.log: PageRef and property-facet calls left the Direct projection indexed-read counter unchanged."
    },
    "notes": "One source-to-read-family lowering now serves the existing Managed caller and Direct PageRef narrowing. Exact parser evaluation remains authoritative; stale or unavailable projections count and use the full parser fallback. Both property-facet consumers stream the existing property_facet_rows_after family. No schema, index, or memo was added."
+  },
+  {
+   "id": "REG-GH-466-ANDROID-DIRECT-SAVE-NOREPLACE-001",
+   "title": "Editing a page on Android with Direct Files saves normally instead of failing with a permission-denied error",
+   "family": "direct-files-graph-text-publication",
+   "sources": {
+    "issues": [
+     466
+    ],
+    "commits": [],
+    "internal": "v0.6.981 regression introduced by 65258e7d (Direct Files name transitions moved onto tine-storage's hard-link-based Android move)"
+   },
+   "platforms": ["android"],
+   "layer": "rust-core-direct-files-publication",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename",
+     "crates/tine-core/src/model.rs::graph_text_exact_move_publishes_expected_bytes_and_refuses_a_replaced_source"
+    ],
+    "scenario": "android.direct-files.edit-existing-page-and-create-page-saves",
+    "failBefore": "Structural on the host: the source-scan guard fails on the v0.6.981 code, which routes every Direct Files create, retirement, publication and restore through tine-storage's DurableDirectoryPublication::move_exact_no_replace; its Android arm is hard-link-then-unlink, Android shared storage (FUSE) refuses hard links, and the raw errno surfaced as 'unknown: Permission denied (os error 13)'. Reporter receipt on GH #466: 0.6.98 saves, 0.6.981 fails on every save, Android 16, Direct Files. The host has no Android runtime harness; same-platform confirmation is pending the reporter on the next release, so platform confidence is tentative."
+   },
+   "notes": "Blocking core operation. Fix carries the exact-byte move protocol over the graph tree's own no-clobber rename (renameat2(RENAME_NOREPLACE) through the raw syscall on Linux/Android, renameatx_np on Apple, FileRenameInformation on Windows: the primitive 0.6.98 shipped on every target); tine-storage's typed boundary stays for app-private authorities where hard links exist. A refused call now names itself in the receipt instead of a bare errno."
   }
  ]
 }

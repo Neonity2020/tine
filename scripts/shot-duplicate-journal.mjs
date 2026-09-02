@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Self-verification shot for a duplicate journal day resolved at the page
 // (audit-residue program item 5). Before this, a duplicate day was not a
 // conflict object at all: no badge, no dock, no in-page surface — only a sticky
@@ -10,16 +11,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5219;
 const server = spawn("./node_modules/.bin/vite", ["preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   await page.goto(`http://localhost:${PORT}/?conflicts`);

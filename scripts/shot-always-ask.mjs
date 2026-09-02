@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Concord P5 visual check: the "always ask" bar. The policy is OFF by default,
 // so the demo gate turns it on and drives one external change through the
 // ordinary handler. Usage: npm run build && node scripts/shot-always-ask.mjs
@@ -7,19 +8,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5233;
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {
-      // not up yet
-    }
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu"] });
   const page = await browser.newPage({ viewport: { width: 1180, height: 900 }, deviceScaleFactor: 2 });
   const errors = [];

@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Extra README/website stills for features that shipped without one: the live
 // `/calc` block and the colored callouts. Headless Chromium over the mock backend
 // (same approach as shot-features.mjs). Usage (after `source scripts/env.sh &&
@@ -14,16 +15,9 @@ mkdirSync(OUT, { recursive: true });
 
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try { const r = await fetch(url); if (r.ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1200, height: 900 }, deviceScaleFactor: 2 });
   page.on("pageerror", (e) => console.log("pageerror:", String(e).split("\n")[0]));

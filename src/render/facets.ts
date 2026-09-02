@@ -62,8 +62,7 @@ const derived = new Map<string, Facets>();
 const DERIVED_MAX = 1024;
 const keyOf = (raw: string, format: Format) => format + "\0" + raw;
 
-/** Build a `Facets` from a backend BlockDto's shipped fields (no parse). */
-export function facetsFromDto(d: {
+type DtoFacetSource = {
   marker?: string;
   priority?: string;
   heading_level?: number;
@@ -71,11 +70,33 @@ export function facetsFromDto(d: {
   deadline?: string;
   tags?: string[];
   properties?: [string, string][];
-}): Facets {
+};
+
+const dtoDerived = new Map<DtoFacetSource, Facets>();
+const DTO_DERIVED_MAX = 1024;
+
+function lruGet<K, V>(cache: Map<K, V>, key: K): V | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+function lruSet<K, V>(cache: Map<K, V>, key: K, value: V, max: number): void {
+  if (cache.size >= max) cache.delete(cache.keys().next().value!);
+  cache.set(key, value);
+}
+
+/** Build a `Facets` from a backend BlockDto's shipped fields (no parse). */
+export function facetsFromDto(d: DtoFacetSource): Facets {
+  const cached = lruGet(dtoDerived, d);
+  if (cached) return cached;
   const marker = d.marker ?? null;
   const p = d.priority;
   const headingProperty = headingPropertyState(d.properties ?? []);
-  return {
+  const facets: Facets = {
     marker,
     done: marker != null && DONE_MARKERS.has(marker),
     priority: p === "A" || p === "B" || p === "C" ? p : null,
@@ -86,6 +107,8 @@ export function facetsFromDto(d: {
     tags: d.tags ?? [],
     properties: d.properties ?? [],
   };
+  lruSet(dtoDerived, d, facets, DTO_DERIVED_MAX);
+  return facets;
 }
 
 function headingPropertyState(properties: readonly [string, string][]): {
@@ -128,15 +151,10 @@ export function facetsOf(raw: string, format: Format): Facets {
   const k = keyOf(raw, format);
   const s = seeded.get(k);
   if (s) return s;
-  const d = derived.get(k);
-  if (d) {
-    derived.delete(k); // LRU bump
-    derived.set(k, d);
-    return d;
-  }
+  const d = lruGet(derived, k);
+  if (d) return d;
   const f = deriveFacets(raw, format);
-  if (derived.size >= DERIVED_MAX) derived.delete(derived.keys().next().value!);
-  derived.set(k, f);
+  lruSet(derived, k, f, DERIVED_MAX);
   return f;
 }
 

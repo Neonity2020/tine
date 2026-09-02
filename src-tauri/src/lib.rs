@@ -40,6 +40,8 @@ mod storage_mode_supervisor;
 #[cfg(test)]
 mod storage_transition_wire_parity;
 mod sync_runtime;
+#[cfg(test)]
+mod test_support;
 mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};

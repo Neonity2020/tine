@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Verify + screenshot the query-builder Sort popover redesign: a grid of
 // one-click presets (Newest first / Priority / Page / Deadline / …) over a
 // free-text property fallback — so the common cases need no typing. Headless
@@ -11,16 +12,9 @@ const PORT = 5216;
 const OUT = "screenshots";
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try { const r = await fetch(url); if (r.ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1200, height: 1300 }, deviceScaleFactor: 2 });
   page.on("pageerror", (e) => console.log("pageerror:", String(e).split("\n")[0]));

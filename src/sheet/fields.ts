@@ -9,7 +9,7 @@ import {
   type PageMutationDraft,
 } from "../store";
 import { facetsFromDto, facetsOf, inlineText, parseBody, tagIdentityKey, type Facets } from "../render/facets";
-import { isRenderHiddenProp } from "../render/block";
+import { isRenderHiddenProp, visibleBody } from "../render/block";
 import { leadingMarker, nextMarker, setMarker } from "../editor/marker";
 import { cycleMarkerSmart, toggleMarkerLabel } from "../editor/repeat";
 import { MARKERS, matchLeadingMarker } from "../markers";
@@ -63,11 +63,77 @@ interface GroupKeysOptions {
   now?: Date;
 }
 
-function facetsForInput(input: GroupKeyInput): Facets | null {
+export function facetsForInput(input: GroupKeyInput): Facets | null {
   const id = typeof input === "string" ? input : input.id;
   const n = typeof input === "string" ? doc.byId[id] : liveFormulaRowNode(input);
   if (n) return facetsOf(n.raw, formatForBlock(id));
   return typeof input === "string" || !input.dto ? null : facetsFromDto(input.dto);
+}
+
+export function recordFacets(row: FormulaEvalRow): Facets | null {
+  return facetsForInput(row);
+}
+
+export function fieldIdsForRecords(
+  rows: readonly FormulaEvalRow[],
+  includePage: boolean,
+  facetAccessor: (row: FormulaEvalRow) => Facets | null = recordFacets,
+): FieldId[] {
+  const out: FieldId[] = [];
+  const props: FieldId[] = [];
+  const seenProps = new Set<string>();
+  let hasState = false;
+  let hasPriority = false;
+  let hasScheduled = false;
+  let hasDeadline = false;
+  let hasTags = false;
+  for (const row of rows) {
+    const facets = facetAccessor(row);
+    if (!facets) continue;
+    hasState ||= !!facets.marker;
+    hasPriority ||= !!facets.priority;
+    hasScheduled ||= !!facets.scheduled;
+    hasDeadline ||= !!facets.deadline;
+    hasTags ||= facets.tags.length > 0;
+    for (const [key] of facets.properties) {
+      if (isRenderHiddenProp(key)) continue;
+      const field: FieldId = `prop:${key}`;
+      if (!seenProps.has(field)) {
+        seenProps.add(field);
+        props.push(field);
+      }
+    }
+  }
+  if (hasState) out.push("state");
+  if (hasPriority) out.push("priority");
+  if (hasScheduled) out.push("scheduled");
+  if (hasDeadline) out.push("deadline");
+  if (hasTags) out.push("tags");
+  out.push(...props);
+  if (includePage) out.push("page");
+  return out;
+}
+
+export function formulaReferenceName(field: FieldId): string | null {
+  if (isFormulaField(field)) return null;
+  if (field.startsWith("prop:")) return field.slice(5);
+  return field;
+}
+
+export function rowRaw(row: FormulaEvalRow): string {
+  return liveFormulaRowNode(row)?.raw ?? row.dto?.raw ?? "";
+}
+
+export function rowTitle(
+  row: FormulaEvalRow,
+  mode: "joined-with-placeholder" | "first-line",
+): string {
+  const lines = visibleBody(rowRaw(row));
+  if (mode === "first-line") return lines[0] ?? "";
+  const title = lines.join(" ");
+  return title.trim() === "" && (liveFormulaRowNode(row)?.children.length ?? row.dto?.children.length ?? 0) > 0
+    ? "—"
+    : title;
 }
 
 function tagSetHas(f: Facets, tag: string): boolean {
@@ -212,30 +278,41 @@ export function fieldLabel(field: FieldId): string {
   return "Page";
 }
 
+export function fieldValueFromFacets(
+  facets: Facets,
+  field: FieldId,
+  page: string,
+): FieldValue | null {
+  if (isFormulaField(field)) return null;
+  switch (field) {
+    case "state":
+      return facets.marker ? { text: facets.marker, raw: facets.marker } : null;
+    case "priority":
+      return facets.priority ? { text: `[#${facets.priority}]`, raw: facets.priority } : null;
+    case "scheduled":
+      return facets.scheduled ? { text: facets.scheduled, raw: facets.scheduled } : null;
+    case "deadline":
+      return facets.deadline ? { text: facets.deadline, raw: facets.deadline } : null;
+    case "tags":
+      return facets.tags.length
+        ? { text: facets.tags.map((tag) => `#${tag}`).join(" "), raw: facets.tags.join(" ") }
+        : null;
+    case "page":
+      return { text: page, raw: page };
+    default: {
+      const key = field.slice(5);
+      const found = facets.properties.find(([candidate]) => candidate === key);
+      return found ? { text: found[1], raw: found[1] } : null;
+    }
+  }
+}
+
 export function readField(id: string, field: FieldId): FieldValue | null {
   if (isFormulaField(field)) return null;
   const n = doc.byId[id];
   const f = facetsForBlock(id);
   if (!n || !f) return null;
-  switch (field) {
-    case "state":
-      return f.marker ? { text: f.marker, raw: f.marker } : null;
-    case "priority":
-      return f.priority ? { text: `[#${f.priority}]`, raw: f.priority } : null;
-    case "scheduled":
-      return f.scheduled ? { text: f.scheduled, raw: f.scheduled } : null;
-    case "deadline":
-      return f.deadline ? { text: f.deadline, raw: f.deadline } : null;
-    case "tags":
-      return f.tags.length ? { text: f.tags.map((t) => `#${t}`).join(" "), raw: f.tags.join(" ") } : null;
-    case "page":
-      return { text: n.page, raw: n.page };
-    default: {
-      const key = field.slice(5);
-      const found = f.properties.find(([k]) => k === key);
-      return found ? { text: found[1], raw: found[1] } : null;
-    }
-  }
+  return fieldValueFromFacets(f, field, n.page);
 }
 
 

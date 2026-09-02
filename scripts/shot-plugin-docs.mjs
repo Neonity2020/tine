@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Capture real mock-app screenshots while exercising all launch plugins.
 // Usage: npm run build, build the plugin WASMs, then run this script.
 import { chromium } from "playwright";
@@ -36,19 +37,6 @@ const server = spawn(VITE, ["preview", "--host", "127.0.0.1", "--port", String(P
 });
 server.once("error", (error) => { serverSpawnError = error; });
 
-async function waitForServer(url) {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (serverSpawnError) throw serverSpawnError;
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {
-      // Preview is still starting.
-    }
-    await sleep(250);
-  }
-  if (serverSpawnError) throw serverSpawnError;
-  throw new Error("preview server did not start");
-}
 
 async function openPlugins(page) {
   await page.getByTitle("Settings (t s)").click();
@@ -111,7 +99,11 @@ async function navigate(page, name) {
 try {
   if (!["desktop", "android", "ios"].includes(PLATFORM)) throw new Error(`unsupported test platform ${PLATFORM}`);
   const url = `http://127.0.0.1:${PORT}/${PLATFORM === "desktop" ? "" : `?platform=${PLATFORM}`}`;
-  await waitForServer(url);
+  await waitForHttpServer(url, 40, 250, {
+      beforeAttempt: () => { if (serverSpawnError) throw serverSpawnError; },
+      beforeFailure: () => { if (serverSpawnError) throw serverSpawnError; },
+      failureMessage: "preview server did not start",
+    });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({
     viewport: PLATFORM === "desktop" ? { width: 1180, height: 820 } : { width: 390, height: 844 },

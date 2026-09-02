@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Headless render smoke test against the mock backend. Catches runtime crashes
 // in the live sidebar/query paths (circular-import TDZ, render throws, etc.).
 // Usage: node scripts/smoke.mjs   (requires `npm run build` first)
@@ -16,20 +17,10 @@ const fail = (m) => {
   process.exit(1);
 };
 
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      const r = await fetch(url);
-      if (r.ok) return;
-    } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 const errors = [];
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch();
   const page = await browser.newPage();
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));

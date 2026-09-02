@@ -123,4 +123,56 @@ describe("formula eval context", () => {
     expect(readFormulaRowField(pageRow, "prop:score")?.text).toBe("1");
     expect(readFormulaRowField(journalRow, "prop:score")?.text).toBe("9");
   });
+
+  it("keeps all seven facet-field arms identical for live and DTO rows", () => {
+    const live: Node = {
+      id: "live",
+      raw: "TODO [#A] Row #alpha #beta\nowner:: Martin\nSCHEDULED: <2026-09-03 Thu>\nDEADLINE: <2026-09-04 Fri>",
+      collapsed: false,
+      parent: null,
+      page: "Sheet",
+      children: [],
+    };
+    const page: FeedPage = {
+      name: "Sheet",
+      kind: "page",
+      title: "Sheet",
+      preBlock: null,
+      roots: [live.id],
+      format: "md",
+      readOnly: false,
+      guide: false,
+    };
+    setDoc({ byId: { [live.id]: live }, pages: [page], feed: [page.name], loaded: true });
+    const dtoRow = {
+      id: "dto",
+      page: page.name,
+      dto: {
+        id: "dto",
+        raw: live.raw,
+        collapsed: false,
+        children: [],
+        marker: "TODO",
+        priority: "A",
+        scheduled: "2026-09-03 Thu",
+        deadline: "2026-09-04 Fri",
+        tags: ["alpha", "beta"],
+        properties: [["owner", "Martin"]] as [string, string][],
+      },
+    };
+    const expected = new Map([
+      ["state", { text: "TODO", raw: "TODO" }],
+      ["priority", { text: "[#A]", raw: "A" }],
+      ["scheduled", { text: "2026-09-03 Thu", raw: "2026-09-03 Thu" }],
+      ["deadline", { text: "2026-09-04 Fri", raw: "2026-09-04 Fri" }],
+      ["tags", { text: "#alpha #beta", raw: "alpha beta" }],
+      ["page", { text: "Sheet", raw: "Sheet" }],
+      ["prop:owner", { text: "Martin", raw: "Martin" }],
+    ] as const);
+
+    for (const [field, value] of expected) {
+      expect(readFormulaRowField({ id: live.id, page: page.name }, field)).toEqual(value);
+      expect(readFormulaRowField(dtoRow, field)).toEqual(value);
+    }
+  });
 });

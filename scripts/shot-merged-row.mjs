@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Self-verification shot for the fourth (merged) outcome: the in-page resolver
 // with mock row 4 (a both-changed row carrying a merged proposal). Three shots:
 // desktop collapsed, desktop expanded, and a phone-width collapsed layout.
@@ -7,13 +8,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5217;
 const server = spawn("./node_modules/.bin/vite", ["preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 async function openConflictPage(page) {
   await page.goto(`http://localhost:${PORT}/?conflicts`);
   await page.waitForSelector(".ls-block", { timeout: 5000 });
@@ -29,7 +23,7 @@ async function openConflictPage(page) {
   await sleep(200);
 }
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu"] });
 
   const desktop = await browser.newPage({ viewport: { width: 1180, height: 1000 }, deviceScaleFactor: 2 });

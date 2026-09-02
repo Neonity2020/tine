@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // README feature-gallery screenshots: tabs, dim-inactive-blocks, carry, queries
 // + query builder, and PDF highlights (text + area). Headless Chromium over the
 // mock backend. Each shot is isolated so one failure doesn't abort the rest.
@@ -14,13 +15,6 @@ mkdirSync(OUT, { recursive: true });
 
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try { const r = await fetch(url); if (r.ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 const shot = async (page, name, fn, opts = {}) => {
   try {
@@ -42,7 +36,7 @@ const reset = async (page) => {
 };
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1200, height: 820 }, deviceScaleFactor: 2 });
   page.on("pageerror", (e) => console.log("pageerror:", String(e).split("\n")[0]));

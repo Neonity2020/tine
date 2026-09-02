@@ -1,6 +1,7 @@
 import { createSignal } from "solid-js";
 import { backend } from "./backend";
 import { CUSTOM_CSS_STYLE_ID, LS_SHIM_STYLE_ID, ensureLsShimStyle } from "./lsShim";
+import { serializedWrites } from "./serializedWrites";
 import { galleryThemeById, galleryThemes } from "./styles/themes";
 import { installedThemeByKey } from "./themes/manager";
 import type { ThemePresentation } from "./themes/manifest";
@@ -12,7 +13,7 @@ const COMPOSITION_KEY = "theme.composition.v1";
 const [selectedStyleId, setSelectedStyleId] = createSignal("");
 const [selectedColorId, setSelectedColorId] = createSignal("");
 const [selectedPresentation, setSelectedPresentation] = createSignal<ThemePresentation>({});
-let persistenceChain = Promise.resolve();
+const compositionWrites = serializedWrites("theme.composition.v1");
 
 export const selectedThemeStyle = selectedStyleId;
 export const selectedThemeColors = selectedColorId;
@@ -93,13 +94,12 @@ function colorId(id: string): string {
 }
 
 function persistComposition(): void {
-  const value = JSON.stringify({
+  void compositionWrites.run(() => backend().setAppString(COMPOSITION_KEY, JSON.stringify({
+    // Read inside the shared-key tail so a queued write cannot retain an older
+    // composition after a newer selection has already been published.
     style: selectedStyleId(),
     colors: selectedColorId(),
-  });
-  persistenceChain = persistenceChain
-    .then(() => backend().setAppString(COMPOSITION_KEY, value))
-    .catch(() => {});
+  }))).catch(() => {});
 }
 
 function applyComposition(style: string, colors: string): void {

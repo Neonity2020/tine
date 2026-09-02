@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Verify the block-level user macro ({{card}}) renders as real nested blocks
 // (heading + paragraph + list) while inline macros (poem/hi) stay inline — the
 // Item 2 OG-parity behavior. Real frontend (Chromium + mock via vite preview).
@@ -8,12 +9,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5199;
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) { try { if ((await fetch(url)).ok) return; } catch {} await sleep(250); }
-  throw new Error("server did not start");
-}
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 900, height: 900 } });
   const errors = [];

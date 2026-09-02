@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Focused screenshots for the README's "highlights" gallery. Each shot is
 // isolated in try/catch so one failure doesn't abort the rest. Skips the
 // PDF flow (slow/can hang headless). Usage: node scripts/shot-readme.mjs
@@ -14,16 +15,6 @@ const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--stric
   stdio: "inherit",
 });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      const r = await fetch(url);
-      if (r.ok) return;
-    } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 const shot = async (page, name, fn) => {
   try {
@@ -36,7 +27,7 @@ const shot = async (page, name, fn) => {
 };
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1180, height: 820 }, deviceScaleFactor: 2 });
   page.on("pageerror", (e) => console.log("pageerror:", String(e).split("\n")[0]));

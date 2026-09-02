@@ -608,23 +608,27 @@ mod tests {
 
     #[test]
     fn app_private_durable_publications_stay_on_named_audited_paths() {
-        let production = include_str!("settings.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("settings.rs has production source before its tests");
-        let bare_whole_file_writes = production
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.contains("std::fs::write("))
-            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
-            .collect::<Vec<_>>();
+        use crate::test_support::{
+            assert_production_region_uses_named_audited_writes, AuditedWriteAllowance,
+        };
 
-        assert!(
-            bare_whole_file_writes.is_empty(),
-            "I-1/I-2 require every app-private durable-state publication in settings.rs to use a named audited path; bare whole-file writes found:\n{}. Use the blessed atomic_write_workspaces / tine_core::model::atomic_write exemplar.",
-            bare_whole_file_writes.join("\n")
+        let source = include_str!("settings.rs");
+        assert_production_region_uses_named_audited_writes(
+            source,
+            "tine_core::model::atomic_write",
+            &[
+                AuditedWriteAllowance {
+                    source_line: "std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;",
+                    expected_count: 3,
+                },
+                AuditedWriteAllowance {
+                    source_line: "std::fs::rename(legacy, path).map_err(|e| e.to_string())?;",
+                    expected_count: 1,
+                },
+            ],
         );
 
+        let production = source.split_once("\n#[cfg(test)]").unwrap().0;
         let raw_renames = production
             .lines()
             .enumerate()

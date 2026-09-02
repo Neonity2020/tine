@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Capture Tine itself using the two launch theme packages.
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
@@ -26,19 +27,6 @@ const server = spawn(
 let serverSpawnError;
 server.once("error", (error) => { serverSpawnError = error; });
 
-async function waitForServer(url) {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (serverSpawnError) throw serverSpawnError;
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {
-      // Preview is still starting.
-    }
-    await sleep(250);
-  }
-  if (serverSpawnError) throw serverSpawnError;
-  throw new Error("preview server did not start");
-}
 
 async function openAppearance(page) {
   await page.getByTitle("Settings (t s)").click();
@@ -72,7 +60,11 @@ async function closeToasts(page) {
 
 try {
   const url = `http://127.0.0.1:${PORT}/`;
-  await waitForServer(url);
+  await waitForHttpServer(url, 40, 250, {
+      beforeAttempt: () => { if (serverSpawnError) throw serverSpawnError; },
+      beforeFailure: () => { if (serverSpawnError) throw serverSpawnError; },
+      failureMessage: "preview server did not start",
+    });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1280, height: 860 }, deviceScaleFactor: 2 });
   page.setDefaultTimeout(10_000);

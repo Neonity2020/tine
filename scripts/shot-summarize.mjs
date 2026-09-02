@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Verify + screenshot the query-builder "+ summarize" control (result
 // aggregation + group-by). Headless Chromium over the mock backend — the top
 // journal has a `{{query (todo TODO DOING)}}` block whose builder bar now shows a
@@ -11,13 +12,6 @@ const PORT = 5259;
 const OUT = "screenshots";
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try { const r = await fetch(url); if (r.ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 const shot = async (page, name, loc) => {
   await loc.scrollIntoViewIfNeeded();
@@ -32,7 +26,7 @@ const shot = async (page, name, loc) => {
 };
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1200, height: 1300 }, deviceScaleFactor: 2 });
   page.on("pageerror", (e) => console.log("pageerror:", String(e).split("\n")[0]));

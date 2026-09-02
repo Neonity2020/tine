@@ -9,6 +9,7 @@ import {
   type PersistedSession,
 } from "./session";
 import { drainPdfWork } from "./pdfOwnership";
+import { serializedWrites } from "./serializedWrites";
 
 export interface Workspace {
   id: string;
@@ -26,13 +27,7 @@ const [workspaceList, setWorkspaceList] = createSignal<Workspace[]>([]);
 const [activeId, setActiveId] = createSignal("");
 export { workspaceList as workspaces, activeId as activeWorkspaceId };
 
-let operationTail: Promise<void> = Promise.resolve();
-
-function enqueue<T>(operation: () => Promise<T>): Promise<T> {
-  const result = operationTail.then(operation, operation);
-  operationTail = result.then(() => undefined, () => undefined);
-  return result;
-}
+let workspaceWrites = serializedWrites("workspaces");
 
 function cloneSession(session: PersistedSession): PersistedSession {
   return JSON.parse(JSON.stringify(session)) as PersistedSession;
@@ -126,7 +121,7 @@ function workspaceId(): string {
 }
 
 export function initializeWorkspaces(): Promise<void> {
-  return enqueue(async () => {
+  return workspaceWrites.run(async () => {
     const loaded = parseRegistry(await backend().loadWorkspaces());
     if (!loaded) throw new Error("The named-workspace registry is invalid");
     // The unchanged live session file is authoritative for the active workspace
@@ -140,7 +135,7 @@ export function initializeWorkspaces(): Promise<void> {
 }
 
 export function saveActiveWorkspace(): Promise<void> {
-  return enqueue(async () => {
+  return workspaceWrites.run(async () => {
     await flushSession();
     const current = registry();
     const next: WorkspaceRegistry = {
@@ -157,7 +152,7 @@ export function saveActiveWorkspace(): Promise<void> {
 }
 
 export function switchWorkspace(targetId: string): Promise<void> {
-  return enqueue(async () => {
+  return workspaceWrites.run(async () => {
     await flushSession();
     const current = registry();
     const target = current.workspaces.find((workspace) => workspace.id === targetId);
@@ -181,7 +176,7 @@ export function switchWorkspace(targetId: string): Promise<void> {
 }
 
 export function createWorkspace(name: string): Promise<string> {
-  return enqueue(async () => {
+  return workspaceWrites.run(async () => {
     await flushSession();
     const current = registry();
     await prepareLayoutReplacement();
@@ -207,7 +202,7 @@ export function createWorkspace(name: string): Promise<string> {
 }
 
 export function renameWorkspace(id: string, name: string): Promise<void> {
-  return enqueue(async () => {
+  return workspaceWrites.run(async () => {
     const current = registry();
     if (!current.workspaces.some((workspace) => workspace.id === id)) throw new Error("Workspace not found");
     const next = {
@@ -222,7 +217,7 @@ export function renameWorkspace(id: string, name: string): Promise<void> {
 }
 
 export function deleteWorkspace(id: string): Promise<void> {
-  return enqueue(async () => {
+  return workspaceWrites.run(async () => {
     const current = registry();
     const removed = current.workspaces.find((workspace) => workspace.id === id);
     if (!removed) throw new Error("Workspace not found");
@@ -253,5 +248,5 @@ export function workspaceDisplayName(workspace: Pick<Workspace, "name">): string
 export function resetWorkspacesForTest() {
   setWorkspaceList([]);
   setActiveId("");
-  operationTail = Promise.resolve();
+  workspaceWrites = serializedWrites("workspaces");
 }

@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // GH #357 geometry harness: a whole-block fenced code block must consume the
 // SAME visual (font/line) metrics in its rendered card and in the block editor
 // that replaces it on click. Prints the numeric geometry for both states,
@@ -29,17 +30,6 @@ const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--stric
   stdio: "ignore",
 });
 
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {
-      // not up yet
-    }
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 async function measure(page, viewport) {
   return page.evaluate(
@@ -94,7 +84,7 @@ async function measure(page, viewport) {
 }
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1120, height: 820 }, deviceScaleFactor: 2 });
   const errors = [];

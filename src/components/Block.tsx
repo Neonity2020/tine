@@ -80,6 +80,7 @@ import {
   formatForBlock,
   depthOf,
   managedBulkOutlinePlan,
+  MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST,
   preflightManagedBulkInsertion,
   consumeManagedBulkInsertionAdmission,
   reportManagedBulkInsertionRefusal,
@@ -88,8 +89,10 @@ import {
   setCollapsedDescendants,
   blockExternalId,
   takeEditorLease,
+  type ManagedBulkInsertionPreflight,
   type OutlineScope,
 } from "../store";
+import { dispatchBulkInsertion } from "../storageDispatch";
 import {
   clearFocusSurface,
   editingId,
@@ -1337,12 +1340,23 @@ export function Editor(props: { id: string }): JSX.Element {
     nodes: readonly OutlineNode[],
     reusedHost: boolean,
   ) => {
-    const admission = preflightManagedBulkInsertion(props.id, (limits) => managedBulkOutlinePlan(
-      nodes,
-      depthOf(props.id) + 1,
-      reusedHost ? 1 : 0,
-      limits,
-    ));
+    const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+      { targetId: props.id },
+      {
+        direct: () => ({ kind: "direct" }),
+        unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
+        managed: (managedAdmission) => preflightManagedBulkInsertion(
+          managedAdmission,
+          props.id,
+          (limits) => managedBulkOutlinePlan(
+            nodes,
+            depthOf(props.id) + 1,
+            reusedHost ? 1 : 0,
+            limits,
+          ),
+        ),
+      },
+    );
     if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
     return admission;
   };

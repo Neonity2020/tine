@@ -48,6 +48,29 @@
       "notes": "Blocking stateful UX: repeated save attempts while a page remains conflicted preserve the latest restart-recovery draft without paying for an atomic whole-envelope rewrite when its bytes are unchanged. Changed drafts use a capsule-specific debounce, independent of the ordinary page-save debounce."
     },
     {
+      "id": "UI-HARVEST-CF-SHEET-BOARD-DTO-FACET-TEXT",
+      "title": "A query-backed board card renders the same facet text as the corresponding live block",
+      "family": "sheet-query-rendering",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest W3-Cf C2c"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/components/SheetBoard.test.tsx"
+        ],
+        "scenario": "sheets.board-query-dto-live-facet-text",
+        "failBefore": "proven"
+      },
+      "notes": "Flexible presentation: the same priority facet rendered as A on a query-result DTO card and [#A] on a live card. The board now consumes the canonical formula-row field reader for both paths; exact styling remains free to vary, but row provenance must not change the displayed value."
+    },
+    {
       "id": "UI-PAGE-WIDTH-CONTENT-INDEPENDENT-382",
       "title": "Page width stays fixed while entering edit mode or expanding content, with configurable standard and wide caps",
       "family": "page-layout",

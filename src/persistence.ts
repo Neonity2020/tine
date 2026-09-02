@@ -1134,7 +1134,7 @@ async function doSave(
       // no durable replacement authority: only the retained page and base below
       // enter the app-private capsule.
       try {
-        await backend().captureLiveSaveConflict?.(dto, baseline, 0);
+        await backend().captureLiveSaveConflict(dto, baseline, 0);
       } catch (error) {
         // The capture only enriches the review; the retained draft below is
         // the recovery material and must still reach the banner and capsule.
