@@ -46,7 +46,7 @@ afterEach(() => {
 describe("live-save conflict capsule refresh", () => {
   it("debounces changed drafts independently and persists the latest one", async () => {
     vi.useFakeTimers();
-    const store = vi.fn(async () => {});
+    const store = vi.fn(async (_root: string, _capsule: unknown) => {});
     __setBackendForTest({
       storeConflictCapsule: store,
       loadConflictCapsules: async () => [],
@@ -57,18 +57,18 @@ describe("live-save conflict capsule refresh", () => {
       name: "Draft",
       path: "pages/Draft.md",
       format: "md",
-      blocks: [{ id: "b1", raw: "registered draft", children: [] }],
+      blocks: [{ id: "b1", raw: "registered draft", collapsed: false, children: [] }],
       rev: "rev-1",
     } as unknown as PageDto;
     await registerLiveSaveConflict(page, "rev-1", 1);
 
     scheduleLiveSaveConflictDraftRefresh({
       ...page,
-      blocks: [{ id: "b1", raw: "intermediate draft", children: [] }],
+      blocks: [{ id: "b1", raw: "intermediate draft", collapsed: false, children: [] }],
     });
     scheduleLiveSaveConflictDraftRefresh({
       ...page,
-      blocks: [{ id: "b1", raw: "latest draft", children: [] }],
+      blocks: [{ id: "b1", raw: "latest draft", collapsed: false, children: [] }],
     });
 
     expect(store).toHaveBeenCalledTimes(1);
