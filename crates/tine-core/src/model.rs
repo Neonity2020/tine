@@ -9112,8 +9112,6 @@ impl Graph {
         // precedes it. Re-run only the path-local portable/no-follow boundary
         // after the chain exists; the graph-wide census remains singular.
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
-        let publication = DurableDirectoryPublication::open(target.parent())
-            .map_err(managed_trash_filesystem_error)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
         if self.graph_text_external_observation_pending() {
@@ -9136,9 +9134,8 @@ impl Graph {
                 "effective page identity evidence changed before no-replace publication",
             ));
         }
-        if let Err(error) = publication
-            .move_exact_no_replace(&temp, &target.filename, bytes)
-            .map_err(managed_trash_filesystem_error)
+        if let Err(error) =
+            move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)
         {
             let _ = target.parent().remove_file(&temp);
             if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
@@ -9239,8 +9236,6 @@ impl Graph {
         }
         let target = self.managed_target(permit, path, true)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
-        let publication = DurableDirectoryPublication::open(target.parent())
-            .map_err(managed_trash_filesystem_error)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
         let validation_result = match validation {
@@ -9269,9 +9264,8 @@ impl Graph {
             let _ = target.parent().remove_file(&temp);
             return Err(error);
         }
-        let result = publication
-            .move_exact_no_replace(&temp, &target.filename, bytes)
-            .map_err(managed_trash_filesystem_error);
+        let result =
+            move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes);
         if let Err(error) = result {
             let _ = target.parent().remove_file(&temp);
             if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
@@ -9367,15 +9361,6 @@ impl Graph {
             None => format!(".{}.{process}.{sequence}.editor-recovery", target.filename,),
         };
         let retired_cleanup = format!(".{}.{process}.{sequence}.editor-retired", target.filename,);
-        let direct_publication = if publication_authority == EditorPublicationAuthority::DirectFile
-        {
-            Some(
-                DurableDirectoryPublication::open(target.parent())
-                    .map_err(managed_trash_filesystem_error)?,
-            )
-        } else {
-            None
-        };
         let mut retired = false;
         let mut published = false;
         let mut conflict_site = None;
@@ -9409,11 +9394,9 @@ impl Graph {
             }
             let rename_noreplace =
                 |from: &str, to: &str, expected: &[u8]| match publication_authority {
-                    EditorPublicationAuthority::DirectFile => direct_publication
-                        .as_ref()
-                        .expect("Direct Files publication was preflighted")
-                        .move_exact_no_replace(from, to, expected)
-                        .map_err(managed_trash_filesystem_error),
+                    EditorPublicationAuthority::DirectFile => {
+                        move_graph_text_exact_no_replace(target.parent(), from, to, expected)
+                    }
                     EditorPublicationAuthority::ReconstructibleManagedProjection => {
                         rename_reconstructible_projection_noreplace(target.parent(), from, to)
                     }
@@ -9481,10 +9464,13 @@ impl Graph {
                 }
                 return Err(error);
             }
-            if let Some(publication) = direct_publication.as_ref() {
-                publication
-                    .move_exact_no_replace(&recovery, &retired_cleanup, &retired_bytes)
-                    .map_err(managed_trash_filesystem_error)?;
+            if publication_authority == EditorPublicationAuthority::DirectFile {
+                move_graph_text_exact_no_replace(
+                    target.parent(),
+                    &recovery,
+                    &retired_cleanup,
+                    &retired_bytes,
+                )?;
                 let _ = target.parent().remove_file(&retired_cleanup);
             } else {
                 target.parent().remove_file(&recovery)?;
@@ -9518,11 +9504,14 @@ impl Graph {
                         validate_graph_text_single_link(&recovery_file, managed_path.as_str())?;
                         let recovery_bytes = read_projection_regular(target.parent(), &recovery)?;
                         match publication_authority {
-                            EditorPublicationAuthority::DirectFile => direct_publication
-                                .as_ref()
-                                .expect("Direct Files publication was preflighted")
-                                .move_exact_no_replace(&recovery, &target.filename, &recovery_bytes)
-                                .map_err(managed_trash_filesystem_error),
+                            EditorPublicationAuthority::DirectFile => {
+                                move_graph_text_exact_no_replace(
+                                    target.parent(),
+                                    &recovery,
+                                    &target.filename,
+                                    &recovery_bytes,
+                                )
+                            }
                             EditorPublicationAuthority::ReconstructibleManagedProjection => {
                                 rename_reconstructible_projection_noreplace(
                                     target.parent(),
@@ -30917,6 +30906,59 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
         from,
         to,
         crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+    )
+}
+
+/// The Direct Files graph-text name transition: the exact-byte move protocol of
+/// `tine_storage::DurableDirectoryPublication::move_exact_no_replace`, carried
+/// by the graph tree's own no-clobber rename.
+///
+/// GH #466. v0.6.981 routed every Direct Files create, live-name retirement,
+/// staged publication, recovery restore and recovery set-aside through the
+/// storage crate's move, whose Android arm is hard-link-then-unlink — a
+/// primitive the FUSE-backed shared storage a Direct Files graph lives in
+/// refuses — so every Android save failed with `Permission denied (os error
+/// 13)`. That crate's move is written for app-private sole-writer namespaces
+/// (the storage-mode selectors, `durable_private_authority_directory`), where
+/// hard links exist; the graph tree is never such a namespace. Its name
+/// transitions use [`rename_projection_noreplace`], the primitive v0.6.98
+/// shipped here on every target (I-16: `renameat2(RENAME_NOREPLACE)` through
+/// the raw syscall on Linux and Android, `renameatx_np(RENAME_EXCL)` on Apple,
+/// `FileRenameInformation` on Windows), which also names the refused call in
+/// its receipt (I-9) instead of surfacing a bare errno.
+///
+/// Protocol: `from` must hold exactly `expected` (a staged or retired inode an
+/// external writer replaced is a collision, never published); the rename never
+/// replaces `to`; the parent barrier is required — the graph tree is the sole
+/// authority for these bytes; `to` is re-read to prove what became visible.
+/// `crate::model::tests::direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename`
+/// pins every Direct Files site to this function.
+fn move_graph_text_exact_no_replace(
+    dir: &Dir,
+    from: &str,
+    to: &str,
+    expected: &[u8],
+) -> io::Result<()> {
+    if read_projection_regular(dir, from)? != expected {
+        return Err(graph_text_transition_byte_collision("source"));
+    }
+    rename_projection_noreplace(dir, from, to)?;
+    sync_projection_directory_with_class(
+        dir,
+        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
+        0,
+        1,
+    )?;
+    if read_projection_regular(dir, to)? != expected {
+        return Err(graph_text_transition_byte_collision("published"));
+    }
+    Ok(())
+}
+
+fn graph_text_transition_byte_collision(position: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("graph text name transition found different bytes at its {position} name"),
     )
 }
 

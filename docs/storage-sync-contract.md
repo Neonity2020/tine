@@ -420,11 +420,21 @@ lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
 or failed identity recheck is never deleted or selected as authority.
 
 Every Direct Files create, live-name retirement, staged publication, recovery
-restore, and recovery set-aside crosses the typed
-`DurableDirectoryPublication` boundary. The staged inode is flushed before it
-can become live. Windows uses write-through name publication; Unix-like hosts
-use their certified exact-name move plus directory durability policy. Tine
-never acknowledges the save merely because an ordinary rename became visible.
+restore, and recovery set-aside is one exact-byte name transition
+(`move_graph_text_exact_no_replace`): the source must still hold the expected
+bytes, the graph tree's own no-clobber rename publishes it
+(`renameat2(RENAME_NOREPLACE)` through the raw syscall on Linux and Android,
+`renameatx_np(RENAME_EXCL)` on Apple platforms, `FileRenameInformation` with
+`ReplaceIfExists=false` on Windows), the parent directory barrier is required,
+and the published name is re-read to prove what became visible. The staged
+inode is flushed before it can become live. The typed
+`DurableDirectoryPublication` boundary of `tine-storage` is NOT used on this
+path: its Android arm is hard-link-then-unlink, which the FUSE-backed shared
+storage a Direct Files graph lives in refuses (GH #466, v0.6.981: every
+Android save failed with `Permission denied (os error 13)`). That boundary
+remains the primitive for app-private sole-writer authorities such as the
+storage-mode selectors, where hard links exist. Tine never acknowledges the
+save merely because an ordinary rename became visible.
 Successful replacement retires the displaced recovery name through a typed
 `.editor-retired` name before deletion, so a crash cannot turn an unflushed
 name transition into a reported durable save. That exact producer-shaped name

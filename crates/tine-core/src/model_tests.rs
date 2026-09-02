@@ -15466,8 +15466,21 @@ fn production_projection_has_no_alternate_graph_writer_entrypoint() {
     assert!(source.contains("self.serialize_page_document("));
 }
 
+/// GH #466. The rule this guard states on failure: every Direct Files graph-text
+/// name transition (create, live-name retirement, staged publication, recovery
+/// restore, recovery set-aside) goes through `move_graph_text_exact_no_replace`
+/// — the exact-byte protocol over the graph tree's own no-clobber rename family
+/// (I-16) — and never through `tine_storage::DurableDirectoryPublication`,
+/// whose Android arm is hard-link-then-unlink and fails with `EACCES` on the
+/// shared storage a Direct Files graph lives in. v0.6.981 shipped exactly that
+/// and every Android save failed. Imitate `move_graph_text_exact_no_replace`
+/// in `model.rs`; the storage boundary stays for app-private authorities only.
 #[test]
-fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
+fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
+    const RULE: &str = "GH #466 / I-16: Direct Files graph-text name transitions use \
+        move_graph_text_exact_no_replace (the graph tree's renameat2(RENAME_NOREPLACE) \
+        family), never tine-storage's DurableDirectoryPublication, whose Android arm is a \
+        hard link that shared storage refuses; imitate move_graph_text_exact_no_replace";
     let source = include_str!("model.rs");
     let create = source
         .split_once("    fn managed_atomic_create_with_proof(")
@@ -15476,9 +15489,14 @@ fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
         .split_once("\n    fn managed_atomic_write_with_conflict(")
         .expect("next Direct Files write function")
         .0;
-    assert!(create.contains("DurableDirectoryPublication::open(target.parent())"));
-    assert!(create.contains(".move_exact_no_replace(&temp, &target.filename, bytes)"));
-    assert!(!create.contains("rename_projection_noreplace("));
+    assert!(
+        create.contains(
+            "move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)"
+        ),
+        "{RULE}"
+    );
+    assert!(!create.contains("DurableDirectoryPublication"), "{RULE}");
+    assert!(!create.contains(".move_exact_no_replace("), "{RULE}");
 
     let write = source
         .split_once("    fn managed_atomic_write_validated(")
@@ -15488,9 +15506,15 @@ fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
         .expect("Direct Files bounded replacement")
         .0;
     assert!(write.contains("self.managed_atomic_replace_bound("));
-    assert!(write.contains("DurableDirectoryPublication::open(target.parent())"));
-    assert!(write.contains(".move_exact_no_replace(&temp, &target.filename, bytes)"));
-    assert!(!write.contains("target.parent().rename("));
+    assert!(
+        write.contains(
+            "move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)"
+        ),
+        "{RULE}"
+    );
+    assert!(!write.contains("DurableDirectoryPublication"), "{RULE}");
+    assert!(!write.contains(".move_exact_no_replace("), "{RULE}");
+    assert!(!write.contains("target.parent().rename("), "{RULE}");
 
     let replace = source
         .split_once("    fn managed_atomic_replace_bound(")
@@ -15499,11 +15523,53 @@ fn direct_files_name_publication_stays_on_the_typed_durable_boundary() {
         .split_once("\n    fn managed_move_noreplace(")
         .expect("next projection method")
         .0;
-    assert!(replace.contains("EditorPublicationAuthority::DirectFile => direct_publication"));
-    assert!(replace.matches(".move_exact_no_replace(").count() >= 3);
+    // The retire/publish closure, the recovery set-aside, and the restore.
     assert!(
-        !replace.contains("EditorPublicationAuthority::DirectFile => rename_projection_noreplace")
+        replace.matches("move_graph_text_exact_no_replace(").count() >= 3,
+        "{RULE}"
     );
+    assert!(!replace.contains("DurableDirectoryPublication"), "{RULE}");
+    assert!(!replace.contains(".move_exact_no_replace("), "{RULE}");
+    assert!(
+        !replace.contains("EditorPublicationAuthority::DirectFile => rename_projection_noreplace"),
+        "the Direct arm must carry the exact-byte protocol, not the bare rename"
+    );
+    assert!(
+        replace.contains("EditorPublicationAuthority::ReconstructibleManagedProjection => {"),
+        "the managed projection arm keeps its own capability-fallback rename"
+    );
+}
+
+/// GH #466. The exact-byte protocol the Direct Files name transition carries:
+/// a matching source is published under a name nothing else holds, an
+/// occupied destination is never replaced, and a source whose bytes are not
+/// the expected ones (an external writer got there first) is never published.
+#[test]
+fn graph_text_exact_move_publishes_expected_bytes_and_refuses_a_replaced_source() {
+    let root = scratch("gh466-graph-text-exact-move");
+    fs::create_dir_all(&root).unwrap();
+    let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+
+    dir.write("staged.md", b"- staged\n").unwrap();
+    move_graph_text_exact_no_replace(&dir, "staged.md", "Page.md", b"- staged\n").unwrap();
+    assert_eq!(fs::read(root.join("Page.md")).unwrap(), b"- staged\n");
+    assert!(!root.join("staged.md").exists());
+
+    dir.write("other.md", b"- other\n").unwrap();
+    let occupied =
+        move_graph_text_exact_no_replace(&dir, "other.md", "Page.md", b"- other\n").unwrap_err();
+    assert_eq!(occupied.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(root.join("Page.md")).unwrap(), b"- staged\n");
+    assert_eq!(fs::read(root.join("other.md")).unwrap(), b"- other\n");
+
+    let replaced = move_graph_text_exact_no_replace(&dir, "other.md", "Fresh.md", b"- expected\n")
+        .unwrap_err();
+    assert_eq!(replaced.kind(), io::ErrorKind::AlreadyExists);
+    assert!(replaced.to_string().contains("source name"), "{replaced}");
+    assert!(!root.join("Fresh.md").exists());
+    assert_eq!(fs::read(root.join("other.md")).unwrap(), b"- other\n");
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ---- #21: path-pinned pages + duplicate-day reconcile ----
