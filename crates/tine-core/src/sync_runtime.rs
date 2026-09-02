@@ -6908,10 +6908,8 @@ fn open_clean_runtime_resources_with_progress(
         }
         Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded)) => {
             counters.checkpoint_roster_entries = loaded.accepted_rows.len();
-            counters.checkpoint_manifest_names = loaded
-                .accepted_rows
-                .len()
-                .saturating_add(loaded.tail.len());
+            counters.checkpoint_manifest_names =
+                loaded.accepted_rows.len().saturating_add(loaded.tail.len());
             counters.checkpoint_required_object_names = loaded.required_objects.len();
             counters.checkpoint_capture_work = loaded.capture_work;
             counters.checkpoint_payload_bytes = loaded.payload_bytes;
@@ -6928,10 +6926,8 @@ fn open_clean_runtime_resources_with_progress(
                         .map_err(display)?;
                     restored_checkpoint = true;
                     counters.checkpoint_opens = 1;
-                    match engine.replay_clean_checkpoint_tail(
-                        &tail,
-                        baseline_claim_source.as_ref(),
-                    ) {
+                    match engine.replay_clean_checkpoint_tail(&tail, baseline_claim_source.as_ref())
+                    {
                         Ok(count) => replayed = count,
                         Err(error) => {
                             eprintln!(

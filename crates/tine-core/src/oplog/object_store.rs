@@ -152,8 +152,7 @@ pub struct ObjectStore {
     /// Fingerprints collected while the ordinary namespace validator already
     /// has every manifest body in memory. Checkpoint roster comparison reads
     /// this cache, never the pre-roster manifest bodies a second time.
-    validated_manifest_fingerprints:
-        Arc<std::sync::RwLock<BTreeMap<BatchId, ContentDigest>>>,
+    validated_manifest_fingerprints: Arc<std::sync::RwLock<BTreeMap<BatchId, ContentDigest>>>,
     validated_manifest_names: Arc<std::sync::RwLock<BTreeSet<BatchId>>>,
     validated_object_names: Arc<std::sync::RwLock<BTreeSet<ContentDigest>>>,
 }
@@ -504,9 +503,7 @@ impl ObjectStore {
             workspace_id: self.workspace_id,
             capability: self.capability.try_clone()?,
             counters: Arc::clone(&self.counters),
-            validated_manifest_fingerprints: Arc::clone(
-                &self.validated_manifest_fingerprints,
-            ),
+            validated_manifest_fingerprints: Arc::clone(&self.validated_manifest_fingerprints),
             validated_manifest_names: Arc::clone(&self.validated_manifest_names),
             validated_object_names: Arc::clone(&self.validated_object_names),
         })
@@ -929,10 +926,9 @@ impl ObjectStore {
         batch_id: BatchId,
         fingerprint: ContentDigest,
     ) -> Result<(), StoreError> {
-        let mut fingerprints = self
-            .validated_manifest_fingerprints
-            .write()
-            .map_err(|_| StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into()))?;
+        let mut fingerprints = self.validated_manifest_fingerprints.write().map_err(|_| {
+            StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into())
+        })?;
         if let Some(existing) = fingerprints.insert(batch_id, fingerprint) {
             if existing != fingerprint {
                 return Err(StoreError::BatchCollision(batch_id));
@@ -1039,14 +1035,7 @@ impl ObjectStore {
         &self,
         roster: &BTreeSet<BatchId>,
         required_objects: &BTreeSet<ContentDigest>,
-    ) -> Result<
-        (
-            BTreeSet<BatchId>,
-            Option<BatchId>,
-            Option<ContentDigest>,
-        ),
-        StoreError,
-    > {
+    ) -> Result<(BTreeSet<BatchId>, Option<BatchId>, Option<ContentDigest>), StoreError> {
         let manifests = self
             .validated_manifest_names
             .read()
@@ -1411,11 +1400,9 @@ impl ObjectStore {
         } else {
             let _ = read_optional_regular(&self.capability, LINEAGE_CLAIM_FILE, 32, Some(32))?;
         }
-        *self
-            .validated_manifest_fingerprints
-            .write()
-            .map_err(|_| StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into()))? =
-            manifest_fingerprints;
+        *self.validated_manifest_fingerprints.write().map_err(|_| {
+            StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into())
+        })? = manifest_fingerprints;
         *self
             .validated_manifest_names
             .write()

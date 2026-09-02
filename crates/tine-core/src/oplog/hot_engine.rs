@@ -6311,8 +6311,7 @@ pub struct ShardedHotEngine {
     transient_effective_views: BTreeMap<BatchId, AuthenticatedEffectiveSemanticView>,
     transient_effective_view_order: VecDeque<BatchId>,
     archive_store: Option<Arc<ObjectStore>>,
-    clean_checkpoint_publisher:
-        Option<super::checkpoint_generation::CleanCheckpointPublisher>,
+    clean_checkpoint_publisher: Option<super::checkpoint_generation::CleanCheckpointPublisher>,
     /// Device-local own-endpoint projection completion evidence. The archive
     /// chain is durable; this engine-owned value also owns the coalescing
     /// buffer from cold repair through actor shutdown.
@@ -6947,12 +6946,11 @@ impl ShardedHotEngine {
         let publisher_store = store
             .duplicate_retained_capability()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.clean_checkpoint_publisher = Some(
-            super::checkpoint_generation::CleanCheckpointPublisher::new(
+        self.clean_checkpoint_publisher =
+            Some(super::checkpoint_generation::CleanCheckpointPublisher::new(
                 publisher_store,
                 durable_sequence,
-            ),
-        );
+            ));
         Ok(())
     }
 
@@ -6987,14 +6985,19 @@ impl ShardedHotEngine {
             .saturating_add(self.ephemeral_portable_paths.len())
             .saturating_add(self.current_path_catalog.rows.len());
         let cadence = retained_items.saturating_add(799) / 800;
-        u64::try_from(cadence.clamp(1, super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX as usize))
-            .unwrap_or(super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX)
+        u64::try_from(cadence.clamp(
+            1,
+            super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX as usize,
+        ))
+        .unwrap_or(super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX)
     }
 
     pub(crate) fn clean_checkpoint_durable_lag(&self) -> u64 {
-        self.clean_checkpoint_publisher.as_ref().map_or(0, |publisher| {
-            publisher.durable_lag(self.next_acceptance_sequence)
-        })
+        self.clean_checkpoint_publisher
+            .as_ref()
+            .map_or(0, |publisher| {
+                publisher.durable_lag(self.next_acceptance_sequence)
+            })
     }
 
     /// Replay the complete manifest-committed accepted tail over a clean
@@ -7048,9 +7051,10 @@ impl ShardedHotEngine {
                     .into(),
             ));
         }
-        let store = self.archive_store.as_ref().cloned().ok_or_else(|| {
-            EngineError::Archive("clean runtime has no operation archive".into())
-        })?;
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
         let accepted_before = self.accepted_batch_count()?;
         let mut pending = BTreeMap::new();
         for batch_id in batch_ids {
@@ -7219,11 +7223,15 @@ impl ShardedHotEngine {
 
         let mut accepted_rows = Vec::with_capacity(self.accepted_sequence.len());
         for sequence in 1..=self.next_acceptance_sequence {
-            let batch_id = self.accepted_sequence.get(&sequence).copied().ok_or_else(|| {
-                EngineError::Archive(format!(
-                    "clean checkpoint accepted sequence {sequence} is absent"
-                ))
-            })?;
+            let batch_id = self
+                .accepted_sequence
+                .get(&sequence)
+                .copied()
+                .ok_or_else(|| {
+                    EngineError::Archive(format!(
+                        "clean checkpoint accepted sequence {sequence} is absent"
+                    ))
+                })?;
             let (no_op, evidence) = match self.statuses.get(&batch_id) {
                 Some(ArchiveStatus::Accepted { no_op, evidence }) => (*no_op, evidence.clone()),
                 _ => {
@@ -7300,10 +7308,7 @@ impl ShardedHotEngine {
             clean_projection_head_batches: self.clean_projection_head_batches.clone(),
             current_path_rows: self.current_path_catalog.rows.clone(),
             current_path_available: self.current_path_catalog.available,
-            current_path_frontier_root: self
-                .current_path_catalog
-                .accepted_frontier_root
-                .clone(),
+            current_path_frontier_root: self.current_path_catalog.accepted_frontier_root.clone(),
         };
         let state_bytes = postcard::to_allocvec(&state)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -7324,10 +7329,11 @@ impl ShardedHotEngine {
         ]
         .into_iter()
         .try_fold(0_u64, |total, count| {
-            total.checked_add(u64::try_from(count).map_err(|_| {
-                EngineError::Archive("clean checkpoint capture cardinality exceeds u64".into())
-            })?)
-            .ok_or_else(|| EngineError::Archive("clean checkpoint work overflowed".into()))
+            total
+                .checked_add(u64::try_from(count).map_err(|_| {
+                    EngineError::Archive("clean checkpoint capture cardinality exceeds u64".into())
+                })?)
+                .ok_or_else(|| EngineError::Archive("clean checkpoint work overflowed".into()))
         })?;
         Ok(CleanCheckpointCapture {
             state_bytes,
@@ -7371,11 +7377,10 @@ impl ShardedHotEngine {
                 "clean checkpoint state is noncanonical, stale, or misbound".into(),
             ));
         }
-        let ephemeral_page_names =
-            EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(
-                &state.ephemeral_page_names,
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let ephemeral_page_names = EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(
+            &state.ephemeral_page_names,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
         let decode_documents = |encoded: &BTreeMap<DocumentId, Vec<u8>>| {
             encoded
                 .iter()
@@ -26370,10 +26375,7 @@ pub(crate) mod validation_tests {
             next_acceptance_sequence: engine.next_acceptance_sequence,
             current_path_rows: engine.current_path_catalog.rows.clone(),
             current_path_available: engine.current_path_catalog.available,
-            current_path_frontier_root: engine
-                .current_path_catalog
-                .accepted_frontier_root
-                .clone(),
+            current_path_frontier_root: engine.current_path_catalog.accepted_frontier_root.clone(),
         }
     }
 

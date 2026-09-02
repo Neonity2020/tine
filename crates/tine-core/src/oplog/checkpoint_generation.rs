@@ -98,9 +98,7 @@ fn sealed_kind_from_code(
     }
 }
 
-impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
-    for CheckpointSealedStore
-{
+impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore for CheckpointSealedStore {
     fn read_sealed_accepted_object(
         &self,
         kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
@@ -175,12 +173,14 @@ impl CheckpointSealedStore {
                 return Err("clean checkpoint sealed map exceeds its root count".into());
             }
         }
-        if rows.len() != usize::try_from(root.count).map_err(|_| "clean checkpoint map count exceeds usize")? {
+        if rows.len()
+            != usize::try_from(root.count)
+                .map_err(|_| "clean checkpoint map count exceeds usize")?
+        {
             return Err("clean checkpoint sealed map count differs from its root".into());
         }
         Ok(rows)
     }
-
 }
 
 struct RecordingCheckpointSealedStore<'a> {
@@ -226,9 +226,11 @@ impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
         _address: ContentDigest,
         _bytes: &[u8],
     ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
-        Err(tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Store(
-            "recording checkpoint store is read-only".into(),
-        ))
+        Err(
+            tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Store(
+                "recording checkpoint store is read-only".into(),
+            ),
+        )
     }
 }
 
@@ -269,9 +271,7 @@ fn map_root_to_wire(
 fn map_root_from_wire(
     wire: MapRootWire,
 ) -> Result<tine_storage::sealed_accepted_index::AuthenticatedMapRootV1, String> {
-    use tine_storage::sealed_accepted_index::{
-        AuthenticatedMapLinkV1, AuthenticatedMapRootV1,
-    };
+    use tine_storage::sealed_accepted_index::{AuthenticatedMapLinkV1, AuthenticatedMapRootV1};
     let root = match (wire.root_key, wire.root_digest) {
         (Some(key), Some(digest)) => Some(AuthenticatedMapLinkV1 { key, digest }),
         (None, None) => None,
@@ -289,9 +289,7 @@ fn map_root_from_wire(
 fn roots_from_wire(
     wire: RosterRootsWire,
 ) -> Result<tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2, String> {
-    use tine_storage::sealed_accepted_index::{
-        AcceptedSequenceRootV2, SealedAcceptedIndexRootsV2,
-    };
+    use tine_storage::sealed_accepted_index::{AcceptedSequenceRootV2, SealedAcceptedIndexRootsV2};
     let roots = SealedAcceptedIndexRootsV2 {
         batch_map: map_root_from_wire(wire.batch_map)?,
         status_map: map_root_from_wire(wire.status_map)?,
@@ -339,9 +337,7 @@ fn encode_canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     postcard::to_allocvec(value).map_err(|error| error.to_string())
 }
 
-fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(
-    bytes: &[u8],
-) -> Result<T, String> {
+fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> Result<T, String> {
     let (value, trailing): (T, &[u8]) =
         postcard::take_from_bytes(bytes).map_err(|error| error.to_string())?;
     if !trailing.is_empty() || encode_canonical(&value)? != bytes {
@@ -353,8 +349,8 @@ fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(
 fn build_payload(capture: CleanCheckpointCapture) -> Result<(u64, Vec<u8>), String> {
     use tine_storage::sealed_accepted_index::{
         AcceptedSequenceEntryV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
-        AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2,
-        SealedAcceptedCausalRecordV2, SealedAcceptedIndexWriter,
+        AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
+        SealedAcceptedIndexWriter,
     };
 
     let mut store = CheckpointSealedStore::default();
@@ -384,7 +380,9 @@ fn build_payload(capture: CleanCheckpointCapture) -> Result<(u64, Vec<u8>), Stri
                 .collect(),
         };
         let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-        let causal_address = writer.publish_causal(&causal).map_err(|error| error.to_string())?;
+        let causal_address = writer
+            .publish_causal(&causal)
+            .map_err(|error| error.to_string())?;
         let status = AcceptedStatusRecordV2 {
             batch_id,
             no_op: row.no_op,
@@ -395,7 +393,9 @@ fn build_payload(capture: CleanCheckpointCapture) -> Result<(u64, Vec<u8>), Stri
                 .map_err(|error| error.to_string())?,
             accepted_causal_record_digest: causal_address,
         };
-        let status_address = writer.publish_status(&status).map_err(|error| error.to_string())?;
+        let status_address = writer
+            .publish_status(&status)
+            .map_err(|error| error.to_string())?;
         batch_map = writer
             .upsert_map(batch_map, batch_id, causal_address)
             .map_err(|error| error.to_string())?;
@@ -469,8 +469,7 @@ fn checkpoint_directory(store: &ObjectStore) -> Result<cap_std::fs::Dir, String>
         .map_err(|error| error.to_string())?;
     tine_storage::ensure_directory_nofollow(&root, CHECKPOINT_DIRECTORY)
         .map_err(|error| error.to_string())?;
-    tine_storage::open_dir_nofollow(&root, CHECKPOINT_DIRECTORY)
-        .map_err(|error| error.to_string())
+    tine_storage::open_dir_nofollow(&root, CHECKPOINT_DIRECTORY).map_err(|error| error.to_string())
 }
 
 fn install_replaceable_exact(
@@ -506,19 +505,13 @@ fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Resu
     let directory = checkpoint_directory(store)?;
     let publication = tine_storage::DurableDirectoryPublication::open(&directory)
         .map_err(|error| error.to_string())?;
-    let prior_pointer_bytes = tine_storage::read_optional_regular(
-        &directory,
-        CHECKPOINT_POINTER,
-        4 * 1024,
-        None,
-    )
-    .map_err(|error| error.to_string())?;
+    let prior_pointer_bytes =
+        tine_storage::read_optional_regular(&directory, CHECKPOINT_POINTER, 4 * 1024, None)
+            .map_err(|error| error.to_string())?;
     let prior_slot = prior_pointer_bytes
         .as_deref()
         .and_then(|bytes| decode_canonical::<CheckpointPointerV1>(bytes).ok())
-        .filter(|pointer| {
-            pointer.schema_version == CHECKPOINT_SCHEMA_VERSION && pointer.slot < 2
-        })
+        .filter(|pointer| pointer.schema_version == CHECKPOINT_SCHEMA_VERSION && pointer.slot < 2)
         .map(|pointer| pointer.slot as usize);
     let slot = prior_slot.map_or(0, |slot| 1 - slot);
     install_replaceable_exact(
@@ -598,21 +591,15 @@ pub(crate) fn open_checkpoint(
     else {
         return Ok(CleanCheckpointOpen::Absent);
     };
-    let Some(pointer_bytes) = tine_storage::read_optional_regular(
-        &directory,
-        CHECKPOINT_POINTER,
-        4 * 1024,
-        None,
-    )
-    .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?
+    let Some(pointer_bytes) =
+        tine_storage::read_optional_regular(&directory, CHECKPOINT_POINTER, 4 * 1024, None)
+            .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?
     else {
         return Ok(CleanCheckpointOpen::Absent);
     };
-    let pointer: CheckpointPointerV1 =
-        match decode_canonical::<CheckpointPointerV1>(&pointer_bytes) {
-        Ok(pointer)
-            if pointer.schema_version == CHECKPOINT_SCHEMA_VERSION && pointer.slot < 2 =>
-        {
+    let pointer: CheckpointPointerV1 = match decode_canonical::<CheckpointPointerV1>(&pointer_bytes)
+    {
+        Ok(pointer) if pointer.schema_version == CHECKPOINT_SCHEMA_VERSION && pointer.slot < 2 => {
             pointer
         }
         Ok(_) | Err(_) => return Ok(invalid("clean checkpoint pointer is invalid")),
@@ -634,15 +621,15 @@ pub(crate) fn open_checkpoint(
     }
     let generation: CheckpointGenerationV1 =
         match decode_canonical::<CheckpointGenerationV1>(&generation_bytes) {
-        Ok(generation)
-            if generation.schema_version == CHECKPOINT_SCHEMA_VERSION
-                && generation.slot == pointer.slot
-                && generation.sequence == pointer.sequence =>
-        {
-            generation
-        }
-        Ok(_) | Err(_) => return Ok(invalid("clean checkpoint generation is invalid")),
-    };
+            Ok(generation)
+                if generation.schema_version == CHECKPOINT_SCHEMA_VERSION
+                    && generation.slot == pointer.slot
+                    && generation.sequence == pointer.sequence =>
+            {
+                generation
+            }
+            Ok(_) | Err(_) => return Ok(invalid("clean checkpoint generation is invalid")),
+        };
     let payload_bytes = match tine_storage::read_optional_regular(
         &directory,
         CHECKPOINT_PAYLOAD_NAMES[slot],
@@ -657,7 +644,8 @@ pub(crate) fn open_checkpoint(
     if ContentDigest::of(&payload_bytes) != generation.payload_digest {
         return Ok(invalid("clean checkpoint payload digest differs"));
     }
-    let payload: CheckpointPayloadV1 = match decode_canonical::<CheckpointPayloadV1>(&payload_bytes) {
+    let payload: CheckpointPayloadV1 = match decode_canonical::<CheckpointPayloadV1>(&payload_bytes)
+    {
         Ok(payload) if payload.schema_version == CHECKPOINT_SCHEMA_VERSION => payload,
         Ok(_) | Err(_) => return Ok(invalid("clean checkpoint payload is invalid")),
     };
@@ -666,7 +654,9 @@ pub(crate) fn open_checkpoint(
         .keys()
         .find(|(kind, _)| sealed_kind_from_code(*kind).is_err())
     {
-        return Ok(invalid(format!("clean checkpoint has unknown sealed kind {kind}")));
+        return Ok(invalid(format!(
+            "clean checkpoint has unknown sealed kind {kind}"
+        )));
     }
     let sealed_store = CheckpointSealedStore {
         objects: payload.sealed_objects,
@@ -731,14 +721,15 @@ pub(crate) fn open_checkpoint(
             Ok(causal) => causal,
             Err(_) => return Ok(invalid("clean checkpoint causal binding failed")),
         };
-        let evidence = match AcceptedBatchEvidence::decode_canonical(
-            &status.exact_evidence_bytes,
-        ) {
+        let evidence = match AcceptedBatchEvidence::decode_canonical(&status.exact_evidence_bytes) {
             Ok(evidence)
                 if evidence.batch_id().as_uuid().into_bytes() == entry.batch_id
                     && evidence.acceptance_sequence() == sequence
                     && evidence.manifest_fingerprint() == causal.manifest_fingerprint
-                    && evidence.event_binding_digest() == causal.event_binding_digest => evidence,
+                    && evidence.event_binding_digest() == causal.event_binding_digest =>
+            {
+                evidence
+            }
             Err(_) => return Ok(invalid("clean checkpoint evidence is invalid")),
             Ok(_) => return Ok(invalid("clean checkpoint evidence binding failed")),
         };
@@ -777,7 +768,10 @@ pub(crate) fn open_checkpoint(
         return Ok(invalid("clean checkpoint roster maps and sequence differ"));
     }
 
-    let required_objects = payload.required_objects.into_iter().collect::<BTreeSet<_>>();
+    let required_objects = payload
+        .required_objects
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let (tail, missing_manifest, missing_object) = store
         .checkpoint_namespace_delta(&roster, &required_objects)
         .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?;
@@ -855,7 +849,11 @@ impl CleanCheckpointPublisher {
                 .elevated_rewrite_observed
                 .store(true, Ordering::Release);
         }
-        let mut state = self.inner.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.in_flight {
             if state
                 .queued
@@ -874,7 +872,11 @@ impl CleanCheckpointPublisher {
             .spawn(move || publisher_loop(inner, capture));
         if let Err(error) = spawn {
             eprintln!("clean checkpoint writer could not start: {error}");
-            let mut state = self.inner.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.in_flight = false;
             self.inner.finished.notify_all();
         }
@@ -915,9 +917,14 @@ fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCaptur
     loop {
         match publish_capture(&inner.store, capture) {
             Ok(sequence) => inner.durable_sequence.store(sequence, Ordering::Release),
-            Err(error) => eprintln!("clean checkpoint write failed; retrying at the next trigger: {error}"),
+            Err(error) => {
+                eprintln!("clean checkpoint write failed; retrying at the next trigger: {error}")
+            }
         }
-        let mut state = inner.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(next) = state.queued.take() else {
             state.in_flight = false;
             inner.finished.notify_all();
@@ -1136,11 +1143,7 @@ mod tests {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        for forbidden in [
-            "write_all",
-            "std::fs::rename",
-            ".remove_file(",
-        ] {
+        for forbidden in ["write_all", "std::fs::rename", ".remove_file("] {
             assert!(
                 !production.contains(forbidden),
                 "checkpoint authoring bypassed the audited publication boundary: {forbidden}"
@@ -1165,9 +1168,8 @@ mod tests {
     #[test]
     fn checkpoint_payload_uses_the_shared_sealed_roster_round_trip() {
         let evidence = evidence();
-        let peer = CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([
-            0x44; 16
-        ])));
+        let peer =
+            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
         let capture = CleanCheckpointCapture {
             state_bytes: b"state".to_vec(),
             accepted_rows: vec![CleanCheckpointAcceptedRow {
@@ -1192,7 +1194,10 @@ mod tests {
             .prove_membership(roots, 1, [0x51; 16], &TineAcceptedEvidenceDecoder)
             .unwrap()
             .unwrap();
-        assert_eq!(proof.status.exact_evidence_bytes, evidence.encode_canonical().unwrap());
+        assert_eq!(
+            proof.status.exact_evidence_bytes,
+            evidence.encode_canonical().unwrap()
+        );
     }
 
     #[test]
@@ -1205,9 +1210,8 @@ mod tests {
         let workspace = crate::oplog::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xa564));
         let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
         let publisher = CleanCheckpointPublisher::new(store, 0);
-        let peer = CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([
-            0x44; 16
-        ])));
+        let peer =
+            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
         let row = CleanCheckpointAcceptedRow {
             no_op: false,
             evidence: evidence(),
@@ -1249,7 +1253,9 @@ mod tests {
         match open_checkpoint(store).unwrap() {
             CleanCheckpointOpen::Loaded(loaded) => loaded.state_bytes,
             CleanCheckpointOpen::Absent => panic!("checkpoint unexpectedly absent"),
-            CleanCheckpointOpen::Invalid(detail) => panic!("checkpoint unexpectedly invalid: {detail}"),
+            CleanCheckpointOpen::Invalid(detail) => {
+                panic!("checkpoint unexpectedly invalid: {detail}")
+            }
         }
     }
 
@@ -1302,7 +1308,12 @@ mod tests {
 
     #[test]
     fn post_publication_checkpoint_damage_is_private_fallback_state() {
-        for damage in ["pointer-bitflip", "generation-truncate", "payload-truncate", "payload-oversize"] {
+        for damage in [
+            "pointer-bitflip",
+            "generation-truncate",
+            "payload-truncate",
+            "payload-oversize",
+        ] {
             let (root, store) = checkpoint_fault_fixture(damage);
             publish_capture(&store, empty_capture(b"disposable")).unwrap();
             let directory = root.join("archive").join(CHECKPOINT_DIRECTORY);
@@ -1316,7 +1327,8 @@ mod tests {
                     std::fs::write(directory.join(CHECKPOINT_POINTER), bytes).unwrap();
                 }
                 "generation-truncate" => {
-                    std::fs::write(directory.join(CHECKPOINT_GENERATION_NAMES[slot]), [0x01]).unwrap();
+                    std::fs::write(directory.join(CHECKPOINT_GENERATION_NAMES[slot]), [0x01])
+                        .unwrap();
                 }
                 "payload-truncate" => {
                     std::fs::write(directory.join(CHECKPOINT_PAYLOAD_NAMES[slot]), [0x01]).unwrap();
