@@ -297,7 +297,7 @@ Managed storage selection, and no byte is written into the user's graph.
 | private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1 | written last; sole local managed-authority selector |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
-| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack v4, page capsule v4/v5, plus commit v1 | authoritative baseline; new writes use capsule v5, readers retain receiptless-v4 recovery; installed before the marker and never mutated |
+| `archive/lazy-genesis/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation | clean open/join | immutable baseline pack, manifest schema 5, page capsule v5, plus commit v1 | authoritative baseline; installed before the marker and never mutated. A sealed baseline whose manifest schema is not the current one is a recognized pre-0.7 containing format: open refuses with `MS-REF-PROTOCOL-INCOMPATIBLE`, which routes the store to preserve-and-rebuild (blank-slate), never to a retryable dead end; no earlier schema is decoded |
 | `archive/operations/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit | causal replay and publication | content-addressed objects plus manifest-last batches | authoritative append-only tail after the baseline |
 | `archive/operations/clean-open-checkpoint-v1/{current,payload-{a,b},generation-{a,b}}` | clean engine actor plus one coalesced background writer | clean managed open | current canonical checkpoint v1; two bounded replaceable slots and one durable commit pointer; accepted roster encoded by `tine-storage` sealed accepted index | disposable acceleration only; absent, stale, torn, wrong-format, oversized, or internally damaged state full-replays and rewrites without refusal; no migration or backup |
 | `archive/operations/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
@@ -827,7 +827,12 @@ An interrupted write therefore leaves the prior pointed generation complete.
 Every create and replacement uses the audited durable directory-publication
 boundary. There is exactly one current format, no migration reader, and no
 preserved backup for rejected checkpoint bytes because the operation archive is
-the sole semantic authority.
+the sole semantic authority. A checkpoint whose roster names an accepted
+manifest or required object that the archive no longer holds is not a
+checkpoint defect: the checkpoint is discarded and the missing archive
+evidence surfaces as `MS-REF-DISK-CORRUPT` (scenario: disk error or torn
+sync-service delivery of the archive), the same scenario the full-replay path
+would report.
 
 The checkpoint contains every clean-runtime field that changes later
 admission, conflict, or query decisions, including the exact ephemeral

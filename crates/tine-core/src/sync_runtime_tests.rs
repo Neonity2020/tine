@@ -9006,6 +9006,59 @@ fn checkpoint_roster_surfaces_missing_authoritative_manifest_immediately() {
         "missing roster authority must surface immediately: {:?}",
         reopened.status
     );
+    assert_eq!(
+        reopened.status.durable_refusal_scenario(),
+        Some(ManagedStorageRefusalScenario::DiskCorrupt),
+        "archive damage is a durable disk-corrupt refusal, never an unmarked retryable one"
+    );
+}
+
+/// Wave-2 review H-1: a store whose sealed lazy-genesis baseline was written
+/// by an earlier build (schema 4) must classify as the durable
+/// `MS-REF-PROTOCOL-INCOMPATIBLE` refusal, because that scenario is the ONLY
+/// one the Tauri graph-open lifecycle answers with preserve-and-rebuild (D-1).
+/// Before the marker was stamped the same store surfaced as an unmarked
+/// retryable open failure: no backup, no rebuild, "could not serve".
+#[test]
+fn a_pre_h_sealed_baseline_is_a_durable_protocol_refusal_not_a_retryable_dead_end() {
+    let fixture = ActivationFixture::nested_unicode("pre-h-lazy-genesis-schema", 0x5c4e_a004);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("schema fixture activates");
+    drive_initial_feed(&handle);
+    drain_managed_local(&handle);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+
+    crate::oplog::lazy_genesis::rewrite_sealed_baseline_schema_for_test(
+        &fixture.request.enrollment_root,
+        &clean_baseline_directory(&fixture.request.archive_root),
+        4,
+    )
+    .unwrap();
+    let before = user_graph_bytes(&fixture.graph_root);
+
+    let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(result.handle.is_none());
+    let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
+        panic!("a pre-H sealed baseline must surface a managed-open refusal: {result:?}");
+    };
+    assert!(
+        detail.contains("lazy genesis manifest schema 4"),
+        "the refusal names the containing component: {detail}"
+    );
+    assert_eq!(
+        result.status.durable_refusal_scenario(),
+        Some(ManagedStorageRefusalScenario::ProtocolIncompatible),
+        "only this scenario reaches the blank-slate preserve-and-rebuild lifecycle"
+    );
+    assert_eq!(
+        user_graph_bytes(&fixture.graph_root),
+        before,
+        "a refused open must not change one byte of the user's graph"
+    );
 }
 
 #[test]

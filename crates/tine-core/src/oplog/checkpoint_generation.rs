@@ -775,9 +775,16 @@ pub(crate) fn open_checkpoint(
     let (tail, missing_manifest, missing_object) = store
         .checkpoint_namespace_delta(&roster, &required_objects)
         .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?;
+    // Archive damage is a refusal of the authoritative tail, not of the
+    // disposable checkpoint: the accepted roster proves this manifest was
+    // published, so its absence is a torn/partial delivery or media loss.
+    // Carry the scenario marker so the public open classifies durably
+    // (`MS-REF-DISK-CORRUPT`) instead of surfacing as an unmarked retryable
+    // dead end (wave-2 review A5-2).
     if let Some(missing) = missing_manifest {
         return Err(CleanCheckpointOpenError::ArchiveDamage(format!(
-            "accepted checkpoint roster manifest {missing} is missing from the archive"
+            "accepted checkpoint roster manifest {missing} is missing from the archive [{}]",
+            crate::oplog::refusal::ManagedStorageRefusalScenario::DiskCorrupt.as_str()
         )));
     }
     let live_fingerprints = store
@@ -795,7 +802,8 @@ pub(crate) fn open_checkpoint(
     }
     if let Some(missing) = missing_object {
         return Err(CleanCheckpointOpenError::ArchiveDamage(format!(
-            "accepted checkpoint roster object {missing} is missing from the archive"
+            "accepted checkpoint roster object {missing} is missing from the archive [{}]",
+            crate::oplog::refusal::ManagedStorageRefusalScenario::DiskCorrupt.as_str()
         )));
     }
     let payload_size = payload_bytes.len();

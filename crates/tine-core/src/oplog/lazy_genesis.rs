@@ -1409,8 +1409,13 @@ impl LazyGenesisCandidate {
                 "lazy genesis sealed commit does not bind its manifest",
             ));
         }
-        let manifest: LazyGenesisManifestV1 =
-            postcard::from_bytes(&manifest_bytes).map_err(|error| invalid(error.to_string()))?;
+        // The commit above already proved these are the exact sealed bytes, so
+        // a manifest that no longer decodes, or decodes to a non-current schema,
+        // is a recognized pre-0.7 containing format rather than damage. Carry
+        // the durable scenario marker so the graph-open lifecycle preserves the
+        // private root and rebuilds automatically instead of refusing (D-1).
+        let manifest: LazyGenesisManifestV1 = postcard::from_bytes(&manifest_bytes)
+            .map_err(|error| superseded_containing_format(&error.to_string()))?;
         validate_manifest(&manifest)?;
         if manifest.workspace_id != commit.workspace_id
             || manifest.lineage_digest != commit.lineage_digest
@@ -1500,8 +1505,13 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
             .checked_add(u64::from(page.blocks))
             .ok_or_else(|| invalid("lazy genesis manifest block count overflows"))
     })?;
-    if manifest.schema_version != LAZY_GENESIS_SCHEMA_VERSION
-        || manifest.page_count != manifest.pages.len() as u64
+    if manifest.schema_version != LAZY_GENESIS_SCHEMA_VERSION {
+        return Err(superseded_containing_format(&format!(
+            "lazy genesis manifest schema {} is not the current schema {}",
+            manifest.schema_version, LAZY_GENESIS_SCHEMA_VERSION
+        )));
+    }
+    if manifest.page_count != manifest.pages.len() as u64
         || manifest
             .pages
             .windows(2)
@@ -1733,6 +1743,53 @@ fn read_bounded(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
 fn describe_file(path: &Path) -> io::Result<BlobDescription> {
     let bytes = fs::read(path)?;
     Ok(BlobDescription::of(&bytes))
+}
+
+/// A sealed lazy-genesis baseline this build does not decode. The message
+/// carries `MS-REF-PROTOCOL-INCOMPATIBLE` so `SyncRuntimeOpenStatus::OpenRefused`
+/// classifies as a durable protocol refusal, which is the only refusal the
+/// Tauri graph-open lifecycle answers with preserve-and-rebuild
+/// (`SparseV2Binding::requires_blank_slate_rebuild`). Without the marker the
+/// same failure surfaced as a retryable dead end (wave-2 review H-1).
+fn superseded_containing_format(detail: &str) -> io::Error {
+    invalid(format!(
+        "{detail}: this pre-0.7 private baseline must be backed up and rebuilt from the \
+         intact Markdown/Org tree by the graph-open lifecycle [{}]",
+        crate::oplog::refusal::ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
+    ))
+}
+
+/// Test-only: rewrite an installed, marker-bound sealed baseline as if an
+/// earlier build had sealed it under `schema_version`. The commit and the
+/// activation marker are re-bound to the rewritten manifest exactly as that
+/// build would have left them, so the real open path meets a consistent
+/// pre-current store rather than a torn one.
+#[cfg(test)]
+pub(crate) fn rewrite_sealed_baseline_schema_for_test(
+    enrollment_root: &Path,
+    baseline_directory: &Path,
+    schema_version: u32,
+) -> io::Result<()> {
+    let manifest_path = baseline_directory.join(LAZY_GENESIS_MANIFEST_FILE);
+    let commit_path = baseline_directory.join(LAZY_GENESIS_COMMIT_FILE);
+    let mut manifest: LazyGenesisManifestV1 = postcard::from_bytes(&fs::read(&manifest_path)?)
+        .map_err(|error| invalid(error.to_string()))?;
+    manifest.schema_version = schema_version;
+    let manifest_bytes =
+        postcard::to_allocvec(&manifest).map_err(|error| invalid(error.to_string()))?;
+    let mut commit = LazyGenesisCommitV1::decode(&fs::read(&commit_path)?)?;
+    commit.manifest = BlobDescription::of(&manifest_bytes);
+    commit.root = lazy_genesis_manifest_root(&manifest_bytes);
+    fs::write(&manifest_path, &manifest_bytes)?;
+    fs::write(&commit_path, commit.encode()?)?;
+    let marker = read_activation_marker(enrollment_root)?
+        .ok_or_else(|| invalid("no activation marker to re-bind"))?;
+    let rebound = LazyGenesisActivationMarkerV1 {
+        baseline_root: commit.root,
+        ..marker
+    };
+    fs::remove_file(enrollment_root.join(LAZY_GENESIS_ACTIVATION_MARKER_FILE))?;
+    publish_activation_marker(enrollment_root, rebound)
 }
 
 fn invalid(detail: impl Into<String>) -> io::Error {
@@ -2203,6 +2260,71 @@ mod tests {
         assert_eq!(reopened.root(), marker.baseline_root());
         assert_eq!(reopened.page_count(), 1);
         drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Wave-2 review H-1: a sealed baseline from an earlier schema is a
+    /// recognized pre-0.7 containing format. Its refusal must carry the
+    /// durable protocol marker, because that marker is what routes the store
+    /// into preserve-and-rebuild instead of a retryable dead end.
+    #[test]
+    fn previous_schema_sealed_baseline_refuses_with_the_protocol_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-lazy-genesis-schema-marker-{}",
+            Uuid::new_v4().simple()
+        ));
+        let enrollment = root.join("enrollment");
+        let destination = root.join("archive/lazy-genesis");
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::create_dir_all(&enrollment).unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(11));
+        let lineage = LineageDigest::of(b"lazy-genesis-schema-marker");
+        let build = || {
+            let scratch = root.join(format!("scratch-{}", Uuid::new_v4().simple()));
+            fs::create_dir_all(&scratch).unwrap();
+            let mut builder = LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog_document_id(),
+                BlobDescription::of(b"capture"),
+                &scratch,
+            )
+            .unwrap();
+            builder.push(page(1, "pages/a.md", 1)).unwrap();
+            builder
+                .finish(vec![0x43, 0x41, 0x54], Some(catalog_dependencies()))
+                .unwrap()
+        };
+        let (candidate, _) = build().publish_durable(&destination).unwrap();
+        let marker = LazyGenesisActivationMarkerV1::new(
+            workspace,
+            lineage,
+            candidate.root(),
+            candidate.source_capture(),
+            ContentDigest::of(b"accepted frontier"),
+            1,
+        )
+        .unwrap();
+        publish_activation_marker(&enrollment, marker).unwrap();
+        drop(candidate.retain_as_authoritative());
+        LazyGenesisCandidate::open_sealed_for_marker(&destination, marker).unwrap();
+
+        rewrite_sealed_baseline_schema_for_test(&enrollment, &destination, 4).unwrap();
+        let rebound = read_activation_marker(&enrollment).unwrap().unwrap();
+        let error = LazyGenesisCandidate::open_sealed_for_marker(&destination, rebound)
+            .err()
+            .expect("a schema-4 baseline is not decoded as current");
+        let detail = error.to_string();
+        assert!(
+            detail.contains("lazy genesis manifest schema 4"),
+            "the refusal names the component: {detail}"
+        );
+        assert!(
+            detail.contains(
+                crate::oplog::refusal::ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
+            ),
+            "the refusal carries the durable protocol marker: {detail}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
