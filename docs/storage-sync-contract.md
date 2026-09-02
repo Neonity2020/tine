@@ -359,8 +359,36 @@ immutable operation archive when needed. Compact accepted statuses, event
 evidence, semantic identity/path/name maps, and their digest roots remain
 inline. Exact historical frontier questions reconstruct from that retained
 semantic accepted evidence; current-point reads remain direct. The dependency
-is certified `tine-storage v0.11.0`, whose supported-target guard includes iOS
-in the durable no-clobber rename implementation.
+is certified `tine-storage v0.12.0`. Its supported-target guards include Linux,
+Windows, macOS, iOS, and Android for both exact-file and whole-directory
+no-clobber publication.
+
+### 1.2a App-private immutable plugin packages
+
+Installed plugin packages live below the app-data `plugins/` root as
+`<plugin-id>/<version>/{manifest.json,plugin.wasm}`. The package is immutable:
+same-version/same-bytes installation is idempotent, while the same version with
+different bytes is refused. Manifest and capability policy stay in the Tauri
+plugin layer; physical publication and removal use the certified
+`tine-storage v0.12.0` package protocol.
+
+Publication stages a complete directory at the store root under
+`.install-<id>-<version>-<pid>-<sequence>`. Each file and then the staging
+directory is synchronized before a native no-replace move installs the version;
+Unix synchronizes both changed parents and Windows uses its certified
+write-through name operation. Retirement durably moves the active directory to
+`.retired-<id>-<version>-<pid>-<sequence>` at the store root before recursive
+reclaim. Both transient grammars are disjoint from plugin ids because valid ids
+cannot begin with a dot.
+
+Every plugin-store open reclaims `.install-*` and `.retired-*` entries and any
+active package directory lacking the exact two-file regular-file shape. This is
+recovery, not interpretation: fully shaped packages still undergo the ordinary
+bounded manifest, identity, symlink, and WebAssembly validation. Uninstall
+first clears selection/settings through the audited settings replacement, then
+retires package bytes. A crash at that seam therefore leaves cleared settings
+and either a complete unselected package that can be retired on retry, or an
+already retired/absent package; no state requires manual filesystem surgery.
 
 Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
 `.authority-tmp-`) and `.staging` files have no authority until their named
@@ -1146,6 +1174,7 @@ in this table.
 | `MS-REF-MALFORMED-IMPORT` | Imported/shared Markdown, Org, descriptor, manifest, or operation bytes cannot be decoded within declared bounds | Leave source/authoritative history unchanged and report the bounded invalid component |
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
+| `APP-REF-PLUGIN-IMMUTABLE-COLLISION` | Two honest concurrent installs, or a crash-recovered retry racing a completed install, present different bytes for the same plugin id and version | Keep the no-clobber winner byte-exact and refuse the other install as `immutable plugin version ... different bytes`; never overwrite or merge the package |
 
 Two retryable refusals are intentionally recorded outside the durable-scenario
 table:

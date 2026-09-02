@@ -47,6 +47,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   so the existing preserve-and-rebuild lifecycle handles them atomically;
   theme package installs and removals serialize their shared settings array.
 
+- **A crash during plugin installation or removal no longer wedges that plugin
+  version until its files are deleted by hand.** Plugin packages now publish as
+  one durably staged, no-clobber directory on every shipped platform; removal
+  retires the complete directory before reclaim, and the next plugin-store open
+  cleans interrupted staging, retirement, or incomplete package residue
+  (internal B5p, Harvest sweep).
+
 - Media (audio/video) assets returned 403 and never loaded when a graph runs under Managed Storage; the native media protocol now serves assets under both storage authorities with unchanged path containment and binding checks (internal B026).
 
 - Managed Storage stopped accepting work at 4,096 lifetime-distinct page

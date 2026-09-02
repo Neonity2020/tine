@@ -5773,6 +5773,30 @@
     "failBefore": "proven: two deliberately overlapped installs completed with only the first theme in durable storage and the installedThemes signal"
    },
    "notes": "All installs and removals rewrite theme.packages.v1, so one module-wide promise chain serializes them. Each queued mutation recomputes from installedThemes inside the chain, persists that exact array, then publishes the same array to the signal."
+  },
+  {
+   "id": "REG-HARVEST-B5P-PLUGIN-PACKAGE-DURABILITY-001",
+   "title": "A crash during plugin install or uninstall cannot wedge that version until manual filesystem surgery",
+   "family": "plugin-package-durability-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Harvest B5p"
+   },
+   "platforms": ["all", "windows", "android", "ios"],
+   "layer": "tauri-native-and-tine-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/plugins.rs::tests::reopen_reclaims_transient_and_wedged_packages_before_retry",
+     "src-tauri/src/plugins.rs::tests::concurrent_different_installs_leave_one_complete_immutable_winner",
+     "src-tauri/src/plugins.rs::tests::settings_clear_cut_leaves_a_recoverable_package_then_retry_finishes",
+     "src-tauri/src/plugins.rs::tests::production_plugin_writes_stay_on_named_audited_paths"
+    ],
+    "scenario": "APP-REF-PLUGIN-IMMUTABLE-COLLISION plus crash-recovered staging and retirement",
+    "failBefore": "A half-package with plugin.wasm but no manifest was simultaneously not reinstallable and not uninstallable; the production source guard also found bare write, rename, recursive-delete, and directory-delete operations."
+   },
+   "notes": "tine-storage v0.12.0 owns the staged-directory protocol: exact file barriers, a five-target native no-clobber directory move, parent barriers, retire-then-reclaim, and reopen cleanup for .install-/.retired-/incomplete shapes. Tauri keeps manifest and symlink policy, uses the audited settings replacement before retirement, and preserves same-bytes idempotence while refusing different bytes for one immutable id/version. No plugin capability or guest/native authority changes."
   }
  ]
 }
