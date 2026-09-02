@@ -12,28 +12,30 @@ describe("structuredHtmlOutline", () => {
     ]);
   });
 
-  it("escapes literal brackets at the unauthenticated HTML boundary (GH: Martin follow-up)", () => {
+  it("keeps literal square brackets instead of backslash-escaping them (GH: Martin; UI-PASTE-BRACKET-LITERAL-001)", () => {
     // Multi-block matches outlineToHtml's own output for a multi-line block copy,
     // so the single-node plain-text bypass does not apply and the outline is asserted.
     expect(structuredHtmlOutline(
       "<ul><li>see [ref] here</li><li>and [two]</li></ul>",
       "see [ref] here\nand [two]",
     )).toEqual([
-      { raw: "see \\[ref\\] here", children: [] },
-      { raw: "and \\[two\\]", children: [] },
+      { raw: "see [ref] here", children: [] },
+      { raw: "and [two]", children: [] },
     ]);
   });
 
-  it("escapes external HTML text that would otherwise inject Markdown link structure", () => {
+  it("keeps Markdown-shaped external text literal; link safety is ExternalLink's job, not the escaper's", () => {
+    // Martin's catalogued decision (UI-PASTE-BRACKET-LITERAL-001) wins over
+    // paste-time escaping. The pasted href can only ever open through
+    // backend().openExternal's native scheme allowlist.
     expect(structuredHtmlOutline(
       "<ul><li>[x](javascript:alert(1))</li><li>safe</li></ul>",
       "[x](javascript:alert(1))\nsafe",
     )).toEqual([
-      { raw: "\\[x\\](javascript:alert(1))", children: [] },
+      { raw: "[x](javascript:alert(1))", children: [] },
       { raw: "safe", children: [] },
     ]);
   });
-
 
   it("keeps headings, quotes, links, emphasis, and fenced code", () => {
     const outline = structuredHtmlOutline([

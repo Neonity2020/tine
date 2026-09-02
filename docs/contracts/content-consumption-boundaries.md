@@ -32,12 +32,17 @@ stack overflow, because a process abort is not a useful safety oracle.
 
 ## Clipboard HTML provenance
 
-`structuredHtmlOutline` is the general external `text/html` boundary and always
-keeps Turndown text escaping enabled. Clipboard text equality is not provenance.
-The authenticated block-payload route exits before this function, so preserving
-its exact source does not require weakening the general boundary.
+`structuredHtmlOutline` is the general external `text/html` boundary. It runs
+Turndown with an **identity text escaper**: literal `[ ] * _ \` # ~` in pasted
+text stay literal (Martin's catalogued decision, `UI-PASTE-BRACKET-LITERAL-001`;
+the 2026-09-02 fix-up restored it after wave-2 packet F had re-enabled
+escaping). Clipboard text equality is not provenance, and the authenticated
+block-payload route exits before this function.
 
-Known presentation cost: external or Logseq-rendered HTML containing literal
-brackets, such as `a [b] c`, becomes `a \[b\] c`. A future heuristic may improve
-that presentation only if it establishes a real provenance signal; equal text
-alone is insufficient.
+The safety argument does not rest on the escaper. Pasted text that happens to
+form Markdown structure produces ordinary graph content, and graph content is
+already untrusted at every consumer: outbound hrefs open only through
+`ExternalLink` → `backend().openExternal`, whose native `external_open_plan`
+allowlist rejects `javascript:` and every other non-file/http(s)/mailto scheme
+(`src-tauri/src/platform.rs` tests pin this). Re-enabling paste-time escaping
+would be a presentation regression, not a boundary.
