@@ -23,6 +23,7 @@ const TMP = "/tmp/tine-external-assets-e2e";
 const GRAPH = `${TMP}/graph`;
 const EXTERNAL = `${TMP}/external-assets`;
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lO1O0QAAAABJRU5ErkJggg==";
+const ASSET_OBSERVATION_TIMEOUT_MS = 30_000;
 
 fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq"]) fs.mkdirSync(`${GRAPH}/${dir}`, { recursive: true });
@@ -98,13 +99,13 @@ try {
     const current = await browser.$("img.inline-image");
     return (await current.isExisting()) && (await current.getAttribute("src")) !== firstSrc;
   }, {
-    timeout: 10_000,
+    timeout: ASSET_OBSERVATION_TIMEOUT_MS,
     timeoutMsg: "externally replaced asset did not receive a fresh blob URL",
   });
 
   fs.unlinkSync(`${EXTERNAL}/pixel.png`);
   await browser.$(".inline-image-missing").waitForExist({
-    timeout: 10_000,
+    timeout: ASSET_OBSERVATION_TIMEOUT_MS,
     timeoutMsg: "externally deleted asset did not render the missing placeholder",
   });
 

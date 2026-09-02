@@ -17,6 +17,21 @@ import {
 const roundtrip = (dsl: string) => toDsl(parseQuery(dsl));
 
 describe("parse + serialize round-trip", () => {
+  it("turns a query past the visual-builder depth cap into a bounded raw fallback", () => {
+    const depth = 65;
+    const dsl = `${"(and ".repeat(depth)}[[Leaf]]${")".repeat(depth)}`;
+    let clause = parseQuery(dsl);
+    let traversed = 0;
+    let foundRaw = false;
+    while (clause.kind === "op" && clause.children.length === 1) {
+      traversed++;
+      clause = clause.children[0];
+    }
+    foundRaw = clause.kind === "raw";
+    expect(foundRaw).toBe(true);
+    expect(traversed).toBeLessThanOrEqual(65);
+  });
+
   it("page / tag refs", () => {
     expect(roundtrip("[[Foo]]")).toBe("[[Foo]]");
     expect(roundtrip("#bar")).toBe("[[bar]]"); // tag normalizes to page-ref (same predicate)

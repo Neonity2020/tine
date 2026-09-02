@@ -342,13 +342,25 @@
      "userOutcome": "Media fallback and expanded audio remain bounded rather than retaining unbounded whole files.",
      "blocking": true,
      "authority": "Tine media resource-budget contract"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "Graph media is served and plays under a Managed Storage binding through the native media protocol, not only under Direct Files.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "Asset containment and binding authority hold under both authorities: traversal, absolute, and symlink asset paths refuse, and stale or unavailable bindings refuse.",
+     "blocking": true,
+     "authority": "Media protocol containment (Graph::stream_asset_path) and binding-generation gate"
     }
    ],
    "acceptableVariations": [
     "Native codec availability and player chrome may vary for the supported fixture."
    ],
    "nonRequirements": [
-    "Exact playback controls, waveform styling, or decoder implementation."
+    "Exact playback controls, waveform styling, or decoder implementation.",
+    "Exact HTTP status codes for refusals (403 vs 404 split may evolve while refusal itself is blocking)."
    ],
    "stability": "stable"
   },
@@ -1231,13 +1243,13 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "authority": "Concord live-save contract: a guarded save refusal retains both the editor draft and the exact disk winner across a process restart.",
-     "userOutcome": "A local draft racing an atomic external replacement appears in the page-level Concord resolver, survives restarting Tine, and can resolve with both sides into ordinary Markdown.",
+     "authority": "Concord live-save contract and Harvest B3: a guarded save refusal retains the exact editor draft, load baseline, and graph/page binding in one app-private durable capsule, without persisting Managed replacement authority.",
+     "userOutcome": "On Direct Files and Tine-managed storage, a local draft racing an external replacement survives a full process restart; both keep-draft and use-current resolutions go through one semantic surface and remove the on-disk capsule before success is shown.",
      "blocking": true
     },
     {
      "class": "stateful-ux",
-     "userOutcome": "Direct Files conflicts use the in-page resolver and queue, never the retired global Keep mine / Use current bar.",
+     "userOutcome": "Both storage modes use the same in-page resolver and queue; after a Managed restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
      "blocking": true
     },
     {
@@ -1255,8 +1267,9 @@
     "Exact conflict colors, internal row geometry, button ordering, DOM nesting, or animation; the overall full-pane review width remains required.",
     "Exact generated block identities or save debounce duration."
    ],
-   "stability": "stable",
-   "notes": "Added for the Concord live Direct Files redesign. It drives an actual guarded save conflict, full app restart, no-loss resolution, visible post-resolution state, and final file bytes."
+   "stability": "quarantined",
+   "quarantineReason": "Harvest B3 (2026-09-02): the extended matrix never ran green. First attempt failed on a bare release build without custom-protocol; second attempt failed because the Keep Draft control was absent from the quick switch. The two-attempt stop-loss is exhausted. Unproved at the native boundary: restart restoration on both backends, post-restart resolution, Managed authority re-observation, and on-disk capsule retirement. Unit and native-crate tests cover the capsule protocol and the frontend retirement paths; this journey stays out of batch blocking until it is repaired and burned in.",
+   "notes": "Extended for Harvest B3. The matrix is meant to drive actual guarded conflicts, full app restarts, both resolution sides on both backends, native capsule-file observation and durable retirement; exact control labels and filesystem timing remain non-contractual."
   },
   "scripts/e2e-dirty-editor-replacement.mjs": {
    "contracts": [

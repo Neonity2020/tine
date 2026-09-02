@@ -171,7 +171,7 @@ beforeEach(() => {
   // missing route record is now intentionally fail-closed during transitions.
   managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
   vi.spyOn(backend(), "writeRich").mockResolvedValue();
-  vi.spyOn(backend(), "savePage").mockResolvedValue("saved-rev");
+  vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "saved-rev" });
   vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map(() => null));
 });
 
@@ -605,7 +605,7 @@ describe("clipboard payload insertion and identity validation", () => {
     deleteBlock(ID2);
     vi.mocked(backend().savePage).mockImplementation(async (dto) => {
       if (dto.name === "Two") throw new Error("disk full");
-      return "saved-rev";
+      return { revision: "saved-rev" };
     });
 
     await paste();
@@ -623,13 +623,13 @@ describe("clipboard payload insertion and identity validation", () => {
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
-    let finishSave!: (revision: string) => void;
+    let finishSave!: (result: { revision: string }) => void;
     vi.mocked(backend().savePage).mockReturnValue(new Promise((resolve) => { finishSave = resolve; }));
 
     const pending = paste();
     await vi.waitFor(() => expect(backend().savePage).toHaveBeenCalled());
     await reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
-    finishSave("stale-rev");
+    finishSave({ revision: "stale-rev" });
 
     await pending;
     expect(doc.byId[ID1]).toBeUndefined();

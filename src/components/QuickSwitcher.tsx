@@ -17,6 +17,8 @@ import { blockDtoExternalId } from "../blockIdentity";
 import { createLongPress } from "../render/longPress";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { managedStorageRuntime } from "../managedStorageRuntime";
+import { graphBinding } from "../persistence";
+import { captureGraphScope, landAsyncOrToast } from "../landAsync";
 
 // One selectable result row.
 type Item =
@@ -99,6 +101,8 @@ export function QuickSwitcher(): JSX.Element {
       pages: currentPageOnly() ? 0 : PAGE_POOL,
       blocks: BLOCK_POOL,
       scope: currentPageScope(),
+      graphRoot: graphMeta()?.root ?? "",
+      graphBinding: graphBinding(),
     }),
     (s) => s && s.q.trim()
       ? backend().runGraphSearch(
@@ -323,7 +327,11 @@ export function QuickSwitcher(): JSX.Element {
         it.path ? router.openFile(it.path, it.name, it.pageKind) : router.openPage(it.name, it.pageKind);
         break;
       case "create":
-        await createPageFile(it.name);
+        if (!(await landAsyncOrToast(
+          captureGraphScope(),
+          () => createPageFile(it.name),
+          "The graph changed before the page was created. Try again.",
+        )).landed) return;
         router.openPage(it.name, "page");
         break;
       case "block":
@@ -344,7 +352,11 @@ export function QuickSwitcher(): JSX.Element {
         openRouteInOtherPane({ kind: "page", name: it.name, pageKind: it.pageKind, path: it.path });
         break;
       case "create":
-        await createPageFile(it.name);
+        if (!(await landAsyncOrToast(
+          captureGraphScope(),
+          () => createPageFile(it.name),
+          "The graph changed before the page was created. Try again.",
+        )).landed) return;
         openRouteInOtherPane({ kind: "page", name: it.name, pageKind: "page" });
         break;
       case "command":
@@ -400,7 +412,11 @@ export function QuickSwitcher(): JSX.Element {
   };
 
   const createPage = async (name: string) => {
-    await createPageFile(name);
+    if (!(await landAsyncOrToast(
+      captureGraphScope(),
+      () => createPageFile(name),
+      "The graph changed before the page was created. Try again.",
+    )).landed) return;
     openPage(name, "page");
   };
 

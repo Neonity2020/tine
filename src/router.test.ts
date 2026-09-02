@@ -27,6 +27,7 @@ import {
 } from "./router";
 import { setNavReuseTabs } from "./navSettings";
 import { doc, setDoc } from "./store";
+import { backend } from "./backend";
 
 // The router holds singleton tab state, so reset to a single unpinned journals
 // tab before each test. confirm() is stubbed true so closing pinned tabs (which
@@ -323,6 +324,25 @@ describe("sticky (pinned) tabs", () => {
     vi.stubGlobal("confirm", () => true);
     await closeTab(id);
     expect(tabs().some((t) => t.id === id)).toBe(false); // confirmed → closed
+  });
+
+  it("re-reads tabs after the pinned confirmation instead of discarding a new tab", async () => {
+    openInNewTab({ kind: "page", name: "Pinned", pageKind: "page" }, true);
+    const pinnedId = activeId();
+    togglePin(pinnedId);
+    let confirm!: (answer: boolean) => void;
+    vi.spyOn(backend(), "confirm").mockImplementation(
+      () => new Promise<boolean>((resolve) => { confirm = resolve; }),
+    );
+
+    const closing = closeTab(pinnedId);
+    openInNewTab({ kind: "page", name: "Arrived during confirm", pageKind: "page" }, true);
+    const arrivedId = activeId();
+    confirm(true);
+
+    await expect(closing).resolves.toBe(true);
+    expect(tabs().some((tab) => tab.id === pinnedId)).toBe(false);
+    expect(tabs().some((tab) => tab.id === arrivedId)).toBe(true);
   });
 });
 

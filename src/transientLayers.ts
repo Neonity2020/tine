@@ -1,5 +1,12 @@
-/** One dismissal stack for transient UI.  Registration order, rather than DOM
- * listener order, is the authority for Escape and Android Back. */
+/** One dismissal stack for transient UI.  ACTIVATION order, rather than DOM
+ * listener order or registration sequence, is the authority for Escape and
+ * Android Back: every layer carries a monotonic `token` re-bumped whenever a
+ * `focusin`/`pointerdown` lands inside its own root, or when
+ * `activateTransientLayer` is called, and `topTransientLayer` ranks by that
+ * token (through the semantic parent forest).  An older layer the user just
+ * touched therefore outranks a newer one they have not — which is what a user
+ * means by "the thing on top".  Pinned by
+ * `transientRegistry.p1d1.lifecycle.test.tsx`. */
 export type TransientDismissReason = "escape" | "back" | "explicit";
 export interface TransientLayer {
   id: string;

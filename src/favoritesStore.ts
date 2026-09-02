@@ -188,7 +188,7 @@ export async function persistFavoritesLayout(next: FavLayout): Promise<void> {
   }
   try {
     const saved = await backend().savePage(layoutPageDto(page, next), layoutRev);
-    layoutRev = typeof saved === "string" ? saved : saved.revision;
+    layoutRev = saved.revision;
     await backend().setFavoritesPage(page);
   } catch {
     // Losing the arrangement is survivable; losing membership is not. Fall

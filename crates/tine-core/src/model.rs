@@ -11783,9 +11783,13 @@ impl Graph {
         // a `yyyy_MM_dd` file) must appear ONCE — both files resolve to the same
         // page name, so otherwise the day renders twice. The stray stays visible
         // via journal_conflicts() for reconciliation.
-        let mut js = dedup_journal_days(raw);
-        js.sort_by_key(|e| std::cmp::Reverse(e.date_key.unwrap_or(0)));
-        js
+        //
+        // This dedup/ordering rule is journal_feed's, not this file's: it used to
+        // be a second hand-written copy here, whose canonicality test read only
+        // `path` where journal_feed's reads `rel_path` first. Two copies of the
+        // rule that decides which file represents a day is how a day silently
+        // drops out of a user's history.
+        crate::journal_feed::journal_feed_candidates_desc(raw)
     }
 
     /// Feed membership is narrower than the raw journal inventory: future
@@ -16535,6 +16539,44 @@ impl Graph {
         Ok(format!("{key}/{name}"))
     }
 
+    fn move_pdf_area_image_to_trash(
+        &self,
+        source_key: &str,
+        page: i64,
+        id: &str,
+        stamp: i64,
+    ) -> io::Result<Option<(PathBuf, PathBuf)>> {
+        let name = format!("{page}_{id}_{stamp}.png");
+        top_level_asset_name(&name)?;
+        let source = self.assets_path().join(source_key).join(&name);
+        if !source.exists() {
+            return Ok(None);
+        }
+        self.ensure_asset_write_target(&source)?;
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
+        self.ensure_trash_write_target(&trash)?;
+        let trash_name = format!("{}__pdf-area__{}__{name}", trash_stamp(), source_key);
+        top_level_asset_name(&trash_name)?;
+        let destination = trash.join(trash_name);
+        move_to_trash(&source, &destination, &trash)?;
+        Ok(Some((source, destination)))
+    }
+
+    /// Roll back a crop written before its highlight sidecar transaction failed.
+    /// The nested source path is derived from the same PDF tuple as the writer;
+    /// callers never receive a general nested-asset deletion capability.
+    pub fn rollback_pdf_area_image(
+        &self,
+        pdf_filename: &str,
+        page: i64,
+        id: &str,
+        stamp: i64,
+    ) -> io::Result<()> {
+        let key = crate::pdf::asset_key(pdf_filename);
+        self.move_pdf_area_image_to_trash(&key, page, id, stamp)?;
+        Ok(())
+    }
+
     /// After the highlight sidecar + hls page pair is durably committed, move
     /// deleted area crops to recoverable asset trash. OG removes this exact crop
     /// with its highlight (`extensions/pdf/core.cljs:155-159` and
@@ -16556,7 +16598,6 @@ impl Graph {
         if deleted.is_empty() {
             return;
         }
-        let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
         for highlight in deleted {
             let Some(stamp) = highlight.image else {
                 continue;
@@ -16581,26 +16622,11 @@ impl Graph {
                 continue;
             }
 
-            let name = format!("{}_{}_{}.png", highlight.page, highlight.id, stamp);
-            if top_level_asset_name(&name).is_err() {
+            let Ok(Some((source, destination))) =
+                self.move_pdf_area_image_to_trash(source_key, highlight.page, &highlight.id, stamp)
+            else {
                 continue;
-            }
-            let source = self.assets_path().join(source_key).join(&name);
-            if !source.is_file()
-                || self.ensure_asset_write_target(&source).is_err()
-                || self.ensure_trash_write_target(&trash).is_err()
-                || fs::create_dir_all(&trash).is_err()
-            {
-                continue;
-            }
-            let trash_name = format!("{}__pdf-area__{}__{name}", trash_stamp(), source_key);
-            if top_level_asset_name(&trash_name).is_err() {
-                continue;
-            }
-            let destination = trash.join(trash_name);
-            if move_to_trash(&source, &destination, &trash).is_err() {
-                continue;
-            }
+            };
 
             // A non-cooperating writer can change the sidecar between the
             // last-moment read and rename. Put the crop back if that happened.
@@ -21082,6 +21108,113 @@ impl Graph {
         })
     }
 
+    /// Compose the durable recovery record for one Direct cross-page move
+    /// (packet B2; I-3, I-2). See `crate::direct_move_recovery` and
+    /// `docs/contracts/direct-move-recovery.md`.
+    ///
+    /// The caller has already performed the in-memory move, so `destination`
+    /// and `sources` are the POST-move DTOs. For each participant this resolves
+    /// the exact file the ordinary save will write, reads its current bytes (the
+    /// preimage) and serializes the proposed bytes (the postimage) through the
+    /// SAME `serialize_page_dto_for_path` boundary the save itself uses — so the
+    /// recorded postimage is byte-identical to what the save publishes, which is
+    /// what lets recovery complete the move without a parser (I-4).
+    ///
+    /// `Ok(None)` means "no record is needed": every participant resolves to the
+    /// same file, i.e. the move is degenerate and is a single ordinary save that
+    /// the existing base-revision guard already makes safe. Composition never
+    /// refuses the move — an `Err` here is reported and the move proceeds
+    /// unbracketed, exactly as it did before B2, because refusing to move a page
+    /// because device-private state is unavailable would be an availability bug,
+    /// not hardening (contract §4).
+    pub fn prepare_direct_cross_page_move(
+        &self,
+        destination: &PageDto,
+        sources: &[PageDto],
+    ) -> io::Result<Option<crate::direct_move_recovery::PreparedDirectMove>> {
+        use crate::direct_move_recovery::{
+            DirectMoveRecord, ImageRef, MoveParticipant, ParticipantRole, PreparedDirectMove,
+            RECORD_SCHEMA,
+        };
+
+        let write = self.admit_managed_text_writer()?;
+        let mut images: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut participants: Vec<MoveParticipant> = Vec::new();
+        let mut seen: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+
+        for (role, page) in std::iter::once((ParticipantRole::Destination, destination))
+            .chain(sources.iter().map(|page| (ParticipantRole::Source, page)))
+        {
+            if page.guide || page.read_only {
+                return Ok(None); // never persisted; a record would name a file that is never written
+            }
+            let (path, _cache) = self.save_target(&write, page)?;
+            if !seen.insert(path.clone()) {
+                // The same physical file on both sides of the move. Degenerate:
+                // one ordinary save, already convergent.
+                return Ok(None);
+            }
+            let existing: Option<String> = match fs::read(&path) {
+                Ok(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "page file is not UTF-8; no move record composed",
+                    )
+                })?),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let (_doc, postimage) =
+                self.serialize_page_dto_for_path(page, &path, existing.as_deref())?;
+
+            let preimage_ref = match &existing {
+                None => ImageRef::Absent,
+                Some(content) => {
+                    let bytes = content.as_bytes().to_vec();
+                    let image = ImageRef::blob_of(&bytes);
+                    if let ImageRef::Blob { sha256, .. } = &image {
+                        images.entry(sha256.clone()).or_insert(bytes);
+                    }
+                    image
+                }
+            };
+            let postimage_bytes = postimage.as_bytes().to_vec();
+            let postimage_ref = ImageRef::blob_of(&postimage_bytes);
+            if let ImageRef::Blob { sha256, .. } = &postimage_ref {
+                images.entry(sha256.clone()).or_insert(postimage_bytes);
+            }
+
+            participants.push(MoveParticipant {
+                role,
+                relative_path: self.rel_path(&path),
+                page_name: page.name.clone(),
+                page_kind: match page.kind {
+                    PageKind::Journal => "journal".to_string(),
+                    PageKind::Page => "page".to_string(),
+                },
+                base_revision: existing.as_deref().map(content_rev),
+                preimage: preimage_ref,
+                postimage: postimage_ref,
+            });
+        }
+
+        if participants.len() < 2 {
+            return Ok(None);
+        }
+
+        Ok(Some(PreparedDirectMove {
+            record: DirectMoveRecord {
+                schema: RECORD_SCHEMA,
+                move_id: crate::direct_move_recovery::new_move_id(),
+                graph_root: self.root.display().to_string(),
+                created_unix_ms: crate::direct_move_recovery::unix_millis_now(),
+                participants,
+            },
+            images,
+        }))
+    }
+
     /// Save a page, refusing to clobber an external change. If the file on disk
     /// no longer matches what Tine last knew (another app or a Syncthing pull
     /// wrote it), returns an `AlreadyExists` "conflict" error WITHOUT writing,
@@ -22280,37 +22413,6 @@ fn reserve_asset(assets: &Path, name: &str) -> io::Result<(String, fs::File)> {
     }
 }
 
-/// Collapse journal entries that resolve to the SAME date down to one (the
-/// canonical `yyyy_MM_dd` file) — a leftover title-named duplicate must not show
-/// the day twice in the feed, quick-switch, or All-Pages. Non-journal entries and
-/// the input order are preserved.
-fn dedup_journal_days(entries: Vec<PageEntry>) -> Vec<PageEntry> {
-    let is_canonical = |e: &PageEntry| {
-        e.path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| JournalDate::from_file_stem(s).is_some())
-    };
-    let mut idx_of: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-    let mut out: Vec<PageEntry> = Vec::new();
-    for e in entries {
-        match e.date_key {
-            Some(k) if e.kind == PageKind::Journal => {
-                if let Some(&i) = idx_of.get(&k) {
-                    if is_canonical(&e) && !is_canonical(&out[i]) {
-                        out[i] = e;
-                    }
-                } else {
-                    idx_of.insert(k, out.len());
-                    out.push(e);
-                }
-            }
-            _ => out.push(e),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 thread_local! {
     static CACHE_LINEAR_SCAN_STEPS: std::cell::Cell<usize> = std::cell::Cell::new(0);
@@ -22393,7 +22495,9 @@ fn walk_page_files(dir: &Path, mut visit: impl FnMut(PathBuf)) {
 /// `alias::`/`tags::`/`icon::`. Free text in `theirs`' pre-block is dropped (rare;
 /// the conflict copy is trashed-recoverable). Mirrors the property-carry in
 /// [`Graph::merge_pages`].
-fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
+/// Exposed so the Tauri conflict-capsule resolver composes this one
+/// pre-block union instead of re-implementing it over `BlockDto` (D-14).
+pub fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
     let mine = mine.unwrap_or("");
     let Some(theirs) = theirs else {
         return (!mine.is_empty()).then(|| mine.to_string());
@@ -22809,7 +22913,9 @@ pub(crate) fn generated_document_page_dto(
     })
 }
 
-pub(crate) fn page_dto_document(page: &PageDto) -> io::Result<Document> {
+/// The one bounded `PageDto` -> `Document` conversion. Exposed so native
+/// callers (the conflict-capsule commands) never re-grow a recursive twin.
+pub fn page_dto_document(page: &PageDto) -> io::Result<Document> {
     Ok(Document {
         pre_block: page.pre_block.clone(),
         roots: dto_blocks_to_doc_checked(&page.blocks, page.format == Format::Org)?,
@@ -24694,7 +24800,7 @@ fn usize_to_u64(value: usize) -> io::Result<u64> {
 /// Managed page input is accepted only through depth 128. All operation-time
 /// nested walks use this fixed root-to-leaf frame ceiling, so traversal does
 /// not consume attacker-controlled call stack or an uncharged all-node stack.
-const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
+pub(crate) const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
 
 #[derive(Clone, Copy)]
 #[cfg(test)]

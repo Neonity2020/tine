@@ -35,3 +35,13 @@ scripts/app-icon-1024.png
 
 # Private Reddit outreach data — keep locally, never publish
 reddit-backup/
+
+# Lane evidence (receipts, gate baselines, necessity/fail-before logs). Workers
+# write these to the worktree root; the manager archives them under
+# tine-agents/evidence/ before integration. They must never be tracked: they
+# leak private worktree paths and dossier names to both public remotes
+# (census guard g_h_repository_root_tracks_no_lane_evidence).
+/RECEIPT*.md
+/baseline-*.txt
+/necessity-*.txt
+/*-fail-before.log

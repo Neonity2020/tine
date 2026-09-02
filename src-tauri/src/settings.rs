@@ -480,37 +480,12 @@ fn validate_workspaces_json(data: &str) -> Result<(), String> {
 static WORKSPACES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn atomic_write_workspaces(path: &std::path::Path, data: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().ok_or("workspace registry has no parent")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspaces.json");
-    let tmp = parent.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(data.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, path)?;
-        // Same policy as the save path (DUP-5): "unsupported here" dir-fsync
-        // outcomes are tolerated, a real EIO/ENOSPC is REPORTED — the
-        // workspaces registry is durable user state, and swallowing the error
-        // is a false ack under the in-scope crash/power-loss threat.
-        tine_core::model::sync_dir_for_rename(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map_err(|e| e.to_string())
+    // Named audited app-private publication protocol (I-1/I-2): the shared
+    // primitive uses a unique create-new temp, file barrier, atomic rename,
+    // temp cleanup on failure, and strict directory-barrier error policy.
+    tine_core::model::atomic_write(path, data.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn load_workspaces_at(path: &std::path::Path, session: &std::path::Path) -> Result<String, String> {
@@ -560,7 +535,50 @@ pub(crate) fn save_workspaces(
     save_workspaces_at(&path, &data)
 }
 
-static SESSION_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn migrate_legacy_session_at(
+    path: &std::path::Path,
+    legacy: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    let Some(legacy) = legacy.filter(|legacy| legacy.exists()) else {
+        return Ok(());
+    };
+    let parent = path.parent().ok_or("session file has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    std::fs::rename(legacy, path).map_err(|e| e.to_string())?;
+    // Named audited legacy-migration protocol (I-1/I-2, DUP-5): report real
+    // directory-barrier failures rather than falsely acknowledging a rename
+    // that may disappear after power loss. Unsupported barriers are tolerated
+    // by the shared helper.
+    tine_core::model::sync_dir_for_rename(parent).map_err(|e| e.to_string())
+}
+
+fn load_session_at(
+    path: &std::path::Path,
+    legacy: Option<&std::path::Path>,
+) -> Result<Option<String>, String> {
+    let _guard = SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    migrate_legacy_session_at(path, legacy)?;
+    Ok(std::fs::read_to_string(path).ok())
+}
+
+fn save_session_at(path: &std::path::Path, data: &str) -> Result<(), String> {
+    let _guard = SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let parent = path.parent().ok_or("session file has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    // Named audited app-private publication protocol (I-1/I-2). The lock
+    // serializes tab-action bursts; atomic_write additionally gives each call
+    // a unique create-new temp and the complete file + directory barriers.
+    tine_core::model::atomic_write(path, data.as_bytes()).map_err(|e| e.to_string())
+}
 
 #[tauri::command]
 pub(crate) fn load_session(
@@ -569,18 +587,8 @@ pub(crate) fn load_session(
 ) -> Result<Option<String>, String> {
     let slot = slot_for_context(&state)?;
     let path = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
-    if !path.exists() {
-        let _migration = SESSION_MIGRATION_LOCK.lock().unwrap();
-        if !path.exists() {
-            if let Some(legacy) = legacy_session_path(&app).filter(|p| p.exists()) {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                std::fs::rename(legacy, &path).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-    Ok(std::fs::read_to_string(path).ok())
+    let legacy = legacy_session_path(&app);
+    load_session_at(&path, legacy.as_deref())
 }
 
 #[tauri::command]
@@ -589,27 +597,169 @@ pub(crate) fn save_session(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    // Unique temp name per write so two concurrent saves (a burst of tab actions)
-    // can't clobber each other's temp file before the rename.
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     let slot = slot_for_context(&state)?;
     let p = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = p.with_extension(format!("json.tmp{seq}"));
-    // Write to a temp file then atomically rename, so a crash mid-write can never
-    // leave a truncated session that fails to parse.
-    std::fs::write(&tmp, data.as_bytes()).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
-    Ok(())
+    save_session_at(&p, &data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_private_durable_publications_stay_on_named_audited_paths() {
+        let production = include_str!("settings.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("settings.rs has production source before its tests");
+        let bare_whole_file_writes = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("std::fs::write("))
+            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+            .collect::<Vec<_>>();
+
+        assert!(
+            bare_whole_file_writes.is_empty(),
+            "I-1/I-2 require every app-private durable-state publication in settings.rs to use a named audited path; bare whole-file writes found:\n{}. Use the blessed atomic_write_workspaces / tine_core::model::atomic_write exemplar.",
+            bare_whole_file_writes.join("\n")
+        );
+
+        let raw_renames = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("std::fs::rename("))
+            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+            .collect::<Vec<_>>();
+        let migration_protocol = production
+            .split("fn migrate_legacy_session_at(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn load_session_at(").next())
+            .expect("legacy session rename has a named audited protocol");
+        assert_eq!(
+            raw_renames.len(),
+            1,
+            "I-1/I-2 permit only the named audited legacy-session rename in settings.rs; raw renames found:\n{}. Use the blessed atomic_write_workspaces / tine_core::model::atomic_write exemplar.",
+            raw_renames.join("\n")
+        );
+        assert!(
+            migration_protocol.contains("std::fs::rename(")
+                && migration_protocol.contains("tine_core::model::sync_dir_for_rename("),
+            "I-1/I-2 require the named legacy-session migration to pair rename with the blessed strict directory barrier"
+        );
+    }
+
+    #[test]
+    fn session_load_ignores_a_stale_atomic_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp.path().join("sessions/graph.json");
+        let current = r#"{"tabs":[{"id":"complete"}],"activeIndex":0}"#;
+        save_session_at(&session, current).unwrap();
+
+        let stale = session.parent().unwrap().join(".graph.json.999999.0.tmp");
+        std::fs::write(&stale, br#"{"tabs":["#).unwrap();
+
+        assert_eq!(
+            load_session_at(&session, None).unwrap().as_deref(),
+            Some(current)
+        );
+        assert!(
+            stale.exists(),
+            "load ignores unique hidden temps from a prior crash"
+        );
+    }
+
+    #[test]
+    fn concurrent_session_save_burst_keeps_a_complete_last_writer_and_no_temps() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 16;
+        let temp = tempfile::tempdir().unwrap();
+        let session = Arc::new(temp.path().join("sessions/graph.json"));
+        let initial =
+            serde_json::json!({"writer": "initial", "padding": "x".repeat(4096)}).to_string();
+        save_session_at(&session, &initial).unwrap();
+
+        let payloads = Arc::new(
+            (0..WRITERS)
+                .map(|writer| {
+                    serde_json::json!({"writer": writer, "padding": "x".repeat(4096)}).to_string()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let start = Arc::new(Barrier::new(WRITERS + 1));
+        let remaining = Arc::new(AtomicUsize::new(WRITERS));
+        let observer_path = Arc::clone(&session);
+        let observer_remaining = Arc::clone(&remaining);
+        let observer = std::thread::spawn(move || {
+            let mut observations = 0;
+            loop {
+                if let Ok(bytes) = std::fs::read_to_string(observer_path.as_ref()) {
+                    serde_json::from_str::<serde_json::Value>(&bytes)
+                        .expect("atomic replacement never exposes a truncated session");
+                    observations += 1;
+                }
+                if observer_remaining.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+            }
+            observations
+        });
+
+        let writers = (0..WRITERS)
+            .map(|writer| {
+                let session = Arc::clone(&session);
+                let payloads = Arc::clone(&payloads);
+                let start = Arc::clone(&start);
+                let remaining = Arc::clone(&remaining);
+                std::thread::spawn(move || {
+                    start.wait();
+                    save_session_at(&session, &payloads[writer]).unwrap();
+                    remaining.fetch_sub(1, Ordering::Release);
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(observer.join().unwrap() > 0);
+
+        let final_bytes = std::fs::read_to_string(session.as_ref()).unwrap();
+        serde_json::from_str::<serde_json::Value>(&final_bytes).unwrap();
+        assert!(
+            payloads.iter().any(|payload| payload == &final_bytes),
+            "the final session is one complete last-writer payload"
+        );
+        let temp_prefix = format!(".{}.", session.file_name().unwrap().to_string_lossy());
+        let stray_temps = std::fs::read_dir(session.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&temp_prefix) && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(
+            stray_temps.is_empty(),
+            "completed saves reclaim temps: {stray_temps:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_session_migration_moves_complete_bytes_to_the_scoped_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("session.json");
+        let session = temp.path().join("sessions/graph.json");
+        let prior = r#"{"tabs":[{"id":"legacy"}],"activeIndex":0}"#;
+        std::fs::write(&legacy, prior).unwrap();
+
+        assert_eq!(
+            load_session_at(&session, Some(&legacy)).unwrap().as_deref(),
+            Some(prior)
+        );
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read_to_string(session).unwrap(), prior);
+    }
 
     #[test]
     fn known_graphs_are_deduplicated_mru_and_removable() {

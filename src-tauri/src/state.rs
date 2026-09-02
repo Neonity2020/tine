@@ -107,6 +107,30 @@ enum GraphAuthorityKind {
     SparseV2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AssetStreamAuthority {
+    Direct,
+    Managed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AssetStreamUnavailable {
+    DirectRetiring,
+    ManagedUnavailable,
+}
+
+#[derive(Debug)]
+pub(crate) enum AssetStreamError {
+    AuthorityUnavailable(AssetStreamUnavailable),
+    InvalidAsset { authority: AssetStreamAuthority },
+}
+
+#[derive(Debug)]
+pub(crate) struct AssetStreamResolution {
+    pub(crate) authority: AssetStreamAuthority,
+    pub(crate) path: PathBuf,
+}
+
 fn require_legacy_authority(kind: GraphAuthorityKind) -> Result<(), String> {
     match kind {
         GraphAuthorityKind::Legacy => Ok(()),
@@ -282,6 +306,46 @@ impl GraphSlot {
             GraphAuthority::SparseV2(_) => {
                 ApplicationPageAdmission::managed_unavailable(self.binding_generation)
             }
+        }
+    }
+
+    /// Resolve one range-streamed asset without borrowing graph-text write
+    /// authority. Direct and Managed both delegate containment to the one
+    /// canonical `Graph::stream_asset_path` implementation; unavailable
+    /// authorities refuse explicitly before touching the filesystem.
+    pub(crate) fn asset_stream_path(
+        &self,
+        name: &str,
+    ) -> Result<AssetStreamResolution, AssetStreamError> {
+        match &self.authority {
+            GraphAuthority::Legacy(_) => match self.legacy_graph() {
+                Ok(graph) => graph
+                    .stream_asset_path(name)
+                    .map(|path| AssetStreamResolution {
+                        authority: AssetStreamAuthority::Direct,
+                        path,
+                    })
+                    .map_err(|_| AssetStreamError::InvalidAsset {
+                        authority: AssetStreamAuthority::Direct,
+                    }),
+                Err(_) => Err(AssetStreamError::AuthorityUnavailable(
+                    AssetStreamUnavailable::DirectRetiring,
+                )),
+            },
+            GraphAuthority::SparseV2(binding) => match binding.has_active_application_handle() {
+                true => Graph::open_derived_read_only(&self.graph_root)
+                    .stream_asset_path(name)
+                    .map(|path| AssetStreamResolution {
+                        authority: AssetStreamAuthority::Managed,
+                        path,
+                    })
+                    .map_err(|_| AssetStreamError::InvalidAsset {
+                        authority: AssetStreamAuthority::Managed,
+                    }),
+                false => Err(AssetStreamError::AuthorityUnavailable(
+                    AssetStreamUnavailable::ManagedUnavailable,
+                )),
+            },
         }
     }
 
@@ -906,6 +970,39 @@ mod tests {
             root.join("journals/2026_08_07.md").exists(),
             "the refused journal deletion must not have touched the file"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn asset_stream_authority_names_direct_retiring_and_managed_unavailable() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-asset-stream-authority-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let direct = graph(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("assets/fixture.mp3"), b"fixture").unwrap();
+        let resolved = direct.asset_stream_path("fixture.mp3").unwrap();
+        assert_eq!(resolved.authority, AssetStreamAuthority::Direct);
+        assert_eq!(resolved.path, root.join("assets/fixture.mp3"));
+
+        direct.begin_legacy_retirement().unwrap();
+        assert!(matches!(
+            direct.asset_stream_path("fixture.mp3"),
+            Err(AssetStreamError::AuthorityUnavailable(
+                AssetStreamUnavailable::DirectRetiring
+            ))
+        ));
+
+        let managed = managed_slot(&root);
+        assert!(matches!(
+            managed.asset_stream_path("fixture.mp3"),
+            Err(AssetStreamError::AuthorityUnavailable(
+                AssetStreamUnavailable::ManagedUnavailable
+            ))
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

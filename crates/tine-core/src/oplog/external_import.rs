@@ -169,8 +169,13 @@ pub(crate) struct ExternalImportObservationMaterial {
     entries: Vec<ExternalImportObservationEntry>,
 }
 
-// Packet 4B deliberately leaves the draft/finalize adapter for the following
-// packet, so these crate-internal handoff methods have no production caller yet.
+// The draft/finalize adapter these methods exist for is live: `import.rs` builds
+// the material while planning a reconciliation, and `hot_engine.rs` consumes it
+// with the prospective portable-path root once the semantic transaction is
+// drafted. (This comment used to say the packet after 4B would supply that
+// caller, and stayed that way after the caller arrived —
+// `tests::the_draft_and_finalize_handoff_has_live_production_callers` is what
+// keeps it honest now.)
 impl ExternalImportObservationMaterial {
     pub(crate) fn new(
         workspace_id: WorkspaceId,
@@ -723,6 +728,7 @@ mod tests {
         LineageDigest, LogseqUuid, SemanticEffectDigest, SessionId, StructuralLocator,
         StructuralSpan,
     };
+    use crate::projection_producer_census::{call_count, production_rust};
 
     #[derive(Clone, Serialize)]
     struct RawObservation {
@@ -924,6 +930,28 @@ mod tests {
         )
         .unwrap();
         super::super::PreparedBatch::new(manifest, observations)
+    }
+
+    /// "No production caller yet" is a claim with a shelf life, and this one
+    /// expired: the callers arrived and the comment did not move. Assert the
+    /// handoff is live, against the same definition of "production" the
+    /// projection-producer census uses (test items and literals masked out).
+    ///
+    /// If a refactor genuinely removes the last caller, that is a real change to
+    /// this module's role — say so above, do not leave this failing.
+    #[test]
+    fn the_draft_and_finalize_handoff_has_live_production_callers() {
+        let production = production_rust();
+        for method in [
+            "ExternalImportObservationMaterial::new",
+            "into_operation_object_and_material",
+        ] {
+            assert!(
+                call_count(&production, method) > 0,
+                "{method} has no production caller; this module's comment says the \
+                 draft/finalize handoff is live"
+            );
+        }
     }
 
     #[test]

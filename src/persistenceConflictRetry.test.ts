@@ -19,7 +19,7 @@ const calls: {
   conflictEpoch: number | null;
   managedConflictObservation: { path: string; revision: string } | null;
 }[] = [];
-let nextResult: (() => Promise<string>) | null = null;
+let nextResult: (() => Promise<{ revision: string }>) | null = null;
 let observedManagedPage: { rev: string; path: string } | null = null;
 let draftPath = "pages/Notes.md";
 
@@ -46,6 +46,8 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
+  isSaveConflictError: (error: unknown) =>
+    typeof error === "object" && error !== null && "kind" in error && error.kind === "save-conflict",
   backend: () => ({
     savePage: (
       page: { name: string },
@@ -57,7 +59,7 @@ vi.mock("./backend", () => ({
       calls.push({ name: page.name, force, conflictEpoch, managedConflictObservation });
       const result = nextResult;
       nextResult = null;
-      return result ? result() : Promise.resolve("rev-after");
+      return result ? result() : Promise.resolve({ revision: "rev-after" });
     },
     getPageByPath: () => Promise.resolve(observedManagedPage),
     getPage: () => Promise.resolve(observedManagedPage),
@@ -178,7 +180,7 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     await forceSave("Notes");
     expect(conflicted.has("Notes")).toBe(false);
 
-    nextResult = () => Promise.reject(new Error("conflict"));
+    nextResult = () => Promise.reject({ kind: "save-conflict", epoch: null });
     await vi.waitFor(() => expect(calls.length).toBe(2));
     await vi.waitFor(() => expect(conflicted.has("Notes")).toBe(true));
   });
@@ -187,7 +189,7 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
   // live and must stay up.
   it("leaves a banner-class conflict exactly as it was", async () => {
     markDirty("Notes");
-    nextResult = () => Promise.reject(new Error("conflict"));
+    nextResult = () => Promise.reject({ kind: "save-conflict", epoch: null });
 
     expect(await forceSave("Notes")).toBe(false);
 
@@ -218,7 +220,7 @@ describe("managed save conflict resolution", () => {
     expect(conflicted.has("Notes")).toBe(true);
     expect(canForceSave("Notes")).toBe(true);
 
-    nextResult = () => Promise.resolve("managed-mine");
+    nextResult = () => Promise.resolve({ revision: "managed-mine" });
     expect(await forceSave("Notes")).toBe(true);
     expect(calls[1]).toMatchObject({
       force: true,
@@ -248,7 +250,7 @@ describe("managed save conflict resolution", () => {
       },
     });
 
-    nextResult = () => Promise.resolve("managed-mine");
+    nextResult = () => Promise.resolve({ revision: "managed-mine" });
     expect(await forceSave("Notes")).toBe(true);
     expect(calls[2]).toMatchObject({
       force: true,
@@ -269,7 +271,7 @@ describe("managed save conflict resolution", () => {
     expect(conflicted.has("Notes")).toBe(true);
     expect(canForceSave("Notes")).toBe(true);
 
-    nextResult = () => Promise.resolve("managed-new-draft-won");
+    nextResult = () => Promise.resolve({ revision: "managed-new-draft-won" });
     expect(await forceSave("Notes")).toBe(true);
     expect(calls[1]).toMatchObject({
       force: true,

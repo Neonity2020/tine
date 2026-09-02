@@ -28,8 +28,10 @@ use super::lazy_genesis::{
     LazyGenesisProviderIndexV1,
 };
 #[cfg(test)]
-use super::local_completion_index::{LocalCompletionFlushStats, LocalCompletionOpenStats};
-use super::local_completion_index::{LocalCompletionIndex, LocalCompletionPruningContext};
+use super::local_completion_index::LocalCompletionFlushStats;
+use super::local_completion_index::{
+    LocalCompletionIndex, LocalCompletionOpenStats, LocalCompletionPruningContext,
+};
 use super::page_name_index::{
     extract_authoritative_catalog_page_names, extract_semantic_page_name_observations,
     extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
@@ -41,7 +43,6 @@ use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
 };
 use super::receiver_absence_summary::ReceiverAbsenceSummary;
-#[cfg(test)]
 use super::receiver_absence_summary::ReceiverAbsenceSummaryOpenStats;
 use super::reference_catalog::ReferenceCatalogPolicyV1;
 #[cfg(test)]
@@ -102,9 +103,6 @@ const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 14;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
 pub(crate) const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 9;
 pub(crate) const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 8;
-pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
-const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
-const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 
 /// Test-only, per-thread attribution for the ordinary trusted-local authoring
 /// path.  This is deliberately an observation receipt, not engine state: it
@@ -4047,7 +4045,6 @@ struct HistoryWorkStats {
     block_claim_validation_nanos: usize,
     block_claim_lookup_nanos: usize,
     block_claim_encode_nanos: usize,
-    block_claim_insert_nanos: usize,
 }
 
 /// Opt-in causal accounting for managed activation replay. Test builds keep
@@ -4229,7 +4226,6 @@ pub struct EngineInstrumentation {
     pub block_claim_validation_nanos: usize,
     pub block_claim_lookup_nanos: usize,
     pub block_claim_encode_nanos: usize,
-    pub block_claim_insert_nanos: usize,
     pub store: super::ObjectStoreStats,
 }
 
@@ -5512,11 +5508,16 @@ fn managed_local_record_from_prepared(
 // ---------------------------------------------------------------------------
 // Projection turn record (journal-universal durability design v4, §3.2–§3.6).
 //
-// NOTHING IN PRODUCTION WRITES OR READS A TURN YET. This section defines the
-// record, its canonical encoding, its two sequence domains and the byte-level
-// name derivation so the later producer conversion has one authority to move
-// to. The architectural fact that no producer is wired is asserted by
-// `oplog::projection_turn_journal::tests::no_production_path_appends_a_turn`.
+// Production writes and reads turns. This section defines the record, its
+// canonical encoding, its two sequence domains and the byte-level name
+// derivation; `projection_turn_journal.rs` appends and drains them, the
+// operational coordinator produces them, and `local_journal_drain.rs` decodes
+// them. The architectural fact is
+// `every_projection_only_producer_reaches_the_projection_turn_journal`, at the
+// end of `projection_turn_journal.rs`.
+//
+// This header claimed the opposite until 2026-09, citing a guard that had never
+// been written; the producers landed and the sentence did not move.
 // ---------------------------------------------------------------------------
 
 /// On-disk format tag of [`ProjectionTurn`].
@@ -6230,6 +6231,59 @@ pub(crate) struct DeferredAbsenceObservation {
     pub(crate) path: ManagedPath,
 }
 
+const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// One accepted-roster row captured coherently by the engine actor. The
+/// checkpoint module feeds these rows through tine-storage's canonical sealed
+/// accepted-index writer; this is not a second roster format.
+#[derive(Clone)]
+pub(crate) struct CleanCheckpointAcceptedRow {
+    pub(crate) no_op: bool,
+    pub(crate) evidence: AcceptedBatchEvidence,
+    pub(crate) causal_dot: BatchCausalDot,
+    pub(crate) canonical_causal_clock: Vec<(CausalPeerId, u64)>,
+}
+
+pub(crate) struct CleanCheckpointCapture {
+    pub(crate) state_bytes: Vec<u8>,
+    pub(crate) accepted_rows: Vec<CleanCheckpointAcceptedRow>,
+    pub(crate) required_objects: BTreeSet<ContentDigest>,
+    pub(crate) capture_work: u64,
+}
+
+/// The semantic state section of the disposable checkpoint. Accepted roster,
+/// causal-clock and archive-fingerprint authority is deliberately absent: the
+/// checkpoint module represents and validates it through
+/// `sealed_accepted_index` before handing rows back to the engine.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanCheckpointStateV1 {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    ephemeral_block_claims: BTreeMap<u128, BTreeSet<ImmutableHomeClaim>>,
+    logseq_claim_root: LogseqClaimIndexRoot,
+    ephemeral_logseq_claims: BTreeMap<LogseqUuid, LogseqClaimRecord>,
+    portable_path_root: PortablePathIndexRoot,
+    ephemeral_portable_paths: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
+    portable_path_conflicts: BTreeMap<PortablePathKeyDigest, PortablePathConflict>,
+    page_name_root: PageNameOwnershipRootV1,
+    ephemeral_page_names: Vec<u8>,
+    page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
+    reference_catalog_policy: ReferenceCatalogPolicyV1,
+    visible_documents: BTreeMap<DocumentId, Vec<u8>>,
+    spare_documents: BTreeMap<DocumentId, Vec<u8>>,
+    visible_document_lru: VecDeque<DocumentId>,
+    visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
+    accepted_frontier_root: AcceptedFrontierRoot,
+    clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
+    current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
+    current_path_available: bool,
+    current_path_frontier_root: AcceptedFrontierRoot,
+}
+
 pub struct ShardedHotEngine {
     /// Lazy cache for `nonlinear_accepted_since` (audit 4, P2). `nonlinear_watermark`
     /// holds the highest acceptance sequence whose batch is known causally
@@ -6257,6 +6311,7 @@ pub struct ShardedHotEngine {
     transient_effective_views: BTreeMap<BatchId, AuthenticatedEffectiveSemanticView>,
     transient_effective_view_order: VecDeque<BatchId>,
     archive_store: Option<Arc<ObjectStore>>,
+    clean_checkpoint_publisher: Option<super::checkpoint_generation::CleanCheckpointPublisher>,
     /// Device-local own-endpoint projection completion evidence. The archive
     /// chain is durable; this engine-owned value also owns the coalescing
     /// buffer from cold repair through actor shutdown.
@@ -6264,7 +6319,9 @@ pub struct ShardedHotEngine {
     /// Derived receiver half, retained only so post-open completions can append
     /// an install-after-receipt summary generation.
     receiver_absence_summary: RefCell<Option<ReceiverAbsenceSummary>>,
-    #[cfg(test)]
+    /// Permanent, content-free attribution for the last absence-decision-map
+    /// open. Managed cold open reports it as part of its stage counters; it
+    /// records how the summary was reached and never decides anything.
     receiver_absence_summary_open_stats: RefCell<Option<ReceiverAbsenceSummaryOpenStats>>,
     /// Disposable per-open merge of receiver receipt history with the local
     /// completion half. Durable truth remains in those two stores.
@@ -6385,6 +6442,13 @@ pub struct ShardedHotEngine {
     /// frontier tips, not to every page/document in the graph.
     accepted_tip_refcounts: BTreeMap<BatchId, usize>,
     ephemeral_causal_clocks: BTreeMap<BatchId, Vec<(CausalPeerId, u64)>>,
+    /// Exact causal dots retained for the disposable sealed checkpoint roster.
+    /// Ordinary accepted-root decisions continue to use the authenticated
+    /// record digests below; this map is capture material only.
+    clean_checkpoint_causal_dots: BTreeMap<BatchId, BatchCausalDot>,
+    /// Union of immutable object names required by the accepted checkpoint
+    /// roster. Updated from each already validated manifest in O(batch delta).
+    clean_checkpoint_required_objects: BTreeSet<ContentDigest>,
     ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
     ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
     ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
@@ -6489,9 +6553,9 @@ impl ShardedHotEngine {
             transient_effective_views: BTreeMap::new(),
             transient_effective_view_order: VecDeque::new(),
             archive_store: None,
+            clean_checkpoint_publisher: None,
             local_completion_index: None,
             receiver_absence_summary: RefCell::new(None),
-            #[cfg(test)]
             receiver_absence_summary_open_stats: RefCell::new(None),
             absence_decision_map: RefCell::new(None),
             deferred_absence_observations: RefCell::new(BTreeSet::new()),
@@ -6539,6 +6603,8 @@ impl ShardedHotEngine {
             accepted_frontier: BTreeMap::new(),
             accepted_tip_refcounts: BTreeMap::new(),
             ephemeral_causal_clocks: BTreeMap::new(),
+            clean_checkpoint_causal_dots: BTreeMap::new(),
+            clean_checkpoint_required_objects: BTreeSet::new(),
             ephemeral_accepted_batch_entries: BTreeMap::new(),
             ephemeral_accepted_document_root: RunLocalAuthenticatedMap::default(),
             ephemeral_accepted_batch_root: RunLocalAuthenticatedMap::default(),
@@ -6860,8 +6926,78 @@ impl ShardedHotEngine {
                     .into(),
             ));
         }
+        let publisher_store = store
+            .duplicate_retained_capability()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.clean_checkpoint_publisher = Some(
+            super::checkpoint_generation::CleanCheckpointPublisher::new(publisher_store, 0),
+        );
         self.archive_store = Some(Arc::new(store));
         Ok(())
+    }
+
+    pub(crate) fn reset_clean_checkpoint_publisher(
+        &mut self,
+        durable_sequence: u64,
+    ) -> Result<(), EngineError> {
+        let store = self.archive_store.as_ref().ok_or_else(|| {
+            EngineError::Archive("clean checkpoint publisher has no operation archive".into())
+        })?;
+        let publisher_store = store
+            .duplicate_retained_capability()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.clean_checkpoint_publisher =
+            Some(super::checkpoint_generation::CleanCheckpointPublisher::new(
+                publisher_store,
+                durable_sequence,
+            ));
+        Ok(())
+    }
+
+    fn schedule_clean_checkpoint(&self) {
+        let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
+            return;
+        };
+        let cadence = self.clean_checkpoint_capture_cadence();
+        let lag = publisher.durable_lag(self.next_acceptance_sequence);
+        if self.next_acceptance_sequence % cadence != 0
+            && lag <= super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX
+        {
+            return;
+        }
+        match self.capture_clean_checkpoint() {
+            Ok(capture) => publisher.enqueue(capture),
+            Err(error) => eprintln!("clean checkpoint capture skipped: {error}"),
+        }
+    }
+
+    /// Full checkpoint capture is deliberately the spec's adaptive-cadence
+    /// option: K=1 through the measured N=800 gate, then grows with retained
+    /// state up to the durable-lag escalation horizon. The worst capture, not
+    /// an amortized mean, remains reported by `capture_work`.
+    fn clean_checkpoint_capture_cadence(&self) -> u64 {
+        let retained_items = self
+            .statuses
+            .len()
+            .saturating_add(self.accepted_frontier.len())
+            .saturating_add(self.ephemeral_block_claims.len())
+            .saturating_add(self.ephemeral_logseq_claims.len())
+            .saturating_add(self.ephemeral_portable_paths.len())
+            .saturating_add(self.current_path_catalog.rows.len());
+        let cadence = retained_items.saturating_add(799) / 800;
+        u64::try_from(cadence.clamp(
+            1,
+            super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX as usize,
+        ))
+        .unwrap_or(super::checkpoint_generation::CLEAN_CHECKPOINT_LAG_MAX)
+    }
+
+    pub(crate) fn clean_checkpoint_durable_lag(&self) -> u64 {
+        self.clean_checkpoint_publisher
+            .as_ref()
+            .map_or(0, |publisher| {
+                publisher.durable_lag(self.next_acceptance_sequence)
+            })
     }
 
     /// Replay the complete manifest-committed accepted tail over a clean
@@ -6879,44 +7015,69 @@ impl ShardedHotEngine {
         &mut self,
         baseline_claim_source: &dyn ProjectionClaimSource,
     ) -> Result<usize, EngineError> {
+        let store =
+            self.archive_store.as_ref().cloned().ok_or_else(|| {
+                EngineError::Archive("clean runtime has no operation archive".into())
+            })?;
+        let batch_ids = store
+            .committed_manifest_names()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.replay_clean_committed_batch_ids(&batch_ids, baseline_claim_source, true)
+    }
+
+    pub(crate) fn replay_clean_checkpoint_tail(
+        &mut self,
+        batch_ids: &BTreeSet<BatchId>,
+        baseline_claim_source: &dyn ProjectionClaimSource,
+    ) -> Result<usize, EngineError> {
+        self.replay_clean_committed_batch_ids(batch_ids, baseline_claim_source, false)
+    }
+
+    fn replay_clean_committed_batch_ids(
+        &mut self,
+        batch_ids: &BTreeSet<BatchId>,
+        baseline_claim_source: &dyn ProjectionClaimSource,
+        require_sequence_zero: bool,
+    ) -> Result<usize, EngineError> {
         if self.lazy_genesis.is_none()
             || self.has_native_semantic_index_stores()
-            || self.accepted_frontier_root.acceptance_sequence() != 0
-            || self.next_acceptance_sequence != 0
+            || (require_sequence_zero && self.next_acceptance_sequence != 0)
+            || batch_ids
+                .iter()
+                .any(|batch_id| self.statuses.contains_key(batch_id))
         {
             return Err(EngineError::Archive(
-                "clean tail replay requires an index-free sequence-zero baseline".into(),
+                "clean tail replay requires an index-free runtime and a disjoint committed tail"
+                    .into(),
             ));
         }
         let store =
             self.archive_store.as_ref().cloned().ok_or_else(|| {
                 EngineError::Archive("clean runtime has no operation archive".into())
             })?;
-        let manifests = store
-            .committed_manifests()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let accepted_before = self.accepted_batch_count()?;
         let mut pending = BTreeMap::new();
-        for manifest in &manifests {
+        for batch_id in batch_ids {
             let validated = match store
-                .inspect_batch(manifest.batch_id())
+                .inspect_batch(*batch_id)
                 .map_err(|error| EngineError::Archive(error.to_string()))?
             {
                 BatchInspection::Ready(batch) => batch,
                 BatchInspection::Absent => {
                     return Err(EngineError::Archive(format!(
                         "clean accepted manifest {} disappeared during replay",
-                        manifest.batch_id()
+                        batch_id
                     )));
                 }
                 BatchInspection::Staged { missing, .. } => {
                     return Err(EngineError::Archive(format!(
                         "clean accepted manifest {} is missing {} immutable objects",
-                        manifest.batch_id(),
+                        batch_id,
                         missing.len()
                     )));
                 }
             };
-            pending.insert(manifest.batch_id(), validated);
+            pending.insert(*batch_id, validated);
         }
         // Dependency heads are a pure function of each validated batch, but
         // recomputing them per readiness probe re-validates the projection
@@ -7017,25 +7178,419 @@ impl ShardedHotEngine {
                 }
             }
         }
-        for manifest in &manifests {
-            self.accepted_batch_evidence(manifest.batch_id())
+        for batch_id in batch_ids {
+            self.accepted_batch_evidence(*batch_id)
                 .map_err(|error| {
                     EngineError::Archive(format!(
                         "manifest-committed clean operation {} did not reach the accepted fixed point: {error}",
-                        manifest.batch_id()
+                        batch_id
                     ))
                 })?;
         }
         let accepted = self.accepted_batch_count()?;
-        let expected = u64::try_from(manifests.len()).map_err(|_| {
+        let expected_tail = u64::try_from(batch_ids.len()).map_err(|_| {
             EngineError::Archive("clean accepted manifest count exceeds u64".into())
         })?;
+        let expected = accepted_before
+            .checked_add(expected_tail)
+            .ok_or_else(|| EngineError::Archive("clean accepted count overflowed".into()))?;
         if accepted != expected {
             return Err(EngineError::Archive(format!(
-                "clean accepted tail contains {expected} manifests but replay produced {accepted} accepted operations"
+                "clean accepted tail expected {expected} total operations but replay produced {accepted}"
             )));
         }
-        Ok(manifests.len())
+        self.schedule_clean_checkpoint();
+        Ok(batch_ids.len())
+    }
+
+    /// Capture the exact semantic clean-runtime state at the current accepted
+    /// frontier. Serialization happens here, on the owning actor, so the
+    /// background publisher never observes concurrently mutating engine data.
+    pub(crate) fn capture_clean_checkpoint(&self) -> Result<CleanCheckpointCapture, EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.archive_store.is_none()
+            || self.has_native_semantic_index_stores()
+            || self.history_failure.is_some()
+            || self.fatal_evidence.is_some()
+            || !self.staged_batches.is_empty()
+            || !self.persisted_staged.is_empty()
+            || !self.archive.is_empty()
+        {
+            return Err(EngineError::Archive(
+                "clean checkpoint capture requires a nonterminal accepted fixed point".into(),
+            ));
+        }
+
+        let mut accepted_rows = Vec::with_capacity(self.accepted_sequence.len());
+        for sequence in 1..=self.next_acceptance_sequence {
+            let batch_id = self
+                .accepted_sequence
+                .get(&sequence)
+                .copied()
+                .ok_or_else(|| {
+                    EngineError::Archive(format!(
+                        "clean checkpoint accepted sequence {sequence} is absent"
+                    ))
+                })?;
+            let (no_op, evidence) = match self.statuses.get(&batch_id) {
+                Some(ArchiveStatus::Accepted { no_op, evidence }) => (*no_op, evidence.clone()),
+                _ => {
+                    return Err(EngineError::Archive(format!(
+                        "clean checkpoint batch {batch_id} has no accepted evidence"
+                    )))
+                }
+            };
+            let causal_dot = self
+                .clean_checkpoint_causal_dots
+                .get(&batch_id)
+                .copied()
+                .ok_or_else(|| {
+                    EngineError::Archive(format!(
+                        "clean checkpoint batch {batch_id} has no causal dot"
+                    ))
+                })?;
+            let canonical_causal_clock = self
+                .ephemeral_causal_clocks
+                .get(&batch_id)
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::Archive(format!(
+                        "clean checkpoint batch {batch_id} has no causal clock"
+                    ))
+                })?;
+            accepted_rows.push(CleanCheckpointAcceptedRow {
+                no_op,
+                evidence,
+                causal_dot,
+                canonical_causal_clock,
+            });
+        }
+
+        let encode_documents = |documents: &BTreeMap<DocumentId, LoroDoc>| {
+            documents
+                .iter()
+                .map(|(document_id, document)| {
+                    document
+                        .export(ExportMode::Snapshot)
+                        .map(|bytes| (*document_id, bytes))
+                        .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+        };
+        let state = CleanCheckpointStateV1 {
+            schema_version: CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION,
+            workspace_id: self.workspace_id,
+            lineage_digest: self.lineage_digest,
+            catalog_document_id: self.catalog_document_id,
+            ephemeral_block_claims: self
+                .ephemeral_block_claims
+                .iter()
+                .map(|(key, claims)| (*key, claims.clone()))
+                .collect(),
+            logseq_claim_root: self.logseq_claim_root,
+            ephemeral_logseq_claims: self.ephemeral_logseq_claims.clone(),
+            portable_path_root: self.portable_path_root,
+            ephemeral_portable_paths: self.ephemeral_portable_paths.clone(),
+            portable_path_conflicts: self.portable_path_conflicts.clone(),
+            page_name_root: self.page_name_root.clone(),
+            ephemeral_page_names: self
+                .ephemeral_page_names
+                .encode_checkpoint_canonical()
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
+            page_name_conflicts: self.page_name_conflicts.clone(),
+            reference_catalog_policy: self.reference_catalog_policy.clone(),
+            visible_documents: encode_documents(&self.visible_documents)?,
+            spare_documents: encode_documents(&self.spare_documents.borrow())?,
+            visible_document_lru: self.visible_document_lru.clone(),
+            visible_document_heads: self.visible_document_heads.clone(),
+            accepted_frontier: self.accepted_frontier.clone(),
+            accepted_frontier_root: self.accepted_frontier_root.clone(),
+            clean_projection_head_batches: self.clean_projection_head_batches.clone(),
+            current_path_rows: self.current_path_catalog.rows.clone(),
+            current_path_available: self.current_path_catalog.available,
+            current_path_frontier_root: self.current_path_catalog.accepted_frontier_root.clone(),
+        };
+        let state_bytes = postcard::to_allocvec(&state)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let capture_work = [
+            state.ephemeral_block_claims.len(),
+            state.ephemeral_logseq_claims.len(),
+            state.ephemeral_portable_paths.len(),
+            state.portable_path_conflicts.len(),
+            state.page_name_conflicts.len(),
+            state.visible_documents.len(),
+            state.spare_documents.len(),
+            state.visible_document_heads.len(),
+            state.accepted_frontier.len(),
+            state.clean_projection_head_batches.len(),
+            state.current_path_rows.len(),
+            accepted_rows.len(),
+            self.clean_checkpoint_required_objects.len(),
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, count| {
+            total
+                .checked_add(u64::try_from(count).map_err(|_| {
+                    EngineError::Archive("clean checkpoint capture cardinality exceeds u64".into())
+                })?)
+                .ok_or_else(|| EngineError::Archive("clean checkpoint work overflowed".into()))
+        })?;
+        Ok(CleanCheckpointCapture {
+            state_bytes,
+            accepted_rows,
+            required_objects: self.clean_checkpoint_required_objects.clone(),
+            capture_work,
+        })
+    }
+
+    /// Restore a state section only after the checkpoint module has validated
+    /// the sealed accepted roster against the live archive namespace.
+    pub(crate) fn restore_clean_checkpoint(
+        &mut self,
+        state_bytes: &[u8],
+        accepted_rows: Vec<CleanCheckpointAcceptedRow>,
+        required_objects: BTreeSet<ContentDigest>,
+    ) -> Result<(), EngineError> {
+        if self.lazy_genesis.is_none()
+            || self.archive_store.is_none()
+            || self.has_native_semantic_index_stores()
+            || self.next_acceptance_sequence != 0
+        {
+            return Err(EngineError::Archive(
+                "clean checkpoint restore requires an index-free sequence-zero baseline".into(),
+            ));
+        }
+        let (state, trailing): (CleanCheckpointStateV1, &[u8]) =
+            postcard::take_from_bytes(state_bytes)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if !trailing.is_empty()
+            || state.schema_version != CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION
+            || postcard::to_allocvec(&state)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                != state_bytes
+            || state.workspace_id != self.workspace_id
+            || state.lineage_digest != self.lineage_digest
+            || state.catalog_document_id != self.catalog_document_id
+            || state.reference_catalog_policy != self.reference_catalog_policy
+        {
+            return Err(EngineError::Archive(
+                "clean checkpoint state is noncanonical, stale, or misbound".into(),
+            ));
+        }
+        let ephemeral_page_names = EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(
+            &state.ephemeral_page_names,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let decode_documents = |encoded: &BTreeMap<DocumentId, Vec<u8>>| {
+            encoded
+                .iter()
+                .map(|(document_id, bytes)| {
+                    let document = LoroDoc::new();
+                    import_complete(*document_id, &document, std::slice::from_ref(bytes))?;
+                    document.set_peer_id(1).map_err(loro_error)?;
+                    self.validate_lazy_genesis_document(*document_id, &document)?;
+                    Ok((*document_id, document))
+                })
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()
+        };
+        let visible_documents = decode_documents(&state.visible_documents)?;
+        let spare_documents = decode_documents(&state.spare_documents)?;
+        if state.current_path_frontier_root != state.accepted_frontier_root {
+            return Err(EngineError::Archive(
+                "clean checkpoint current-path frontier is stale".into(),
+            ));
+        }
+
+        let baseline_root = self.accepted_frontier_root.clone();
+        let mut previous_root = baseline_root;
+        let mut statuses = BTreeMap::new();
+        let mut archive_fingerprints = BTreeMap::new();
+        let mut accepted_sequence = BTreeMap::new();
+        let mut causal_clocks = BTreeMap::new();
+        let mut causal_dots = BTreeMap::new();
+        let mut causal_chain = BTreeMap::new();
+        let mut accepted_batch_entries = BTreeMap::new();
+        let mut accepted_batch_root = RunLocalAuthenticatedMap::default();
+        for (index, row) in accepted_rows.into_iter().enumerate() {
+            let sequence = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| EngineError::Archive("checkpoint sequence overflowed".into()))?;
+            row.evidence.validate()?;
+            if row.evidence.acceptance_sequence() != sequence
+                || row.evidence.prior_frontier_root() != &previous_root
+                || row.causal_dot.counter() == 0
+            {
+                return Err(EngineError::Archive(
+                    "clean checkpoint accepted roster is noncontiguous".into(),
+                ));
+            }
+            let batch_id = row.evidence.batch_id();
+            let (clock_root_key, clock_root_digest) =
+                authenticated_causal_clock_root(&row.canonical_causal_clock)?;
+            let causal_record_digest = accepted_causal_record_digest(
+                batch_id,
+                row.evidence.manifest_fingerprint(),
+                row.evidence.event_binding_digest(),
+                row.causal_dot,
+                clock_root_key,
+                clock_root_digest,
+            );
+            accepted_batch_root.upsert(batch_id.as_uuid().into_bytes(), causal_record_digest);
+            accepted_batch_entries.insert(batch_id, causal_record_digest);
+            causal_clocks.insert(batch_id, row.canonical_causal_clock);
+            causal_dots.insert(batch_id, row.causal_dot);
+            match causal_chain.get(&row.causal_dot.peer_id()) {
+                Some((counter, _)) if *counter >= row.causal_dot.counter() => {}
+                _ => {
+                    causal_chain.insert(
+                        row.causal_dot.peer_id(),
+                        (row.causal_dot.counter(), batch_id),
+                    );
+                }
+            }
+            archive_fingerprints.insert(batch_id, row.evidence.manifest_fingerprint());
+            accepted_sequence.insert(sequence, batch_id);
+            previous_root = row.evidence.post_frontier_root().clone();
+            statuses.insert(
+                batch_id,
+                ArchiveStatus::Accepted {
+                    no_op: row.no_op,
+                    evidence: row.evidence,
+                },
+            );
+        }
+        let next_acceptance_sequence = u64::try_from(accepted_sequence.len())
+            .map_err(|_| EngineError::Archive("checkpoint sequence exceeds u64".into()))?;
+        if previous_root != state.accepted_frontier_root
+            || state.accepted_frontier_root.acceptance_sequence() != next_acceptance_sequence
+            || accepted_batch_root.root_key() != state.accepted_frontier_root.batch_map_root_key
+            || accepted_batch_root.root_digest()
+                != state.accepted_frontier_root.batch_map_root_digest
+        {
+            return Err(EngineError::Archive(
+                "clean checkpoint roster does not authenticate its frontier".into(),
+            ));
+        }
+        let baseline = self.lazy_genesis.as_ref().expect("checked baseline");
+        let overlay_documents = state
+            .accepted_frontier
+            .values()
+            .filter(|document| {
+                baseline.frontier_document(document.document_id()).as_ref() != Some(*document)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut accepted_document_root = RunLocalAuthenticatedMap::default();
+        for document in &overlay_documents {
+            accepted_document_root.upsert(
+                document.document_id().as_uuid().into_bytes(),
+                ContentDigest::of(&encode_accepted_document(document)?),
+            );
+        }
+        if accepted_document_root.root_key() != state.accepted_frontier_root.document_map_root_key
+            || accepted_document_root.root_digest()
+                != state.accepted_frontier_root.document_map_root_digest
+        {
+            return Err(EngineError::Archive(
+                "clean checkpoint documents do not authenticate their frontier".into(),
+            ));
+        }
+        let mut accepted_tip_refcounts = BTreeMap::new();
+        for batch_id in state
+            .accepted_frontier
+            .values()
+            .flat_map(|document| document.direct_dependency_heads().iter().copied())
+        {
+            *accepted_tip_refcounts.entry(batch_id).or_insert(0_usize) += 1;
+        }
+
+        self.archive.clear();
+        self.bounded_staging_cache.clear();
+        self.transient_effective_views.clear();
+        self.transient_effective_view_order.clear();
+        self.history_failure = None;
+        self.archive_fingerprints = archive_fingerprints;
+        self.persisted_staged.clear();
+        self.statuses = statuses;
+        self.staged_batches.clear();
+        self.ephemeral_block_claims = state.ephemeral_block_claims.into_iter().collect();
+        self.logseq_claim_root = state.logseq_claim_root;
+        self.ephemeral_logseq_claims = state.ephemeral_logseq_claims;
+        self.portable_path_root = state.portable_path_root;
+        self.ephemeral_portable_paths = state.ephemeral_portable_paths;
+        self.portable_path_conflicts = state.portable_path_conflicts;
+        self.page_name_root = state.page_name_root;
+        self.ephemeral_page_names = ephemeral_page_names;
+        self.page_name_conflicts = state.page_name_conflicts;
+        self.reference_catalog_policy = state.reference_catalog_policy;
+        self.fatal_evidence = None;
+        self.fatal_handle = None;
+        self.visible_documents = visible_documents;
+        *self.spare_documents.borrow_mut() = spare_documents;
+        self.pending_author_documents.borrow_mut().take();
+        self.accepted_author_projection_pages.borrow_mut().take();
+        self.visible_document_lru = state.visible_document_lru;
+        self.visible_document_heads = state.visible_document_heads;
+        self.local_overlay = CommittedLocalOverlay::default();
+        self.terminal_documents.clear();
+        self.terminal_document_heads.clear();
+        self.accepted_frontier = state.accepted_frontier;
+        self.accepted_tip_refcounts = accepted_tip_refcounts;
+        *self.ephemeral_causal_chain.borrow_mut() = causal_chain;
+        self.ephemeral_causal_clocks = causal_clocks;
+        self.clean_checkpoint_causal_dots = causal_dots;
+        self.clean_checkpoint_required_objects = required_objects;
+        self.ephemeral_accepted_batch_entries = accepted_batch_entries;
+        self.ephemeral_accepted_document_root = accepted_document_root;
+        self.ephemeral_accepted_batch_root = accepted_batch_root;
+        self.accepted_frontier_root = state.accepted_frontier_root;
+        self.accepted_sequence = accepted_sequence;
+        self.next_acceptance_sequence = next_acceptance_sequence;
+        self.clean_projection_heads.clear();
+        self.clean_projection_head_batches = state.clean_projection_head_batches;
+        self.current_path_catalog = CurrentPathCatalog {
+            rows: state.current_path_rows,
+            available: state.current_path_available,
+            accepted_frontier_root: state.current_path_frontier_root,
+        };
+        self.current_path_cursor_book.borrow_mut().active.clear();
+        self.advance_author_mutation_generation();
+        Ok(())
+    }
+
+    pub(crate) fn reset_clean_checkpoint_to_baseline(&mut self) -> Result<(), EngineError> {
+        let baseline = self.lazy_genesis.as_ref().cloned().ok_or_else(|| {
+            EngineError::Archive("checkpoint fallback has no lazy-genesis baseline".into())
+        })?;
+        let store = self.archive_store.as_ref().ok_or_else(|| {
+            EngineError::Archive("checkpoint fallback has no operation archive".into())
+        })?;
+        let store = store
+            .duplicate_retained_capability()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let policy = self.reference_catalog_policy.clone();
+        let mut baseline_engine = Self::new(
+            self.workspace_id,
+            self.lineage_digest,
+            self.catalog_document_id,
+        );
+        baseline_engine.reference_catalog_policy = policy;
+        baseline_engine.accepted_frontier_root = empty_accepted_frontier_root();
+        baseline_engine.install_lazy_genesis_baseline(baseline)?;
+        baseline_engine.attach_clean_archive_store(store)?;
+        *self = baseline_engine;
+        Ok(())
+    }
+
+    pub(crate) fn is_clean_genesis_frontier(&self) -> Result<bool, EngineError> {
+        self.ensure_not_blocked()?;
+        if self.lazy_genesis.is_none() {
+            return Err(EngineError::Archive(
+                "genesis predicate requires a clean baseline runtime".into(),
+            ));
+        }
+        Ok(self.next_acceptance_sequence == 0)
     }
 
     /// Validate one local candidate completely, then publish its manifest as
@@ -7116,6 +7671,7 @@ impl ShardedHotEngine {
             self.clean_projection_heads
                 .insert(work.path().clone(), work);
         }
+        self.schedule_clean_checkpoint();
         Ok(outcome)
     }
 
@@ -7176,6 +7732,7 @@ impl ShardedHotEngine {
             };
         }
         self.refresh_clean_projection_head_for_batch(prepared.manifest().batch_id())?;
+        self.schedule_clean_checkpoint();
         Ok(outcome)
     }
 
@@ -7567,16 +8124,23 @@ impl ShardedHotEngine {
         let mut map = if let Some(store) = self.archive_store.as_deref() {
             let opened = ReceiverAbsenceSummary::open(store, receipts)
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
-            #[cfg(test)]
-            {
-                *self.receiver_absence_summary_open_stats.borrow_mut() = Some(opened.stats.clone());
-            }
+            *self.receiver_absence_summary_open_stats.borrow_mut() = Some(opened.stats.clone());
             *self.receiver_absence_summary.borrow_mut() = opened.cache;
             opened.map
         } else {
             let catalog = receipts
                 .validated_catalog()
                 .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            *self.receiver_absence_summary_open_stats.borrow_mut() =
+                Some(ReceiverAbsenceSummaryOpenStats {
+                    receipt_content_reads: catalog
+                        .iter()
+                        .map(|row| usize::from(row.completion.is_some()) + 1)
+                        .sum(),
+                    full_catalog_passes: 1,
+                    rebuilt: true,
+                    ..ReceiverAbsenceSummaryOpenStats::default()
+                });
             let mut map = AbsenceDecisionMap::default();
             for entry in catalog {
                 if entry.completion.is_some() {
@@ -7707,11 +8271,33 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    /// The last absence-decision-map open's attribution, if one has run.
+    pub(crate) fn receiver_absence_summary_open_stats(
+        &self,
+    ) -> Option<ReceiverAbsenceSummaryOpenStats> {
+        self.receiver_absence_summary_open_stats.borrow().clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn receiver_absence_summary_open_stats_for_test(
         &self,
     ) -> Option<ReceiverAbsenceSummaryOpenStats> {
-        self.receiver_absence_summary_open_stats.borrow().clone()
+        self.receiver_absence_summary_open_stats()
+    }
+
+    /// The device-local own-endpoint completion chain's open attribution.
+    pub(crate) fn local_completion_open_stats(&self) -> Option<LocalCompletionOpenStats> {
+        self.local_completion_index
+            .as_ref()
+            .map(|index| index.open_stats().clone())
+    }
+
+    /// How many own-endpoint completion entries the local chain currently
+    /// retains. Counted, never used as a decision input.
+    pub(crate) fn local_completion_entry_count(&self) -> usize {
+        self.local_completion_index
+            .as_ref()
+            .map_or(0, LocalCompletionIndex::completed_entry_count)
     }
 
     pub(crate) fn local_completed_projection_intent_ids(&self) -> BTreeSet<ProjectionIntentId> {
@@ -7813,9 +8399,7 @@ impl ShardedHotEngine {
 
     #[cfg(test)]
     pub(crate) fn local_completion_open_stats_for_test(&self) -> Option<LocalCompletionOpenStats> {
-        self.local_completion_index
-            .as_ref()
-            .map(|index| index.open_stats().clone())
+        self.local_completion_open_stats()
     }
 
     #[cfg(test)]
@@ -8275,7 +8859,6 @@ impl ShardedHotEngine {
             block_claim_validation_nanos: work.block_claim_validation_nanos,
             block_claim_lookup_nanos: work.block_claim_lookup_nanos,
             block_claim_encode_nanos: work.block_claim_encode_nanos,
-            block_claim_insert_nanos: work.block_claim_insert_nanos,
             store: self
                 .archive_store
                 .as_ref()
@@ -9479,6 +10062,12 @@ impl ShardedHotEngine {
         self.next_acceptance_sequence = evidence.acceptance_sequence;
         self.accepted_frontier_root = evidence.post_frontier_root.clone();
         let manifest = self.archive[&evidence.batch_id].manifest();
+        let checkpoint_causal_dot = manifest.causal_dot();
+        let checkpoint_required_objects = manifest
+            .required_objects()
+            .iter()
+            .map(|descriptor| descriptor.content_digest())
+            .collect::<Vec<_>>();
         let clock = self
             .derive_ephemeral_causal_clock(manifest)
             .expect("accepted inline causal clock was validated");
@@ -9494,6 +10083,10 @@ impl ShardedHotEngine {
         );
         self.ephemeral_causal_clocks
             .insert(evidence.batch_id, clock);
+        self.clean_checkpoint_causal_dots
+            .insert(evidence.batch_id, checkpoint_causal_dot);
+        self.clean_checkpoint_required_objects
+            .extend(checkpoint_required_objects);
         self.ephemeral_accepted_batch_entries
             .insert(evidence.batch_id, record_digest);
         self.ephemeral_accepted_batch_root
@@ -18793,25 +19386,6 @@ impl ShardedHotEngine {
             return Ok((self.logseq_claim_root, Vec::new()));
         }
 
-        let existing = self
-            .ephemeral_logseq_claims
-            .values()
-            .map(|record| record.introductions.len())
-            .sum::<usize>();
-        let added = additions
-            .iter()
-            .filter(|(uuid, introduction)| {
-                !self
-                    .ephemeral_logseq_claims
-                    .get(uuid)
-                    .is_some_and(|record| record.introductions.binary_search(introduction).is_ok())
-            })
-            .count();
-        if existing.saturating_add(added) > MAX_EPHEMERAL_LOGSEQ_CLAIMS {
-            return Err(EngineError::InvalidTransaction(
-                "run-local Logseq claim index reached its fixed capacity".into(),
-            ));
-        }
         let mut records = self.ephemeral_logseq_claims.clone();
         for (logseq_uuid, introduction) in &additions {
             let record = records
@@ -20162,17 +20736,6 @@ impl ShardedHotEngine {
                 conflicts,
             });
         }
-        if self
-            .ephemeral_portable_paths
-            .len()
-            .saturating_add(self.local_overlay.portable_paths.len())
-            .saturating_add(changed.len())
-            > MAX_EPHEMERAL_PORTABLE_PATHS
-        {
-            return Err(EngineError::InvalidTransaction(
-                "no-store portable-path test index reached its fixed capacity".into(),
-            ));
-        }
         let _ = publish_index;
         let root = semantic_portable_path_root_after_changes(base_root, &base_records, &changed)?;
         Ok(PortablePathPublicationCandidate {
@@ -21167,23 +21730,6 @@ impl ShardedHotEngine {
         }
         let encode_nanos =
             usize::try_from(encode_started.elapsed().as_nanos()).unwrap_or(usize::MAX);
-        let insert_started = Instant::now();
-        let novel = changed_claims
-            .iter()
-            .filter(|(block_id, _)| {
-                !self
-                    .ephemeral_block_claims
-                    .contains_key(&block_id.as_uuid().as_u128())
-            })
-            .count();
-        if self.ephemeral_block_claims.len().saturating_add(novel) > MAX_EPHEMERAL_BLOCK_CLAIMS {
-            return Err(EngineError::InvalidTransaction(
-                "run-local block-claim index reached its fixed capacity".into(),
-            ));
-        }
-        let insert_nanos =
-            usize::try_from(insert_started.elapsed().as_nanos()).unwrap_or(usize::MAX);
-
         let novel_conflicts: Vec<_> = changed_claims
             .iter()
             .filter_map(|(block_id, claims)| {
@@ -21217,7 +21763,6 @@ impl ShardedHotEngine {
         );
         work.block_claim_lookup_nanos = work.block_claim_lookup_nanos.saturating_add(lookup_nanos);
         work.block_claim_encode_nanos = work.block_claim_encode_nanos.saturating_add(encode_nanos);
-        work.block_claim_insert_nanos = work.block_claim_insert_nanos.saturating_add(insert_nanos);
         self.history_work.set(work);
         let ephemeral_block_claims = changed_claims
             .into_iter()
@@ -25573,7 +26118,7 @@ impl From<super::ReceiptError> for EngineError {
 }
 
 #[cfg(test)]
-mod validation_tests {
+pub(crate) mod validation_tests {
     use loro::LoroText;
     use uuid::Uuid;
 
@@ -25732,7 +26277,7 @@ mod validation_tests {
     }
 
     #[derive(Debug, Eq, PartialEq)]
-    struct ObservableEngineState {
+    pub(crate) struct ObservableEngineState {
         history_failure: Option<EngineError>,
         archive_batches: BTreeSet<BatchId>,
         archive_fingerprints: BTreeMap<BatchId, ContentDigest>,
@@ -25758,14 +26303,21 @@ mod validation_tests {
         terminal_documents: BTreeMap<DocumentId, Vec<u8>>,
         terminal_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
         accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
+        accepted_tip_refcounts: BTreeMap<BatchId, usize>,
+        clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
         ephemeral_causal_chain: BTreeMap<CausalPeerId, (u64, BatchId)>,
         ephemeral_causal_clocks: BTreeMap<BatchId, Vec<(CausalPeerId, u64)>>,
+        clean_checkpoint_causal_dots: BTreeMap<BatchId, BatchCausalDot>,
+        clean_checkpoint_required_objects: BTreeSet<ContentDigest>,
         ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
         ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
         ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
         accepted_frontier_root: AcceptedFrontierRoot,
         accepted_sequence: BTreeMap<u64, BatchId>,
         next_acceptance_sequence: u64,
+        current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
+        current_path_available: bool,
+        current_path_frontier_root: AcceptedFrontierRoot,
     }
 
     fn document_updates(
@@ -25782,7 +26334,7 @@ mod validation_tests {
             .collect()
     }
 
-    fn observable_engine_state(engine: &ShardedHotEngine) -> ObservableEngineState {
+    pub(crate) fn observable_engine_state(engine: &ShardedHotEngine) -> ObservableEngineState {
         ObservableEngineState {
             history_failure: engine.history_failure.clone(),
             archive_batches: engine.archive.keys().copied().collect(),
@@ -25809,14 +26361,21 @@ mod validation_tests {
             terminal_documents: document_updates(&engine.terminal_documents),
             terminal_document_heads: engine.terminal_document_heads.clone(),
             accepted_frontier: engine.accepted_frontier.clone(),
+            accepted_tip_refcounts: engine.accepted_tip_refcounts.clone(),
+            clean_projection_head_batches: engine.clean_projection_head_batches.clone(),
             ephemeral_causal_chain: engine.ephemeral_causal_chain.borrow().clone(),
             ephemeral_causal_clocks: engine.ephemeral_causal_clocks.clone(),
+            clean_checkpoint_causal_dots: engine.clean_checkpoint_causal_dots.clone(),
+            clean_checkpoint_required_objects: engine.clean_checkpoint_required_objects.clone(),
             ephemeral_accepted_batch_entries: engine.ephemeral_accepted_batch_entries.clone(),
             ephemeral_accepted_document_root: engine.ephemeral_accepted_document_root.clone(),
             ephemeral_accepted_batch_root: engine.ephemeral_accepted_batch_root.clone(),
             accepted_frontier_root: engine.accepted_frontier_root.clone(),
             accepted_sequence: engine.accepted_sequence.clone(),
             next_acceptance_sequence: engine.next_acceptance_sequence,
+            current_path_rows: engine.current_path_catalog.rows.clone(),
+            current_path_available: engine.current_path_catalog.available,
+            current_path_frontier_root: engine.current_path_catalog.accepted_frontier_root.clone(),
         }
     }
 
@@ -27482,7 +28041,11 @@ mod validation_tests {
     }
 
     #[test]
-    fn no_store_block_claim_capacity_rejects_before_candidate_mutation() {
+    fn block_claim_index_grows_past_any_fixed_capacity() {
+        // Guard for the A4 fix: run-local identity indexes must never refuse
+        // at a capacity (I-8: a refusal with no in-scope threat scenario is an
+        // availability bug; I-10: the refusal was permanent across reopen).
+        // See specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md.
         let catalog = DocumentId::from_uuid(Uuid::from_u128(115_001));
         let mut engine = ShardedHotEngine::new(
             WorkspaceId::from_uuid(Uuid::from_u128(115_000)),
@@ -27490,7 +28053,7 @@ mod validation_tests {
             catalog,
         );
         let retained_home = DocumentId::from_uuid(Uuid::from_u128(115_002));
-        for key in 0..MAX_EPHEMERAL_BLOCK_CLAIMS {
+        for key in 0..4_096usize {
             engine.ephemeral_block_claims.insert(
                 key as u128,
                 BTreeSet::from([ImmutableHomeClaim::new(
@@ -27499,9 +28062,6 @@ mod validation_tests {
                 )]),
             );
         }
-        let before_claims = engine.ephemeral_block_claims.clone();
-        let before_fatal_evidence = engine.fatal_evidence.clone();
-        let before_fatal_handle = engine.fatal_handle;
         let block_id = BlockId::from_uuid(Uuid::from_u128(115_010));
         let home = DocumentId::from_uuid(Uuid::from_u128(115_011));
         let effect = SemanticEffect::new(
@@ -27520,24 +28080,28 @@ mod validation_tests {
             Vec::new(),
         )
         .unwrap();
-        let result = engine.validate_and_prepare_semantic_roles_and_block_homes(
-            BatchId::from_uuid(Uuid::from_u128(115_012)),
-            BatchCausalDot::new(
-                CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(115_013))),
-                1,
+        let candidate = engine
+            .validate_and_prepare_semantic_roles_and_block_homes(
+                BatchId::from_uuid(Uuid::from_u128(115_012)),
+                BatchCausalDot::new(
+                    CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(115_013))),
+                    1,
+                )
+                .unwrap(),
+                &[],
+                &effect,
             )
-            .unwrap(),
-            &[],
-            &effect,
+            .expect(
+                "a 4,097th lifetime block claim must validate: run-local identity \
+                 indexes have no fixed capacity (I-8/I-10, A4-fix-dossier.md)",
+            );
+        assert!(
+            candidate
+                .ephemeral_block_claims
+                .iter()
+                .any(|(key, _)| *key == block_id.as_uuid().as_u128()),
+            "the candidate must carry the new claim for insertion"
         );
-        assert!(matches!(
-            result,
-            Err(EngineError::InvalidTransaction(message))
-                if message.contains("fixed capacity")
-        ));
-        assert_eq!(engine.ephemeral_block_claims, before_claims);
-        assert_eq!(engine.fatal_evidence, before_fatal_evidence);
-        assert_eq!(engine.fatal_handle, before_fatal_handle);
     }
 
     #[test]
@@ -29292,7 +29856,7 @@ mod validation_tests {
     fn stage_ready_with_claim_source_has_exactly_the_three_clean_entry_points() {
         let source = include_str!("hot_engine.rs");
         let production = source
-            .split("#[cfg(test)]\nmod validation_tests")
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
             .next()
             .expect("the hot-engine production half remains identifiable");
         let mut enclosing = "<file scope>";
@@ -29327,7 +29891,7 @@ mod validation_tests {
         assert_eq!(
             callers,
             vec![
-                "replay_clean_committed_tail",
+                "replay_clean_committed_batch_ids",
                 "commit_clean_prepared",
                 "accept_clean_prepared_below_managed_local_overlay",
             ],
@@ -29521,7 +30085,7 @@ mod validation_tests {
         );
 
         let production = source
-            .split("#[cfg(test)]\nmod validation_tests")
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
             .next()
             .expect("production half remains identifiable");
         assert_eq!(
@@ -30035,6 +30599,199 @@ mod validation_tests {
         assert!(source.contains("verify_checkpoints: false"));
         assert!(source.contains("new_verifying(catalog_document_id"));
     }
+
+    // -----------------------------------------------------------------
+    // Harvest A4 — what actually consumes a run-local page-name record.
+    //
+    // CHARACTERIZATION: these assert the CURRENT behavior of the capped,
+    // removal-free `EphemeralPageNameOwnershipStateV1::records` map. They
+    // are the cheap half of the A4 repro (the cap itself is reached in
+    // `oplog::hot_engine_integration_tests`, ignored because it is slow).
+    // -----------------------------------------------------------------
+    fn a4_stage(
+        engine: &mut ShardedHotEngine,
+        author: AuthorBatch,
+        operations: Vec<SemanticOperation>,
+    ) {
+        let prepared = engine
+            .prepare_fixture_transaction(author, &OperationTransaction::new(operations).unwrap())
+            .expect("A4 count-semantics transaction drafts");
+        let outcome = engine.stage_ready(ValidatedBatch::new(prepared));
+        assert!(
+            matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+            "A4 count-semantics transaction was not accepted: {:?}",
+            outcome.disposition()
+        );
+    }
+
+    #[test]
+    fn a4_page_name_records_count_distinct_names_and_are_never_released() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0xa4_1000));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0xa4_1001));
+        let lineage = LineageDigest::of(b"harvest-a4-count-semantics");
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        assert_eq!(engine.ephemeral_page_names.record_count(), 0);
+
+        // (a) Distinct names: one record per distinct canonical name key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1010, 0xa4_1010),
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1200)),
+                    name: crate::oplog::LogicalPageName::parse("Alpha").unwrap(),
+                    path: ManagedPath::parse("pages/alpha.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1101)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1201)),
+                    name: crate::oplog::LogicalPageName::parse("Beta").unwrap(),
+                    path: ManagedPath::parse("pages/beta.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+            ],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            2,
+            "two distinct page names occupy two records"
+        );
+
+        // (b) A path-only edit is not a name change and consumes nothing.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1011, 0xa4_1011),
+            vec![SemanticOperation::EditPagePath {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                path: ManagedPath::parse("elsewhere/alpha.md").unwrap(),
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 2);
+
+        // (c) A RENAME consumes a SECOND record: the released old key is
+        // retained alongside the newly acquired one. Renaming one page N
+        // times therefore costs N+1 records, not 1.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1012, 0xa4_1012),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha Renamed").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha-renamed.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            3,
+            "a rename retains the released old key AND acquires the new one"
+        );
+
+        // (d) A second rename of the same page costs another record.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1013, 0xa4_1013),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha Again").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha-again.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 4);
+
+        // (e) Renaming BACK to an already-seen name reuses its key: the map
+        // is keyed by canonical name, so the cost is lifetime-DISTINCT names.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1014, 0xa4_1014),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1100)),
+                    new_name: crate::oplog::LogicalPageName::parse("Alpha").unwrap(),
+                    new_path: ManagedPath::parse("pages/alpha.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            4,
+            "returning to a previously used name reuses its existing record"
+        );
+
+        // (f) DELETION frees nothing: the tombstoned page's name record stays.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1015, 0xa4_1015),
+            vec![SemanticOperation::DeletePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1101)),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            4,
+            "deleting a page releases no page-name record"
+        );
+
+        // (g) A brand-new page reusing the deleted page's name reuses the key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1016, 0xa4_1016),
+            vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1102)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1202)),
+                name: crate::oplog::LogicalPageName::parse("Beta").unwrap(),
+                path: ManagedPath::parse("pages/beta-2.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 4);
+
+        // (h) Case-folding twins share one canonical key.
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1017, 0xa4_1017),
+            vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1103)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa4_1203)),
+                name: crate::oplog::LogicalPageName::parse("Gamma").unwrap(),
+                path: ManagedPath::parse("pages/gamma.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        assert_eq!(engine.ephemeral_page_names.record_count(), 5);
+        a4_stage(
+            &mut engine,
+            test_author(0xa4_1018, 0xa4_1018),
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0xa4_1103)),
+                    new_name: crate::oplog::LogicalPageName::parse("GAMMA").unwrap(),
+                    new_path: ManagedPath::parse("pages/GAMMA.md").unwrap(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            engine.ephemeral_page_names.record_count(),
+            5,
+            "a case-only rename stays inside the same canonical key"
+        );
+
+        // (i) Block-only work never touches the page-name index.
+        assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
+    }
 }
 
 #[cfg(test)]
@@ -30288,7 +31045,7 @@ mod replay_benchmark {
             .saturating_add(replay_timing.checkpoint_blob_append_nanos)
             .saturating_add(replay_timing.checkpoint_whole_digest_nanos);
         eprintln!(
-            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_insert_ms={:.3} claim_hot_entries={} owned_semantic_snapshot_entries={}",
+            "oplog_hot_replay blocks=1000000 page_operations={pages} batches={} elapsed_ms={:.3} inspection_ms={:.3} validation_ms={:.3} replay_peak_rss_kib={} claim_validation_ms={:.3} claim_lookup_ms={:.3} claim_encode_ms={:.3} claim_hot_entries={} owned_semantic_snapshot_entries={}",
             replay.status().accepted_batch_ids().unwrap().len(),
             elapsed.as_secs_f64() * 1_000.0,
             inspection_elapsed.as_secs_f64() * 1_000.0,
@@ -30297,7 +31054,6 @@ mod replay_benchmark {
             instrumentation.block_claim_validation_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_lookup_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_encode_nanos as f64 / 1_000_000.0,
-            instrumentation.block_claim_insert_nanos as f64 / 1_000_000.0,
             instrumentation.block_claim_hot_entries,
             owned_semantic_snapshot_entries(),
         );

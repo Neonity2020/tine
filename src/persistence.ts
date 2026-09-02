@@ -4,9 +4,11 @@
 // from being lost, clobbered, or written into the wrong graph.
 //
 // store.ts owns the doc tree and calls markDirty(page) on every mutation; this
-// module decides WHEN and HOW that reaches disk. It depends on store only for a
-// page snapshot (pageToDto) and the loaded flag (doc.loaded) — used at call time,
-// so the store↔persistence import cycle resolves cleanly.
+// module decides WHEN and HOW that reaches disk. Its whole dependency on store is
+// the named import below, and every binding in it is read at call time rather
+// than at module scope, so the store↔persistence import cycle resolves cleanly.
+// `persistence.storeSurface.test.ts` pins that import list: it is the coupling
+// this split exists to bound, so it may not grow unnoticed.
 
 import {
   doc,
@@ -614,10 +616,13 @@ function actorReasonCode(message: string): string {
  *  could not name, so no override may be presented for it. Returns null when the
  *  error is not banner class at all, and -1 for the unnameable legacy shape. */
 function conflictObservationEpoch(error: unknown): number | null {
-  const message = String(error).replace(/^Error: /, "");
-  if (message === "conflict") return -1;
-  const match = /^conflict:(\d+)$/.exec(message);
-  return match ? Number(match[1]) : null;
+  if (typeof error !== "object" || error === null || !("kind" in error) || error.kind !== "save-conflict") {
+    return null;
+  }
+  if (!("epoch" in error) || error.epoch === null) return -1;
+  return typeof error.epoch === "number" && Number.isSafeInteger(error.epoch) && error.epoch >= 0
+    ? error.epoch
+    : null;
 }
 
 /** Whether a save failed because the page revision changed underneath it.
@@ -909,7 +914,7 @@ async function doSave(
   if (intent.kind === "ordinary" && !dirty.has(name)) return true; // saved by a prior link
   if (intent.kind === "ordinary" && isConflicted(name)) {
     const draft = pageToDto(name);
-    if (draft) refreshLiveSaveConflictDraft(draft);
+    if (draft) await refreshLiveSaveConflictDraft(draft);
     return false;
   }
   // A cross-page move source: hold its save until the destination is durable (C#1).
@@ -980,7 +985,7 @@ async function doSave(
         observation?.kind === "managed" ? observation.observation : null,
       )
     );
-    const rev = typeof saved === "string" ? saved : saved.revision;
+    const rev = saved.revision;
     // A reload/rename/delete/rebind while savePage was in flight invalidates the
     // retirement proof even if those bytes landed. Never let that stale success
     // authorize identity reuse or update the replacement instance's baseline.
@@ -989,7 +994,7 @@ async function doSave(
       && graphBindingRev === bindingAtStart
       && peekPageInstanceGeneration(name) === issuingInstance
       && editorActivationFor(name) === issuingActivation;
-    if (typeof saved !== "string" && saved.activation) {
+    if (saved.activation) {
       if (exactIssuerStillLive) {
         // A first-create response may resolve/retarget the activation. It belongs
         // only to the exact page instance and graph binding that issued this save;
@@ -1058,11 +1063,12 @@ async function doSave(
         conflictObservation.set(name, { kind: "direct", epoch: observed });
         try {
           const capture = await backend().captureLiveSaveConflict(dto, baseline, observed);
-          registerLiveSaveConflict(dto, baseline, observed, capture);
+          if (!capture) throw new Error("Direct Files capture returned no authority payload");
+          await registerLiveSaveConflict(dto, baseline, observed, capture);
         } catch (captureError) {
           // The draft remains live and close protection stays armed. Surface the
           // missing restart capsule instead of pretending crash recovery exists.
-          registerLiveSaveConflict(dto, baseline, observed);
+          await registerLiveSaveConflict(dto, baseline, observed);
           pushToast(
             `Couldn't preserve “${name}” for restart recovery. Keep Tine open while resolving it. (${String(captureError)})`,
             "error",
@@ -1100,10 +1106,24 @@ async function doSave(
         identity: ++managedConflictObservationClock,
         observation: managedObservation,
       });
+      // Use the same semantic capture boundary as Direct Files. Managed returns
+      // no durable replacement authority: only the retained page and base below
+      // enter the app-private capsule.
+      try {
+        await backend().captureLiveSaveConflict?.(dto, baseline, 0);
+      } catch (error) {
+        // The capture only enriches the review; the retained draft below is
+        // the recovery material and must still reach the banner and capsule.
+        console.error("[tine] managed conflict capture failed", error);
+      }
       // Re-notify an already visible banner so its Keep mine enabled state
-      // reflects this newly observed (or now unobservable) managed owner.
+      // reflects this newly observed (or now unobservable) managed owner. Clear
+      // before replacing the capsule so the newly persisted draft survives.
       if (isConflicted(name)) clearConflict(name);
-      markConflict(name);
+      // Persist only the retained draft and its load baseline while raising the
+      // ordinary banner. The actor's replacement observation above remains
+      // session-scoped and must be minted again after restart.
+      await markConflict(name, { page: dto, baseRev: baseline, storage: "managed" });
     } else if (saveFailureCode(e).startsWith("conflict_authority.")) {
       // The force named an observation the disk has since moved past — a later
       // external write, or a read, revoked it before the click reached the

@@ -1714,21 +1714,16 @@ pub struct ImportInventoryEntry {
 }
 
 impl ImportInventoryEntry {
-    /// Construct an entry using the legacy fixed-layout path classification.
+    /// The only way to build an entry: the caller states the kind, which its
+    /// graph capability's configured root classifier returned.
     ///
-    /// New callers that have a graph capability must use
-    /// [`Self::with_kind`] with [`ManagedTextKind`] returned by its configured
-    /// root classifier. This compatibility constructor preserves the existing
-    /// unactivated raw-inventory boundary until that caller is updated.
-    pub fn new(path: ManagedPath, state: ImportInventoryState) -> Self {
-        let kind = if path.as_str().starts_with("journals/") {
-            ManagedTextKind::Journal
-        } else {
-            ManagedTextKind::Page
-        };
-        Self { kind, path, state }
-    }
-
+    /// There was a second constructor, `new`, that guessed the kind from a
+    /// `journals/` path prefix. Its doc said it existed to preserve an
+    /// unactivated raw-inventory boundary "until that caller is updated" — but
+    /// production had already moved, and its only remaining caller was a test.
+    /// A fixed-layout guess is wrong for any graph with configured page/journal
+    /// roots, so it is gone rather than waiting for a migration that had already
+    /// happened.
     pub fn with_kind(
         kind: ManagedTextKind,
         path: ManagedPath,
@@ -2814,5 +2809,33 @@ mod tests {
         for unsafe_name in ["", ".", "..", "nested/name", r"nested\name", "CON"] {
             assert!(root.join_sibling(unsafe_name).is_err(), "{unsafe_name}");
         }
+    }
+
+    /// `ImportInventoryEntry` had a second constructor that inferred
+    /// [`ManagedTextKind`] from a `journals/` path prefix, documented as a
+    /// compatibility shim held open "until that caller is updated". Production
+    /// had already been updated; the only caller left was a test, so the shim
+    /// was documenting a migration that had finished. Kind now comes from the
+    /// caller's configured root classifier, which is the only thing that can be
+    /// right for a graph with non-default page/journal roots.
+    #[test]
+    fn an_inventory_entry_never_guesses_its_kind_from_the_path() {
+        let source = include_str!("receipt.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+        assert!(
+            !production.contains("starts_with(\"journals/\")"),
+            "an inventory entry is classifying itself by path prefix again. Only the \
+             graph capability's configured root classifier knows whether a path is a \
+             journal, so take ManagedTextKind from the caller (invariant I-11)."
+        );
+        assert!(
+            !production.contains("fn new(path: ManagedPath"),
+            "the legacy fixed-layout ImportInventoryEntry constructor is back. \
+             `with_kind` is the only constructor; if a caller cannot supply a kind, it \
+             does not have the capability it needs to build an inventory entry."
+        );
     }
 }

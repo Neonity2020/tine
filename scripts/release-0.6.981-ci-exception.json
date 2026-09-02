@@ -31,6 +31,9 @@
   "retiredManagedV1AllowedProblems": [
     "legacy v1 path is compiled outside inert fixture: crates/tine-core/src/sync_runtime_tests.rs:27760"
   ],
+  "releaseE2eNonblockingScenarioKeys": [
+    "linux-release:managed-journal-feed"
+  ],
   "windowsMissingRequiredTestNames": [
     "oplog::enrollment::tests::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
     "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",

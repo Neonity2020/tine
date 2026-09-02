@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
 import { __setBackendForTest, type Backend } from "../backend";
@@ -7,6 +7,7 @@ import {
   openCommandPalette,
   openSwitcher,
   setRecentPages,
+  setGraphMeta,
   setRightSidebarOpen,
   rightSidebarOpen,
   switcherOpen,
@@ -91,11 +92,18 @@ const blockHit = {
   match_class: "substring",
 };
 
+beforeEach(() => {
+  // QuickSwitcher is graph-scoped in production. Give the render harness the
+  // same ownership token so create-row actions exercise their normal path.
+  setGraphMeta({ root: "/graphs/quick-switcher-test" } as never);
+});
+
 afterEach(() => {
   vi.useRealTimers();
   closeContextMenu();
   closeSwitcher();
   setRecentPages([]);
+  setGraphMeta(null);
   setRightSidebarOpen(false);
   __setBackendForTest(null);
   clearTransientLayersForTest();

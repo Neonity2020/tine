@@ -2,10 +2,10 @@ use serde_json::{json, Value};
 use tine_core::oplog::{
     AnnotatedIdentity, BatchId, BlobDescription, BlockId, CrdtPeerCounter, CrdtPeerId, DeviceId,
     DocumentDependencies, DocumentId, FrontierV2, ImportId, ImportInventoryEntry,
-    ImportInventoryState, ImportLocator, LogseqUuid, ManagedPath, PageId, PortablePathKey,
-    ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion, ProjectionIntent,
-    ProjectionPrecondition, ReceiptError, SessionId, StructuralLocator, StructuralSpan,
-    WorkspaceId, DIFF_SCHEMA_VERSION,
+    ImportInventoryState, ImportLocator, LogseqUuid, ManagedPath, ManagedTextKind, PageId,
+    PortablePathKey, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion,
+    ProjectionIntent, ProjectionPrecondition, ReceiptError, SessionId, StructuralLocator,
+    StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
 };
 use uuid::Uuid;
 
@@ -576,11 +576,13 @@ fn import_id_and_unmatched_ids_are_deterministic_and_domain_separated() {
                 .logical_completion_id(),
         ];
     let inventory = [
-        ImportInventoryEntry::new(
+        ImportInventoryEntry::with_kind(
+            ManagedTextKind::Journal,
             ManagedPath::parse("journals/2026_07_22.md").unwrap(),
             ImportInventoryState::Absent,
         ),
-        ImportInventoryEntry::new(
+        ImportInventoryEntry::with_kind(
+            ManagedTextKind::Page,
             ManagedPath::parse("pages/hello.md").unwrap(),
             ImportInventoryState::Present(BlobDescription::of(b"external bytes")),
         ),
@@ -627,7 +629,8 @@ fn import_id_and_unmatched_ids_are_deterministic_and_domain_separated() {
 
     let changed_inventory = [
         inventory[0].clone(),
-        ImportInventoryEntry::new(
+        ImportInventoryEntry::with_kind(
+            ManagedTextKind::Page,
             ManagedPath::parse("pages/hello.md").unwrap(),
             ImportInventoryState::Present(BlobDescription::of(b"different bytes")),
         ),
@@ -676,11 +679,13 @@ fn import_derivation_rejects_noncanonical_evidence() {
     ));
 
     let reversed_inventory = [
-        ImportInventoryEntry::new(
+        ImportInventoryEntry::with_kind(
+            ManagedTextKind::Page,
             ManagedPath::parse("pages/z.md").unwrap(),
             ImportInventoryState::Absent,
         ),
-        ImportInventoryEntry::new(
+        ImportInventoryEntry::with_kind(
+            ManagedTextKind::Page,
             ManagedPath::parse("pages/a.md").unwrap(),
             ImportInventoryState::Absent,
         ),

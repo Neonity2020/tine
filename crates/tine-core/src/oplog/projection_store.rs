@@ -89,17 +89,15 @@ const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = [
 
 /// The current private receipt-store claim.
 ///
-/// Sub-design (c) §1 (v19): the record format now carries an explicit
-/// target-kind discriminant, and the 0.7 blank-slate decision says pre-(c)
-/// stores are refused rather than migrated. The claim version IS that
-/// transition -- there is no dual acceptance, no legacy classification, and no
-/// migration apparatus. A pre-(c) magic falls into the store's existing
-/// recognized-and-refused convention below, carrying the re-activation remedy;
-/// the user's Markdown is untouched.
-const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR6\0";
-const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 3] = [b"TINEPR5\0", b"TINEPR4\0", b"TINEPR3\0"];
+/// The forensic evidence format now has exactly one decoder. The claim version
+/// is the containing-format boundary: a TINEPR6 store is recognized and
+/// refused before mutation, then the outer blank-slate lifecycle preserves the
+/// whole private root and rebuilds current authority from Markdown/Org.
+const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR7\0";
+const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 4] =
+    [b"TINEPR6\0", b"TINEPR5\0", b"TINEPR4\0", b"TINEPR3\0"];
 const STORE_INIT_MAGIC: &[u8; 8] = b"TINEPI5\0";
-const STORE_CLAIM_VERSION: u32 = 6;
+const STORE_CLAIM_VERSION: u32 = 7;
 const STORE_CLAIM_BASE_LEN: usize = STORE_CLAIM_MAGIC.len() + 4 + 32 + 16 + 1 + 16 + 16 + 32;
 /// The version-specific claim envelope length. A current-magic claim of any
 /// other length is malformed, never a shorter older format: this is what the
@@ -112,7 +110,6 @@ const MAX_PROJECTION_CATALOG_ROWS: usize = 2_000_000;
 const MAX_PROJECTION_CATALOG_DIRECTORY_ENTRIES: usize = 4_000_000;
 const LOCAL_ATTEMPT_SCHEMA_VERSION: u32 = 1;
 const LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 2;
-const PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 1;
 const PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_CLEANUP_ROUND_STATE_BYTES: u64 = 4 * 1024;
 const PENDING_CLEANUP_MARKER_SCHEMA_VERSION: u32 = 1;
@@ -5077,11 +5074,7 @@ fn decode_pending_cleanup_marker(
 }
 
 fn valid_local_forensic_version(record: &LocalProjectionEvidenceRecord) -> bool {
-    match record.schema_version {
-        PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION => record.recovery_resource_id.is_none(),
-        LOCAL_FORENSIC_SCHEMA_VERSION => true,
-        _ => false,
-    }
+    record.schema_version == LOCAL_FORENSIC_SCHEMA_VERSION
 }
 
 fn decode_local_forensic_record(
@@ -7125,11 +7118,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v1_forensic_evidence_decodes_but_never_authorizes_cleanup() {
+    fn canonical_v1_forensic_evidence_is_not_decoded_by_the_current_store() {
         let fixture = Fixture::new_replacement("v1-forensic-compatibility");
         let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
         let record = LocalProjectionEvidenceRecord {
-            schema_version: PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION,
+            schema_version: 1,
             intent_id: fixture.intent.id().unwrap(),
             attempt_id: reservation.attempt_id(),
             target_path: fixture.intent.path().clone(),
@@ -7162,17 +7155,31 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = fixture
-            .store
-            .local_forensic_evidence(&fixture.intent)
-            .unwrap();
-        assert_eq!(loaded, vec![record]);
-        assert!(!loaded[0].is_cleanup_bound());
+        assert!(matches!(
+            fixture.store.local_forensic_evidence(&fixture.intent),
+            Err(ProjectionStoreError::ForensicBindingMismatch)
+        ));
         assert!(fixture
             .store
             .pending_projection_cleanup()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn the_previous_claim_family_is_rejected_as_an_upgrade_boundary() {
+        assert_eq!(STORE_CLAIM_MAGIC, b"TINEPR7\0");
+        assert!(PRIOR_STORE_CLAIM_MAGICS.contains(&b"TINEPR6\0"));
+        let mut previous = Vec::new();
+        previous.extend_from_slice(b"TINEPR6\0");
+        previous.extend_from_slice(&6_u32.to_be_bytes());
+        assert!(matches!(
+            classify_precheck_claim(&previous),
+            Err(ProjectionStoreError::UpgradeRequired {
+                found: 6,
+                current: 7,
+            })
+        ));
     }
 
     #[test]

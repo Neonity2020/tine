@@ -15,9 +15,13 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 #[derive(Debug)]
-struct ProductionFile {
-    relative: String,
-    code: String,
+pub(crate) struct ProductionFile {
+    pub(crate) relative: String,
+    /// The file exactly as it is on disk, comments and all. Use this to assert
+    /// things about what the source *says*; use [`ProductionFile::code`] to
+    /// assert things about what it *does*.
+    pub(crate) raw: String,
+    pub(crate) code: String,
     compact: String,
 }
 
@@ -44,6 +48,13 @@ fn visit_source_extensions(directory: &Path, extensions: &[&str], files: &mut Ve
     for entry in fs::read_dir(directory).expect("native source directory is readable") {
         let path = entry.expect("native source entry is readable").path();
         if path.is_dir() {
+            // Tauri's Android codegen lands in a gitignored `generated/`
+            // sibling of the hand-written sources after any Android build;
+            // it is not shipped source and would make this guard depend on
+            // whether the checkout has ever built for Android.
+            if path.file_name().is_some_and(|name| name == "generated") {
+                continue;
+            }
             visit_source_extensions(&path, extensions, files);
         } else if path
             .extension()
@@ -219,16 +230,44 @@ fn code_mask(source: &str) -> String {
             None
         };
         if let Some(start) = char_start {
-            let mut cursor = index + usize::from(bytes[index] == b'b') + 1;
-            if bytes.get(cursor) == Some(&b'\\') {
-                cursor += 2;
-            } else {
-                cursor += 1;
-            }
-            if bytes.get(cursor) == Some(&b'\'') {
-                index = cursor + 1;
-                out[start..index].fill(b' ');
-                continue;
+            // The payload is NOT always one or two bytes. `'\\u{000d}'` and `'\\x41'`
+            // are variable-length escapes, and `'\u{00e9}'` written literally is
+            // multi-byte UTF-8. Assuming otherwise left the literal's own bytes --
+            // quote, braces, digits -- unmasked in `code`, so an occurrence inside
+            // an extracted function body would mis-count brace depth.
+            let cursor = index + usize::from(bytes[index] == b'b') + 1;
+            let payload_end = match bytes.get(cursor) {
+                Some(b'\\') => match bytes.get(cursor + 1) {
+                    // `\\u{XXXXXX}`: variable length, terminated by the brace.
+                    Some(b'u') if bytes.get(cursor + 2) == Some(&b'{') => bytes[cursor + 3..]
+                        .iter()
+                        .position(|byte| *byte == b'}')
+                        .map(|offset| cursor + 3 + offset + 1),
+                    // `\\xNN`: always two hex digits.
+                    Some(b'x') => Some(cursor + 4),
+                    // Every other escape is one character after the backslash.
+                    Some(_) => Some(cursor + 2),
+                    None => None,
+                },
+                // A literal character, possibly multi-byte UTF-8.
+                Some(_) => {
+                    let mut end = cursor + 1;
+                    while bytes
+                        .get(end)
+                        .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+                    {
+                        end += 1;
+                    }
+                    Some(end)
+                }
+                None => None,
+            };
+            if let Some(cursor) = payload_end {
+                if bytes.get(cursor) == Some(&b'\'') {
+                    index = cursor + 1;
+                    out[start..index].fill(b' ');
+                    continue;
+                }
             }
         }
         index += 1;
@@ -487,7 +526,56 @@ fn without_test_items(source: &str) -> String {
     String::from_utf8(bytes).expect("blanking preserves UTF-8")
 }
 
-fn production_rust() -> Vec<ProductionFile> {
+/// Every production Rust source in `tine-core` and `src-tauri`, with test items
+/// and comment/literal bytes masked out.
+///
+/// Shared with the rest of the crate so a "no production caller" / "only caller"
+/// claim anywhere can be asserted against the same definition of "production"
+/// this census uses, instead of each site inventing its own file scan.
+///
+/// The scan reads and syntax-parses the whole tree, so it is computed once per
+/// test process rather than once per assertion.
+pub(crate) fn production_rust() -> &'static [ProductionFile] {
+    static SCANNED: std::sync::OnceLock<Vec<ProductionFile>> = std::sync::OnceLock::new();
+    SCANNED.get_or_init(scan_production_rust)
+}
+
+/// Every Rust source in the two crates the census walks, tests included, as
+/// `(repository-relative path, raw source)`.
+///
+/// [`production_rust`] deliberately drops test-only files; a guard that has to
+/// ask "does the thing this comment names exist anywhere?" needs them back.
+pub(crate) fn repository_rust_sources() -> &'static [(String, String)] {
+    static SCANNED: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    SCANNED.get_or_init(|| {
+        let repo = repository_root();
+        let mut paths = Vec::new();
+        for root in [
+            repo.join("crates/tine-core/src"),
+            repo.join("crates/tine-core/tests"),
+            repo.join("src-tauri/src"),
+        ] {
+            if root.is_dir() {
+                visit_rs(&root, &mut paths);
+            }
+        }
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let relative = path
+                    .strip_prefix(&repo)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = fs::read_to_string(&path).expect("Rust source is readable");
+                (relative, source)
+            })
+            .collect()
+    })
+}
+
+fn scan_production_rust() -> Vec<ProductionFile> {
     let repo = repository_root();
     let roots = [
         repo.join("crates/tine-core/src"),
@@ -530,6 +618,7 @@ fn production_rust() -> Vec<ProductionFile> {
                 .collect();
             ProductionFile {
                 relative,
+                raw: source,
                 code,
                 compact,
             }
@@ -706,7 +795,8 @@ fn inventory_digest(inventory: &[(String, String, usize)]) -> String {
         .collect()
 }
 
-fn call_count(files: &[ProductionFile], name: &str) -> usize {
+/// How many times production code calls `name`, not counting its definition.
+pub(crate) fn call_count(files: &[ProductionFile], name: &str) -> usize {
     let call = format!("{name}(");
     let definition = format!("fn {name}(");
     files
@@ -773,7 +863,7 @@ fn function_bodies<'a>(files: &'a [ProductionFile], name: &str) -> Vec<&'a str> 
 #[test]
 fn g_a_mutation_primitive_counts_are_pinned_per_file() {
     let actual = token_inventory(
-        &production_rust(),
+        production_rust(),
         &[
             ("cap.rename", ".rename("),
             ("cap.remove_file", ".remove_file("),
@@ -828,6 +918,31 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ),
         ("crates/tine-core/src/concord_ledger.rs", "fs.rename", 1),
         ("crates/tine-core/src/concord_ledger.rs", "fs.write", 1),
+        // The Direct cross-page move recovery store (packet B2). Its GRAPH
+        // writes are not here because they are not raw primitives: every page
+        // byte it publishes goes through `model::atomic_write`, which is why
+        // this file appears in the `atomic_write` caller count below. What is
+        // left is the app-private store's own housekeeping — creating its three
+        // subdirectories, retiring a record, dropping an unreferenced blob,
+        // quarantining a malformed record — plus the one primitive an atomic
+        // write cannot express: removing a page file when rolling a move back
+        // to "this page did not exist". See
+        // `docs/contracts/direct-move-recovery.md`.
+        (
+            "crates/tine-core/src/direct_move_recovery.rs",
+            "fs.create_dir_all",
+            5,
+        ),
+        (
+            "crates/tine-core/src/direct_move_recovery.rs",
+            "fs.remove_file",
+            4,
+        ),
+        (
+            "crates/tine-core/src/direct_move_recovery.rs",
+            "fs.rename",
+            1,
+        ),
         (
             "crates/tine-core/src/direct_projection.rs",
             "fs.create_dir_all",
@@ -883,7 +998,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/model.rs", "cap.remove_file", 26),
         ("crates/tine-core/src/model.rs", "cap.rename", 1),
         ("crates/tine-core/src/model.rs", "fs.create_dir", 8),
-        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 16),
+        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 15),
         ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 2),
         ("crates/tine-core/src/model.rs", "fs.remove_file", 16),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
@@ -896,11 +1011,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/onboarding.rs", "fs.create_dir_all", 4),
-        (
-            "crates/tine-core/src/oplog/enrollment.rs",
-            "cap.create_dir",
-            1,
-        ),
         ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
         (
             "crates/tine-core/src/oplog/import.rs",
@@ -1041,7 +1151,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/oplog/sqlite.rs", "open.create", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "open.create_new", 1),
         ("crates/tine-core/src/oplog/wire.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/oplog/wire.rs", "cap.remove_file", 8),
+        ("crates/tine-core/src/oplog/wire.rs", "cap.remove_file", 9),
         ("crates/tine-core/src/oplog/wire.rs", "cap.rename", 8),
         ("crates/tine-core/src/oplog/wire.rs", "file.set_len", 1),
         ("crates/tine-core/src/oplog/wire.rs", "fs.create_dir_all", 2),
@@ -1084,6 +1194,13 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/backup.rs", "libc.renameat2", 1),
         ("src-tauri/src/backup.rs", "open.create_new", 3),
         ("src-tauri/src/commands.rs", "cap.remove_file", 1),
+        // Packet B3: the app-private live-save conflict envelope. Its
+        // directory is created before the audited atomic replacement, torn
+        // temporaries and the retired final file are removed, and an
+        // unreadable envelope is renamed aside rather than deleted.
+        ("src-tauri/src/conflict_capsule.rs", "fs.create_dir_all", 1),
+        ("src-tauri/src/conflict_capsule.rs", "fs.remove_file", 2),
+        ("src-tauri/src/conflict_capsule.rs", "fs.rename", 1),
         ("src-tauri/src/data_home.rs", "fs.create_dir_all", 1),
         ("src-tauri/src/data_home.rs", "fs.remove_file", 1),
         ("src-tauri/src/data_home.rs", "fs.write", 1),
@@ -1121,17 +1238,13 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             4,
         ),
         ("src-tauri/src/migrate_identifier.rs", "fs.rename", 4),
-        ("src-tauri/src/plugins.rs", "fs.create_dir", 1),
-        ("src-tauri/src/plugins.rs", "fs.create_dir_all", 2),
-        ("src-tauri/src/plugins.rs", "fs.remove_dir", 1),
-        ("src-tauri/src/plugins.rs", "fs.remove_dir_all", 2),
-        ("src-tauri/src/plugins.rs", "fs.rename", 1),
-        ("src-tauri/src/plugins.rs", "fs.write", 2),
+        // Packet B5p moved every plugin-package mutation behind tine-storage's
+        // package protocol (see g_d); `plugins.rs` has no raw primitive left.
         ("src-tauri/src/settings.rs", "fs.create_dir_all", 3),
-        ("src-tauri/src/settings.rs", "fs.remove_file", 1),
-        ("src-tauri/src/settings.rs", "fs.rename", 3),
-        ("src-tauri/src/settings.rs", "fs.write", 1),
-        ("src-tauri/src/settings.rs", "open.create_new", 1),
+        // Packet B5s collapses the settings, workspace, and session publishers
+        // onto the shared atomic writer. Only the audited legacy-session move
+        // still needs a raw rename in this file.
+        ("src-tauri/src/settings.rs", "fs.rename", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir", 1),
         ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 3),
         ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 3),
@@ -1219,7 +1332,16 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("rename_projection_noreplace_platform", 1),
         ("rename_managed_noreplace", 3),
         ("atomic_publish", 2),
-        ("atomic_write", 6),
+        // +4 from `direct_move_recovery.rs` (packet B2): the record, each
+        // content-addressed image blob, a quarantined record, and every page a
+        // recovery completes or rolls back. Recovery writes graph bytes through
+        // the SAME named audited protocol an ordinary save uses.
+        // +2 from `settings.rs` (packet B5s): the workspace registry and scoped
+        // session saves now use that same named audited protocol.
+        // +1 from `src-tauri/src/conflict_capsule.rs` (packet B3): the
+        // app-private live-save conflict envelope is replaced whole through
+        // the same named audited protocol.
+        ("atomic_write", 13),
         ("atomic_write_new", 11),
         ("atomic_replace_expected_with_hooks", 1),
         ("atomic_copy", 0),
@@ -1255,7 +1377,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("install_staged_artifact", 1),
         ("replace_head", 0),
         ("ensure_shared_provider_directory", 4),
-        ("put_complete", 2),
+        ("put_complete", 1),
         ("provider_retire_original_into_placeholder", 1),
         ("write_config", 9),
         ("atomic_update", 4),
@@ -1391,11 +1513,11 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
         "#[cfg(all(target_os=\"android\",debug_assertions))]modandroid_managed_storage_smoke;"
     ));
     let folding_callers = files
-        .into_iter()
+        .iter()
         .filter_map(|file| {
             let count = identifier_occurrences(&file.code, "graph_name_folding(")
                 - file.code.matches("fn graph_name_folding(").count();
-            (count != 0).then_some((file.relative, count))
+            (count != 0).then_some((file.relative.clone(), count))
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1429,6 +1551,9 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             ("journal.fast_append", "self.segment.append("),
             ("journal.managed_append", ".append(payload_kind,payload)"),
             ("journal.turn_append", "self.journal.append("),
+            ("package.publish", "publish_package_noclobber("),
+            ("package.recover", "recover_package_store("),
+            ("package.retire", "retire_package("),
         ],
     );
     let expected = [
@@ -1439,6 +1564,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ),
         ("crates/tine-core/src/fast_commit.rs", "journal.v1.open", 1),
         ("crates/tine-core/src/model.rs", "durable_directory.open", 5),
+        // Packet A5: the disposable clean-open checkpoint publishes its two
+        // slots and commit pointer through one durable directory.
+        (
+            "crates/tine-core/src/oplog/checkpoint_generation.rs",
+            "durable_directory.open",
+            1,
+        ),
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
@@ -1495,6 +1627,9 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             "journal.v2.prepare",
             1,
         ),
+        ("src-tauri/src/plugins.rs", "package.publish", 1),
+        ("src-tauri/src/plugins.rs", "package.recover", 1),
+        ("src-tauri/src/plugins.rs", "package.retire", 1),
     ]
     .into_iter()
     .map(|(path, boundary, count)| (path.to_owned(), boundary.to_owned(), count))
@@ -1509,11 +1644,63 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.11.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.12.0\""));
+    // Re-pinned 2026-09-02 (wave-2 fix-ups): packet A5 added
+    // `checkpoint_generation.rs` (one `DurableDirectoryPublication::open`)
+    // without updating this census, so master 7623fb76 was red here.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "9ef9a144697760038b8d607ead9cf5c667d7883e0a54b158b59a7188943dea2c",
+        "1de0036d4d96794366ef120ab4428d9c1898f732bf2b8bf08ada78da26f0dd23",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
+    );
+}
+
+/// Lane evidence never enters the tracked tree at the repository root.
+///
+/// Wave-2 lanes committed `RECEIPT*.md`, `baseline-*.txt`, `necessity-*.txt`
+/// and a fail-before log at the root; every lane wrote the same `RECEIPT.md`
+/// name, so the merges destroyed four receipts, and the surviving files leaked
+/// private worktree paths and dossier names to both public remotes. Lanes still
+/// write their receipt and baselines to the worktree root (a workspace-write
+/// lane cannot reach outside it), but those files stay UNTRACKED — `.gitignore`
+/// carries the patterns — and the manager archives them under
+/// `tine-agents/evidence/` before integration. This guard checks the tracked
+/// set, so an in-flight lane's untracked receipt does not trip it.
+#[test]
+fn g_h_repository_root_tracks_no_lane_evidence() {
+    let repo = repository_root();
+    let ignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
+    for pattern in [
+        "/RECEIPT*.md",
+        "/baseline-*.txt",
+        "/necessity-*.txt",
+        "/*-fail-before.log",
+    ] {
+        assert!(
+            ignore.lines().any(|line| line.trim() == pattern),
+            ".gitignore lost the lane-evidence pattern {pattern}"
+        );
+    }
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "ls-files",
+            "--",
+            "RECEIPT*.md",
+            "baseline-*.txt",
+            "necessity-*.txt",
+            "*-fail-before.log",
+        ])
+        .output()
+    else {
+        return; // no git on this machine: the .gitignore half still holds
+    };
+    let tracked = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        tracked.trim().is_empty(),
+        "lane evidence is tracked at the repository root; move it under \
+         tine-agents/evidence/ and `git rm` it:\n{tracked}"
     );
 }
 
@@ -1693,7 +1880,7 @@ fn g_f_graph_path_process_handoffs_are_pinned() {
 fn g_g_user_selected_report_writes_stay_on_the_atomic_family() {
     let repo = repository_root();
     let save_dialogs = token_inventory(
-        &production_rust(),
+        production_rust(),
         &[("dialog.blocking_save_file", ".blocking_save_file(")],
     );
     assert_eq!(
@@ -1774,6 +1961,36 @@ fn ms14b_retired_patricia_and_detached_bootstrap_routes_are_absent() {
 }
 
 #[test]
+fn code_mask_masks_variable_length_character_literals() {
+    // `'\u{0009}'..='\u{000d}'` appears verbatim in production sources. The
+    // char-literal branch used to assume a one-or-two-byte payload, so NONE of
+    // these bytes were masked -- the braces and digits reached `code`, and a
+    // brace inside an extracted function body mis-counts depth.
+    let source = "const R: RangeInclusive<char> = '\\u{0009}'..='\\u{000d}';\nlet b = '\\x41';\nlet e = '\u{00e9}';\nlet n = '\\n';\n";
+    let masked = code_mask(source);
+
+    assert_eq!(masked.len(), source.len(), "the mask must preserve offsets");
+    assert!(
+        !masked.contains('{'),
+        "unmasked char-literal brace: {masked}"
+    );
+    assert!(
+        !masked.contains('}'),
+        "unmasked char-literal brace: {masked}"
+    );
+    assert!(!masked.contains("0009"));
+    assert!(!masked.contains("000d"));
+    assert!(!masked.contains("x41"));
+    assert!(
+        !masked.contains('\u{00e9}'),
+        "unmasked multi-byte char literal"
+    );
+    // Code around the literals survives.
+    assert!(masked.contains("const R: RangeInclusive<char> ="));
+    assert!(masked.contains("..="));
+}
+
+#[test]
 fn syntax_aware_test_mask_handles_items_fields_locals_and_expressions() {
     let source = r#"
         #[cfg(test)] fn omitted_item() { fs::write("x", b"x"); }
@@ -1805,18 +2022,121 @@ fn census_guard_itself_names_every_required_guard() {
         .filter_map(|line| line.trim().strip_prefix("fn g_"))
         .filter_map(|line| line.split_once('(').map(|(name, _)| name))
         .collect::<BTreeSet<_>>();
-    assert_eq!(tests.len(), 7);
+    assert_eq!(tests.len(), 8);
     let prefixes = tests
         .iter()
         .map(|name| name.split('_').next().unwrap())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         prefixes,
-        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g"])
+        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g", "h"])
     );
     assert!(
         include_str!("oplog/mod.rs")
             .contains("fn oplog_external_module_surface_is_exactly_the_named_consumers()"),
         "G-14b-a public oplog surface guard must remain present"
+    );
+}
+
+/// I-11 guard: a comment may not point at another file by line number.
+///
+/// Line numbers in one file are invalidated by an edit in another, silently and
+/// without a compiler or test noticing. The 2026-09 sweep found this exact rot:
+/// `object_store.rs` and `sqlite.rs` both cited `hot_engine.rs:13120-13127` as
+/// the batch-acceptance gate. That range holds unrelated projection-manifest
+/// encoding today, and the function the same sentence named,
+/// `accept_batch_at_history`, no longer exists anywhere in the crate. Cite the
+/// type, function or module by name instead — a name that disappears is at
+/// least greppable, and often a compile error.
+#[test]
+fn production_comments_cite_names_not_line_numbers() {
+    /// Immutable published third-party sources are addressable by line because
+    /// the exact version is pinned in the same citation.
+    const PINNED_EXTERNAL_CITATIONS: &[(&str, &str)] =
+        &[("src-tauri/src/ios_folder_picker.rs", "tauri-2.11.2")];
+
+    let mut offenders = Vec::new();
+    for file in production_rust() {
+        for (number, line) in file.raw.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("//") || trimmed.starts_with("/*")) {
+                continue;
+            }
+            if PINNED_EXTERNAL_CITATIONS
+                .iter()
+                .any(|(path, marker)| file.relative == *path && line.contains(marker))
+            {
+                continue;
+            }
+            let bytes = line.as_bytes();
+            let cites_a_line = line.match_indices(".rs:").any(|(index, _)| {
+                bytes
+                    .get(index + 4)
+                    .is_some_and(|byte| byte.is_ascii_digit())
+                    && bytes[..index]
+                        .last()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            });
+            if cites_a_line {
+                offenders.push(format!("{}:{}: {}", file.relative, number + 1, trimmed));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these comments cite another file by line number, which rots the moment that \
+         file is edited and no gate notices (invariant I-11: code does not lie about \
+         itself). Cite the type/function/module by name instead. Offenders:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// I-11 guard: a comment may not name a test that does not exist.
+///
+/// A comment saying that some named guard "is the architectural fact that says
+/// so" is a promise that the guard is running. The 2026-09 sweep found two comments pointing at
+/// `no_production_path_appends_a_turn` and
+/// `no_production_path_opens_or_appends_a_projection_turn` — neither had ever
+/// existed, and both were asserting that nothing in production opened the
+/// projection-turn journal while `sync_runtime.rs` was opening and draining it.
+/// A named guard is only worth citing if citing it is checked.
+#[test]
+fn comments_that_cite_a_test_name_a_test_that_exists() {
+    let sources = repository_rust_sources();
+    let mut offenders = Vec::new();
+    for (relative, source) in sources {
+        for (number, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("//") || trimmed.starts_with("*")) {
+                continue;
+            }
+            for (index, _) in line.match_indices("tests::") {
+                let cited = line[index + "tests::".len()..]
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect::<String>();
+                if cited.is_empty() {
+                    continue;
+                }
+                let defined = sources.iter().any(|(_, other)| {
+                    other.contains(&format!("fn {cited}("))
+                        || other.contains(&format!("mod {cited} "))
+                        || other.contains(&format!("mod {cited};"))
+                });
+                if !defined {
+                    offenders.push(format!("{relative}:{}: tests::{cited}", number + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these comments cite a test or test module that does not exist anywhere in the \
+         crate, so the architectural fact they promise is not actually being asserted \
+         (invariant I-11: code does not lie about itself). Write the guard, or cite the \
+         one that really covers the claim. Offenders:\n{}",
+        offenders.join("\n")
     );
 }

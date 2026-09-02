@@ -449,6 +449,26 @@ pub(crate) fn concord_ledger_dir(
     Some(data_dir.join("concord-ledger").join(root_backup_id(root)))
 }
 
+/// The Direct-move recovery store for a graph root
+/// (`<app-data>/direct-move-recovery/<id>`, the same root-id convention as
+/// backups and the Concord ledger).
+///
+/// App-private and graph-keyed, deliberately OUTSIDE the graph tree: the graph
+/// directory is Logseq-shared surface and a sync transport carries it, so a
+/// device's in-flight move record must never travel with it
+/// (`docs/contracts/direct-move-recovery.md` §2).
+pub(crate) fn direct_move_recovery_dir(
+    app: &tauri::AppHandle,
+    root: &std::path::Path,
+) -> Option<PathBuf> {
+    let data_dir = app.path().app_data_dir().ok()?;
+    Some(
+        data_dir
+            .join("direct-move-recovery")
+            .join(root_backup_id(root)),
+    )
+}
+
 #[tauri::command]
 pub(crate) async fn list_backups(
     app: tauri::AppHandle,

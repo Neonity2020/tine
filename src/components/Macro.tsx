@@ -33,6 +33,7 @@ import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
 import { blockDtoExternalId } from "../blockIdentity";
+import { ExternalLink } from "./ExternalLink";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
 
@@ -1090,7 +1091,7 @@ export function VideoMacro(props: { body: string }): JSX.Element {
       fallback={
         <Show
           when={/\.(mp4|webm|ogg)(\?|$)/i.test(url())}
-          fallback={<a class="external-link" href={url()} target="_blank" rel="noreferrer">{url()}</a>}
+          fallback={<ExternalLink class="external-link" dest={url()} target="_blank" rel="noreferrer">{url()}</ExternalLink>}
         >
           <video class="embed-video" src={url()} controls />
         </Show>
@@ -1108,9 +1109,9 @@ export function VideoMacro(props: { body: string }): JSX.Element {
 export function TweetMacro(props: { body: string }): JSX.Element {
   const url = () => props.body.replace(/^(tweet|twitter)\s*/i, "").trim();
   return (
-    <a class="external-link tweet-link" href={url()} target="_blank" rel="noreferrer">
+    <ExternalLink class="external-link tweet-link" dest={url()} target="_blank" rel="noreferrer">
       🐦 {url()}
-    </a>
+    </ExternalLink>
   );
 }
 

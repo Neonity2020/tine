@@ -27,7 +27,7 @@ import {
 } from "./store";
 import { pushToast } from "./ui";
 import type { OutlineNode } from "./editor/outline";
-import { managedStorageRuntime } from "./managedStorageRuntime";
+import { dispatchDroppedFileInsertion } from "./storageDispatch";
 
 const MAX_DROPPED_CELLS = 5000;
 
@@ -141,46 +141,50 @@ async function insertDroppedFilesDirect(afterId: string, paths: readonly string[
  * sequential IO and unbounded page behavior. */
 export async function insertDroppedFiles(afterId: string, paths: readonly string[]): Promise<void> {
   try {
-    const authority = managedStorageRuntime.snapshot().applicationPageAdmission;
-    if (authority?.authority === "direct") {
-      await insertDroppedFilesDirect(afterId, paths);
-      return;
-    }
-    if (!authority || authority.authority !== "managed_writable") {
-      const admission = preflightManagedBulkInsertion(afterId, () => ({
-        insertedDescendants: 0,
-        removedOrReusedDescendants: 0,
-        insertionRootDepth: depthOf(afterId) + 1,
-        maximumInputRelativeDepth: 0,
-        insertedRawTextUtf8Bytes: 0,
-      }));
-      if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
-      return;
-    }
+    // Authority is selected once, by the dispatcher (I-6). The three arms are
+    // the arms this function always had, including the unavailable arm's report
+    // through the managed bulk-insertion preflight rather than a shared toast.
+    await dispatchDroppedFileInsertion<void>(
+      { afterId, paths },
+      {
+        direct: () => insertDroppedFilesDirect(afterId, paths),
+        unavailable: () => {
+          const admission = preflightManagedBulkInsertion(afterId, () => ({
+            insertedDescendants: 0,
+            removedOrReusedDescendants: 0,
+            insertionRootDepth: depthOf(afterId) + 1,
+            maximumInputRelativeDepth: 0,
+            insertedRawTextUtf8Bytes: 0,
+          }));
+          if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
+        },
+        managed: async () => {
+          const plan = await planManagedDrop(paths);
+          if (!plan.length) return;
+          const plannedNodes = plan.map((item): OutlineNode => item.kind === "grid"
+            ? item.node
+            // Generated asset filename/path bytes are actor-authoritative. The one
+            // reference node is still a certain block-count fact before import.
+            : { raw: "", children: [] });
+          const admission = preflightManagedBulkInsertion(afterId, (limits) => managedBulkOutlinePlan(
+            plannedNodes,
+            depthOf(afterId) + 1,
+            0,
+            limits,
+          ));
+          if (admission.kind === "refused") {
+            reportManagedBulkInsertionRefusal(admission.toast);
+            return;
+          }
 
-    const plan = await planManagedDrop(paths);
-    if (!plan.length) return;
-    const plannedNodes = plan.map((item): OutlineNode => item.kind === "grid"
-      ? item.node
-      // Generated asset filename/path bytes are actor-authoritative. The one
-      // reference node is still a certain block-count fact before import.
-      : { raw: "", children: [] });
-    const admission = preflightManagedBulkInsertion(afterId, (limits) => managedBulkOutlinePlan(
-      plannedNodes,
-      depthOf(afterId) + 1,
-      0,
-      limits,
-    ));
-    if (admission.kind === "refused") {
-      reportManagedBulkInsertionRefusal(admission.toast);
-      return;
-    }
-
-    const nodes = await materializeManagedDrop(afterId, plan);
-    if (!nodes.length) return;
-    if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, afterId)) return;
-    withUndoUnit("file-drop", [doc.byId[afterId].page], () => insertOutlineAfter(afterId, nodes));
-    pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
+          const nodes = await materializeManagedDrop(afterId, plan);
+          if (!nodes.length) return;
+          if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, afterId)) return;
+          withUndoUnit("file-drop", [doc.byId[afterId].page], () => insertOutlineAfter(afterId, nodes));
+          pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
+        },
+      },
+    );
   } catch (e) {
     pushToast(`Couldn't insert dropped file: ${String(e)}`, "error");
   }

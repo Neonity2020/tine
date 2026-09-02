@@ -10,6 +10,8 @@ import {
 import { onPageBecameReplaceable, resetStore, sweepReplaceable } from "./store";
 import { managedStorageRuntime } from "./managedStorageRuntime";
 import { setToasts, toasts } from "./ui";
+import { setGraphMeta } from "./ui";
+import { resetSaveState } from "./persistence";
 
 // Concord P5 (L0): when the OS or filesystem gave us no event — a network
 // mount, a sync client writing through a path the kernel doesn't report, an app
@@ -18,14 +20,18 @@ import { setToasts, toasts } from "./ui";
 // net plus one backend stat diff whose findings arrive as ordinary
 // graph-changed events. Nothing here touches a page directly.
 
+const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 beforeEach(() => {
   resetFocusRescanThrottle();
+  setGraphMeta({ root: "/graphs/A" } as never);
   setToasts([]);
 });
 
 afterEach(() => {
   managedStorageRuntime.clear();
   setToasts([]);
+  setGraphMeta(null);
   installFocusFreshnessVerifier(async () => {});
   vi.restoreAllMocks();
   resetStore();
@@ -89,6 +95,46 @@ describe("reload on focus", () => {
     release();
     await refresh;
     expect(completed).toBe(true);
+  });
+
+  it("coalesces a same-graph focus during an in-flight rescan into that rescan", async () => {
+    // Fail-before (wave-2 review D2): the replacement decision was made after
+    // the in-flight refresh settled and nulled its binding, so every coalesced
+    // same-graph focus scheduled a second full stat-diff of the graph.
+    let finish!: (sequence: number) => void;
+    const rescan = vi.spyOn(backend(), "rescanGraphNow")
+      .mockImplementation(() => new Promise<number>((resolve) => { finish = resolve; }));
+
+    const first = refreshOnReturnToWindow(100_000);
+    await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(1));
+    const second = refreshOnReturnToWindow(100_001);
+    finish(1);
+    await first;
+    await second;
+    await flushMicrotasks();
+
+    expect(rescan).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops the old graph tail and queues one non-overlapping refresh for the new binding", async () => {
+    let finishOld!: (sequence: number) => void;
+    const rescan = vi.spyOn(backend(), "rescanGraphNow")
+      .mockImplementationOnce(() => new Promise<number>((resolve) => { finishOld = resolve; }))
+      .mockResolvedValueOnce(2);
+    const verifier = vi.fn(async () => {});
+    installFocusFreshnessVerifier(verifier);
+
+    const old = refreshOnReturnToWindow(100_000);
+    await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(1));
+    resetSaveState();
+    setGraphMeta({ root: "/graphs/B" } as never);
+    const replacement = refreshOnReturnToWindow(100_001);
+    finishOld(1);
+
+    await old;
+    await replacement;
+    await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(2));
+    expect(verifier).toHaveBeenCalledTimes(1);
   });
 
   it("fires on window focus and on becoming visible, never while hidden", async () => {

@@ -23,7 +23,13 @@ import {
   onMount,
   type JSX,
 } from "solid-js";
-import { backend } from "../backend";
+import {
+  backend,
+  isSaveConflictError,
+  resolveConflictCapsule,
+  reviewConflictCapsule,
+  type ConflictCapsuleAuthority,
+} from "../backend";
 import { openFile } from "../router";
 import { ConflictFileRow } from "./JournalConflictFileRow";
 import {
@@ -34,6 +40,7 @@ import {
   refreshSyncConflicts,
   refreshJournalConflicts,
   journalConflicts,
+  retireLiveSaveConflict,
   settleArtifactConflict,
   updateLiveSaveConflictDiskRev,
 } from "../ui";
@@ -62,6 +69,13 @@ import {
   seedSuggestedOrNoLoss,
 } from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
+
+function errorDetail(error: unknown): string {
+  // Tauri rejects a `Result<T, String>` with the bare string; keep its text.
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return "unexpected error";
+}
 
 function unsupportedConflictSource(source: never): never {
   throw new Error(`unsupported conflict source: ${String(source)}`);
@@ -219,7 +233,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       pushToast(ok, "success");
       await refreshJournalConflicts();
     } catch (e) {
-      pushToast(`Couldn’t do that: ${String(e)}`, "error");
+      pushToast(`Couldn’t do that: ${errorDetail(e)}`, "error");
     }
   };
   const trashDayFile = async (name: string) => {
@@ -233,23 +247,28 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
 
   // Load the diff from whichever source this object came from. Both return the
   // same `SyncConflictDiff`, so everything downstream is source-agnostic.
+  const [capsuleAuthority, setCapsuleAuthority] =
+    createSignal<ConflictCapsuleAuthority | null>(null);
   const [diff, { refetch }] = createResource<SyncConflictDiff | null, string>(
     () => `${conflict().id}:${conflict().live?.draft_version ?? 0}`,
     async () => {
       const c = conflict();
+      setCapsuleAuthority(null);
       switch (c.source) {
         case "live-save": {
           const live = c.live;
           if (!live) return null;
-          const result = live.disk_rev !== undefined
-            ? await backend().durableLiveSaveConflictDiff(live.page, live.base_text ?? null)
-            : await backend().liveSaveConflictDiff(
-                live.page,
-                live.base_rev,
-                live.conflict_epoch,
-              );
-          updateLiveSaveConflictDiskRev(c.page_name, result.conflict_rev);
-          return result;
+          const review = await reviewConflictCapsule(c);
+          setCapsuleAuthority(review.authority);
+          // A Direct capsule captured without durable recovery (the capture
+          // fallback) carries only a session-scoped observation epoch, which is
+          // dead after a restart. Pin the reviewed disk revision on it so the
+          // restored capsule re-observes the file durably instead of replaying
+          // that epoch (this is what the pre-capsule resource did).
+          if (review.authority.kind === "direct_live") {
+            void updateLiveSaveConflictDiskRev(c.page_name, review.diff.conflict_rev);
+          }
+          return review.diff;
         }
         case "vcs-markers": {
           const parsed = await backend().vcsMarkerConflictDiff(c.page_path);
@@ -397,7 +416,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           return;
         }
         if (!live.restored && snapshot(reviewedDraft) !== snapshot(live.page)) {
-          refreshLiveSaveConflictDraft(reviewedDraft);
+          await refreshLiveSaveConflictDraft(reviewedDraft);
           alignment = undefined;
           void refetch();
           pushToast("Your draft changed. Review the updated comparison, then apply it again.", "info");
@@ -405,20 +424,18 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         }
         const draftToResolve = live.restored ? live.page : reviewedDraft;
         releasePageSaves = holdManagedMovePages([pageName]);
-        const resolved = live.disk_rev !== undefined
-          ? await backend().resolveDurableLiveSaveConflict(
-            draftToResolve,
-            live.disk_rev,
-            decisions(),
-            preChoice(),
-          )
-          : await backend().resolveLiveSaveConflict(
-            draftToResolve,
-            live.base_rev,
-            live.conflict_epoch,
-            decisions(),
-            preChoice(),
-          );
+        const authority = capsuleAuthority();
+        if (!authority) {
+          void refetch();
+          pushToast("The conflict owner must be observed again before applying.", "info");
+          return;
+        }
+        const resolved = await resolveConflictCapsule(
+          { ...conflict(), live: { ...live, page: draftToResolve } },
+          authority,
+          decisions(),
+          preChoice(),
+        );
         if (
           pageInstanceGeneration(pageName) !== instance
           || editGeneration(pageName) !== edit
@@ -426,12 +443,10 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
         ) {
           throw new Error("the resolved file was committed, but the open editor changed; reopen the page to load the exact result");
         }
-        // The guarded native command is the durable resolution boundary. Clear
-        // the capsule there, before editor replacement waits to retire the old
-        // activation: retirement can be slow, but it must not keep presenting a
-        // conflict whose merged bytes are already committed. The returned DTO
-        // is the exact page written, so installing it cannot invent another
-        // version even if that retirement finishes later.
+        // The guarded native command is the durable resolution boundary. Retire
+        // the capsule before acknowledging or replacing the editor, so a crash
+        // immediately after the click cannot resurrect a resolved conflict.
+        await retireLiveSaveConflict(pageName);
         dropObservation(pageName);
         clearConflict(pageName);
         await reloadPage(resolved);
@@ -539,7 +554,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       // still has one left to reconcile after this fold.
       if (source === "duplicate-journal") void refreshJournalConflicts();
     } catch (e) {
-      if (String(e).includes("conflict")) {
+      if (isSaveConflictError(e)) {
         pushToast("The file changed on disk — re-reading it, please redo your choices.", "error");
         alignment = undefined;
         if (source === "live-save") {
@@ -549,7 +564,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           void refetch();
         }
       } else {
-        pushToast(`Couldn’t resolve it: ${String(e)}`, "error");
+        pushToast(`Couldn’t resolve it: ${errorDetail(e)}`, "error");
       }
     } finally {
       releasePageSaves();
@@ -743,7 +758,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
                   when={conflict().source === "vcs-markers"}
                   fallback={
                     conflict().source === "live-save"
-                      ? <>The resolved page is saved through the same guarded Direct Files path.</>
+                      ? <>The resolved page is saved through the active storage mode’s guarded semantic path.</>
                       : conflict().source === "duplicate-journal"
                         ? <>The other file moves to the recoverable trash once this is applied, leaving the day one file.</>
                         : <>The copy moves to the recoverable trash once this is applied.</>

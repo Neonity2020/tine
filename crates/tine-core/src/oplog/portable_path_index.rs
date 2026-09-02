@@ -183,7 +183,7 @@ impl PortablePathRecord {
                 .as_ref()
                 .is_some_and(|release| release.prior_exact_path.portable_key().digest() != expected)
         {
-            return Err(StoreError::MalformedLogseqClaimIndex);
+            return Err(StoreError::MalformedPortablePathIndex);
         }
         Ok(())
     }
@@ -194,4 +194,48 @@ fn exact_path_digest(path: &ManagedPath) -> ContentDigest {
     bytes.extend_from_slice(&(path.as_str().len() as u64).to_be_bytes());
     bytes.extend_from_slice(path.as_str().as_bytes());
     ContentDigest::of(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This validator used to report `StoreError::MalformedLogseqClaimIndex`,
+    /// so a portable-path record that failed its own schema/digest check
+    /// surfaced to logs and refusal classification as "authenticated Logseq
+    /// claim index is malformed" — a different index, with a different owner,
+    /// that has no producer at all. Borrowing a neighbouring module's error is
+    /// how a diagnostic starts lying; keep this file's refusals named after
+    /// this file's index.
+    #[test]
+    fn a_malformed_portable_path_record_reports_a_portable_path_error() {
+        let source = include_str!("portable_path_index.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+        for (index, line) in production.lines().enumerate() {
+            let Some((_, rest)) = line.split_once("StoreError::") else {
+                continue;
+            };
+            let variant = rest
+                .trim_end_matches(&[',', ')', ';'][..])
+                .split(|character: char| !character.is_alphanumeric())
+                .next()
+                .unwrap_or_default();
+            assert!(
+                variant.contains("PortablePath"),
+                "line {} refuses with StoreError::{variant}, which names a different \
+                 index than the one this file validates. A caller reading that error — or \
+                 a refusal classifier switching on it — would be told the wrong thing \
+                 (invariant I-11: code does not lie about itself).",
+                index + 1
+            );
+        }
+
+        assert_eq!(
+            StoreError::MalformedPortablePathIndex.to_string(),
+            "authenticated portable-path index is malformed or non-canonical"
+        );
+    }
 }

@@ -68,6 +68,16 @@ import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
 import { recordGraphOpenCommand } from "./graphOpenTrace";
 
+export type ConflictCapsuleAuthority =
+  | { kind: "direct_durable"; expected_disk_rev: string }
+  | { kind: "direct_live"; conflict_epoch: number }
+  | { kind: "managed"; path: string; revision: string };
+
+export interface ConflictCapsuleReview {
+  diff: SyncConflictDiff;
+  authority: ConflictCapsuleAuthority;
+}
+
 // Encode asset bytes as one base64 string for the save_*/copy_image IPC. The old
 // `Array.from(bytes)` produced a JSON number[] — ~4-5x the payload + a multi-MB
 // per-element parse and a giant throwaway array on the webview thread for every
@@ -191,15 +201,49 @@ export interface PluginRegistryCacheEnvelope {
   signature: string;
 }
 
-export interface LegacyPluginRegistryCache {
-  indexJson: string;
-  signature: string;
+/** A Direct Files revision conflict, classified once at the Tauri wire boundary.
+ * Callers branch on this tag and never inspect arbitrary backend prose. */
+export class SaveConflictError extends Error {
+  readonly kind = "save-conflict";
+
+  constructor(readonly epoch: number | null) {
+    super(epoch === null ? "conflict" : `conflict:${epoch}`);
+    this.name = "SaveConflictError";
+  }
+
+  /** Display sites that stringify a rejection keep seeing the bare wire code. */
+  override toString(): string {
+    return this.message;
+  }
+}
+
+export function isSaveConflictError(error: unknown): error is SaveConflictError {
+  return error instanceof SaveConflictError;
+}
+
+/** The one place a native rejection becomes a typed error. Every guarded
+ * Direct Files write — `save_page` and the seven conflict-resolution
+ * commands — rejects with the same `conflict` / `conflict:<epoch>` wire code;
+ * classifying here means no caller needs to know which commands can conflict.
+ * Anything else passes through untouched. */
+export function classifyNativeCallError(error: unknown): unknown {
+  return classifySaveConflictWire(error) ?? error;
+}
+
+export function classifySaveConflictWire(error: unknown): SaveConflictError | null {
+  const message = typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : null;
+  if (message === "conflict") return new SaveConflictError(null);
+  const match = message?.match(/^conflict:(\d+)$/);
+  return match ? new SaveConflictError(Number(match[1])) : null;
 }
 
 export type PluginRegistryCacheLoad =
   | { kind: "absent" }
   | { kind: "envelope"; envelope: PluginRegistryCacheEnvelope }
-  | { kind: "legacy"; indexJson: string; signature: string }
   | { kind: "unsafe"; reason: string };
 
 export type LoadGraphResult =
@@ -252,8 +296,7 @@ export interface Backend {
   loadPluginRegistryCache(): Promise<PluginRegistryCacheLoad>;
   storePluginRegistryCache(
     indexJson: string,
-    signature: string,
-    expectedLegacy?: LegacyPluginRegistryCache
+    signature: string
   ): Promise<void>;
   /** Keep Android's edge-to-edge status/navigation icon appearance readable
    *  against Tine's explicit in-app theme. Other platforms are a no-op. */
@@ -299,6 +342,16 @@ export interface Backend {
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
+  /** Publish the durable recovery record for one Direct cross-page move BEFORE
+   *  the first page is written (packet B2, I-3/I-2). `destination` and
+   *  `sources` are the POST-move DTOs, in the exact order the choreography
+   *  saves them. Resolves to the record id, or `null` when no record was
+   *  composed — a degenerate move, or an unavailable app-private root. `null`
+   *  never refuses the move; see `docs/contracts/direct-move-recovery.md` §4. */
+  beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]): Promise<string | null>;
+  /** Retire that record once every participant is durably terminal. Resolves to
+   *  whether it was retired; a record left behind is converged at the next open. */
+  finishDirectCrossPageMove(moveId: string): Promise<boolean>;
   /** X1 native bridge only. Production gesture routing remains disabled until
    * X2 owns quiescence, leases, publication, and semantic history. */
   moveManagedApplicationSubtrees(
@@ -534,7 +587,18 @@ export interface Backend {
     page: PageDto,
     baseRev: string | null,
     conflictEpoch: number,
-  ): Promise<LiveSaveConflictCapture>;
+  ): Promise<LiveSaveConflictCapture | null>;
+  /** App-private, graph-keyed recovery capsules for unresolved live drafts. */
+  loadConflictCapsules?(root: string): Promise<ConflictObject[]>;
+  storeConflictCapsule?(root: string, capsule: ConflictObject): Promise<void>;
+  retireConflictCapsule?(root: string, pageName: string): Promise<void>;
+  conflictCapsuleDiff?(conflict: ConflictObject): Promise<ConflictCapsuleReview>;
+  resolveConflictCapsule?(
+    conflict: ConflictObject,
+    authority: ConflictCapsuleAuthority,
+    decisions: Record<string, MergeDecision>,
+    preChoice?: "mine" | "theirs" | "union",
+  ): Promise<PageDto>;
   durableLiveSaveConflictDiff(page: PageDto, baseText: string | null): Promise<SyncConflictDiff>;
   resolveDurableLiveSaveConflict(
     page: PageDto,
@@ -678,6 +742,8 @@ export interface Backend {
    *  (non-dedup — the filename links the `.edn` `:image <stamp>` to the file).
    *  Returns the assets-relative path. */
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array): Promise<string>;
+  /** Move a just-written area crop to recoverable trash when its sidecar write fails. */
+  rollbackPdfAreaImage(pdf: string, page: number, id: string, stamp: number): Promise<void>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
   /** Subscribe to coalesced external bulk revisions (Concord P2): one event
@@ -861,8 +927,13 @@ export function isTauri(): boolean {
  * to a `Graph` that no longer exists once they return.
  *
  * Kept as an explicit list because it is a claim about the backend: each of
- * these was verified to reach `refresh_graph`. Adding a command that reopens the
- * graph without adding it here reintroduces the round-15 blockers.
+ * these reaches `refresh_graph`. Adding a command that reopens the graph without
+ * adding it here reintroduces the round-15 blockers.
+ *
+ * The claim is checked, not asserted: `backend_command_parity.rs`'s
+ * `rebinding_commands_are_exactly_the_commands_that_reopen_the_graph` re-derives
+ * the set by scanning every `#[tauri::command]` in `src-tauri/src` for a
+ * `refresh_graph(` call and fails on any difference in either direction.
  */
 const REBINDING_COMMANDS = new Set([
   "set_default_home",
@@ -934,7 +1005,9 @@ class TauriBackend implements Backend {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
       recordGraphOpenCommand(cmd, started, "failed");
       reportPhase("failed", performance.now() - started);
-      throw error;
+      // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
+      // save_page and left the resolver recovery branch dead).
+      throw classifyNativeCallError(error);
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
     recordGraphOpenCommand(cmd, started, "completed");
@@ -1023,13 +1096,11 @@ class TauriBackend implements Backend {
   }
   storePluginRegistryCache(
     indexJson: string,
-    signature: string,
-    expectedLegacy?: LegacyPluginRegistryCache
+    signature: string
   ) {
     return this.call<void>("store_plugin_registry_cache", {
       indexJson,
       signature,
-      expectedLegacy: expectedLegacy ?? null,
     });
   }
   setSystemBarAppearance(dark: boolean) {
@@ -1073,7 +1144,7 @@ class TauriBackend implements Backend {
   graphSourceFiles(includeJournals: boolean) {
     return this.call<GraphSourceFile[]>("graph_source_files", { includeJournals });
   }
-  savePage(
+  async savePage(
     page: PageDto,
     baseRev: string | null,
     force = false,
@@ -1089,6 +1160,12 @@ class TauriBackend implements Backend {
         managedConflictObservation,
       })
     );
+  }
+  beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]) {
+    return this.call<string | null>("begin_direct_cross_page_move", { destination, sources });
+  }
+  finishDirectCrossPageMove(moveId: string) {
+    return this.call<boolean>("finish_direct_cross_page_move", { moveId });
   }
   moveManagedApplicationSubtrees(
     bindingGeneration: number,
@@ -1538,10 +1615,46 @@ class TauriBackend implements Backend {
     });
   }
   captureLiveSaveConflict(page: PageDto, baseRev: string | null, conflictEpoch: number) {
-    return this.call<LiveSaveConflictCapture>("capture_live_save_conflict", {
+    return this.call<LiveSaveConflictCapture | null>("capture_live_save_conflict", {
       page,
       baseRev,
       conflictEpoch,
+    });
+  }
+  loadConflictCapsules(root: string) {
+    return this.call<ConflictObject[]>("load_conflict_capsules", { root });
+  }
+  storeConflictCapsule(root: string, capsule: ConflictObject) {
+    return this.call<void>("store_conflict_capsule", { root, capsule });
+  }
+  retireConflictCapsule(root: string, pageName: string) {
+    return this.call<void>("retire_conflict_capsule", { root, pageName });
+  }
+  conflictCapsuleDiff(conflict: ConflictObject) {
+    const live = conflict.live;
+    if (!live) return Promise.reject(new Error("conflict capsule has no retained draft"));
+    return this.call<ConflictCapsuleReview>("conflict_capsule_diff", {
+      page: live.page,
+      baseRev: live.base_rev,
+      conflictEpoch: live.conflict_epoch,
+      baseText: live.base_text,
+      diskRev: live.disk_rev,
+    });
+  }
+  resolveConflictCapsule(
+    conflict: ConflictObject,
+    authority: ConflictCapsuleAuthority,
+    decisions: Record<string, MergeDecision>,
+    preChoice: "mine" | "theirs" | "union" = "union",
+  ) {
+    const live = conflict.live;
+    if (!live) return Promise.reject(new Error("conflict capsule has no retained draft"));
+    return this.call<PageDto>("resolve_conflict_capsule", {
+      page: live.page,
+      baseRev: live.base_rev,
+      authority,
+      decisions,
+      preChoice,
     });
   }
   durableLiveSaveConflictDiff(page: PageDto, baseText: string | null) {
@@ -1708,6 +1821,9 @@ class TauriBackend implements Backend {
       bytesB64: bytesToBase64(bytes),
     });
   }
+  rollbackPdfAreaImage(pdf: string, page: number, id: string, stamp: number) {
+    return this.call<void>("rollback_pdf_area_image", { pdf, page, id, stamp });
+  }
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChange>("graph-changed", (e) => cb(e.payload));
@@ -1868,6 +1984,95 @@ export function backend(): Backend {
     _backend = isTauri() ? new TauriBackend() : mockBackend();
   }
   return _backend;
+}
+
+// Browser/test fallback for the native-only recovery channel. Keeping this
+// adapter beside the Backend boundary avoids teaching the fixture backend about
+// app-data files while preserving the same async contract in UI tests.
+const browserConflictCapsules = new Map<string, Map<string, ConflictObject>>();
+
+export async function loadConflictCapsules(root: string): Promise<ConflictObject[]> {
+  const current = backend();
+  if (current.loadConflictCapsules) return current.loadConflictCapsules(root);
+  return [...(browserConflictCapsules.get(root)?.values() ?? [])]
+    .map((capsule) => structuredClone(capsule));
+}
+
+/** Synchronous browser/test cache view. Native callers return null and must
+ * await the app-private file before graph activation. */
+export function cachedConflictCapsules(root: string): ConflictObject[] | null {
+  if (backend().loadConflictCapsules) return null;
+  return [...(browserConflictCapsules.get(root)?.values() ?? [])]
+    .map((capsule) => structuredClone(capsule));
+}
+
+export async function storeConflictCapsule(root: string, capsule: ConflictObject): Promise<void> {
+  const current = backend();
+  if (current.storeConflictCapsule) return current.storeConflictCapsule(root, capsule);
+  const graph = browserConflictCapsules.get(root) ?? new Map<string, ConflictObject>();
+  graph.set(capsule.page_name, structuredClone(capsule));
+  browserConflictCapsules.set(root, graph);
+}
+
+export async function retireConflictCapsule(root: string, pageName: string): Promise<void> {
+  const current = backend();
+  if (current.retireConflictCapsule) return current.retireConflictCapsule(root, pageName);
+  const graph = browserConflictCapsules.get(root);
+  graph?.delete(pageName);
+  if (graph?.size === 0) browserConflictCapsules.delete(root);
+}
+
+/** One semantic review surface. Native dispatch is storage-mode aware; the
+ * browser fallback models the Direct path for UI tests and demos. */
+export async function reviewConflictCapsule(
+  conflict: ConflictObject,
+): Promise<ConflictCapsuleReview> {
+  const current = backend();
+  if (current.conflictCapsuleDiff) return current.conflictCapsuleDiff(conflict);
+  const live = conflict.live;
+  if (!live) throw new Error("conflict capsule has no retained draft");
+  if (live.disk_rev !== undefined) {
+    return {
+      diff: await current.durableLiveSaveConflictDiff(live.page, live.base_text ?? null),
+      authority: { kind: "direct_durable", expected_disk_rev: live.disk_rev },
+    };
+  }
+  return {
+    diff: await current.liveSaveConflictDiff(live.page, live.base_rev, live.conflict_epoch),
+    authority: { kind: "direct_live", conflict_epoch: live.conflict_epoch },
+  };
+}
+
+export async function resolveConflictCapsule(
+  conflict: ConflictObject,
+  authority: ConflictCapsuleAuthority,
+  decisions: Record<string, MergeDecision>,
+  preChoice: "mine" | "theirs" | "union" = "union",
+): Promise<PageDto> {
+  const current = backend();
+  if (current.resolveConflictCapsule) {
+    return current.resolveConflictCapsule(conflict, authority, decisions, preChoice);
+  }
+  const live = conflict.live;
+  if (!live) throw new Error("conflict capsule has no retained draft");
+  if (authority.kind === "direct_durable") {
+    return current.resolveDurableLiveSaveConflict(
+      live.page,
+      authority.expected_disk_rev,
+      decisions,
+      preChoice,
+    );
+  }
+  if (authority.kind === "direct_live") {
+    return current.resolveLiveSaveConflict(
+      live.page,
+      live.base_rev,
+      authority.conflict_epoch,
+      decisions,
+      preChoice,
+    );
+  }
+  throw new Error("the browser conflict demo has no managed actor");
 }
 
 /** Test-only backend injection for delayed/rejected native-boundary proofs. */

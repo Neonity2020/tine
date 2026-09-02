@@ -3981,11 +3981,18 @@ pub(crate) async fn capture_live_save_conflict(
     base_rev: Option<String>,
     conflict_epoch: u64,
     state: GraphContext<'_>,
-) -> Result<tine_core::LiveSaveConflictCapture, String> {
+) -> Result<Option<tine_core::LiveSaveConflictCapture>, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        // Managed retains the exact frontend draft in the app-private capsule,
+        // but its replacement observation is session-scoped and must never be
+        // serialized. Crossing this same semantic capture boundary therefore
+        // deliberately returns no durable authority payload for Managed.
+        if slot.is_sparse_v2() {
+            return Ok(None);
+        }
         slot.with_filesystem_graph(|graph| {
             graph
                 .capture_live_save_conflict(
@@ -3995,6 +4002,7 @@ pub(crate) async fn capture_live_save_conflict(
                         observation_epoch: conflict_epoch,
                     },
                 )
+                .map(Some)
                 .map_err(|error| error.to_string())
         })
     })
@@ -4017,6 +4025,219 @@ pub(crate) async fn durable_live_save_conflict_diff(
                 .durable_live_save_conflict_diff(&page, base_text.as_deref())
                 .map_err(|error| error.to_string())
         })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ConflictCapsuleAuthority {
+    DirectDurable { expected_disk_rev: String },
+    DirectLive { conflict_epoch: u64 },
+    Managed { path: String, revision: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ConflictCapsuleReview {
+    diff: tine_core::sync_diff::SyncConflictDiff,
+    authority: ConflictCapsuleAuthority,
+}
+
+/// Capsule pages become `Document`s through tine-core's single bounded
+/// converter and merge their pre-blocks through its single union. Packet B3
+/// briefly re-implemented both here over `BlockDto` (a recursive walker and a
+/// `split_once("::")` union); that reinvented the depth bound packet F built
+/// and diverged from Direct sync's property parsing (D-14).
+fn capsule_document(page: &PageDto) -> Result<tine_core::Document, String> {
+    tine_core::model::page_dto_document(page)
+        .map_err(|error| format!("invalid retained conflict page: {error}"))
+}
+
+fn managed_capsule_current(
+    handle: &SyncRuntimeHandle,
+    page: &PageDto,
+) -> Result<(PageDto, String), String> {
+    let selector = if page.path.is_empty() {
+        SyncApplicationPageSelector::Logical {
+            name: page.name.clone(),
+            page_kind: page.kind.into(),
+        }
+    } else {
+        SyncApplicationPageSelector::ExactPath {
+            path: page.path.clone(),
+        }
+    };
+    let current = load_sparse_page(handle, selector)?
+        .ok_or_else(|| "managed conflict owner disappeared; reload before resolving".to_owned())?;
+    let revision = current
+        .rev
+        .clone()
+        .ok_or_else(|| "managed conflict owner has no observable revision".to_owned())?;
+    Ok((current, revision))
+}
+
+/// One semantic review surface for app-private conflict capsules. Managed
+/// replacement authority is observed here and returned only to this live UI
+/// review; it is never written into the durable capsule.
+#[tauri::command]
+pub(crate) async fn conflict_capsule_diff(
+    page: PageDto,
+    base_rev: Option<String>,
+    conflict_epoch: i64,
+    base_text: Option<String>,
+    disk_rev: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<ConflictCapsuleReview, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let (current, revision) = managed_capsule_current(handle, &page)?;
+                let mine = capsule_document(&page)?;
+                let theirs = capsule_document(&current)?;
+                let mut diff = tine_core::sync_diff::diff_docs(&mine, &theirs);
+                diff.base_rev = base_rev.unwrap_or_default();
+                diff.conflict_rev = revision.clone();
+                Ok(ConflictCapsuleReview {
+                    diff,
+                    authority: ConflictCapsuleAuthority::Managed {
+                        path: current.path,
+                        revision,
+                    },
+                })
+            }
+            None => {
+                let graph = slot.legacy_graph()?;
+                if let Some(expected_disk_rev) = disk_rev {
+                    let diff = graph
+                        .durable_live_save_conflict_diff(&page, base_text.as_deref())
+                        .map_err(|error| error.to_string())?;
+                    Ok(ConflictCapsuleReview {
+                        diff,
+                        authority: ConflictCapsuleAuthority::DirectDurable { expected_disk_rev },
+                    })
+                } else {
+                    let conflict_epoch = u64::try_from(conflict_epoch).map_err(|_| {
+                        "direct conflict capsule has no live observation".to_owned()
+                    })?;
+                    let diff = graph
+                        .live_save_conflict_diff(
+                            &page,
+                            base_rev.as_deref(),
+                            tine_core::ConflictOverride {
+                                observation_epoch: conflict_epoch,
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(ConflictCapsuleReview {
+                        diff,
+                        authority: ConflictCapsuleAuthority::DirectLive { conflict_epoch },
+                    })
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Apply decisions through the same semantic command for both storage modes.
+/// The Managed branch re-proves the ephemeral observation in its actor turn;
+/// Direct Files delegates to its existing one-shot/durable guards.
+#[tauri::command]
+pub(crate) async fn resolve_conflict_capsule(
+    page: PageDto,
+    base_rev: Option<String>,
+    authority: ConflictCapsuleAuthority,
+    decisions: std::collections::HashMap<String, String>,
+    pre_choice: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<PageDto, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let ConflictCapsuleAuthority::Managed { path, revision } = authority else {
+                    return Err("managed conflict review authority is missing".to_owned());
+                };
+                let (current, observed_revision) = managed_capsule_current(handle, &page)?;
+                if current.path != path || observed_revision != revision {
+                    return Err(
+                        "managed conflict owner changed; review the refreshed comparison"
+                            .to_owned(),
+                    );
+                }
+                let mine = capsule_document(&page)?;
+                let theirs = capsule_document(&current)?;
+                let merged =
+                    tine_core::sync_diff::merge_blocks(&mine.roots, &theirs.roots, &decisions)
+                        .map_err(|error| error.to_string())?;
+                let choice = pre_choice.as_deref().unwrap_or("union");
+                let pre_block = match choice {
+                    "theirs" => theirs.pre_block,
+                    "mine" => mine.pre_block,
+                    _ if page.format == tine_core::model::Format::Md => {
+                        tine_core::model::union_pre(
+                            mine.pre_block.as_deref(),
+                            theirs.pre_block.as_deref(),
+                        )
+                    }
+                    _ => mine.pre_block,
+                };
+                let mut resolved = page.clone();
+                resolved.blocks = merged
+                    .iter()
+                    .map(tine_core::model::block_to_dto)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                resolved.pre_block = pre_block;
+                resolved.path = current.path;
+                resolved.format = current.format;
+                resolved.read_only = current.read_only;
+                resolved.activation = None;
+                let saved_revision = save_sparse_page_with(
+                    resolved.clone(),
+                    base_rev,
+                    true,
+                    Some(ManagedConflictObservation { path, revision }),
+                    |request| handle.save_application_page(request),
+                )?;
+                resolved.rev = Some(saved_revision);
+                Ok(resolved)
+            }
+            None => {
+                let graph = slot.legacy_graph()?;
+                match authority {
+                    ConflictCapsuleAuthority::DirectDurable { expected_disk_rev } => graph
+                        .resolve_durable_live_save_conflict(
+                            &page,
+                            &expected_disk_rev,
+                            &decisions,
+                            pre_choice.as_deref().unwrap_or("union"),
+                        )
+                        .map_err(direct_save_error_message),
+                    ConflictCapsuleAuthority::DirectLive { conflict_epoch } => graph
+                        .resolve_live_save_conflict(
+                            &page,
+                            base_rev.as_deref(),
+                            tine_core::ConflictOverride {
+                                observation_epoch: conflict_epoch,
+                            },
+                            &decisions,
+                            pre_choice.as_deref().unwrap_or("both"),
+                        )
+                        .map_err(direct_save_error_message),
+                    ConflictCapsuleAuthority::Managed { .. } => {
+                        Err("direct conflict review authority is missing".to_owned())
+                    }
+                }
+            }
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4368,6 +4589,32 @@ mod application_page_authority_tests {
     }
 
     #[test]
+    fn pdf_area_rollback_moves_the_real_nested_crop_to_typed_asset_trash() {
+        let (temp, graph) = graph_with_files(&[]);
+        let stored = graph
+            .write_pdf_area_image("paper.pdf", 3, "area-id", 42, b"png")
+            .unwrap();
+        assert!(
+            stored.contains('/'),
+            "the fixture must exercise the nested OG layout"
+        );
+        let source = graph.assets_path().join(&stored);
+        assert!(source.is_file());
+
+        rollback_pdf_area_image_at(&graph, "paper.pdf", 3, "area-id", 42).unwrap();
+
+        assert!(!source.exists());
+        let trash = temp.path().join("logseq/.tine-trash/assets");
+        let names = std::fs::read_dir(trash)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+        assert!(names[0].contains("__pdf-area__"));
+        assert!(names[0].ends_with("__3_area-id_42.png"));
+    }
+
+    #[test]
     fn sparse_load_mapping_sets_actor_revision_and_fails_closed() {
         let loaded = map_sparse_page_load(SyncApplicationPageLoadOutcome::Loaded {
             page: page("Loaded", PageKind::Page, "pages/Loaded.md", "- body"),
@@ -4392,6 +4639,57 @@ mod application_page_authority_tests {
         .unwrap_err();
         assert!(deferred.contains("updating this page"));
         assert!(deferred.contains("Try again"));
+    }
+
+    #[test]
+    fn managed_capsule_adapter_applies_both_semantic_resolution_sides() {
+        let draft = page(
+            "Note",
+            PageKind::Page,
+            "pages/Note.md",
+            "retained laptop draft",
+        );
+        let current = page(
+            "Note",
+            PageKind::Page,
+            "pages/Note.md",
+            "current phone body",
+        );
+        let mine = capsule_document(&draft).unwrap();
+        let theirs = capsule_document(&current).unwrap();
+        let diff = tine_core::sync_diff::diff_docs(&mine, &theirs);
+        assert!(!diff.rows.is_empty());
+
+        for (decision, expected) in [
+            ("mine", "retained laptop draft"),
+            ("theirs", "current phone body"),
+        ] {
+            let decisions = diff
+                .rows
+                .iter()
+                .map(|row| (row.id.clone(), decision.to_owned()))
+                .collect();
+            let merged =
+                tine_core::sync_diff::merge_blocks(&mine.roots, &theirs.roots, &decisions).unwrap();
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].raw, expected);
+            assert_eq!(
+                tine_core::model::block_to_dto(&merged[0]).unwrap().raw,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn managed_capsule_authority_is_an_explicit_ephemeral_observation() {
+        let authority = ConflictCapsuleAuthority::Managed {
+            path: "pages/Note.md".into(),
+            revision: "observed-after-restart".into(),
+        };
+        let encoded = serde_json::to_value(authority).unwrap();
+        assert_eq!(encoded["kind"], "managed");
+        assert_eq!(encoded["path"], "pages/Note.md");
+        assert_eq!(encoded["revision"], "observed-after-restart");
     }
 
     #[test]
@@ -4901,6 +5199,38 @@ pub(crate) fn save_pdf_area_image(
             .map_err(|e| e.to_string())?;
         crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
         Ok(stored)
+    })
+}
+
+fn rollback_pdf_area_image_at(
+    graph: &tine_core::model::Graph,
+    pdf: &str,
+    page: i64,
+    id: &str,
+    stamp: i64,
+) -> Result<(), String> {
+    graph
+        .rollback_pdf_area_image(pdf, page, id, stamp)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn rollback_pdf_area_image(
+    pdf: String,
+    page: i64,
+    id: String,
+    stamp: i64,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let window_label = state.window.label().to_string();
+    with_trash_graph(&state, |graph| {
+        let source = graph
+            .assets_path()
+            .join(tine_core::pdf::asset_key(&pdf))
+            .join(format!("{page}_{id}_{stamp}.png"));
+        rollback_pdf_area_image_at(graph, &pdf, page, &id, stamp)?;
+        crate::watcher::note_asset_self_write(&window_label, &source);
+        Ok(())
     })
 }
 

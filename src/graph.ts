@@ -211,7 +211,9 @@ export async function loadGraphPath(
   }
   if (switching || !hadGraph) resetLeftSidebarSections();
   setGraphMeta(meta ?? null);
-  restoreLiveSaveConflicts(meta.root);
+  // Recovery is part of graph activation: no page becomes interactive before
+  // its app-private retained drafts have been restored into the conflict queue.
+  await restoreLiveSaveConflicts(meta.root);
   // Revoke every in-flight result from the previous binding NOW. This is also
   // required for same-root force refresh (restore): root equality cannot
   // distinguish pre-restore DTOs from the freshly rebound graph. A visible

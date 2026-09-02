@@ -1,9 +1,25 @@
-//! Exact, read-only external inventory and conservative identity matching.
+//! Exact external inventory and conservative identity matching — and, at the
+//! end of the file, clean activation.
 //!
-//! This module plans reconciliation only. It does not publish semantic
-//! operations, write a graph, or activate managed sync. The clean runtime
-//! reads its disposable SQLite path ownership instead of recreating a native
-//! path index beside SQLite.
+//! Two jobs live here, and only one of them is read-only.
+//!
+//! RECONCILIATION PLANNING is: it drafts `ImportExecutionMaterial` and
+//! candidates that are deliberately non-authoritative — the hot engine must
+//! recapture them before anything is published — so this half publishes no
+//! semantic operation and writes no graph. The clean runtime reads its
+//! disposable SQLite path ownership instead of recreating a native path index
+//! beside SQLite.
+//!
+//! ACTIVATION is not. `prepare_clean_activation` → `commit_clean_activation`
+//! publishes the baseline, publishes the SQLite projection, and writes the
+//! activation marker that `docs/storage-sync-contract.md` calls the sole local
+//! managed-authority selector; `open_clean_activation` reads it back at every
+//! later open. That is the last few hundred lines of this file.
+//!
+//! This header claimed the module "does not publish semantic operations, write
+//! a graph, or activate managed sync" — true of the first half, flatly false of
+//! the second. `the_activation_half_of_this_module_is_not_read_only` keeps both
+//! halves named.
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -8646,6 +8662,53 @@ mod tests {
         assert!(
             large.recorded_work_units() <= small.recorded_work_units().saturating_mul(8),
             "structural work did not scale linearly: small={small:?}, large={large:?}"
+        );
+    }
+
+    /// The module doc claimed this file never activates managed sync. It does,
+    /// in `commit_clean_activation`: three publications and the activation
+    /// marker that selects local managed authority. A reader who believed the
+    /// old header would have looked for the write path anywhere but here.
+    #[test]
+    fn the_activation_half_of_this_module_is_not_read_only() {
+        let source = include_str!("import.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+        let (_, commit) = production
+            .split_once("pub(crate) fn commit_clean_activation(")
+            .expect("commit_clean_activation is still defined here");
+        let commit = &commit[..commit.find("\npub(crate) fn ").unwrap_or(commit.len())];
+
+        for write in [
+            "baseline.publish_durable(",
+            "sqlite.publish()",
+            "publish_activation_marker(",
+        ] {
+            assert!(
+                commit.contains(write),
+                "commit_clean_activation no longer performs {write}. If activation \
+                 genuinely moved out of this module, rewrite the module doc in the same \
+                 change — it names this function as the reason the file is not read-only \
+                 (invariant I-11)."
+            );
+            // Harvest H 3a: no activation marker and no authoritative baseline
+            // publication happens BEFORE `commit_clean_activation`. Pin the
+            // invariant itself, not its converse: every production occurrence
+            // of each publication token lives inside the commit slice.
+            assert_eq!(
+                production.matches(write).count(),
+                commit.matches(write).count(),
+                "{write} is invoked outside commit_clean_activation; the preparation half \
+                 must stay free of authority-changing publication (Harvest H 3a, I-7)"
+            );
+        }
+
+        assert!(
+            production.contains("pub(crate) fn prepare_clean_activation(")
+                && production.contains("pub(crate) fn open_clean_activation("),
+            "the activation pipeline the module doc describes is no longer here."
         );
     }
 }

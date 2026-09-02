@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { backend } from "./backend";
+import { backend, SaveConflictError } from "./backend";
 import {
   acceptColdReturnManagedStorage,
   handleGraphChange,
@@ -144,6 +144,20 @@ describe("mobile external link delegation", () => {
       uninstall();
     }
   });
+
+  it("fails closed on a non-allowlisted anchor scheme on Android", async () => {
+    vi.spyOn(backend(), "appPlatform").mockResolvedValue("android");
+    const openExternal = vi.spyOn(backend(), "openExternal").mockResolvedValue();
+    const uninstall = await installMobileExternalLinkHandler();
+    try {
+      const event = click(addAnchor("javascript:alert(1)"));
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(openExternal).not.toHaveBeenCalled();
+    } finally {
+      uninstall();
+    }
+  });
 });
 
 describe("journal watcher feed reconciliation", () => {
@@ -264,7 +278,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
     vi.spyOn(backend(), "savePage").mockImplementation(
       (_dto, _baseRev, force, observation) => {
         calls.push({ force: !!force, observation: observation ?? null });
-        return Promise.reject(new Error(`conflict:${epoch}`));
+        return Promise.reject(new SaveConflictError(epoch));
       }
     );
     return calls;
@@ -293,7 +307,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
             return Promise.reject(new Error("conflict_authority.superseded: ..."));
           }
           live = null;
-          return Promise.resolve("rev-forced");
+          return Promise.resolve({ revision: "rev-forced" });
         }
         const refuse = () => {
           live = next;
@@ -301,12 +315,12 @@ describe("conflict requires per-page divergence, not just a notification", () =>
         };
         if (!holding) {
           refuse();
-          return Promise.reject(new Error(`conflict:${live}`));
+          return Promise.reject(new SaveConflictError(live));
         }
-        return new Promise<string>((_resolve, reject) => {
+        return new Promise<{ revision: string }>((_resolve, reject) => {
           pending.push(() => {
             refuse();
-            reject(new Error(`conflict:${live}`));
+            reject(new SaveConflictError(live));
           });
         });
       }
@@ -362,9 +376,9 @@ describe("conflict requires per-page divergence, not just a notification", () =>
 
   it("leaves an in-flight save alone — its own base_rev guard is the authority", async () => {
     liveDirtyPage("rev-1");
-    let release: (rev: string) => void = () => {};
+    let release: (result: { revision: string }) => void = () => {};
     vi.spyOn(backend(), "savePage").mockReturnValue(
-      new Promise<string>((resolve) => {
+      new Promise<{ revision: string }>((resolve) => {
         release = resolve;
       })
     );
@@ -375,7 +389,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
 
     expect(isConflicted(name)).toBe(false);
     expect(getPage).not.toHaveBeenCalled();
-    release("rev-2");
+    release({ revision: "rev-2" });
     await saving;
   });
 
@@ -520,7 +534,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
     await handleGraphChange({ name, kind: "page", created: false, removed: false });
     expect(isConflicted(name)).toBe(true);
 
-    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-4");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-4" });
     vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-3"));
     await handleGraphChange({ name, kind: "page", created: false, removed: false });
 

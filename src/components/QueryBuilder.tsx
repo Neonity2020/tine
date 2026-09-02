@@ -25,6 +25,7 @@ import {
   MARKERS,
   PRIORITIES,
   BETWEEN_FIELDS,
+  MAX_QUERY_BUILDER_DEPTH,
   SORT_PRESETS,
   type Clause,
   type BetweenField,
@@ -417,6 +418,9 @@ interface NodeCtx {
 }
 
 function Node(props: NodeCtx): JSX.Element {
+  if (props.loc.length >= MAX_QUERY_BUILDER_DEPTH) {
+    return <span class="qb-depth-limit">Query nesting truncated at {MAX_QUERY_BUILDER_DEPTH} levels</span>;
+  }
   const isOp = () => props.clause.kind === "op";
   const op = () => props.clause as Clause & { kind: "op" };
 

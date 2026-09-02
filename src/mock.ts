@@ -831,29 +831,10 @@ export function mockBackend(): Backend {
       if (mockPluginRegistryCache) {
         return { kind: "envelope" as const, envelope: { ...mockPluginRegistryCache } };
       }
-      const hasIndex = Object.prototype.hasOwnProperty.call(mockAppStrings, "plugin-registry-index");
-      const hasSignature = Object.prototype.hasOwnProperty.call(mockAppStrings, "plugin-registry-signature");
-      if (!hasIndex && !hasSignature) return { kind: "absent" as const };
-      if (!hasIndex || !hasSignature || !mockAppStrings["plugin-registry-index"] || !mockAppStrings["plugin-registry-signature"]?.trim()) {
-        return { kind: "unsafe" as const, reason: "legacy registry cache is torn" };
-      }
-      return {
-        kind: "legacy" as const,
-        indexJson: mockAppStrings["plugin-registry-index"],
-        signature: mockAppStrings["plugin-registry-signature"],
-      };
+      return { kind: "absent" as const };
     },
-    async storePluginRegistryCache(indexJson, signature, expectedLegacy) {
-      if (expectedLegacy && (
-        mockPluginRegistryCache !== null
-        || mockAppStrings["plugin-registry-index"] !== expectedLegacy.indexJson
-        || mockAppStrings["plugin-registry-signature"] !== expectedLegacy.signature
-      )) {
-        throw new Error("legacy registry cache changed during migration");
-      }
+    async storePluginRegistryCache(indexJson, signature) {
       mockPluginRegistryCache = { schemaVersion: 1, indexJson, signature: signature.trim() };
-      delete mockAppStrings["plugin-registry-index"];
-      delete mockAppStrings["plugin-registry-signature"];
     },
     async setSystemBarAppearance(): Promise<void> {},
     async quit(): Promise<void> {
@@ -922,6 +903,12 @@ export function mockBackend(): Backend {
     },
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
       return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
+    },
+    async beginDirectCrossPageMove(_destination: PageDto, _sources: PageDto[]): Promise<string | null> {
+      return null; // the browser mock has no app-private root and no durable graph
+    },
+    async finishDirectCrossPageMove(_moveId: string): Promise<boolean> {
+      return false;
     },
     async moveManagedApplicationSubtrees(
       bindingGeneration: number,
@@ -2285,5 +2272,6 @@ export function mockBackend(): Backend {
     ): Promise<string> {
       return `${pdf.replace(/\.pdf$/i, "")}/${page}_${id}_${stamp}.png`;
     },
+    async rollbackPdfAreaImage(): Promise<void> {},
   };
 }

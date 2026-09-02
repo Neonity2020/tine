@@ -43,9 +43,36 @@ function collectSourceFiles(relative) {
 
 for (const sourceRoot of sourceRoots) collectSourceFiles(sourceRoot);
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// A sibling `<stem>_tests.rs` file is test-only when, and only when, a
+// production file in the same directory includes it under `#[cfg(test)]`
+// (either `#[path = "<file>"] mod tests;` or `mod <stem>;`). The 2026-09-01
+// seam refactor (3a123bc1) moved the trailing test modules of `model.rs` and
+// `sync_runtime.rs` into such files; a `_tests.rs` file with no gated includer
+// is NOT excluded, so a file that merely borrows the suffix stays scanned.
+function testOnlyInclude(relative) {
+  if (!/_tests\.rs$/.test(relative)) return false;
+  const directory = path.dirname(relative);
+  const file = path.basename(relative);
+  const stem = file.slice(0, -".rs".length);
+  const gatedInclude = new RegExp(
+    `^#\\[cfg\\(test\\)\\]\\s*\\n(?:#\\[path = "${escapeRegExp(file)}"\\]\\s*\\nmod \\w+;|mod ${escapeRegExp(stem)};)`,
+    "m"
+  );
+  for (const sibling of fs.readdirSync(path.join(root, directory))) {
+    if (!sibling.endsWith(".rs") || sibling === file) continue;
+    if (gatedInclude.test(fs.readFileSync(path.join(root, directory, sibling), "utf8"))) return true;
+  }
+  return false;
+}
+
 function compiledSource(relative) {
   const source = fs.readFileSync(path.join(root, relative), "utf8");
   if (!relative.endsWith(".rs")) return source;
+  if (testOnlyInclude(relative)) return "";
 
   // Every in-source Rust test module in the affected paths is an end-of-file
   // `#[cfg(test)] mod tests` block. Keeping test fixtures out of this source
@@ -156,6 +183,14 @@ function assertDetectorSelfTests() {
     if (!sourceProblems(relative, source).some((finding) => finding.includes(expected))) {
       throw new Error(`retired managed-v1 source guard self-test missed ${label}`);
     }
+  }
+  // The gated-include exclusion must stay exact: the real out-of-line test
+  // module is excluded, a same-suffix file nobody includes is not.
+  if (!testOnlyInclude("crates/tine-core/src/sync_runtime_tests.rs")) {
+    throw new Error("retired managed-v1 source guard self-test: sync_runtime_tests.rs is a cfg(test) include and must be excluded");
+  }
+  if (testOnlyInclude("crates/tine-core/src/guard_self_probe_tests.rs")) {
+    throw new Error("retired managed-v1 source guard self-test: an un-included _tests.rs file must stay scanned");
   }
 }
 

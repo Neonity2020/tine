@@ -1059,11 +1059,16 @@ fn backlink_filter_entry(
 
     fn visit(
         block: &DocBlock,
+        depth: usize,
         text: &mut String,
         max_text: usize,
         add_facet: &mut impl FnMut(&str),
         truncated: &mut bool,
     ) {
+        if depth > crate::model::MAX_MANAGED_BLOCK_DEPTH {
+            *truncated = true;
+            return;
+        }
         *truncated |= append_bounded_text(text, block.visible_text(), max_text);
         let projection = block.projection();
         for name in &projection.refs_page {
@@ -1092,13 +1097,14 @@ fn backlink_filter_entry(
             }
         }
         for child in &block.children {
-            visit(child, text, max_text, add_facet, truncated);
+            visit(child, depth + 1, text, max_text, add_facet, truncated);
         }
     }
 
     let mut text_truncated = false;
     visit(
         block,
+        1,
         &mut text,
         max_text,
         &mut add_facet,
@@ -1155,12 +1161,17 @@ pub(crate) fn application_backlink_filter_entry(
 
     fn visit(
         block: &BlockDto,
+        depth: usize,
         is_org: bool,
         text: &mut String,
         max_text: usize,
         add_facet: &mut impl FnMut(&str),
         truncated: &mut bool,
     ) {
+        if depth > crate::model::MAX_MANAGED_BLOCK_DEPTH {
+            *truncated = true;
+            return;
+        }
         let projected = dto_block_to_doc_block(block, is_org);
         *truncated |= append_bounded_text(text, projected.visible_text(), max_text);
         let projection = projected.projection();
@@ -1186,13 +1197,22 @@ pub(crate) fn application_backlink_filter_entry(
             }
         }
         for child in &block.children {
-            visit(child, is_org, text, max_text, add_facet, truncated);
+            visit(
+                child,
+                depth + 1,
+                is_org,
+                text,
+                max_text,
+                add_facet,
+                truncated,
+            );
         }
     }
 
     let mut text_truncated = false;
     visit(
         block,
+        1,
         is_org,
         &mut text,
         max_text,
@@ -2914,6 +2934,14 @@ fn advanced_pred(
     current_page: Option<&str>,
     today: JournalDate,
 ) -> (Option<Pred>, Vec<String>, Vec<String>) {
+    // Both limits live here, not only at the two `run_advanced_*` entry points,
+    // because `page_affects_advanced_query` reaches this function directly. It
+    // used to skip the byte ceiling entirely, which made scoped invalidation the
+    // one caller that could hand an unbounded graph-authored string to the
+    // parser — the exact thing QUERY_SOURCE_MAX_BYTES exists to prevent.
+    if !query_source_within_limit(query_src) {
+        return (None, Vec::new(), vec!["query-too-large".to_string()]);
+    }
     if !query_nesting_within_limit(query_src) {
         return (None, Vec::new(), vec!["query-nesting-too-deep".to_string()]);
     }
@@ -5476,6 +5504,20 @@ mod tests {
         assert!(!query_source_within_limit(&oversized));
         assert!(Pred::parse(&oversized, TODAY).is_none());
 
+        // The advanced parser must fail closed on size too, at `advanced_pred`
+        // itself. `page_affects_advanced_query` calls it directly, so a ceiling
+        // enforced only at the `run_advanced_*` entry points is not the shared
+        // ceiling this module's doc comment promises.
+        let oversized_advanced = format!(
+            "[:find (pull ?b [*]) :where (property ?b :note \"{}\")]",
+            "y".repeat(QUERY_SOURCE_MAX_BYTES)
+        );
+        assert!(!query_source_within_limit(&oversized_advanced));
+        let (rejected, ran, ignored) = advanced_pred(&oversized_advanced, None, TODAY);
+        assert!(rejected.is_none());
+        assert!(ran.is_empty());
+        assert!(ignored.iter().any(|item| item == "query-too-large"));
+
         let harmless = format!("(and (content \"{}\"))", "(".repeat(QUERY_NESTING_MAX + 10));
         assert!(query_nesting_within_limit(&harmless));
 
@@ -5492,6 +5534,59 @@ mod tests {
             query_nesting_within_limit(&advanced_comment),
             "advanced EDN comments must not count delimiter text"
         );
+    }
+
+    #[test]
+    fn application_backlink_filter_truncates_past_the_managed_block_depth() {
+        let mut block = BlockDto {
+            id: "leaf".into(),
+            raw: "leaf-sentinel".into(),
+            ..BlockDto::default()
+        };
+        for depth in 0..=crate::model::MAX_MANAGED_BLOCK_DEPTH {
+            block = BlockDto {
+                id: format!("depth-{depth}"),
+                raw: format!("depth-{depth}"),
+                children: vec![block],
+                ..BlockDto::default()
+            };
+        }
+        let entry = application_backlink_filter_entry(
+            "Hostile",
+            PageKind::Page,
+            &block,
+            false,
+            &std::collections::HashSet::new(),
+            usize::MAX,
+        );
+        assert!(entry.truncated);
+        assert!(!entry.text.contains("leaf-sentinel"));
+
+        let mut doc_block = DocBlock {
+            raw: "leaf-sentinel".into(),
+            children: Vec::new(),
+            uuid: "leaf".into(),
+            is_org: false,
+            proj: std::sync::OnceLock::new(),
+        };
+        for depth in 0..=crate::model::MAX_MANAGED_BLOCK_DEPTH {
+            doc_block = DocBlock {
+                raw: format!("depth-{depth}"),
+                children: vec![doc_block],
+                uuid: format!("doc-depth-{depth}"),
+                is_org: false,
+                proj: std::sync::OnceLock::new(),
+            };
+        }
+        let entry = backlink_filter_entry(
+            "Hostile",
+            PageKind::Page,
+            &doc_block,
+            &std::collections::HashSet::new(),
+            usize::MAX,
+        );
+        assert!(entry.truncated);
+        assert!(!entry.text.contains("leaf-sentinel"));
     }
 
     #[test]

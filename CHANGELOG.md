@@ -8,6 +8,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Managed-storage startup diagnostics now say which stage did the work, and
+  how much.** `TINE_DEBUG=1` already printed a per-stage timing line for a
+  managed cold open, but a slow stage could not be attributed to a mechanism.
+  The open now also emits one content-free work-counter record — batches
+  replayed, receipt evidence names and content reads, full-catalog passes,
+  summary and own-completion chain reads, archive inspections — and splits the
+  old journal-drain boundary into own-endpoint retirement scan and
+  absence-decision-map open. Diagnostics only: nothing in the open path reads a
+  counter, and no user-visible behavior changes.
+
 ### Fixed
 
 - **Concord now uses the full pane width while you review a conflict.** The
@@ -16,6 +28,75 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   wide mode. A mounted resolver now uses that pane's wide content width
   automatically, then restores the usual reading width when the conflict is
   resolved; narrow and split panes keep their responsive layout.
+
+- **A failed PDF area-highlight save no longer leaves an invisible nested crop
+  behind.** If the PNG lands but the highlight sidecar transaction is refused,
+  Tine now moves that exact crop into recoverable asset trash before reverting
+  the optimistic highlight.
+
+- **Unrelated backend errors containing the word “conflict” no longer trigger
+  the stale-file recovery path.** Direct save conflicts are classified once at
+  the native call boundary from their exact wire tag; UI code consumes the
+  typed result instead of searching arbitrary error prose.
+
+- Retired plugin-registry settings-cache keys are no longer parsed or migrated.
+  They are disposable cache data: Tine ignores that old shape and fetches a
+  currently signed registry, while preserving all unrelated app settings.
+
+- **Harvest D — asynchronous results stay with the graph and editor that
+  started them.** Quick Switcher creation/search, pinned-tab confirmation,
+  asset imports and recordings, plugin calls, focus rescans, and Settings
+  operations now revalidate graph-binding or operation ownership after waits;
+  display-only repaint changes no longer invalidate plugin work, and desktop
+  media-editor settings remain hidden on mobile.
+
+- Managed Storage clean reopen no longer semantically reapplies every accepted
+  operation since activation. A crash-durable disposable engine checkpoint now
+  restores the accepted frontier and replays only its unpublished archive tail;
+  damaged checkpoint bytes always fall back to full replay, while missing
+  authoritative manifests or required objects remain visible as archive damage.
+
+- **Harvest F — hostile graph and clipboard content now reaches its existing
+  consumption boundaries instead of bypassing them.** Macro links can no longer
+  navigate the privileged WebView directly, mobile blocks unknown schemes,
+  formula/query/peek/backlink recursion has explicit bounds, and pasted HTML
+  links open only through the native scheme allowlist. (Packet F's
+  re-enabled paste-time Markdown escaping was undone on review: literal
+  brackets in pasted text stay literal, per `UI-PASTE-BRACKET-LITERAL-001`.)
+
+- **Harvest H — pre-release Managed private formats have one decoder, and
+  concurrent theme changes no longer overwrite one another.** Schema-4 lazy
+  genesis and schema-1 forensic records now invalidate their containing store
+  so the existing preserve-and-rebuild lifecycle handles them atomically;
+  theme package installs and removals serialize their shared settings array.
+
+- **A crash during plugin installation or removal no longer wedges that plugin
+  version until its files are deleted by hand.** Plugin packages now publish as
+  one durably staged, no-clobber directory on every shipped platform; removal
+  retires the complete directory before reclaim, and the next plugin-store open
+  cleans interrupted staging, retirement, or incomplete package residue
+  (internal B5p, Harvest sweep).
+
+- Media (audio/video) assets returned 403 and never loaded when a graph runs under Managed Storage; the native media protocol now serves assets under both storage authorities with unchanged path containment and binding checks (internal B026).
+
+- Managed Storage stopped accepting work at 4,096 lifetime-distinct page
+  names, and at 4,096 lifetime blocks a save could report success and then
+  leave the store permanently unable to open. Four internal fixed-capacity
+  limits on run-local identity indexes were removed; the indexes now simply
+  grow with the graph's lifetime history (internal A4, Harvest sweep).
+
+- **Open tabs and pane state now survive a crash immediately after an autosave.**
+  Session and workspace files now use the same durable atomic replacement
+  protocol as other app-private settings, including file and directory
+  barriers; bursts of tab actions are serialized, and the one-time legacy
+  session move receives the same directory durability check.
+
+- **A draft that met an external edit no longer disappears when Tine is
+  restarted.** Direct Files and Tine-managed storage now retain unresolved live
+  drafts in one graph-keyed, app-private atomic capsule. Reopening restores the
+  exact draft before the graph becomes interactive; Managed storage observes
+  its current owner again instead of reviving stale overwrite authority, and a
+  completed resolution durably retires the capsule before Tine reports success.
 
 ## [0.6.981] - 2026-09-01
 

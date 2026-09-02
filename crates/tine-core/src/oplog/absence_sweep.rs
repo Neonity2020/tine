@@ -304,6 +304,12 @@ impl SweepManager {
         Ok(manager)
     }
 
+    /// How many sweep chains this manager reconstructed at open. Diagnostic
+    /// attribution only; no caller branches on it.
+    pub(crate) fn chain_count(&self) -> usize {
+        self.chains.len()
+    }
+
     pub(crate) fn publication_barrier_active(&self) -> bool {
         let now = now_unix_ms().unwrap_or(u64::MAX);
         self.chains

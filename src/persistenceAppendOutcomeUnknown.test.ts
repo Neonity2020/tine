@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const saves: string[] = [];
 const toasts: Array<{ message: string; tone: string }> = [];
-let nextSave: () => Promise<string>;
+let nextSave: () => Promise<{ revision: string }>;
 
 vi.mock("./store", () => ({
   doc: { loaded: true, pages: [] },
@@ -51,7 +51,7 @@ describe("managed append outcome uncertainty", () => {
   beforeEach(() => {
     saves.length = 0;
     toasts.length = 0;
-    nextSave = () => Promise.resolve("saved");
+    nextSave = () => Promise.resolve({ revision: "saved" });
     resetSaveState();
     vi.useFakeTimers();
   });
@@ -82,7 +82,7 @@ describe("managed append outcome uncertainty", () => {
     expect(toasts).toHaveLength(1);
 
     resetSaveState();
-    nextSave = () => Promise.resolve("after-reopen");
+    nextSave = () => Promise.resolve({ revision: "after-reopen" });
     markDirty("Second");
     await vi.advanceTimersByTimeAsync(500);
     expect(saves).toEqual(["First", "Second"]);
@@ -92,7 +92,9 @@ describe("managed append outcome uncertainty", () => {
     let attempts = 0;
     nextSave = () => {
       attempts++;
-      return attempts === 1 ? Promise.reject(new Error("EBUSY")) : Promise.resolve("saved");
+      return attempts === 1
+        ? Promise.reject(new Error("EBUSY"))
+        : Promise.resolve({ revision: "saved" });
     };
     markDirty("Transient");
     await vi.advanceTimersByTimeAsync(500);

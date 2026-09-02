@@ -166,9 +166,16 @@ impl ManagedLocalGenerationAnchorV2 {
         self.accepted_batch_id
     }
 
-    /// Verify the accepted engine batch after the runtime has opened the
-    /// engine. The anchor is itself the bootstrap locator for this evidence,
-    /// so structural decoding cannot require the value as prior input.
+    /// TEST-ONLY assertion helper: does this anchor name the accepted batch the
+    /// caller expected?
+    ///
+    /// It reads like a production verification step and is not one — it is
+    /// `#[cfg(test)]` and cannot execute in a shipped build. Production binds the
+    /// anchor to its accepted batch structurally instead, through
+    /// [`validate_checkpoint_batch_binding`] on every `new`, `encode` and
+    /// `decode`, so an anchor whose batch and checkpoint disagree never becomes a
+    /// value at all; `sync_runtime.rs` then carries `accepted_batch_id()` forward
+    /// from the decoded anchor rather than re-checking it.
     #[cfg(test)]
     pub(crate) fn require_accepted_batch_id(
         &self,
@@ -739,5 +746,42 @@ mod tests {
         let mut replayed = Vec::new();
         assert_eq!(journal.replay(|frame| replayed.push(frame)).unwrap(), 1);
         assert_eq!(replayed, vec![expected]);
+    }
+
+    /// Guards the doc comment on `require_accepted_batch_id`: it says the
+    /// production binding happens structurally, on every constructor and codec
+    /// entry point, rather than through that test-only helper. If a new entry
+    /// point stops calling `validate_checkpoint_batch_binding`, that sentence
+    /// becomes a lie and this test says so.
+    #[test]
+    fn every_production_entry_point_binds_the_checkpoint_to_its_accepted_batch() {
+        let source = include_str!("local_journal_v2_anchor.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("this file still has a test module")
+            .0;
+
+        for entry_point in ["fn new(", "fn encode(", "fn decode("] {
+            let start = production
+                .find(entry_point)
+                .unwrap_or_else(|| panic!("{entry_point} is still an entry point on this anchor"));
+            let body = &production[start..];
+            let end = body[1..]
+                .find("\n    pub(crate) ")
+                .map_or(body.len(), |offset| offset + 1);
+            assert!(
+                body[..end].contains("validate_checkpoint_batch_binding("),
+                "{entry_point} no longer calls validate_checkpoint_batch_binding, so the \
+                 accepted-batch binding documented on require_accepted_batch_id is not \
+                 actually enforced in production. Either restore the call or correct that \
+                 doc comment (invariant I-11: code does not lie about itself)."
+            );
+        }
+
+        assert!(
+            production.contains("#[cfg(test)]\n    pub(crate) fn require_accepted_batch_id("),
+            "require_accepted_batch_id is documented as TEST-ONLY; if it became a production \
+             method, rewrite that doc comment (invariant I-11)."
+        );
     }
 }

@@ -18,6 +18,9 @@ import {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helper = path.join(root, "scripts/build-e2e-receipt.mjs");
 const runner = path.join(root, "scripts/run-e2e.mjs");
+const releaseExceptionHelper = path.join(root, "scripts/release-0.6.981-ci-exception.mjs");
+const releaseExceptionLedger = path.join(root, "scripts/release-0.6.981-ci-exception.json");
+const packageManifest = path.join(root, "package.json");
 const inputHelper = path.join(root, "scripts/build-e2e-inputs.mjs");
 const proofReuseHelper = path.join(root, "scripts/release-proof-reuse-lib.mjs");
 const proofOnlyRegistry = path.join(root, "scripts/release-proof-only.json");
@@ -54,6 +57,9 @@ try {
   fs.copyFileSync(proofReuseHelper, path.join(fixture, "scripts/release-proof-reuse-lib.mjs"));
   fs.copyFileSync(proofOnlyRegistry, path.join(fixture, "scripts/release-proof-only.json"));
   fs.copyFileSync(runner, path.join(fixture, "scripts/run-e2e.mjs"));
+  fs.copyFileSync(releaseExceptionHelper, path.join(fixture, "scripts/release-0.6.981-ci-exception.mjs"));
+  fs.copyFileSync(releaseExceptionLedger, path.join(fixture, "scripts/release-0.6.981-ci-exception.json"));
+  fs.copyFileSync(packageManifest, path.join(fixture, "package.json"));
   fs.copyFileSync(capabilities, path.join(fixture, "scripts/e2e-capabilities.mjs"));
   fs.copyFileSync(contracts, path.join(fixture, "tests/ui-regressions/e2e-contracts.json"));
   fs.writeFileSync(path.join(fixture, "scripts/e2e-multigraph.mjs"), "// Provenance validation reached the selected scenario.\n");
@@ -220,6 +226,9 @@ try {
     [proofReuseHelper, "scripts/release-proof-reuse-lib.mjs"],
     [proofOnlyRegistry, "scripts/release-proof-only.json"],
     [runner, "scripts/run-e2e.mjs"],
+    [releaseExceptionHelper, "scripts/release-0.6.981-ci-exception.mjs"],
+    [releaseExceptionLedger, "scripts/release-0.6.981-ci-exception.json"],
+    [packageManifest, "package.json"],
     [capabilities, "scripts/e2e-capabilities.mjs"],
     [contracts, "tests/ui-regressions/e2e-contracts.json"],
   ]) fs.copyFileSync(source, path.join(promotionFixture, destination));

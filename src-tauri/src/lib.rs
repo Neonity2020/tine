@@ -14,6 +14,7 @@ mod android_system_bars;
 mod backend_command_parity;
 mod backup;
 mod commands;
+mod conflict_capsule;
 mod data_home;
 mod debug;
 mod graph;
@@ -45,22 +46,23 @@ use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
     acknowledge_managed_application_move, activate_absent_editor, activate_editor,
     apply_journal_filename_migrations, asset_trash_stats, block_ref_counts, block_referrers,
-    capture_live_save_conflict, capture_quick_switch, close_graph_window, conflict_queue,
-    copy_guide_into_graph, delete_page, detect_media_editor, duplicate_journal_diff,
-    durable_live_save_conflict_diff, edit_asset_external, empty_asset_trash, existing_page_names,
-    export_query_subtrees, get_backlink_filter_context, get_backlinks, get_page, get_page_by_path,
-    get_unlinked_refs, graph_source_files, guide_pages, import_asset, import_native_capture,
-    journal_content_days, journal_feed_page, list_journal_conflicts,
-    list_journal_filename_migrations, list_orphan_assets, list_pages, list_sync_conflicts,
-    list_templates, list_vcs_marker_conflicts, live_save_conflict_diff, load_workspaces,
-    merge_pages, move_managed_application_subtrees, open_asset, open_page_file, open_pdf,
-    page_aliases, page_icons, page_print_html, preflight_managed_page_mutation, prepare_tine_quit,
-    present_conflict_override, preview_block, publish_html, query_facets, quick_switch, read_asset,
-    read_custom_css, read_highlights, read_journal_file, read_local_image, read_text_file,
-    recover_managed_application_subtrees, referenced_page_names, rename_file_to_page, rename_page,
-    rescan_graph_now, resolve_block, resolve_blocks, resolve_duplicate_journal_day,
-    resolve_durable_live_save_conflict, resolve_live_save_conflict, resolve_sync_conflict,
-    resolve_vcs_marker_conflict, retire_editor_activation, run_advanced_query, run_graph_search,
+    capture_live_save_conflict, capture_quick_switch, close_graph_window, conflict_capsule_diff,
+    conflict_queue, copy_guide_into_graph, delete_page, detect_media_editor,
+    duplicate_journal_diff, durable_live_save_conflict_diff, edit_asset_external,
+    empty_asset_trash, existing_page_names, export_query_subtrees, get_backlink_filter_context,
+    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages,
+    import_asset, import_native_capture, journal_content_days, journal_feed_page,
+    list_journal_conflicts, list_journal_filename_migrations, list_orphan_assets, list_pages,
+    list_sync_conflicts, list_templates, list_vcs_marker_conflicts, live_save_conflict_diff,
+    load_workspaces, merge_pages, move_managed_application_subtrees, open_asset, open_page_file,
+    open_pdf, page_aliases, page_icons, page_print_html, preflight_managed_page_mutation,
+    prepare_tine_quit, present_conflict_override, preview_block, publish_html, query_facets,
+    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
+    read_local_image, read_text_file, recover_managed_application_subtrees, referenced_page_names,
+    rename_file_to_page, rename_page, rescan_graph_now, resolve_block, resolve_blocks,
+    resolve_conflict_capsule, resolve_duplicate_journal_day, resolve_durable_live_save_conflict,
+    resolve_live_save_conflict, resolve_sync_conflict, resolve_vcs_marker_conflict,
+    retire_editor_activation, rollback_pdf_area_image, run_advanced_query, run_graph_search,
     run_query, save_asset, save_page, save_pdf_area_image, save_workspaces, search,
     set_default_home, set_default_journal_template, set_doc_mode_enter_for_new_block,
     set_favorites, set_favorites_page, set_guide_announced, set_journal_title_format,
@@ -70,15 +72,16 @@ use commands::{
     trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff, write_highlights,
     write_pdf_view_state,
 };
+use conflict_capsule::{load_conflict_capsules, retire_conflict_capsule, store_conflict_capsule};
 use debug::{
     app_architecture, clear_diagnostics, debug_header, debug_info, debug_init, debug_log, diag,
     diagnostic_frontend_event, diagnostic_ipc_event, diagnostic_report, diagnostic_session_active,
     flight_init, install_panic_logger, mark_clean_shutdown, save_diagnostic_report,
 };
 use graph::{
-    app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
-    default_graph_parent, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
-    warm_done,
+    app_platform, approve_external_assets, begin_direct_cross_page_move, capture_graph_binding,
+    capture_target, create_graph, default_graph_parent, finish_direct_cross_page_move,
+    inspect_graph_access, load_graph, open_graph_window, startup_graph_path, warm_done,
 };
 use graph_verification::{
     cancel_graph_verification, create_graph_verification, save_graph_verification_report,
@@ -750,6 +753,8 @@ pub fn run() {
             load_graph,
             inspect_graph_access,
             approve_external_assets,
+            begin_direct_cross_page_move,
+            finish_direct_cross_page_move,
             open_graph_window,
             startup_graph_path,
             capture_target,
@@ -858,9 +863,14 @@ pub fn run() {
             text_block_diff3,
             live_save_conflict_diff,
             capture_live_save_conflict,
+            conflict_capsule_diff,
+            load_conflict_capsules,
+            store_conflict_capsule,
+            retire_conflict_capsule,
             durable_live_save_conflict_diff,
             resolve_durable_live_save_conflict,
             resolve_live_save_conflict,
+            resolve_conflict_capsule,
             resolve_sync_conflict,
             rescan_graph_now,
             resolve_vcs_marker_conflict,
@@ -894,6 +904,7 @@ pub fn run() {
             write_highlights,
             write_pdf_view_state,
             save_pdf_area_image,
+            rollback_pdf_area_image,
             get_backup_keep,
             set_backup_keep,
             get_capture_enter_files,

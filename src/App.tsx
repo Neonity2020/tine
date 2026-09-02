@@ -954,11 +954,15 @@ export async function installMobileExternalLinkHandler(): Promise<() => void> {
     const el = target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
     const a = el?.closest?.("a[href]") as HTMLAnchorElement | null;
     const href = a?.getAttribute("href")?.trim() ?? "";
-    if (!a || !/^(https?:\/\/|mailto:)/i.test(href)) return;
+    if (!a) return;
+    const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(href)?.[1]?.toLowerCase();
+    if (!scheme) return; // graph-internal relative/hash navigation
 
     e.preventDefault();
     e.stopPropagation();
-    void backend().openExternal(a.href);
+    if (scheme === "file" || scheme === "http" || scheme === "https" || scheme === "mailto") {
+      void backend().openExternal(a.href);
+    }
   };
 
   document.addEventListener("click", onClick, true);

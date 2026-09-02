@@ -262,6 +262,23 @@ impl LocalCompletionIndex {
             .collect()
     }
 
+    /// How many own-endpoint completion entries this chain retains, counting
+    /// the unflushed buffer. Diagnostic attribution only.
+    pub(crate) fn completed_entry_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(intent_id, stored)| {
+                stored.entry.state == LocalCompletionState::Completed
+                    && !self.buffered.contains_key(intent_id)
+            })
+            .count()
+            + self
+                .buffered
+                .values()
+                .filter(|entry| entry.state == LocalCompletionState::Completed)
+                .count()
+    }
+
     pub(crate) fn completed_entries(&self) -> Vec<LocalCompletionEntry> {
         self.entries
             .values()
@@ -443,7 +460,7 @@ impl LocalCompletionIndex {
         Ok(true)
     }
 
-    #[cfg(test)]
+    /// How this chain was reached at open. Diagnostic attribution only.
     pub(crate) fn open_stats(&self) -> &LocalCompletionOpenStats {
         &self.open_stats
     }

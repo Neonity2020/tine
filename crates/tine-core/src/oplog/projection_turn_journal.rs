@@ -23,9 +23,16 @@
 //!   because a projection turn carries no semantic transition to be ahead of.
 //!   That gate lands with the producers in packet 2a.
 //!
-//! NOTHING IN PRODUCTION OPENS THIS JOURNAL YET. The turn machinery ships alone;
-//! `tests::no_production_path_opens_or_appends_a_projection_turn` is the
-//! architectural fact that says so, and it fails the moment a caller appears.
+//! Production opens this journal. The cold open selects and drains it
+//! (`sync_runtime.rs`: `open_projection_turn_journal`,
+//! `drain_open_projection_turn_journal`), the coordinator appends one turn per
+//! projection-only origin, and `projection.rs` replays it. The architectural
+//! fact is `every_projection_only_producer_reaches_the_projection_turn_journal`
+//! at the end of this file's tests, which fails if a producer is unwired.
+//!
+//! This paragraph said the exact opposite until 2026-09 — "NOTHING IN
+//! PRODUCTION OPENS THIS JOURNAL YET", citing a guard that had never been
+//! written. The producers landed; the sentence did not move.
 
 use std::collections::VecDeque;
 

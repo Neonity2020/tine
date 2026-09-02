@@ -167,6 +167,14 @@ fn validate_logical_page_name(value: &str) -> Result<(), LogicalPageNameError> {
 /// collapsing the two folds is a versioned migration (storage backlog), not a
 /// patch. Until then, every lookup into a canonical-keyed index MUST use this
 /// fold — querying it with `refs::normalize` silently misses (DUP-1).
+///
+/// That MUST is not expressible in the type system today: the `*_by_name_key`
+/// queries take `&str`. What holds it up is that this fold has exactly two
+/// front doors — [`LogicalPageName::canonical_key`] (and the `key_digest` built
+/// on it) and `sync_runtime`'s `managed_page_name_key` — plus
+/// `only_the_named_front_doors_compute_the_managed_page_name_fold`, which fails
+/// if a third appears or if a refs fold is handed to a name-key query. A new
+/// caller here is a new front door, and belongs in this list.
 pub(crate) fn canonical_page_name_key(value: &str) -> String {
     let lowered: String = value.trim().chars().flat_map(char::to_lowercase).collect();
     let without_leading = lowered.strip_prefix('/').unwrap_or(&lowered);
@@ -1931,5 +1939,45 @@ mod tests {
                 SEMANTIC_EFFECT_SCHEMA_VERSION - 1
             ))
         );
+    }
+
+    /// The managed fold's MUST (see [`canonical_page_name_key`]) cannot be typed
+    /// today, so pin its front doors instead. DUP-1 was exactly this: a managed
+    /// rename keyed a canonical index with the refs fold, found nothing, and
+    /// reported `Applied` while doing nothing to `ΟΔΥΣΣΕΥΣ`.
+    #[test]
+    fn only_the_named_front_doors_compute_the_managed_page_name_fold() {
+        let production = crate::projection_producer_census::production_rust();
+        let callers = production
+            .iter()
+            .filter(|file| {
+                file.code.contains("canonical_page_name_key(")
+                    && !file.code.contains("fn canonical_page_name_key(")
+            })
+            .map(|file| file.relative.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            callers,
+            vec!["crates/tine-core/src/sync_runtime.rs".to_owned()],
+            "the managed page-name fold has a new front door. Every one of them is a \
+             place a caller can key a canonical index, so name it in \
+             canonical_page_name_key's doc comment in the same change — the doc claims \
+             this list is complete (invariant I-11)."
+        );
+
+        for file in production {
+            for (number, line) in file.code.lines().enumerate() {
+                let queries_by_name_key =
+                    line.contains("by_name_key") || line.contains("at_name_key");
+                assert!(
+                    !(queries_by_name_key && line.contains("refs::")),
+                    "{}:{}: a canonical-keyed query is being handed a refs fold. The two \
+                     folds disagree on Greek final sigma, so this silently misses instead \
+                     of failing — it is DUP-1 verbatim. Use canonical_page_name_key.",
+                    file.relative,
+                    number + 1
+                );
+            }
+        }
     }
 }

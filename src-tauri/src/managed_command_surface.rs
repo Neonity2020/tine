@@ -53,6 +53,7 @@ use ManagedRouting::{ConfigWrite, Filesystem, LegacyOnly, ManagedRouted, NoGraph
 const SCANNED_SOURCES: &[(&str, &str)] = &[
     ("backup.rs", include_str!("backup.rs")),
     ("commands.rs", include_str!("commands.rs")),
+    ("conflict_capsule.rs", include_str!("conflict_capsule.rs")),
     ("data_home.rs", include_str!("data_home.rs")),
     ("debug.rs", include_str!("debug.rs")),
     ("graph.rs", include_str!("graph.rs")),
@@ -105,6 +106,13 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("apply_spellcheck", NoGraphSlot),
     ("approve_external_assets", NoGraphSlot),
     ("asset_trash_stats", Filesystem),
+    // The Direct cross-page move recovery bracket (packet B2): compose+commit
+    // the crash record before the first page write, retire it once every
+    // participant is durably terminal. Both take the legacy graph deliberately —
+    // the record exists because a Direct move is N+1 separate file writes, and a
+    // managed cross-page move is one native operation that needs no such record.
+    // The frontend front door never routes a managed binding here.
+    ("begin_direct_cross_page_move", LegacyOnly),
     ("block_ref_counts", ManagedRouted),
     ("block_referrers", ManagedRouted),
     ("cancel_graph_verification", NoGraphSlot),
@@ -121,6 +129,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("clipboard_files", NoGraphSlot),
     ("clear_diagnostics", NoGraphSlot),
     ("close_graph_window", NoGraphSlot),
+    ("conflict_capsule_diff", ManagedRouted),
     ("conflict_queue", Filesystem),
     ("copy_guide_into_graph", ManagedRouted),
     ("copy_image_to_clipboard", NoGraphSlot),
@@ -141,6 +150,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("empty_asset_trash", TrashWrite),
     ("existing_page_names", ManagedRouted),
     ("export_query_subtrees", ManagedRouted),
+    ("finish_direct_cross_page_move", LegacyOnly),
     ("forget_known_graph", NoGraphSlot),
     ("get_app_bool", NoGraphSlot),
     ("get_app_string", NoGraphSlot),
@@ -185,6 +195,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("list_vcs_marker_conflicts", Filesystem),
     ("live_save_conflict_diff", Filesystem),
     ("load_graph", NoGraphSlot),
+    ("load_conflict_capsules", NoGraphSlot),
     ("load_plugin_registry_cache", NoGraphSlot),
     ("load_session", NoGraphSlot),
     ("load_workspaces", NoGraphSlot),
@@ -224,6 +235,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("rescan_graph_now", NoGraphSlot),
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
+    ("resolve_conflict_capsule", ManagedRouted),
     ("resolve_duplicate_journal_day", LegacyOnly),
     ("resolve_durable_live_save_conflict", LegacyOnly),
     ("resolve_live_save_conflict", LegacyOnly),
@@ -232,7 +244,9 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("restore_absence_sweep", ManagedRouted),
     ("restore_backup", LegacyOnly),
     ("retire_editor_activation", LegacyOnly),
+    ("retire_conflict_capsule", NoGraphSlot),
     ("reveal_known_graph", NoGraphSlot),
+    ("rollback_pdf_area_image", TrashWrite),
     ("run_advanced_query", ManagedRouted),
     ("run_graph_search", ManagedRouted),
     ("run_query", ManagedRouted),
@@ -274,6 +288,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("sparse_v2_tick", NoGraphSlot),
     ("startup_graph_path", NoGraphSlot),
     ("store_plugin_registry_cache", NoGraphSlot),
+    ("store_conflict_capsule", NoGraphSlot),
     ("stream_asset_path", Filesystem),
     ("sync_conflict_diff", Filesystem),
     ("take_data_home_fallback_notice", NoGraphSlot),
@@ -314,6 +329,17 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
         "apply_journal_filename_migrations",
         "renaming graph files is the oplog's authority under managed storage, \
          which has no Direct Files journal filenames to repair",
+    ),
+    (
+        "begin_direct_cross_page_move",
+        "a Direct cross-page move is N+1 separate file writes and needs a crash \
+         record to converge; a managed cross-page move is one native operation \
+         the actor commits atomically, so there is nothing to recover",
+    ),
+    (
+        "finish_direct_cross_page_move",
+        "retires the record `begin_direct_cross_page_move` composed, so it is \
+         refused for the same reason",
     ),
     (
         "list_backups",

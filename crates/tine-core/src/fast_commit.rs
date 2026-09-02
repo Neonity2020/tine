@@ -23,10 +23,15 @@
 //! prototype-only: these incomplete frames are not the managed-local durable
 //! record and cannot be replayed by that bridge.
 //!
-//! This is a narrowly scoped internal API. It is deliberately not wired into
-//! the shipping save route yet: the runtime integration is a later lane's work,
-//! and this lane's contract is to prove the spine can meet the ordinary-edit
-//! latency budget first.
+//! This module has two deliberately different wiring states.
+//! The `FastLocalCommitter` remains deliberately unwired from the shipping save
+//! route: runtime integration is a later lane's work, and the prototype first
+//! proves the ordinary-edit latency budget.
+//! The structural counters are wired into production boundaries in `model.rs`,
+//! `object_store.rs`, `sqlite.rs`,
+//! and `hot_engine.rs`; the projection-producer census and the header guard
+//! below pin those callers so this distinction cannot drift back into a claim
+//! that the whole module is dormant.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -813,6 +818,50 @@ mod tests {
 
     fn overlay_base() -> std::path::PathBuf {
         std::env::temp_dir()
+    }
+
+    #[test]
+    fn header_distinguishes_the_unwired_committer_from_wired_counters() {
+        use crate::projection_producer_census::{call_count, production_rust};
+
+        let source = include_str!("fast_commit.rs");
+        let header = source.split("use std::borrow::Cow;").next().unwrap();
+        assert!(
+            header.contains("The `FastLocalCommitter` remains deliberately unwired"),
+            "the header must scope the unwired claim to the committer"
+        );
+        assert!(
+            header.contains("The structural counters are wired into production"),
+            "the header must acknowledge the production instrumentation half"
+        );
+
+        let production = production_rust();
+        let external_committer_mentions: usize = production
+            .iter()
+            .filter(|file| file.relative != "crates/tine-core/src/fast_commit.rs")
+            .map(|file| file.code.matches("FastLocalCommitter").count())
+            .sum();
+        assert_eq!(
+            external_committer_mentions, 0,
+            "FastLocalCommitter gained a production caller; update the header and contract"
+        );
+
+        for name in [
+            "note_sqlite_drain",
+            "note_archive_object_read",
+            "note_graph_wide_catalog_decode",
+            "note_graph_wide_catalog_validation",
+            "note_application_page_load",
+            "note_graph_text_inventory",
+            "note_effective_identity_rebuild",
+            "note_real_page_name_materialization",
+        ] {
+            assert!(
+                call_count(production, name) > 0,
+                "structural counter {name} is no longer wired in production; update the \
+                 header and contract (a legitimate additional call site is fine)"
+            );
+        }
     }
 
     fn journal_frames(

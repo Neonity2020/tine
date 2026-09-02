@@ -1629,10 +1629,14 @@ pub enum SyncRuntimeCleanOpenStage {
     GraphOpen,
     EndpointAndReceiptOpen,
     ObjectStoreRepairAndValidation,
+    CleanCheckpointOpen,
+    CleanCheckpointTailDiscovery,
     CommittedTailReplay,
     ProjectionOpen,
     EngineIndexesAndSweepsOpen,
     RetainedJournalsOpen,
+    OwnEndpointRetirementScan,
+    AbsenceDecisionMapOpen,
     RetainedJournalsDrain,
     TerminalProjectionRepair,
     CompletionFlush,
@@ -1646,10 +1650,14 @@ impl SyncRuntimeCleanOpenStage {
             Self::GraphOpen => "graph_open",
             Self::EndpointAndReceiptOpen => "endpoint_and_receipt_open",
             Self::ObjectStoreRepairAndValidation => "object_store_repair_and_validation",
+            Self::CleanCheckpointOpen => "clean_checkpoint_open",
+            Self::CleanCheckpointTailDiscovery => "clean_checkpoint_tail_discovery",
             Self::CommittedTailReplay => "committed_tail_replay",
             Self::ProjectionOpen => "projection_open",
             Self::EngineIndexesAndSweepsOpen => "engine_indexes_and_sweeps_open",
             Self::RetainedJournalsOpen => "retained_journals_open",
+            Self::OwnEndpointRetirementScan => "own_endpoint_retirement_scan",
+            Self::AbsenceDecisionMapOpen => "absence_decision_map_open",
             Self::RetainedJournalsDrain => "retained_journals_drain",
             Self::TerminalProjectionRepair => "terminal_projection_repair",
             Self::CompletionFlush => "completion_flush",
@@ -1703,6 +1711,78 @@ pub struct SyncRuntimeRecoveryDiagnostics {
     pub replayed_generations: u64,
 }
 
+/// Content-free work counters for one clean managed cold open.
+///
+/// Every field counts work the open actually performed — directory names
+/// observed, evidence bodies decoded, history entries replayed. Nothing here
+/// is read back by the open path: these values are produced after the work
+/// they describe and never gate, shorten, or redirect a stage. They exist so
+/// the per-stage wall times reported alongside them can be attributed to a
+/// mechanism instead of guessed at (I-14: a cost that grows with store
+/// lifetime must be visible as a number before it can be bounded).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SyncRuntimeCleanOpenCounters {
+    /// Accepted batches in the engine's history at open — the lifetime axis.
+    pub accepted_batches: usize,
+    /// Committed operation manifests replayed onto the immutable baseline.
+    pub committed_tail_replayed: usize,
+    /// Exactly one when a durable clean checkpoint restored engine state.
+    pub checkpoint_opens: usize,
+    /// Exactly one when open started from the immutable sequence-zero baseline.
+    pub full_replay_opens: usize,
+    /// Accepted roster rows authenticated through the sealed index.
+    pub checkpoint_roster_entries: usize,
+    /// Archive manifest names compared during checkpoint tail discovery.
+    pub checkpoint_manifest_names: usize,
+    /// Required object names compared without opening object bodies.
+    pub checkpoint_required_object_names: usize,
+    /// Semantic items touched by the actor capture which produced the checkpoint.
+    pub checkpoint_capture_work: u64,
+    /// Canonical checkpoint payload bytes opened before the durable tail.
+    pub checkpoint_payload_bytes: usize,
+    /// Published frontier minus durable checkpoint frontier after open.
+    pub checkpoint_durable_lag: u64,
+    /// Sweep chains reconstructed from the private derived root.
+    pub sweep_chains: usize,
+    /// Receipt evidence FILENAMES observed by the names-only horizon scan.
+    pub receipt_evidence_names: usize,
+    /// Receipt evidence BODIES read and decoded (intent + completion rows).
+    pub receipt_content_reads: usize,
+    /// Complete `validated_catalog()` passes over the receipt store.
+    pub receipt_full_catalog_passes: usize,
+    /// Summary objects read while opening the receiver absence summary.
+    pub summary_content_reads: usize,
+    /// The summary was rebuilt from the full catalog rather than delta-read.
+    pub summary_rebuilt: bool,
+    /// Newly completed receiver rows the summary delta-read.
+    pub summary_delta_completions: usize,
+    /// Newly intended (uncompleted) receiver rows the summary delta-read.
+    pub summary_delta_intents: usize,
+    /// Own-endpoint completion-chain object names observed at open.
+    pub local_completion_names: usize,
+    /// Own-endpoint completion-chain objects read and decoded at open.
+    pub local_completion_content_reads: usize,
+    /// The own-endpoint chain was rebuilt rather than resumed from compaction.
+    pub local_completion_rebuilt: bool,
+    /// Own-endpoint completion entries retained after open.
+    pub local_completion_entries: usize,
+    /// Own intent ids probed for retired receipt artifacts.
+    pub retired_own_intent_probes: usize,
+    /// Retired own-endpoint receipt artifacts still present on disk.
+    pub retired_own_receipt_artifacts: usize,
+    /// Archive directory enumerations performed during this open.
+    pub archive_directory_enumerations: usize,
+    /// Archive manifest bodies read during this open.
+    pub archive_manifest_reads: usize,
+    /// Archive object bodies read during this open.
+    pub archive_object_reads: usize,
+    /// Batch manifests INSPECTED (decoded and validated) during this open —
+    /// the per-batch work of committed-tail replay.
+    pub archive_inspected_manifests: usize,
+    /// Immutable objects inspected (decoded) during this open.
+    pub archive_inspected_objects: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeOpenProgress {
     Phase {
@@ -1719,6 +1799,11 @@ pub enum SyncRuntimeOpenProgress {
     },
     RecoveryDiagnostics {
         diagnostics: SyncRuntimeRecoveryDiagnostics,
+    },
+    /// Emitted exactly once when a clean cold open completes, after every
+    /// stage boundary it attributes. Observational only.
+    CleanOpenCounters {
+        counters: SyncRuntimeCleanOpenCounters,
     },
 }
 
@@ -3419,6 +3504,7 @@ impl SyncRuntimeHandle {
                     stage: SyncRuntimeCleanOpenStage,
                     elapsed: Duration,
                 },
+                Counters(SyncRuntimeCleanOpenCounters),
                 Complete(Result<Option<CleanRuntimeResources>, String>),
             }
             let (recovery_sender, recovery_receiver) = mpsc::channel();
@@ -3430,12 +3516,16 @@ impl SyncRuntimeHandle {
                         session.attach();
                     }
                     let stage_sender = recovery_sender.clone();
+                    let counters_sender = recovery_sender.clone();
                     let result = open_clean_runtime_resources_with_progress(
                         &recovery_request,
                         &mut |_| {},
                         &mut |stage, elapsed| {
                             let _ =
                                 stage_sender.send(RecoveryWorkerEvent::Stage { stage, elapsed });
+                        },
+                        &mut |counters| {
+                            let _ = counters_sender.send(RecoveryWorkerEvent::Counters(counters));
                         },
                     );
                     let _ = recovery_sender.send(RecoveryWorkerEvent::Complete(result));
@@ -3451,6 +3541,9 @@ impl SyncRuntimeHandle {
                 match recovery_receiver.recv_timeout(RUNTIME_OPEN_PROGRESS_HEARTBEAT) {
                     Ok(RecoveryWorkerEvent::Stage { stage, elapsed }) => {
                         progress(SyncRuntimeOpenProgress::RecoveryStage { stage, elapsed });
+                    }
+                    Ok(RecoveryWorkerEvent::Counters(counters)) => {
+                        progress(SyncRuntimeOpenProgress::CleanOpenCounters { counters });
                     }
                     Ok(RecoveryWorkerEvent::Complete(result)) => {
                         if recovery_worker.join().is_err() {
@@ -3719,6 +3812,7 @@ impl SyncRuntimeHandle {
             &runtime_open_request_from_activation(&request),
             &mut progress,
             &mut |_, _| {},
+            &mut |_| {},
         ) {
             Ok(Some(resources)) => {
                 progress(SyncLocalActivationProgress::Phase {
@@ -4686,6 +4780,23 @@ impl SyncRuntimeHandle {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::ManagedApplicationQueryInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn observable_engine_state(
+        &self,
+    ) -> Result<
+        crate::oplog::hot_engine::validation_tests::ObservableEngineState,
+        SyncRuntimeRequestError,
+    > {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ObservableEngineState {
             reply: reply_sender,
         })?;
         reply_receiver
@@ -6534,7 +6645,7 @@ fn activate_clean_runtime_resources_retaining_archive(
 fn open_clean_runtime_resources(
     request: &SyncRuntimeOpenRequest,
 ) -> Result<Option<CleanRuntimeResources>, String> {
-    open_clean_runtime_resources_with_progress(request, &mut |_| {}, &mut |_, _| {})
+    open_clean_runtime_resources_with_progress(request, &mut |_| {}, &mut |_, _| {}, &mut |_| {})
 }
 
 /// Own the engine and its lease together throughout cold repair. Drop flushes
@@ -6623,14 +6734,71 @@ impl CleanOpenStageTrace {
         }
         self.previous = now;
     }
+
+    /// Publish the completed open's work counters once, after the last stage.
+    fn report_counters(
+        &self,
+        counters: &SyncRuntimeCleanOpenCounters,
+        progress: &mut dyn FnMut(SyncRuntimeCleanOpenCounters),
+    ) {
+        progress(*counters);
+        if self.debug_enabled {
+            eprintln!(
+                "[tine] managed clean open counters: accepted_batches={}; \
+committed_tail_replayed={}; checkpoint_opens={}; full_replay_opens={}; \
+checkpoint_roster_entries={}; checkpoint_manifest_names={}; \
+checkpoint_required_object_names={}; checkpoint_capture_work={}; checkpoint_payload_bytes={}; \
+checkpoint_durable_lag={}; sweep_chains={}; receipt_evidence_names={}; \
+receipt_content_reads={}; receipt_full_catalog_passes={}; \
+summary_content_reads={}; summary_rebuilt={}; summary_delta_completions={}; \
+summary_delta_intents={}; local_completion_names={}; \
+local_completion_content_reads={}; local_completion_rebuilt={}; \
+local_completion_entries={}; retired_own_intent_probes={}; \
+retired_own_receipt_artifacts={}; archive_directory_enumerations={}; \
+archive_manifest_reads={}; archive_object_reads={}; \
+archive_inspected_manifests={}; archive_inspected_objects={}",
+                counters.accepted_batches,
+                counters.committed_tail_replayed,
+                counters.checkpoint_opens,
+                counters.full_replay_opens,
+                counters.checkpoint_roster_entries,
+                counters.checkpoint_manifest_names,
+                counters.checkpoint_required_object_names,
+                counters.checkpoint_capture_work,
+                counters.checkpoint_payload_bytes,
+                counters.checkpoint_durable_lag,
+                counters.sweep_chains,
+                counters.receipt_evidence_names,
+                counters.receipt_content_reads,
+                counters.receipt_full_catalog_passes,
+                counters.summary_content_reads,
+                counters.summary_rebuilt,
+                counters.summary_delta_completions,
+                counters.summary_delta_intents,
+                counters.local_completion_names,
+                counters.local_completion_content_reads,
+                counters.local_completion_rebuilt,
+                counters.local_completion_entries,
+                counters.retired_own_intent_probes,
+                counters.retired_own_receipt_artifacts,
+                counters.archive_directory_enumerations,
+                counters.archive_manifest_reads,
+                counters.archive_object_reads,
+                counters.archive_inspected_manifests,
+                counters.archive_inspected_objects,
+            );
+        }
+    }
 }
 
 fn open_clean_runtime_resources_with_progress(
     request: &SyncRuntimeOpenRequest,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
     stage_progress: &mut dyn FnMut(SyncRuntimeCleanOpenStage, Duration),
+    counters_progress: &mut dyn FnMut(SyncRuntimeCleanOpenCounters),
 ) -> Result<Option<CleanRuntimeResources>, String> {
     let mut trace = CleanOpenStageTrace::new();
+    let mut counters = SyncRuntimeCleanOpenCounters::default();
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
         "clean managed runtime open has no persisted local identity record".to_owned()
     })?;
@@ -6720,15 +6888,85 @@ fn open_clean_runtime_resources_with_progress(
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeTailReplay,
     });
-    let replayed = engine
-        .replay_clean_committed_tail(baseline_claim_source.as_ref())
-        .map_err(display)?;
+    let checkpoint_open = crate::oplog::checkpoint_generation::open_checkpoint(&store);
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
+        stage_progress,
+    );
+    let mut replayed = 0_usize;
+    let mut restored_checkpoint = false;
+    match checkpoint_open {
+        Err(crate::oplog::checkpoint_generation::CleanCheckpointOpenError::ArchiveDamage(
+            error,
+        )) => return Err(error),
+        Err(crate::oplog::checkpoint_generation::CleanCheckpointOpenError::Store(error)) => {
+            eprintln!("clean checkpoint could not be read; using full replay: {error}");
+        }
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Absent) => {}
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Invalid(error)) => {
+            eprintln!("clean checkpoint is disposable and will be rebuilt: {error}");
+        }
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded)) => {
+            counters.checkpoint_roster_entries = loaded.accepted_rows.len();
+            counters.checkpoint_manifest_names =
+                loaded.accepted_rows.len().saturating_add(loaded.tail.len());
+            counters.checkpoint_required_object_names = loaded.required_objects.len();
+            counters.checkpoint_capture_work = loaded.capture_work;
+            counters.checkpoint_payload_bytes = loaded.payload_bytes;
+            let durable_sequence = loaded.accepted_rows.len() as u64;
+            let tail = loaded.tail.clone();
+            match engine.restore_clean_checkpoint(
+                &loaded.state_bytes,
+                loaded.accepted_rows,
+                loaded.required_objects,
+            ) {
+                Ok(()) => {
+                    engine
+                        .reset_clean_checkpoint_publisher(durable_sequence)
+                        .map_err(display)?;
+                    restored_checkpoint = true;
+                    counters.checkpoint_opens = 1;
+                    match engine.replay_clean_checkpoint_tail(&tail, baseline_claim_source.as_ref())
+                    {
+                        Ok(count) => replayed = count,
+                        Err(error) => {
+                            eprintln!(
+                                "clean checkpoint tail admission failed; using sequence-zero replay: {error}"
+                            );
+                            engine
+                                .reset_clean_checkpoint_to_baseline()
+                                .map_err(display)?;
+                            restored_checkpoint = false;
+                            counters.checkpoint_opens = 0;
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "clean checkpoint state validation failed; using full replay: {error}"
+                    );
+                }
+            }
+        }
+    }
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointTailDiscovery,
+        stage_progress,
+    );
+    if !restored_checkpoint {
+        counters.full_replay_opens = 1;
+        replayed = engine
+            .replay_clean_committed_tail(baseline_claim_source.as_ref())
+            .map_err(display)?;
+    }
+    counters.committed_tail_replayed = replayed;
+    counters.checkpoint_durable_lag = engine.clean_checkpoint_durable_lag();
     drop(baseline_claim_source);
     trace.phase(
         SyncRuntimeCleanOpenStage::CommittedTailReplay,
         stage_progress,
     );
-    let projection = if replayed == 0 {
+    let projection = if engine.is_clean_genesis_frontier().map_err(display)? {
         let expected = engine.accepted_frontier_root().map_err(display)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
             &request.database_path,
@@ -6776,13 +7014,21 @@ fn open_clean_runtime_resources_with_progress(
     // workspace lease before either journal drain or any actor publication
     // path can run. Open/in-grace records therefore re-establish the barrier
     // before retained outbound work becomes runnable.
-    let accepted_batch_ids = engine
+    let accepted_batch_ids: BTreeSet<_> = engine
         .status()
         .accepted_batch_ids()
         .map_err(display)?
         .into_iter()
         .collect();
+    counters.accepted_batches = accepted_batch_ids.len();
     let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
+    counters.sweep_chains = sweeps.chain_count();
+    counters.local_completion_entries = engine.local_completion_entry_count();
+    if let Some(stats) = engine.local_completion_open_stats() {
+        counters.local_completion_names = stats.names_observed;
+        counters.local_completion_content_reads = stats.content_reads;
+        counters.local_completion_rebuilt = stats.rebuilt;
+    }
     trace.phase(
         SyncRuntimeCleanOpenStage::EngineIndexesAndSweepsOpen,
         stage_progress,
@@ -6818,19 +7064,42 @@ fn open_clean_runtime_resources_with_progress(
     let retained_own_intents =
         retained_local_completion_intents(&managed_local, &projection_turns)?;
     retired_own_intent_ids.extend(retained_own_intents.iter().copied());
+    counters.retired_own_intent_probes = retired_own_intent_ids.len();
     let retired_receipt_artifacts =
         receipts.retired_own_endpoint_artifacts(&retired_own_intent_ids);
+    counters.retired_own_receipt_artifacts = retired_receipt_artifacts.len();
     if !retired_receipt_artifacts.is_empty() {
         eprintln!(
             "retired own-endpoint receipt artifacts remain inert: {}",
             retired_receipt_artifacts.join(", ")
         );
     }
+    trace.phase(
+        SyncRuntimeCleanOpenStage::OwnEndpointRetirementScan,
+        stage_progress,
+    );
     completion_guard
         .runtime_mut()
         .engine()
         .open_absence_decision_map(&receipts)
         .map_err(display)?;
+    if let Some(stats) = completion_guard
+        .runtime_mut()
+        .engine()
+        .receiver_absence_summary_open_stats()
+    {
+        counters.receipt_evidence_names = stats.evidence_names_observed;
+        counters.receipt_content_reads = stats.receipt_content_reads;
+        counters.receipt_full_catalog_passes = stats.full_catalog_passes;
+        counters.summary_content_reads = stats.summary_content_reads;
+        counters.summary_rebuilt = stats.rebuilt;
+        counters.summary_delta_completions = stats.delta_completions;
+        counters.summary_delta_intents = stats.delta_intents;
+    }
+    trace.phase(
+        SyncRuntimeCleanOpenStage::AbsenceDecisionMapOpen,
+        stage_progress,
+    );
     completion_guard.retain(retained_own_intents);
     let recovered_provider_batches = drain_open_managed_local_journal(
         &graph,
@@ -6865,6 +7134,13 @@ fn open_clean_runtime_resources_with_progress(
     // buffered entries, independent of how long actor construction takes.
     let runtime = completion_guard.finish()?;
     trace.phase(SyncRuntimeCleanOpenStage::CompletionFlush, stage_progress);
+    let archive = store.instrumentation();
+    counters.archive_directory_enumerations = archive.directory_enumerations;
+    counters.archive_manifest_reads = archive.accepted_manifest_reads + archive.dag_manifest_reads;
+    counters.archive_object_reads = archive.accepted_object_reads;
+    counters.archive_inspected_manifests = archive.inspected_manifest_operations;
+    counters.archive_inspected_objects = archive.inspected_object_operations;
+    trace.report_counters(&counters, counters_progress);
     Ok(Some(CleanRuntimeResources {
         graph,
         receipts,
@@ -9568,6 +9844,10 @@ enum ActorRequest {
         reply: mpsc::Sender<ManagedApplicationQueryInstrumentation>,
     },
     #[cfg(test)]
+    ObservableEngineState {
+        reply: mpsc::Sender<crate::oplog::hot_engine::validation_tests::ObservableEngineState>,
+    },
+    #[cfg(test)]
     ManagedTaskQueryOverlaySnapshot {
         reply: mpsc::Sender<ManagedTaskQueryOverlaySnapshot>,
     },
@@ -9985,6 +10265,17 @@ fn run_actor_loop(
             #[cfg(test)]
             ActorRequest::ManagedApplicationQueryInstrumentation { reply } => {
                 let _ = reply.send(actor.managed_application_query_instrumentation());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ObservableEngineState { reply } => {
+                if let Some(clean) = actor.clean.as_ref() {
+                    let _ = reply.send(
+                        crate::oplog::hot_engine::validation_tests::observable_engine_state(
+                            clean.runtime.engine(),
+                        ),
+                    );
+                }
                 false
             }
             #[cfg(test)]

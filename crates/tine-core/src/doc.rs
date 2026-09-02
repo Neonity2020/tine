@@ -131,10 +131,13 @@ pub struct DocBlock {
     /// Runtime/store identity assigned from the document's physical owner and
     /// structural sibling-index path. Persisted `id::` is a separate external
     /// reference identity. This key round-trips through an in-memory save but is
-    /// never serialized. It is NOT part of block *content*, so it is excluded
-    /// from equality — otherwise the conflict guard (`parse(disk) == cached`)
-    /// would always see a "change".
-    #[serde(default)]
+    /// never serialized — `#[serde(skip)]`, like `proj`, so the claim is the
+    /// attribute rather than a comment; `serialized_document_carries_no_runtime_identity`
+    /// pins it. (It was `#[serde(default)]`, which suppresses nothing on the way
+    /// out.) It is NOT part of block *content*, so it is excluded from equality —
+    /// otherwise the conflict guard (`parse(disk) == cached`) would always see a
+    /// "change".
+    #[serde(skip)]
     pub uuid: String,
     /// Whether this block's page is Org (vs Markdown) — the format lsdoc needs to
     /// parse inline refs correctly (e.g. org `[[target][alias]]`). Page-level
@@ -1455,6 +1458,53 @@ pub fn scan_vcs_conflict_markers(content: &str) -> Vec<(usize, ConflictMarkerKin
         }
     }
     out
+}
+
+#[cfg(test)]
+mod runtime_identity_serialization_tests {
+    use super::*;
+
+    /// `DocBlock::uuid` is run-local: it is derived from the owning file plus the
+    /// block's structural sibling path, so a value from one process means nothing
+    /// in another. The doc comment has always said it "is never serialized"; the
+    /// attribute said `#[serde(default)]`, which only supplies a fallback on the
+    /// way IN. This is the test that makes the sentence true.
+    #[test]
+    fn serialized_document_carries_no_runtime_identity() {
+        let mut child = DocBlock::new("child");
+        child.uuid = "run-local-child".into();
+        let mut root = DocBlock::new("root");
+        root.uuid = "run-local-root".into();
+        root.children.push(child);
+        let document = Document {
+            pre_block: Some("title:: Page".into()),
+            roots: vec![root],
+        };
+
+        let encoded = serde_json::to_string(&document).expect("Document is Serialize");
+        assert!(
+            !encoded.contains("uuid"),
+            "runtime block identity leaked into a serialized Document: {encoded}"
+        );
+        assert!(
+            !encoded.contains("run-local"),
+            "runtime block identity leaked into a serialized Document: {encoded}"
+        );
+        // The content the type exists to carry still round-trips.
+        assert!(encoded.contains("root") && encoded.contains("child"));
+    }
+
+    /// And nothing can put one back: a payload naming `uuid` deserializes to the
+    /// empty run-local identity the receiving process will assign itself.
+    #[test]
+    fn a_uuid_in_a_payload_is_not_adopted() {
+        let decoded: Document = serde_json::from_str(
+            r#"{"pre_block":null,"roots":[{"raw":"root","children":[],"uuid":"forged"}]}"#,
+        )
+        .expect("unknown/skipped fields are ignored");
+        assert_eq!(decoded.roots[0].uuid, "");
+        assert_eq!(decoded.roots[0].raw, "root");
+    }
 }
 
 #[cfg(test)]

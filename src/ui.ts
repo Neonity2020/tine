@@ -11,7 +11,14 @@ import type {
   PageDto,
 } from "./types";
 import type { OwnedPluginBlockSnapshot } from "./plugins/ownership";
-import { backend, isTauri } from "./backend";
+import {
+  backend,
+  cachedConflictCapsules,
+  isTauri,
+  loadConflictCapsules,
+  retireConflictCapsule,
+  storeConflictCapsule,
+} from "./backend";
 import { pageIdentityKey } from "./pageIdentity";
 import { membershipChanged, resetFavoritesLayout, setMembershipSink, storedFavoritesLayout } from "./favoritesStore";
 import { reconcileLayout } from "./favoritesLayout";
@@ -372,46 +379,50 @@ let artifactConflictQueue: ConflictObject[] = [];
 const liveSaveConflicts = new Map<string, ConflictObject>();
 const LIVE_CONFLICT_STORE_KEY = "tine.concord.live-conflicts.v1";
 
-type StoredLiveConflict = { root: string; conflict: ConflictObject };
-
-function readStoredLiveConflicts(): StoredLiveConflict[] {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(LIVE_CONFLICT_STORE_KEY) ?? "[]");
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item): item is StoredLiveConflict =>
-      typeof item?.root === "string"
-      && item?.conflict?.source === "live-save"
-      && !!item.conflict.live?.page,
-    );
-  } catch {
-    return [];
-  }
+function isLiveConflictCapsule(value: unknown): value is ConflictObject {
+  const item = value as Partial<ConflictObject> | null;
+  return item?.source === "live-save"
+    && typeof item.page_name === "string"
+    && typeof item.page_path === "string"
+    && !!item.live?.page;
 }
 
-function persistLiveSaveConflicts(): boolean {
+async function persistLiveSaveConflict(conflict: ConflictObject): Promise<void> {
   const root = graphMeta()?.root;
-  if (!root) return false;
-  try {
-    const otherGraphs = readStoredLiveConflicts().filter((item) => item.root !== root);
-    const current = [...liveSaveConflicts.values()].map((conflict) => ({ root, conflict }));
-    localStorage.setItem(LIVE_CONFLICT_STORE_KEY, JSON.stringify([...otherGraphs, ...current]));
-    return true;
-  } catch {
-    return false;
-  }
+  if (!root) throw new Error("no graph is bound");
+  await storeConflictCapsule(root, conflict);
 }
 
 /** Rehydrate unresolved live drafts after a process restart. The capsule stays
  * app-private; no marker or metadata is written into the graph. */
-export function restoreLiveSaveConflicts(root: string): void {
+export async function restoreLiveSaveConflicts(root: string): Promise<void> {
   liveSaveConflicts.clear();
-  for (const item of readStoredLiveConflicts()) {
-    if (item.root === root && item.conflict.live) {
-      liveSaveConflicts.set(item.conflict.page_name, {
-        ...item.conflict,
-        live: { ...item.conflict.live, restored: true },
-      });
+  // The retired browser channel was never durable on every WebKitGTK profile.
+  // There is intentionally no migration: discard it on first native-channel use.
+  try {
+    localStorage.removeItem(LIVE_CONFLICT_STORE_KEY);
+  } catch {
+    // A blocked browser store cannot affect the app-private native channel.
+  }
+  try {
+    // Browser fixtures have an in-memory cache and historically observe this
+    // helper synchronously. Native activation always takes the awaited branch.
+    const cached = cachedConflictCapsules(root);
+    const capsules = cached ?? await loadConflictCapsules(root);
+    for (const item of capsules) {
+      if (isLiveConflictCapsule(item) && item.live) {
+        liveSaveConflicts.set(item.page_name, {
+          ...item,
+          live: { ...item.live, restored: true },
+        });
+      }
     }
+  } catch (error) {
+    pushToast(
+      `Tine couldn't restore restart-recovery conflicts. (${String(error)})`,
+      "error",
+      { sticky: true },
+    );
   }
   publishConflictQueue();
 }
@@ -443,10 +454,13 @@ export function registerLiveSaveConflict(
   baseRev: string | null,
   conflictEpoch: number,
   recovery?: { base_text: string | null; disk_rev: string },
-): void {
+  storage: "direct" | "managed" = "direct",
+): Promise<void> {
   const previous = liveSaveConflicts.get(page.name)?.live?.draft_version ?? 0;
-  liveSaveConflicts.set(page.name, {
-    id: `live:${page.path || page.name}`,
+  const conflict: ConflictObject = {
+    id: storage === "managed"
+      ? `live-managed:${page.path || page.name}`
+      : `live:${page.path || page.name}`,
     source: "live-save",
     page_name: page.name,
     page_path: page.path ?? page.name,
@@ -464,44 +478,80 @@ export function registerLiveSaveConflict(
       base_text: recovery?.base_text,
       disk_rev: recovery?.disk_rev,
     },
-  });
+  };
+  liveSaveConflicts.set(page.name, conflict);
   publishConflictQueue();
-  if (recovery && !persistLiveSaveConflicts()) {
+  return persistLiveSaveConflict(conflict).catch((error) => {
     pushToast(
       `“${page.name}” is still recoverable in this window, but Tine could not preserve the conflict for an app restart.`,
       "error",
       { sticky: true },
     );
-  }
+    console.error("[tine] conflict capsule store failed", error);
+  });
 }
 
-export function refreshLiveSaveConflictDraft(page: PageDto): void {
+export async function refreshLiveSaveConflictDraft(page: PageDto): Promise<void> {
   const current = liveSaveConflicts.get(page.name);
   if (!current?.live) return;
-  liveSaveConflicts.set(page.name, {
+  const conflict: ConflictObject = {
     ...current,
     live: { ...current.live, page, draft_version: current.live.draft_version + 1 },
-  });
+  };
+  liveSaveConflicts.set(page.name, conflict);
   publishConflictQueue();
-  persistLiveSaveConflicts();
+  // The refreshed draft is already the in-memory truth; a failed capsule
+  // rewrite (disk full, I/O error) must not reject out of the autosave path.
+  await persistLiveSaveConflict(conflict).catch((error) => {
+    console.error("[tine] conflict capsule refresh failed", error);
+  });
 }
 
-export function updateLiveSaveConflictDiskRev(name: string, diskRev: string): void {
+export async function updateLiveSaveConflictDiskRev(name: string, diskRev: string): Promise<void> {
   const current = liveSaveConflicts.get(name);
   if (!current?.live || current.live.disk_rev === diskRev) return;
-  liveSaveConflicts.set(name, {
+  const conflict: ConflictObject = {
     ...current,
     live: { ...current.live, disk_rev: diskRev },
-  });
+  };
+  liveSaveConflicts.set(name, conflict);
   publishConflictQueue();
-  persistLiveSaveConflicts();
+  await persistLiveSaveConflict(conflict);
 }
 
+function retireCapsuleOnDisk(name: string): Promise<void> {
+  const root = graphMeta()?.root;
+  if (!root) return Promise.reject(new Error("no graph is bound"));
+  return retireConflictCapsule(root, name);
+}
+
+/** Clearing a retained draft retires its on-disk capsule too, on every path.
+ * Retention and retirement are one property: a draft the user resolved through
+ * the banner, an ordinary save that succeeded, or a page drop must never
+ * resurrect as a stale conflict on the next launch. Non-blocking sites get the
+ * retirement in the background with a sticky toast on failure; the in-page
+ * resolver awaits it through `retireLiveSaveConflict` before acknowledging. */
 export function clearLiveSaveConflict(name: string): void {
-  if (liveSaveConflicts.delete(name)) {
-    publishConflictQueue();
-    persistLiveSaveConflicts();
-  }
+  if (!liveSaveConflicts.delete(name)) return;
+  publishConflictQueue();
+  retireCapsuleOnDisk(name).catch((error) => {
+    pushToast(
+      `“${name}” was resolved, but Tine could not retire its restart-recovery copy; it may reappear after a restart.`,
+      "error",
+      { sticky: true },
+    );
+    console.error("[tine] conflict capsule retire failed", error);
+  });
+}
+
+/** Durably retire before a resolution surface removes or acknowledges it. The
+ * in-memory entry stays until the on-disk capsule is gone, so a failed
+ * retirement leaves the conflict visible instead of silently dropping it. */
+export async function retireLiveSaveConflict(name: string): Promise<void> {
+  if (!liveSaveConflicts.has(name)) return;
+  await retireCapsuleOnDisk(name);
+  liveSaveConflicts.delete(name);
+  publishConflictQueue();
 }
 /** The queue entry for the page loaded from `path`, if it has one. */
 export function conflictObjectFor(
@@ -1346,7 +1396,21 @@ export function resetShortcutOverride(id: string) {
 // Pages that failed to save because the file changed on disk (external edit /
 // Syncthing). Surfaced as a banner; the user resolves with reload or overwrite.
 export const [conflicts, setConflicts] = createSignal<string[]>([]);
-export function markConflict(name: string) {
+export function markConflict(
+  name: string,
+  capsule?: { page: PageDto; baseRev: string | null; storage: "managed" },
+): void | Promise<void> {
+  if (capsule) {
+    return registerLiveSaveConflict(
+      capsule.page,
+      capsule.baseRev,
+      -1,
+      undefined,
+      capsule.storage,
+    ).then(() => {
+      if (!conflicts().includes(name)) setConflicts([...conflicts(), name]);
+    });
+  }
   if (!conflicts().includes(name)) setConflicts([...conflicts(), name]);
 }
 export function clearConflict(name: string) {

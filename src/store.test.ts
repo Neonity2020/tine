@@ -90,7 +90,7 @@ import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
 import { splitProps, joinProps, isBuiltinHidden, hideAll } from "./editor/properties";
 import { setCopyIncludeSubtree, setCopyStripCollapsed } from "./copySettings";
-import { backend, type Backend } from "./backend";
+import { backend, SaveConflictError, type Backend } from "./backend";
 import {
   isConflicted,
   conflicts,
@@ -416,7 +416,7 @@ describe("managed quick-capture admission", () => {
         application_page_max_depth: 128,
       },
     } as any);
-    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "capture-rev" });
     const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
     __setStoreMutationObserverForTest((observation) => {
       if (observation.kind === "publication") counts.publications++;
@@ -480,7 +480,7 @@ describe("managed quick-capture admission", () => {
   it("refuses a capture whose text exactly reaches the advertised request byte limit", async () => {
     setToasts([]);
     bindManagedPage("Bytes", ["anchor"]);
-    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "capture-rev" });
 
     const captured = await captureToPage("Bytes", `- ${"a".repeat(1_048_576)}`);
 
@@ -499,7 +499,7 @@ describe("managed quick-capture admission", () => {
   it("counts what the page already holds, so a small capture into a nearly full page is refused", async () => {
     setToasts([]);
     bindManagedPage("Bytes", ["b".repeat(1_048_400)]);
-    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "capture-rev" });
 
     const captured = await captureToPage("Bytes", `- ${"c".repeat(200)}`);
 
@@ -515,7 +515,7 @@ describe("managed quick-capture admission", () => {
   it("still admits a capture that leaves the page comfortably inside both limits", async () => {
     setToasts([]);
     bindManagedPage("Bytes", ["anchor"]);
-    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "capture-rev" });
 
     const captured = await captureToPage("Bytes", "- ordinary note");
 
@@ -1672,7 +1672,7 @@ describe("working-set eviction", () => {
   // would submit it under the new file's revision, which the base-revision guard
   // accepts because that baseline genuinely matches disk. No conflict is raised.
   it("refuses an undo entry recorded before the page was evicted (GH #305)", async () => {
-    const saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-victim");
+    const saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev-victim" });
     await ensurePageLoaded({
       name: "Victim",
       kind: "page",
@@ -2189,7 +2189,7 @@ describe("target-relative multi-root drag (GH #240)", () => {
     ]);
     clearSeededFacets();
     const before = [pageState("Source one"), pageState("Source two"), pageState("Destination")];
-    const saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("selection-drag-rev");
+    const saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "selection-drag-rev" });
     try {
       expect(await observe(() => moveBlocksRelative(
         [sourceTwo.id, sourceOne.id],
@@ -2237,7 +2237,7 @@ describe("target-relative drag persistence barrier (GH #240)", () => {
     const saved: PageDto[] = [];
     const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
       saved.push(dto);
-      return "barrier-rev";
+      return { revision: "barrier-rev" };
     });
     try {
       expect(await moveBlocksRelative(["source-one", "source-two"], "target", "before")).toBe(true);
@@ -2255,7 +2255,7 @@ describe("target-relative drag persistence barrier (GH #240)", () => {
     await loadFeed([page("Source", "source"), page("Destination", "target")]);
     markDirty("Source");
     const before = [pageState("Source"), pageState("Destination")];
-    const saveSpy = vi.spyOn(backend(), "savePage").mockRejectedValueOnce(new Error("conflict:240"));
+    const saveSpy = vi.spyOn(backend(), "savePage").mockRejectedValueOnce(new SaveConflictError(240));
     const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
     __setStoreMutationObserverForTest((observation) => {
       if (observation.kind === "publication") counts.publications++;
@@ -2274,19 +2274,19 @@ describe("target-relative drag persistence barrier (GH #240)", () => {
 
   it("does not begin a post-removal source save before the destination resolves", async () => {
     await loadFeed([page("Source one", "source-one"), page("Source two", "source-two"), page("Destination", "target")]);
-    let resolveDestination!: (revision: string) => void;
-    const destinationSaved = new Promise<string>((resolve) => { resolveDestination = resolve; });
+    let resolveDestination!: (result: { revision: string }) => void;
+    const destinationSaved = new Promise<{ revision: string }>((resolve) => { resolveDestination = resolve; });
     const saved: PageDto[] = [];
     const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation((dto) => {
       saved.push(dto);
-      return dto.name === "Destination" ? destinationSaved : Promise.resolve("source-rev");
+      return dto.name === "Destination" ? destinationSaved : Promise.resolve({ revision: "source-rev" });
     });
     try {
       expect(await moveBlocksRelative(["source-one", "source-two"], "target", "before")).toBe(true);
       await vi.waitFor(() => expect(saved.map((dto) => dto.name)).toEqual(["Destination"]));
       expect(saved[0].blocks.map((block) => block.id)).toEqual(["source-one", "source-two", "target"]);
 
-      resolveDestination("destination-rev");
+      resolveDestination({ revision: "destination-rev" });
       await flushAll();
       expect(saved.map((dto) => dto.name)).toEqual(["Destination", "Source one", "Source two"]);
       expect(saved.slice(1).map((dto) => dto.blocks)).toEqual([[], []]);
@@ -3312,7 +3312,7 @@ describe("selection move burst history (F2)", () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
-    saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("move-burst-rev");
+    saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "move-burst-rev" });
   });
   afterEach(() => {
     vi.runOnlyPendingTimers();
@@ -3689,7 +3689,7 @@ describe("save engine (persistence)", () => {
       .forEach(clearConflict); // ui conflicts aren't cleared by resetStore
     vi.useFakeTimers();
     setToasts([]);
-    saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("rev1");
+    saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev1" });
   });
   afterEach(() => {
     vi.runOnlyPendingTimers();
@@ -3710,7 +3710,7 @@ describe("save engine (persistence)", () => {
 
   it("flushPage writes immediately and advances the baseline rev", async () => {
     load([blk("x")]);
-    saveSpy.mockResolvedValue("rev2");
+    saveSpy.mockResolvedValue({ revision: "rev2" });
     markDirty("Test");
     expect(await flushPage("Test")).toBe(true);
     expect(saveSpy).toHaveBeenCalledTimes(1);
@@ -3722,10 +3722,10 @@ describe("save engine (persistence)", () => {
 
   it("delete drains an edit injected into its first save before tombstoning", async () => {
     load([blk("first accepted draft")]);
-    let finishFirstSave!: (revision: string) => void;
+    let finishFirstSave!: (result: { revision: string }) => void;
     saveSpy
-      .mockImplementationOnce(() => new Promise<string>((resolve) => { finishFirstSave = resolve; }))
-      .mockResolvedValueOnce("rev2");
+      .mockImplementationOnce(() => new Promise<{ revision: string }>((resolve) => { finishFirstSave = resolve; }))
+      .mockResolvedValueOnce({ revision: "rev2" });
     const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
 
     markDirty("Test");
@@ -3734,7 +3734,7 @@ describe("save engine (persistence)", () => {
     const firstBlock = doc.pages[0].roots[0];
     setRaw(firstBlock, "second accepted draft"); // typed while the first save is in flight
     const deleting = deletePage("Test", "page");
-    finishFirstSave("rev1");
+    finishFirstSave({ revision: "rev1" });
 
     await expect(firstSave).resolves.toBe(true);
     await expect(deleting).resolves.toBe(true);
@@ -3916,7 +3916,7 @@ describe("save engine (persistence)", () => {
   it("a conflict marks the page (no clobber) and flushAll reports failure", async () => {
     load([blk("x")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new Error("conflict"));
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(null));
     expect(await flushAll()).toBe(false);
     expect(isConflicted("Test")).toBe(true);
   });
@@ -3937,7 +3937,7 @@ describe("save engine (persistence)", () => {
       target: "pages/Fallback.md",
       prospective: false,
     });
-    saveSpy.mockRejectedValueOnce(new Error("conflict:77"));
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(77));
 
     expect(await flushPage("Fallback")).toBe(false);
     expect(activate).toHaveBeenCalledWith("pages/Fallback.md", "replace", null);
@@ -3945,7 +3945,7 @@ describe("save engine (persistence)", () => {
     expect(saveSpy.mock.calls[0][1]).toBe("loaded-revision");
     expect(conflicts()).toContain("Fallback");
 
-    saveSpy.mockResolvedValueOnce("winner-replaced");
+    saveSpy.mockResolvedValueOnce({ revision: "winner-replaced" });
     expect(await forceSave("Fallback")).toBe(true);
     expect(saveSpy.mock.calls[1][0]).toMatchObject({ activation: 7001 });
     expect(saveSpy.mock.calls[1][2]).toBe(true);
@@ -4139,10 +4139,10 @@ describe("save engine (persistence)", () => {
   it("forceSave overwrites even a conflicted page (force=true)", async () => {
     load([blk("x")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new Error("conflict:11"));
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(11));
     await flushPage("Test");
     expect(isConflicted("Test")).toBe(true);
-    saveSpy.mockResolvedValue("rev3");
+    saveSpy.mockResolvedValue({ revision: "rev3" });
     expect(await forceSave("Test")).toBe(true);
     expect(saveSpy.mock.calls.at(-1)![2]).toBe(true); // force flag
     expect(saveSpy.mock.calls.at(-1)![3]).toBe(11); // exact observed winner
@@ -4151,7 +4151,7 @@ describe("save engine (persistence)", () => {
   it("deletes a CONFLICTED page through the backend without flushing its retained draft", async () => {
     load([blk("x")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new Error("conflict"));
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(null));
     await flushPage("Test"); // the save is now refused until the conflict is resolved
     expect(isConflicted("Test")).toBe(true);
     const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
@@ -4166,7 +4166,7 @@ describe("save engine (persistence)", () => {
   it("retains a CONFLICTED draft when its backend delete fails", async () => {
     load([blk("retained conflict draft")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new Error("conflict"));
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(null));
     await flushPage("Test");
     expect(isConflicted("Test")).toBe(true);
     const deleteSpy = vi.spyOn(backend(), "deletePage").mockRejectedValue(new Error("delete deferred"));
