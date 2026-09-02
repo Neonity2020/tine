@@ -464,10 +464,13 @@ The switched read families are the conservative task-query subset already
 accepted by `sparse_task_query_eligibility` (task markers plus priority,
 scheduled/deadline and presentation directives), literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
-inventory used by autocomplete and navigation. They also include page aliases
-and real-page ownership, explicit backlink and safely tokenizable unlinked-
-reference candidate selection, persisted/runtime block-identity lookup,
-block-referrer candidates, and distinct-referrer counts. Once current, these families
+inventory used by autocomplete and navigation. They also include the shared
+property-facet rows used by the query builder and editor autocomplete, and the
+PageRef simple-query candidate plan lowered through the same SQL read family in
+both storage regimes. The switched families further include page aliases and
+real-page ownership, explicit backlink and safely tokenizable unlinked-reference
+candidate selection, persisted/runtime block-identity lookup, block-referrer
+candidates, and distinct-referrer counts. Once current, these families
 enumerate SQLite task candidates and re-evaluate every returned raw block
 through the existing parser query evaluator, or obtain a generation-bound
 candidate/name set before applying the existing parser-owned matching and

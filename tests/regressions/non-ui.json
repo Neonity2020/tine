@@ -5913,6 +5913,25 @@
     "failBefore": "The conflict resolver used String(error).includes(\"conflict\"), so unrelated prose containing that word was routed into the stale-file re-observation path."
    },
    "notes": "The Tauri save_page boundary recognizes only the complete conflict or conflict:<epoch> wire shape and raises SaveConflictError. Persistence and the resolver consume its save-conflict tag; managed actor refusal remains on its separate exact reason-code envelope."
+  },
+  {
+   "id": "REG-W3-B4-DIRECT-SHARED-QUERY-READS-001",
+   "title": "Direct Files property facets and PageRef simple queries use the generation-bound shared SQLite read",
+   "family": "waited-path-query-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 B4"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
+     "crates/tine-core/src/direct_projection.rs::tests::b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence",
+     "crates/tine-core/src/oplog/query_lowering.rs::tests::source_to_sql_read_family_has_one_producer_file"
+    ],
+    "scenario": "direct-query.shared-facet-and-page-ref-candidate-read",
+    "failBefore": "b4-indexed-routes-fail-before.log: PageRef and property-facet calls left the Direct projection indexed-read counter unchanged."
+   },
+   "notes": "One source-to-read-family lowering now serves the existing Managed caller and Direct PageRef narrowing. Exact parser evaluation remains authoritative; stale or unavailable projections count and use the full parser fallback. Both property-facet consumers stream the existing property_facet_rows_after family. No schema, index, or memo was added."
   }
  ]
 }
