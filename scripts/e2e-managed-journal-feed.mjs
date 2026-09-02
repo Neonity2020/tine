@@ -347,10 +347,13 @@ try {
     };
   });
   if (!scrollProof.ok) throw new Error(`could not drive the managed feed to its pagination sentinel: ${JSON.stringify(scrollProof)}`);
-  await browser.waitUntil(async () => (await feedText()).includes(markers[3]), {
+  await browser.waitUntil(async () => {
+    const current = await feedText();
+    return markers.filter((marker) => current.includes(marker)).length >= 6;
+  }, {
     timeout: 30_000,
     interval: 200,
-    timeoutMsg: "managed feed pagination did not append the next journal window",
+    timeoutMsg: "managed feed pagination did not expose six newest-first journal days",
   });
   const paginated = await feedText();
   const observed = markers.filter((marker) => paginated.includes(marker));

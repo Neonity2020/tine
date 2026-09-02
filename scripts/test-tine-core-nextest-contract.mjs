@@ -26,6 +26,7 @@ import {
   classifyRetiredManagedV1Problems,
   linuxReleaseExcludedTestNames,
   oneReleaseCiExceptionActive,
+  releaseE2eScenarioIsNonblocking,
   windowsRequiredTestNames,
 } from "./release-0.6.981-ci-exception.mjs";
 
@@ -130,6 +131,13 @@ assert.equal(
 assert.equal(PROJECT_VERSION, ONE_RELEASE_CI_EXCEPTION_VERSION);
 assert.equal(oneReleaseCiExceptionActive(), true);
 assert.equal(oneReleaseCiExceptionActive(NEXT_RELEASE_VERSION), false);
+assert.deepEqual(
+  ONE_RELEASE_CI_EXCEPTION.releaseE2eNonblockingScenarioKeys,
+  ["linux-release:managed-journal-feed"]
+);
+assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "managed-journal-feed"), true);
+assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "managed-journal-feed", NEXT_RELEASE_VERSION), false);
+assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "some-other-scenario"), false);
 assert.deepEqual(
   LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
   linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES)

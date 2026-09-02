@@ -27,6 +27,7 @@ if (ONE_RELEASE_CI_EXCEPTION.releaseVersion !== ONE_RELEASE_CI_EXCEPTION_VERSION
 
 for (const field of [
   "linuxAdditionalKnownRedTestNames",
+  "releaseE2eNonblockingScenarioKeys",
   "retiredManagedV1AllowedProblems",
   "windowsMissingRequiredTestNames",
 ]) {
@@ -68,4 +69,9 @@ export function classifyRetiredManagedV1Problems(problems, version = PROJECT_VER
     allowed: problems.filter((problem) => allowed.has(problem)),
     unexpected: problems.filter((problem) => !allowed.has(problem)),
   };
+}
+
+export function releaseE2eScenarioIsNonblocking(suiteName, scenarioId, version = PROJECT_VERSION) {
+  if (!oneReleaseCiExceptionActive(version)) return false;
+  return ONE_RELEASE_CI_EXCEPTION.releaseE2eNonblockingScenarioKeys.includes(`${suiteName}:${scenarioId}`);
 }
