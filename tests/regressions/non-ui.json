@@ -8,13 +8,19 @@
    "sources": {"issues": [], "commits": [], "internal": "Harvest A5"},
    "platforms": ["all"],
    "layer": "rust-core-storage",
-   "status": "fixing",
+   "status": "covered",
    "coverage": {
-    "tests": ["crates/tine-core/src/oplog/checkpoint_generation.rs", "crates/tine-core/src/oplog/hot_engine.rs", "crates/tine-core/src/sync_runtime.rs"],
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::second_clean_cold_open_restores_checkpoint_instead_of_full_replay",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_surfaces_missing_authoritative_manifest_immediately",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_never_masks_mutated_authoritative_manifest",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_surfaces_missing_required_object_immediately",
+     "crates/tine-core/src/oplog/checkpoint_generation.rs::tests::checkpoint_open_counter_distinguishes_checkpoint_from_full_replay"
+    ],
     "scenario": "managed-clean-open.disposable-checkpoint-tail-only",
-    "failBefore": "at e19514f98cf1044391f3a3d2f09d2579275353ee, oplog::checkpoint_generation::tests::checkpoint_open_counter_distinguishes_checkpoint_from_full_replay failed because no checkpoint-open path or path-discriminating counter existed"
+    "failBefore": "at e19514f98cf1044391f3a3d2f09d2579275353ee, sync_runtime_tests::second_clean_cold_open_restores_checkpoint_instead_of_full_replay fails because the second clean open replays every accepted batch (no checkpoint path exists); the checkpoint_open_counter unit test fails for the same reason"
    },
-   "notes": "Before Harvest A5 every clean reopen semantically reapplies every accepted batch onto sequence-zero genesis: N=800 committed_tail_replay measured 1253.5 ms and 90.0% of clean recovery. The checkpoint must remain disposable, compare its roster/fingerprints against authoritative archive evidence, existence-check required objects by name, and fall back without introducing a new refusal."
+   "notes": "Before Harvest A5 every clean reopen semantically reapplies every accepted batch onto sequence-zero genesis: N=800 committed_tail_replay measured 1253.5 ms and 90.0% of clean recovery. The checkpoint is disposable, compares its roster/fingerprints against authoritative archive evidence, existence-checks required objects by name, and falls back without a new refusal; a roster-named manifest or object missing from the archive is surfaced as MS-REF-DISK-CORRUPT (archive damage, not checkpoint damage). Numeric lifetime-cost gates (A5-r4) are pending Martin's rebaselining decision and are not part of this row."
   },
   {
    "id": "REG-HARVEST-F-CONTENT-DEPTH-BOUNDS-001",
@@ -58,13 +64,20 @@
    "sources": {"issues": [], "commits": [], "internal": "Harvest B3"},
    "platforms": ["all"],
    "layer": "tauri-native-and-frontend",
-   "status": "fixing",
+   "status": "covered",
    "coverage": {
-    "tests": [],
+    "tests": [
+     "src-tauri/src/conflict_capsule.rs::tests::replacement_and_retirement_reopen_as_complete_transitions",
+     "src-tauri/src/conflict_capsule.rs::tests::unreadable_envelope_is_set_aside_and_the_queue_keeps_working",
+     "src/liveSaveConflictRetirement.test.tsx",
+     "src/backendCallFunnel.test.ts",
+     "src/components/ConflictResolution.test.tsx",
+     "scripts/e2e-concord-live-save.mjs"
+    ],
     "scenario": "harvest-b3.live-conflict-capsule-restart-parity",
-    "failBefore": "source-proven"
+    "failBefore": "capsule protocol: b3-conflict-capsule-fail-before.log on 7623fb76's parent (no capsule module; archived under tine-agents/evidence/wave2). Fix-up 2026-09-02 on 7623fb76: liveSaveConflictRetirement (clear path never retired the on-disk capsule, so a resolved draft resurrected after restart) and backendCallFunnel (only savePage classified the conflict wire code; seven resolve commands threw raw strings) fail before, pass after."
    },
-   "notes": "Before Harvest B3, Direct Files retained the only copy of a refused live draft in localStorage, which WebKitGTK does not persist, while the Managed Storage conflict branch retained no restart capsule at all. The replacement must use a graph-keyed app-private atomic publication and retirement protocol, restore exact draft bytes and binding on both backends, and require Managed authority to be re-observed after restart."
+   "notes": "Before Harvest B3, Direct Files retained the only copy of a refused live draft in localStorage, which WebKitGTK does not persist, while the Managed Storage conflict branch retained no restart capsule at all. The replacement uses a graph-keyed app-private atomic publication and retirement protocol, restores exact draft bytes and binding on both backends, and requires Managed authority to be re-observed after restart. The native restart journey itself is quarantined (stop-loss exhausted); restart restoration, post-restart resolution, and Managed re-observation are proved only at the unit/crate layer until that journey is repaired."
   },
   {
    "id": "REG-MANAGED-REFERRER-BOUNDED-PREFIX-001",
@@ -5749,13 +5762,15 @@
      "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_is_not_decoded_by_the_current_store",
      "crates/tine-core/src/oplog/projection_store.rs::tests::the_previous_claim_family_is_rejected_as_an_upgrade_boundary",
      "crates/tine-core/src/sync_runtime_tests.rs::a_pre_c_private_store_is_refused_before_any_graph_mutation",
+     "crates/tine-core/src/sync_runtime_tests.rs::a_pre_h_sealed_baseline_is_a_durable_protocol_refusal_not_a_retryable_dead_end",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::previous_schema_sealed_baseline_refuses_with_the_protocol_marker",
      "src-tauri/src/graph.rs::tests::pre_07_unknown_state_archives_then_rebuilds_without_manual_reactivation",
      "src-tauri/src/sync_runtime.rs::tests::blank_slate_archive_preserves_every_private_byte"
     ],
     "scenario": "managed-storage.pre-0.7-containing-format-blank-slate-rebuild",
     "failBefore": "proven: schema-4 capsules and schema-1 forensic evidence decoded as current, and a TINEPR6 store reopened normally"
    },
-   "notes": "The lazy-genesis containing manifest moved from schema 4 to 5, and the projection receipt-store claim moved from TINEPR6/version 6 to TINEPR7/version 7. Prior containing formats are recognized only at the no-mutation precheck. The existing graph-open lifecycle durably archives every private byte, publishes Direct Files as the reconstruction source, and automatically activates the one current Managed format. No migration decoder was added."
+   "notes": "The lazy-genesis containing manifest moved from schema 4 to 5, and the projection receipt-store claim moved from TINEPR6/version 6 to TINEPR7/version 7. Prior containing formats are recognized only at the no-mutation precheck. Fix-up 2026-09-02 (review H-1): a sealed schema-4 baseline previously refused WITHOUT the MS-REF-PROTOCOL-INCOMPATIBLE marker, so SparseV2Availability classified it Retryable and the store dead-ended at 'could not serve this workspace' instead of preserve-and-rebuild; the a_pre_h test failed before and passes after. The existing graph-open lifecycle durably archives every private byte, publishes Direct Files as the reconstruction source, and automatically activates the one current Managed format. No migration decoder was added."
   },
   {
    "id": "REG-HARVEST-H-THEME-RMW-001",

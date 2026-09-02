@@ -52,8 +52,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Harvest F — hostile graph and clipboard content now reaches its existing
   consumption boundaries instead of bypassing them.** Macro links can no longer
   navigate the privileged WebView directly, mobile blocks unknown schemes,
-  formula/query/peek/backlink recursion has explicit bounds, and external HTML
-  text can no longer inject Markdown structure through disabled escaping.
+  formula/query/peek/backlink recursion has explicit bounds, and pasted HTML
+  links open only through the native scheme allowlist. (Packet F's
+  re-enabled paste-time Markdown escaping was undone on review: literal
+  brackets in pasted text stay literal, per `UI-PASTE-BRACKET-LITERAL-001`.)
 
 - **Harvest H — pre-release Managed private formats have one decoder, and
   concurrent theme changes no longer overwrite one another.** Schema-4 lazy
