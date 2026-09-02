@@ -911,7 +911,7 @@ async function doSave(
   if (intent.kind === "ordinary" && !dirty.has(name)) return true; // saved by a prior link
   if (intent.kind === "ordinary" && isConflicted(name)) {
     const draft = pageToDto(name);
-    if (draft) refreshLiveSaveConflictDraft(draft);
+    if (draft) await refreshLiveSaveConflictDraft(draft);
     return false;
   }
   // A cross-page move source: hold its save until the destination is durable (C#1).
@@ -1060,11 +1060,12 @@ async function doSave(
         conflictObservation.set(name, { kind: "direct", epoch: observed });
         try {
           const capture = await backend().captureLiveSaveConflict(dto, baseline, observed);
-          registerLiveSaveConflict(dto, baseline, observed, capture);
+          if (!capture) throw new Error("Direct Files capture returned no authority payload");
+          await registerLiveSaveConflict(dto, baseline, observed, capture);
         } catch (captureError) {
           // The draft remains live and close protection stays armed. Surface the
           // missing restart capsule instead of pretending crash recovery exists.
-          registerLiveSaveConflict(dto, baseline, observed);
+          await registerLiveSaveConflict(dto, baseline, observed);
           pushToast(
             `Couldn't preserve “${name}” for restart recovery. Keep Tine open while resolving it. (${String(captureError)})`,
             "error",
@@ -1102,10 +1103,18 @@ async function doSave(
         identity: ++managedConflictObservationClock,
         observation: managedObservation,
       });
+      // Use the same semantic capture boundary as Direct Files. Managed returns
+      // no durable replacement authority: only the retained page and base below
+      // enter the app-private capsule.
+      await backend().captureLiveSaveConflict?.(dto, baseline, 0);
       // Re-notify an already visible banner so its Keep mine enabled state
-      // reflects this newly observed (or now unobservable) managed owner.
+      // reflects this newly observed (or now unobservable) managed owner. Clear
+      // before replacing the capsule so the newly persisted draft survives.
       if (isConflicted(name)) clearConflict(name);
-      markConflict(name);
+      // Persist only the retained draft and its load baseline while raising the
+      // ordinary banner. The actor's replacement observation above remains
+      // session-scoped and must be minted again after restart.
+      await markConflict(name, { page: dto, baseRev: baseline, storage: "managed" });
     } else if (saveFailureCode(e).startsWith("conflict_authority.")) {
       // The force named an observation the disk has since moved past — a later
       // external write, or a read, revoked it before the click reached the

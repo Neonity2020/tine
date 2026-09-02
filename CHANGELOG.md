@@ -36,6 +36,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   barriers; bursts of tab actions are serialized, and the one-time legacy
   session move receives the same directory durability check.
 
+- **A draft that met an external edit no longer disappears when Tine is
+  restarted.** Direct Files and Tine-managed storage now retain unresolved live
+  drafts in one graph-keyed, app-private atomic capsule. Reopening restores the
+  exact draft before the graph becomes interactive; Managed storage observes
+  its current owner again instead of reviving stale overwrite authority, and a
+  completed resolution durably retires the capsule before Tine reports success.
+
 ## [0.6.981] - 2026-09-01
 
 ### Added

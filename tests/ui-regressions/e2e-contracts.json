@@ -1243,13 +1243,13 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "authority": "Concord live-save contract: a guarded save refusal retains both the editor draft and the exact disk winner across a process restart.",
-     "userOutcome": "A local draft racing an atomic external replacement appears in the page-level Concord resolver, survives restarting Tine, and can resolve with both sides into ordinary Markdown.",
+     "authority": "Concord live-save contract and Harvest B3: a guarded save refusal retains the exact editor draft, load baseline, and graph/page binding in one app-private durable capsule, without persisting Managed replacement authority.",
+     "userOutcome": "On Direct Files and Tine-managed storage, a local draft racing an external replacement survives a full process restart; both keep-draft and use-current resolutions go through one semantic surface and remove the on-disk capsule before success is shown.",
      "blocking": true
     },
     {
      "class": "stateful-ux",
-     "userOutcome": "Direct Files conflicts use the in-page resolver and queue, never the retired global Keep mine / Use current bar.",
+     "userOutcome": "Both storage modes use the same in-page resolver and queue; after a Managed restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
      "blocking": true
     }
    ],
@@ -1262,7 +1262,7 @@
     "Exact generated block identities or save debounce duration."
    ],
    "stability": "stable",
-   "notes": "Added for the Concord live Direct Files redesign. It drives an actual guarded save conflict, full app restart, no-loss resolution, visible post-resolution state, and final file bytes."
+   "notes": "Extended for Harvest B3. The matrix drives actual guarded conflicts, full app restarts, both resolution sides on both backends, native capsule-file observation and durable retirement; exact control labels and filesystem timing remain non-contractual."
   },
   "scripts/e2e-dirty-editor-replacement.mjs": {
    "contracts": [
