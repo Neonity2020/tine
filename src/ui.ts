@@ -500,7 +500,11 @@ export async function refreshLiveSaveConflictDraft(page: PageDto): Promise<void>
   };
   liveSaveConflicts.set(page.name, conflict);
   publishConflictQueue();
-  await persistLiveSaveConflict(conflict);
+  // The refreshed draft is already the in-memory truth; a failed capsule
+  // rewrite (disk full, I/O error) must not reject out of the autosave path.
+  await persistLiveSaveConflict(conflict).catch((error) => {
+    console.error("[tine] conflict capsule refresh failed", error);
+  });
 }
 
 export async function updateLiveSaveConflictDiskRev(name: string, diskRev: string): Promise<void> {
@@ -515,19 +519,39 @@ export async function updateLiveSaveConflictDiskRev(name: string, diskRev: strin
   await persistLiveSaveConflict(conflict);
 }
 
-export function clearLiveSaveConflict(name: string): void {
-  if (liveSaveConflicts.delete(name)) {
-    publishConflictQueue();
-  }
+function retireCapsuleOnDisk(name: string): Promise<void> {
+  const root = graphMeta()?.root;
+  if (!root) return Promise.reject(new Error("no graph is bound"));
+  return retireConflictCapsule(root, name);
 }
 
-/** Durably retire before a resolution surface removes or acknowledges it. */
+/** Clearing a retained draft retires its on-disk capsule too, on every path.
+ * Retention and retirement are one property: a draft the user resolved through
+ * the banner, an ordinary save that succeeded, or a page drop must never
+ * resurrect as a stale conflict on the next launch. Non-blocking sites get the
+ * retirement in the background with a sticky toast on failure; the in-page
+ * resolver awaits it through `retireLiveSaveConflict` before acknowledging. */
+export function clearLiveSaveConflict(name: string): void {
+  if (!liveSaveConflicts.delete(name)) return;
+  publishConflictQueue();
+  retireCapsuleOnDisk(name).catch((error) => {
+    pushToast(
+      `“${name}” was resolved, but Tine could not retire its restart-recovery copy; it may reappear after a restart.`,
+      "error",
+      { sticky: true },
+    );
+    console.error("[tine] conflict capsule retire failed", error);
+  });
+}
+
+/** Durably retire before a resolution surface removes or acknowledges it. The
+ * in-memory entry stays until the on-disk capsule is gone, so a failed
+ * retirement leaves the conflict visible instead of silently dropping it. */
 export async function retireLiveSaveConflict(name: string): Promise<void> {
   if (!liveSaveConflicts.has(name)) return;
-  const root = graphMeta()?.root;
-  if (!root) throw new Error("no graph is bound");
-  await retireConflictCapsule(root, name);
-  clearLiveSaveConflict(name);
+  await retireCapsuleOnDisk(name);
+  liveSaveConflicts.delete(name);
+  publishConflictQueue();
 }
 /** The queue entry for the page loaded from `path`, if it has one. */
 export function conflictObjectFor(

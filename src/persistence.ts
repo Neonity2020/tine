@@ -1109,7 +1109,13 @@ async function doSave(
       // Use the same semantic capture boundary as Direct Files. Managed returns
       // no durable replacement authority: only the retained page and base below
       // enter the app-private capsule.
-      await backend().captureLiveSaveConflict?.(dto, baseline, 0);
+      try {
+        await backend().captureLiveSaveConflict?.(dto, baseline, 0);
+      } catch (error) {
+        // The capture only enriches the review; the retained draft below is
+        // the recovery material and must still reach the banner and capsule.
+        console.error("[tine] managed conflict capture failed", error);
+      }
       // Re-notify an already visible banner so its Keep mine enabled state
       // reflects this newly observed (or now unobservable) managed owner. Clear
       // before replacing the capsule so the newly persisted draft survives.

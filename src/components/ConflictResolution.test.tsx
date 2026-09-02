@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { render } from "solid-js/web";
 import { PageConflictResolution } from "./ConflictResolution";
-import { __setBackendForTest, type Backend } from "../backend";
+import { __setBackendForTest, SaveConflictError, type Backend } from "../backend";
 import {
   doc,
   loadSingle,
@@ -167,6 +167,32 @@ describe("in-page conflict resolution", () => {
         "Couldn’t resolve it: ordinary prose containing conflict",
       );
       expect(toasts().some((toast) => toast.message.includes("file changed on disk"))).toBe(false);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("takes the disk-changed recovery branch only for the typed conflict the call funnel mints", async () => {
+    // Fail-before (wave-2 review H2-1): the seven resolve commands rejected with
+    // the raw `conflict:<epoch>` string, only save_page was classified, and this
+    // branch was unreachable — the user got a generic failure instead of a
+    // re-read. The funnel now types every native rejection; the component
+    // consumes the type and nothing else.
+    stubBackend({
+      resolveVcsMarkerConflict: async () => {
+        throw new SaveConflictError(7);
+      },
+    });
+    const { host, dispose } = mount(markerObject);
+    try {
+      await flush();
+      await flush();
+      [...host.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      expect(toasts().at(-1)?.message).toContain("file changed on disk");
     } finally {
       dispose();
     }

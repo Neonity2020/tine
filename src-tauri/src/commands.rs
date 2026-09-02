@@ -4044,66 +4044,14 @@ pub(crate) struct ConflictCapsuleReview {
     authority: ConflictCapsuleAuthority,
 }
 
-fn capsule_doc_block(block: &BlockDto, is_org: bool) -> Result<tine_core::DocBlock, String> {
-    let children = block
-        .children
-        .iter()
-        .map(|child| capsule_doc_block(child, is_org))
-        .collect::<Result<Vec<_>, _>>()?;
-    // DocBlock's memoized projection is intentionally private. Serde is its
-    // public construction boundary here: the skipped projection starts empty,
-    // while only semantic wire fields cross from the retained PageDto. Runtime
-    // identity is also deliberately skipped by Serde, so restore that existing
-    // in-memory identity explicitly after the semantic construction.
-    let mut retained: tine_core::DocBlock = serde_json::from_value(serde_json::json!({
-        "raw": block.raw,
-        "children": children,
-        "is_org": is_org,
-    }))
-    .map_err(|error| format!("invalid retained conflict block: {error}"))?;
-    retained.uuid.clone_from(&block.id);
-    Ok(retained)
-}
-
+/// Capsule pages become `Document`s through tine-core's single bounded
+/// converter and merge their pre-blocks through its single union. Packet B3
+/// briefly re-implemented both here over `BlockDto` (a recursive walker and a
+/// `split_once("::")` union); that reinvented the depth bound packet F built
+/// and diverged from Direct sync's property parsing (D-14).
 fn capsule_document(page: &PageDto) -> Result<tine_core::Document, String> {
-    Ok(tine_core::Document {
-        pre_block: page.pre_block.clone(),
-        roots: page
-            .blocks
-            .iter()
-            .map(|block| capsule_doc_block(block, page.format == tine_core::model::Format::Org))
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
-fn capsule_union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
-    let mine = mine.unwrap_or("");
-    let Some(theirs) = theirs else {
-        return (!mine.is_empty()).then(|| mine.to_owned());
-    };
-    let mine_keys: std::collections::HashSet<String> = mine
-        .lines()
-        .filter_map(|line| {
-            line.split_once("::")
-                .map(|(key, _)| key.trim().to_ascii_lowercase())
-        })
-        .collect();
-    let extra = theirs
-        .lines()
-        .filter(|line| {
-            line.split_once("::")
-                .is_some_and(|(key, _)| !mine_keys.contains(&key.trim().to_ascii_lowercase()))
-        })
-        .collect::<Vec<_>>();
-    if extra.is_empty() {
-        return (!mine.is_empty()).then(|| mine.to_owned());
-    }
-    let mut joined = mine.to_owned();
-    if !joined.is_empty() && !joined.ends_with('\n') {
-        joined.push('\n');
-    }
-    joined.push_str(&extra.join("\n"));
-    Some(joined)
+    tine_core::model::page_dto_document(page)
+        .map_err(|error| format!("invalid retained conflict page: {error}"))
 }
 
 fn managed_capsule_current(
@@ -4234,7 +4182,10 @@ pub(crate) async fn resolve_conflict_capsule(
                     "theirs" => theirs.pre_block,
                     "mine" => mine.pre_block,
                     _ if page.format == tine_core::model::Format::Md => {
-                        capsule_union_pre(mine.pre_block.as_deref(), theirs.pre_block.as_deref())
+                        tine_core::model::union_pre(
+                            mine.pre_block.as_deref(),
+                            theirs.pre_block.as_deref(),
+                        )
                     }
                     _ => mine.pre_block,
                 };

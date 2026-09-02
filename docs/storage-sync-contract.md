@@ -278,11 +278,14 @@ and manifest tail.
 Live-save conflicts use a storage-mode-independent app-private protocol beside
 those managed components: `<app-data>/conflict-capsules/<graph-key>.v1.json`,
 where `graph-key` is the session-style sanitized graph basename plus FNV-1a of
-the root path. `ConflictCapsuleEnvelopeV1` contains the exact retained PageDto,
+the root path. `ConflictCapsuleEnvelope` contains the exact retained PageDto,
 its load baseline, and page binding, but never Managed replacement authority.
 The whole graph envelope is replaced through `atomic_write` (unique create-new
 temporary file, file barrier, atomic rename, directory barrier); stale torn
-temporaries are ignored and reclaimed on reopen. Explicit resolution re-proves
+temporaries are ignored and reclaimed on reopen. An envelope that does not
+decode (torn or foreign bytes at this app-private boundary) is set aside as
+`<graph-key>.v1.json.unreadable-<uuid>` with a directory barrier and the queue
+reopens empty; it never blocks capture or resolution. Explicit resolution re-proves
 the active backend's authority and durably rewrites the envelope, or removes
 and directory-syncs the final file, before the frontend acknowledges success.
 This state is recovery material only: it grants neither graph authority nor a

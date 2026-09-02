@@ -89,15 +89,9 @@ fn reclaim_torn_temps(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn load_unlocked(path: &Path) -> Result<Vec<Value>, String> {
-    reclaim_torn_temps(path)?;
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.to_string()),
-    };
+fn decode_envelope(bytes: &[u8]) -> Result<Vec<Value>, String> {
     let envelope: ConflictCapsuleEnvelope =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     if envelope.version != ENVELOPE_VERSION {
         return Err(format!(
             "unsupported conflict capsule version {}",
@@ -112,6 +106,47 @@ fn load_unlocked(path: &Path) -> Result<Vec<Value>, String> {
         }
     }
     Ok(envelope.capsules)
+}
+
+/// Set an unreadable envelope aside under a unique sibling name and report an
+/// empty queue. Recovery over refusal (D-2): the envelope is restart-recovery
+/// material, never graph authority, so a file this build cannot decode
+/// (in-scope: disk error, a sync client delivering another build's envelope)
+/// must not make every later capture and retirement fail forever. The bytes
+/// are preserved, not deleted.
+fn quarantine_unreadable(path: &Path, reason: &str) -> Result<(), String> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err("conflict capsule name is not UTF-8".into());
+    };
+    let aside = path.with_file_name(format!(
+        "{name}.unreadable-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::rename(path, &aside).map_err(|error| error.to_string())?;
+    if let Some(parent) = path.parent() {
+        tine_core::model::sync_dir_for_rename(parent).map_err(|error| error.to_string())?;
+    }
+    eprintln!(
+        "[tine] conflict capsule envelope set aside as {}: {reason}",
+        aside.display()
+    );
+    Ok(())
+}
+
+fn load_unlocked(path: &Path) -> Result<Vec<Value>, String> {
+    reclaim_torn_temps(path)?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    match decode_envelope(&bytes) {
+        Ok(capsules) => Ok(capsules),
+        Err(reason) => {
+            quarantine_unreadable(path, &reason)?;
+            Ok(Vec::new())
+        }
+    }
 }
 
 fn load_at(path: &Path) -> Result<Vec<Value>, String> {
@@ -240,6 +275,40 @@ mod tests {
         let bytes = std::fs::read_to_string(&path).unwrap();
         assert!(bytes.contains("exact retained bytes"));
         assert_eq!(load_at(&path).unwrap()[0]["page_name"], "Note");
+    }
+
+    #[test]
+    fn unreadable_envelope_is_set_aside_and_the_queue_keeps_working() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = capsule_path(temp.path(), Path::new("/graphs/alpha"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"version\":99,\"capsules\":[]}").unwrap();
+
+        assert!(load_at(&path).unwrap().is_empty());
+        assert!(
+            !path.exists(),
+            "the unreadable envelope is moved aside, not read"
+        );
+        let aside = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".unreadable-")
+            })
+            .expect("the original bytes are preserved beside the envelope");
+        assert_eq!(
+            std::fs::read(&aside).unwrap(),
+            b"{\"version\":99,\"capsules\":[]}"
+        );
+
+        upsert_at(&path, capsule("Note", "after quarantine")).unwrap();
+        assert_eq!(load_at(&path).unwrap()[0]["page_name"], "Note");
+        retire_at(&path, "Note").unwrap();
+        assert!(load_at(&path).unwrap().is_empty());
     }
 
     #[test]

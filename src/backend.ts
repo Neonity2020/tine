@@ -210,10 +210,24 @@ export class SaveConflictError extends Error {
     super(epoch === null ? "conflict" : `conflict:${epoch}`);
     this.name = "SaveConflictError";
   }
+
+  /** Display sites that stringify a rejection keep seeing the bare wire code. */
+  override toString(): string {
+    return this.message;
+  }
 }
 
 export function isSaveConflictError(error: unknown): error is SaveConflictError {
   return error instanceof SaveConflictError;
+}
+
+/** The one place a native rejection becomes a typed error. Every guarded
+ * Direct Files write — `save_page` and the seven conflict-resolution
+ * commands — rejects with the same `conflict` / `conflict:<epoch>` wire code;
+ * classifying here means no caller needs to know which commands can conflict.
+ * Anything else passes through untouched. */
+export function classifyNativeCallError(error: unknown): unknown {
+  return classifySaveConflictWire(error) ?? error;
 }
 
 export function classifySaveConflictWire(error: unknown): SaveConflictError | null {
@@ -991,7 +1005,9 @@ class TauriBackend implements Backend {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
       recordGraphOpenCommand(cmd, started, "failed");
       reportPhase("failed", performance.now() - started);
-      throw error;
+      // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
+      // save_page and left the resolver recovery branch dead).
+      throw classifyNativeCallError(error);
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
     recordGraphOpenCommand(cmd, started, "completed");
@@ -1135,21 +1151,15 @@ class TauriBackend implements Backend {
     conflictEpoch: number | null = null,
     managedConflictObservation: { path: string; revision: string } | null = null,
   ) {
-    try {
-      return await measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
-        this.call<SavePageResult>("save_page", {
-          page,
-          baseRev,
-          force,
-          conflictEpoch,
-          managedConflictObservation,
-        })
-      );
-    } catch (error) {
-      const conflict = classifySaveConflictWire(error);
-      if (conflict) throw conflict;
-      throw error;
-    }
+    return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
+      this.call<SavePageResult>("save_page", {
+        page,
+        baseRev,
+        force,
+        conflictEpoch,
+        managedConflictObservation,
+      })
+    );
   }
   beginDirectCrossPageMove(destination: PageDto, sources: PageDto[]) {
     return this.call<string | null>("begin_direct_cross_page_move", { destination, sources });

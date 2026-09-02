@@ -42,6 +42,7 @@ import {
   journalConflicts,
   retireLiveSaveConflict,
   settleArtifactConflict,
+  updateLiveSaveConflictDiskRev,
 } from "../ui";
 import {
   dropObservation,
@@ -70,7 +71,10 @@ import {
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
 
 function errorDetail(error: unknown): string {
-  return error instanceof Error ? error.message : "unexpected error";
+  // Tauri rejects a `Result<T, String>` with the bare string; keep its text.
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return "unexpected error";
 }
 
 function unsupportedConflictSource(source: never): never {
@@ -256,6 +260,14 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           if (!live) return null;
           const review = await reviewConflictCapsule(c);
           setCapsuleAuthority(review.authority);
+          // A Direct capsule captured without durable recovery (the capture
+          // fallback) carries only a session-scoped observation epoch, which is
+          // dead after a restart. Pin the reviewed disk revision on it so the
+          // restored capsule re-observes the file durably instead of replaying
+          // that epoch (this is what the pre-capsule resource did).
+          if (review.authority.kind === "direct_live") {
+            void updateLiveSaveConflictDiskRev(c.page_name, review.diff.conflict_rev);
+          }
           return review.diff;
         }
         case "vcs-markers": {

@@ -22495,7 +22495,9 @@ fn walk_page_files(dir: &Path, mut visit: impl FnMut(PathBuf)) {
 /// `alias::`/`tags::`/`icon::`. Free text in `theirs`' pre-block is dropped (rare;
 /// the conflict copy is trashed-recoverable). Mirrors the property-carry in
 /// [`Graph::merge_pages`].
-fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
+/// Exposed so the Tauri conflict-capsule resolver composes this one
+/// pre-block union instead of re-implementing it over `BlockDto` (D-14).
+pub fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
     let mine = mine.unwrap_or("");
     let Some(theirs) = theirs else {
         return (!mine.is_empty()).then(|| mine.to_string());
@@ -22911,7 +22913,9 @@ pub(crate) fn generated_document_page_dto(
     })
 }
 
-pub(crate) fn page_dto_document(page: &PageDto) -> io::Result<Document> {
+/// The one bounded `PageDto` -> `Document` conversion. Exposed so native
+/// callers (the conflict-capsule commands) never re-grow a recursive twin.
+pub fn page_dto_document(page: &PageDto) -> io::Result<Document> {
     Ok(Document {
         pre_block: page.pre_block.clone(),
         roots: dto_blocks_to_doc_checked(&page.blocks, page.format == Format::Org)?,
