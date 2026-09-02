@@ -1,0 +1,7 @@
+Harvest D exact-parent baseline reconstruction
+base: e19514f98cf1044391f3a3d2f09d2579275353ee
+command: npx tsc --noEmit
+result: exit 0; TypeScript: No errors found
+
+The original executor did not preserve its pre-edit output. This baseline was
+rerun in the same detached exact-parent worktree as baseline-d-npm-test.txt.

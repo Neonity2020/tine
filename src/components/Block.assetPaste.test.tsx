@@ -1,11 +1,12 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { For, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
 import { initParser } from "../render/parse";
 import { doc, loadSingle, pageByName, resetStore } from "../store";
 import { startEditing } from "../editorController";
-import { setToasts, toasts } from "../ui";
+import { setGraphMeta, setToasts, toasts } from "../ui";
+import { resetSaveState } from "../persistence";
 import type { BlockDto, PageDto } from "../types";
 import { Block } from "./Block";
 
@@ -13,11 +14,16 @@ beforeAll(async () => {
   await initParser();
 });
 
+beforeEach(() => {
+  setGraphMeta({ root: "/graphs/A" } as never);
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   resetStore();
   setToasts([]);
+  setGraphMeta(null);
   document.body.innerHTML = "";
 });
 
@@ -129,6 +135,37 @@ describe("asset paste durability", () => {
       finish("durable.png");
       await settle();
       expect(doc.byId[id].raw).toBe("![](../assets/durable.png)");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not land a durable asset in an editor whose graph binding changed", async () => {
+    loadSingle(page("Assets", [blk("asset-stale", "")]));
+    const id = pageByName("Assets")!.roots[0];
+    startEditing(id, 0);
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:asset"),
+      revokeObjectURL: vi.fn(),
+    });
+    let finish!: (name: string) => void;
+    vi.spyOn(backend(), "saveAsset").mockImplementation(
+      () => new Promise<string>((resolve) => { finish = resolve; }),
+    );
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Assets")?.roots ?? []}>{(bid) => <Block id={bid} />}</For>
+    ));
+    try {
+      const textarea = root.querySelector("textarea")! as HTMLTextAreaElement;
+      textarea.dispatchEvent(imagePasteEvent(new File([new Uint8Array([1])], "paste.png", { type: "image/png" })));
+      await settle();
+      resetSaveState();
+      setGraphMeta({ root: "/graphs/B" } as never);
+      finish("durable.png");
+      await settle();
+      expect(doc.byId[id].raw).toBe("");
+      expect(toasts().some((toast) => toast.message.includes("was not inserted"))).toBe(true);
     } finally {
       dispose();
     }

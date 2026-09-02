@@ -1,4 +1,5 @@
-import { graphEpoch, graphMeta, graphTransitioning } from "../ui";
+import { graphMeta, graphTransitioning } from "../ui";
+import { graphBinding } from "../persistence";
 import type { PluginBlockSnapshot } from "./protocol";
 
 export interface PluginGraphOwner {
@@ -14,13 +15,13 @@ export interface OwnedPluginBlockSnapshot {
 export function capturePluginGraphOwner(): PluginGraphOwner | null {
   const root = graphMeta()?.root;
   if (!root || graphTransitioning()) return null;
-  return Object.freeze({ graphRoot: root, generation: graphEpoch() });
+  return Object.freeze({ graphRoot: root, generation: graphBinding() });
 }
 
 export function isPluginGraphOwnerCurrent(owner: PluginGraphOwner): boolean {
   return !graphTransitioning()
     && graphMeta()?.root === owner.graphRoot
-    && graphEpoch() === owner.generation;
+    && graphBinding() === owner.generation;
 }
 
 export function bindPluginBlockSnapshot(block: PluginBlockSnapshot): OwnedPluginBlockSnapshot | null {

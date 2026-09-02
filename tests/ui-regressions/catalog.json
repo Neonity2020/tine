@@ -9673,6 +9673,72 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: inline and displayed dollar math remains typeset when a whole agent response or another Markdown span is italic, bold, struck, or highlighted. Classification: blocking core operation because the same valid math already renders outside emphasis and formatting surrounding prose must not erase its semantics. Fail-before on exact Tine base d427c43b with the vendored lsdoc v0.5.6 WASM: the focused render test found zero .math descendants and left both delimiters as literal text inside <em>. The parser fix is deliberately lsdoc-only: v0.5.7 recognizes top-level-valid dollar fragments through a root-owned linear index at grammar-bounded nested emphasis sites, while Tine's existing recursive renderer and MathView consume the resulting Latex child unchanged. Org, invalid dollar shapes, code spans, synthetic triple emphasis, and non-emphasis link labels remain unchanged. Anonymized-graph acceptance covered all 1,045 files with freshly rebuilt v0.5.6 and v0.5.7 release parsers: the baseline had zero differences; v0.5.7 produced exactly three, and the fail-closed classifier proved all three as md-nested-dollar-latex with 1, 2, and 3 accepted candidates respectively, leaving zero unclassified corpus changes."
+    },
+    {
+      "id": "UI-HARVEST-D-QUICK-SWITCHER-GRAPH-OWNERSHIP",
+      "title": "Quick Switcher never shows or opens a result from the graph that was switched away",
+      "family": "frontend-staleness",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 1" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": { "tests": ["src/components/QuickSwitcher.test.tsx", "src/frontendStaleness.guard.test.ts"], "scenario": "quick-switcher.graph-binding", "failBefore": "proven" },
+      "notes": "A search or page creation begun under one graph is discarded after a binding change instead of navigating the new graph."
+    },
+    {
+      "id": "UI-HARVEST-D-PINNED-TAB-CONFIRM-LANDING",
+      "title": "A tab opened while a pinned-tab close confirmation is visible is not silently discarded",
+      "family": "frontend-staleness",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 2" },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": { "tests": ["src/router.test.ts"], "scenario": "router.pinned-close-reread", "failBefore": "proven" },
+      "notes": "The live tab roster and closeability are rechecked after the native confirmation wait."
+    },
+    {
+      "id": "UI-HARVEST-D-ASSET-EDITOR-OWNERSHIP",
+      "title": "A delayed asset import or recording never inserts into a different graph or block",
+      "family": "frontend-staleness",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 3" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": { "tests": ["src/components/Block.assetPaste.test.tsx", "src/frontendStaleness.guard.test.ts"], "scenario": "assets.editor-graph-owner", "failBefore": "proven" },
+      "notes": "Every asset initiator captures graph and editor identity before its first wait; a durable orphan is safer than a wrong-note reference."
+    },
+    {
+      "id": "UI-HARVEST-D-PLUGIN-BINDING-NOT-REPAINT",
+      "title": "Changing typography while a plugin runs does not discard its otherwise valid result",
+      "family": "frontend-staleness",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 4" },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": { "tests": ["src/plugins/ownership.test.ts", "src/frontendStaleness.guard.test.ts"], "scenario": "plugins.graph-binding-not-render-epoch", "failBefore": "proven" },
+      "notes": "Plugin ownership follows graphBindingRev; a render epoch is not graph identity."
+    },
+    {
+      "id": "UI-HARVEST-D-FOCUS-RESCAN-REBIND",
+      "title": "The first focus rescan for a newly selected graph is neither skipped nor cross-wired",
+      "family": "frontend-staleness",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 5" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": { "tests": ["src/reloadOnFocus.test.tsx"], "scenario": "focus-rescan.graph-rebind", "failBefore": "proven" },
+      "notes": "Old completion/application state is retired and one replacement refresh waits for the stale tail to settle."
+    },
+    {
+      "id": "UI-HARVEST-D-SETTINGS-BUSY-OWNERSHIP",
+      "title": "Settings controls stay disabled until their own plugin or restore operation finishes",
+      "family": "frontend-staleness",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest D sites 6-7" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": { "tests": ["src/components/Settings.backups.test.tsx", "src/frontendStaleness.guard.test.ts", "src/components/Settings.mediaEditors.platform.test.tsx"], "scenario": "settings.busy-owner-and-mobile-gate", "failBefore": "proven" },
+      "notes": "Only the owning operation clears a busy token, restore is busy during confirmation, and desktop-only media settings are absent on mobile."
     }
   ]
 }

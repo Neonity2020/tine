@@ -6,6 +6,7 @@ import { closeSettings, openSettings } from "../ui";
 const backupBackend = vi.hoisted(() => ({
   getBackupKeep: vi.fn(),
   listBackups: vi.fn(),
+  confirm: vi.fn(),
 }));
 
 vi.mock("../backend", async (importOriginal) => {
@@ -66,6 +67,32 @@ describe("Backups settings", () => {
     expect(root.textContent).toContain("1 files");
     expect(keep.disabled).toBe(false);
     const restore = [...root.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Restore") as HTMLButtonElement;
+    expect(restore.disabled).toBe(false);
+    dispose();
+  });
+
+  it("owns the busy state while the restore confirmation is still open", async () => {
+    backupBackend.getBackupKeep.mockResolvedValue(12);
+    backupBackend.listBackups.mockResolvedValue([{ stamp: "2026-07-22_12-00-00", files: 1 }]);
+    let answer!: (confirmed: boolean) => void;
+    backupBackend.confirm.mockImplementation(
+      () => new Promise<boolean>((resolve) => { answer = resolve; }),
+    );
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    openSettings("backups");
+    await tick();
+    await tick();
+
+    const restore = [...root.querySelectorAll("button")]
+      .find((button) => button.textContent?.trim() === "Restore") as HTMLButtonElement;
+    restore.click();
+    await tick();
+    expect(backupBackend.confirm).toHaveBeenCalledOnce();
+    expect(restore.disabled).toBe(true);
+    answer(false);
+    await tick();
     expect(restore.disabled).toBe(false);
     dispose();
   });

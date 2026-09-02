@@ -184,7 +184,7 @@ export interface PaneRouter {
   goForward(): void;
   setActiveTab(id: string): void;
   closeActiveTab(): void;
-  closeTab(id: string): Promise<void>;
+  closeTab(id: string): Promise<boolean>;
   reopenClosedTab(): void;
   activateAdjacentTab(dir: 1 | -1): void;
   activateNextTab(): void;
@@ -592,8 +592,7 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     if (route().kind !== "pdf") return false;
     const list = tabs();
     if (list.length > 1) {
-      await closeTab(activeId());
-      return true;
+      return closeTab(activeId());
     }
     if (activeTab().pos > 0) {
       goBack();
@@ -851,19 +850,26 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     void closeTab(activeId());
   }
 
-  async function closeTab(id: string) {
-    const list = tabs();
+  async function closeTab(id: string): Promise<boolean> {
+    let list = tabs();
     if (list.length === 1) {
-      if (route().kind !== "journals" && lastTabCloseHandler(paneId)) return;
-      return; // feed pane keeps its last tab
+      if (route().kind !== "journals" && lastTabCloseHandler(paneId)) return false;
+      return false; // feed pane keeps its last tab
     }
-    const t = list.find((x) => x.id === id);
+    let t = list.find((x) => x.id === id);
     // Pinned = sticky = "I want to keep this": confirm before closing, so an
     // accidental Ctrl+W (or middle-click) doesn't drop it. Uses the GTK dialog
     // (backend.confirm), NOT window.confirm - the latter silently returns true in
     // this WebKitGTK build, so the tab would close without ever asking. Unpinned
     // tabs skip the await and close synchronously (no behaviour change there).
-    if (t?.pinned && !(await backend().confirm(`Close pinned tab “${routeTitle(tabRoute(t))}”?`))) return;
+    if (t?.pinned) {
+      if (!(await backend().confirm(`Close pinned tab “${routeTitle(tabRoute(t))}”?`))) return false;
+      // The confirmation dialog yields to every navigation source. Re-read the
+      // live roster and prove the same tab is still closeable before landing.
+      list = tabs();
+      t = list.find((candidate) => candidate.id === id);
+      if (!t || list.length <= 1) return false;
+    }
     // Save the current scroll against the (about-to-close) active tab's route, so a
     // later Ctrl+Shift+T reopen lands back where it was. The route object survives
     // in `closedTabs`, so its scrollByRoute entry is still live on reopen.
@@ -878,10 +884,13 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     }
     setTabs(next);
     if (activeId() === id) {
-      setActiveId(next[Math.max(0, idx - 1)].id);
+      const replacement = next[Math.min(Math.max(0, idx - 1), next.length - 1)];
+      if (!replacement) return false;
+      setActiveId(replacement.id);
       activateCurrentRoute();
     }
     persist();
+    return true;
   }
 
   /** Reopen the most-recently-closed tab (Ctrl+Shift+T), restoring its full

@@ -589,24 +589,26 @@ function PluginSettingsForm(props: {
 }): JSX.Element {
   const operationKey = () => `${props.plugin.manifest.id}@${props.plugin.manifest.version}:settings`;
   const update = async (key: string, value: string | number | boolean) => {
-    props.setBusy(operationKey());
+    const myKey = operationKey();
+    props.setBusy(myKey);
     try {
       await pluginManager.setSetting(props.plugin.manifest.id, props.plugin.manifest.version, key, value);
     } catch (error) {
       pushToast(`Plugin setting could not be saved: ${String(error)}`, "error");
     } finally {
-      props.setBusy(null);
+      if (props.busy() === myKey) props.setBusy(null);
     }
   };
   const reset = async (key?: string) => {
-    props.setBusy(operationKey());
+    const myKey = operationKey();
+    props.setBusy(myKey);
     try {
       if (key) await pluginManager.resetSetting(props.plugin.manifest.id, props.plugin.manifest.version, key);
       else await pluginManager.resetSettings(props.plugin.manifest.id, props.plugin.manifest.version);
     } catch (error) {
       pushToast(`Plugin settings could not be reset: ${String(error)}`, "error");
     } finally {
-      props.setBusy(null);
+      if (props.busy() === myKey) props.setBusy(null);
     }
   };
 
@@ -716,7 +718,8 @@ function PluginsTab(): JSX.Element {
       pushToast("Choose both manifest.json and the plugin's .wasm entry.", "error");
       return;
     }
-    setBusy("install");
+    const myKey = "install";
+    setBusy(myKey);
     try {
       const manifest: unknown = JSON.parse(await manifestFile.text());
       const plugin = await pluginManager.install(manifest, new Uint8Array(await wasmFile.arrayBuffer()));
@@ -726,31 +729,36 @@ function PluginsTab(): JSX.Element {
     } catch (error) {
       pushToast(`Plugin installation failed: ${String(error)}`, "error");
     } finally {
-      setBusy(null);
+      if (busy() === myKey) setBusy(null);
       if (packageInput) packageInput.value = "";
     }
   };
 
   const togglePlugin = async (id: string, version: string, enabled: boolean) => {
-    setBusy(`${id}@${version}`);
+    const myKey = `${id}@${version}`;
+    setBusy(myKey);
     try {
       if (enabled) await pluginManager.disable(id);
       else await pluginManager.enable(id, version);
     } catch (error) {
       pushToast(`Plugin could not be ${enabled ? "disabled" : "enabled"}: ${String(error)}`, "error");
     } finally {
-      setBusy(null);
+      if (busy() === myKey) setBusy(null);
     }
   };
 
   const uninstallPlugin = async (plugin: ReturnType<typeof installedPlugins>[number]) => {
     const { id, name, version } = plugin.manifest;
+    const myKey = `${id}@${version}:uninstall`;
+    setBusy(myKey);
     const confirmed = await backend().confirm(
       `Uninstall ${name} ${version}?\n\nThis removes the plugin from this device. It does not change your graph or notes.`,
       "Uninstall plugin?"
     );
-    if (!confirmed) return;
-    setBusy(`${id}@${version}:uninstall`);
+    if (!confirmed) {
+      if (busy() === myKey) setBusy(null);
+      return;
+    }
     try {
       await pluginManager.uninstall(id, version);
       pushToast(`${name} ${version} was uninstalled.`, "info");
@@ -758,7 +766,7 @@ function PluginsTab(): JSX.Element {
     } catch (error) {
       pushToast(`Plugin could not be uninstalled: ${String(error)}`, "error");
     } finally {
-      setBusy(null);
+      if (busy() === myKey) setBusy(null);
     }
   };
 
@@ -768,7 +776,8 @@ function PluginsTab(): JSX.Element {
   };
 
   const installCommunity = async (plugin: RegistryPlugin, version: RegistryVersion) => {
-    setBusy(`${plugin.id}@${version.version}`);
+    const myKey = `${plugin.id}@${version.version}`;
+    setBusy(myKey);
     try {
       const installed = await installCommunityPlugin(plugin, version);
       pushToast(`${installed.manifest.name} installed disabled. Enable it after reviewing its capabilities.`, "info");
@@ -777,7 +786,7 @@ function PluginsTab(): JSX.Element {
     } catch (error) {
       pushToast(`Community plugin installation failed: ${String(error)}`, "error");
     } finally {
-      setBusy(null);
+      if (busy() === myKey) setBusy(null);
     }
   };
 
@@ -3205,6 +3214,7 @@ function BackupsTab(props: { search: string }): JSX.Element {
 
   const restore = async (b: BackupInfo) => {
     if (!ready() || busy()) return;
+    setBusy(true);
     const when = fmtStamp(b.stamp);
     // Native GTK confirm — window.confirm silently returns true here, which would
     // overwrite the graph with no prompt.
@@ -3214,9 +3224,10 @@ function BackupsTab(props: { search: string }): JSX.Element {
           `This restores the ${b.files} file(s) in that backup to their original locations. ` +
           `Your current state is snapshotted first, so this is reversible.`
       ))
-    )
+    ) {
+      setBusy(false);
       return;
-    setBusy(true);
+    }
     setGraphTransitioning(true);
     try {
       // Persist current edits first so the pre-restore safety snapshot captures
