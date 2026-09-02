@@ -4052,14 +4052,17 @@ fn capsule_doc_block(block: &BlockDto, is_org: bool) -> Result<tine_core::DocBlo
         .collect::<Result<Vec<_>, _>>()?;
     // DocBlock's memoized projection is intentionally private. Serde is its
     // public construction boundary here: the skipped projection starts empty,
-    // while only semantic wire fields cross from the retained PageDto.
-    serde_json::from_value(serde_json::json!({
+    // while only semantic wire fields cross from the retained PageDto. Runtime
+    // identity is also deliberately skipped by Serde, so restore that existing
+    // in-memory identity explicitly after the semantic construction.
+    let mut retained: tine_core::DocBlock = serde_json::from_value(serde_json::json!({
         "raw": block.raw,
         "children": children,
-        "uuid": block.id,
         "is_org": is_org,
     }))
-    .map_err(|error| format!("invalid retained conflict block: {error}"))
+    .map_err(|error| format!("invalid retained conflict block: {error}"))?;
+    retained.uuid.clone_from(&block.id);
+    Ok(retained)
 }
 
 fn capsule_document(page: &PageDto) -> Result<tine_core::Document, String> {
