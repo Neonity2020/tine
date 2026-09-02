@@ -25,6 +25,7 @@ import {
 } from "solid-js";
 import {
   backend,
+  isSaveConflictError,
   resolveConflictCapsule,
   reviewConflictCapsule,
   type ConflictCapsuleAuthority,
@@ -67,6 +68,10 @@ import {
   seedSuggestedOrNoLoss,
 } from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
+
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : "unexpected error";
+}
 
 function unsupportedConflictSource(source: never): never {
   throw new Error(`unsupported conflict source: ${String(source)}`);
@@ -224,7 +229,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       pushToast(ok, "success");
       await refreshJournalConflicts();
     } catch (e) {
-      pushToast(`Couldn’t do that: ${String(e)}`, "error");
+      pushToast(`Couldn’t do that: ${errorDetail(e)}`, "error");
     }
   };
   const trashDayFile = async (name: string) => {
@@ -537,7 +542,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
       // still has one left to reconcile after this fold.
       if (source === "duplicate-journal") void refreshJournalConflicts();
     } catch (e) {
-      if (String(e).includes("conflict")) {
+      if (isSaveConflictError(e)) {
         pushToast("The file changed on disk — re-reading it, please redo your choices.", "error");
         alignment = undefined;
         if (source === "live-save") {
@@ -547,7 +552,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject }): JSX
           void refetch();
         }
       } else {
-        pushToast(`Couldn’t resolve it: ${String(e)}`, "error");
+        pushToast(`Couldn’t resolve it: ${errorDetail(e)}`, "error");
       }
     } finally {
       releasePageSaves();

@@ -1358,6 +1358,13 @@ export function PdfViewer(props: {
     setHighlights([...prev, h]);
     if (!(await persistOwned())) {
       setHighlights(prev); // revert the optimistic add on failure
+      try {
+        await trackAssetWrite(
+          backend().rollbackPdfAreaImage(props.filename, page, id, stamp)
+        );
+      } catch (e) {
+        pushToast(`Couldn't move the unused area image to trash. (${String(e)})`, "error");
+      }
       return false;
     }
     await copyCreatedHighlightRef(h.id);

@@ -31,7 +31,7 @@ afterEach(async () => {
 });
 
 function mountGrouped() {
-  vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+  vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev" });
   vi.spyOn(backend(), "setFavorites").mockResolvedValue();
   vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
   seedFavorites(["Alpha", "Beta", "Gamma"]);

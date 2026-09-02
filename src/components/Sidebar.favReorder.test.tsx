@@ -99,7 +99,7 @@ describe("favorites drag reorder (GH #211)", () => {
   // drag sideways, which is why depth is measured from the GRAB POINT rather
   // than the row's left edge — a straight vertical drag can never nest.
   it("nests a favorite under the one above it when dragged to the right", async () => {
-    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev" });
     vi.spyOn(backend(), "setFavorites").mockResolvedValue();
     vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
     const { dispose, rows } = mountThreeFavorites();
@@ -132,7 +132,7 @@ describe("favorites drag reorder (GH #211)", () => {
   // The rename input is sized to its text rather than stretched precisely so
   // there is somewhere left to grab.
   it("drags a whole group, carrying what it holds", async () => {
-    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("rev");
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev" });
     vi.spyOn(backend(), "setFavorites").mockResolvedValue();
     vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
     const { root, rows, dispose } = mountThreeFavorites();

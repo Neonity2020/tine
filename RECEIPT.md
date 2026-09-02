@@ -1,3 +1,100 @@
+# Harvest H2 receipt — Wave 2 follow-ons
+
+## Contract, base, and ownership
+
+- Authority: `H2-followons-dossier.md` plus the user-authorized A5 checkpoint
+  exception recorded in the A5 dossier §6.
+- Composed base: `batch/harvest-wave2` at `b792327`, with the independent
+  composed-integration fix `32f2d425a924b08ee744eea6771074f12cb746c2`.
+- Contract delta: none. H2 deletes retired compatibility/cache branches and adds
+  one tuple-specific recovery command; it does not change storage, sync, codec,
+  or application-page authority contracts.
+- A5 production and tests remain unchanged by H2. `cargo fmt --all` was run once;
+  formatter-only changes it exposed in A5-owned files were mechanically reverted.
+
+## Outcomes
+
+- 1b: **skipped: owner checkpointed** (A5).
+- 1c: deleted the legacy plugin-registry settings-pair parser, migration object,
+  guarded migration call, mock behavior, and legacy-only tests. The retired shape
+  is disposable cache: it is treated as absent, causing one signed live refetch,
+  while unrelated settings are preserved.
+- 1d: deleted the `string` arm from `SavePageResult` and every consumer/mock/test
+  branch for it. Native and mock producers use the existing object result.
+- 2a: added `rollback_pdf_area_image`, a narrow PDF/page/id/stamp command that
+  derives the writer's real nested OG crop path and moves that exact file into
+  typed recoverable asset trash. The viewer calls it only when `persistOwned`
+  returns false before sidecar commit; reload failures after commit do not erase
+  the crop.
+- 2c: **skipped: owner checkpointed** (A5).
+- E-1: `save_page` now classifies only the complete `conflict` or
+  `conflict:<epoch>` wire shape into `SaveConflictError`. Persistence and the
+  resolver consume the tag. The component contains neither the old substring
+  branch nor `String(e)` error classification.
+- 3c: **already satisfied at the composed base** by
+  `journal_feed_candidates_desc`, its structural delegation guard, and real-tree
+  behavior tests.
+- 3f: **already satisfied at the composed base**; the dark trusted-local commit
+  module was absent and its source guard remained intact.
+
+## Composed-integration repair
+
+Before H2 item edits, the composed branch failed
+`managed_capsule_adapter_applies_both_semantic_resolution_sides`: B3 decoded a
+capsule block through Serde, but `DocBlock::uuid` is skipped by Serde, so the
+resolved runtime block lost its identity. Commit `32f2d425...` copies the capsule
+block id into the runtime UUID after decoding. The focused test and the full
+Tauri suite are green.
+
+## Necessity and regression inventory
+
+- `necessity-h2.txt` records the fail-before PDF orphan and prose-sniffing paths.
+- Added covered catalog entries:
+  `REG-HARVEST-H2-PDF-AREA-ROLLBACK-001` and
+  `REG-HARVEST-H2-TYPED-SAVE-CONFLICT-001`.
+- Plugin legacy-cache deletion removes no authored/user data; its sole cost is a
+  refetch. No new codec or migration decoder was added.
+
+## Verification
+
+- Focused Rust PDF rollback test: green against a real `Graph` nested crop.
+- Focused registry-cache Rust tests: 5 passed.
+- Focused logic tests: green, including exact wire classification, retired cache,
+  save-result typing, and persistence paths.
+- Focused render tests: 75 passed, including adversarial prose classification and
+  PDF rollback.
+- `cargo test -p tine`: 366 passed, 2 ignored.
+- `npm test`: green; logic 206 files / 3,340 tests, plus complete render and
+  deployment-profile suites.
+- `npx tsc --noEmit`: green.
+- `npm run build`: green.
+- `node scripts/check-storage-pin.mjs`: green.
+- `node scripts/check-regression-catalog.mjs`: green (393 UI entries, 252 issues,
+  two inventories).
+- `npm run bench`: completed; cross-machine numbers are advisory (`bigLoad`
+  -33.9%, `scrollBig` +156.1%).
+- `git diff --check`: green.
+- `npm run check:regressions`: catalog green, then the inherited retired-managed-v1
+  source guard failed at `crates/tine-core/src/sync_runtime_tests.rs:28335`; H2
+  does not edit that file.
+- Full `cargo test -p tine-core`: 1,776 passed, 80 failed, 52 ignored on two runs.
+  The composed pre-H2 floor was 1,777/79/52. Exact comparison found zero removed
+  names and one added A5-owned name,
+  `checkpoint_roster_surfaces_missing_authoritative_manifest_immediately`.
+  It passes immediately with `--exact --nocapture`; both parallel full runs show
+  the global deterministic checkpoint hook firing in that test. Exact hashes,
+  commands, and retained logs are recorded in `baseline-h2.txt`. H2 does not
+  promote this scheduling collision into the checkpointed owner's write set.
+
+## Verdict
+
+PASS WITH INHERITED FLOOR ANOMALY RECORDED. All owned H2 behavior, typing, native,
+frontend, build, pin, and catalog gates are green. The only full-core name-set
+addition is in checkpointed A5, is untouched by H2, and passes in isolation; it
+is preserved explicitly in the receipt rather than represented as green.
+
+---
+
 # Harvest H receipt — correctness hygiene
 
 ## Contract and base

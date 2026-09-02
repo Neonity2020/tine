@@ -5797,6 +5797,44 @@
     "failBefore": "A half-package with plugin.wasm but no manifest was simultaneously not reinstallable and not uninstallable; the production source guard also found bare write, rename, recursive-delete, and directory-delete operations."
    },
    "notes": "tine-storage v0.12.0 owns the staged-directory protocol: exact file barriers, a five-target native no-clobber directory move, parent barriers, retire-then-reclaim, and reopen cleanup for .install-/.retired-/incomplete shapes. Tauri keeps manifest and symlink policy, uses the audited settings replacement before retirement, and preserves same-bytes idempotence while refusing different bytes for one immutable id/version. No plugin capability or guest/native authority changes."
+  },
+  {
+   "id": "REG-HARVEST-H2-PDF-AREA-ROLLBACK-001",
+   "title": "A failed PDF highlight sidecar write moves its already-written nested area crop to recoverable asset trash",
+   "family": "pdf-area-highlight-data-safety",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H2 item 2a"},
+   "platforms": ["all"],
+   "layer": "frontend-and-core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/PdfViewer.test.tsx::rolls a nested area crop back to trash when the sidecar write fails",
+     "src-tauri/src/commands.rs::application_page_authority_tests::pdf_area_rollback_moves_the_real_nested_crop_to_typed_asset_trash"
+    ],
+    "scenario": "pdf-area.crop-written-sidecar-refused-recoverable-rollback",
+    "failBefore": "Before Harvest H2 the PNG was written before the sidecar transaction, but the failure path only reverted the optimistic UI highlight and left the nested crop orphaned."
+   },
+   "notes": "The rollback command accepts only the PDF/page/highlight-id/stamp tuple, derives the same nested OG-compatible source path as the writer, and moves that exact crop into typed asset trash. It is invoked only when highlight persistence returns false before sidecar commit; later reload failures do not erase a committed crop."
+  },
+  {
+   "id": "REG-HARVEST-H2-TYPED-SAVE-CONFLICT-001",
+   "title": "Conflict resolution branches on an exact typed save-conflict tag instead of arbitrary error prose",
+   "family": "save-conflict-classification",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H2 E-1"},
+   "platforms": ["all"],
+   "layer": "frontend-tauri-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/ConflictResolution.test.tsx::routes ordinary prose containing conflict through the generic failure path",
+     "src/components/ConflictResolution.test.tsx::has no message-sniffing conflict branch in the production component",
+     "src/persistence.test.ts::tags only the complete Direct Files conflict wire shape at the backend boundary",
+     "src/persistence.test.ts::recognizes only bounded content-conflict contracts"
+    ],
+    "scenario": "save-conflict.exact-wire-tag-no-message-sniff",
+    "failBefore": "The conflict resolver used String(error).includes(\"conflict\"), so unrelated prose containing that word was routed into the stale-file re-observation path."
+   },
+   "notes": "The Tauri save_page boundary recognizes only the complete conflict or conflict:<epoch> wire shape and raises SaveConflictError. Persistence and the resolver consume its save-conflict tag; managed actor refusal remains on its separate exact reason-code envelope."
   }
  ]
 }

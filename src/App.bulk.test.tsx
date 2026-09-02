@@ -5,7 +5,7 @@
 // its bulk threshold into ONE `graph-changed-bulk` event; these tests pin the
 // frontend half of that contract.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { backend } from "./backend";
+import { backend, SaveConflictError } from "./backend";
 import { handleGraphChange, handleGraphChangedBulk } from "./App";
 import { resetPaneLayoutToSingle } from "./panes";
 import {
@@ -195,7 +195,7 @@ describe("one bulk epoch, one frontend notification", () => {
     markDirty(diverged);
     vi.spyOn(backend(), "getPage").mockImplementation((name) => Promise.resolve(diskDto(name)));
     // Only the backend's own guarded-save refusal may raise the banner.
-    vi.spyOn(backend(), "savePage").mockRejectedValue(new Error("conflict:7"));
+    vi.spyOn(backend(), "savePage").mockRejectedValue(new SaveConflictError(7));
 
     try {
       await handleGraphChangedBulk({ changes: changesFor(names) });

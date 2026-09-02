@@ -15,6 +15,7 @@ import {
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
 import { pageInventoryRev } from "../ui";
+import { SaveConflictError } from "../backend";
 
 afterEach(() => {
   clearTransientLayersForTest();
@@ -24,7 +25,7 @@ afterEach(() => {
 function materializeDeps(overrides: Partial<MaterializeQueryDependencies> = {}): MaterializeQueryDependencies {
   return {
     getPage: vi.fn(async () => null),
-    savePage: vi.fn(async () => "rev-new"),
+    savePage: vi.fn(async () => ({ revision: "rev-new" })),
     runGraphSearch: vi.fn(async () => ({ hits: [], diagnostics: [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false })),
     ...overrides,
   };
@@ -149,7 +150,7 @@ describe("materializeQueryWorkspace", () => {
 
   it("keeps the workspace virtual when a create race reaches the save guard", async () => {
     const deps = materializeDeps({
-      savePage: vi.fn(async () => { throw new Error("conflict:17"); }),
+      savePage: vi.fn(async () => { throw new SaveConflictError(17); }),
     });
     const result = await materializeQueryWorkspace({
       title: "Raced",
@@ -244,7 +245,7 @@ function executionFixture(explained: boolean): QueryExecution {
 function workspaceDeps(): QueryWorkspaceDependencies {
   return {
     getPage: vi.fn(async () => null),
-    savePage: vi.fn(async () => "saved-rev"),
+    savePage: vi.fn(async () => ({ revision: "saved-rev" })),
     runGraphSearch: vi.fn(async (_source, pageLimit, blockLimit, _lane, explain) =>
       pageLimit === 0 && blockLimit === 0
         ? { hits: [], diagnostics: [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false }

@@ -4052,14 +4052,17 @@ fn capsule_doc_block(block: &BlockDto, is_org: bool) -> Result<tine_core::DocBlo
         .collect::<Result<Vec<_>, _>>()?;
     // DocBlock's memoized projection is intentionally private. Serde is its
     // public construction boundary here: the skipped projection starts empty,
-    // while only semantic wire fields cross from the retained PageDto.
-    serde_json::from_value(serde_json::json!({
+    // while only semantic wire fields cross from the retained PageDto. Runtime
+    // identity is also deliberately skipped by Serde, so restore that existing
+    // in-memory identity explicitly after the semantic construction.
+    let mut retained: tine_core::DocBlock = serde_json::from_value(serde_json::json!({
         "raw": block.raw,
         "children": children,
-        "uuid": block.id,
         "is_org": is_org,
     }))
-    .map_err(|error| format!("invalid retained conflict block: {error}"))
+    .map_err(|error| format!("invalid retained conflict block: {error}"))?;
+    retained.uuid.clone_from(&block.id);
+    Ok(retained)
 }
 
 fn capsule_document(page: &PageDto) -> Result<tine_core::Document, String> {
@@ -4632,6 +4635,32 @@ mod application_page_authority_tests {
             rel_path: path.into(),
             path: std::path::PathBuf::from(path),
         }
+    }
+
+    #[test]
+    fn pdf_area_rollback_moves_the_real_nested_crop_to_typed_asset_trash() {
+        let (temp, graph) = graph_with_files(&[]);
+        let stored = graph
+            .write_pdf_area_image("paper.pdf", 3, "area-id", 42, b"png")
+            .unwrap();
+        assert!(
+            stored.contains('/'),
+            "the fixture must exercise the nested OG layout"
+        );
+        let source = graph.assets_path().join(&stored);
+        assert!(source.is_file());
+
+        rollback_pdf_area_image_at(&graph, "paper.pdf", 3, "area-id", 42).unwrap();
+
+        assert!(!source.exists());
+        let trash = temp.path().join("logseq/.tine-trash/assets");
+        let names = std::fs::read_dir(trash)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+        assert!(names[0].contains("__pdf-area__"));
+        assert!(names[0].ends_with("__3_area-id_42.png"));
     }
 
     #[test]
@@ -5219,6 +5248,38 @@ pub(crate) fn save_pdf_area_image(
             .map_err(|e| e.to_string())?;
         crate::watcher::note_asset_self_write(&window_label, &g.assets_path().join(&stored));
         Ok(stored)
+    })
+}
+
+fn rollback_pdf_area_image_at(
+    graph: &tine_core::model::Graph,
+    pdf: &str,
+    page: i64,
+    id: &str,
+    stamp: i64,
+) -> Result<(), String> {
+    graph
+        .rollback_pdf_area_image(pdf, page, id, stamp)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn rollback_pdf_area_image(
+    pdf: String,
+    page: i64,
+    id: String,
+    stamp: i64,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let window_label = state.window.label().to_string();
+    with_trash_graph(&state, |graph| {
+        let source = graph
+            .assets_path()
+            .join(tine_core::pdf::asset_key(&pdf))
+            .join(format!("{page}_{id}_{stamp}.png"));
+        rollback_pdf_area_image_at(graph, &pdf, page, &id, stamp)?;
+        crate::watcher::note_asset_self_write(&window_label, &source);
+        Ok(())
     })
 }
 

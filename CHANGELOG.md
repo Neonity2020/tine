@@ -22,6 +22,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A failed PDF area-highlight save no longer leaves an invisible nested crop
+  behind.** If the PNG lands but the highlight sidecar transaction is refused,
+  Tine now moves that exact crop into recoverable asset trash before reverting
+  the optimistic highlight.
+
+- **Unrelated backend errors containing the word “conflict” no longer trigger
+  the stale-file recovery path.** Direct save conflicts are classified once at
+  the native call boundary from their exact wire tag; UI code consumes the
+  typed result instead of searching arbitrary error prose.
+
+- Retired plugin-registry settings-cache keys are no longer parsed or migrated.
+  They are disposable cache data: Tine ignores that old shape and fetches a
+  currently signed registry, while preserving all unrelated app settings.
+
 - **Harvest D — asynchronous results stay with the graph and editor that
   started them.** Quick Switcher creation/search, pinned-tab confirmation,
   asset imports and recordings, plugin calls, focus rescans, and Settings

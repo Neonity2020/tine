@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { backend } from "./backend";
+import { backend, SaveConflictError } from "./backend";
 import { layoutFromBlocks, layoutMembers, layoutToMarkdown } from "./favoritesLayout";
 import {
   addGroup,
@@ -74,7 +74,7 @@ describe("favorites arrangement store", () => {
   });
 
   it("materializes the page as soon as the arrangement carries a group", async () => {
-    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("r2");
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "r2" });
     const setFavorites = vi.spyOn(backend(), "setFavorites").mockResolvedValue();
     const setFavoritesPage = vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
     await loadFavoritesLayout(["Alpha", "Beta"], null);
@@ -94,7 +94,7 @@ describe("favorites arrangement store", () => {
   });
 
   it("still projects membership when writing the arrangement page fails", async () => {
-    vi.spyOn(backend(), "savePage").mockRejectedValue(new Error("conflict"));
+    vi.spyOn(backend(), "savePage").mockRejectedValue(new SaveConflictError(null));
     vi.spyOn(backend(), "setFavoritesPage").mockResolvedValue();
     const setFavorites = vi.spyOn(backend(), "setFavorites").mockResolvedValue();
     await loadFavoritesLayout(["Alpha"], null);

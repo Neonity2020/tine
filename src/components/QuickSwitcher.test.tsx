@@ -353,7 +353,7 @@ describe("QuickSwitcher search syntax help", () => {
     });
     const savePage = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
       if (dto.path) disk.set(dto.path, JSON.stringify(dto));
-      return "saved-exact-rev";
+      return { revision: "saved-exact-rev" };
     });
     vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
       hits: [{
@@ -567,7 +567,7 @@ describe("QuickSwitcher search syntax help", () => {
   });
 
   it("refreshes canonical page inventory after a direct create", async () => {
-    const save = vi.spyOn(backend(), "savePage").mockResolvedValue("created-rev");
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "created-rev" });
     const before = pageInventoryRev();
     const root = document.createElement("div");
     document.body.append(root);
@@ -593,9 +593,9 @@ describe("QuickSwitcher search syntax help", () => {
   });
 
   it("does not navigate a created-page result after the graph binding changes", async () => {
-    let finish!: (revision: string) => void;
+    let finish!: (result: { revision: string }) => void;
     vi.spyOn(backend(), "savePage").mockImplementation(
-      () => new Promise<string>((resolve) => { finish = resolve; }),
+      () => new Promise<{ revision: string }>((resolve) => { finish = resolve; }),
     );
     const root = document.createElement("div");
     document.body.append(root);
@@ -616,7 +616,7 @@ describe("QuickSwitcher search syntax help", () => {
       await vi.waitFor(() => expect(backend().savePage).toHaveBeenCalledOnce());
       resetSaveState();
       setGraphMeta({ root: "/graphs/B" } as never);
-      finish("created-rev");
+      finish({ revision: "created-rev" });
       await vi.waitFor(() => expect(toasts().some((toast) => toast.message.includes("graph changed"))).toBe(true));
       expect(route()).toEqual({ kind: "journals" });
     } finally {

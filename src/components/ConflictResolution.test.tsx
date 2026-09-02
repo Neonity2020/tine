@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { render } from "solid-js/web";
 import { PageConflictResolution } from "./ConflictResolution";
 import { __setBackendForTest, type Backend } from "../backend";
@@ -17,6 +18,8 @@ import {
   restoreLiveSaveConflicts,
   setConflictQueue,
   setGraphMeta,
+  setToasts,
+  toasts,
 } from "../ui";
 import type {
   ConflictObject,
@@ -41,6 +44,7 @@ afterEach(() => {
   __setBackendForTest(null);
   setConflictQueue([]);
   setGraphMeta(null);
+  setToasts([]);
   localStorage.clear();
   resetStore();
 });
@@ -138,6 +142,36 @@ function mount(conflict: ConflictObject): { host: HTMLElement; dispose: () => vo
 }
 
 describe("in-page conflict resolution", () => {
+  it("has no message-sniffing conflict branch in the production component", () => {
+    const source = readFileSync("src/components/ConflictResolution.tsx", "utf8");
+    expect(source).not.toContain('.includes("conflict")');
+    expect(source).not.toContain("String(e)");
+  });
+
+  it("routes ordinary prose containing conflict through the generic failure path", async () => {
+    stubBackend({
+      resolveVcsMarkerConflict: async () => {
+        throw new Error("ordinary prose containing conflict");
+      },
+    });
+    const { host, dispose } = mount(markerObject);
+    try {
+      await flush();
+      await flush();
+      [...host.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Apply resolution"))!
+        .click();
+      await flush();
+      await flush();
+      expect(toasts().at(-1)?.message).toBe(
+        "Couldn’t resolve it: ordinary prose containing conflict",
+      );
+      expect(toasts().some((toast) => toast.message.includes("file changed on disk"))).toBe(false);
+    } finally {
+      dispose();
+    }
+  });
+
   it("names the sides the marker file itself named", async () => {
     stubBackend({});
     const { host, dispose } = mount(markerObject);

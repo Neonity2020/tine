@@ -54,14 +54,14 @@ vi.mock("./backend", () => ({
           return Promise.reject(new Error("conflict_authority.superseded: ..."));
         }
         live = null;
-        return Promise.resolve("rev-forced");
+        return Promise.resolve({ revision: "rev-forced" });
       }
       if (refuseGuarded.has(page.name)) {
         live = nextEpoch;
         nextEpoch += 1;
-        return Promise.reject(new Error(`conflict:${live}`));
+        return Promise.reject({ kind: "save-conflict", epoch: live });
       }
-      return Promise.resolve("rev-after");
+      return Promise.resolve({ revision: "rev-after" });
     },
   }),
 }));

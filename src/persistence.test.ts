@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { classifySaveConflictWire, SaveConflictError } from "./backend";
 import {
   dirtyPages,
   flushAll,
@@ -70,14 +71,23 @@ describe("managed move persistence barrier", () => {
 });
 
 describe("save failure classification", () => {
+  it("tags only the complete Direct Files conflict wire shape at the backend boundary", () => {
+    expect(classifySaveConflictWire("conflict")).toMatchObject({ kind: "save-conflict", epoch: null });
+    expect(classifySaveConflictWire(new Error("conflict:17"))).toMatchObject({ kind: "save-conflict", epoch: 17 });
+    expect(classifySaveConflictWire("conflict:17 suffix")).toBeNull();
+    expect(classifySaveConflictWire("ordinary prose says conflict:17")).toBeNull();
+    expect(classifySaveConflictWire({ toString: () => "conflict:17" })).toBeNull();
+  });
+
   it("recognizes only bounded content-conflict contracts", () => {
-    expect(isSaveConflictFailure("conflict:17")).toBe(true);
+    expect(isSaveConflictFailure(new SaveConflictError(17))).toBe(true);
     expect(isSaveConflictFailure("managed.conflict: stale_base")).toBe(true);
     expect(isSaveConflictFailure(
       "sync actor refused application page intent at committing the semantic page transaction (reason code: managed.conflict)",
     )).toBe(true);
     expect(isSaveConflictFailure("precheck.portable_collision: page already exists")).toBe(false);
     expect(isSaveConflictFailure("ordinary prose says conflict or already exists")).toBe(false);
+    expect(isSaveConflictFailure("conflict:17")).toBe(false);
   });
 
   // A non-retryable failure used to be retried twice more before toasting, and

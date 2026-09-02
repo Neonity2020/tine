@@ -108,15 +108,11 @@ export interface EditorActivationHandle {
  *
  * Direct Files may return the activation that now owns a successful first
  * creation (including its resolved target). Managed storage keeps its existing
- * revision-only semantics and therefore omits `activation`. The string arm is
- * retained for compatibility with older/mock managed backends during the
- * transport transition. */
-export type SavePageResult =
-  | string
-  | {
-      revision: string;
-      activation?: EditorActivationHandle;
-    };
+ * revision-only semantics and therefore omits `activation`. */
+export type SavePageResult = {
+  revision: string;
+  activation?: EditorActivationHandle;
+};
 
 /** One authoritative Journals-feed transaction.  Cursor fields are ordinal
  * journal days, never counts of returned DTOs (a selected file may vanish). */

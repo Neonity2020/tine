@@ -1,0 +1,35 @@
+Harvest H2 necessity evidence
+=============================
+
+2a PDF area rollback
+--------------------
+Before H2, createAreaHighlightOwned wrote the nested PNG first and then called
+persistOwned. If the sidecar write failed, it reverted only the optimistic
+highlight signal and returned false; there was no backend/native rollback
+command. The PNG therefore remained invisible and orphaned. The new native
+test starts from Graph::write_pdf_area_image's real nested path and proves the
+tuple-specific rollback moves it into typed recoverable asset trash.
+
+E-1 exact conflict classification
+---------------------------------
+Before H2, ConflictResolution.tsx branched on
+`String(e).includes("conflict")`. An ordinary error whose prose happened to
+contain that word entered the stale-file re-observation path. The adversarial
+component test reproduces that input and now requires the generic failure path;
+a source guard forbids both the substring branch and String(e) in the component.
+
+1c and 1d deletion proof
+------------------------
+The plugin registry's legacy settings pair was cache-only. Ignoring it produces
+one live refetch and preserves unrelated settings; no user graph or authored
+plugin state is deleted. SavePageResult's string arm had no native producer;
+all real and mock backends now return the existing object wire shape.
+
+Skipped/already-satisfied outcomes
+----------------------------------
+- 1b: skipped: owner checkpointed (A5).
+- 2c: skipped: owner checkpointed (A5).
+- 3c: already satisfied at the composed base by the shared journal-feed helper
+  and its structural plus real-tree tests.
+- 3f: already satisfied at the composed base; the dark trusted-local commit
+  module was already absent and its source guard remained present.
