@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // GH #369 — useless pane scrollbars: reproduce the reporter's "dashboard"
 // (multiple short split panes) in headless Chromium against `vite preview`,
 // measure each pane's scroll geometry, and screenshot it. jsdom cannot prove
@@ -29,17 +30,6 @@ const server = spawn(
   { stdio: "ignore" },
 );
 
-async function waitForServer(url, tries = 80) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {
-      // not up yet
-    }
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 async function openPageInFocusedPane(page, name) {
   await page.keyboard.press("Control+k");
@@ -152,7 +142,7 @@ async function measureFocusedPageWidth(page) {
 }
 
 try {
-  await waitForServer(`http://127.0.0.1:${PORT}/`);
+  await waitForHttpServer(`http://127.0.0.1:${PORT}/`, 80, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
   });

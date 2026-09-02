@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Capture the PDF reader at phone width. Run against a baseline URL as well as
 // the current preview to retain visual before/after evidence:
 //
@@ -23,17 +24,6 @@ let server;
 
 mkdirSync(OUT, { recursive: true });
 
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {
-      // Preview is still starting.
-    }
-    await sleep(250);
-  }
-  throw new Error(`server did not start: ${url}`);
-}
 
 async function openPdfAtPhoneWidth(browser, url, outputPath) {
   const context = await browser.newContext({
@@ -96,7 +86,7 @@ async function openPdfAtPhoneWidth(browser, url, outputPath) {
 try {
   if (!process.env.TINE_PDF_MOBILE_AFTER_URL) {
     server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "inherit" });
-    await waitForServer(afterUrl);
+    await waitForHttpServer(afterUrl, 60, 250, { failureMessage: `server did not start: ${url}` });
   }
 
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });

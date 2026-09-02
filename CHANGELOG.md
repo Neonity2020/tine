@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Sheets, serialized writes, and local screenshot harnesses now share their
+  canonical implementations.** Board and table field rendering use the same
+  facet readers, query DTO facets are memoized by DTO identity, shared-key
+  frontend writes use one promise-tail shape, and local preview scripts retain
+  their individual retry budgets behind one readiness helper.
+
 - **The pinned `tine-storage` release now certifies every shipped platform.**
   Version 0.12.2 preserves complete plugin packages that contain harmless extra
   files, strengthens interrupted-install recovery checks, and gives Linux and

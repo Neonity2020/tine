@@ -391,35 +391,22 @@ export function windowsWebviewProfileSnapshot(root) {
  * Every suite used to carry its own copy with its own attempt budget (DUP-12);
  * the attempt policy stays with the caller, the waiting shape lives here.
  */
-export async function waitForHttpServer(url, tries = 40, intervalMs = 250, fetchImpl = fetch) {
-  for (let attempt = 0; attempt < tries; attempt += 1) {
-    try {
-      if ((await fetchImpl(url)).ok) return;
-    } catch {
-      // The server is still starting.
-    }
-    await sleep(intervalMs);
-  }
-  throw new Error(`server did not start at ${url} after ${tries} attempts`);
-}
-
-/**
- * Shared readiness wait for script-owned preview servers (DUP-12). Attempt and
- * interval policy remains explicit at each call site; lifecycle hooks preserve
- * the few scripts that also prove ownership of their spawned server process.
- */
-export async function waitForServer(
+export async function waitForHttpServer(
   url,
-  tries = 60,
+  tries = 40,
   intervalMs = 250,
-  {
+  fetchOrOptions = fetch,
+) {
+  const options = typeof fetchOrOptions === "function"
+    ? { fetchImpl: fetchOrOptions }
+    : fetchOrOptions;
+  const {
     beforeAttempt,
     ready,
     beforeFailure,
     failureMessage = `server did not start at ${url} after ${tries} attempts`,
     fetchImpl = fetch,
-  } = {},
-) {
+  } = options;
   for (let attempt = 0; attempt < tries; attempt += 1) {
     await beforeAttempt?.();
     try {

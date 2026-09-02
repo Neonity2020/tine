@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { backend } from "../backend";
+import { serializedWrites } from "../serializedWrites";
 import { parseThemeManifest, themeManifestCss, themeVersionKey, type ThemeManifest } from "./manifest";
 
 const STORAGE_KEY = "theme.packages.v1";
@@ -14,7 +15,7 @@ export interface InstalledTheme {
 
 const [installedThemes, setInstalledThemes] = createSignal<InstalledTheme[]>([]);
 const [revokedThemeVersions, setRevokedThemeVersions] = createSignal<ReadonlySet<string>>(new Set());
-let persistenceChain: Promise<void> = Promise.resolve();
+const packageWrites = serializedWrites("theme.packages.v1");
 export { installedThemes, revokedThemeVersions };
 
 function parseStoredThemes(text: string): ThemeManifest[] {
@@ -45,7 +46,7 @@ async function persist(themes: InstalledTheme[]) {
 function mutateInstalledThemes<T>(
   update: (current: InstalledTheme[]) => { next: InstalledTheme[]; result: T },
 ): Promise<T> {
-  const operation = persistenceChain.then(async () => {
+  return packageWrites.run(async () => {
     // Every mutation rewrites the same STORAGE_KEY array. Re-read the signal
     // inside the serialized tail so a queued different-theme mutation sees
     // all preceding durable changes instead of publishing a stale snapshot.
@@ -54,8 +55,6 @@ function mutateInstalledThemes<T>(
     setInstalledThemes(next);
     return result;
   });
-  persistenceChain = operation.then(() => undefined, () => undefined);
-  return operation;
 }
 
 export async function initThemePackages(initialRevocations: ReadonlySet<string> = new Set()): Promise<void> {

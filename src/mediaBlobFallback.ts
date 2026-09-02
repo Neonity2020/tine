@@ -1,23 +1,18 @@
 import { backend } from "./backend";
+import { serializedWrites } from "./serializedWrites";
 
 const AUDIO_MAX_BYTES = 64 * 1024 * 1024;
 const VIDEO_MAX_BYTES = 128 * 1024 * 1024;
 const TOTAL_MAX_BYTES = 128 * 1024 * 1024;
 
 let retainedBytes = 0;
-let queueTail: Promise<void> = Promise.resolve();
+const mediaFallbackWrites = serializedWrites("media-blob-fallback-budget");
 
 export type MediaBlobLease = {
   url: string;
   bytes: number;
   release: () => void;
 };
-
-function enqueue<T>(task: () => Promise<T>): Promise<T> {
-  const result = queueTail.then(task, task);
-  queueTail = result.then(() => {}, () => {});
-  return result;
-}
 
 function abortError(): Error {
   return new DOMException("media fallback cancelled", "AbortError");
@@ -35,7 +30,7 @@ export function acquireMediaBlobFallback(
   mime: string,
   signal?: AbortSignal
 ): Promise<MediaBlobLease> {
-  return enqueue(async () => {
+  return mediaFallbackWrites.run(async () => {
     if (signal?.aborted) throw abortError();
     const perFileMax = kind === "audio" ? AUDIO_MAX_BYTES : VIDEO_MAX_BYTES;
     const remaining = TOTAL_MAX_BYTES - retainedBytes;

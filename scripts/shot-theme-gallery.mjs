@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Built-in theme gallery acceptance shots. Runs against the built frontend and
 // mock backend, saving full visual checks under subagent-tasks/notes/ plus small
 // crops used by Settings card thumbnails.
@@ -24,18 +25,6 @@ const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--stric
   stdio: "ignore",
 });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) return;
-    } catch {
-      // still starting
-    }
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 async function openPage(browser, customCss = "") {
   const context = await browser.newContext({
@@ -119,7 +108,7 @@ function assertManagedOrder(label, order) {
 }
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
   });

@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Vertical alignment of everything that must sit on a block's FIRST line:
 // the bullet dot / ordered number (GH #459) and the reference-count badge
 // (GH #454).
@@ -39,13 +40,6 @@ const server = spawn(
   { cwd: root, stdio: "ignore" },
 );
 
-async function waitForServer(url) {
-  for (let i = 0; i < 80; i += 1) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("preview server did not start");
-}
 
 /** In-page: the signed distance from the first-line-box centre of every visible
  *  block to the centre of its bullet. Blocks whose content is not ordinary text
@@ -111,7 +105,7 @@ const note = (message) => problems.push(message);
 
 try {
   const url = `http://127.0.0.1:${port}/`;
-  await waitForServer(url);
+  await waitForHttpServer(url, 80, 250, { failureMessage: "preview server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1000, height: 1000 } });
   const pageErrors = [];

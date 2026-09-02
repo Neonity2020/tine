@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Self-verification shots for the conflict dock (spec:
 // tine-agents/specs/concord-conflict-dock.md): the full panel at the top of a
 // long page, the slim pinned bar once the panel scrolls out of view, and the
@@ -9,13 +10,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5218;
 const server = spawn("./node_modules/.bin/vite", ["preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 async function openConflictPage(page, { phone = false } = {}) {
   await page.goto(`http://localhost:${PORT}/?conflicts`);
   await page.waitForSelector(".ls-block", { timeout: 5000 });
@@ -40,7 +34,7 @@ const scrollPane = (page, top) =>
   }, top);
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu"] });
   const errors = [];
 

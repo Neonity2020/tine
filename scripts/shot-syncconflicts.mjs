@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Open Settings → Backups & recovery (with the ?conflicts gate so the mock
 // surfaces a sync-conflict copy), screenshot the panel, then open the merge modal
 // and screenshot it. Verifies the sync-conflict reconcile + block-merge UI.
@@ -7,15 +8,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5209;
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 900, height: 1180 } });
   await page.goto(`http://localhost:${PORT}/?conflicts`);

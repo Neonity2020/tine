@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // HARNESS DEBT — DOES NOT CURRENTLY RUN HERE. Kept because the check it wants
 // to make is the right one, not because it works: every invocation on this box
 // is killed (exit 144) before the script produces output, with no stray vite or
@@ -25,19 +26,9 @@ const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--stric
   stdio: "inherit",
 });
 
-async function waitForServer(url, tries = 40) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      const r = await fetch(url);
-      if (r.ok) return;
-    } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 40, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
   });

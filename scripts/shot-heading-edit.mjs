@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Visual verification for Item 1(a): the block editor <textarea> renders
 // heading-sized while editing a SINGLE-LINE heading block (OG parity), matching
 // the rendered view, and stays BODY-sized for a multi-line heading (uniline gate).
@@ -9,13 +10,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5198;
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
-async function waitForServer(url, tries = 60) {
-  for (let i = 0; i < tries; i++) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("server did not start");
-}
 
 // Enter the first block's editor and replace its content with `content` (typed).
 async function editFirstBlock(page, content) {
@@ -56,7 +50,7 @@ async function renderedHeadingFontPx(page) {
 }
 
 try {
-  await waitForServer(`http://localhost:${PORT}/`);
+  await waitForHttpServer(`http://localhost:${PORT}/`, 60, 250, { failureMessage: "server did not start" });
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   const errors = [];

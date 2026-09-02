@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   createWebdriverLifecycle,
@@ -8,12 +11,9 @@ import {
   parseFrameExtentsOutput,
   tauriCapabilities,
   waitForHttpServer,
-  waitForServer,
   webdriverSessionToken,
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
-import fs from "node:fs";
-import os from "node:os";
 
 // DUP-12 (2026-08-25 duplication audit): these cases pin the domains where the
 // previously per-suite harness spellings disagreed — capability objects,
@@ -126,16 +126,30 @@ test("waitForHttpServer: retries through failures and reports the attempt budget
   assert.equal(calls, 2);
 });
 
-test("waitForServer: preserves caller-owned attempt policy and lifecycle checks", async () => {
+test("waitForHttpServer preserves caller-owned policy and lifecycle checks", async () => {
   let attempts = 0;
   let ownershipChecks = 0;
-  await waitForServer("http://preview.invalid", 3, 0, {
+  await waitForHttpServer("http://preview.invalid", 3, 0, {
     beforeAttempt: () => { ownershipChecks += 1; },
     ready: () => true,
     fetchImpl: async () => ({ ok: ++attempts === 2 }),
   });
   assert.equal(attempts, 2);
   assert.equal(ownershipChecks, 2);
+});
+
+test("DUP-12b keeps every private server wait on waitForHttpServer", () => {
+  const scripts = path.dirname(fileURLToPath(import.meta.url));
+  const offenders = fs.readdirSync(scripts)
+    .filter((name) => name.endsWith(".mjs"))
+    .filter((name) => /(?:async\s+)?function\s+waitForServer\s*\(/.test(
+      fs.readFileSync(path.join(scripts, name), "utf8"),
+    ));
+  assert.deepEqual(
+    offenders,
+    [],
+    "DUP-12 requires scripts/*.mjs readiness loops to use scripts/e2e-capabilities.mjs::waitForHttpServer",
+  );
 });
 
 test("webdriver lifecycle finds only the exact tagged process tree", () => {

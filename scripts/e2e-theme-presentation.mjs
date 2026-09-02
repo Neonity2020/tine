@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -35,17 +36,10 @@ const server = spawn(
   { cwd: root, stdio: "ignore" },
 );
 
-async function waitForServer(url) {
-  for (let i = 0; i < 60; i += 1) {
-    try { if ((await fetch(url)).ok) return; } catch {}
-    await sleep(250);
-  }
-  throw new Error("preview server did not start");
-}
 
 try {
   const url = `http://127.0.0.1:${port}/`;
-  await waitForServer(url);
+  await waitForHttpServer(url, 60, 250, { failureMessage: "preview server did not start" });
   const browser = await chromium.launch({ args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"] });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   page.setDefaultTimeout(15_000);

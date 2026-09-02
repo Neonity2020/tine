@@ -1,3 +1,4 @@
+import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Visual verification for packet C-5b's tier-3 toast and Deleted pages dock.
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
@@ -13,21 +14,10 @@ const server = spawn("./node_modules/.bin/vite", [
   "--strictPort",
 ], { stdio: "ignore" });
 
-async function waitForServer(url) {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      if ((await fetch(url)).ok) return;
-    } catch {
-      // Preview is still starting.
-    }
-    await sleep(250);
-  }
-  throw new Error("preview server did not start");
-}
 
 try {
   const url = `http://127.0.0.1:${PORT}/?absence-sweeps`;
-  await waitForServer(url);
+  await waitForHttpServer(url, 60, 250, { failureMessage: "preview server did not start" });
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
   });
