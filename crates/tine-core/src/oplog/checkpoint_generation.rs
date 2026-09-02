@@ -356,47 +356,45 @@ fn build_payload(
         SealedAcceptedIndexWriter,
     };
 
-    let (
-        mut store,
-        mut batch_map,
-        mut status_map,
-        mut sequence_root,
-        mut required_objects,
-    ) = match predecessor {
-        Some((sequence, payload)) => {
-            if payload.schema_version != CHECKPOINT_SCHEMA_VERSION
-                || sequence < capture.base_sequence
-                || sequence > capture.target_sequence
-            {
-                return Err("clean checkpoint predecessor frontier is incompatible".into());
+    let (mut store, mut batch_map, mut status_map, mut sequence_root, mut required_objects) =
+        match predecessor {
+            Some((sequence, payload)) => {
+                if payload.schema_version != CHECKPOINT_SCHEMA_VERSION
+                    || sequence < capture.base_sequence
+                    || sequence > capture.target_sequence
+                {
+                    return Err("clean checkpoint predecessor frontier is incompatible".into());
+                }
+                let roots = roots_from_wire(payload.roster_roots)?;
+                if roots.sequence.len != sequence {
+                    return Err("clean checkpoint predecessor roster frontier differs".into());
+                }
+                (
+                    CheckpointSealedStore {
+                        objects: payload.sealed_objects,
+                    },
+                    roots.batch_map,
+                    roots.status_map,
+                    roots.sequence,
+                    payload
+                        .required_objects
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                )
             }
-            let roots = roots_from_wire(payload.roster_roots)?;
-            if roots.sequence.len != sequence {
-                return Err("clean checkpoint predecessor roster frontier differs".into());
+            None => {
+                if capture.base_sequence != 0 {
+                    return Err("clean checkpoint delta has no durable predecessor".into());
+                }
+                (
+                    CheckpointSealedStore::default(),
+                    AuthenticatedMapRootV1::empty(),
+                    AuthenticatedMapRootV1::empty(),
+                    AcceptedSequenceRootV2::empty(),
+                    BTreeSet::new(),
+                )
             }
-            (
-                CheckpointSealedStore {
-                    objects: payload.sealed_objects,
-                },
-                roots.batch_map,
-                roots.status_map,
-                roots.sequence,
-                payload.required_objects.into_iter().collect::<BTreeSet<_>>(),
-            )
-        }
-        None => {
-            if capture.base_sequence != 0 {
-                return Err("clean checkpoint delta has no durable predecessor".into());
-            }
-            (
-                CheckpointSealedStore::default(),
-                AuthenticatedMapRootV1::empty(),
-                AuthenticatedMapRootV1::empty(),
-                AcceptedSequenceRootV2::empty(),
-                BTreeSet::new(),
-            )
-        }
-    };
+        };
     for row in &capture.accepted_rows {
         if row.evidence.acceptance_sequence() <= sequence_root.len {
             continue;
@@ -529,13 +527,9 @@ fn read_current_payload_for_extension(
     store: &ObjectStore,
 ) -> Result<Option<(u64, CheckpointPayloadV1)>, String> {
     let directory = checkpoint_directory(store)?;
-    let Some(pointer_bytes) = tine_storage::read_optional_regular(
-        &directory,
-        CHECKPOINT_POINTER,
-        4 * 1024,
-        None,
-    )
-    .map_err(|error| error.to_string())?
+    let Some(pointer_bytes) =
+        tine_storage::read_optional_regular(&directory, CHECKPOINT_POINTER, 4 * 1024, None)
+            .map_err(|error| error.to_string())?
     else {
         return Ok(None);
     };

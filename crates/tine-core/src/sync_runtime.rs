@@ -58,7 +58,7 @@ use crate::oplog::discovery::{
 use crate::oplog::enrollment::{
     inspect_local_activation_reservation_at, open_existing_enrollment_application_root,
     EnrollmentApplicationRoot, EnrollmentBindingV1, EnrollmentError, LocalActivationIdentityV1,
-    PreparationId, SharedEnrollmentDescriptorV1,
+    PreparationId,
 };
 use crate::oplog::hot_engine::ProjectionEndpointBinding;
 use crate::oplog::hot_engine::{AcceptedFrontierRoot, ShardedHotEngine};
@@ -1113,6 +1113,18 @@ fn fail_once_at_activation_cut(cut: ActivationTestCut) {
 }
 
 #[cfg(test)]
+thread_local! {
+    static CLEAN_ACTIVATION_POST_RETAIN_TEST_CUT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn fail_once_after_clean_activation_retain() {
+    CLEAN_ACTIVATION_POST_RETAIN_TEST_CUT.with(|pending| pending.set(true));
+}
+
+#[cfg(test)]
 fn fail_once_after_share_prepared(workspace_id: WorkspaceId) {
     *PREPARE_SHARED_TEST_CUT.lock().unwrap() = Some(workspace_id);
 }
@@ -1200,58 +1212,6 @@ pub struct SyncSharedEnrollmentDescriptor {
     pub descriptor_digest: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum SharedEnrollmentDescriptor {
-    Legacy(SharedEnrollmentDescriptorV1),
-    Clean(CleanSharedEnrollmentDescriptorV1),
-}
-
-impl SharedEnrollmentDescriptor {
-    fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if let Ok(descriptor) = CleanSharedEnrollmentDescriptorV1::decode(bytes) {
-            return Ok(Self::Clean(descriptor));
-        }
-        SharedEnrollmentDescriptorV1::decode(bytes)
-            .map(Self::Legacy)
-            .map_err(display)
-    }
-
-    const fn workspace_id(&self) -> WorkspaceId {
-        match self {
-            Self::Legacy(descriptor) => descriptor.workspace_id(),
-            Self::Clean(descriptor) => descriptor.workspace_id(),
-        }
-    }
-
-    const fn lineage_digest(&self) -> LineageDigest {
-        match self {
-            Self::Legacy(descriptor) => descriptor.lineage_digest(),
-            Self::Clean(descriptor) => descriptor.lineage_digest(),
-        }
-    }
-
-    const fn catalog_document_id(&self) -> DocumentId {
-        match self {
-            Self::Legacy(descriptor) => descriptor.catalog_document_id(),
-            Self::Clean(descriptor) => descriptor.catalog_document_id(),
-        }
-    }
-
-    fn encode(&self) -> Result<Vec<u8>, String> {
-        match self {
-            Self::Legacy(descriptor) => descriptor.encode().map_err(display),
-            Self::Clean(descriptor) => descriptor.encode().map_err(display),
-        }
-    }
-
-    fn digest(&self) -> Result<ContentDigest, String> {
-        match self {
-            Self::Legacy(descriptor) => descriptor.digest().map_err(display),
-            Self::Clean(descriptor) => descriptor.digest().map_err(display),
-        }
-    }
-}
-
 /// Structural provider-prefix state observed before cold descriptor discovery.
 /// `Partial` is retryable honest file-sync delivery; `Refused` is an unsafe or
 /// ambiguous shape and deliberately carries no storage authority.
@@ -1275,32 +1235,18 @@ pub fn inspect_shared_provider_cold_prefix(
 }
 
 impl SyncSharedEnrollmentDescriptor {
-    /// Build the public descriptor from a legacy core descriptor.
-    ///
-    /// Retained for the provider-recovery regressions that construct a
-    /// descriptor straight from decoded provider bytes; production reaches
-    /// the public surface through [`Self::from_descriptor`].
-    #[cfg(test)]
-    fn from_core(descriptor: SharedEnrollmentDescriptorV1) -> Result<Self, String> {
-        Self::from_descriptor(SharedEnrollmentDescriptor::Legacy(descriptor))
-    }
-
     fn from_clean(descriptor: CleanSharedEnrollmentDescriptorV1) -> Result<Self, String> {
-        Self::from_descriptor(SharedEnrollmentDescriptor::Clean(descriptor))
-    }
-
-    fn from_descriptor(descriptor: SharedEnrollmentDescriptor) -> Result<Self, String> {
         Ok(Self {
-            encoded: descriptor.encode()?,
+            encoded: descriptor.encode().map_err(display)?,
             workspace_id: descriptor.workspace_id(),
             lineage_digest: descriptor.lineage_digest(),
             catalog_document_id: descriptor.catalog_document_id(),
-            descriptor_digest: descriptor.digest()?.to_string(),
+            descriptor_digest: descriptor.digest().map_err(display)?.to_string(),
         })
     }
 
-    fn decode(&self) -> Result<SharedEnrollmentDescriptor, String> {
-        SharedEnrollmentDescriptor::decode(&self.encoded)
+    fn decode(&self) -> Result<CleanSharedEnrollmentDescriptorV1, String> {
+        CleanSharedEnrollmentDescriptorV1::decode(&self.encoded).map_err(display)
     }
 }
 
@@ -1309,9 +1255,9 @@ pub fn inspect_shared_enrollment(
 ) -> Result<Option<SyncSharedEnrollmentDescriptor>, String> {
     inspect_shared_provider_descriptor(provider_root)
         .map_err(display)?
-        .map(|bytes| SharedEnrollmentDescriptor::decode(&bytes))
+        .map(|bytes| CleanSharedEnrollmentDescriptorV1::decode(&bytes).map_err(display))
         .transpose()?
-        .map(SyncSharedEnrollmentDescriptor::from_descriptor)
+        .map(SyncSharedEnrollmentDescriptor::from_clean)
         .transpose()
 }
 
@@ -1331,10 +1277,10 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
     // retryable partial arrival.  Filesystem validation failures are local
     // platform errors and must remain visible to the caller instead of being
     // mislabeled as an unfinished sync.
-    let Ok(descriptor) = SharedEnrollmentDescriptor::decode(&bytes) else {
+    let Ok(descriptor) = CleanSharedEnrollmentDescriptorV1::decode(&bytes) else {
         return Ok(None);
     };
-    match SyncSharedEnrollmentDescriptor::from_descriptor(descriptor) {
+    match SyncSharedEnrollmentDescriptor::from_clean(descriptor) {
         Ok(descriptor) => Ok(Some(descriptor)),
         Err(_) => Ok(None),
     }
@@ -1845,9 +1791,17 @@ pub struct SyncWatcherStatus {
     pub full_scan_documents_read: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncCheckpointCaptureSkip {
+    IneligibleState,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeTick {
     Idle,
+    CheckpointCaptureSkipped {
+        reason: SyncCheckpointCaptureSkip,
+    },
     LocalMutation(SyncLocalMutationOutcome),
     /// A provider-authored batch is now reflected in the receiver's SQLite
     /// projection and graph bytes. Unlike traversal-only `Recovering`, this is
@@ -3926,7 +3880,16 @@ impl SyncRuntimeHandle {
                 match activate_clean_runtime_resources(&request, clean_graph, &mut progress) {
                     Ok(resources) => resources,
                     Err(detail) => {
-                        return activation_retryable(SyncLocalActivationStage::Absent, detail)
+                        let durable_stage = if request
+                            .enrollment_root
+                            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+                            .is_file()
+                        {
+                            SyncLocalActivationStage::LocalActive
+                        } else {
+                            SyncLocalActivationStage::Absent
+                        };
+                        return activation_retryable(durable_stage, detail);
                     }
                 };
             progress(SyncLocalActivationProgress::Phase {
@@ -6462,7 +6425,11 @@ fn activate_clean_runtime_resources(
 ) -> Result<CleanRuntimeResources, String> {
     let archive_predates_this_attempt = request.archive_root.exists();
     let result = activate_clean_runtime_resources_retaining_archive(request, graph, progress);
-    if result.is_err() && !archive_predates_this_attempt {
+    let authority_was_retained = request
+        .enrollment_root
+        .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+        .is_file();
+    if result.is_err() && !archive_predates_this_attempt && !authority_was_retained {
         if let Err(error) = remove_disposable_clean_archive(&request.archive_root) {
             return Err(match result {
                 Err(detail) => format!(
@@ -6547,6 +6514,10 @@ fn activate_clean_runtime_resources_retaining_archive(
     )
     .map_err(display)?;
     let (baseline, projection, accepted_frontier, marker) = committed.into_parts();
+    #[cfg(test)]
+    if CLEAN_ACTIVATION_POST_RETAIN_TEST_CUT.with(std::cell::Cell::take) {
+        return Err("injected failure after clean activation retained authority".into());
+    }
     if marker.workspace_id() != request.identities.workspace_id
         || marker.lineage_digest() != request.identities.lineage_digest
     {
@@ -9810,7 +9781,7 @@ enum ActorRequest {
         injected_flagged_rename_errno: Option<i32>,
     },
     JoinShared {
-        descriptor: SharedEnrollmentDescriptor,
+        descriptor: CleanSharedEnrollmentDescriptorV1,
         reply: mpsc::Sender<Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError>>,
     },
     Tick {
@@ -11164,6 +11135,13 @@ fn recover_clean_foreground_journal_only(
     binding: &ActorRuntimeBinding,
     create_if_absent: bool,
 ) -> Result<Option<RecoveredCleanForegroundJournal>, String> {
+    if !application_runtime_root.exists() {
+        if !create_if_absent {
+            return Ok(None);
+        }
+        fs::create_dir_all(application_runtime_root)
+            .map_err(|error| format!("cannot create clean foreground journal root: {error}"))?;
+    }
     let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
         .map_err(|error| format!("cannot retain clean foreground journal root: {error}"))?;
     ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
@@ -21160,6 +21138,16 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
+        if self
+            .clean
+            .as_ref()
+            .and_then(|clean| clean.runtime.engine().take_clean_checkpoint_capture_skip())
+            .is_some()
+        {
+            return SyncRuntimeTick::CheckpointCaptureSkipped {
+                reason: SyncCheckpointCaptureSkip::IneligibleState,
+            };
+        }
         match self.cleanup_acknowledged_move_episodes() {
             Ok(true) => return SyncRuntimeTick::Recovering,
             Ok(false) => {}
@@ -21849,9 +21837,9 @@ impl RuntimeActor {
             return Ok(());
         };
         if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH {
-            if SharedEnrollmentDescriptor::decode(&bytes)
-                .map_err(SyncRuntimeRequestError::ActorRefused)?
-                != SharedEnrollmentDescriptor::Clean(descriptor.clone())
+            if CleanSharedEnrollmentDescriptorV1::decode(&bytes)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                != *descriptor
             {
                 return Err(SyncRuntimeRequestError::ActorRefused(
                     "clean provider descriptor changed".into(),
@@ -22873,18 +22861,9 @@ impl RuntimeActor {
 
     fn join_shared(
         &mut self,
-        descriptor: SharedEnrollmentDescriptor,
+        descriptor: CleanSharedEnrollmentDescriptorV1,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
-        match descriptor {
-            SharedEnrollmentDescriptor::Legacy(descriptor) => {
-                let _ = descriptor;
-                Err(SyncRuntimeRequestError::ActorRefused(
-                    "pre-0.7 shared enrollment is no longer supported; Return to Direct Files and share the graph again"
-                        .into(),
-                ))
-            }
-            SharedEnrollmentDescriptor::Clean(descriptor) => self.join_shared_clean(descriptor),
-        }
+        self.join_shared_clean(descriptor)
     }
 
     fn install_clean_join_candidate(
@@ -23050,9 +23029,9 @@ impl RuntimeActor {
                     "clean shared enrollment descriptor is not provider-visible".into(),
                 )
             })?;
-        if SharedEnrollmentDescriptor::decode(&expected)
-            .map_err(SyncRuntimeRequestError::ActorRefused)?
-            != SharedEnrollmentDescriptor::Clean(descriptor.clone())
+        if CleanSharedEnrollmentDescriptorV1::decode(&expected)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            != descriptor
         {
             return Err(SyncRuntimeRequestError::ActorRefused(
                 "provider descriptor changed before clean join".into(),

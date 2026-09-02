@@ -78,12 +78,16 @@
      "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_surfaces_missing_authoritative_manifest_immediately",
      "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_never_masks_mutated_authoritative_manifest",
      "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_roster_surfaces_missing_required_object_immediately",
+     "crates/tine-core/src/sync_runtime_tests.rs::checkpoint_open_matches_sequence_zero_replay_over_generated_crash_histories",
+     "crates/tine-core/src/sync_runtime_tests.rs::pre_07_shared_descriptor_fixture_routes_to_preserve_and_rebuild",
+     "crates/tine-core/src/sync_runtime_tests.rs::failure_after_clean_activation_retain_completes_on_the_next_open",
+     "crates/tine-core/src/oplog/checkpoint_generation.rs::tests::checkpoint_payload_extends_the_durable_frontier_from_one_row_delta",
      "crates/tine-core/src/oplog/checkpoint_generation.rs::tests::checkpoint_open_counter_distinguishes_checkpoint_from_full_replay"
     ],
     "scenario": "managed-clean-open.disposable-checkpoint-tail-only",
     "failBefore": "at e19514f98cf1044391f3a3d2f09d2579275353ee, sync_runtime_tests::second_clean_cold_open_restores_checkpoint_instead_of_full_replay fails because the second clean open replays every accepted batch (no checkpoint path exists); the checkpoint_open_counter unit test fails for the same reason"
    },
-   "notes": "Before Harvest A5 every clean reopen semantically reapplies every accepted batch onto sequence-zero genesis: N=800 committed_tail_replay measured 1253.5 ms and 90.0% of clean recovery. The checkpoint is disposable, compares its roster/fingerprints against authoritative archive evidence, existence-checks required objects by name, and falls back without a new refusal; a roster-named manifest or object missing from the archive is surfaced as MS-REF-DISK-CORRUPT (archive damage, not checkpoint damage). Numeric lifetime-cost gates (A5-r4) are pending Martin's rebaselining decision and are not part of this row."
+   "notes": "Before Harvest A5 every clean reopen semantically reapplied every accepted batch onto sequence-zero genesis: N=800 committed_tail_replay measured 1253.5 ms and 90.0% of clean recovery. The checkpoint is disposable, compares its roster/fingerprints against authoritative archive evidence, existence-checks required objects by name, and falls back without a new refusal; a roster-named manifest or object missing from the archive is surfaced as MS-REF-DISK-CORRUPT (archive damage, not checkpoint damage). Wave 3 captures only roster/object deltas after the durable frontier, compares canonical per-block state across checkpoint and full replay, removes the pre-0.7 sharing descriptor decoder, and resumes a failure after authoritative activation retain. Martin accepted option (a) on 2026-09-02: the prior open ratios are accepted with archive rebaselining as the terminal bound, while per-save capture is gated at N=800/N=50 <= 1.25."
   },
   {
    "id": "REG-HARVEST-F-CONTENT-DEPTH-BOUNDS-001",

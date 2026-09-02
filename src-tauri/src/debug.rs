@@ -440,6 +440,21 @@ pub(crate) fn record_storage_transition(
     record_fixed_event("storage.transition", fields);
 }
 
+pub(crate) fn record_checkpoint_capture_skip(
+    reason: tine_core::sync_runtime::SyncCheckpointCaptureSkip,
+) {
+    let mut fields = Map::new();
+    fields.insert(
+        "reason".into(),
+        json!(match reason {
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::IneligibleState => {
+                "ineligible_state"
+            }
+        }),
+    );
+    record_fixed_event("managed.checkpoint_capture_skipped", fields);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_direct_save(
     outcome: &'static str,
@@ -885,6 +900,8 @@ mod tests {
         assert!(!source.contains("fields.insert(\"path\""));
         assert!(!source.contains("fields.insert(\"detail\""));
         assert!(source.contains("verboseDebugLogIncluded\": false"));
+        assert!(source.contains("managed.checkpoint_capture_skipped"));
+        assert!(source.contains("ineligible_state"));
     }
 
     #[test]

@@ -486,6 +486,33 @@ fn pre_07_activation_oracle_is_absent_from_the_source() {
     }
 }
 
+/// H2 1b: the retired JSON shared-enrollment lifecycle is no longer decoded.
+/// Its raw fixture is classified as protocol-incompatible, the one refusal the
+/// application layer answers by preserving the private root and rebuilding
+/// from Direct Files.
+#[test]
+fn pre_07_shared_descriptor_fixture_routes_to_preserve_and_rebuild() {
+    let fixture = br#"{"schema_version":6,"lifecycle":{"state":"shared_active","descriptor":{"schema_version":1}}}"#;
+    let error = crate::oplog::enrollment::decode_enrollment_record_for_test(fixture)
+        .expect_err("the retired shared descriptor lifecycle must not decode");
+    assert!(matches!(
+        error,
+        EnrollmentError::FutureUnsupportedLifecycle(ref state) if state == "shared_active"
+    ));
+    assert!(matches!(
+        classify_enrollment_error(error),
+        DiscoveryClassification::UnsupportedOrIncompatible(
+            DiscoveryComponent::Enrollment,
+            ManagedStorageRefusalScenario::ProtocolIncompatible,
+        )
+    ));
+
+    let enrollment = include_str!("oplog/enrollment.rs");
+    let runtime = include_str!("sync_runtime.rs");
+    assert!(!enrollment.contains(&["struct SharedEnrollmentDescriptor", "V1",].concat()));
+    assert!(!runtime.contains(&["Legacy", "(SharedEnrollmentDescriptor", "V1)"].concat()));
+}
+
 #[test]
 fn public_durable_refusal_scenarios_exactly_match_the_storage_contract() {
     let contract = include_str!("../../../docs/storage-sync-contract.md");
@@ -11042,10 +11069,7 @@ fn shared_provider_clean_late_join_installs_provider_history_without_rewriting_g
     let descriptor = initiator_handle
         .prepare_shared()
         .expect("late-share descriptor publication");
-    let clean_descriptor = match SharedEnrollmentDescriptor::decode(&descriptor.encoded).unwrap() {
-        SharedEnrollmentDescriptor::Clean(descriptor) => descriptor,
-        SharedEnrollmentDescriptor::Legacy(_) => panic!("clean runtime emitted legacy share"),
-    };
+    let clean_descriptor = descriptor.decode().unwrap();
     copy_provider_tree(
         &initiator.request.provider_root,
         &joiner.request.provider_root,
@@ -16347,8 +16371,8 @@ fn reordered_remote_acceptance_cannot_reuse_stale_recovery_coverage() {
     let descriptor_bytes = inspect_shared_provider_descriptor(&receiver.request.provider_root)
         .unwrap()
         .expect("covered receiver retained a provider descriptor");
-    let descriptor = SyncSharedEnrollmentDescriptor::from_core(
-        SharedEnrollmentDescriptorV1::decode(&descriptor_bytes).unwrap(),
+    let descriptor = SyncSharedEnrollmentDescriptor::from_clean(
+        CleanSharedEnrollmentDescriptorV1::decode(&descriptor_bytes).unwrap(),
     )
     .unwrap();
     let stale_active = SyncRuntimeHandle::activate_or_resume_local(stale.request.clone());
@@ -22666,18 +22690,24 @@ fn managed_twenty_page_history_curve_manual_benchmark() {
 /// comparable even on a machine running other work; absolute milliseconds
 /// across separate runs are not.
 ///
-/// `TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS` (default `50,400,800`) sets the
+/// `TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS` (default `50,200,400,800`) sets the
 /// accepted-batch checkpoints. Output lines are prefixed `attribution*` and
 /// are machine-readable for `scripts/harvest-a1-open-attribution.mjs`.
+///
+/// Martin accepted option (a) on 2026-09-02: checkpoint capture itself remains
+/// a hard per-save delta bound even though the older open ratios were accepted
+/// with archive rebaselining as their terminal bound.
+const A5_ACCEPTED_CAPTURE_RATIO: f64 = 1.25;
+
 #[test]
 #[ignore = "manual release benchmark: per-stage attribution of the managed crash-reopen curve"]
-fn managed_open_stage_attribution_manual_benchmark() {
+fn managed_checkpoint_capture_stays_within_accepted_ratio_manual_benchmark() {
     assert!(
         !cfg!(debug_assertions),
         "this receipt is release-only; run cargo test -p tine-core --release --lib managed_open_stage_attribution_manual_benchmark -- --ignored --nocapture"
     );
     let checkpoints = std::env::var("TINE_MANAGED_OPEN_ATTRIBUTION_CHECKPOINTS")
-        .unwrap_or_else(|_| "50,400,800".to_owned())
+        .unwrap_or_else(|_| "50,200,400,800".to_owned())
         .split(',')
         .filter_map(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -22709,6 +22739,7 @@ fn managed_open_stage_attribution_manual_benchmark() {
     assert!(!editable.is_empty(), "20-page fixture has no editable page");
 
     let mut accepted_rounds = 0_usize;
+    let mut capture_work = Vec::with_capacity(checkpoints.len());
     for checkpoint in checkpoints {
         while accepted_rounds < checkpoint {
             let path = &editable[accepted_rounds % editable.len()];
@@ -22766,6 +22797,7 @@ fn managed_open_stage_attribution_manual_benchmark() {
         accepted_rounds += 1;
 
         let counters = counters.expect("a clean crash reopen reports its work counters");
+        capture_work.push((checkpoint, counters.checkpoint_capture_work));
         let recovery_ms = stages
             .last()
             .map_or(0.0, |(_, elapsed)| startup_ms(*elapsed));
@@ -22816,6 +22848,13 @@ fn managed_open_stage_attribution_manual_benchmark() {
             counters.archive_inspected_objects,
         );
     }
+    let (base_checkpoint, base_capture) = capture_work[0];
+    let (final_checkpoint, final_capture) = capture_work[capture_work.len() - 1];
+    let capture_ratio = final_capture as f64 / base_capture.max(1) as f64;
+    assert!(
+        capture_ratio <= A5_ACCEPTED_CAPTURE_RATIO,
+        "per-save checkpoint capture exceeded the accepted ratio: N={final_checkpoint} work={final_capture}, N={base_checkpoint} work={base_capture}, ratio={capture_ratio:.3}"
+    );
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
@@ -28245,6 +28284,47 @@ fn assert_public_activation_cut_resumes(
     );
     assert_eq!(user_graph_bytes(&fixture.graph_root), before);
     drop(handle);
+}
+
+/// H2 2c: once the marker has transferred authority to the sealed baseline,
+/// a later activation failure must retain that complete state for the next
+/// open. Reclaiming the archive at this point strands the marker and turns a
+/// one-shot runtime-open failure into a permanent half-live store.
+#[test]
+fn failure_after_clean_activation_retain_completes_on_the_next_open() {
+    let fixture = ActivationFixture::nested_unicode("post-retain-resume", 0xa1f5_c200);
+    let before = user_graph_bytes(&fixture.graph_root);
+    fail_once_after_clean_activation_retain();
+
+    let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert!(interrupted.handle.is_none());
+    assert!(matches!(
+        interrupted.status,
+        SyncLocalActivationStatus::Retryable {
+            durable_stage: SyncLocalActivationStage::LocalActive,
+            ..
+        }
+    ));
+    assert!(fixture
+        .request
+        .enrollment_root
+        .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
+        .is_file());
+    assert!(clean_baseline_directory(&fixture.request.archive_root).is_dir());
+    assert!(clean_operation_archive_directory(&fixture.request.archive_root).is_dir());
+    assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+
+    let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
+    let handle = resumed
+        .handle
+        .expect("the retained marker, baseline, and archive resume");
+    drive_initial_feed(&handle);
+    assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
 }
 
 #[test]

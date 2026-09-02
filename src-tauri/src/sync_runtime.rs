@@ -934,6 +934,7 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
 pub(crate) fn tick_dto(tick: SyncRuntimeTick) -> SparseV2TickDto {
     match tick {
         SyncRuntimeTick::Idle => tick_value("idle", None, None),
+        SyncRuntimeTick::CheckpointCaptureSkipped { .. } => tick_value("recovering", None, None),
         SyncRuntimeTick::LocalMutation(outcome) => {
             tick_value("local_mutation", Some(format!("{outcome:?}")), None)
         }
@@ -4124,10 +4125,13 @@ pub(crate) async fn sparse_v2_tick(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
         let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        active_handle(&slot)?
+        let tick = active_handle(&slot)?
             .tick()
-            .map(tick_dto)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if let SyncRuntimeTick::CheckpointCaptureSkipped { reason } = &tick {
+            crate::debug::record_checkpoint_capture_skip(*reason);
+        }
+        Ok(tick_dto(tick))
     })
     .await
     .map_err(|error| error.to_string())?

@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // Attribute the managed crash-reopen aging curve to an open STAGE.
 //
-// Runs `managed_open_stage_attribution_manual_benchmark` (release, ignored) a
+// Runs `managed_checkpoint_capture_stays_within_accepted_ratio_manual_benchmark`
+// (release, ignored) a
 // number of times and reports, per checkpoint, the median per-stage wall time,
 // that stage's SHARE of the clean recovery, and its growth factor against the
 // first checkpoint. The box this runs on is shared, so shares and growth
 // factors within one process invocation are the signal; absolute milliseconds
 // across runs are not.
 //
-//   node scripts/harvest-a1-open-attribution.mjs [--runs 3] [--checkpoints 50,400,800]
+//   node scripts/harvest-a1-open-attribution.mjs [--runs 3] [--checkpoints 50,200,400,800]
 //
 // Requires `source scripts/env.sh` first (cargo is not on the default PATH).
 
@@ -24,8 +25,8 @@ function flag(name, fallback) {
 }
 
 const runs = Number.parseInt(flag("runs", "3"), 10);
-const checkpoints = flag("checkpoints", "50,400,800");
-const testName = "managed_open_stage_attribution_manual_benchmark";
+const checkpoints = flag("checkpoints", "50,200,400,800");
+const testName = "managed_checkpoint_capture_stays_within_accepted_ratio_manual_benchmark";
 // Martin accepted the measured A5 open ratios on 2026-09-02 with archive
 // rebaselining (D-5) as the terminal lifetime bound. Capture remains a hard
 // per-save delta bound and is not rebaselined by that decision.

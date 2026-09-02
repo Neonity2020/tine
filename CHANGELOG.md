@@ -104,6 +104,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   restores the accepted frontier and replays only its unpublished archive tail;
   damaged checkpoint bytes always fall back to full replay, while missing
   authoritative manifests or required objects remain visible as archive damage.
+  Per-save checkpoint capture now extends that cache from its durable frontier
+  instead of recapturing accepted history. Pre-0.7 sharing descriptors no longer
+  have a production decoder, and a failure after activation authority is retained
+  resumes from the preserved marker, baseline, and archive on the next open.
 
 - **Harvest F — hostile graph and clipboard content now reaches its existing
   consumption boundaries instead of bypassing them.** Macro links can no longer

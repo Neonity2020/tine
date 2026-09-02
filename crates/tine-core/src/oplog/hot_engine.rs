@@ -6253,6 +6253,14 @@ pub(crate) struct CleanCheckpointCapture {
     pub(crate) capture_work: u64,
 }
 
+/// Fixed diagnostic outcome retained by the actor when checkpoint capture is
+/// skipped. The checkpoint is disposable, so callers never receive the
+/// underlying free-form error as authority or control flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanCheckpointCaptureSkip {
+    IneligibleState,
+}
+
 /// The semantic state section of the disposable checkpoint. Accepted roster,
 /// causal-clock and archive-fingerprint authority is deliberately absent: the
 /// checkpoint module represents and validates it through
@@ -6314,6 +6322,7 @@ pub struct ShardedHotEngine {
     transient_effective_view_order: VecDeque<BatchId>,
     archive_store: Option<Arc<ObjectStore>>,
     clean_checkpoint_publisher: Option<super::checkpoint_generation::CleanCheckpointPublisher>,
+    clean_checkpoint_capture_skip: Cell<Option<CleanCheckpointCaptureSkip>>,
     /// Device-local own-endpoint projection completion evidence. The archive
     /// chain is durable; this engine-owned value also owns the coalescing
     /// buffer from cold repair through actor shutdown.
@@ -6455,8 +6464,7 @@ pub struct ShardedHotEngine {
     /// reads only the rows after its durable frontier; the publisher folds
     /// them into the preceding v1 payload without introducing a second disk
     /// format.
-    clean_checkpoint_required_objects_by_sequence:
-        BTreeMap<u64, BTreeSet<ContentDigest>>,
+    clean_checkpoint_required_objects_by_sequence: BTreeMap<u64, BTreeSet<ContentDigest>>,
     ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
     ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
     ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
@@ -6562,6 +6570,7 @@ impl ShardedHotEngine {
             transient_effective_view_order: VecDeque::new(),
             archive_store: None,
             clean_checkpoint_publisher: None,
+            clean_checkpoint_capture_skip: Cell::new(None),
             local_completion_index: None,
             receiver_absence_summary: RefCell::new(None),
             receiver_absence_summary_open_stats: RefCell::new(None),
@@ -6970,8 +6979,14 @@ impl ShardedHotEngine {
         let durable_sequence = publisher.durable_sequence();
         match self.capture_clean_checkpoint(durable_sequence) {
             Ok(capture) => publisher.enqueue(capture),
-            Err(error) => eprintln!("clean checkpoint capture skipped: {error}"),
+            Err(_) => self
+                .clean_checkpoint_capture_skip
+                .set(Some(CleanCheckpointCaptureSkip::IneligibleState)),
         }
+    }
+
+    pub(crate) fn take_clean_checkpoint_capture_skip(&self) -> Option<CleanCheckpointCaptureSkip> {
+        self.clean_checkpoint_capture_skip.take()
     }
 
     pub(crate) fn clean_checkpoint_durable_lag(&self) -> u64 {
@@ -10093,10 +10108,8 @@ impl ShardedHotEngine {
             .insert(evidence.batch_id, checkpoint_causal_dot);
         self.clean_checkpoint_required_objects
             .extend(checkpoint_required_objects.iter().copied());
-        self.clean_checkpoint_required_objects_by_sequence.insert(
-            evidence.acceptance_sequence,
-            checkpoint_required_objects,
-        );
+        self.clean_checkpoint_required_objects_by_sequence
+            .insert(evidence.acceptance_sequence, checkpoint_required_objects);
         self.ephemeral_accepted_batch_entries
             .insert(evidence.batch_id, record_digest);
         self.ephemeral_accepted_batch_root
@@ -26311,6 +26324,10 @@ pub(crate) mod validation_tests {
         visible_document_lru: VecDeque<DocumentId>,
         visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
         terminal_documents: BTreeMap<DocumentId, Vec<u8>>,
+        /// Canonical per-block semantic state, separate from opaque CRDT update
+        /// bytes so replay/checkpoint equivalence cannot hide a block-level
+        /// owner, identity, or content divergence behind document equality.
+        terminal_block_states: BTreeMap<(DocumentId, BlockId), BlockState>,
         terminal_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
         accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
         accepted_tip_refcounts: BTreeMap<BatchId, usize>,
@@ -26344,6 +26361,20 @@ pub(crate) mod validation_tests {
             .collect()
     }
 
+    fn block_states(
+        documents: &BTreeMap<DocumentId, LoroDoc>,
+    ) -> BTreeMap<(DocumentId, BlockId), BlockState> {
+        let mut states = BTreeMap::new();
+        for (document_id, document) in documents {
+            for (block_id, state) in read_all_blocks(*document_id, document)
+                .expect("observable terminal documents have canonical block state")
+            {
+                states.insert((*document_id, block_id), state);
+            }
+        }
+        states
+    }
+
     pub(crate) fn observable_engine_state(engine: &ShardedHotEngine) -> ObservableEngineState {
         ObservableEngineState {
             history_failure: engine.history_failure.clone(),
@@ -26369,6 +26400,7 @@ pub(crate) mod validation_tests {
             visible_document_lru: engine.visible_document_lru.clone(),
             visible_document_heads: engine.visible_document_heads.clone(),
             terminal_documents: document_updates(&engine.terminal_documents),
+            terminal_block_states: block_states(&engine.terminal_documents),
             terminal_document_heads: engine.terminal_document_heads.clone(),
             accepted_frontier: engine.accepted_frontier.clone(),
             accepted_tip_refcounts: engine.accepted_tip_refcounts.clone(),

@@ -169,8 +169,6 @@ pub(crate) fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClas
         | EnrollmentError::UnsupportedCheckpointSchema(_)
         | EnrollmentError::UnsupportedRecordSchema(_)
         | EnrollmentError::UnsupportedPacketSchema(_)
-        | EnrollmentError::UnsupportedSharedEnrollmentDescriptorSchema(_)
-        | EnrollmentError::UnsupportedJoinerWorkspaceArchiveSchema(_)
         | EnrollmentError::UnsupportedCompatibility { .. }
         | EnrollmentError::FutureUnsupportedLifecycle(_) => {
             DiscoveryClassification::UnsupportedOrIncompatible(
@@ -202,10 +200,7 @@ pub(crate) fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClas
         }
         EnrollmentError::BindingMismatch(_)
         | EnrollmentError::UnsupportedArtifact(_)
-        | EnrollmentError::PublishedBatchMismatch
-        | EnrollmentError::SharedEnrollmentBindingMismatch
-        | EnrollmentError::SharedEnrollmentDescriptorDigestMismatch
-        | EnrollmentError::DirtyUniqueLocalTail => {
+        | EnrollmentError::PublishedBatchMismatch => {
             DiscoveryClassification::AmbiguousOrForeignResidue(
                 AmbiguousEvidence::EnrollmentNamespace,
                 ManagedStorageRefusalScenario::SyncConflict,

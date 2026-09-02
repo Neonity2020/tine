@@ -54,15 +54,11 @@ use super::{
 
 pub(crate) const ENROLLMENT_RECORD_SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLISHED_RECOVERY_PACKET_SCHEMA_VERSION: u32 = 1;
-pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
-pub(crate) const JOINER_WORKSPACE_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const LOCAL_ACTIVATION_RESERVATION_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_ENROLLMENT_RECORD_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ENROLLMENT_JSON_DEPTH: usize = 16;
 /// All lifecycle records remain bounded and read with a single fixed parser
-/// budget.  Shared enrollment carries one exact descriptor plus local archive
-/// proof, so its authenticated record is intentionally larger than the legacy
-/// LocalActive handoff record while still far below the 32 KiB byte ceiling.
+/// budget, well below the 32 KiB byte ceiling.
 pub(crate) const MAX_ENROLLMENT_JSON_TOKENS: usize = 768;
 pub(crate) const MAX_ENROLLMENT_OPEN_CHAIN_RECORDS: usize = 64;
 pub(crate) const MAX_ENROLLMENT_NAMESPACE_ENTRIES: usize = 2048;
@@ -783,258 +779,6 @@ struct LocalActiveV1 {
     exclusion: LocalExclusionV1,
 }
 
-/// Exact bootstrap and projection/base facts that two honest local enrollments
-/// must share before they can enter one shared lineage.  This deliberately
-/// excludes device-local paths and resource identities: those are separately
-/// bound by each enrollment record and cannot be compared across devices.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SharedProjectionBaseEvidenceV1 {
-    bootstrap_import_id: ContentDigest,
-    bootstrap_part_count: u32,
-    bootstrap_terminal_part_id: Option<ContentDigest>,
-    staged_file_count: u64,
-    staged_total_bytes: u64,
-}
-
-impl SharedProjectionBaseEvidenceV1 {
-    fn validate(&self) -> Result<(), EnrollmentError> {
-        let zero = self.bootstrap_part_count == 0;
-        if self.bootstrap_terminal_part_id.is_none() != zero {
-            return Err(EnrollmentError::InvalidSharedProjectionBaseEvidence);
-        }
-        Ok(())
-    }
-}
-
-/// The one portable, commit-last enrollment descriptor an initiator may hand
-/// to a peer.  Its digest is its identity; there is intentionally no mutable
-/// descriptor registry or descriptor discovery scan.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SharedEnrollmentDescriptorV1 {
-    schema_version: u32,
-    compatibility: EnrollmentCompatibilityV1,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
-    catalog_document_id: DocumentId,
-    initiator_graph_resource_id: CanonicalGraphResourceId,
-    initiator_device_id: DeviceId,
-    object_store_namespace: ContentDigest,
-    initiator_local_active_head: ContentDigest,
-    initiator_verification_digest: ContentDigest,
-    initiator_handoff: HandoffV1,
-    projection_base: SharedProjectionBaseEvidenceV1,
-}
-
-impl SharedEnrollmentDescriptorV1 {
-    pub(crate) fn digest(&self) -> Result<ContentDigest, EnrollmentError> {
-        self.validate()?;
-        let bytes =
-            serde_json::to_vec(self).map_err(|error| EnrollmentError::Encode(error.to_string()))?;
-        Ok(ContentDigest::of(
-            &[b"tine/shared-enrollment-descriptor/v1\0".as_slice(), &bytes].concat(),
-        ))
-    }
-
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, EnrollmentError> {
-        self.validate()?;
-        serde_json::to_vec(self).map_err(|error| EnrollmentError::Encode(error.to_string()))
-    }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, EnrollmentError> {
-        if bytes.len() > MAX_ENROLLMENT_RECORD_BYTES {
-            return Err(EnrollmentError::RecordTooLarge(bytes.len()));
-        }
-        validate_json_bounds(bytes)?;
-        reject_duplicate_json_fields(bytes)?;
-        let descriptor: Self = serde_json::from_slice(bytes)
-            .map_err(|error| EnrollmentError::Decode(error.to_string()))?;
-        descriptor.validate()?;
-        if descriptor.encode()? != bytes {
-            return Err(EnrollmentError::NonCanonicalRecord);
-        }
-        Ok(descriptor)
-    }
-
-    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
-        self.workspace_id
-    }
-
-    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
-        self.lineage_digest
-    }
-
-    pub(crate) const fn catalog_document_id(&self) -> DocumentId {
-        self.catalog_document_id
-    }
-
-    fn validate(&self) -> Result<(), EnrollmentError> {
-        if self.schema_version != SHARED_ENROLLMENT_DESCRIPTOR_SCHEMA_VERSION {
-            return Err(
-                EnrollmentError::UnsupportedSharedEnrollmentDescriptorSchema(self.schema_version),
-            );
-        }
-        self.compatibility.validate_current()?;
-        if !matches!(self.initiator_handoff, HandoffV1::Safe) {
-            return Err(EnrollmentError::UnsafeSharedEnrollmentHandoff);
-        }
-        self.projection_base.validate()
-    }
-
-    fn is_compatible_with(&self, binding: &EnrollmentBindingV1) -> bool {
-        self.workspace_id == binding.workspace_id
-            && self.lineage_digest == binding.lineage_digest
-            && self.catalog_document_id == binding.catalog_document_id
-            && self.compatibility == binding.compatibility
-    }
-}
-
-/// Durable evidence that a joining device retired its former local workspace
-/// only after proving it had no unique operation that was not projected.  The
-/// archive bytes are retained by the caller's existing backup/archive path;
-/// the journal stores the exact digest and pre-archive LocalActive witness.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JoinerWorkspaceArchiveV1 {
-    schema_version: u32,
-    archived_workspace_digest: ContentDigest,
-    source_local_active_head: ContentDigest,
-    source_verification_digest: ContentDigest,
-    unique_unprojected_operation_count: u64,
-    projection_base: SharedProjectionBaseEvidenceV1,
-}
-
-impl JoinerWorkspaceArchiveV1 {
-    fn validate(&self) -> Result<(), EnrollmentError> {
-        if self.schema_version != JOINER_WORKSPACE_ARCHIVE_SCHEMA_VERSION {
-            return Err(EnrollmentError::UnsupportedJoinerWorkspaceArchiveSchema(
-                self.schema_version,
-            ));
-        }
-        if self.unique_unprojected_operation_count != 0 {
-            return Err(EnrollmentError::DirtyUniqueLocalTail);
-        }
-        self.projection_base.validate()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SharedEnrollmentRoleV1 {
-    Initiator,
-    Joiner,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SharePreparedV1 {
-    descriptor: SharedEnrollmentDescriptorV1,
-    descriptor_digest: ContentDigest,
-    local_active: LocalActiveV1,
-}
-
-impl SharePreparedV1 {
-    fn validate(&self, binding: &EnrollmentBindingV1) -> Result<(), EnrollmentError> {
-        self.descriptor.validate()?;
-        if !self.descriptor.is_compatible_with(binding)
-            || self.descriptor.initiator_graph_resource_id != binding.graph_resource_id
-            || self.descriptor.initiator_device_id != binding.device_id
-        {
-            return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
-        }
-        if self.descriptor.digest()? != self.descriptor_digest {
-            return Err(EnrollmentError::SharedEnrollmentDescriptorDigestMismatch);
-        }
-        self.local_active.validate_for_shared_runtime(binding)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JoiningV1 {
-    descriptor: SharedEnrollmentDescriptorV1,
-    descriptor_digest: ContentDigest,
-    archived_local_workspace: JoinerWorkspaceArchiveV1,
-    local_active: LocalActiveV1,
-}
-
-impl JoiningV1 {
-    fn validate(&self, binding: &EnrollmentBindingV1) -> Result<(), EnrollmentError> {
-        self.descriptor.validate()?;
-        self.archived_local_workspace.validate()?;
-        if !self.descriptor.is_compatible_with(binding)
-            || self.descriptor.digest()? != self.descriptor_digest
-            || self.archived_local_workspace.projection_base != self.descriptor.projection_base
-        {
-            return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
-        }
-        self.local_active.validate_for_shared_runtime(binding)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SharedActiveV1 {
-    descriptor: SharedEnrollmentDescriptorV1,
-    descriptor_digest: ContentDigest,
-    role: SharedEnrollmentRoleV1,
-    archived_local_workspace: Option<JoinerWorkspaceArchiveV1>,
-    local_active: LocalActiveV1,
-}
-
-impl SharedActiveV1 {
-    fn validate(&self, binding: &EnrollmentBindingV1) -> Result<(), EnrollmentError> {
-        self.descriptor.validate()?;
-        if self.descriptor.digest()? != self.descriptor_digest
-            || !self.descriptor.is_compatible_with(binding)
-        {
-            return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
-        }
-        self.local_active.validate_for_shared_runtime(binding)?;
-        match (self.role, &self.archived_local_workspace) {
-            (SharedEnrollmentRoleV1::Initiator, None) => Ok(()),
-            (SharedEnrollmentRoleV1::Joiner, Some(archive)) => {
-                archive.validate()?;
-                if archive.projection_base != self.descriptor.projection_base {
-                    return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
-                }
-                Ok(())
-            }
-            _ => Err(EnrollmentError::IllegalLifecycle(
-                "shared enrollment role and joiner archive evidence disagree",
-            )),
-        }
-    }
-}
-
-impl LocalActiveV1 {
-    fn validate_for_shared_runtime(
-        &self,
-        binding: &EnrollmentBindingV1,
-    ) -> Result<(), EnrollmentError> {
-        self.anchor.validate()?;
-        if matches!(self.handoff, HandoffV1::Safe)
-            && matches!(self.exclusion, LocalExclusionV1::Published { .. })
-        {
-            return Err(EnrollmentError::IllegalLifecycle(
-                "a shared published exclusion cannot be marked handoff-safe",
-            ));
-        }
-        if let LocalExclusionV1::Published { packet } = &self.exclusion {
-            packet.validate()?;
-            if packet.archive_resource_id != binding.archive_resource_id {
-                return Err(EnrollmentError::BindingMismatch(
-                    EnrollmentBindingField::ArchiveResource,
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BlockedV1 {
@@ -1049,9 +793,6 @@ enum EnrollmentLifecycleV1 {
     ShadowImport(ShadowImportV1),
     VerifiedLocal(VerifiedLocalV1),
     LocalActive(LocalActiveV1),
-    SharePrepared(SharePreparedV1),
-    Joining(JoiningV1),
-    SharedActive(SharedActiveV1),
     Blocked(BlockedV1),
 }
 
@@ -1083,9 +824,6 @@ impl EnrollmentLifecycleV1 {
                 }
                 Ok(())
             }
-            Self::SharePrepared(prepared) => prepared.validate(binding),
-            Self::Joining(joining) => joining.validate(binding),
-            Self::SharedActive(active) => active.validate(binding),
             Self::Blocked(blocked) => {
                 if Some(blocked.prior_record_digest) != previous {
                     return Err(EnrollmentError::IllegalLifecycle(
@@ -1338,76 +1076,6 @@ fn validate_transition(
         (EnrollmentLifecycleV1::LocalActive(_), EnrollmentLifecycleV1::Blocked(blocked)) => {
             blocked.prior_record_digest == current_digest
         }
-        (
-            EnrollmentLifecycleV1::LocalActive(current),
-            EnrollmentLifecycleV1::SharePrepared(prepared),
-        ) => {
-            matches!(current.handoff, HandoffV1::Safe)
-                && matches!(current.exclusion, LocalExclusionV1::Idle)
-                && prepared.descriptor.initiator_verification_digest == current.verification_digest
-                && prepared.local_active == *current
-        }
-        (EnrollmentLifecycleV1::LocalActive(current), EnrollmentLifecycleV1::Joining(joining)) => {
-            matches!(current.handoff, HandoffV1::Safe)
-                && matches!(current.exclusion, LocalExclusionV1::Idle)
-                && joining.archived_local_workspace.source_local_active_head == current_digest
-                && joining.archived_local_workspace.source_verification_digest
-                    == current.verification_digest
-                && joining.local_active == *current
-        }
-        (
-            EnrollmentLifecycleV1::SharePrepared(prepared),
-            EnrollmentLifecycleV1::SharedActive(active),
-        ) => {
-            active.role == SharedEnrollmentRoleV1::Initiator
-                && active.archived_local_workspace.is_none()
-                && active.descriptor == prepared.descriptor
-                && active.descriptor_digest == prepared.descriptor_digest
-                && active.local_active == prepared.local_active
-        }
-        (
-            EnrollmentLifecycleV1::SharePrepared(current),
-            EnrollmentLifecycleV1::SharePrepared(next),
-        ) => {
-            current.descriptor == next.descriptor
-                && current.descriptor_digest == next.descriptor_digest
-                && current.local_active.verification_digest == next.local_active.verification_digest
-                && current.local_active.anchor == next.local_active.anchor
-                && legal_local_active_transition(&current.local_active, &next.local_active)
-        }
-        (EnrollmentLifecycleV1::SharePrepared(_), EnrollmentLifecycleV1::Blocked(blocked))
-        | (EnrollmentLifecycleV1::Joining(_), EnrollmentLifecycleV1::Blocked(blocked))
-        | (EnrollmentLifecycleV1::SharedActive(_), EnrollmentLifecycleV1::Blocked(blocked)) => {
-            blocked.prior_record_digest == current_digest
-        }
-        (EnrollmentLifecycleV1::Joining(joining), EnrollmentLifecycleV1::SharedActive(active)) => {
-            active.role == SharedEnrollmentRoleV1::Joiner
-                && active.descriptor == joining.descriptor
-                && active.descriptor_digest == joining.descriptor_digest
-                && active.archived_local_workspace.as_ref()
-                    == Some(&joining.archived_local_workspace)
-                && active.local_active == joining.local_active
-        }
-        (EnrollmentLifecycleV1::Joining(current), EnrollmentLifecycleV1::Joining(next)) => {
-            current.descriptor == next.descriptor
-                && current.descriptor_digest == next.descriptor_digest
-                && current.archived_local_workspace == next.archived_local_workspace
-                && current.local_active.verification_digest == next.local_active.verification_digest
-                && current.local_active.anchor == next.local_active.anchor
-                && legal_local_active_transition(&current.local_active, &next.local_active)
-        }
-        (
-            EnrollmentLifecycleV1::SharedActive(current),
-            EnrollmentLifecycleV1::SharedActive(next),
-        ) => {
-            current.descriptor == next.descriptor
-                && current.descriptor_digest == next.descriptor_digest
-                && current.role == next.role
-                && current.archived_local_workspace == next.archived_local_workspace
-                && current.local_active.verification_digest == next.local_active.verification_digest
-                && current.local_active.anchor == next.local_active.anchor
-                && legal_local_active_transition(&current.local_active, &next.local_active)
-        }
         _ => false,
     };
     if !legal {
@@ -1564,61 +1232,36 @@ pub(crate) fn inspect_existing_enrollment_at(
     let lifecycle = match current.record.lifecycle() {
         EnrollmentLifecycleV1::ShadowImport(_) => EnrollmentDiscoveryLifecycle::ShadowImport,
         EnrollmentLifecycleV1::VerifiedLocal(_) => EnrollmentDiscoveryLifecycle::VerifiedLocal,
-        EnrollmentLifecycleV1::LocalActive(active)
-        | EnrollmentLifecycleV1::SharedActive(SharedActiveV1 {
-            local_active: active,
-            ..
-        }) => EnrollmentDiscoveryLifecycle::LocalActive(EnrollmentDiscoveryLocalActive {
-            verification_digest: active.verification_digest,
-            bootstrap_import_id: active.anchor.bootstrap_import_id,
-            bootstrap_part_count: active.anchor.bootstrap_part_count,
-            anchor_history_generation: active.anchor.accepted_frontier_anchor.history_generation,
-            anchor_history_index_root: active.anchor.accepted_frontier_anchor.history_root,
-            anchor_acceptance_sequence: active.anchor.accepted_frontier_anchor.acceptance_sequence,
-            anchor_accepted_frontier_state_digest: active
-                .anchor
-                .accepted_frontier_anchor
-                .accepted_frontier_state_digest,
-            handoff: match active.handoff {
-                HandoffV1::Safe => EnrollmentDiscoveryHandoff::Safe,
-                HandoffV1::Unsafe { session_id } => {
-                    EnrollmentDiscoveryHandoff::Unsafe { session_id }
-                }
-            },
-            exclusion: match active.exclusion {
-                LocalExclusionV1::Idle => EnrollmentDiscoveryExclusion::Idle,
-                LocalExclusionV1::Published { .. } => EnrollmentDiscoveryExclusion::Published,
-            },
-        }),
-        EnrollmentLifecycleV1::SharePrepared(SharePreparedV1 {
-            local_active: active,
-            ..
-        })
-        | EnrollmentLifecycleV1::Joining(JoiningV1 {
-            local_active: active,
-            ..
-        }) => EnrollmentDiscoveryLifecycle::LocalActive(EnrollmentDiscoveryLocalActive {
-            verification_digest: active.verification_digest,
-            bootstrap_import_id: active.anchor.bootstrap_import_id,
-            bootstrap_part_count: active.anchor.bootstrap_part_count,
-            anchor_history_generation: active.anchor.accepted_frontier_anchor.history_generation,
-            anchor_history_index_root: active.anchor.accepted_frontier_anchor.history_root,
-            anchor_acceptance_sequence: active.anchor.accepted_frontier_anchor.acceptance_sequence,
-            anchor_accepted_frontier_state_digest: active
-                .anchor
-                .accepted_frontier_anchor
-                .accepted_frontier_state_digest,
-            handoff: match active.handoff {
-                HandoffV1::Safe => EnrollmentDiscoveryHandoff::Safe,
-                HandoffV1::Unsafe { session_id } => {
-                    EnrollmentDiscoveryHandoff::Unsafe { session_id }
-                }
-            },
-            exclusion: match active.exclusion {
-                LocalExclusionV1::Idle => EnrollmentDiscoveryExclusion::Idle,
-                LocalExclusionV1::Published { .. } => EnrollmentDiscoveryExclusion::Published,
-            },
-        }),
+        EnrollmentLifecycleV1::LocalActive(active) => {
+            EnrollmentDiscoveryLifecycle::LocalActive(EnrollmentDiscoveryLocalActive {
+                verification_digest: active.verification_digest,
+                bootstrap_import_id: active.anchor.bootstrap_import_id,
+                bootstrap_part_count: active.anchor.bootstrap_part_count,
+                anchor_history_generation: active
+                    .anchor
+                    .accepted_frontier_anchor
+                    .history_generation,
+                anchor_history_index_root: active.anchor.accepted_frontier_anchor.history_root,
+                anchor_acceptance_sequence: active
+                    .anchor
+                    .accepted_frontier_anchor
+                    .acceptance_sequence,
+                anchor_accepted_frontier_state_digest: active
+                    .anchor
+                    .accepted_frontier_anchor
+                    .accepted_frontier_state_digest,
+                handoff: match active.handoff {
+                    HandoffV1::Safe => EnrollmentDiscoveryHandoff::Safe,
+                    HandoffV1::Unsafe { session_id } => {
+                        EnrollmentDiscoveryHandoff::Unsafe { session_id }
+                    }
+                },
+                exclusion: match active.exclusion {
+                    LocalExclusionV1::Idle => EnrollmentDiscoveryExclusion::Idle,
+                    LocalExclusionV1::Published { .. } => EnrollmentDiscoveryExclusion::Published,
+                },
+            })
+        }
         EnrollmentLifecycleV1::Blocked(blocked) => EnrollmentDiscoveryLifecycle::Blocked {
             reason_code: blocked.reason_code.clone(),
             evidence_digest: blocked.evidence_digest,
@@ -1823,13 +1466,7 @@ fn decode_record(bytes: &[u8]) -> Result<EnrollmentRecordV1, EnrollmentError> {
         .ok_or_else(|| EnrollmentError::Decode("record lifecycle state is missing".into()))?;
     if !matches!(
         lifecycle_state,
-        "shadow_import"
-            | "verified_local"
-            | "local_active"
-            | "share_prepared"
-            | "joining"
-            | "shared_active"
-            | "blocked"
+        "shadow_import" | "verified_local" | "local_active" | "blocked"
     ) {
         return Err(EnrollmentError::FutureUnsupportedLifecycle(
             lifecycle_state.to_owned(),
@@ -1857,6 +1494,11 @@ fn decode_record(bytes: &[u8]) -> Result<EnrollmentRecordV1, EnrollmentError> {
         return Err(EnrollmentError::NonCanonicalRecord);
     }
     Ok(record)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_enrollment_record_for_test(bytes: &[u8]) -> Result<(), EnrollmentError> {
+    decode_record(bytes).map(|_| ())
 }
 
 #[derive(Clone, Copy)]
@@ -2706,13 +2348,6 @@ pub(crate) enum EnrollmentError {
     PublishedBatchMismatch,
     InvalidVerifiedLocalTerminal,
     InvalidLocalActiveAnchor,
-    InvalidSharedProjectionBaseEvidence,
-    UnsupportedSharedEnrollmentDescriptorSchema(u32),
-    UnsupportedJoinerWorkspaceArchiveSchema(u32),
-    UnsafeSharedEnrollmentHandoff,
-    SharedEnrollmentBindingMismatch,
-    SharedEnrollmentDescriptorDigestMismatch,
-    DirtyUniqueLocalTail,
     InvalidBlockedReason,
     IllegalLifecycle(&'static str),
     IllegalTransition,
@@ -2824,32 +2459,6 @@ impl fmt::Display for EnrollmentError {
             Self::InvalidLocalActiveAnchor => formatter.write_str(
                 "local-active bootstrap anchor identity or proof counts are inconsistent",
             ),
-            Self::InvalidSharedProjectionBaseEvidence => {
-                formatter.write_str("shared enrollment projection/base evidence is inconsistent")
-            }
-            Self::UnsupportedSharedEnrollmentDescriptorSchema(schema) => {
-                write!(
-                    formatter,
-                    "unsupported shared enrollment descriptor schema {schema}"
-                )
-            }
-            Self::UnsupportedJoinerWorkspaceArchiveSchema(schema) => {
-                write!(
-                    formatter,
-                    "unsupported joiner workspace archive schema {schema}"
-                )
-            }
-            Self::UnsafeSharedEnrollmentHandoff => {
-                formatter.write_str("shared enrollment requires a safe handoff")
-            }
-            Self::SharedEnrollmentBindingMismatch => formatter
-                .write_str("shared enrollment binding or projection/base evidence mismatch"),
-            Self::SharedEnrollmentDescriptorDigestMismatch => {
-                formatter.write_str("shared enrollment descriptor digest mismatch")
-            }
-            Self::DirtyUniqueLocalTail => {
-                formatter.write_str("joiner has unique unprojected local operations")
-            }
             Self::InvalidBlockedReason => formatter.write_str("invalid blocked reason code"),
             Self::IllegalLifecycle(detail) => {
                 write!(formatter, "illegal enrollment lifecycle: {detail}")

@@ -102,11 +102,12 @@ literal. Format/schema constants remain beside their codecs and are likewise
 certified through `tine_storage::formats`.
 
 [ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the sole production
-activation format. Existing pre-0.7 enrollment and multipart-bootstrap state
-is refused as authority and the product offers Return to Direct Files before a
-fresh clean activation. Production contains one baseline-plus-manifest actor
-constructor and one share/join state machine. The cursor-based join state,
-legacy mutation slot, and legacy provider indexes are absent from production
+activation format. Existing pre-0.7 enrollment, sharing descriptors, and
+multipart-bootstrap state have no production codec or lifecycle arm. They are
+preserved as protocol-incompatible evidence and the product offers Return to
+Direct Files before a fresh clean activation. Production contains one
+baseline-plus-manifest actor constructor and one share/join state machine. The
+cursor-based join state, legacy mutation slot, and legacy provider indexes are absent from production
 and pinned absent by the retired-source guard. Older constructors and handoff
 fixtures remain callable only under `cfg(test)` as bounded differential oracles;
 they are not an alternate runtime authority. The final enumerated known-red
@@ -185,7 +186,7 @@ interpret the mere presence of the directory as an opt-in marker.
 | Relative path under `shared/` | Writer | Reader | Format | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `inbox/`, `outbox/` | transport scaffold | `SharedProviderTransport` | directories | created on explicit activation/join; retained |
-| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | clean magic-prefixed descriptor v1; legacy JSON is recognized only to refuse pre-0.7 state | immutable identity for the shared graph |
+| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | the one current clean magic-prefixed descriptor v1; any pre-0.7 shape is unrecognized protocol-incompatible evidence | immutable identity for the shared graph |
 | `{inbox,outbox}/clean-baselines-v1/<root>.index` | initiator | clean joiner | canonical lazy-genesis provider index v1 | immutable; descriptor-bound; published after every baseline chunk |
 | `{inbox,outbox}/clean-baselines-v1/<root>.<file>.<chunk>.chunk` | initiator | clean joiner | fixed-size exact chunk of a sealed lazy-genesis file | immutable; reassembled only through the descriptor-bound index |
 | `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |
@@ -562,6 +563,10 @@ from that observation instead of completing under stale authority.
    agree. Authority is still inactive.
 4. **LocalActive** — promotion publishes the accepted runtime state; the actor
    acquires enrollment/archive leases and becomes the sole managed writer.
+   Once the activation marker and immutable baseline have been retained, a
+   later runtime-open failure must keep that authoritative set whole. The next
+   explicit open resumes from it; it must not reclaim only the archive and
+   strand a half-live marker.
 5. **Blocked / incompatible / corrupt / ambiguous** — typed terminal or
    retryable evidence; no fallback writer is silently admitted.
 6. **StoppedSafe / StoppedCrashed / Terminal** — clean drain publishes a safe
@@ -883,16 +888,19 @@ empty tail is not evidence of genesis. Open counters distinguish checkpoint
 and full-replay paths and report roster/name work, checkpoint capture work and
 payload bytes, the actual tail replayed, and durable lag.
 
-Snapshot capture is coherent on the owning actor. It uses the full-capture,
-adaptive-cadence option: K=1 through the measured N=800 range, then
-`ceil(retained_items / 800)` capped at 64; durable lag above 64 forces an
-immediate elevated-priority capture. Each capture hands immutable canonical
-bytes to at most one background writer; one newest snapshot replaces any
-queued snapshot. This
-coalescing bounds memory, not freshness. Publication failure is logged and the
-next trigger retries without affecting correctness. Durable lag has no hard
-bound and never applies foreground backpressure: a crash replays exactly the
-unpublished tail. Lag above 64 marks the next coalesced rewrite elevated and
+Snapshot capture is coherent on the owning actor and is attempted after every
+accepted managed save. The actor captures canonical semantic state plus only
+the accepted roster and required-object additions after the publisher's durable
+frontier. The background publisher folds that delta into the preceding payload
+using the same `clean-open-checkpoint-v1` format; no second reader or authority
+is introduced. At the accepted 2026-09-02 gate, capture work at N=800 divided
+by N=50 must be at most the named `A5_ACCEPTED_CAPTURE_RATIO` of 1.25. Each
+capture hands immutable canonical bytes to at most one background writer; one
+newest snapshot replaces any queued snapshot. This coalescing bounds memory,
+not freshness. Publication failure is logged and the next trigger retries
+without affecting correctness. Durable lag has no hard bound and never applies
+foreground backpressure: a crash replays exactly the unpublished tail. Lag
+above 64 marks the next coalesced rewrite elevated and
 immediate, still off the waited path. Archive rebaselining, co-designed with
 0.7 sync, is the committed terminal bound that will reduce the roster,
 namespace scans, and checkpoint state to graph-proportional plus recent tail;
@@ -1208,11 +1216,12 @@ in this table.
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
 | `APP-REF-PLUGIN-IMMUTABLE-COLLISION` | Two honest concurrent installs, or a crash-recovered retry racing a completed install, present different bytes for the same plugin id and version | Keep the no-clobber winner byte-exact and refuse the other install as `immutable plugin version ... different bytes`; never overwrite or merge the package |
 
-Two retryable refusals are intentionally recorded outside the durable-scenario
+Three retryable refusals are intentionally recorded outside the durable-scenario
 table:
 
 | Operation | In-scope scenario | Required response |
 | --- | --- | --- |
+| local activation fails after retaining its activation marker and immutable baseline but before actor open | Crash or runtime-open failure lands between authoritative retain and the first active actor | Preserve the marker, baseline, archive, and enrollment as one authoritative set; the next explicit open resumes and completes activation |
 | prepare-share while an absence publication barrier is active | A half-synced folder or dying mount delivers mass absence; publishing the first shared baseline would propagate history-bearing deletions before disposition | Refuse with `external deletions awaiting disposition`; retain all local durability and retry after sweep close/grace expiry or explicit disposition |
 | exact provider removal whose caller requires the source present, on a path that is already absent | Sync-service delivery, an honest concurrent instance, or this device's own earlier completed removal has already taken the path; the completed journal record for that removal has since been compacted against provider state (§2.10c-i) | Report `UnknownProviderPath` for the exact path. This is the same answer the `RequirePresent` policy gives for any absent source; the caller re-observes provider state (the clean provider path walk reads the path before it asks for the removal). A caller whose policy is `SettleIfAbsent` settles instead. |
 
