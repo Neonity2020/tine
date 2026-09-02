@@ -17,6 +17,26 @@
    "notes": "Before Harvest A5 every clean reopen semantically reapplies every accepted batch onto sequence-zero genesis: N=800 committed_tail_replay measured 1253.5 ms and 90.0% of clean recovery. The checkpoint must remain disposable, compare its roster/fingerprints against authoritative archive evidence, existence-check required objects by name, and fall back without introducing a new refusal."
   },
   {
+   "id": "REG-HARVEST-F-CONTENT-DEPTH-BOUNDS-001",
+   "title": "Crafted deeply nested formulas, queries, previews, and backlink trees stop at their consumption-point bounds",
+   "family": "hostile-content-consumption",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest F depth sweep"},
+   "platforms": ["all"],
+   "layer": "frontend-and-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/sheet/formula/eval.test.ts",
+     "src/editor/queryBuilder.test.ts",
+     "src/render/PeekPopup.test.ts",
+     "crates/tine-core/src/query.rs::tests::application_backlink_filter_truncates_past_the_managed_block_depth"
+    ],
+    "scenario": "content.deep-recursion-consumption-bounds",
+    "failBefore": "proven on e19514f9"
+   },
+   "notes": "Every cap-plus-one fixture is constructed iteratively. Before Harvest F each consumer fully traversed it; afterwards formulas return a named error, the visual query path falls back or truncates, previews count omitted descendants, and both Direct and application backlink filter entries mark truncation while reusing the managed block-depth contract."
+  },
+  {
    "id": "REG-SESSION-ATOMIC-DURABILITY-001",
    "title": "App-private session state is published through a named crash-durable atomic replacement protocol",
    "family": "app-private-data-safety",

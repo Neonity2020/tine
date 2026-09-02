@@ -28,6 +28,18 @@ beforeEach(() => {
 });
 
 describe("QueryBuilder transient ownership (post-GH #161)", () => {
+  it("renders a bounded sentinel instead of recursing through a hostile query tree", () => {
+    const depth = 65;
+    const dsl = `${"(and ".repeat(depth)}[[Leaf]]${")".repeat(depth)}`;
+    const { host, dispose } = mountBuilder(dsl);
+    try {
+      expect(host.querySelector(".qb-depth-limit")?.textContent).toContain("64");
+      expect(host.querySelectorAll(".qb-group").length).toBeLessThanOrEqual(64);
+    } finally {
+      dispose();
+    }
+  });
+
   it("gives every popover family one Escape or Back rung above a lower owner without changing the DSL", () => {
     const { host, source, dispose } = mountBuilder();
     const original = source();

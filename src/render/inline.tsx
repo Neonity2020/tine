@@ -45,6 +45,7 @@ import { PeekPopup, PeekContext, capBlockTree } from "./PeekPopup";
 import { annotationInfoForBlock, pdfFileFromPreBlock } from "../editor/annotation";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { hiccupToHtml } from "./hiccup";
+import { ExternalLink, reportLinkOpenFailure } from "../components/ExternalLink";
 
 
 // ===========================================================================
@@ -485,20 +486,17 @@ function renderLink(
   }
   return (
     <span class="link-copy-wrap">
-      <a
+      <ExternalLink
         class="external-link"
-        href={dest}
-        {...(spanAttrs ?? {})}
-        onClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
+        dest={dest}
+        attrs={spanAttrs}
+        open={() => {
           const rel = assetLinkRel(dest);
-          if (rel !== null) void backend().openAsset(rel).catch((error) => reportLinkOpenFailure(dest, error));
-          else void backend().openExternal(dest).catch((error) => reportLinkOpenFailure(dest, error));
+          return rel !== null ? backend().openAsset(rel) : backend().openExternal(dest);
         }}
       >
         <Show when={s.label && s.label.length} fallback={dest}>{renderInlines(s.label!, blockId, spanMode, macroExpansion, format)}</Show>
-      </a>
+      </ExternalLink>
       <CopyButton text={dest} title="Copy link" class="copy-inline" />
     </span>
   );
@@ -509,10 +507,6 @@ function renderLink(
  *  missing file and a platform with no file manager all looked identical to a
  *  dead link — which is exactly how the reported `file://` failure stayed
  *  invisible for as long as it did. */
-export function reportLinkOpenFailure(dest: string, error: unknown): void {
-  pushToast(`Couldn't open ${dest}. (${String(error)})`, "error");
-}
-
 function pdfFilenameFromDest(dest: string): string {
   const normalized = dest.replace(/\\/g, "/");
   const rel = assetRelPath(normalized);
@@ -650,9 +644,9 @@ function renderEmail(text: EmailValue, spanAttrs?: SpanDomAttrs): JSX.Element {
   }
   const href = `mailto:${addr}`;
   return (
-    <a class="external-link" href={href} {...(spanAttrs ?? {})} onClick={(e) => { e.preventDefault(); e.stopPropagation(); void backend().openExternal(href); }}>
+    <ExternalLink class="external-link" dest={href} attrs={spanAttrs}>
       {addr}
-    </a>
+    </ExternalLink>
   );
 }
 

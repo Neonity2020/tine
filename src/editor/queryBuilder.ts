@@ -149,7 +149,9 @@ interface Cur {
   pos: number;
 }
 
-function parseExpr(toks: Tok[], cur: Cur, src: string): Clause | null {
+export const MAX_QUERY_BUILDER_DEPTH = 64;
+
+function parseExpr(toks: Tok[], cur: Cur, src: string, nesting = 0): Clause | null {
   const t = toks[cur.pos];
   if (!t) return null;
   if (t.t === "page" || t.t === "tag") {
@@ -170,6 +172,22 @@ function parseExpr(toks: Tok[], cur: Cur, src: string): Clause | null {
   }
   if (t.t === "(") {
     const open = t;
+    if (nesting >= MAX_QUERY_BUILDER_DEPTH) {
+      let depth = 0;
+      let close: Tok | undefined;
+      while (cur.pos < toks.length) {
+        const tk = toks[cur.pos++];
+        if (tk.t === "(") depth++;
+        else if (tk.t === ")") {
+          depth--;
+          if (depth === 0) {
+            close = tk;
+            break;
+          }
+        }
+      }
+      return close ? { kind: "raw", text: src.slice(open.s, close.e) } : null;
+    }
     cur.pos++;
     const head = toks[cur.pos];
     if (!head || head.t !== "word") return null;
@@ -179,10 +197,10 @@ function parseExpr(toks: Tok[], cur: Cur, src: string): Clause | null {
     switch (name) {
       case "and":
       case "or":
-        clause = { kind: "op", op: name, children: parseList(toks, cur, src) };
+        clause = { kind: "op", op: name, children: parseList(toks, cur, src, nesting + 1) };
         break;
       case "not": {
-        const child = parseExpr(toks, cur, src);
+        const child = parseExpr(toks, cur, src, nesting + 1);
         clause = child ? { kind: "op", op: "not", children: [child] } : null;
         break;
       }
@@ -316,11 +334,11 @@ function parseExpr(toks: Tok[], cur: Cur, src: string): Clause | null {
   return null;
 }
 
-function parseList(toks: Tok[], cur: Cur, src: string): Clause[] {
+function parseList(toks: Tok[], cur: Cur, src: string, nesting: number): Clause[] {
   const out: Clause[] = [];
   while (toks[cur.pos] && toks[cur.pos].t !== ")") {
     const before = cur.pos;
-    const c = parseExpr(toks, cur, src);
+    const c = parseExpr(toks, cur, src, nesting);
     if (c) out.push(c);
     if (cur.pos === before) cur.pos++; // guard against non-advance
   }

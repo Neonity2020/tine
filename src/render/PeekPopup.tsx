@@ -10,10 +10,16 @@ const POPUP_MARGIN = 8;
 const POPUP_OFFSET = 6;
 const POPUP_FALLBACK_WIDTH = 600;
 const POPUP_FALLBACK_HEIGHT = 320;
+export const MAX_PEEK_BLOCK_DEPTH = 64;
 
-function countBlocks(blocks: BlockDto[]): number {
+function countBlocks(blocks: readonly BlockDto[]): number {
   let count = 0;
-  for (const block of blocks) count += 1 + countBlocks(block.children);
+  const stack = [...blocks];
+  while (stack.length > 0) {
+    const block = stack.pop()!;
+    count++;
+    for (const child of block.children) stack.push(child);
+  }
   return count;
 }
 
@@ -22,20 +28,34 @@ export function capBlockTree(blocks: BlockDto[], maxBlocks: number): { blocks: B
 
   let emitted = 0;
   let truncated = 0;
-  const copy = (source: BlockDto[]): BlockDto[] => {
-    const out: BlockDto[] = [];
-    for (const block of source) {
-      if (emitted >= maxBlocks) {
-        truncated += countBlocks([block]);
-        continue;
-      }
-      emitted++;
-      out.push({ ...block, children: copy(block.children) });
-    }
-    return out;
-  };
+  const out: BlockDto[] = [];
+  const stack: Array<{
+    source: readonly BlockDto[];
+    index: number;
+    target: BlockDto[];
+    depth: number;
+  }> = [{ source: blocks, index: 0, target: out, depth: 1 }];
 
-  return { blocks: copy(blocks), truncated };
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.index >= frame.source.length) {
+      stack.pop();
+      continue;
+    }
+    const block = frame.source[frame.index++];
+    if (emitted >= maxBlocks || frame.depth > MAX_PEEK_BLOCK_DEPTH) {
+      truncated += countBlocks([block]);
+      continue;
+    }
+    emitted++;
+    const children: BlockDto[] = [];
+    frame.target.push({ ...block, children });
+    if (block.children.length > 0) {
+      stack.push({ source: block.children, index: 0, target: children, depth: frame.depth + 1 });
+    }
+  }
+
+  return { blocks: out, truncated };
 }
 
 export function PeekPopup(props: {

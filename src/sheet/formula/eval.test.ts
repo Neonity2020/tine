@@ -37,6 +37,17 @@ function binaryAst(op: BinaryOp): Ast {
 }
 
 describe("formula evaluator", () => {
+  it("fails closed before evaluating an expression deeper than the hostile-content cap", () => {
+    let ast: Ast = { kind: "literal", value: 1 };
+    for (let depth = 0; depth <= 128; depth++) ast = { kind: "unary", op: "-", expr: ast };
+    const result = evaluate(ast, {
+      field: () => nullValue(),
+      formulaAst: () => null,
+      now: new Date(Date.UTC(2026, 0, 15)),
+    });
+    expect(result).toEqual(errorValue("Formula depth exceeds 128"));
+  });
+
   it("covers the binary coercion matrix", () => {
     const values: Record<string, FormulaValue> = {
       text: textValue("b"),
