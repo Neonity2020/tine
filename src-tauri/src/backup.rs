@@ -1052,8 +1052,8 @@ fn live_relative(area: &RestoreRecovery, live: &std::path::Path) -> std::io::Res
 
 /// Rename relative to two already-bound directory handles and fail if the
 /// destination exists. Linux/Android and Apple expose native no-replace
-/// rename-at syscalls. Windows remains capability-bound and is protected by the
-/// caller's existence check; the private recovery directory prevents an escape.
+/// rename-at syscalls. Windows uses a capability-bound hard link followed by
+/// source removal, so a concurrent sync-service delivery cannot be replaced.
 fn rename_noreplace_between(
     from_dir: &Dir,
     from: &std::path::Path,
@@ -1104,14 +1104,20 @@ fn rename_noreplace_between(
             .then_some(())
             .ok_or_else(std::io::Error::last_os_error);
     }
+    #[cfg(target_os = "windows")]
+    {
+        from_dir.hard_link(from, to_dir, std::path::Path::new(to))?;
+        from_dir.remove_file(from)
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
         target_os = "macos",
-        target_os = "ios"
+        target_os = "ios",
+        target_os = "windows"
     )))]
     {
-        from_dir.rename(from, to_dir, std::path::Path::new(to))
+        compile_error!("backup restore publication requires an audited Tine platform arm");
     }
 }
 
@@ -1133,15 +1139,20 @@ fn publish_temp_noreplace(
     {
         rename_noreplace_between(parent, temp, parent, name)
     }
+    #[cfg(target_os = "windows")]
+    {
+        parent.hard_link(temp, parent, std::path::Path::new(name))?;
+        parent.remove_file(temp)
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
         target_os = "macos",
-        target_os = "ios"
+        target_os = "ios",
+        target_os = "windows"
     )))]
     {
-        parent.hard_link(temp, parent, std::path::Path::new(name))?;
-        parent.remove_file(temp)
+        compile_error!("backup temp publication requires an audited Tine platform arm");
     }
 }
 
@@ -2159,6 +2170,16 @@ mod tests {
 
         let retire = function_source(source, "fn move_live_to_recovery(");
         assert!(retire.contains("sync_restore_rename_parents(&recovery_parent, &live_parent)?"));
+
+        let no_replace = function_source(source, "fn rename_noreplace_between(");
+        assert!(no_replace.contains("#[cfg(target_os = \"windows\")]"));
+        assert!(no_replace.contains("from_dir.hard_link("));
+        assert!(no_replace.contains("target_os = \"windows\""));
+        assert!(no_replace.contains("compile_error!"));
+        assert!(
+            !no_replace.contains("#[cfg(not(any(\n        target_os = \"linux\",\n        target_os = \"android\",\n        target_os = \"macos\",\n        target_os = \"ios\"\n    )))]"),
+            "the fallback must not silently mean Windows"
+        );
     }
 
     fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -2317,6 +2338,37 @@ mod tests {
         assert_eq!(
             std::fs::read(recovery.path.join("pages/secret.md")).unwrap(),
             b"recovery sentinel"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_backup_recovery_rejects_a_concurrent_sync_delivery() {
+        let root = scratch("windows-restore-concurrent-delivery");
+        let live_path = root.join("live");
+        let recovery_path = root.join("recovery");
+        std::fs::create_dir_all(&live_path).unwrap();
+        std::fs::create_dir_all(&recovery_path).unwrap();
+        std::fs::write(live_path.join("page.md"), b"live source").unwrap();
+        std::fs::write(recovery_path.join("page.md"), b"sync delivery").unwrap();
+        let live = Dir::open_ambient_dir(&live_path, cap_std::ambient_authority()).unwrap();
+        let recovery = Dir::open_ambient_dir(&recovery_path, cap_std::ambient_authority()).unwrap();
+
+        assert!(rename_noreplace_between(
+            &live,
+            std::path::Path::new("page.md"),
+            &recovery,
+            std::ffi::OsStr::new("page.md"),
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(live_path.join("page.md")).unwrap(),
+            b"live source"
+        );
+        assert_eq!(
+            std::fs::read(recovery_path.join("page.md")).unwrap(),
+            b"sync delivery"
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -759,6 +759,7 @@ pub(crate) struct LazyGenesisActivationMarkerV1 {
     schema_version: u32,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
+    generation: u64,
     baseline_root: ContentDigest,
     source_capture: BlobDescription,
     accepted_frontier_digest: ContentDigest,
@@ -774,10 +775,31 @@ impl LazyGenesisActivationMarkerV1 {
         accepted_frontier_digest: ContentDigest,
         watcher_fence: u64,
     ) -> io::Result<Self> {
+        Self::new_for_generation(
+            workspace_id,
+            lineage_digest,
+            0,
+            baseline_root,
+            source_capture,
+            accepted_frontier_digest,
+            watcher_fence,
+        )
+    }
+
+    pub(crate) fn new_for_generation(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        generation: u64,
+        baseline_root: ContentDigest,
+        source_capture: BlobDescription,
+        accepted_frontier_digest: ContentDigest,
+        watcher_fence: u64,
+    ) -> io::Result<Self> {
         let marker = Self {
             schema_version: LAZY_GENESIS_ACTIVATION_MARKER_SCHEMA_VERSION,
             workspace_id,
             lineage_digest,
+            generation,
             baseline_root,
             source_capture,
             accepted_frontier_digest,
@@ -826,6 +848,10 @@ impl LazyGenesisActivationMarkerV1 {
 
     pub(crate) const fn lineage_digest(self) -> LineageDigest {
         self.lineage_digest
+    }
+
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
     }
 
     pub(crate) const fn baseline_root(self) -> ContentDigest {
@@ -2077,6 +2103,7 @@ mod tests {
             marker
         );
         assert_eq!(marker.watcher_fence(), 73);
+        assert_eq!(marker.generation(), 0);
         assert_eq!(
             marker.workspace_id(),
             WorkspaceId::from_uuid(Uuid::from_u128(1))
@@ -2101,12 +2128,33 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("impl LazyGenesisActivationMarkerV1"))
             .map(|(body, _)| body)
             .expect("activation marker definition must remain identifiable");
+        assert!(
+            marker_source.contains("generation: u64"),
+            "the activation marker must name the authority-directory generation"
+        );
+        for field in [
+            "schema_version: u32",
+            "workspace_id: WorkspaceId",
+            "lineage_digest: LineageDigest",
+            "generation: u64",
+            "baseline_root: ContentDigest",
+            "source_capture: BlobDescription",
+            "accepted_frontier_digest: ContentDigest",
+            "watcher_fence: u64",
+        ] {
+            assert!(
+                marker_source.contains(field),
+                "missing marker field {field}"
+            );
+        }
         assert!(!marker_source.contains("sqlite"));
         assert!(!marker_source.contains("database"));
 
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
         assert!(contract.contains("one final lazy-genesis authority marker"));
         assert!(contract.contains("SQLite identity is deliberately absent"));
+        assert!(contract.contains("authority-directory generation"));
+        assert!(contract.contains("one marker rename is\nthe commit point"));
         assert!(contract.contains("Tauri binding records opt-in\nintent"));
     }
 

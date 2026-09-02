@@ -2,6 +2,54 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-W3-R1-JOIN-GENERATION-COMMIT-001",
+   "title": "Shared-join baseline and operation authority commit as one marker-selected generation",
+   "family": "managed-storage-crash-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 R1-1; approved shape A"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::clean_join_generation_crash_cuts_recover_to_the_marker_named_pair"],
+    "scenario": "managed-shared-join.marker-generation-commit",
+    "failBefore": "r1-r1-1-fail-before.txt at a38c84f8fb97b8a0aa2d0f32aed6058ca40e34d5: the marker had no generation pointer and the four-rename directory swap exposed inter-step crash states"
+   },
+   "notes": "Fresh stores use generation 0. Join publishes the next complete baseline/operations pair, syncs its parent, and atomically replaces the marker. Open follows the marker and reclaims unreferenced generation and candidate directories."
+  },
+  {
+   "id": "REG-W3-R1-PRIVATE-ROOT-RENAME-BARRIERS-001",
+   "title": "Blank-slate private-root archive renames durably synchronize both parents",
+   "family": "managed-storage-crash-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 R1-2"},
+   "platforms": ["all"],
+   "layer": "tauri-storage-lifecycle",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/sync_runtime.rs::tests::blank_slate_private_root_renames_barrier_both_parents"],
+    "scenario": "managed-blank-slate.private-root-rename-barriers",
+    "failBefore": "r1-r1-2-fail-before.txt at a38c84f8fb97b8a0aa2d0f32aed6058ca40e34d5: both private-root rename helpers returned without the existing two-parent directory barrier"
+   },
+   "notes": "The shared sync_provider_namespace_rename helper flushes the destination parent before the source parent after each cross-directory move."
+  },
+  {
+   "id": "REG-W3-R1-WINDOWS-BACKUP-NOREPLACE-001",
+   "title": "Windows backup recovery cannot clobber a concurrently delivered destination",
+   "family": "backup-restore-publication",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 R1-6"},
+   "platforms": ["windows"],
+   "layer": "tauri-backup",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/backup.rs::tests::restore_stack_keeps_capability_bound_publication_and_orders_crash_barriers",
+     "src-tauri/src/backup.rs::tests::windows_backup_recovery_rejects_a_concurrent_sync_delivery"
+    ],
+    "scenario": "backup-restore.windows-concurrent-sync-delivery",
+    "failBefore": "r1-r1-6-fail-before.txt at a38c84f8fb97b8a0aa2d0f32aed6058ca40e34d5: Windows fell through a negated four-platform cfg to plain rename after an existence check"
+   },
+   "notes": "Windows uses capability-bound hard-link-create followed by source removal; an occupied destination returns AlreadyExists and neither the delivered destination nor the live source is overwritten. All five Tine targets are explicit cfg arms."
+  },
+  {
    "id": "REG-W3-CC-PUBLISH-PUBLIC-PROPERTY-001",
    "title": "Static publication recognizes public pages through the same property-line grammar as Logseq",
    "family": "static-publication-privacy",

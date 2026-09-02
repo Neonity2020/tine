@@ -1177,14 +1177,17 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/sync_runtime.rs",
             "fs.remove_dir_all",
-            6,
+            5,
         ),
-        ("crates/tine-core/src/sync_runtime.rs", "fs.rename", 11),
+        // Packet R1 replaces the rollback rename lattice with two staged
+        // generation publications; the marker replacement is the sole commit.
+        ("crates/tine-core/src/sync_runtime.rs", "fs.rename", 3),
         ("crates/tine-core/src/sync_runtime.rs", "open.create_new", 1),
         ("src-tauri/src/backup.rs", "cap.create_dir", 2),
-        ("src-tauri/src/backup.rs", "cap.hard_link", 1),
-        ("src-tauri/src/backup.rs", "cap.remove_file", 2),
-        ("src-tauri/src/backup.rs", "cap.rename", 1),
+        // Packet R1 gives Windows the same no-clobber hard-link publication
+        // shape as Unix and removes the replacement-style rename fallback.
+        ("src-tauri/src/backup.rs", "cap.hard_link", 2),
+        ("src-tauri/src/backup.rs", "cap.remove_file", 3),
         ("src-tauri/src/backup.rs", "fs.copy", 3),
         ("src-tauri/src/backup.rs", "fs.create_dir", 1),
         ("src-tauri/src/backup.rs", "fs.create_dir_all", 5),

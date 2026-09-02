@@ -358,6 +358,9 @@ jobs:
           tool: nextest@0.9.143
       - run: npm ci
       - run: npm run build
+      - name: Windows backup recovery no-replace collision
+        if: inputs.scope == 'windows' && inputs.windows_test_name == ''
+        run: cargo test -p tine --lib backup::tests::windows_backup_recovery_rejects_a_concurrent_sync_delivery -- --exact
       - name: Windows core test targets compile (all; release gate)
         if: inputs.windows_test_name == ''
         run: cargo test -p tine-core --no-run

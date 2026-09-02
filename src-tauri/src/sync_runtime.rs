@@ -2405,6 +2405,17 @@ fn archive_private_root(
     std::fs::rename(private_root, &destination).map_err(|error| {
         format!("Couldn't preserve Tine-managed storage recovery state: {error}")
     })?;
+    sync_provider_namespace_rename(
+        destination.parent().ok_or_else(|| {
+            "Tine-managed storage recovery destination has no parent directory.".to_string()
+        })?,
+        private_root.parent().ok_or_else(|| {
+            "Tine-managed storage recovery source has no parent directory.".to_string()
+        })?,
+    )
+    .map_err(|error| {
+        format!("Couldn't durably preserve Tine-managed storage recovery state: {error}")
+    })?;
     Ok(Some(destination))
 }
 
@@ -2514,6 +2525,17 @@ fn replace_failed_blank_slate_candidate(
     }
     std::fs::rename(private_root, &destination).map_err(|error| {
         format!("Couldn't set aside the failed managed-storage rebuild: {error}")
+    })?;
+    sync_provider_namespace_rename(
+        destination.parent().ok_or_else(|| {
+            "The failed managed-storage recovery destination has no parent directory.".to_string()
+        })?,
+        private_root.parent().ok_or_else(|| {
+            "The failed managed-storage rebuild has no parent directory.".to_string()
+        })?,
+    )
+    .map_err(|error| {
+        format!("Couldn't durably set aside the failed managed-storage rebuild: {error}")
     })?;
     Ok(Some(destination))
 }
@@ -5311,6 +5333,34 @@ mod tests {
             assert!(
                 !command.contains(forbidden),
                 "emergency return must not depend on `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_slate_private_root_renames_barrier_both_parents() {
+        let source = include_str!("sync_runtime.rs");
+        for signature in [
+            "fn archive_private_root(",
+            "fn replace_failed_blank_slate_candidate(",
+        ] {
+            let start = source
+                .find(signature)
+                .expect("rename helper remains present");
+            let body = &source[start
+                ..source[start..]
+                    .find("\n}\n")
+                    .map(|offset| start + offset + 3)
+                    .expect("rename helper remains bounded")];
+            let rename = body
+                .find("std::fs::rename(")
+                .expect("private-root publication remains a rename");
+            let barrier = body
+                .find("sync_provider_namespace_rename(")
+                .expect("private-root rename must sync destination and source parents");
+            assert!(
+                rename < barrier,
+                "the rename must precede its directory barriers"
             );
         }
     }

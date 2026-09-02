@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Managed shared joins now commit through one generation-bearing marker.**
+  Verified baseline and operation directories are published under the next
+  generation, and cold open follows the marker to one complete pair while
+  reclaiming interrupted candidates.
+
 - **Core duplicate paths now share their canonical converters.** Static query
   lists and query-backed sheets hydrate from one source-graph boundary, hot and
   borrowed-state page materialization share one allocation-neutral block
@@ -61,6 +66,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   counter, and no user-visible behavior changes.
 
 ### Fixed
+
+- **Managed recovery moves and Windows backup restore close their publication
+  crash windows.** Private-root archive moves now synchronize both renamed
+  parents, and Windows recovery publication cannot replace a same-named entry
+  delivered concurrently by a sync service.
 
 - **Static publishing no longer exposes a private page whose malformed
   `public::true` line is rejected by Logseq.** Publication now uses the shared

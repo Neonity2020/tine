@@ -1037,6 +1037,10 @@ enum SharedJoinTestPausePoint {
     EnrollmentLockContended,
     BeforeCandidateDownload,
     AfterCandidateDownload,
+    AfterBaselineSwap,
+    AfterOperationSwap,
+    AfterAuthorityDirectorySync,
+    AfterMarkerReplacement,
     BeforeEnrollmentPublication,
 }
 
@@ -6169,12 +6173,77 @@ impl CleanRuntimeActorCore {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CleanAuthorityDirectories {
+    baseline: PathBuf,
+    operations: PathBuf,
+}
+
+fn clean_authority_directories(archive_root: &Path, generation: u64) -> CleanAuthorityDirectories {
+    CleanAuthorityDirectories {
+        baseline: archive_root.join(format!(
+            "{}.{generation}",
+            crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY
+        )),
+        operations: archive_root.join(format!("{CLEAN_OPERATION_ARCHIVE_DIRECTORY}.{generation}")),
+    }
+}
+
 fn clean_baseline_directory(archive_root: &Path) -> PathBuf {
-    archive_root.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY)
+    clean_authority_directories(archive_root, 0).baseline
 }
 
 fn clean_operation_archive_directory(archive_root: &Path) -> PathBuf {
-    archive_root.join(CLEAN_OPERATION_ARCHIVE_DIRECTORY)
+    clean_authority_directories(archive_root, 0).operations
+}
+
+fn clean_authority_generation(name: &str, stem: &str) -> Option<u64> {
+    name.strip_prefix(stem)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .and_then(|suffix| suffix.parse().ok())
+}
+
+/// Resolve the sole authority generation named by the durable marker and
+/// retire incomplete join candidates or generations that marker never made
+/// authoritative. The marker replacement is therefore the only join commit
+/// point; no directory swap repair state machine exists.
+fn resolve_clean_authority_directories(
+    archive_root: &Path,
+    enrollment_root: &Path,
+) -> std::io::Result<Option<CleanAuthorityDirectories>> {
+    let Some(marker) = read_activation_marker(enrollment_root)? else {
+        return Ok(None);
+    };
+    let active = clean_authority_directories(archive_root, marker.generation());
+    let mut removed = false;
+    for entry in fs::read_dir(archive_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let generation = clean_authority_generation(
+            &name,
+            crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY,
+        )
+        .or_else(|| clean_authority_generation(&name, CLEAN_OPERATION_ARCHIVE_DIRECTORY));
+        let orphan = generation.is_some_and(|generation| generation != marker.generation())
+            || name.starts_with(".clean-join-");
+        if !orphan {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("clean authority orphan is not a private directory: {name}"),
+            ));
+        }
+        fs::remove_dir_all(entry.path())?;
+        removed = true;
+    }
+    if removed {
+        crate::filesystem_durability::sync_reconstructible_directory_path(archive_root)?;
+    }
+    Ok(Some(active))
 }
 
 fn retained_local_completion_intents(
@@ -6784,9 +6853,15 @@ fn open_clean_runtime_resources_with_progress(
             phase: SyncLocalActivationPhase::RetainedRuntimeOpen,
         });
     }
+    let Some(authority_directories) =
+        resolve_clean_authority_directories(&request.archive_root, &request.enrollment_root)
+            .map_err(display)?
+    else {
+        return Ok(None);
+    };
     let Some(opened) = open_clean_activation_authority(
         &request.enrollment_root,
-        &clean_baseline_directory(&request.archive_root),
+        &authority_directories.baseline,
         identities.catalog_document_id,
         ReferenceCatalogPolicyV1::default(),
     )
@@ -6835,7 +6910,7 @@ fn open_clean_runtime_resources_with_progress(
     }
     let (mut engine, baseline, _) = opened.into_parts();
     let binding = ActorRuntimeBinding::from_clean(identities, endpoint, &receipts);
-    let operation_archive_path = clean_operation_archive_directory(&request.archive_root);
+    let operation_archive_path = authority_directories.operations;
     let store = ObjectStore::open_structural(&operation_archive_path, identities.workspace_id)
         .map_err(display)?;
     let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
@@ -22885,18 +22960,32 @@ impl RuntimeActor {
         let baseline_directory = candidate.baseline_directory.clone();
         let operation_archive_directory = candidate.operation_archive_directory.clone();
         let baseline_frontier_digest = candidate.baseline_frontier_digest;
-        let canonical_baseline = clean_baseline_directory(&request.archive_root);
-        let canonical_operations = clean_operation_archive_directory(&request.archive_root);
-        let nonce = Uuid::new_v4().simple().to_string();
-        let prior_baseline = request
-            .archive_root
-            .join(format!(".lazy-genesis.{nonce}.prior"));
-        let prior_operations = request
-            .archive_root
-            .join(format!(".operations.{nonce}.prior"));
-        let replacement_marker = LazyGenesisActivationMarkerV1::new(
+        let next_generation = prior_marker.generation().checked_add(1).ok_or_else(|| {
+            SyncRuntimeRequestError::ActorRefused(
+                "clean shared join exhausted authority generations".into(),
+            )
+        })?;
+        let replacement_directories =
+            clean_authority_directories(&request.archive_root, next_generation);
+        for destination in [
+            &replacement_directories.baseline,
+            &replacement_directories.operations,
+        ] {
+            match fs::symlink_metadata(destination) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "clean shared join generation destination already exists: {}",
+                        destination.display()
+                    )))
+                }
+                Err(error) => return Err(SyncRuntimeRequestError::ActorRefused(error.to_string())),
+            }
+        }
+        let replacement_marker = LazyGenesisActivationMarkerV1::new_for_generation(
             descriptor.workspace_id(),
             descriptor.lineage_digest(),
+            next_generation,
             descriptor.baseline_root(),
             descriptor.source_capture(),
             baseline_frontier_digest,
@@ -22905,37 +22994,50 @@ impl RuntimeActor {
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
 
         // The graph is already semantically equal to the provider frontier.
-        // Drop only the old managed runtime, retain the graph itself, then
-        // install both immutable authorities before replacing the marker.
+        // Drop only the old managed runtime and publish the replacement under
+        // a fresh generation. The old generation stays untouched until the
+        // marker replacement commits; open reclaims whichever generation the
+        // marker does not name.
         self.clean.take();
         let installation = (|| {
-            fs::rename(&canonical_baseline, &prior_baseline)
+            fs::rename(&baseline_directory, &replacement_directories.baseline)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-            if let Err(error) = fs::rename(&baseline_directory, &canonical_baseline) {
-                let _ = fs::rename(&prior_baseline, &canonical_baseline);
-                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
-            }
-            if let Err(error) = fs::rename(&canonical_operations, &prior_operations) {
-                let _ = fs::rename(&canonical_baseline, &baseline_directory);
-                let _ = fs::rename(&prior_baseline, &canonical_baseline);
-                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
-            }
-            if let Err(error) = fs::rename(&operation_archive_directory, &canonical_operations) {
-                let _ = fs::rename(&prior_operations, &canonical_operations);
-                let _ = fs::rename(&canonical_baseline, &baseline_directory);
-                let _ = fs::rename(&prior_baseline, &canonical_baseline);
-                return Err(SyncRuntimeRequestError::ActorRefused(error.to_string()));
-            }
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterBaselineSwap,
+            );
+            fs::rename(
+                &operation_archive_directory,
+                &replacement_directories.operations,
+            )
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterOperationSwap,
+            );
             crate::filesystem_durability::sync_reconstructible_directory_path(
                 &request.archive_root,
             )
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterAuthorityDirectorySync,
+            );
             replace_activation_marker_for_join(
                 &request.enrollment_root,
                 prior_marker,
                 replacement_marker,
             )
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            #[cfg(test)]
+            pause_shared_join_for_test(
+                descriptor.workspace_id(),
+                SharedJoinTestPausePoint::AfterMarkerReplacement,
+            );
+            Ok(())
         })();
         if let Err(error) = installation {
             self.terminal = Some(format!(
@@ -22996,12 +23098,7 @@ impl RuntimeActor {
         self.recovery = SyncRuntimeRecovery::CleanManifestReplay;
         self.stopped_safe = false;
         self.terminal = None;
-        fs::remove_dir_all(&prior_baseline)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        fs::remove_dir_all(&prior_operations)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        crate::filesystem_durability::sync_reconstructible_directory_path(&request.archive_root)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+        Ok(())
     }
 
     fn join_shared_clean(

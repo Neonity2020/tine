@@ -650,6 +650,165 @@ fn install_shared_join_pause(
     (entered_receiver, resume_sender)
 }
 
+#[test]
+fn clean_join_generation_crash_cuts_recover_to_the_marker_named_pair() {
+    for (index, (point, marker_committed, baseline_published, operations_published)) in [
+        (
+            SharedJoinTestPausePoint::AfterBaselineSwap,
+            false,
+            true,
+            false,
+        ),
+        (
+            SharedJoinTestPausePoint::AfterOperationSwap,
+            false,
+            true,
+            true,
+        ),
+        (
+            SharedJoinTestPausePoint::AfterAuthorityDirectorySync,
+            false,
+            true,
+            true,
+        ),
+        (
+            SharedJoinTestPausePoint::AfterMarkerReplacement,
+            true,
+            true,
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_initiator, joiner, handle, descriptor) = pending_generation_join_fixture(
+            &format!("join-generation-cut-{point:?}"),
+            0xc100_0000 + index as u128 * 0x100,
+        );
+        let workspace_id = joiner.request.identities.workspace_id;
+        let (entered, resume) = install_shared_join_pause(workspace_id, point);
+        let joining_handle = handle.clone();
+        let joining = std::thread::spawn(move || joining_handle.join_shared(descriptor));
+        entered
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("clean join did not reach {point:?}"));
+
+        let observed_marker = read_activation_marker(&joiner.request.enrollment_root)
+            .unwrap()
+            .expect("the join cut retains an authority marker");
+        assert_eq!(
+            observed_marker.generation(),
+            u64::from(marker_committed),
+            "{point:?}"
+        );
+        let prior_observed = clean_authority_directories(&joiner.request.archive_root, 0);
+        let candidate_observed = clean_authority_directories(&joiner.request.archive_root, 1);
+        assert!(prior_observed.baseline.is_dir(), "{point:?}");
+        assert!(prior_observed.operations.is_dir(), "{point:?}");
+        assert_eq!(
+            candidate_observed.baseline.is_dir(),
+            baseline_published,
+            "{point:?}"
+        );
+        assert_eq!(
+            candidate_observed.operations.is_dir(),
+            operations_published,
+            "{point:?}"
+        );
+        resume.send(()).unwrap();
+        assert!(
+            joining.join().unwrap().is_ok(),
+            "the real join did not resume after {point:?}"
+        );
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        // Apply the same next-open resolver to an exact filesystem shape for
+        // the interrupted cut. The live join above proves the cut mapping;
+        // this isolated shape proves recovery without disturbing its actor.
+        let root = std::env::temp_dir().join(format!(
+            "tine-clean-join-generation-cut-{point:?}-{}",
+            Uuid::new_v4().simple()
+        ));
+        let archive = root.join("archive");
+        let enrollment = root.join("enrollment");
+        fs::create_dir_all(&archive).unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0xc101));
+        let lineage = LineageDigest::of(b"clean-join-generation-cut");
+        let marker = |generation| {
+            LazyGenesisActivationMarkerV1::new_for_generation(
+                workspace,
+                lineage,
+                generation,
+                ContentDigest::of(format!("baseline-{generation}").as_bytes()),
+                BlobDescription::of(b"source-capture"),
+                ContentDigest::of(format!("frontier-{generation}").as_bytes()),
+                generation,
+            )
+            .unwrap()
+        };
+        let prior = marker(0);
+        let prior_directories = clean_authority_directories(&archive, 0);
+        fs::create_dir_all(&prior_directories.baseline).unwrap();
+        fs::create_dir_all(&prior_directories.operations).unwrap();
+        crate::oplog::lazy_genesis::publish_activation_marker(&enrollment, prior).unwrap();
+
+        let candidate_directories = clean_authority_directories(&archive, 1);
+        if baseline_published {
+            fs::create_dir_all(&candidate_directories.baseline).unwrap();
+        }
+        if operations_published {
+            fs::create_dir_all(&candidate_directories.operations).unwrap();
+        }
+        fs::create_dir_all(archive.join(".clean-join-uncommitted")).unwrap();
+        if marker_committed {
+            replace_activation_marker_for_join(&enrollment, prior, marker(1)).unwrap();
+        }
+
+        let resolved = resolve_clean_authority_directories(&archive, &enrollment)
+            .unwrap()
+            .expect("the marker retains one authority generation");
+        let expected = if marker_committed {
+            &candidate_directories
+        } else {
+            &prior_directories
+        };
+        let orphan = if marker_committed {
+            &prior_directories
+        } else {
+            &candidate_directories
+        };
+        assert_eq!(resolved.baseline, expected.baseline, "{point:?}");
+        assert_eq!(resolved.operations, expected.operations, "{point:?}");
+        assert!(expected.baseline.is_dir(), "{point:?}");
+        assert!(expected.operations.is_dir(), "{point:?}");
+        assert!(!orphan.baseline.exists(), "{point:?}");
+        assert!(!orphan.operations.exists(), "{point:?}");
+        assert!(!archive.join(".clean-join-uncommitted").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    let source = include_str!("sync_runtime.rs");
+    let start = source
+        .find("    fn install_clean_join_candidate(")
+        .expect("join installation remains present");
+    let end = source[start..]
+        .find("\n    fn join_shared_clean(")
+        .map(|offset| start + offset)
+        .expect("join installation remains bounded");
+    let install = &source[start..end];
+    assert_eq!(
+        install
+            .matches("replace_activation_marker_for_join(")
+            .count(),
+        1
+    );
+    assert!(!install.contains(".prior"));
+    assert!(!install.contains("canonical_baseline"));
+}
+
 fn empty_request(profile: SyncStorageProfile) -> (PathBuf, SyncRuntimeOpenRequest) {
     let root = std::env::temp_dir().join(format!("tine-sync-runtime-empty-{}", Uuid::new_v4()));
     let graph_root = root.join("graph");
@@ -12155,6 +12314,52 @@ fn pending_shared_join_fixture(
     );
     let active = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone());
     let handle = active.handle.expect("joiner LocalActive");
+    drive_initial_feed(&handle);
+    (initiator, joiner, handle, descriptor)
+}
+
+fn pending_generation_join_fixture(
+    label: &str,
+    seed: u128,
+) -> (
+    ActivationFixture,
+    ActivationFixture,
+    SyncRuntimeHandle,
+    SyncSharedEnrollmentDescriptor,
+) {
+    let initiator = make_shared_fixture(&format!("{label}-initiator"), seed);
+    let mut joiner = make_shared_fixture(&format!("{label}-joiner"), seed);
+    joiner.request.identities.endpoint_id =
+        ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
+    joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
+    joiner.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(seed + 0x12));
+
+    let initiator_handle = SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone())
+        .handle
+        .expect("generation-cut initiator LocalActive");
+    drive_initial_feed(&initiator_handle);
+    let _ = submit_shared_page(
+        &initiator_handle,
+        seed + 0x20,
+        "Generation Cut",
+        "notes/generation-cut.md",
+        "history existed before sharing",
+    );
+    let shared_graph = user_graph_bytes(&initiator.graph_root);
+    let descriptor = initiator_handle
+        .prepare_shared()
+        .expect("generation-cut descriptor publication");
+    copy_provider_tree(
+        &initiator.request.provider_root,
+        &joiner.request.provider_root,
+    );
+    for (relative, bytes) in &shared_graph {
+        let destination = joiner.graph_root.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, bytes).unwrap();
+    }
+    let active = SyncRuntimeHandle::activate_or_resume_local(joiner.request.clone());
+    let handle = active.handle.expect("generation-cut joiner LocalActive");
     drive_initial_feed(&handle);
     (initiator, joiner, handle, descriptor)
 }
