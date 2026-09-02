@@ -1538,6 +1538,9 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             ("journal.fast_append", "self.segment.append("),
             ("journal.managed_append", ".append(payload_kind,payload)"),
             ("journal.turn_append", "self.journal.append("),
+            ("package.publish", "publish_package_noclobber("),
+            ("package.recover", "recover_package_store("),
+            ("package.retire", "retire_package("),
         ],
     );
     let expected = [
@@ -1604,6 +1607,9 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             "journal.v2.prepare",
             1,
         ),
+        ("src-tauri/src/plugins.rs", "package.publish", 1),
+        ("src-tauri/src/plugins.rs", "package.recover", 1),
+        ("src-tauri/src/plugins.rs", "package.retire", 1),
     ]
     .into_iter()
     .map(|(path, boundary, count)| (path.to_owned(), boundary.to_owned(), count))
@@ -1618,10 +1624,10 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.11.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.12.0\""));
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "9ef9a144697760038b8d607ead9cf5c667d7883e0a54b158b59a7188943dea2c",
+        "ab5fa0db2936c55d742204faf26bcf69965d9d2ccdaf6b962435353a25eaed9e",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

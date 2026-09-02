@@ -5683,6 +5683,30 @@
     "failBefore": "proven"
    },
    "notes": "Fail-before on 3a123bc1 in the RELEASE profile (the shipped configuration): saving and annotating the same hls__ page hung both writers permanently, 0 of 2 finished in 60s; the same tree passes in 0.51s after the fix. The saver holds the graph-global graph-text identity gate while it waits for the page lock the annotator holds, so no later graph-text write in the process can proceed either. Debug builds hit debug_assert at model.rs:1542 instead and never reached the hang, which is why it survived. Six writers took the two locks in the wrong order: resolve_vcs_marker_conflict, resolve_durable_live_save_conflict, resolve_sync_conflict, open_pdf, write_highlights and confirm_removed_page_projection_with_attempts. All six now take the identity gate before any page lock; the order is proved statically over model.rs's call graph; and the epoch read refuses instead of silently reading without authority."
+  },
+  {
+   "id": "REG-HARVEST-B5P-PLUGIN-PACKAGE-DURABILITY-001",
+   "title": "A crash during plugin install or uninstall cannot wedge that version until manual filesystem surgery",
+   "family": "plugin-package-durability-and-recovery",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Harvest B5p"
+   },
+   "platforms": ["all", "windows", "android", "ios"],
+   "layer": "tauri-native-and-tine-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/plugins.rs::tests::reopen_reclaims_transient_and_wedged_packages_before_retry",
+     "src-tauri/src/plugins.rs::tests::concurrent_different_installs_leave_one_complete_immutable_winner",
+     "src-tauri/src/plugins.rs::tests::settings_clear_cut_leaves_a_recoverable_package_then_retry_finishes",
+     "src-tauri/src/plugins.rs::tests::production_plugin_writes_stay_on_named_audited_paths"
+    ],
+    "scenario": "APP-REF-PLUGIN-IMMUTABLE-COLLISION plus crash-recovered staging and retirement",
+    "failBefore": "A half-package with plugin.wasm but no manifest was simultaneously not reinstallable and not uninstallable; the production source guard also found bare write, rename, recursive-delete, and directory-delete operations."
+   },
+   "notes": "tine-storage v0.12.0 owns the staged-directory protocol: exact file barriers, a five-target native no-clobber directory move, parent barriers, retire-then-reclaim, and reopen cleanup for .install-/.retired-/incomplete shapes. Tauri keeps manifest and symlink policy, uses the audited settings replacement before retirement, and preserves same-bytes idempotence while refusing different bytes for one immutable id/version. No plugin capability or guest/native authority changes."
   }
  ]
 }
