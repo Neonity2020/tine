@@ -2355,6 +2355,44 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static FRONTIER_DOCUMENT_ENCODE_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TerminalBootstrapEncodeAccounting {
+    pub(crate) actual: usize,
+    pub(crate) required: usize,
+}
+
+#[cfg(test)]
+static TERMINAL_BOOTSTRAP_ENCODE_ACCOUNTING: Mutex<
+    BTreeMap<WorkspaceId, TerminalBootstrapEncodeAccounting>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn reset_terminal_bootstrap_encode_accounting_for_test(workspace: WorkspaceId) {
+    TERMINAL_BOOTSTRAP_ENCODE_ACCOUNTING
+        .lock()
+        .expect("terminal bootstrap encode accounting lock")
+        .insert(workspace, TerminalBootstrapEncodeAccounting::default());
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_bootstrap_encode_accounting_for_test(
+    workspace: WorkspaceId,
+) -> TerminalBootstrapEncodeAccounting {
+    TERMINAL_BOOTSTRAP_ENCODE_ACCOUNTING
+        .lock()
+        .expect("terminal bootstrap encode accounting lock")
+        .get(&workspace)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct FullDigestScanInstrumentation {
     pub(crate) semantic_projection_scans: usize,
@@ -4754,6 +4792,11 @@ impl SqliteFrontier {
             ));
         }
         let engine = source.engine;
+        #[cfg(test)]
+        let frontier_document_encodes_before =
+            FRONTIER_DOCUMENT_ENCODE_COUNT.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let mut required_frontier_document_encodes = 0_usize;
         let mut instrumentation = RebuildInstrumentation::default();
         let writes_before = self.physical.write_instrumentation();
         self.physical.begin_candidate_build()?;
@@ -4769,7 +4812,6 @@ impl SqliteFrontier {
         }
         let prefix_started = std::time::Instant::now();
         let mut provenance = Vec::new();
-        let mut terminal_documents = BTreeMap::new();
         let mut cursor = source.cursor()?;
         while let Some(event) = cursor.next_event().map_err(|error| {
             ProjectionError::Rebuild(format!(
@@ -4787,6 +4829,11 @@ impl SqliteFrontier {
                     event.acceptance_sequence(),
                 ))
             })?;
+            #[cfg(test)]
+            {
+                required_frontier_document_encodes = required_frontier_document_encodes
+                    .saturating_add(event.affected_documents().len());
+            }
             let (_, apply_stats) = self
                 .apply_terminal_prefix_candidate_with_stats(&event)
                 .map_err(|error| {
@@ -4796,15 +4843,6 @@ impl SqliteFrontier {
                         event.acceptance_sequence(),
                     ))
                 })?;
-            for document in event.affected_documents() {
-                terminal_documents.insert(
-                    document.document_id().as_uuid().into_bytes(),
-                    storage_frontier::PhysicalFrontierDocument {
-                        document_id: document.document_id().as_uuid().into_bytes(),
-                        canonical_bytes: encode_frontier_document(document)?,
-                    },
-                );
-            }
             instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
             instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
             instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
@@ -4862,6 +4900,11 @@ impl SqliteFrontier {
             })
             .collect::<Result<Vec<_>, ProjectionError>>()?;
         let expected_terminal_frontier_documents = terminal_documents.len();
+        #[cfg(test)]
+        {
+            required_frontier_document_encodes = required_frontier_document_encodes
+                .saturating_add(expected_terminal_frontier_documents);
+        }
         let seeded_frontier = self
             .physical
             .seed_sparse_terminal_frontier_documents(&terminal_physical_root, &terminal_documents);
@@ -4958,6 +5001,22 @@ impl SqliteFrontier {
             writes_before,
             self.physical.write_instrumentation(),
         );
+        #[cfg(test)]
+        {
+            let frontier_document_encodes_after =
+                FRONTIER_DOCUMENT_ENCODE_COUNT.with(std::cell::Cell::get);
+            TERMINAL_BOOTSTRAP_ENCODE_ACCOUNTING
+                .lock()
+                .expect("terminal bootstrap encode accounting lock")
+                .insert(
+                    engine.workspace_id(),
+                    TerminalBootstrapEncodeAccounting {
+                        actual: frontier_document_encodes_after
+                            .saturating_sub(frontier_document_encodes_before),
+                        required: required_frontier_document_encodes,
+                    },
+                );
+        }
         Ok((instrumentation, bootstrap))
     }
 
@@ -6300,6 +6359,8 @@ fn decode_affected_documents(bytes: &[u8]) -> Result<Vec<DocumentDependencies>, 
 }
 
 fn encode_frontier_document(document: &DocumentDependencies) -> Result<Vec<u8>, ProjectionError> {
+    #[cfg(test)]
+    FRONTIER_DOCUMENT_ENCODE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     postcard::to_allocvec(document)
         .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))
 }

@@ -199,6 +199,49 @@ pub(crate) fn prepared_editor_projection_instrumentation() -> PreparedEditorProj
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProjectionPlanningCounts {
+    pub(crate) planner_invocations: usize,
+    pub(crate) base_parses: usize,
+}
+
+#[cfg(test)]
+static PROJECTION_PLANNING_COUNTS: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<WorkspaceId, ProjectionPlanningCounts>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+pub(crate) fn reset_projection_planning_counts_for_test(workspace_id: WorkspaceId) {
+    PROJECTION_PLANNING_COUNTS
+        .lock()
+        .expect("projection planning count lock")
+        .insert(workspace_id, ProjectionPlanningCounts::default());
+}
+
+#[cfg(test)]
+pub(crate) fn projection_planning_counts_for_test(
+    workspace_id: WorkspaceId,
+) -> ProjectionPlanningCounts {
+    PROJECTION_PLANNING_COUNTS
+        .lock()
+        .expect("projection planning count lock")
+        .get(&workspace_id)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn note_projection_planning_for_test(
+    workspace_id: WorkspaceId,
+    update: impl FnOnce(&mut ProjectionPlanningCounts),
+) {
+    let mut counts = PROJECTION_PLANNING_COUNTS
+        .lock()
+        .expect("projection planning count lock");
+    update(counts.entry(workspace_id).or_default());
+}
+
+#[cfg(test)]
 fn note_prepared_editor_projection(
     update: impl FnOnce(&mut PreparedEditorProjectionInstrumentation),
 ) {
@@ -1065,6 +1108,10 @@ pub(crate) fn plan_projection_with_layout_annotations(
     expected_base: Option<&[u8]>,
     expected_base_annotations: Option<&[AnnotatedIdentity]>,
 ) -> Result<ProjectionPlan, ProjectionError> {
+    #[cfg(test)]
+    note_projection_planning_for_test(workspace_id, |counts| {
+        counts.planner_invocations = counts.planner_invocations.saturating_add(1);
+    });
     let may_adopt_exact_source = expected_base_annotations.is_none()
         || matches!(format_for_page(&state.page)?, ProjectionFormat::Markdown);
     if let Some(source) = expected_base.filter(|_| may_adopt_exact_source) {
@@ -1118,6 +1165,10 @@ fn plan_exact_source_projection(
     source: &[u8],
     expected_base_annotations: Option<&[AnnotatedIdentity]>,
 ) -> Result<ProjectionPlan, ExactSourceProjectionError> {
+    #[cfg(test)]
+    note_projection_planning_for_test(workspace_id, |counts| {
+        counts.base_parses = counts.base_parses.saturating_add(1);
+    });
     let format = format_for_page(&state.page)?;
     let source_text =
         std::str::from_utf8(source).map_err(|_| ProjectionError::InvalidUtf8("projection base"))?;
@@ -1840,7 +1891,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             record_completed_tombstone_path(receipts, engine, plan.intent(), authorization)?
         }
         None => {
-            match record_completed_path(receipts, engine, source.page_id(), plan.intent()) {
+            match record_completed_path(engine, &plan) {
                 Ok(()) => {}
                 Err(ProjectionError::RecoveryIntentMismatch)
                     if engine.require_index_free_clean_projection_runtime().is_ok()
@@ -2018,9 +2069,9 @@ fn recover_receiver_incomplete_projection_under_handoff(
         .map_err(ProjectionError::Engine)?;
     retire_completed_projection_recovery(graph, store, intent, Some(handoff))?;
     let recorded = if formatting_adoption {
-        record_adopted_formatting_path(store, engine, intent.page_id(), intent)
+        record_adopted_formatting_path(engine, &plan)
     } else {
-        record_completed_path(store, engine, intent.page_id(), intent)
+        record_completed_path(engine, &plan)
     };
     match recorded {
         Ok(()) | Err(ProjectionError::RecoveryIntentMismatch) => {}
@@ -3321,9 +3372,9 @@ pub fn recover_incomplete_projections(
         // receipt, but a completion that is no longer the current accepted
         // page state must not replace point-addressable import authority.
         let recorded = if formatting_adoption {
-            record_adopted_formatting_path(store, engine, intent.page_id(), &intent)
+            record_adopted_formatting_path(engine, &plan)
         } else {
-            record_completed_path(store, engine, intent.page_id(), &intent)
+            record_completed_path(engine, &plan)
         };
         match recorded {
             Ok(()) | Err(ProjectionError::RecoveryIntentMismatch) => {}
@@ -3405,21 +3456,17 @@ pub(super) fn retire_one_projection_recovery(
 /// route; otherwise a recovered receipt would be durable but intentionally
 /// invisible to bounded external import.
 fn record_completed_path(
-    store: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
-    page_id: PageId,
-    intent: &ProjectionIntent,
+    plan: &ProjectionPlan,
 ) -> Result<(), ProjectionError> {
-    record_completed_path_with_authorization(store, engine, page_id, intent)
+    record_completed_path_with_authorization(engine, plan)
 }
 
 fn record_adopted_formatting_path(
-    store: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
-    page_id: PageId,
-    intent: &ProjectionIntent,
+    plan: &ProjectionPlan,
 ) -> Result<(), ProjectionError> {
-    record_completed_path_with_authorization(store, engine, page_id, intent)
+    record_completed_path_with_authorization(engine, plan)
 }
 
 fn record_completed_tombstone_path(
@@ -3441,71 +3488,33 @@ fn record_completed_tombstone_path(
 }
 
 fn record_completed_path_with_authorization(
-    store: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
-    page_id: PageId,
-    intent: &ProjectionIntent,
+    plan: &ProjectionPlan,
 ) -> Result<(), ProjectionError> {
-    // Revalidate the completed intent against the current accepted page before
-    // exposing it as point-addressable authority. Historical recovery is
-    // allowed to inspect an old frontier, but it must never replace the
-    // authority for a newer accepted frontier or a reused path.
-    let current = engine.authorize_projection_write(page_id)?;
-    if current.state().page.path != *intent.path()
-        || current.state().frontier != *intent.frontier()
-        || current.state().claim_evidence != intent.claim_evidence()
-    {
+    // Compare the plan that authorized the write with the current accepted
+    // page before exposing it as point-addressable authority. Historical
+    // recovery first proves its reconstructed plan equals the durable intent;
+    // neither path re-derives work already completed by the planner.
+    let intent = plan.intent();
+    let current = engine.authorize_projection_write(intent.page_id())?;
+    if !completed_plan_matches_current(engine.workspace_id(), current.state(), plan) {
         return Err(ProjectionError::RecoveryIntentMismatch);
-    }
-    let base = store.load_base(intent)?;
-    let base_bytes = base.as_ref().map(BaseBlob::bytes);
-    let replay =
-        if base_bytes.is_some_and(|bytes| intent.target() == super::BlobDescription::of(bytes)) {
-            plan_projection_with_layout_annotations(
-                engine.workspace_id(),
-                current.state(),
-                base_bytes,
-                Some(intent.annotations()),
-            )?
-        } else {
-            plan_projection(engine.workspace_id(), current.state(), base_bytes)?
-        };
-    if replay.intent() != intent {
-        // The completion may have been captured by the annotation-guided
-        // planner (its predecessor base carried layout annotations), which the
-        // plain replay above cannot reproduce even though the bytes agree.
-        // Accept only when the guided planner reproduces the recorded intent
-        // exactly from the same current state and recorded base — byte or
-        // frontier drift still refuses through the equality below.
-        let guided = plan_projection_with_layout_annotations(
-            engine.workspace_id(),
-            current.state(),
-            base_bytes,
-            Some(intent.annotations()),
-        )?;
-        if guided.intent() != intent {
-            // Span annotations have two deterministic producer conventions:
-            // exact-source adoption shifts the predecessor's spans (each block
-            // keeps its trailing newline), while a fresh plan derives spans
-            // from the parse (newline excluded). A completion captured through
-            // the former cannot be reproduced by the latter even though every
-            // semantic component agrees. In the index-free clean runtime the
-            // publication below is a no-op, so tolerate exactly that drift:
-            // path, page, frontier, claims and target bytes must still match.
-            let annotations_only_drift =
-                engine.require_index_free_clean_projection_runtime().is_ok()
-                    && guided.intent().path() == intent.path()
-                    && guided.intent().page_id() == intent.page_id()
-                    && guided.intent().frontier() == intent.frontier()
-                    && guided.intent().claim_evidence() == intent.claim_evidence()
-                    && guided.intent().target() == intent.target();
-            if !annotations_only_drift {
-                return Err(ProjectionError::RecoveryIntentMismatch);
-            }
-        }
     }
 
     Ok(())
+}
+
+fn completed_plan_matches_current(
+    workspace_id: WorkspaceId,
+    current: &ProjectionPageState,
+    plan: &ProjectionPlan,
+) -> bool {
+    let intent = plan.intent();
+    intent.workspace_id() == workspace_id
+        && current.page.page_id == intent.page_id()
+        && current.page.path == *intent.path()
+        && current.frontier == *intent.frontier()
+        && current.claim_evidence == intent.claim_evidence()
 }
 
 fn require_endpoint_authority(
@@ -4604,6 +4613,27 @@ mod tests {
         assert!(
             forced_fallback.is_none(),
             "{label}: mismatched capture base must select the ordinary planner"
+        );
+    }
+
+    #[test]
+    fn completion_carries_an_existing_page_plan_without_replanning() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_070));
+        let state = structural_layout_state(
+            "pages/completion-plan.md",
+            vec![(80_071, None, "a", "before".into(), None)],
+        );
+        reset_projection_planning_counts_for_test(workspace);
+        let plan = plan_projection(workspace, &state, Some(b"- before\n")).unwrap();
+
+        assert!(completed_plan_matches_current(workspace, &state, &plan));
+        assert_eq!(
+            projection_planning_counts_for_test(workspace),
+            ProjectionPlanningCounts {
+                planner_invocations: 1,
+                base_parses: 1,
+            },
+            "completion must compare the carried plan without parsing its base again",
         );
     }
 

@@ -22343,6 +22343,54 @@ fn managed_parse_receipt_real_graph_census() {
 }
 
 #[test]
+fn terminal_bootstrap_encodes_only_required_frontier_documents() {
+    const EVENTS: usize = 6;
+    let fixture = ActivationFixture::nested_unicode("terminal-bootstrap-encode-budget", 0xa0da);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("the terminal-bootstrap fixture activates");
+    drive_initial_feed(&handle);
+    for index in 0..EVENTS {
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            &format!("terminal bootstrap history event {index}"),
+        );
+        drain_managed_local(&handle);
+    }
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    drop(handle);
+
+    let workspace_id = fixture.request.identities.workspace_id;
+    crate::oplog::sqlite::remove_disposable_projection(&fixture.request.database_path).unwrap();
+    crate::oplog::sqlite::reset_terminal_bootstrap_encode_accounting_for_test(workspace_id);
+    let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+    let accounting =
+        crate::oplog::sqlite::terminal_bootstrap_encode_accounting_for_test(workspace_id);
+    assert!(
+        accounting.required >= EVENTS,
+        "the generated accepted history did not reach terminal replay: {accounting:?}",
+    );
+    assert_eq!(
+        accounting.actual, accounting.required,
+        "terminal bootstrap encoded replay intermediates beyond its required accepted-batch and exact-terminal documents",
+    );
+    let handle = reopened.handle.expect("the rebuilt fixture reopens");
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
 fn managed_one_block_save_stays_within_two_parser_passes() {
     let fixture = ActivationFixture::nested_unicode("managed-save-parse-budget", 0xa0d9);
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());

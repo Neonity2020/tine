@@ -952,6 +952,17 @@ authorize neither the delivered intent nor the current accepted state retains
 the obligation as a published continuation rather than reporting completion, so
 Safe is never published over a missing projection.
 
+Completion publication carries the `ProjectionPlan` that authorized the graph
+mutation through the completion boundary. Ordinary execution compares that
+plan's workspace, page, path, frontier, and claim evidence with the current
+accepted page before exposing point-addressable authority. Recovery first
+reconstructs one plan from the durable intent and exact base, requires the full
+reconstructed intent to equal the durable intent, uses that same plan for the
+recovery mutation, and then performs the same current-authority comparison.
+Completion recording never invokes the planner again. This preserves the
+stale-frontier and reused-path refusal while making the plan that actually
+authorized the completed bytes—not a later re-derivation—the compared value.
+
 A receiver-local projection can legitimately differ byte-for-byte from the
 source target while expressing the same accepted semantic page. On a later
 local edit, the current accepted manifest head remains the semantic authority,

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
+import { setDataRev } from "../ui";
 import {
   clearTransientLayersForTest,
   dismissTopTransient,
@@ -28,6 +29,28 @@ beforeEach(() => {
 });
 
 describe("QueryBuilder transient ownership (post-GH #161)", () => {
+  it("fetches facets once per builder and refreshes once per data revision", async () => {
+    const facets = vi.mocked(backend().queryFacets);
+    const { host, dispose } = mountBuilder();
+    try {
+      await Promise.resolve();
+      expect(facets).toHaveBeenCalledTimes(1);
+
+      host.querySelector<HTMLButtonElement>(".qb-add")!.click();
+      [...host.querySelectorAll<HTMLButtonElement>(".qb-menu-item")]
+        .find((button) => button.textContent === "Property")!
+        .click();
+      await Promise.resolve();
+      expect(facets).toHaveBeenCalledTimes(1);
+
+      setDataRev((revision) => revision + 1);
+      await Promise.resolve();
+      expect(facets).toHaveBeenCalledTimes(2);
+    } finally {
+      dispose();
+    }
+  });
+
   it("renders a bounded sentinel instead of recursing through a hostile query tree", () => {
     const depth = 65;
     const dsl = `${"(and ".repeat(depth)}[[Leaf]]${")".repeat(depth)}`;

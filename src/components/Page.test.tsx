@@ -30,7 +30,8 @@ import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { resetSharedQueryResultsForTests } from "../queryResultCache";
 
 beforeAll(async () => {
   await initParser();
@@ -43,6 +44,7 @@ afterEach(() => {
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  resetSharedQueryResultsForTests();
   endEdit("blur");
   closeContextMenu();
   resetStore();
@@ -798,7 +800,7 @@ describe("tag-page table", () => {
         ],
       },
     ];
-    vi.spyOn(backend(), "runQuery").mockResolvedValue(groups);
+    const runQuery = vi.spyOn(backend(), "runQuery").mockResolvedValue(groups);
     vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "rev1" });
 
     const tagPage = pageByName("Tag")!;
@@ -820,6 +822,11 @@ describe("tag-page table", () => {
     await tick();
     expect(root.textContent).toContain("Tagged row");
     expect(root.textContent).toContain("Martin");
+    expect(runQuery).toHaveBeenCalledTimes(1);
+
+    setDataRev((revision) => revision + 1);
+    await tick();
+    expect(runQuery).toHaveBeenCalledTimes(2);
 
     (root.querySelector(".sheet-add-row-ghost") as HTMLButtonElement).click();
     await flushMicrotasks();
@@ -834,6 +841,16 @@ describe("tag-page table", () => {
     expect(doc.byId[newId].raw).toMatch(/^#Tag\s*$/);
     expect(editingId()).toBe(newId);
 
+    dispose();
+  });
+
+  it("keeps journal tag-table resources keyed off", async () => {
+    const runQuery = vi.spyOn(backend(), "runQuery").mockResolvedValue([]);
+    const { dispose } = mount(() => (
+      <TagTableToggle page={page("2030-07-15", "journal", [])} />
+    ));
+    await tick();
+    expect(runQuery).not.toHaveBeenCalled();
     dispose();
   });
 });

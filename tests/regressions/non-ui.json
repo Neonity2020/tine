@@ -2,6 +2,69 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-W3-P0-TERMINAL-BOOTSTRAP-DEAD-ENCODE-001",
+   "title": "Terminal SQLite bootstrap encodes only the exact terminal frontier instead of replay intermediates",
+   "family": "managed-storage-lifetime-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 1"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::terminal_bootstrap_encodes_only_required_frontier_documents"],
+    "scenario": "managed-terminal-bootstrap.exact-terminal-frontier-only",
+    "failBefore": "item1-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: six generated accepted events caused 13 frontier-document encodes when only seven accepted-batch and exact-terminal encodes were required"
+   },
+   "notes": "The removed replay-loop BTreeMap was shadowed before its first read; provenance accumulation and exact terminal frontier seeding are unchanged. No contract or format delta."
+  },
+  {
+   "id": "REG-W3-P0-PROJECTION-PLAN-CARRY-001",
+   "title": "An existing-page managed drain plans and parses its base once, then carries that plan through completion",
+   "family": "managed-storage-drain-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 2"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/projection.rs::tests::completion_carries_an_existing_page_plan_without_replanning",
+     "crates/tine-core/src/sync_runtime_tests.rs::projection_recovery_equivalence_oracle_real_store_subset"
+    ],
+    "scenario": "managed-projection-drain.carry-authorized-plan",
+    "failBefore": "item2-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: one existing-page completion made two planner invocations and two base parses instead of one of each"
+   },
+   "notes": "Completion compares the carried plan with current accepted workspace/page/path/frontier/claims. Recovery reconstructs and proves one plan against the durable intent before mutation, then carries it. The storage contract records this authority comparison; receipt formats are unchanged."
+  },
+  {
+   "id": "REG-W3-P0-PAGE-TAG-QUERY-DEDUPE-001",
+   "title": "A routed named page shares one tag query per graph revision across its toggle, table, and split panes",
+   "family": "waited-path-query-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 3"},
+   "platforms": ["all"],
+   "layer": "frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src/components/Page.test.tsx::tag-page table"],
+    "scenario": "page-tag-table.shared-query-per-data-revision",
+    "failBefore": "item3-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: the toggle and enabled table made two identical runQuery calls"
+   },
+   "notes": "The existing sharedQueryResult graph scope is reused; journals retain their null resource key and issue no query. No presentation catalog row is required."
+  },
+  {
+   "id": "REG-W3-P0-QUERY-BUILDER-FACETS-DEDUPE-001",
+   "title": "One Query Builder instance fetches facets once per graph revision for all mounted controls",
+   "family": "waited-path-query-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 4"},
+   "platforms": ["all"],
+   "layer": "frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src/components/QueryBuilder.transient.test.tsx::fetches facets once per builder and refreshes once per data revision"],
+    "scenario": "query-builder.facets-once-per-instance-revision",
+    "failBefore": "item4-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: SummarizeControl and PropertyPick made two queryFacets calls in one builder"
+   },
+   "notes": "The shared resource is owned by the builder instance and keyed by graphEpoch plus dataRev. No global cache and no presentation catalog row are introduced."
+  },
+  {
    "id": "REG-MANAGED-CLEAN-OPEN-CHECKPOINT-001",
    "title": "Clean Managed Storage reopen restores a disposable checkpoint and semantically replays only its uncheckpointed tail",
    "family": "managed-storage-lifetime-cost",

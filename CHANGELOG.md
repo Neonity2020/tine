@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Repeated performance work is cut from four storage and query paths.**
+  Terminal SQLite bootstrap no longer encodes every replay intermediate into a
+  dead map; managed projection completion carries its already-authorized plan
+  instead of parsing and planning again; routed page tag queries share one
+  request per graph revision across the toggle, table, and split panes; and one
+  Query Builder instance shares a graph-revision-keyed facets fetch across its
+  controls. Product behavior and persisted formats are unchanged.
+
 - **Managed-storage startup diagnostics now say which stage did the work, and
   how much.** `TINE_DEBUG=1` already printed a per-stage timing line for a
   managed cold open, but a slow stage could not be attributed to a mechanism.

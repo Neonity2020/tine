@@ -7,6 +7,7 @@ import {
   createSignal,
   createUniqueId,
   onCleanup,
+  type Accessor,
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
@@ -32,7 +33,7 @@ import {
   type SortPreset,
 } from "../editor/queryBuilder";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
-import { pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
+import { dataRev, graphEpoch, pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
 import { registerTransientLayer, type TransientLayer } from "../transientLayers";
 
 // Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
@@ -43,6 +44,9 @@ import { registerTransientLayer, type TransientLayer } from "../transientLayers"
 // `stop` keeps clicks inside the bar from bubbling to the block's onClick, which
 // would drop the block into raw-text edit mode and replace the builder.
 const stop = (e: MouseEvent) => e.stopPropagation();
+
+type QueryFacets = [string, string[]][];
+type QueryFacetsAccessor = Accessor<QueryFacets | undefined>;
 const locKey = (l: number[]) => l.join(".");
 
 type ClauseKind = Clause["kind"];
@@ -220,13 +224,12 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
 // independent (you can group by page AND count per group). The numbers are
 // computed in the frontend from the returned block list (Macro.tsx); this just
 // edits the DSL directive that rides along.
-function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => void; parentTransientId?: string }): JSX.Element {
+function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => void; facets: QueryFacetsAccessor; parentTransientId?: string }): JSX.Element {
   const [open, setOpen] = createSignal(false);
   // Two-step property choice: null = show the top-level buttons; "sum"/"avg" =
   // pick a property to aggregate; "group" = pick a property to group by.
   const [pick, setPick] = createSignal<"sum" | "avg" | "group" | null>(null);
-  const [facets] = createResource(() => backend().queryFacets());
-  const keys = () => (facets() ?? []).map(([k]) => k);
+  const keys = () => (props.facets() ?? []).map(([k]) => k);
   const agg = () => currentAgg(props.tree());
   const group = () => currentGroup(props.tree());
   const active = () => !!agg() || !!group();
@@ -358,6 +361,10 @@ export function QueryBuilder(props: {
   parentTransientId?: string;
 }): JSX.Element {
   const tree = createMemo(() => parseQuery(props.dsl()));
+  const [facets] = createResource(
+    () => `${graphEpoch()}\0${dataRev()}`,
+    () => backend().queryFacets(),
+  );
   // Which popover is open, by op/clause loc + purpose. Only one at a time.
   const [openMenu, setOpenMenu] = createSignal<string | null>(null);
   // Open the root add-picker immediately when this block was just created via
@@ -374,11 +381,11 @@ export function QueryBuilder(props: {
 
   return (
     <div class="qb-bar" onClick={stop}>
-      <Node clause={tree()} loc={[]} isRoot tree={tree} apply={apply}
+      <Node clause={tree()} loc={[]} isRoot tree={tree} apply={apply} facets={facets}
         openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding}
         parentTransientId={props.parentTransientId} />
       <SortControl tree={tree} apply={apply} parentTransientId={props.parentTransientId} />
-      <SummarizeControl tree={tree} apply={apply} parentTransientId={props.parentTransientId} />
+      <SummarizeControl tree={tree} apply={apply} facets={facets} parentTransientId={props.parentTransientId} />
       <button
         class="qb-sort qb-advanced"
         title={ADVANCED_CHEATSHEET}
@@ -410,6 +417,7 @@ interface NodeCtx {
   clause: Clause;
   tree: () => Clause;
   apply: (next: Clause) => void;
+  facets: QueryFacetsAccessor;
   openMenu: () => string | null;
   setOpenMenu: (k: string | null) => void;
   adding: () => string | null;
@@ -565,7 +573,7 @@ function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.
           </>
         }>
           <div class="qb-picker-title">Edit value</div>
-          <ValuePicker kind={editKind()} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
+          <ValuePicker facets={props.facets} kind={editKind()} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
         </Show>
       </div>
     </Show>
@@ -604,6 +612,7 @@ function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
       </button>
       <Show when={open()}>
         <AddPicker
+          facets={props.facets}
           rootRef={(element) => { pickerEl = element; }}
           onCommit={(c) => props.apply(addChild(props.tree(), props.loc, c))}
           onSetOp={(op) => props.apply(setOp(props.tree(), props.loc, op))}
@@ -634,6 +643,7 @@ const FILTER_TYPES: { kind: ClauseKind; label: string }[] = [
 ];
 
 function AddPicker(props: {
+  facets: QueryFacetsAccessor;
   onCommit: (c: Clause) => void;
   onSetOp: (op: "and" | "or") => void;
   rootRef?: (element: HTMLDivElement) => void;
@@ -669,7 +679,7 @@ function AddPicker(props: {
         </For>
       </Show>
       <Show when={step() !== "type"}>
-        <ValuePicker kind={step() as ClauseKind} onCommit={commit} />
+        <ValuePicker facets={props.facets} kind={step() as ClauseKind} onCommit={commit} />
       </Show>
     </div>
   );
@@ -677,7 +687,7 @@ function AddPicker(props: {
 
 // Renders the value collector for a given clause kind. Shared by the add-filter
 // picker and the in-place "Edit value" flow.
-function ValuePicker(props: { kind: ClauseKind; onCommit: (c: Clause) => void }): JSX.Element {
+function ValuePicker(props: { facets: QueryFacetsAccessor; kind: ClauseKind; onCommit: (c: Clause) => void }): JSX.Element {
   return (
     <>
       <Show when={props.kind === "page"}>
@@ -690,7 +700,7 @@ function ValuePicker(props: { kind: ClauseKind; onCommit: (c: Clause) => void })
         <MultiPick options={PRIORITIES} onCommit={(levels) => props.onCommit({ kind: "priority", levels })} />
       </Show>
       <Show when={props.kind === "property"}>
-        <PropertyPick onCommit={(key, value) => props.onCommit({ kind: "property", key, value })} />
+        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit({ kind: "property", key, value })} />
       </Show>
       <Show when={props.kind === "between"}>
         <BetweenPick onCommit={(field, start, end) => props.onCommit({ kind: "between", field, start, end })} />
@@ -702,7 +712,7 @@ function ValuePicker(props: { kind: ClauseKind; onCommit: (c: Clause) => void })
         <PageInput placeholder="Namespace (parent page)" onCommit={(ns) => props.onCommit({ kind: "namespace", ns })} />
       </Show>
       <Show when={props.kind === "pageProperty"}>
-        <PropertyPick onCommit={(key, value) => props.onCommit({ kind: "pageProperty", key, value })} />
+        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit({ kind: "pageProperty", key, value })} />
       </Show>
       <Show when={props.kind === "content"}>
         <TextInput placeholder="Text to search for" onCommit={(text) => props.onCommit({ kind: "content", text })} />
@@ -796,12 +806,11 @@ function MultiPick(props: { options: string[]; onCommit: (picked: string[]) => v
 
 // Property: choose a key (autocompleted from used properties), then a value
 // (from that key's known values, "any", or free text).
-function PropertyPick(props: { onCommit: (key: string, value: string | null) => void }): JSX.Element {
-  const [facets] = createResource(() => backend().queryFacets());
+function PropertyPick(props: { facets: QueryFacetsAccessor; onCommit: (key: string, value: string | null) => void }): JSX.Element {
   const [key, setKey] = createSignal("");
   const [chosen, setChosen] = createSignal<string | null>(null);
-  const keys = () => (facets() ?? []).map(([k]) => k);
-  const valuesFor = (k: string) => (facets() ?? []).find(([kk]) => kk === k)?.[1] ?? [];
+  const keys = () => (props.facets() ?? []).map(([k]) => k);
+  const valuesFor = (k: string) => (props.facets() ?? []).find(([kk]) => kk === k)?.[1] ?? [];
   const [val, setVal] = createSignal("");
 
   return (

@@ -4,7 +4,7 @@ import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatch
 import { PaneContext, focusedRouter, openRouteInOtherPane } from "../panes";
 import {
   isFavorite, toggleFavorite,
-  graphEpoch, openPageInSidebar, openBlockInSidebar, openPageContextMenu, carryDays, showCarryButtons,
+  graphEpoch, graphMeta, openPageInSidebar, openBlockInSidebar, openPageContextMenu, carryDays, showCarryButtons,
   agendaQuery, contextMenu, dataRev, isConflicted, renamePageInNavigation,
   vcsMarkerConflictFor, conflictObjectFor,
 } from "../ui";
@@ -35,6 +35,7 @@ import { graphBinding } from "../persistence";
 import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
 import { selectedThemePresentation } from "../themeGallery";
 import { TodayTaskSummary } from "./TodayTaskSummary";
+import { sharedQueryResult } from "../queryResultCache";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -1057,6 +1058,13 @@ function tagQuery(pageName: string): string {
   return `(tag ${quoteQueryString(pageName)})`;
 }
 
+function sharedTagQuery(pageName: string, requestKey: string): Promise<RefGroup[]> {
+  const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
+  return sharedQueryResult(scope, `page-tag\0${requestKey}`, () =>
+    backend().runQuery(tagQuery(pageName))
+  );
+}
+
 function taggedCount(groups: readonly RefGroup[] | undefined): number {
   return groups?.reduce((sum, group) => sum + group.blocks.length, 0) ?? 0;
 }
@@ -1064,7 +1072,7 @@ function taggedCount(groups: readonly RefGroup[] | undefined): number {
 export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
   const [groups] = createResource(
     () => (props.page.kind === "page" ? `${props.page.name}\0${dataRev()}` : null),
-    () => backend().runQuery(tagQuery(props.page.name))
+    (requestKey) => sharedTagQuery(props.page.name, requestKey)
   );
   const enabled = () => tagTableEnabled(props.page.name);
   const visible = () => props.page.kind === "page" && (enabled() || taggedCount(groups()) > 0);
@@ -1085,7 +1093,7 @@ export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
 export function TagPageTable(props: { pageName: string }): JSX.Element {
   const [groups] = createResource(
     () => `${props.pageName}\0${dataRev()}`,
-    () => backend().runQuery(tagQuery(props.pageName))
+    (requestKey) => sharedTagQuery(props.pageName, requestKey)
   );
   const addRow = async () => {
     const ok = await appendToTodayJournal(`${tagRef(props.pageName)} `);
