@@ -1152,32 +1152,34 @@ refusal that could have come from any of 131 unnamed sites.
 ### 3.1a The private receipt-store claim, and when it is checked
 
 `receipts/projection-receipts.claim` identifies the one implemented private
-receipt-store format by magic. The current claim is **`TINEPR6\0`, `STORE_CLAIM_VERSION` = 6**.
-Earlier development magics — `TINEPR5\0`, `TINEPR4\0`, `TINEPR3\0` — are
+receipt-store format by magic. The current claim is **`TINEPR7\0`, `STORE_CLAIM_VERSION` = 7**.
+Earlier development magics — `TINEPR6\0`, `TINEPR5\0`, `TINEPR4\0`,
+`TINEPR3\0` — are
 recognized only so the low-level opener can refuse them without mutation. They
 have no reader, compatibility implementation, or migration path.
 
-**Why the version moved to 6.** The intent and completion records now carry an
-explicit target-kind discriminant (below). Managed storage has not shipped, so
-the only stores carrying a pre-(c) claim are development stores, and the 0.7
-blank-slate policy applies: the low-level store refuses before mutation; the
-Tauri graph-open boundary preserves the entire unrecognized private root as a
-backup, opens the untouched Markdown/Org tree as the reconstruction source,
+**Why the version moved to 7.** Local forensic evidence previously accepted a
+schema-1 record beside the schema-2 current record. Removing that private
+dual-decoder requires invalidating its containing store too: a TINEPR6 store is
+now rejected at the claim precheck rather than failing later on an unreadable
+record. Managed storage has not shipped, so the 0.7 blank-slate policy applies:
+the Tauri graph-open boundary preserves the entire unrecognized private root as
+a backup, opens the untouched Markdown/Org tree as the reconstruction source,
 and automatically activates a fresh store in the one current format. The user
 does not migrate or manually re-activate anything.
 
 **Why packet 2c does not move it again.** Packet 2c retires only the
 own-endpoint facet of the receipt protocol. The foreign receiver namespaces,
 record formats, and recovery protocol remain live and unchanged, so the
-wholesale-retirement premise for a `TINEPR7` claim is false. A store written by
+wholesale-retirement premise for a claim bump was false by itself. A store written by
 a pre-2c `(c)` build differs only by possibly retaining own-endpoint receipt
 artifacts. Current code neither authors nor consults those artifacts as
 authority: it reports their validated names, leaves their bytes untouched, and
 recovers own work exclusively from the durable turn/journal plus the local
-completion index. Refusing `TINEPR6` would reactivate an intermediate
-development store and could lose undrained frames without adding safety. The
-real-store recovery-equivalence oracle covers every specified crash cut for
-exactly this transition.
+completion index. The independent forensic-decoder retirement above is the
+containing-format reason the claim now moves; packet 2c still contributes no
+additional format change. The real-store recovery-equivalence oracle covers
+every specified crash cut for the 2c transition.
 
 | Claim observed | Response |
 | --- | --- |
