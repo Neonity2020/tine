@@ -20,6 +20,8 @@ import { resetSaveState } from "./persistence";
 // net plus one backend stat diff whose findings arrive as ordinary
 // graph-changed events. Nothing here touches a page directly.
 
+const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 beforeEach(() => {
   resetFocusRescanThrottle();
   setGraphMeta({ root: "/graphs/A" } as never);
@@ -93,6 +95,25 @@ describe("reload on focus", () => {
     release();
     await refresh;
     expect(completed).toBe(true);
+  });
+
+  it("coalesces a same-graph focus during an in-flight rescan into that rescan", async () => {
+    // Fail-before (wave-2 review D2): the replacement decision was made after
+    // the in-flight refresh settled and nulled its binding, so every coalesced
+    // same-graph focus scheduled a second full stat-diff of the graph.
+    let finish!: (sequence: number) => void;
+    const rescan = vi.spyOn(backend(), "rescanGraphNow")
+      .mockImplementation(() => new Promise<number>((resolve) => { finish = resolve; }));
+
+    const first = refreshOnReturnToWindow(100_000);
+    await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(1));
+    const second = refreshOnReturnToWindow(100_001);
+    finish(1);
+    await first;
+    await second;
+    await flushMicrotasks();
+
+    expect(rescan).toHaveBeenCalledTimes(1);
   });
 
   it("drops the old graph tail and queues one non-overlapping refresh for the new binding", async () => {

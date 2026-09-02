@@ -134,14 +134,13 @@ export function refreshOnReturnToWindow(now = Date.now()): Promise<void> {
   sweepReplaceable();
   const bindingChanged = retireChangedBinding();
   if (activeRefresh) {
-    if (bindingChanged || activeRefreshBinding !== stateBinding) queuedBindingRefresh = true;
-    const requestedBinding = stateBinding;
-    return activeRefresh.then(() => {
-      if (activeRefresh && activeRefreshBinding === requestedBinding) return activeRefresh;
-      if (queuedBindingRefresh || activeRefreshBinding !== requestedBinding) {
-        return refreshOnReturnToWindow(now + FOCUS_RESCAN_THROTTLE_MS);
-      }
-    });
+    // Decide replacement NOW, while the in-flight refresh's binding is still
+    // recorded. Deciding after it settles reads the nulled binding and turns
+    // every coalesced same-graph focus into a second full rescan (wave-2 D2).
+    const needsReplacement = bindingChanged || activeRefreshBinding !== stateBinding;
+    if (!needsReplacement) return activeRefresh;
+    queuedBindingRefresh = true;
+    return activeRefresh.then(() => refreshOnReturnToWindow(now + FOCUS_RESCAN_THROTTLE_MS));
   }
   if (now - lastRescan < FOCUS_RESCAN_THROTTLE_MS) return Promise.resolve();
   const scope = captureGraphScope();

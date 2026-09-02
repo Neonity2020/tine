@@ -2017,6 +2017,7 @@ export function Editor(props: { id: string }): JSX.Element {
         try {
           const stored = await trackAssetWrite(backend().importNativeCapture(res.path, candidate));
           if (editorToken) insertStoredAssets(editorToken, [{ stored }]);
+          else reportStaleAsset();
         } catch (err) {
           pushToast(`Couldn’t import the recording (${String(err)})`, "error");
         }
