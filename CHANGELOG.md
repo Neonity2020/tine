@@ -30,6 +30,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Concord now uses the full pane width while you review a conflict.** The
+  ordinary reading-width limit left both versions and their decision controls
+  cramped and wrapping in a spacious window unless you happened to discover
+  wide mode. A mounted resolver now uses that pane's wide content width
+  automatically, then restores the usual reading width when the conflict is
+  resolved; narrow and split panes keep their responsive layout.
+
 - **A failed PDF area-highlight save no longer leaves an invisible nested crop
   behind.** If the PNG lands but the highlight sidecar transaction is refused,
   Tine now moves that exact crop into recoverable asset trash before reverting

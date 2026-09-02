@@ -172,6 +172,27 @@ async function assertLiveConflict(browser, local, current, phase) {
     return cells.some((value) => value.includes(local))
       && cells.some((value) => value.includes(current));
   }, { timeout: 30_000, timeoutMsg: `${phase}: resolver did not retain both sides` });
+  const geometry = await browser.execute(() => {
+    const pane = document.querySelector(".main-content");
+    const inner = document.querySelector(".main-content-inner");
+    const panel = document.querySelector(".page-conflict");
+    if (!(pane instanceof HTMLElement)
+      || !(inner instanceof HTMLElement)
+      || !(panel instanceof HTMLElement)) return null;
+    const style = getComputedStyle(inner);
+    return {
+      panelWidth: panel.getBoundingClientRect().width,
+      usablePaneWidth: pane.getBoundingClientRect().width
+        - parseFloat(style.paddingLeft)
+        - parseFloat(style.paddingRight),
+    };
+  });
+  if (!geometry || Math.abs(geometry.panelWidth - geometry.usablePaneWidth) > 2) {
+    throw new Error(`${phase}: Concord did not span the pane's usable width: ${JSON.stringify(geometry)}`);
+  }
+  if (phase === "direct:Keep Draft:initial") {
+    await browser.saveScreenshot("/tmp/e2e-concord-live-save-width.png");
+  }
 }
 
 async function resolveEverywhere(browser, side) {
@@ -244,15 +265,21 @@ async function runBackend(mode) {
     detached: true,
   });
   await sleep(3000);
-  const newSession = () => remote({
-    hostname: "127.0.0.1",
-    port: DRIVER_PORT,
-    path: "/",
-    capabilities: tauriCapabilities(APP, `concord-live-save-${suffix}`),
-    logLevel: "error",
-    connectionRetryCount: 1,
-    connectionRetryTimeout: 60_000,
-  });
+  const newSession = async () => {
+    const browser = await remote({
+      hostname: "127.0.0.1",
+      port: DRIVER_PORT,
+      path: "/",
+      capabilities: tauriCapabilities(APP, `concord-live-save-${suffix}`),
+      logLevel: "error",
+      connectionRetryCount: 1,
+      connectionRetryTimeout: 60_000,
+    });
+    // Keep a genuinely spacious desktop pane for Concord's review-width
+    // contract; narrow-pane behavior has its own container-query coverage.
+    await browser.setWindowSize(1400, 900);
+    return browser;
+  };
 
   let browser;
   try {

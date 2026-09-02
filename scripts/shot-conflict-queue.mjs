@@ -37,6 +37,21 @@ try {
     if (await page.locator(".page-conflict").count()) break;
   }
   await page.waitForSelector(".page-conflict", { timeout: 5000 });
+  const paneBox = await page.locator(".main-content").boundingBox();
+  const conflictBox = await page.locator(".page-conflict").boundingBox();
+  const contentPadding = await page.locator(".main-content-inner").evaluate((el) => {
+    const style = getComputedStyle(el);
+    return parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  });
+  if (!paneBox || !conflictBox) throw new Error("could not measure Concord geometry");
+  // Concord should consume all usable pane width without requiring the
+  // unrelated wide-mode toggle. Keep the pane's deliberate content gutters.
+  const expectedWidth = paneBox.width - contentPadding;
+  if (Math.abs(conflictBox.width - expectedWidth) > 2) {
+    throw new Error(
+      `Concord stayed reading-width capped: panel=${conflictBox.width}, expected=${expectedWidth}`,
+    );
+  }
   await page.locator(".page-conflict").screenshot({ path: "/tmp/shot-conflict-inpage.png" });
   await page.screenshot({ path: "/tmp/shot-conflict-queue.png" });
   // Concord P5: the Settings surfaces are the INVENTORY only — no merge modal.

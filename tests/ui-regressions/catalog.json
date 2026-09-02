@@ -2,6 +2,30 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-CONCORD-DEFAULT-FULL-WIDTH-20260901",
+      "title": "Concord opens at the pane's full content width without requiring the user to discover wide mode",
+      "family": "external-change-conflict-resolution",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/styles/concordWidth.test.ts",
+          "scripts/shot-conflict-queue.mjs",
+          "scripts/e2e-concord-live-save.mjs"
+        ],
+        "scenario": "concord.default-full-pane-width",
+        "failBefore": "proven"
+      },
+      "notes": "Martin's 2026-09-01 screenshot showed the review panel inheriting the ordinary 810px reading cap in a wide pane, forcing side text and decision controls to wrap. Wide mode already supplied the intended spacious geometry, but discovering that unrelated display toggle is not part of resolving a conflict. While a Concord resolver is mounted, its pane now uses the existing configurable wide cap; the persistent resolver slot keeps that geometry stable when the same panel node moves into the dock, and resolving the conflict restores the ordinary reading cap. Narrow panes continue to use Concord's existing container-query layout."
+    },
+    {
       "id": "UI-PAGE-WIDTH-CONTENT-INDEPENDENT-382",
       "title": "Page width stays fixed while entering edit mode or expanding content, with configurable standard and wide caps",
       "family": "page-layout",

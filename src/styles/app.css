@@ -1259,6 +1259,16 @@ textarea {
   max-width: var(--tine-wide-content-max-width, var(--ls-main-content-max-width-wide));
 }
 
+/* Concord is a review workspace, not reading prose: use the pane's existing
+   wide cap while its resolver is mounted so both versions and their controls
+   have room without requiring the user to discover wide mode. Key this to the
+   persistent slot, not the panel itself — the dock physically reparents the
+   same panel node while expanded. Resolving the conflict removes the slot and
+   restores the ordinary reading width. */
+.main-content-inner:has(.page-conflict-slot) {
+  max-width: var(--tine-wide-content-max-width, var(--ls-main-content-max-width-wide));
+}
+
 /* Document mode: a cleaner prose view — hide bullets, collapse controls, and the
    child indent guides (structure still there, just visually quiet). */
 .document-mode .bullet-container {
