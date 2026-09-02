@@ -8,6 +8,7 @@ import {
   parseFrameExtentsOutput,
   tauriCapabilities,
   waitForHttpServer,
+  waitForServer,
   webdriverSessionToken,
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
@@ -123,6 +124,18 @@ test("waitForHttpServer: retries through failures and reports the attempt budget
     /did not start at http:\/\/127\.0\.0\.1:9\/ after 2 attempts/,
   );
   assert.equal(calls, 2);
+});
+
+test("waitForServer: preserves caller-owned attempt policy and lifecycle checks", async () => {
+  let attempts = 0;
+  let ownershipChecks = 0;
+  await waitForServer("http://preview.invalid", 3, 0, {
+    beforeAttempt: () => { ownershipChecks += 1; },
+    ready: () => true,
+    fetchImpl: async () => ({ ok: ++attempts === 2 }),
+  });
+  assert.equal(attempts, 2);
+  assert.equal(ownershipChecks, 2);
 });
 
 test("webdriver lifecycle finds only the exact tagged process tree", () => {

@@ -62,7 +62,7 @@ import {
   focusCell,
   setCellSel,
 } from "../sheet/selection";
-import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, isFieldId, type FieldId } from "../sheet/fields";
+import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, formulaReferenceName, isFieldId, type FieldId } from "../sheet/fields";
 import { startEditing } from "../editorController";
 import { copyStripCollapsed } from "../copySettings";
 import { copyBlockOutline, writeClipboardText } from "../clipboard";
@@ -679,12 +679,6 @@ function SheetMenu(props: {
       </Show>
     </>
   );
-}
-
-function formulaReferenceName(field: FieldId): string | null {
-  if (field.startsWith("formula:")) return null;
-  if (field.startsWith("prop:")) return field.slice(5);
-  return field;
 }
 
 // Right-click menu for an INLINE block ref `((uuid))` — acts on the referenced

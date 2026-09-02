@@ -2,7 +2,18 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { initParser } from "../render/parse";
 import { doc, resetStore, setDoc, undo, type FeedPage, type Node } from "../store";
 import { setWorkflow } from "../ui";
-import { cycleField, fieldIdsForBlocks, fieldLabel, groupKeysForBlock, isFieldId, readField, writeField, writeTagDelta } from "./fields";
+import {
+  cycleField,
+  fieldIdsForBlocks,
+  fieldIdsForRecords,
+  fieldLabel,
+  groupKeysForBlock,
+  isFieldId,
+  readField,
+  rowTitle,
+  writeField,
+  writeTagDelta,
+} from "./fields";
 
 beforeAll(async () => {
   await initParser();
@@ -57,6 +68,67 @@ describe("sheet fields", () => {
       "prop:estimate",
       "page",
     ]);
+  });
+
+  it("discovers DTO fields through the shared ordered facet accessor", () => {
+    expect(fieldIdsForRecords([
+      {
+        id: "dto-a",
+        page: "Remote",
+        dto: {
+          id: "dto-a",
+          raw: "TODO [#A] One #tag",
+          collapsed: false,
+          children: [],
+          marker: "TODO",
+          priority: "A",
+          tags: ["tag"],
+          properties: [["id", "hidden"], ["owner", "Martin"]],
+        },
+      },
+      {
+        id: "dto-b",
+        page: "Remote",
+        dto: {
+          id: "dto-b",
+          raw: "Two",
+          collapsed: false,
+          children: [],
+          scheduled: "2026-09-03 Thu",
+          deadline: "2026-09-04 Fri",
+          properties: [["estimate", "2h"]],
+        },
+      },
+    ], true)).toEqual([
+      "state",
+      "priority",
+      "scheduled",
+      "deadline",
+      "tags",
+      "prop:owner",
+      "prop:estimate",
+      "page",
+    ]);
+  });
+
+  it("preserves the table and board row-title modes", () => {
+    const row = {
+      id: "dto",
+      page: "Remote",
+      dto: { id: "dto", raw: "First line\nSecond line", collapsed: false, children: [] },
+    };
+    expect(rowTitle(row, "first-line")).toBe("First line");
+    expect(rowTitle(row, "joined-with-placeholder")).toBe("First line Second line");
+    expect(rowTitle({
+      id: "parent",
+      page: "Remote",
+      dto: {
+        id: "parent",
+        raw: "",
+        collapsed: false,
+        children: [{ id: "child", raw: "Child", collapsed: false, children: [] }],
+      },
+    }, "joined-with-placeholder")).toBe("—");
   });
 
   it("keeps field (column) order stable when a cell value is edited (GH #216)", () => {

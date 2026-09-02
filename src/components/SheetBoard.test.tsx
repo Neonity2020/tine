@@ -174,6 +174,40 @@ describe("SheetBoard", () => {
     dispose();
   });
 
+  it("renders a DTO priority chip through the same text contract as a live query row", () => {
+    const remote: FeedPage = {
+      ...page(["live"]),
+      name: "Remote",
+      title: "Remote",
+    };
+    setDoc({
+      byId: {
+        board: node("board", "Board\ntine.view:: board\ntine.group-by:: state", null),
+        live: { ...node("live", "TODO [#A] Live row", null), page: remote.name },
+      },
+      pages: [page(["board"]), remote],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const groups: RefGroup[] = [{
+      page: remote.name,
+      kind: "page",
+      blocks: [
+        { id: "live", raw: "TODO [#A] Live row", marker: "TODO", priority: "A", collapsed: false, children: [] },
+        { id: "dto", raw: "TODO [#A] DTO row", marker: "TODO", priority: "A", collapsed: false, children: [] },
+      ],
+    }];
+
+    const { root, dispose } = mount(() => (
+      <SheetBoard ownerId="board" rowSource="query" groupBy="state" groups={groups} />
+    ));
+    const priorityText = (id: string) =>
+      root.querySelector(`[data-block-id="${id}"] .block-priority`)?.textContent?.trim();
+
+    expect(priorityText("dto")).toBe(priorityText("live"));
+    dispose();
+  });
+
   it("paginates same-UUID page and journal twins by composite row identity", () => {
     const shared = "same-id";
     const filler = Array.from({ length: 199 }, (_, i) => ({

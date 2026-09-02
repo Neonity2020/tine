@@ -404,6 +404,36 @@ export async function waitForHttpServer(url, tries = 40, intervalMs = 250, fetch
 }
 
 /**
+ * Shared readiness wait for script-owned preview servers (DUP-12). Attempt and
+ * interval policy remains explicit at each call site; lifecycle hooks preserve
+ * the few scripts that also prove ownership of their spawned server process.
+ */
+export async function waitForServer(
+  url,
+  tries = 60,
+  intervalMs = 250,
+  {
+    beforeAttempt,
+    ready,
+    beforeFailure,
+    failureMessage = `server did not start at ${url} after ${tries} attempts`,
+    fetchImpl = fetch,
+  } = {},
+) {
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    await beforeAttempt?.();
+    try {
+      if ((await fetchImpl(url)).ok && (await ready?.()) !== false) return;
+    } catch {
+      // The server is still starting.
+    }
+    await sleep(intervalMs);
+  }
+  await beforeFailure?.();
+  throw new Error(typeof failureMessage === "function" ? failureMessage() : failureMessage);
+}
+
+/**
  * The one parser for the `_NET_FRAME_EXTENTS` / `_GTK_FRAME_EXTENTS` xprop
  * output. The two local copies had drifted (DUP-12): one treated
  * "X property not found" as zero extents, the other as malformed. The missing

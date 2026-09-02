@@ -17,8 +17,8 @@ import {
   withUndoUnit,
   type PageMutationAuthority,
 } from "../store";
-import { facetsFromDto, facetsOf, type Facets } from "../render/facets";
-import { pageProperties, visibleBody, isRenderHiddenProp } from "../render/block";
+import { facetsOf } from "../render/facets";
+import { pageProperties } from "../render/block";
 import { InlineText } from "../render/inline";
 import { observeNear, unobserveNear } from "../lazyObserve";
 import { editorOffsetFromRenderedRange } from "../render/spans";
@@ -46,10 +46,15 @@ import {
 import { beginCellPointerSelection, isSheetPointerInteractive, sheetGridIdFromEventTarget } from "../sheet/pointerSelection";
 import {
   cycleField,
+  fieldIdsForRecords,
   fieldIdsForBlocks,
   fieldLabel,
+  formulaReferenceName,
   isFormulaField,
   readField,
+  recordFacets,
+  rowRaw,
+  rowTitle,
   toggleStateMarkerLabel,
   writeField,
   type FieldId,
@@ -503,7 +508,7 @@ export function SheetTable(props: {
     if (!s) return rs;
     const col = columns()[s.col];
     const value = (r: RowRecord): SortKey => {
-      if (col === "title") return { kind: "text", text: rowTitle(r) };
+      if (col === "title") return { kind: "text", text: rowTitle(r, "joined-with-placeholder") };
       const formula = formulaValue(r, col);
       if (formula?.kind === "number") return { kind: "number", value: formula.value, text: String(formula.value) };
       const field = rowFieldValue(r, col);
@@ -1312,63 +1317,6 @@ export function SheetTable(props: {
   );
 }
 
-function recordFacets(row: RowRecord): Facets | null {
-  const n = liveFormulaRowNode(row);
-  if (n) return facetsOf(n.raw, formatForBlock(row.id));
-  return row.dto ? facetsFromDto(row.dto) : null;
-}
-
-function fieldIdsForRecords(rows: readonly RowRecord[], includePage: boolean): FieldId[] {
-  const out: FieldId[] = [];
-  const props: FieldId[] = [];
-  const seenProps = new Set<string>();
-  let hasState = false;
-  let hasPriority = false;
-  let hasScheduled = false;
-  let hasDeadline = false;
-  let hasTags = false;
-  for (const r of rows) {
-    const f = recordFacets(r);
-    if (!f) continue;
-    hasState ||= !!f.marker;
-    hasPriority ||= !!f.priority;
-    hasScheduled ||= !!f.scheduled;
-    hasDeadline ||= !!f.deadline;
-    hasTags ||= f.tags.length > 0;
-    for (const [key] of f.properties) {
-      if (isRenderHiddenProp(key)) continue;
-      const field: FieldId = `prop:${key}`;
-      if (!seenProps.has(field)) {
-        seenProps.add(field);
-        props.push(field);
-      }
-    }
-  }
-  if (hasState) out.push("state");
-  if (hasPriority) out.push("priority");
-  if (hasScheduled) out.push("scheduled");
-  if (hasDeadline) out.push("deadline");
-  if (hasTags) out.push("tags");
-  out.push(...props);
-  if (includePage) out.push("page");
-  return out;
-}
-
-function formulaReferenceName(field: FieldId): string | null {
-  if (isFormulaField(field)) return null;
-  if (field.startsWith("prop:")) return field.slice(5);
-  return field;
-}
-
-function rowRaw(row: RowRecord): string {
-  return liveFormulaRowNode(row)?.raw ?? row.dto?.raw ?? "";
-}
-
-function rowTitle(row: RowRecord): string {
-  const title = visibleBody(rowRaw(row)).join(" ");
-  return title.trim() === "" && (liveFormulaRowNode(row)?.children.length ?? row.dto?.children.length ?? 0) > 0 ? "—" : title;
-}
-
 function clickOffset(e: MouseEvent, contentRef: HTMLDivElement | undefined, raw: string): number | null {
   if (!contentRef) return null;
   const d = document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null };
@@ -1493,9 +1441,9 @@ function TitleCell(props: {
           fallback={
             <Show
               when={props.near}
-              fallback={<span class="sheet-cell-defer">{rowTitle(props.row)}</span>}
+              fallback={<span class="sheet-cell-defer">{rowTitle(props.row, "joined-with-placeholder")}</span>}
             >
-              <InlineText text={rowTitle(props.row)} format={fmt()} />
+              <InlineText text={rowTitle(props.row, "joined-with-placeholder")} format={fmt()} />
             </Show>
           }
         >
