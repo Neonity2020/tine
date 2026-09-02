@@ -4,7 +4,8 @@ import path from "node:path";
 
 export const STORAGE_REPOSITORY = "https://github.com/martinkoutecky/tine-storage";
 export const STORAGE_PIN_METADATA = "docs/dependency-receipts/tine-storage.json";
-export const STORAGE_REQUIRED_JOBS = "linux-complete,windows-complete,android-compile,api-semver";
+export const STORAGE_REQUIRED_JOBS =
+  "linux-complete,windows-complete,android-compile,macos-compile,ios-compile,api-semver";
 // The complete manifest hash pins every persistent format. These v0.2 journal
 // values are also explicit so a superficially valid non-v2 receipt fails with a
 // useful diagnostic before Tine starts consuming the frontier protocol.

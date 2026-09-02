@@ -1016,19 +1016,15 @@ mod tests {
 
     #[test]
     fn production_plugin_writes_stay_on_named_audited_paths() {
-        let source = include_str!("plugins.rs");
-        let production = source.split("\n#[cfg(test)]").next().unwrap();
-        for forbidden in [
-            "std::fs::write(",
-            "std::fs::rename(",
-            "std::fs::remove_dir_all(",
-            "std::fs::remove_dir(",
-        ] {
-            assert!(
-                !production.contains(forbidden),
-                "I-1/I-2: plugin package writes must use the named tine-storage protocol; see settings.rs::app_private_durable_publications_stay_on_named_audited_paths; found {forbidden}"
-            );
-        }
+        crate::test_support::assert_production_region_uses_named_audited_writes(
+            include_str!("plugins.rs"),
+            "tine_storage::publish_package_noclobber",
+            &[],
+        );
+        let production = include_str!("plugins.rs")
+            .split_once("\n#[cfg(test)]")
+            .unwrap()
+            .0;
         assert!(production.contains("tine_storage::publish_package_noclobber"));
         assert!(production.contains("tine_storage::retire_package"));
         assert!(production.contains("tine_storage::recover_package_store"));
