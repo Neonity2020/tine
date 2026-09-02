@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { classifySaveConflictWire, SaveConflictError } from "./backend";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  __setBackendForTest,
+  classifySaveConflictWire,
+  type Backend,
+  SaveConflictError,
+} from "./backend";
 import {
   dirtyPages,
   flushAll,
@@ -11,8 +16,15 @@ import {
   requireManagedRuntimeReopen,
   resetSaveState,
   saveFailureDisposition,
+  scheduleLiveSaveConflictDraftRefresh,
   trackAssetWrite,
 } from "./persistence";
+import type { PageDto } from "./types";
+import {
+  registerLiveSaveConflict,
+  setConflictQueue,
+  setGraphMeta,
+} from "./ui";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
   let resolve!: (value: T) => void;
@@ -23,6 +35,52 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
   });
   return { promise, resolve, reject };
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+  __setBackendForTest(null);
+  setConflictQueue([]);
+  setGraphMeta(null);
+});
+
+describe("live-save conflict capsule refresh", () => {
+  it("debounces changed drafts independently and persists the latest one", async () => {
+    vi.useFakeTimers();
+    const store = vi.fn(async () => {});
+    __setBackendForTest({
+      storeConflictCapsule: store,
+      loadConflictCapsules: async () => [],
+      retireConflictCapsule: async () => {},
+    } as unknown as Backend);
+    setGraphMeta({ root: "/graphs/A" } as never);
+    const page = {
+      name: "Draft",
+      path: "pages/Draft.md",
+      format: "md",
+      blocks: [{ id: "b1", raw: "registered draft", children: [] }],
+      rev: "rev-1",
+    } as unknown as PageDto;
+    await registerLiveSaveConflict(page, "rev-1", 1);
+
+    scheduleLiveSaveConflictDraftRefresh({
+      ...page,
+      blocks: [{ id: "b1", raw: "intermediate draft", children: [] }],
+    });
+    scheduleLiveSaveConflictDraftRefresh({
+      ...page,
+      blocks: [{ id: "b1", raw: "latest draft", children: [] }],
+    });
+
+    expect(store).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(store).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(store).toHaveBeenCalledTimes(2);
+    expect(store.mock.calls.at(-1)?.[1]).toMatchObject({
+      live: { page: { blocks: [{ raw: "latest draft" }] } },
+    });
+  });
+});
 
 describe("asset write close barrier", () => {
   it("flushAll waits for a pending tracked asset write", async () => {

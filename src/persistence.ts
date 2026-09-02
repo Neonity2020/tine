@@ -882,6 +882,30 @@ function enqueueSave(
   return next;
 }
 
+const LIVE_CONFLICT_CAPSULE_DEBOUNCE_MS = 500;
+const liveConflictCapsuleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Capsule durability has its own debounce: a conflicted page remains dirty,
+ * so ordinary save attempts may recur even though there is no file write to
+ * perform. Coalesce those attempts around the latest draft without coupling
+ * the crash-recovery envelope rewrite to the main save timer. */
+export function scheduleLiveSaveConflictDraftRefresh(
+  page: NonNullable<ReturnType<typeof pageToDto>>,
+): void {
+  const previous = liveConflictCapsuleTimers.get(page.name);
+  if (previous) clearTimeout(previous);
+  const token = graphToken;
+  const timer = setTimeout(() => {
+    if (liveConflictCapsuleTimers.get(page.name) !== timer) return;
+    liveConflictCapsuleTimers.delete(page.name);
+    // A timer belongs to the graph whose draft scheduled it. Never let an old
+    // graph's delayed refresh attach to a same-named page after a switch.
+    if (graphToken !== token) return;
+    void refreshLiveSaveConflictDraft(page);
+  }, LIVE_CONFLICT_CAPSULE_DEBOUNCE_MS);
+  liveConflictCapsuleTimers.set(page.name, timer);
+}
+
 /** Write the page's CURRENT state once. No-op success if it isn't dirty and not
  *  forced. Sends `baseRev` (the version the editor loaded) so the backend
  *  conflicts against external changes; updates the baseline on success. On a
@@ -914,7 +938,7 @@ async function doSave(
   if (intent.kind === "ordinary" && !dirty.has(name)) return true; // saved by a prior link
   if (intent.kind === "ordinary" && isConflicted(name)) {
     const draft = pageToDto(name);
-    if (draft) await refreshLiveSaveConflictDraft(draft);
+    if (draft) scheduleLiveSaveConflictDraftRefresh(draft);
     return false;
   }
   // A cross-page move source: hold its save until the destination is durable (C#1).

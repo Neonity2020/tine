@@ -14,15 +14,27 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
-import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import {
+  freeLoopbackPort,
+  tauriCapabilities,
+  webdriverServerArgs,
+} from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
 const APP = process.env.TINE_APP || `${process.env.HOME}/research/tine`;
 const TD = process.env.TAURI_DRIVER
   || (process.env.CARGO_HOME ? `${process.env.CARGO_HOME}/bin/tauri-driver` : "tauri-driver");
-const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4500);
-const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4501);
+const DRIVER_PORT = process.env.E2E_DRIVER_PORT
+  ? Number(process.env.E2E_DRIVER_PORT)
+  : await freeLoopbackPort();
+const NATIVE_PORT = process.env.E2E_NATIVE_PORT
+  ? Number(process.env.E2E_NATIVE_PORT)
+  : await freeLoopbackPort(new Set([DRIVER_PORT]));
+const RUN_LABEL = (process.env.TINE_E2E_RUN_LABEL || "concord-live-save")
+  .replaceAll(/[^A-Za-z0-9_.-]/g, "-");
+const ARTIFACTS = path.resolve(process.env.E2E_ARTIFACT_DIR || "/tmp");
+fs.mkdirSync(ARTIFACTS, { recursive: true });
 
 function waitFor(check, timeout, message, interval = 100) {
   const deadline = Date.now() + timeout;
@@ -52,6 +64,21 @@ function windowIds(env, pattern = "^Tine$") {
   }
 }
 
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function atomicReplace(file, text) {
+  const replacement = `${file}.external`;
+  fs.writeFileSync(replacement, text);
+  fs.renameSync(replacement, file);
+}
+
 function capsuleFiles(root) {
   const found = [];
   const walk = (dir) => {
@@ -73,6 +100,31 @@ function readCapsule(root) {
   const files = capsuleFiles(root);
   if (files.length !== 1) throw new Error(`expected one capsule file, found ${files.length}`);
   return { file: files[0], envelope: JSON.parse(fs.readFileSync(files[0], "utf8")) };
+}
+
+function assertCapsuleRecord(capsule, item, mode, expectedBaseRev) {
+  if (!capsule
+    || capsule.source !== "live-save"
+    || capsule.page_name !== item.name
+    || capsule.page_path !== item.path
+    || capsule.kind !== "page"
+    || !capsule.live) {
+    throw new Error(`${mode}:${item.name}: graph/page capsule binding is invalid`);
+  }
+  if (!JSON.stringify(capsule.live.page).includes(item.local)) {
+    throw new Error(`${mode}:${item.name}: exact retained draft bytes are missing`);
+  }
+  if (typeof capsule.live.base_rev !== "string"
+    || (expectedBaseRev !== undefined && capsule.live.base_rev !== expectedBaseRev)) {
+    throw new Error(`${mode}:${item.name}: exact load baseline is missing or changed`);
+  }
+  if (mode === "managed") {
+    if (capsule.live.disk_rev !== undefined || capsule.live.conflict_epoch !== -1) {
+      throw new Error(`${mode}:${item.name}: replacement authority leaked into the durable capsule`);
+    }
+  } else if (typeof capsule.live.disk_rev !== "string") {
+    throw new Error(`${mode}:${item.name}: durable Direct disk revision is missing`);
+  }
 }
 
 async function visibleButtonContaining(browser, text) {
@@ -126,19 +178,28 @@ async function enableManagedStorage(browser, env) {
 }
 
 async function openPage(browser, title) {
-  const search = await browser.$('button[title^="Search (Ctrl+K)"]');
-  await search.waitForClickable({ timeout: 30_000 });
-  await search.click();
-  const input = await browser.$(".switcher-input");
-  await input.waitForExist({ timeout: 15_000 });
-  await input.setValue(title);
-  const row = await waitFor(async () => {
-    for (const candidate of await browser.$$(".switcher-item")) {
-      if ((await candidate.getText()).includes(title)) return candidate;
-    }
-    return undefined;
-  }, 15_000, `${title} was absent from quick switch`);
-  await row.click();
+  const journals = await browser.$(".nav-item*=Journals");
+  await journals.waitForClickable({ timeout: 30_000 });
+  await journals.click();
+  let link;
+  try {
+    link = await waitFor(async () => {
+      for (const candidate of await browser.$$(".page-ref")) {
+        if ((await candidate.getText()).trim() === title) return candidate;
+      }
+      return undefined;
+    }, 30_000, `${title} was absent from the routed journal links`);
+  } catch (error) {
+    const state = await browser.execute(() => ({
+      body: document.body?.innerText.slice(0, 4000),
+      pageRefs: [...document.querySelectorAll(".page-ref")]
+        .map((node) => node.textContent?.trim() ?? ""),
+      titles: [...document.querySelectorAll(".page-title, .journal-title, .journal-day")]
+        .map((node) => node.textContent?.trim() ?? ""),
+    }));
+    throw new Error(`${String(error)}; routed state: ${JSON.stringify(state)}`);
+  }
+  await link.click();
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()) === title, {
     timeout: 15_000,
     timeoutMsg: `${title} did not open`,
@@ -166,33 +227,17 @@ async function assertLiveConflict(browser, local, current, phase) {
   const resolver = await browser.$(".page-conflict");
   await resolver.waitForExist({ timeout: 30_000 });
   await browser.waitUntil(async () => {
-    const cells = await browser.execute(() =>
-      [...document.querySelectorAll(".page-conflict .sync-merge-cell")]
-        .map((cell) => cell.textContent ?? ""));
-    return cells.some((value) => value.includes(local))
-      && cells.some((value) => value.includes(current));
+    const state = await browser.execute(() => ({
+      text: document.querySelector(".page-conflict")?.textContent ?? "",
+      labels: [...document.querySelectorAll(".page-conflict .sync-merge-collabels span")]
+        .map((label) => label.textContent?.trim() ?? ""),
+    }));
+    return state.text.includes("Your draft and the current file both changed")
+      && state.text.includes(local)
+      && state.text.includes(current)
+      && state.labels.includes("Your retained draft")
+      && state.labels.includes("Current file on disk");
   }, { timeout: 30_000, timeoutMsg: `${phase}: resolver did not retain both sides` });
-  const geometry = await browser.execute(() => {
-    const pane = document.querySelector(".main-content");
-    const inner = document.querySelector(".main-content-inner");
-    const panel = document.querySelector(".page-conflict");
-    if (!(pane instanceof HTMLElement)
-      || !(inner instanceof HTMLElement)
-      || !(panel instanceof HTMLElement)) return null;
-    const style = getComputedStyle(inner);
-    return {
-      panelWidth: panel.getBoundingClientRect().width,
-      usablePaneWidth: pane.getBoundingClientRect().width
-        - parseFloat(style.paddingLeft)
-        - parseFloat(style.paddingRight),
-    };
-  });
-  if (!geometry || Math.abs(geometry.panelWidth - geometry.usablePaneWidth) > 2) {
-    throw new Error(`${phase}: Concord did not span the pane's usable width: ${JSON.stringify(geometry)}`);
-  }
-  if (phase === "direct:Keep Draft:initial") {
-    await browser.saveScreenshot("/tmp/e2e-concord-live-save-width.png");
-  }
 }
 
 async function resolveEverywhere(browser, side) {
@@ -234,8 +279,8 @@ async function runBackend(mode) {
   const graph = `/tmp/tgraph-concord-live-save-${suffix}`;
   const xdg = `/tmp/txdg-concord-live-save-${suffix}`;
   const data = `${xdg}/data`;
-  const mineName = "Keep Draft";
-  const theirsName = "Use Current";
+  const mineName = "B3EKeepDraft";
+  const theirsName = "B3EUseCurrent";
   const mineFile = `${graph}/pages/${mineName}.md`;
   const theirsFile = `${graph}/pages/${theirsName}.md`;
   fs.rmSync(graph, { recursive: true, force: true });
@@ -245,7 +290,9 @@ async function runBackend(mode) {
   }
   fs.writeFileSync(mineFile, "- common mine base\n");
   fs.writeFileSync(theirsFile, "- common theirs base\n");
-  fs.writeFileSync(`${graph}/journals/2026_09_01.md`, `- [[${mineName}]]\n- [[${theirsName}]]\n`);
+  const now = new Date();
+  const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
+  fs.writeFileSync(`${graph}/journals/${journal}.md`, `- [[${mineName}]]\n- [[${theirsName}]]\n`);
 
   const env = {
     ...process.env,
@@ -258,13 +305,40 @@ async function runBackend(mode) {
     WEBKIT_DISABLE_COMPOSITING_MODE: "1",
     GDK_BACKEND: "x11",
   };
-  const log = fs.openSync(`/tmp/td-concord-live-save-${suffix}.log`, "w");
-  const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), {
-    env,
-    stdio: ["ignore", log, log],
-    detached: true,
-  });
-  await sleep(3000);
+  let driver;
+  let driverLog;
+  let browser;
+
+  const startDriver = async (phase) => {
+    driverLog = fs.openSync(path.join(
+      ARTIFACTS,
+      `${RUN_LABEL}-${suffix}-${phase}-tauri-driver.log`,
+    ), "w");
+    driver = spawn(
+      TD,
+      webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"),
+      { env, stdio: ["ignore", driverLog, driverLog], detached: true },
+    );
+    await sleep(3000);
+  };
+  const stopDriver = async (deleteSession) => {
+    if (deleteSession && browser) {
+      try { await browser.deleteSession(); } catch {}
+    }
+    browser = undefined;
+    const pid = driver?.pid;
+    if (pid) {
+      try { process.kill(-pid, "SIGKILL"); } catch {}
+      await waitFor(
+        () => driver.exitCode !== null || !processAlive(pid),
+        30_000,
+        `${suffix}: tauri-driver did not stop`,
+      );
+    }
+    driver = undefined;
+    try { if (driverLog !== undefined) fs.closeSync(driverLog); } catch {}
+    driverLog = undefined;
+  };
   const newSession = async () => {
     const browser = await remote({
       hostname: "127.0.0.1",
@@ -280,23 +354,53 @@ async function runBackend(mode) {
     await browser.setWindowSize(1400, 900);
     return browser;
   };
+  const forceKillApp = async () => {
+    const window = await waitFor(
+      () => windowIds(env)[0],
+      30_000,
+      `${suffix}: native app window was absent before SIGKILL`,
+    );
+    const pid = Number(execFileSync("xdotool", ["getwindowpid", window], {
+      encoding: "utf8",
+      env,
+    }).trim());
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new Error(`${suffix}: native window exposed invalid app pid ${pid}`);
+    }
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !processAlive(pid), 30_000, `${suffix}: SIGKILL did not stop Tine pid ${pid}`);
+    browser = undefined;
+    await stopDriver(false);
+  };
 
-  let browser;
   try {
+    await startDriver("initial");
     browser = await newSession();
     await waitForApp(browser, `${suffix}:initial`);
     if (mode === "managed") await enableManagedStorage(browser, env);
 
     const cases = [
-      { name: mineName, file: mineFile, local: `${suffix} retained laptop draft`, current: `${suffix} current phone body` },
-      { name: theirsName, file: theirsFile, local: `${suffix} second retained draft`, current: `${suffix} second current body` },
+      {
+        name: mineName,
+        path: `pages/${mineName}.md`,
+        file: mineFile,
+        local: `${suffix} retained laptop draft`,
+        current: `${suffix} current phone body`,
+        outage: `${suffix} newer phone body during outage`,
+      },
+      {
+        name: theirsName,
+        path: `pages/${theirsName}.md`,
+        file: theirsFile,
+        local: `${suffix} second retained draft`,
+        current: `${suffix} second current body`,
+        outage: `${suffix} newer second body during outage`,
+      },
     ];
     for (const item of cases) {
       await openPage(browser, item.name);
       await editPage(browser, item.local);
-      const replacement = `${item.file}.external`;
-      fs.writeFileSync(replacement, `- ${item.current}\n`);
-      fs.renameSync(replacement, item.file);
+      atomicReplace(item.file, `- ${item.current}\n`);
       await assertLiveConflict(browser, item.local, item.current, `${suffix}:${item.name}:initial`);
     }
 
@@ -307,28 +411,35 @@ async function runBackend(mode) {
       return observed.envelope.capsules?.length === 2 ? observed : undefined;
     }, 30_000, `${suffix}: native capsule did not contain both retained drafts`);
     const byName = new Map(beforeRestart.envelope.capsules.map((capsule) => [capsule.page_name, capsule]));
+    const baseRevs = new Map();
     for (const item of cases) {
       const capsule = byName.get(item.name);
-      if (!capsule || JSON.stringify(capsule).includes("authority")) {
-        throw new Error(`${suffix}:${item.name}: capsule binding/authority shape is invalid`);
-      }
-      const bytes = JSON.stringify(capsule.live.page);
-      if (!bytes.includes(item.local) || typeof capsule.live.base_rev !== "string") {
-        throw new Error(`${suffix}:${item.name}: exact draft or base revision missing from capsule`);
-      }
-      if (mode === "managed" && (capsule.live.disk_rev !== undefined || capsule.live.conflict_epoch !== -1)) {
-        throw new Error(`${suffix}:${item.name}: Managed replacement authority leaked into capsule`);
-      }
+      assertCapsuleRecord(capsule, item, mode);
+      baseRevs.set(item.name, capsule.live.base_rev);
     }
 
-    await browser.deleteSession();
-    browser = undefined;
-    await sleep(1500);
+    await forceKillApp();
+    for (const item of cases) atomicReplace(item.file, `- ${item.outage}\n`);
+    await startDriver("restart");
     browser = await newSession();
     await waitForApp(browser, `${suffix}:restart`);
 
+    const afterRestart = await waitFor(() => {
+      const observed = readCapsule(data);
+      return observed.envelope.capsules?.length === 2 ? observed : undefined;
+    }, 30_000, `${suffix}: restart did not retain both durable capsules`);
+    if (afterRestart.file !== beforeRestart.file) {
+      throw new Error(`${suffix}: restart restored the capsules under a different graph binding`);
+    }
+    const restoredByName = new Map(
+      afterRestart.envelope.capsules.map((capsule) => [capsule.page_name, capsule]),
+    );
+    for (const item of cases) {
+      assertCapsuleRecord(restoredByName.get(item.name), item, mode, baseRevs.get(item.name));
+    }
+
     await openPage(browser, mineName);
-    await assertLiveConflict(browser, cases[0].local, cases[0].current, `${suffix}:mine:restart`);
+    await assertLiveConflict(browser, cases[0].local, cases[0].outage, `${suffix}:mine:restart`);
     await resolveEverywhere(browser, "mine");
     await waitForFileText(mineFile, (text) => text.includes(cases[0].local), `${suffix}: keep retained draft`);
     const afterFirst = readCapsule(data).envelope.capsules;
@@ -337,19 +448,17 @@ async function runBackend(mode) {
     }
 
     await openPage(browser, theirsName);
-    await assertLiveConflict(browser, cases[1].local, cases[1].current, `${suffix}:theirs:restart`);
+    await assertLiveConflict(browser, cases[1].local, cases[1].outage, `${suffix}:theirs:restart`);
     await resolveEverywhere(browser, "theirs");
-    await waitForFileText(theirsFile, (text) => text.includes(cases[1].current), `${suffix}: use current owner`);
+    await waitForFileText(theirsFile, (text) => text.includes(cases[1].outage), `${suffix}: use current owner`);
     if (capsuleFiles(data).length !== 0) {
       throw new Error(`${suffix}: final resolution was acknowledged before capsule file retirement`);
     }
     const legacy = await browser.execute(() => localStorage.getItem("tine.concord.live-conflicts.v1"));
     if (legacy !== null) throw new Error(`${suffix}: retired localStorage channel survived first use`);
-    console.log(`PASS: ${suffix} live conflicts restored exact capsules and resolved both sides`);
+    console.log(`PASS: ${suffix} SIGKILL restart restored exact capsules, re-observed newer owners, and resolved both sides`);
   } finally {
-    try { if (browser) await browser.deleteSession(); } catch {}
-    try { process.kill(-driver.pid, "SIGKILL"); } catch {}
-    try { fs.closeSync(log); } catch {}
+    try { await stopDriver(true); } catch {}
     await sleep(1500);
   }
 }

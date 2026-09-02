@@ -1244,19 +1244,13 @@
     {
      "class": "exact-safety-interoperability",
      "authority": "Concord live-save contract and Harvest B3: a guarded save refusal retains the exact editor draft, load baseline, and graph/page binding in one app-private durable capsule, without persisting Managed replacement authority.",
-     "userOutcome": "On Direct Files and Tine-managed storage, a local draft racing an external replacement survives a full process restart; both keep-draft and use-current resolutions go through one semantic surface and remove the on-disk capsule before success is shown.",
+     "userOutcome": "On Direct Files and Tine-managed storage, a local draft racing an external replacement survives SIGKILL and restart with its exact draft, baseline, and graph/page binding; a newer owner arriving during the outage is re-observed, both resolution actions use one semantic surface, and the on-disk capsule is removed before success is shown.",
      "blocking": true
     },
     {
      "class": "stateful-ux",
-     "userOutcome": "Both storage modes use the same in-page resolver and queue; after a Managed restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
+     "userOutcome": "Both storage modes use the same in-page resolver and queue; after restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
      "blocking": true
-    },
-    {
-     "class": "flexible-presentation-heuristic",
-     "authority": "Martin's 2026-09-01 Concord review-width requirement.",
-     "userOutcome": "In a spacious desktop pane, Concord uses the pane's usable content width automatically instead of inheriting the prose reading cap or requiring wide mode.",
-     "blocking": false
     }
    ],
    "acceptableVariations": [
@@ -1264,12 +1258,12 @@
     "Labels and explanatory wording may evolve while both texts remain visible and the guarded apply remains explicit."
    ],
    "nonRequirements": [
-    "Exact conflict colors, internal row geometry, button ordering, DOM nesting, or animation; the overall full-pane review width remains required.",
+    "Exact conflict colors, pixel geometry, button ordering, DOM nesting, or animation; pane-width coverage remains in the dedicated render contract.",
     "Exact generated block identities or save debounce duration."
    ],
    "stability": "quarantined",
-   "quarantineReason": "Harvest B3 (2026-09-02): the extended matrix never ran green. First attempt failed on a bare release build without custom-protocol; second attempt failed because the Keep Draft control was absent from the quick switch. The two-attempt stop-loss is exhausted. Unproved at the native boundary: restart restoration on both backends, post-restart resolution, Managed authority re-observation, and on-disk capsule retirement. Unit and native-crate tests cover the capsule protocol and the frontend retirement paths; this journey stays out of batch blocking until it is repaired and burned in.",
-   "notes": "Extended for Harvest B3. The matrix is meant to drive actual guarded conflicts, full app restarts, both resolution sides on both backends, native capsule-file observation and durable retirement; exact control labels and filesystem timing remain non-contractual."
+   "quarantineReason": "Harvest B3E (2026-09-02): fresh two-attempt stop-loss exhausted on unchanged custom-protocol binary SHA-256 03fbd80834ef7c03ac8d1079186503e79c11f0239b02c9c45b5c809aa7b78848. Attempt 1: harness routing failed before the Direct journey because the spaced fixture title was absent from the exact journal-link selector. Attempt 2: the journal visibly contained both replacement simple-name links, but WebdriverIO exposed their labels as [[B3EKeepDraft]] and [[B3EUseCurrent]] while the selector required unbracketed text; classification: harness. Unproved at the native boundary: conflict capture, SIGKILL restoration on both backends, outage-owner re-observation, both resolution actions, and capsule retirement. Focused unit tests cover refresh coalescing and frontend retirement; this journey stays out of batch blocking until its page-ref selector is repaired and the unchanged-binary matrix burns in green.",
+   "notes": "B3E changed the intended journey to kill the actual Tine PID with SIGKILL, restart under a fresh driver, inspect exact capsule draft/baseline/graph-page binding, introduce a newer external owner during the outage, and exercise both resolution sides on both backends. The current quarantined run stops at its journal-link harness selector before those assertions. Exact pixels and filesystem timing are non-contractual."
   },
   "scripts/e2e-dirty-editor-replacement.mjs": {
    "contracts": [

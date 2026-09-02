@@ -494,6 +494,15 @@ export function registerLiveSaveConflict(
 export async function refreshLiveSaveConflictDraft(page: PageDto): Promise<void> {
   const current = liveSaveConflicts.get(page.name);
   if (!current?.live) return;
+  // The capsule already holds the registered draft. Save retries while the
+  // banner is open often carry that same draft, so compare only the fields
+  // that produce page bytes before paying for another atomic envelope write.
+  const persistedDraftBytes = JSON.stringify([
+    current.live.page.pre_block,
+    current.live.page.blocks,
+  ]);
+  const nextDraftBytes = JSON.stringify([page.pre_block, page.blocks]);
+  if (persistedDraftBytes === nextDraftBytes) return;
   const conflict: ConflictObject = {
     ...current,
     live: { ...current.live, page, draft_version: current.live.draft_version + 1 },

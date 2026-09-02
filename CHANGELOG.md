@@ -33,6 +33,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Conflicted pages no longer rewrite their restart-recovery capsule for every
+  save attempt.** Identical retained drafts skip the atomic envelope write, and
+  changed drafts use a capsule-specific debounce so continued editing preserves
+  the latest recovery copy without coupling it to the ordinary page-save timer.
+
 - **Concord now uses the full pane width while you review a conflict.** The
   ordinary reading-width limit left both versions and their decision controls
   cramped and wrapping in a spacious window unless you happened to discover

@@ -3,6 +3,7 @@ import { __setBackendForTest, type Backend } from "./backend";
 import {
   clearLiveSaveConflict,
   conflictQueue,
+  refreshLiveSaveConflictDraft,
   registerLiveSaveConflict,
   retireLiveSaveConflict,
   setConflictQueue,
@@ -28,15 +29,19 @@ const page: PageDto = {
   rev: "rev-1",
 } as unknown as PageDto;
 
-function stubBackend(overrides: Partial<Backend>): { retire: ReturnType<typeof vi.fn> } {
+function stubBackend(overrides: Partial<Backend>): {
+  retire: ReturnType<typeof vi.fn>;
+  store: ReturnType<typeof vi.fn>;
+} {
   const retire = vi.fn(async () => {});
+  const store = vi.fn(async () => {});
   __setBackendForTest({
-    storeConflictCapsule: async () => {},
+    storeConflictCapsule: store,
     loadConflictCapsules: async () => [],
     retireConflictCapsule: retire,
     ...overrides,
   } as unknown as Backend);
-  return { retire };
+  return { retire, store };
 }
 
 afterEach(() => {
@@ -47,6 +52,18 @@ afterEach(() => {
 });
 
 describe("live-save conflict retirement", () => {
+  it("does not rewrite the capsule for identical conflicted draft save attempts", async () => {
+    const { store } = stubBackend({});
+    setGraphMeta({ root: "/graphs/A" } as never);
+    await registerLiveSaveConflict(page, "rev-1", 1);
+
+    await refreshLiveSaveConflictDraft(page);
+    await refreshLiveSaveConflictDraft(page);
+    await refreshLiveSaveConflictDraft(page);
+
+    expect(store).toHaveBeenCalledTimes(1);
+  });
+
   it("clearLiveSaveConflict retires the on-disk capsule for the cleared page", async () => {
     const { retire } = stubBackend({});
     setGraphMeta({ root: "/graphs/A" } as never);
