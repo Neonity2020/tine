@@ -11,6 +11,7 @@ pub(crate) mod absence_decision;
 pub(crate) mod absence_sweep;
 pub(crate) mod batch;
 pub(crate) mod checkpoint_generation;
+pub(crate) mod conflict_history;
 pub(crate) mod discovery;
 pub(crate) mod enrollment;
 pub(crate) mod external_import;

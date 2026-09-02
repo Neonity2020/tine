@@ -21,6 +21,7 @@ use tine_storage::{
 use uuid::Uuid;
 
 use super::absence_decision::{AbsenceCompletionAnchor, AbsenceDecision, AbsenceDecisionMap};
+use super::conflict_history::{ConflictHistoryBatch, ConflictHistoryIndex, ProjectionCreateKey};
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::import::ImportExecutionMaterial;
 use super::lazy_genesis::{
@@ -4193,6 +4194,10 @@ pub struct EngineInstrumentation {
     pub external_history_blob_reads: usize,
     pub recovery_history_record_reads: usize,
     pub projection_reconciliation_history_record_reads: usize,
+    /// Accepted batches loaded while answering the most recent conflict-
+    /// resolution evaluation. A3 binds this to unresolved conflict pairs,
+    /// never to the retained-history length.
+    pub conflict_resolution_history_loads: usize,
     pub effective_title_projection_authority_calls: usize,
     pub effective_title_projection_point_proofs: usize,
     pub effective_title_projection_frontier_head_visits: usize,
@@ -6447,6 +6452,11 @@ pub struct ShardedHotEngine {
     #[cfg(test)]
     retained_catalog_enabled: Cell<bool>,
     history_work: Cell<HistoryWorkStats>,
+    /// Run-local, acceptance-sequence-stamped conflict candidates. Immutable
+    /// accepted batches are authority; this is rebuilt after checkpoint open.
+    conflict_history_index: RefCell<ConflictHistoryIndex>,
+    conflict_resolution_history_loads: Cell<usize>,
+    conflict_resolution_evaluation_active: Cell<bool>,
     accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
     /// Number of accepted documents whose direct frontier names each batch.
     /// This makes provider-head publication proportional to the number of
@@ -6617,6 +6627,9 @@ impl ShardedHotEngine {
             #[cfg(test)]
             retained_catalog_enabled: Cell::new(true),
             history_work: Cell::new(HistoryWorkStats::default()),
+            conflict_history_index: RefCell::new(ConflictHistoryIndex::default()),
+            conflict_resolution_history_loads: Cell::new(0),
+            conflict_resolution_evaluation_active: Cell::new(false),
             accepted_frontier: BTreeMap::new(),
             accepted_tip_refcounts: BTreeMap::new(),
             ephemeral_causal_clocks: BTreeMap::new(),
@@ -8834,6 +8847,7 @@ impl ShardedHotEngine {
             recovery_history_record_reads: work.recovery_history_record_reads,
             projection_reconciliation_history_record_reads: work
                 .projection_reconciliation_history_record_reads,
+            conflict_resolution_history_loads: self.conflict_resolution_history_loads.get(),
             effective_title_projection_authority_calls: work
                 .effective_title_projection_authority_calls,
             effective_title_projection_point_proofs: work.effective_title_projection_point_proofs,
@@ -16112,6 +16126,7 @@ impl ShardedHotEngine {
     /// (audit 4, finding 3). Already-settled pairs are suppressed by the
     /// descendant-touch gate during derivation, so reseeding is idempotent.
     pub(crate) fn accepted_nonlinear_batch_ids(&self) -> Result<Vec<BatchId>, EngineError> {
+        self.ensure_conflict_history_index()?;
         let ids: Vec<BatchId> = self
             .status()
             .accepted_batches()?
@@ -16125,6 +16140,79 @@ impl ShardedHotEngine {
             }
         }
         Ok(nonlinear)
+    }
+
+    fn ensure_conflict_history_index(&self) -> Result<(), EngineError> {
+        if self
+            .conflict_history_index
+            .borrow()
+            .is_current(self.next_acceptance_sequence)
+        {
+            return Ok(());
+        }
+        let accepted = self
+            .accepted_sequence
+            .iter()
+            .map(|(sequence, batch_id)| (*sequence, *batch_id))
+            .collect::<Vec<_>>();
+        let mut rebuilt = ConflictHistoryIndex::default();
+        for (sequence, batch_id) in accepted {
+            let batch = self.load_accepted_validated_batch(batch_id)?;
+            let effect = self.accepted_semantic_effect(&batch)?;
+            let clock = self
+                .ephemeral_causal_clocks
+                .get(&batch_id)
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::Archive(format!(
+                        "accepted conflict-index batch {batch_id} is missing its causal clock"
+                    ))
+                })?;
+            rebuilt.advance(
+                sequence,
+                self.conflict_history_batch(&batch, &effect, clock)?,
+            );
+        }
+        *self.conflict_history_index.borrow_mut() = rebuilt;
+        Ok(())
+    }
+
+    fn conflict_history_batch(
+        &self,
+        batch: &ValidatedBatch,
+        effect: &SemanticEffect,
+        clock: Vec<(CausalPeerId, u64)>,
+    ) -> Result<ConflictHistoryBatch, EngineError> {
+        let mut projection_create_keys = Vec::new();
+        if projection_effect_is_pure_create(effect) {
+            for object in batch
+                .objects()
+                .iter()
+                .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+            {
+                let intent = ManifestedProjectionIntent::decode(object.payload())
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                let Some(bytes) = intent.target().bytes() else {
+                    continue;
+                };
+                if projection_create_forest(effect, intent.page_id()).is_none() {
+                    continue;
+                }
+                projection_create_keys.push(ProjectionCreateKey::new(
+                    intent.page_id(),
+                    intent.path().clone(),
+                    ContentDigest::of(bytes),
+                ));
+            }
+        }
+        Ok(ConflictHistoryBatch::new(
+            batch.manifest().batch_id(),
+            batch.manifest().causal_dot(),
+            clock,
+            batch.manifest().origin(),
+            effect.blocks(),
+            projection_create_keys,
+        ))
     }
 
     /// Whether later accepted history has superseded state recorded by this
@@ -19328,6 +19416,22 @@ impl ShardedHotEngine {
             current_path_catalog_root,
         )?;
         let status_evidence = accepted_evidence.clone();
+        // The disposable index must represent the prior frontier before this
+        // acceptance becomes visible. A checkpoint-restored engine rebuilds
+        // here once; ordinary in-run accepts advance it by the batch delta.
+        self.ensure_conflict_history_index()?;
+        let conflict_history_batch = {
+            let batch = &self.archive[&batch_id];
+            let clock = self.derive_ephemeral_causal_clock(batch.manifest())?;
+            self.conflict_history_batch(
+                batch,
+                effective_view
+                    .as_ref()
+                    .expect("accepted batch has an effective semantic view")
+                    .effect(),
+                clock,
+            )?
+        };
         self.commit_identity_publication(identity);
         self.commit_logseq_claim_updates(
             logseq_claim_candidate.expect("visible batch prepared Logseq claim updates"),
@@ -19335,6 +19439,10 @@ impl ShardedHotEngine {
         self.commit_portable_path_updates(portable_paths);
         self.commit_page_name_updates(page_names);
         self.commit_acceptance_evidence(post_documents, accepted_evidence, tip_transition);
+        self.conflict_history_index.borrow_mut().advance(
+            status_evidence.acceptance_sequence(),
+            conflict_history_batch,
+        );
         self.commit_current_path_catalog_transition(current_path_catalog_transition);
         {
             let mut touched_documents = Vec::with_capacity(replacements.len());
@@ -19742,6 +19850,23 @@ impl ShardedHotEngine {
         &self,
         batch_id: BatchId,
     ) -> Result<Vec<ConflictResolutionIntent>, EngineError> {
+        self.ensure_conflict_history_index()?;
+        self.conflict_resolution_history_loads.set(0);
+        self.conflict_resolution_evaluation_active.set(true);
+        let result = self.conflict_resolution_intents_counted(batch_id);
+        self.conflict_resolution_evaluation_active.set(false);
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_conflict_history_index_for_test(&self) {
+        *self.conflict_history_index.borrow_mut() = ConflictHistoryIndex::default();
+    }
+
+    fn conflict_resolution_intents_counted(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<ConflictResolutionIntent>, EngineError> {
         if self.accepted_batch_is_causally_linear(batch_id)? {
             return Ok(Vec::new());
         }
@@ -19750,18 +19875,10 @@ impl ShardedHotEngine {
         if x_effect.blocks().is_empty() {
             return Ok(Vec::new());
         }
-        let x_containment = self.accepted_batch_causal_containment(&x_batch)?;
-        let accepted = self.status().accepted_batches()?.to_vec();
+        let candidates = self.conflict_history_index.borrow().candidates(batch_id);
         let mut intents = Vec::new();
-        for candidate in accepted {
-            let z_id = candidate.batch_id;
-            if z_id == batch_id {
-                continue;
-            }
+        for z_id in candidates {
             let z_batch = self.load_accepted_validated_batch(z_id)?;
-            if x_containment.contains(z_batch.manifest().causal_dot(), z_id) {
-                continue;
-            }
             let z_effect = self.accepted_semantic_effect(&z_batch)?;
             let shared: Vec<(&BlockDelta, &BlockDelta)> = x_effect
                 .blocks()
@@ -19783,14 +19900,6 @@ impl ShardedHotEngine {
             ) && projection_effect_is_pure_create(&x_effect)
                 && projection_effect_is_pure_create(&z_effect);
             if shared.is_empty() && !possible_projection_create {
-                continue;
-            }
-            // Batches causally after `batch_id` (an already-accepted
-            // resolution, a later user action) are not concurrent with it.
-            // Keep this behind the two cheap overlap classifiers: unrelated
-            // accepted history never needs even a sparse-clock lookup.
-            let z_containment = self.accepted_batch_causal_containment(&z_batch)?;
-            if z_containment.contains(x_batch.manifest().causal_dot(), batch_id) {
                 continue;
             }
             let pair = ConflictPair::from_manifests(x_batch.manifest(), z_batch.manifest());
@@ -19827,31 +19936,11 @@ impl ShardedHotEngine {
         block_id: BlockId,
         pair: &ConflictPair,
     ) -> Result<bool, EngineError> {
-        let min_batch = self.load_accepted_validated_batch(pair.min_batch)?;
-        let max_batch = self.load_accepted_validated_batch(pair.max_batch)?;
-        let accepted = self.status().accepted_batches()?.to_vec();
-        for candidate in accepted {
-            let w_id = candidate.batch_id;
-            if w_id == pair.min_batch || w_id == pair.max_batch {
-                continue;
-            }
-            let w_batch = self.load_accepted_validated_batch(w_id)?;
-            let w_effect = self.accepted_semantic_effect(&w_batch)?;
-            if !w_effect
-                .blocks()
-                .iter()
-                .any(|delta| delta.block_id == block_id)
-            {
-                continue;
-            }
-            let containment = self.accepted_batch_causal_containment(&w_batch)?;
-            if containment.contains(min_batch.manifest().causal_dot(), pair.min_batch)
-                && containment.contains(max_batch.manifest().causal_dot(), pair.max_batch)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(!self.conflict_history_index.borrow().pair_is_unresolved(
+            block_id,
+            pair.min_batch,
+            pair.max_batch,
+        ))
     }
 
     /// Find a later one-sided operation which proves that the two racing text
@@ -19874,34 +19963,23 @@ impl ShardedHotEngine {
         } else {
             pair.min_batch
         };
-        let x_batch = self.load_accepted_validated_batch(x_batch_id)?;
-        let z_batch = self.load_accepted_validated_batch(z_batch_id)?;
         let mut converged = BTreeSet::new();
-        for candidate in self.status().accepted_batches()?.to_vec() {
-            let w_id = candidate.batch_id;
+        let index = self.conflict_history_index.borrow();
+        for w_id in index.unresolved_members(block_id) {
             if w_id == x_batch_id || w_id == z_batch_id {
                 continue;
             }
-            let w_batch = self.load_accepted_validated_batch(w_id)?;
-            let w_effect = self.accepted_semantic_effect(&w_batch)?;
-            let matches_x = w_effect.blocks().iter().any(|delta| {
-                delta.block_id == block_id
-                    && delta.after.as_ref().is_some_and(|after| {
-                        after.owner == x_after.owner && after.content == x_after.content
-                    })
+            let matches_x = index.post_state(w_id, block_id).is_some_and(|after| {
+                after.owner == x_after.owner && after.content == x_after.content
             });
-            let matches_z = w_effect.blocks().iter().any(|delta| {
-                delta.block_id == block_id
-                    && delta.after.as_ref().is_some_and(|after| {
-                        after.owner == z_after.owner && after.content == z_after.content
-                    })
+            let matches_z = index.post_state(w_id, block_id).is_some_and(|after| {
+                after.owner == z_after.owner && after.content == z_after.content
             });
             if !matches_x && !matches_z {
                 continue;
             }
-            let containment = self.accepted_batch_causal_containment(&w_batch)?;
-            let descends_x = containment.contains(x_batch.manifest().causal_dot(), x_batch_id);
-            let descends_z = containment.contains(z_batch.manifest().causal_dot(), z_batch_id);
+            let descends_x = index.contains(w_id, x_batch_id);
+            let descends_z = index.contains(w_id, z_batch_id);
             if descends_x != descends_z {
                 if descends_x && matches_z {
                     converged.insert(z_after.content.clone());
@@ -19932,28 +20010,17 @@ impl ShardedHotEngine {
         } else {
             pair.min_batch
         };
-        let x_batch = self.load_accepted_validated_batch(x_batch_id)?;
-        let z_batch = self.load_accepted_validated_batch(z_batch_id)?;
-        let x_containment = self.accepted_batch_causal_containment(&x_batch)?;
-        let z_containment = self.accepted_batch_causal_containment(&z_batch)?;
-
+        let index = self.conflict_history_index.borrow();
         let mut pairs = BTreeSet::from([(pair.min_batch, pair.max_batch)]);
-        for candidate in self.status().accepted_batches()?.to_vec() {
-            let ancestor_id = candidate.batch_id;
+        for ancestor_id in index.unresolved_members(block_id) {
             if ancestor_id == x_batch_id || ancestor_id == z_batch_id {
                 continue;
             }
-            let ancestor = self.load_accepted_validated_batch(ancestor_id)?;
-            let effect = self.accepted_semantic_effect(&ancestor)?;
-            if !effect
-                .blocks()
-                .iter()
-                .any(|delta| delta.block_id == block_id && delta.after.is_some())
-            {
+            if index.post_state(ancestor_id, block_id).is_none() {
                 continue;
             }
-            let in_x = x_containment.contains(ancestor.manifest().causal_dot(), ancestor_id);
-            let in_z = z_containment.contains(ancestor.manifest().causal_dot(), ancestor_id);
+            let in_x = index.contains(x_batch_id, ancestor_id);
+            let in_z = index.contains(z_batch_id, ancestor_id);
             if in_x == in_z {
                 continue;
             }
@@ -19967,13 +20034,8 @@ impl ShardedHotEngine {
 
         let mut retirements = Vec::new();
         for (min_batch, max_batch) in pairs {
-            let max = self.load_accepted_validated_batch(max_batch)?;
-            let effect = self.accepted_semantic_effect(&max)?;
-            let Some(expected_content) = effect
-                .blocks()
-                .iter()
-                .find(|delta| delta.block_id == block_id)
-                .and_then(|delta| delta.after.as_ref())
+            let Some(expected_content) = index
+                .post_state(max_batch, block_id)
                 .map(|after| after.content.clone())
             else {
                 continue;
@@ -20180,6 +20242,13 @@ impl ShardedHotEngine {
         &self,
         batch_id: BatchId,
     ) -> Result<ValidatedBatch, EngineError> {
+        if self.conflict_resolution_evaluation_active.get() {
+            self.conflict_resolution_history_loads.set(
+                self.conflict_resolution_history_loads
+                    .get()
+                    .saturating_add(1),
+            );
+        }
         if let Some(batch) = self.archive.get(&batch_id) {
             return Ok(batch.clone());
         }

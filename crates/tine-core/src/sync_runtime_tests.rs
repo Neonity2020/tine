@@ -22700,6 +22700,23 @@ fn managed_twenty_page_history_curve_manual_benchmark() {
 /// with archive rebaselining as their terminal bound.
 const A5_ACCEPTED_CAPTURE_RATIO: f64 = 1.25;
 
+const A3_CONFLICT_LOAD_SLOPE: usize = 8;
+const A3_CONFLICT_LOAD_INTERCEPT: usize = 64;
+
+#[test]
+fn conflict_history_gate_and_contract_pin_the_same_pair_bound() {
+    let gate = include_str!("oplog/hot_engine_integration_tests.rs");
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    assert!(gate.contains(&format!(
+        "const LOAD_BOUND: usize = {A3_CONFLICT_LOAD_SLOPE} * UNRESOLVED_PAIRS + {A3_CONFLICT_LOAD_INTERCEPT};"
+    )));
+    assert!(contract.contains("currently unresolved pairs"));
+    assert!(contract.contains("only the currently unresolved pairs"));
+    assert!(contract.contains("full retained history"));
+    assert!(contract.contains("The index is neither resolution evidence"));
+    assert!(contract.contains("nor persisted authority"));
+}
+
 #[test]
 #[ignore = "manual release benchmark: per-stage attribution of the managed crash-reopen curve"]
 fn managed_checkpoint_capture_stays_within_accepted_ratio_manual_benchmark() {

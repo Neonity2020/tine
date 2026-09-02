@@ -65,6 +65,24 @@
    "notes": "The shared resource is owned by the builder instance and keyed by graphEpoch plus dataRev. No global cache and no presentation catalog row are introduced."
   },
   {
+   "id": "REG-W3-A3-BOUNDED-CONFLICT-HISTORY-001",
+   "title": "Conflict evaluation loads scale with unresolved pairs instead of retained history",
+   "family": "managed-storage-lifetime-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 A3"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::conflict_resolution_history_loads_are_bounded_by_unresolved_pairs",
+     "crates/tine-core/src/sync_runtime_tests.rs::conflict_history_gate_and_contract_pin_the_same_pair_bound"
+    ],
+    "scenario": "managed-conflict-resolution.unresolved-pair-index",
+    "failBefore": "a3-fail-before-final-curve.txt at 342c86c7f87f4b5818bc5b1fd78c4eecd14cdf22: one unresolved pair loaded medians of 106, 806, and 1606 accepted batches at retained-history sizes 50, 400, and 800; the 8*C+64 bound was 72"
+   },
+   "notes": "A run-local accepted-sequence index records concurrent same-block pairs, exact pure-create projection candidates, descendant settlement, and only the sparse settled ancestry needed by later one-sided convergence. It advances from accepted semantic deltas and rebuilds from immutable accepted history after reopen; it is not persisted and cannot author or suppress a resolution by itself. The explicit harvest scale gate replays history newest-first into a fresh engine and evaluates each size three times without adding seven minutes to every ordinary core test run."
+  },
+  {
    "id": "REG-MANAGED-CLEAN-OPEN-CHECKPOINT-001",
    "title": "Clean Managed Storage reopen restores a disposable checkpoint and semantically replays only its uncheckpointed tail",
    "family": "managed-storage-lifetime-cost",

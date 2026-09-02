@@ -6464,6 +6464,155 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
         .unwrap()
         .is_empty());
 }
+
+fn a3_conflict_history_load_samples(history_size: usize) -> Vec<usize> {
+    let ids = Ids::new();
+    let dir = TestDir::new(&format!("a3-conflict-history-{history_size}"));
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let mut author_engine = ids.engine();
+    author_engine.stage_ready(baseline.clone());
+    let mut replay_batches = Vec::with_capacity(history_size);
+
+    for index in 0..history_size {
+        let transaction = tx(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: ids.block_c,
+                home_document_id: ids.home_c,
+            },
+            content: format!("unrelated history {index}"),
+        }]);
+        let unique = 0xa3_0000_u64 + index as u64;
+        let prepared = author_engine
+            .prepare_fixture_transaction(author(unique as u128, unique), &transaction)
+            .unwrap();
+        let batch = ready(&archive, &prepared);
+        assert!(matches!(
+            author_engine.stage_ready(batch.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        replay_batches.push(batch);
+    }
+
+    // Rebuild a fresh run-local index while the retained linear history is
+    // delivered newest-first. The ready queue drains it only when the missing
+    // prefix arrives, exercising replay and out-of-order admission together.
+    let mut evaluation_engine = ids.engine();
+    evaluation_engine.stage_ready(baseline.clone());
+    for batch in replay_batches.into_iter().rev() {
+        assert!(!matches!(
+            evaluation_engine.stage_ready(batch).disposition,
+            BatchDisposition::Rejected { .. }
+        ));
+    }
+
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "A3 offline edit".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let unique = 0xa3_f000_u64;
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(unique as u128, unique),
+        edited,
+        author((unique + 1) as u128, unique + 1),
+        deleted,
+    );
+    assert!(matches!(
+        evaluation_engine.stage_ready(edited).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        evaluation_engine.stage_ready(deleted.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    (0..3)
+        .map(|_| {
+            assert!(!evaluation_engine
+                .conflict_resolution_intents(deleted.manifest().batch_id())
+                .unwrap()
+                .is_empty());
+            evaluation_engine
+                .instrumentation()
+                .conflict_resolution_history_loads
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "harvest A3 scale gate: 50/400/800 replayed histories, medians of three"]
+fn conflict_resolution_history_loads_are_bounded_by_unresolved_pairs() {
+    const UNRESOLVED_PAIRS: usize = 1;
+    const LOAD_BOUND: usize = 8 * UNRESOLVED_PAIRS + 64;
+    let mut medians = Vec::new();
+    for history_size in [50_usize, 400, 800] {
+        let mut samples = a3_conflict_history_load_samples(history_size);
+        samples.sort_unstable();
+        let median = samples[1];
+        eprintln!(
+            "A3 history={history_size} unresolved={UNRESOLVED_PAIRS} samples={samples:?} median={median} bound={LOAD_BOUND}"
+        );
+        medians.push((history_size, median));
+    }
+    for (history_size, median) in medians {
+        assert!(
+            median <= LOAD_BOUND,
+            "conflict evaluation loaded {median} accepted batches at history {history_size}; bound {LOAD_BOUND}"
+        );
+    }
+}
+
+#[test]
+fn conflict_history_index_rebuild_matches_incremental_resolution_results() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a3-conflict-index-rebuild");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "A3 rebuilt conflict".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(0xa3_f100, 0xa3_f100),
+        edited,
+        author(0xa3_f101, 0xa3_f101),
+        deleted,
+    );
+    let engine = apply_pair(ids, &baseline, edited, deleted.clone());
+    let before = engine
+        .conflict_resolution_intents(deleted.manifest().batch_id())
+        .unwrap();
+    let snapshot = engine.canonical_snapshot().unwrap();
+
+    // A clean checkpoint intentionally carries no copy of this disposable
+    // cache. Dropping it models that open boundary; the next evaluation must
+    // reconstruct the exact candidates from accepted batches.
+    engine.drop_conflict_history_index_for_test();
+    let rebuilt = engine
+        .conflict_resolution_intents(deleted.manifest().batch_id())
+        .unwrap();
+    assert_eq!(rebuilt, before);
+    assert_eq!(engine.canonical_snapshot().unwrap(), snapshot);
+}
 // ---------------------------------------------------------------------------
 // Harvest A4 — run-local identity indexes have NO fixed capacity (FIXED).
 //

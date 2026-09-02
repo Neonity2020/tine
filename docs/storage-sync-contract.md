@@ -943,6 +943,23 @@ sibling has deterministic conflict-pair identity so later convergence can
 retire it, but retirement is permitted only while its text is unchanged and it
 has no children; any user-touched sibling remains user data.
 
+Conflict evaluation uses one disposable, run-local index stamped by accepted
+sequence. Each accepted semantic delta adds its touched blocks and concurrent
+same-block pairs. Pure projection creates also meet through the exact page,
+path, and target-byte digest because their sparse block identities may differ;
+the existing forest-shape proof remains authoritative. A later touch that
+causally descends from both members removes the settled pair. Evaluation visits
+only the currently unresolved pairs and their causal branch members, never the
+full retained history. When a descendant settles a pair, the index carries
+only that pair's transitive members as sparse branch ancestry; a later
+concurrent descendant can therefore retire the deterministic sibling authored
+for the earlier pair without rediscovering unrelated history. A cold or
+checkpoint-backed open rebuilds the index from immutable accepted batches
+before conflict work is reseeded, and any stamp mismatch does the same before
+the next acceptance or evaluation. The index is neither resolution evidence
+nor persisted authority: dropping it cannot change an answer, and no history
+cap or fixed lookback participates in classification.
+
 Concurrent new blocks may legitimately choose the same sibling-order key.
 Projection orders that temporary merged state by `(order key, block identity)`;
 equal order keys are not corruption and must not block provider recovery. A

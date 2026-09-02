@@ -39,6 +39,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Query Builder instance shares a graph-revision-keyed facets fetch across its
   controls. Product behavior and persisted formats are unchanged.
 
+- **Conflict resolution now scales with unresolved races rather than retained
+  history.** A disposable accepted-sequence index tracks concurrent block
+  pairs, exact pure-create projection candidates, and descendant settlement;
+  it rebuilds from immutable accepted batches on reopen and leaves conflict
+  semantics and persisted formats unchanged.
+
 - **Managed-storage startup diagnostics now say which stage did the work, and
   how much.** `TINE_DEBUG=1` already printed a per-stage timing line for a
   managed cold open, but a slow stage could not be attributed to a mechanism.
