@@ -1645,12 +1645,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
         .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.12.0\""));
-    // Re-pinned 2026-09-02 (wave-2 fix-ups): packet A5 added
-    // `checkpoint_generation.rs` (one `DurableDirectoryPublication::open`)
-    // without updating this census, so master 7623fb76 was red here.
+    // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
+    // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
+    // callers without updating this census, so checkpoint 15abd615 was red here.
+    // The write-crossing table above remains unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1de0036d4d96794366ef120ab4428d9c1898f732bf2b8bf08ada78da26f0dd23",
+        "fc5d7b6b196ba0336e0d36cec9ed5f1a440ecbd90fda2b0ddebe09c8c731e49b",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
