@@ -41,6 +41,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   formula/query/peek/backlink recursion has explicit bounds, and external HTML
   text can no longer inject Markdown structure through disabled escaping.
 
+- **Harvest H — pre-release Managed private formats have one decoder, and
+  concurrent theme changes no longer overwrite one another.** Schema-4 lazy
+  genesis and schema-1 forensic records now invalidate their containing store
+  so the existing preserve-and-rebuild lifecycle handles them atomically;
+  theme package installs and removals serialize their shared settings array.
+
 - Media (audio/video) assets returned 403 and never loaded when a graph runs under Managed Storage; the native media protocol now serves assets under both storage authorities with unchanged path containment and binding checks (internal B026).
 
 - Managed Storage stopped accepting work at 4,096 lifetime-distinct page

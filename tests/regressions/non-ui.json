@@ -316,7 +316,7 @@
    "coverage": {
     "tests": [
      "crates/tine-core/src/oplog/projection_store.rs::tests::same_byte_rebind_after_handle_capture_never_publishes_cleanup_authority",
-     "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_decodes_but_never_authorizes_cleanup",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_is_not_decoded_by_the_current_store",
      "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_preserves_same_byte_replacement",
      "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_state_and_identity_fail_closed",
      "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_temp_is_bounded_and_unicode_unknown_fails_closed"
@@ -324,7 +324,7 @@
     "scenario": "projection.recovery-sidecar-settlement-and-retirement",
     "failBefore": "proven"
    },
-   "notes": "Catalog maintenance 2026-08-28: packet 2b deliberately collapsed the restart/grace cleanup protocol and removed its obsolete tests. The remaining coverage names the retained fail-closed resource-substitution, canonical-v1 compatibility, same-byte replacement, and cleanup-namespace integrity contract; deleted retirement-oracle tests are not release evidence."
+   "notes": "Catalog maintenance 2026-08-28: packet 2b deliberately collapsed the restart/grace cleanup protocol and removed its obsolete tests. Harvest H then removed the schema-1 forensic decoder entirely and moved the containing store claim to TINEPR7; old evidence is preserved only as part of the rejected private-store backup, never interpreted as cleanup authority. The remaining coverage names fail-closed resource substitution, same-byte replacement, and cleanup-namespace integrity; deleted retirement-oracle tests are not release evidence."
   },
   {
    "id": "REG-SYNC-PROVIDER-OBSERVATION-ORDERING-001",
@@ -5501,7 +5501,7 @@
    "status": "needs-revalidation",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_v4_dual_decode_defaults_to_receiptless_fallback",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_decoder_accepts_only_the_current_receipted_shape",
      "crates/tine-core/src/oplog/lazy_genesis.rs::tests::sqlite_receipt_bounds_are_inclusive_and_omit_after_either_cap",
      "crates/tine-core/src/oplog/import.rs::tests::import_admission_reuses_the_parser_owned_document",
      "crates/tine-core/src/outline.rs::tests::exact_source_parse_cache_is_three_entry_format_keyed_and_never_caches_refusals",
@@ -5511,7 +5511,7 @@
     ],
     "failBefore": "proven on the MS-08 packet base: rebuilding a missing disposable SQLite projection reparsed both pages in a two-page healthy baseline; the permanent budget requires zero source parses for already-receipted pages"
    },
-   "notes": "Internal MS-08 cost-model correction. New page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Receiptless capsule v4 remains dual-decodable. Any absent, stale, invalid, or capsule-inconsistent receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save census now counts the whole-document outline parser primitive rather than selected Graph callers. A bounded three-entry exact-source cache covers the accepted base, requested target, and clean render base, while parser-owned heading event facts avoid per-block outline reparses. The first and steady post-drain one-block saves both remain within two whole-document outline parser invocations, and both drain legs assert zero. Lost all four receipt-reuse proofs (reuse without reparsing, stale-receipt reparse, oversized-receipt omission, schema tripwire) that state this row's outcome; the surviving parser-pass and parse-cache tests are neighbors, not substitutes. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
+   "notes": "Internal MS-08 cost-model correction. Page-capsule v5 records optionally retain the parser-owned MaterializedPageInput-equivalent payload, bound to the exact-source digest, its own canonical semantic digest, and an explicit parser schema. Receipts are capped at 64 MiB and one million block rows; exceeding either bound omits the receipt without blocking activation. Harvest H removed the receiptless capsule-v4 fallback and moved the containing lazy-genesis manifest to schema 5, so an old baseline takes the preserve-and-rebuild lifecycle rather than a dual decoder. Any absent, stale, invalid, or capsule-inconsistent current receipt takes the retained exact-source reparse-and-compare path, and real divergence still refuses reconstruction. The foreground save census now counts the whole-document outline parser primitive rather than selected Graph callers. A bounded three-entry exact-source cache covers the accepted base, requested target, and clean render base, while parser-owned heading event facts avoid per-block outline reparses. The first and steady post-drain one-block saves both remain within two whole-document outline parser invocations, and both drain legs assert zero. Lost all four receipt-reuse proofs (reuse without reparsing, stale-receipt reparse, oversized-receipt omission, schema tripwire) that state this row's outcome; the surviving parser-pass and parse-cache tests are neighbors, not substitutes. Coverage cited here was deleted by the MS-14b managed-storage retirement (9f24d985 detached bootstrap/Patricia, d3707944 enrollment writer residue, 1a3352b0 resume-point residue); the dead references are removed and this note is the audit trail. Found by the 2026-09-01 debt audit: 13 rows cited 24 deleted tests because check:regressions never ran on landed master (ci.yml had no push trigger)."
   },
   {
    "id": "REG-MANAGED-MS14-R0-CURRENT-HEAD-AND-SPARSE-INTEGRITY",
@@ -5733,6 +5733,46 @@
     "failBefore": "proven"
    },
    "notes": "Fail-before on 3a123bc1 in the RELEASE profile (the shipped configuration): saving and annotating the same hls__ page hung both writers permanently, 0 of 2 finished in 60s; the same tree passes in 0.51s after the fix. The saver holds the graph-global graph-text identity gate while it waits for the page lock the annotator holds, so no later graph-text write in the process can proceed either. Debug builds hit debug_assert at model.rs:1542 instead and never reached the hang, which is why it survived. Six writers took the two locks in the wrong order: resolve_vcs_marker_conflict, resolve_durable_live_save_conflict, resolve_sync_conflict, open_pdf, write_highlights and confirm_removed_page_projection_with_attempts. All six now take the identity gate before any page lock; the order is proved statically over model.rs's call graph; and the epoch read refuses instead of silently reading without authority."
+  },
+  {
+   "id": "REG-HARVEST-H-MANAGED-FORMAT-001",
+   "title": "A pre-0.7 Managed store is preserved as a backup and rebuilt automatically instead of being refused or silently decoded",
+   "family": "managed-storage-data-safety-and-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage-and-tauri-lifecycle",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::capsule_decoder_accepts_only_the_current_receipted_shape",
+     "crates/tine-core/src/oplog/lazy_genesis.rs::tests::lazy_genesis_pack_is_deterministic_bounded_and_point_readable",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_is_not_decoded_by_the_current_store",
+     "crates/tine-core/src/oplog/projection_store.rs::tests::the_previous_claim_family_is_rejected_as_an_upgrade_boundary",
+     "crates/tine-core/src/sync_runtime_tests.rs::a_pre_c_private_store_is_refused_before_any_graph_mutation",
+     "src-tauri/src/graph.rs::tests::pre_07_unknown_state_archives_then_rebuilds_without_manual_reactivation",
+     "src-tauri/src/sync_runtime.rs::tests::blank_slate_archive_preserves_every_private_byte"
+    ],
+    "scenario": "managed-storage.pre-0.7-containing-format-blank-slate-rebuild",
+    "failBefore": "proven: schema-4 capsules and schema-1 forensic evidence decoded as current, and a TINEPR6 store reopened normally"
+   },
+   "notes": "The lazy-genesis containing manifest moved from schema 4 to 5, and the projection receipt-store claim moved from TINEPR6/version 6 to TINEPR7/version 7. Prior containing formats are recognized only at the no-mutation precheck. The existing graph-open lifecycle durably archives every private byte, publishes Direct Files as the reconstruction source, and automatically activates the one current Managed format. No migration decoder was added."
+  },
+  {
+   "id": "REG-HARVEST-H-THEME-RMW-001",
+   "title": "Two concurrent theme changes do not lose one another or leave storage different from the UI",
+   "family": "theme-package-persistence",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest H"},
+   "platforms": ["all"],
+   "layer": "frontend-persistence",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/themes/manager.test.ts::serializes overlapping mutations of the shared package array"
+    ],
+    "scenario": "themes.concurrent-shared-array-read-modify-write",
+    "failBefore": "proven: two deliberately overlapped installs completed with only the first theme in durable storage and the installedThemes signal"
+   },
+   "notes": "All installs and removals rewrite theme.packages.v1, so one module-wide promise chain serializes them. Each queued mutation recomputes from installedThemes inside the chain, persists that exact array, then publishes the same array to the signal."
   }
  ]
 }

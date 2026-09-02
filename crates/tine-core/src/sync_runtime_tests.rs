@@ -268,11 +268,11 @@ fn a_pre_c_private_store_is_refused_before_any_graph_mutation() {
         SyncShutdownOutcome::Safe(_)
     ));
 
-    // A pre-(c) claim: the prior magic family, recognized and refused.
+    // The immediately previous claim family must be recognized and refused.
     let claim_path = store_claim_path(&fixture.request);
     let mut claim = Vec::new();
-    claim.extend_from_slice(b"TINEPR5\0");
-    claim.extend_from_slice(&5_u32.to_be_bytes());
+    claim.extend_from_slice(b"TINEPR6\0");
+    claim.extend_from_slice(&6_u32.to_be_bytes());
     claim.extend_from_slice(&[0_u8; 32]);
     claim.extend_from_slice(fixture.request.identities.workspace_id.as_uuid().as_bytes());
     claim.extend_from_slice(&[0_u8; 1 + 16 + 16 + 32 + 5 * 32]);
@@ -407,7 +407,7 @@ fn the_claim_precheck_leaves_fresh_activation_and_ordinary_reopen_unaffected() {
 
     let claim = fs::read(store_claim_path(&fixture.request)).unwrap();
     assert!(
-        claim.starts_with(b"TINEPR6\0"),
+        claim.starts_with(b"TINEPR7\0"),
         "a freshly initialized store carries the current claim magic"
     );
 

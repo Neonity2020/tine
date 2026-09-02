@@ -883,7 +883,7 @@ fn corrupt_missing_noncanonical_and_unknown_evidence_fail_closed() {
     // The CURRENT magic naming a version this build does not know. It moves
     // with the store format: the point of the case is "current family, future
     // version", not the literal bytes.
-    claim.extend_from_slice(b"TINEPR6\0");
+    claim.extend_from_slice(b"TINEPR7\0");
     claim.extend_from_slice(&99_u32.to_be_bytes());
     claim.extend_from_slice(&[0_u8; 32]);
     claim.extend_from_slice(workspace(1).as_uuid().as_bytes());
@@ -1068,7 +1068,7 @@ fn claimless_nonempty_and_prior_version_receipt_roots_fail_without_mutation() {
                             **source,
                             ProjectionStoreError::UpgradeRequired {
                                 found: refused,
-                                current: 6
+                                current: 7
                             } if refused == found
                         )
             ),
