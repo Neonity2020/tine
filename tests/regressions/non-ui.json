@@ -185,11 +185,11 @@
    "layer": "frontend",
    "status": "covered",
    "coverage": {
-    "tests": ["src/components/QueryBuilder.transient.test.tsx::fetches facets once per builder and refreshes once per data revision"],
+    "tests": ["src/components/QueryBuilder.transient.test.tsx::fetches facets once and refreshes once per data revision"],
     "scenario": "query-builder.facets-once-per-instance-revision",
     "failBefore": "tine-agents/evidence/wave3/P0/item4-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: SummarizeControl and PropertyPick made two queryFacets calls in one builder"
    },
-   "notes": "The shared resource is owned by the builder instance and keyed by graphEpoch plus dataRev. No global cache and no presentation catalog row are introduced."
+   "notes": "The shared resource is owned by the builder instance and keyed by graphEpoch plus dataRev. Harvest W4-P1 then made the REQUEST shared across instances too, through sharedQueryResult under a query-facets key namespace: the scope stays per-builder by decision, so this row's outcome is unchanged and now holds a fortiori. Its proof test lost the words \"per builder\" from its title in that packet, because per-builder fetching is exactly what stopped being true; see REG-W4-B4B-DIRECT-INDEXED-QUERY-ROUTING-001's sibling UI row UI-HARVEST-W4-P1-QUERY-BUILDER-FACET-SHARING for the cross-instance bound."
   },
   {
    "id": "REG-W3-A3-BOUNDED-CONFLICT-HISTORY-001",
