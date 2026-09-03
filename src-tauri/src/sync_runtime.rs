@@ -3370,6 +3370,11 @@ pub(crate) fn run_android_managed_return_to_direct_files(
         .graphs
         .write()
         .unwrap()
+        // No `map_err` here: `GraphRegistry::bind` is typed (W4-E2) and this
+        // helper now returns `CommandError` too (W4-E2b), so `?` is the whole
+        // conversion. Nothing on a Linux host compiles this
+        // `#[cfg(target_os = "android")]` body — CI is the first gate that
+        // does, which is how the E2 version of this line broke Android twice.
         .bind("managed-storage-smoke".into(), Arc::clone(&slot))?;
 
     let private_name = private_root
