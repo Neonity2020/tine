@@ -844,6 +844,77 @@ describe("tag-page table", () => {
     dispose();
   });
 
+  // Harvest W4-P1 item 4 — MEASUREMENT, not a cut. "Three split panes issue
+  // three runQuery calls" does not by itself prove amplification: three panes
+  // may be asking three real questions. So both controls run. The bound is one
+  // call per DISTINCT (page, dataRev) question, per invalidation.
+  it("issues one tag query per distinct routed page per invalidation, not one per consumer", async () => {
+    const INVALIDATIONS = 5;
+    const names = ["TagA", "TagB", "TagC"];
+    setDoc({
+      byId: {},
+      pages: names.map((name) => page(name, "page", [])),
+      feed: ["TagA"],
+      loaded: true,
+    });
+    const runQuery = vi.spyOn(backend(), "runQuery").mockResolvedValue([] as RefGroup[]);
+
+    // (a) three consumers, ONE routed page.
+    const same = mount(() => (
+      <>
+        <TagTableToggle page={pageByName("TagA")!} />
+        <TagPageTable pageName="TagA" />
+        <TagPageTable pageName="TagA" />
+      </>
+    ));
+    await tick();
+    await flushMicrotasks();
+    const samePerInvalidation: number[] = [];
+    for (let i = 0; i < INVALIDATIONS; i++) {
+      runQuery.mockClear();
+      setDataRev((revision) => revision + 1);
+      await tick();
+      await flushMicrotasks();
+      samePerInvalidation.push(runQuery.mock.calls.length);
+    }
+    same.dispose();
+    resetSharedQueryResultsForTests();
+
+    // (b) three consumers, THREE distinct routed pages.
+    const distinct = mount(() => (
+      <>
+        <TagPageTable pageName="TagA" />
+        <TagPageTable pageName="TagB" />
+        <TagPageTable pageName="TagC" />
+      </>
+    ));
+    await tick();
+    await flushMicrotasks();
+    const distinctPerInvalidation: number[] = [];
+    const distinctPagesAsked = new Set<string>();
+    for (let i = 0; i < INVALIDATIONS; i++) {
+      runQuery.mockClear();
+      setDataRev((revision) => revision + 1);
+      await tick();
+      await flushMicrotasks();
+      distinctPerInvalidation.push(runQuery.mock.calls.length);
+      for (const [dsl] of runQuery.mock.calls) distinctPagesAsked.add(String(dsl));
+    }
+    distinct.dispose();
+
+    // eslint-disable-next-line no-console -- the measurement IS the receipt.
+    console.log(
+      `w4_p1_tag_query invalidations=${INVALIDATIONS} ` +
+        `samePageConsumers=3 samePageCallsPerInvalidation=${JSON.stringify(samePerInvalidation)} ` +
+        `distinctPageConsumers=3 distinctPageCallsPerInvalidation=${JSON.stringify(distinctPerInvalidation)} ` +
+        `distinctQuestionsAsked=${distinctPagesAsked.size}`
+    );
+
+    expect(samePerInvalidation).toEqual(Array.from({ length: INVALIDATIONS }, () => 1));
+    expect(distinctPerInvalidation).toEqual(Array.from({ length: INVALIDATIONS }, () => 3));
+    expect(distinctPagesAsked.size).toBe(names.length);
+  });
+
   it("keeps journal tag-table resources keyed off", async () => {
     const runQuery = vi.spyOn(backend(), "runQuery").mockResolvedValue([]);
     const { dispose } = mount(() => (

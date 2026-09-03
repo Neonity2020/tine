@@ -19,6 +19,12 @@ import type { PageEntry } from "./types";
 // Own root: lives for the app's lifetime by design (mirrors blockRefCounts.ts /
 // resolveBatch.ts). The initial epoch (0) is a real resource key, so first paint
 // fetches; a later graphEpoch change refetches and fixes the old mount/load race.
+/** Test seam for Harvest W4-P1 item 2: fires once per execution of the
+ *  page-name merge memo body, BEFORE its O(|pages|) `Set` is built. A counter
+ *  placed downstream of the memo instead would report zero even while the Set
+ *  was rebuilt on every typing lull. */
+export const __pagesTestHooks: { onMergePageNames?: () => void } = {};
+
 const pageInventory = createRoot(() => {
   const [physicalPages] = createResource(
     () => ({ epoch: graphEpoch(), inventory: pageInventoryRev() }),
@@ -62,6 +68,7 @@ const pageInventory = createRoot(() => {
   // then fill gaps. This is the sole complete page-name inventory for namespace
   // consumers, while `allPages` intentionally remains physical-only.
   const names = createMemo(() => {
+    __pagesTestHooks.onMergePageNames?.();
     const seen = new Set<string>();
     const inventory: string[] = [];
     const add = (name: string) => {

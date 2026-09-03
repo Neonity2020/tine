@@ -106,6 +106,69 @@ describe("GH #229 complete page-name inventory", () => {
     expect(allPageNames()).toEqual(["test", "test/linked"]);
   });
 
+  // Harvest W4-P1 item 2 — a COUNTER PROBE, not a necessity test. It reports
+  // what the merge memo actually costs across five typing lulls in which the
+  // backend answers "unchanged against the digest you carried". The bound below
+  // is what HEAD already delivers: `referencedNames` resolves to the SAME array
+  // reference, and a Solid resource value is stored in a signal whose default
+  // comparator is identity, so the merge memo is never notified. If this ever
+  // becomes nonzero, that count is the pre-fix number for a real cut.
+  it("rebuilds the page-name merge zero times across five unchanged-reply lulls", async () => {
+    const CARRIED_DIGEST = 77;
+    const LULLS = 5;
+    const classes = { "changed-names": 0, "unchanged-names-null": 0, "request-failed": 0 };
+    backendMock.listPages.mockResolvedValue([page("test")]);
+    backendMock.referencedPageNames.mockImplementation(async () => {
+      classes["changed-names"]++;
+      return refs(["test/linked"], CARRIED_DIGEST);
+    });
+    const { allPageNames, bumpDataRev } = await loadInventory();
+    const { __pagesTestHooks } = await import("./pages");
+
+    await vi.waitFor(() => expect(allPageNames()).toEqual(["test", "test/linked"]));
+    const settled = allPageNames();
+
+    backendMock.referencedPageNames.mockClear();
+    backendMock.referencedPageNames.mockImplementation(async () => {
+      classes["unchanged-names-null"]++;
+      return refs(null, CARRIED_DIGEST);
+    });
+    let merges = 0;
+    __pagesTestHooks.onMergePageNames = () => {
+      merges++;
+    };
+    for (let lull = 0; lull < LULLS; lull++) {
+      bumpDataRev();
+      await vi.waitFor(() =>
+        expect(backendMock.referencedPageNames).toHaveBeenCalledTimes(lull + 1)
+      );
+      // Settle the resource write that follows the awaited reply.
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+    __pagesTestHooks.onMergePageNames = undefined;
+
+    // eslint-disable-next-line no-console -- the measurement IS the receipt.
+    console.log(
+      `w4_p1_page_name_merge lulls=${LULLS} merges=${merges} ` +
+        `changed-names=${classes["changed-names"]} unchanged-names-null=${classes["unchanged-names-null"]} ` +
+        `request-failed=${classes["request-failed"]}`
+    );
+
+    // Every lull presented the carried digest, not null.
+    expect(backendMock.referencedPageNames.mock.calls).toEqual(
+      Array.from({ length: LULLS }, () => [CARRIED_DIGEST])
+    );
+    expect(allPageNames()).toEqual(settled);
+    expect(allPageNames()).toBe(settled);
+    expect({ merges, ...classes }).toEqual({
+      merges: 0,
+      "changed-names": 1,
+      "unchanged-names-null": LULLS,
+      "request-failed": 0,
+    });
+  });
+
   it("rejects physical and reference-name responses from a superseded graph", async () => {
     const physicalResolvers: Array<(pages: PageEntry[]) => void> = [];
     const referenceResolvers: Array<(names: string[]) => void> = [];

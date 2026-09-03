@@ -9853,6 +9853,28 @@
       "status": "covered",
       "coverage": { "tests": ["src/backendCallFunnel.test.ts", "src/persistenceConflictRetry.test.ts"], "scenario": "direct-save.typed-disposition-and-banner-routing", "failBefore": "proven" },
       "notes": "Exact safety: only a typed SaveConflictError reaches conflict resolution; DirectSaveFailureError follows its producer reasonCode even when detail contains conflict-like page text. Fail-before: a permanent precheck failure on a page the user is entitled to name conflict_authority.notes was substring-matched into the authority handler, which deletes the epoch, re-dirties the page and fire-and-forgets another save, so one user request became four backend calls; log under tine-agents/evidence/wave4/e4/. Proven at the save-policy layer, which owns the banner STATE (markConflict/isConflicted); the rendered banner component is not driven here, so this row asserts that the banner is never raised, not how it looks when it is."
+    },
+    {
+      "id": "UI-HARVEST-W4-P1-SHEET-SORT-KEY-DERIVATION",
+      "title": "Sorting a sheet derives each row's sort key once, not once per comparison",
+      "family": "sheet-table-sorting",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest W4-P1 item 1" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": { "tests": ["src/components/SheetTable.test.tsx::SheetTable sort-key derivation (Harvest W4-P1 item 1)::derives at most one sort key per row for title, property, and formula sorts", "src/components/SheetTable.test.tsx::SheetTable sort-key derivation (Harvest W4-P1 item 1)::keeps the full sorted row index so off-window navigation still reaches a sorted row"], "scenario": "sheet-table.sort-key-derivation-bound", "failBefore": "proven" },
+      "notes": "Flexible presentation/heuristic cost bound, not exact behavior: sorting by title, by an ordinary property, or by a formula column derives at most R effective sort keys for R rows, and the sorted order and displayed values are unchanged. Fail-before: deriving inside the comparator cost 2532 derivations for R=200 on a deterministically shuffled fixture, a 12.66x multiplier; after the decorate-sort-undecorate cut, 200 in each of the three cases. Logs under tine-agents/evidence/wave4/p1/ (necessity-p1-1.txt, after-p1-1.txt). This row claims the measured multiplier and the <= R bound only; the packet has no timing metric for this path and does not claim a UI freeze. The second test pins the deliberate exception: rowIndexes still walks the full sorted list because off-window keyboard/block navigation needs the complete map."
+    },
+    {
+      "id": "UI-HARVEST-W4-P1-QUERY-BUILDER-FACET-SHARING",
+      "title": "Several query builders on one page ask for the graph's facets once, and all of them show the answer",
+      "family": "query-builder-facets",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest W4-P1 item 3" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": { "tests": ["src/components/QueryBuilder.transient.test.tsx::QueryBuilder facet sharing (Harvest W4-P1 item 3)::issues one shared facets request per (graph scope, dataRev) for five mounted builders"], "scenario": "query-builder.shared-facets-per-graph-scope-and-datarev", "failBefore": "proven" },
+      "notes": "Blocking stateful UX plus a cost bound: one queryFacets(false) request per (graph scope, dataRev) however many builders are mounted, AND every mounted builder offers the current payload through its own Property picker, so the reduction cannot be met by starving a consumer or serving an earlier revision. Fail-before: five mounted builders issued five identical whole-graph requests per revision (log under tine-agents/evidence/wave4/p1/necessity-p1-3.txt); after routing the resource through sharedQueryResult under a query-facets key namespace, one per mount, one per dataRev bump, one per graph-scope change (after-p1-3.txt). The autocomplete producer's queryFacets(true) is a different question and is asserted to remain its own call."
     }
   ]
 }

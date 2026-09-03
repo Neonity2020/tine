@@ -40,6 +40,7 @@ beforeEach(() => {
 
 afterEach(() => {
   __sheetTableTestHooks.onIndexRow = undefined;
+  __sheetTableTestHooks.onSortKey = undefined;
   resetCellSelectionForTests();
   resetStore();
   __setBackendForTest(null);
@@ -209,6 +210,114 @@ function loadTableDoc() {
     loaded: true,
   });
 }
+
+// A children table of `count` rows whose title, `score` property and `double`
+// formula all disagree with document order, so a comparator that silently
+// returned the rows unmoved could not pass the ordering assertions.
+//
+// The ranks are DETERMINISTICALLY SHUFFLED, not merely reversed: V8's TimSort
+// reverses an already-descending run in n-1 comparisons, which understates the
+// per-comparison key-derivation cost by an order of magnitude.
+//
+// Returns the row ids in ASCENDING RANK order, i.e. the order a sorted table
+// must produce, so a caller can name the row that lands off the render window.
+function loadSortKeyBenchDoc(count: number): string[] {
+  const ids = Array.from({ length: count }, (_, i) => `s${i}`);
+  const ranks = Array.from({ length: count }, (_, i) => i);
+  let seed = 0x5eed;
+  for (let i = count - 1; i > 0; i--) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    const j = seed % (i + 1);
+    [ranks[i], ranks[j]] = [ranks[j], ranks[i]];
+  }
+  const idByRank: string[] = new Array(count);
+  const byId: Record<string, StoreNode> = {
+    table: node(
+      "table",
+      [
+        "Table",
+        "tine.view:: table",
+        "tine.fields:: score=number",
+        "tine.formula.double:: score * 2",
+      ].join("\n"),
+      null,
+      ids
+    ),
+  };
+  for (const [i, id] of ids.entries()) {
+    const rank = ranks[i];
+    idByRank[rank] = id;
+    byId[id] = node(id, `Row ${String(rank).padStart(4, "0")}\nscore:: ${rank}`, "table");
+  }
+  setDoc({ byId, pages: [page(["table"])], feed: ["Sheet"], loaded: true });
+  return idByRank;
+}
+
+describe("SheetTable sort-key derivation (Harvest W4-P1 item 1)", () => {
+  it("derives at most one sort key per row for title, property, and formula sorts", () => {
+    const R = 200;
+    loadSortKeyBenchDoc(R);
+    const { root, dispose } = mount(() => <Block id="table" />);
+    try {
+      let derived = 0;
+      __sheetTableTestHooks.onSortKey = () => {
+        derived++;
+      };
+
+      const titles = () =>
+        [...root.querySelectorAll(".sheet-title-cell .sheet-cell-body")].map((c) => c.textContent?.trim());
+      const sortByHeader = (header: HTMLElement): number => {
+        derived = 0;
+        header.click();
+        return derived;
+      };
+
+      // (a) title — the cheap-looking branch that a partial fix would optimize alone.
+      const title = sortByHeader(root.querySelector(".sheet-title-header") as HTMLElement);
+      expect(titles().slice(0, 3)).toEqual(["Row 0000", "Row 0001", "Row 0002"]);
+      expect(titles()).toHaveLength(R);
+
+      // (b) an ordinary declared property — numeric, so it takes the fieldTypes branch.
+      const property = sortByHeader(fieldHeader(root, "score"));
+      expect(titles().slice(0, 3)).toEqual(["Row 0000", "Row 0001", "Row 0002"]);
+
+      // (c) a formula column — the most expensive derivation of the three.
+      const formula = sortByHeader(fieldHeader(root, "ƒdouble"));
+      expect(titles().slice(0, 3)).toEqual(["Row 0000", "Row 0001", "Row 0002"]);
+
+      // eslint-disable-next-line no-console -- the measurement IS the receipt.
+      console.log(`w4_p1_sort_key_derivations R=${R} title=${title} property=${property} formula=${formula}`);
+      // Reported as counts so a failure prints the actual multiplier, not just
+      // a boolean. Each must be in [1, R]: 0 would mean the seam moved away.
+      expect({
+        R,
+        title: title >= 1 && title <= R ? "<=R" : title,
+        property: property >= 1 && property <= R ? "<=R" : property,
+        formula: formula >= 1 && formula <= R ? "<=R" : formula,
+      }).toEqual({ R, title: "<=R", property: "<=R", formula: "<=R" });
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps the full sorted row index so off-window navigation still reaches a sorted row", () => {
+    const R = 260;
+    const idByRank = loadSortKeyBenchDoc(R);
+    const last = idByRank[R - 1];
+    const { root, dispose } = mount(() => <Block id="table" />);
+    try {
+      (root.querySelector(".sheet-title-header") as HTMLElement).click();
+      // The window renders 200 of 260, so the highest-ranked row is off-window.
+      expect(root.querySelector(`[data-row="${R - 1}"]`)).toBeNull();
+      setCellSel({ gridId: "table", surfaceId: "main", rowId: last, columnId: "title", row: 0, col: 0 });
+      const rebased = cellSel();
+      expect(rebased?.kind === "cell" ? rebased.row : -1).toBe(R - 1);
+      expect(root.querySelector(`[data-row="${R - 1}"][data-col="0"]`)).not.toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+});
 
 describe("SheetTable", () => {
   it("routes real window Arrow keys from a clicked Table cell (GH #113)", () => {

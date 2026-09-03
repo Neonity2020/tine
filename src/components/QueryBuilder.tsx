@@ -33,7 +33,8 @@ import {
   type SortPreset,
 } from "../editor/queryBuilder";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
-import { dataRev, graphEpoch, pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
+import { sharedQueryResult } from "../queryResultCache";
+import { dataRev, graphEpoch, graphMeta, pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
 import { registerTransientLayer, type TransientLayer } from "../transientLayers";
 
 // Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
@@ -361,9 +362,20 @@ export function QueryBuilder(props: {
   parentTransientId?: string;
 }): JSX.Element {
   const tree = createMemo(() => parseQuery(props.dsl()));
+  // N builders on one page asked the SAME whole-graph facets question N times
+  // per (graphEpoch, dataRev). The scope is per-builder by decision (P0), so the
+  // fix is not a shared scope but a shared REQUEST: `sharedQueryResult` collapses
+  // identical in-flight/resolved work under its own key namespace, exactly as the
+  // page-tag query does. `queryFacets(true)` (autocomplete) asks a different
+  // question and deliberately keeps its own path. Harvest W4-P1 item 3.
   const [facets] = createResource(
     () => `${graphEpoch()}\0${dataRev()}`,
-    () => backend().queryFacets(),
+    (requestKey) =>
+      sharedQueryResult(
+        `${graphMeta()?.root ?? ""}\0${graphEpoch()}`,
+        `query-facets\0${requestKey}`,
+        () => backend().queryFacets(),
+      ),
   );
   // Which popover is open, by op/clause loc + purpose. Only one at a time.
   const [openMenu, setOpenMenu] = createSignal<string | null>(null);

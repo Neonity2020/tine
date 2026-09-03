@@ -24124,6 +24124,277 @@ fn managed_crash_reopen_aged_history_manual_benchmark() {
     ));
 }
 
+/// Harvest W4-P1 item 5 (B052). Managed reopen cycles measured by the probe
+/// below, pinned here and in `docs/storage-sync-contract.md`; the schema test
+/// keeps the two in step.
+const W4_P1_RECEIVER_SUMMARY_CYCLES: usize = 20;
+/// Accepted application saves performed per cycle before the clean shutdown.
+const W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE: usize = 1;
+
+fn w4_p1_count_files(directory: &Path) -> usize {
+    let mut files = 0;
+    for entry in fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            files += w4_p1_count_files(&entry.path());
+        } else if kind.is_file() {
+            files += 1;
+        }
+    }
+    files
+}
+
+/// Harvest W4-P1 item 5 — B052 receiver-absence-summary open attribution.
+///
+/// MEASUREMENT ONLY: it changes no production code and asserts no budget. It
+/// answers one question the debug-gated one-shot open line could not: across
+/// `W4_P1_RECEIVER_SUMMARY_CYCLES` ordinary desktop Managed cycles on a real
+/// graph copy — each `W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE` accepted save, a
+/// clean shutdown, and one cold `open_with_progress` — how many opens read the
+/// receiver summary's delta path and how many took a full validated-catalog
+/// pass.
+///
+/// It reports only the observable binary categories the production counters
+/// actually distinguish. It deliberately does NOT attribute a rebuild to a
+/// missing cache, an invalid cache, or a coverage mismatch:
+/// `ReceiverAbsenceSummary::open` collapses `Ok(None)` with every `Err` through
+/// `open_cache(..).ok().flatten()`, a coverage mismatch reaches the same
+/// `rebuilt`/`full_catalog_passes` values, and `HotEngine::open_absence_decision_map`'s
+/// no-archive-store fallback synthesizes those same values. Separating the
+/// three needs a dedicated producer reason counter, which is a separate packet.
+///
+/// That last fallback is a generic/offline-engine path, not a normal-session
+/// fork: `w4_p1_storage_contract_pins_receiver_summary_frequency_schema` pins
+/// the production call ordering that attaches the clean archive store before
+/// the absence map is opened, so these cycles measure attached opens.
+///
+/// Emits counts and fixed labels only — never a path, page name or block text
+/// from the corpus. Nothing mechanical enforces that here: the I-5 print-site
+/// census skips `#[path]`-included test files, so it is met by construction.
+#[test]
+#[ignore = "manual release benchmark: receiver absence summary open attribution across managed reopen cycles"]
+fn w4_p1_receiver_summary_reopen_frequency_probe() {
+    assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release --lib sync_runtime::tests::w4_p1_receiver_summary_reopen_frequency_probe -- --ignored --exact --nocapture"
+        );
+    let source = real_graph_copy_source_from_env("TINE_MS_AUDIT_GRAPH_COPY");
+    let fixture = ActivationFixture::copied_graph("w4-p1-receiver-summary-reopen", 0xa0f5, &source);
+    let corpus_files = w4_p1_count_files(&fixture.graph_root);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let mut handle = activated.handle.expect("real graph copy activates");
+    drive_initial_feed(&handle);
+
+    let pages = match handle.application_page_inventory().unwrap() {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+        other => panic!("managed page inventory did not load: {other:?}"),
+    };
+    let corpus_pages = pages.len();
+    let mut paths = pages
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut corpus_blocks = 0usize;
+    let mut editable: Option<String> = None;
+    for path in &paths {
+        let page = load_application_exact(&handle, path).0;
+        corpus_blocks += page.blocks.len();
+        if editable.is_some() {
+            continue;
+        }
+        // Replacing a first block that carries an externally imported `id::`
+        // is a separate identity case the trusted-local save vocabulary
+        // declines; this probe wants an ordinary accepted save.
+        let ordinary = page.blocks.first().is_some_and(|first| {
+            !first.raw.lines().any(|line| {
+                line.split_once("::")
+                    .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("id"))
+            })
+        });
+        if ordinary {
+            editable = Some(path.clone());
+        }
+    }
+    let target = editable.expect("real graph copy has an editable page");
+
+    let mut full_catalog_pass_0 = 0usize;
+    let mut full_catalog_pass_1 = 0usize;
+    let mut summary_rebuilt_false = 0usize;
+    let mut summary_rebuilt_true = 0usize;
+    let mut receipt_content_reads = 0usize;
+    let mut summary_content_reads = 0usize;
+    let mut delta_completions = 0usize;
+    let mut delta_intents = 0usize;
+    let mut receipt_evidence_names = 0usize;
+
+    for cycle in 0..W4_P1_RECEIVER_SUMMARY_CYCLES {
+        for save in 0..W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE {
+            let (page, revision) = load_application_exact(&handle, &target);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("w4-p1 receiver summary probe cycle {cycle} save {save}"),
+            );
+            drain_managed_local(&handle);
+        }
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let mut observed = None;
+        let reopened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                    observed = Some(counters);
+                }
+            });
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        handle = reopened.handle.expect("clean managed cycle reopens");
+        let counters = observed.expect("clean cold open reports counters");
+        match counters.receipt_full_catalog_passes {
+            0 => full_catalog_pass_0 += 1,
+            1 => full_catalog_pass_1 += 1,
+            other => panic!("cycle {cycle} reported {other} full-catalog passes; the categories this probe reports assume at most one per open"),
+        }
+        if counters.summary_rebuilt {
+            summary_rebuilt_true += 1;
+        } else {
+            summary_rebuilt_false += 1;
+        }
+        receipt_content_reads += counters.receipt_content_reads;
+        summary_content_reads += counters.summary_content_reads;
+        delta_completions += counters.summary_delta_completions;
+        delta_intents += counters.summary_delta_intents;
+        receipt_evidence_names += counters.receipt_evidence_names;
+    }
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+
+    assert_eq!(
+        full_catalog_pass_0 + full_catalog_pass_1,
+        W4_P1_RECEIVER_SUMMARY_CYCLES
+    );
+    assert_eq!(
+        summary_rebuilt_false + summary_rebuilt_true,
+        W4_P1_RECEIVER_SUMMARY_CYCLES
+    );
+    // Content-read and delta counters are TOTALS across the cycles.
+    eprintln!(
+        "w4_p1_receiver_summary_reopen corpusFiles={corpus_files} corpusPages={corpus_pages} \
+         corpusBlocks={corpus_blocks} cycles={} savesPerCycle={} shutdownKind=clean-safe \
+         archiveStoreAttached=yes-by-production-call-order fullCatalogPass0={full_catalog_pass_0} \
+         fullCatalogPass1={full_catalog_pass_1} summaryRebuiltFalse={summary_rebuilt_false} \
+         summaryRebuiltTrue={summary_rebuilt_true} receiptContentReads={receipt_content_reads} \
+         summaryContentReads={summary_content_reads} deltaCompletions={delta_completions} \
+         deltaIntents={delta_intents} receiptEvidenceNames={receipt_evidence_names}",
+        W4_P1_RECEIVER_SUMMARY_CYCLES, W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE,
+    );
+}
+
+/// Harvest W4-P1 item 5. Two facts the measurement above depends on, and which
+/// prose alone would let drift (I-11: the code does not lie about itself).
+#[test]
+fn w4_p1_storage_contract_pins_receiver_summary_frequency_schema() {
+    // 1. Normal Managed opens attach the clean archive store BEFORE opening the
+    //    absence-decision map, so `archive_store == None` is the generic/offline
+    //    engine fallback rather than a normal-session fork. Without this, the
+    //    frequency table's `archiveStoreAttached=yes` would be an unchecked claim.
+    let runtime = include_str!("sync_runtime.rs");
+    let attaches = runtime
+        .match_indices(".attach_clean_archive_store(")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    let opens = runtime
+        .match_indices(".open_absence_decision_map(")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert!(
+        opens.len() >= 2,
+        "sync_runtime.rs must still open the absence-decision map on both the activation and clean-reopen paths; found {} call sites",
+        opens.len()
+    );
+    assert!(
+        attaches.len() >= opens.len(),
+        "every sync_runtime.rs open_absence_decision_map call must be preceded by its own attach_clean_archive_store call, or the receiver-summary delta path silently becomes the no-archive full-catalog fallback (I-11). attaches={} opens={}",
+        attaches.len(),
+        opens.len()
+    );
+    for (nth, open) in opens.iter().enumerate() {
+        assert!(
+            attaches[nth] < *open,
+            "sync_runtime.rs open_absence_decision_map call {nth} is not preceded by an attach_clean_archive_store call; a normal Managed open would then take the no-archive full-catalog fallback and w4_p1_receiver_summary_reopen_frequency_probe's archiveStoreAttached column would be false (I-11)"
+        );
+    }
+
+    // 2. The published frequency table still describes the run that produced it.
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    let row = |name: &str| -> String {
+        let needle = format!("| `{name}` |");
+        let line = contract
+            .lines()
+            .find(|line| line.starts_with(&needle))
+            .unwrap_or_else(|| {
+                panic!("docs/storage-sync-contract.md must carry the Harvest W4-P1 receiver-summary frequency row `{name}`")
+            });
+        line.split('|')
+            .nth(2)
+            .unwrap_or_else(|| panic!("frequency row `{name}` has no value cell"))
+            .trim()
+            .trim_matches('`')
+            .to_string()
+    };
+    let count = |name: &str| -> usize {
+        row(name).parse::<usize>().unwrap_or_else(|error| {
+            panic!("frequency row `{name}` must hold a plain count: {error}")
+        })
+    };
+    for name in [
+        "checkedHead",
+        "corpusFiles",
+        "corpusPages",
+        "corpusBlocks",
+        "shutdownKind",
+        "archiveStoreAttached",
+        "receiptContentReads",
+        "summaryContentReads",
+        "deltaCompletions",
+        "deltaIntents",
+    ] {
+        assert!(
+            !row(name).is_empty(),
+            "frequency row `{name}` must record what was measured"
+        );
+    }
+    assert_eq!(
+        count("cycles"),
+        W4_P1_RECEIVER_SUMMARY_CYCLES,
+        "the published table must describe the cycle count the probe runs"
+    );
+    assert_eq!(
+        count("savesPerCycle"),
+        W4_P1_RECEIVER_SUMMARY_SAVES_PER_CYCLE,
+        "the published table must describe the saves per cycle the probe runs"
+    );
+    assert_eq!(
+        count("fullCatalogPass0") + count("fullCatalogPass1"),
+        W4_P1_RECEIVER_SUMMARY_CYCLES,
+        "every measured open is one full-catalog-pass category or the other"
+    );
+    assert_eq!(
+        count("summaryRebuiltFalse") + count("summaryRebuiltTrue"),
+        W4_P1_RECEIVER_SUMMARY_CYCLES,
+        "every measured open is one summary-rebuilt category or the other"
+    );
+}
+
 #[test]
 #[ignore = "manual release benchmark: committed edit to peer-visible latency on two graph copies"]
 fn managed_two_device_sync_latency_real_corpora_manual_benchmark() {

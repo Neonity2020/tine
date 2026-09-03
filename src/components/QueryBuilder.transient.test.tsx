@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
-import { backend } from "../backend";
-import { setDataRev } from "../ui";
+import { autocompleteFacets, backend } from "../backend";
+import { resetSharedQueryResultsForTests } from "../queryResultCache";
+import { bumpGraphEpoch, setDataRev } from "../ui";
 import {
   clearTransientLayersForTest,
   dismissTopTransient,
@@ -20,6 +21,7 @@ function mountBuilder(dsl = "(and (task TODO))") {
 
 afterEach(() => {
   clearTransientLayersForTest();
+  resetSharedQueryResultsForTests();
   vi.restoreAllMocks();
   document.body.replaceChildren();
 });
@@ -29,7 +31,9 @@ beforeEach(() => {
 });
 
 describe("QueryBuilder transient ownership (post-GH #161)", () => {
-  it("fetches facets once per builder and refreshes once per data revision", async () => {
+  // Sharing across instances is proven separately, by the Harvest W4-P1 item 3
+  // test below; this one pins the per-revision refresh for a single builder.
+  it("fetches facets once and refreshes once per data revision", async () => {
     const facets = vi.mocked(backend().queryFacets);
     const { host, dispose } = mountBuilder();
     try {
@@ -123,6 +127,90 @@ describe("QueryBuilder transient ownership (post-GH #161)", () => {
     } finally {
       first.dispose();
       second.dispose();
+    }
+  });
+});
+
+describe("QueryBuilder facet sharing (Harvest W4-P1 item 3)", () => {
+  // Drive the production Property picker and read back the keys it offers, so a
+  // "one call" bound cannot be met by starving four of the five builders.
+  function propertyKeysOffered(host: HTMLElement): string[] {
+    const add = host.querySelector<HTMLButtonElement>(".qb-add")!;
+    add.click();
+    [...host.querySelectorAll<HTMLButtonElement>(".qb-menu-item")]
+      .find((button) => button.textContent === "Property")!
+      .click();
+    const keys = [...host.querySelectorAll<HTMLButtonElement>(".qb-value .qb-menu-item")].map(
+      (button) => button.textContent ?? ""
+    );
+    add.click(); // The trigger toggles: leave the picker closed for the next read.
+    return keys;
+  }
+
+  it("issues one shared facets request per (graph scope, dataRev) for five mounted builders", async () => {
+    const payloads: Array<[string, string[]][]> = [
+      [["revision-one", ["r1"]]],
+      [["revision-two", ["r2"]]],
+      [["revision-three", ["r3"]]],
+    ];
+    let current = 0;
+    const facets = vi.mocked(backend().queryFacets);
+    facets.mockReset();
+    facets.mockImplementation(async (autocomplete?: boolean) =>
+      autocomplete ? [["autocomplete-only", ["a"]]] : payloads[current]
+    );
+
+    const builders = Array.from({ length: 5 }, () => mountBuilder("(and (task TODO))"));
+    try {
+      await Promise.resolve();
+      await Promise.resolve();
+      const mounted = facets.mock.calls.length;
+      for (const builder of builders) {
+        expect(propertyKeysOffered(builder.host)).toEqual(["revision-one"]);
+      }
+
+      // A new data revision: one fresh shared call, and every builder sees it.
+      facets.mockClear();
+      current = 1;
+      setDataRev((revision) => revision + 1);
+      await Promise.resolve();
+      await Promise.resolve();
+      const perRevision = facets.mock.calls.length;
+      for (const builder of builders) {
+        expect(propertyKeysOffered(builder.host)).toEqual(["revision-two"]);
+      }
+
+      // A graph switch: the shared scope changes, so one fresh call again.
+      facets.mockClear();
+      current = 2;
+      bumpGraphEpoch();
+      await Promise.resolve();
+      await Promise.resolve();
+      const perGraphScope = facets.mock.calls.length;
+      for (const builder of builders) {
+        expect(propertyKeysOffered(builder.host)).toEqual(["revision-three"]);
+      }
+
+      // The autocomplete producer asks a DIFFERENT question and must not be
+      // served from the builder's shared entry.
+      facets.mockClear();
+      expect(await autocompleteFacets()).toEqual([["autocomplete-only", ["a"]]]);
+      const autocompleteCalls = facets.mock.calls.map(([flag]) => flag ?? false);
+
+      // eslint-disable-next-line no-console -- the measurement IS the receipt.
+      console.log(
+        `w4_p1_query_facets builders=5 mounted=${mounted} perDataRev=${perRevision} ` +
+          `perGraphScope=${perGraphScope} autocomplete=${JSON.stringify(autocompleteCalls)}`
+      );
+
+      expect({ mounted, perRevision, perGraphScope, autocompleteCalls }).toEqual({
+        mounted: 1,
+        perRevision: 1,
+        perGraphScope: 1,
+        autocompleteCalls: [true],
+      });
+    } finally {
+      for (const builder of builders) builder.dispose();
     }
   });
 });
