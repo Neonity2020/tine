@@ -8734,27 +8734,70 @@ mod tests {
     /// and every publish/rename/remove failed outright with
     /// `ProviderJournalLimit` once the store reached
     /// `MAX_PROVIDER_JOURNAL_COMPLETED` — a stuck state reachable by ordinary
-    /// long use (I-10). This drives well past that cap.
+    /// long use (I-10).
+    ///
+    /// The packet's claim has two halves with very different costs, so they
+    /// are two tests over one implementation:
+    ///
+    /// * **Steady state.** Compaction fires at
+    ///   `PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER` (64), so a few
+    ///   hundred operations already prove that `completed/` stops growing.
+    ///   That is the regression that catches the defect, and it runs here.
+    /// * **Never refusing past the structural cap.** The old
+    ///   `ProviderJournalLimit` refusal lived at
+    ///   `MAX_PROVIDER_JOURNAL_COMPLETED` (16_384), so exercising it needs
+    ///   real volume. That is the `#[ignore]`d variant below.
+    ///
+    /// Why split: at 20,000 operations this performed 20,000 real
+    /// `publish_object_exact` calls plus a directory scan every 997, which
+    /// exceeded nextest's 600s `profile.ci` cap under load. It has no timing
+    /// assertion — it is a resource-lifecycle test, not a benchmark — so a
+    /// timeout was pure harness cost, and the "fails first run, passes on
+    /// rerun" shape it produced is invisible to a baseline-by-names
+    /// comparison, because a test that finishes passes.
     #[test]
     fn provider_journal_completed_records_retire_against_live_provider_state() {
-        // Past MAX_PROVIDER_JOURNAL_COMPLETED (16_384) by a clear margin, so
-        // the old refusal is exercised many times over rather than skirted.
-        const OPERATIONS: usize = 20_000;
+        // Many multiples of the compaction trigger (64), which is what the
+        // steady-state assertions below actually measure.
+        exercise_provider_journal_completed_retirement(400);
+    }
+
+    /// The volume half: drive past `MAX_PROVIDER_JOURNAL_COMPLETED` (16_384)
+    /// by a clear margin, so the old capacity refusal would be exercised many
+    /// times over rather than skirted. Deliberate, not a CI gate — run it with
+    /// `cargo test -p tine-core --lib -- --ignored <name>` when changing the
+    /// journal's caps, its compaction trigger, or its retirement predicate.
+    #[test]
+    #[ignore = "20,000 real provider publications; exceeds the CI per-test cap. Run deliberately when changing journal caps or retirement."]
+    fn provider_journal_completed_store_never_refuses_past_its_structural_cap() {
+        exercise_provider_journal_completed_retirement(20_000);
+    }
+
+    fn exercise_provider_journal_completed_retirement(operations: usize) {
         let root = ScenarioRoot::new().unwrap();
         let provider_root = root.0.join("provider");
         let journal_root = root.0.join("private/device/journal");
         let completed_root = journal_root.join("completed");
         let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
 
+        // Sample often enough to actually observe the store rise toward the
+        // trigger and be compacted back, at any volume. A fixed stride tuned
+        // for 20,000 operations samples the 400-operation run exactly once, at
+        // index 0, which makes `peak_completed` report 1 and turns both peak
+        // assertions into tautologies. Roughly twenty samples either way, and
+        // never fewer than one per compaction cycle.
+        let sample_stride = (operations / 20)
+            .min(PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER)
+            .max(1);
         let mut peak_completed = 0_usize;
-        for index in 0..OPERATIONS {
+        for index in 0..operations {
             let bytes = format!("harvest a2 provider object {index}").into_bytes();
             provider
                 .publish_object_exact(ContentDigest::of(&bytes), &bytes)
                 .unwrap_or_else(|error| {
                     panic!("publication {index} must never fail on journal capacity: {error}")
                 });
-            if index % 997 == 0 {
+            if index % sample_stride == 0 {
                 peak_completed = peak_completed.max(retained_dir_count(&completed_root));
             }
         }
@@ -8763,21 +8806,21 @@ mod tests {
         // The measured gate numbers, for the packet receipt and for anyone
         // re-running this after changing the trigger.
         eprintln!(
-            "harvest A2 gate: {OPERATIONS} completed provider operations, \
+            "harvest A2 gate: {operations} completed provider operations, \
              peak completed/ {peak_completed}, final completed/ {completed}, \
              trigger {PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER}, \
              structural bound {MAX_PROVIDER_JOURNAL_COMPLETED}"
         );
         assert!(
             completed <= PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER,
-            "{OPERATIONS} completed operations left {completed} records, \
+            "{operations} completed operations left {completed} records, \
              which is lifetime growth, not a steady state"
         );
         assert!(
             peak_completed <= PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER,
             "the completed store peaked at {peak_completed} records"
         );
-        // The compaction must have actually run: OPERATIONS records could not
+        // The compaction must have actually run: `operations` records could not
         // otherwise fit under the trigger.
         assert!(peak_completed > 0);
 
