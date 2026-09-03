@@ -82,6 +82,9 @@ pub(crate) fn debug_init() {
 /// Emit one detailed line to stderr and, when explicitly enabled, the directed
 /// debug file. This function does not write to the privacy-safe flight recorder.
 pub(crate) fn diag(msg: impl AsRef<str>) {
+    if !debug_enabled() {
+        return;
+    }
     let msg = msg.as_ref();
     eprintln!("[tine] {msg}");
     if let Some(Some(lock)) = DEBUG_LOG.get() {
@@ -804,6 +807,36 @@ pub(crate) fn clear_diagnostics() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "child-process probe for stderr capture"]
+    fn diag_disabled_child_probe() {
+        diag("diag-disabled-probe");
+    }
+
+    #[test]
+    fn diag_is_silent_when_debug_is_disabled() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "debug::tests::diag_disabled_child_probe",
+                "--nocapture",
+            ])
+            .env_remove("TINE_DEBUG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr-capture child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "diag leaked to stderr with debugging disabled: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn recorder_retains_previous_unclean_run_and_bounds_each_segment() {

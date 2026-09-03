@@ -11,6 +11,7 @@ import { lsdocDocumentAvailable, lsdocVersion, parseLsdocDocument } from "./lsdo
 import { projectionKey } from "./projection";
 import { lineNumberForOffset, minimize, toBytes } from "./minimize";
 import { anonymizeAndVerify, anonymizeSourceRel } from "./anonymize";
+import { parserDiagnostic, type ParserDiagnostic } from "./diagnostic";
 import { benchFromResults, summarizeBenchRuns, type BenchRun, type BenchSummary } from "./bench";
 import {
   isMldocBacktickStateArtifact,
@@ -36,7 +37,7 @@ export type Finding =
         | { ok: true; tier: string; input: string; lsdocKey: string; mldocKey: string }
         | { ok: false };
     }
-  | { type: "mldoc-failure"; rel: string; status: string; detail: string }
+  | { type: "mldoc-failure"; rel: string; status: string; diagnostic: ParserDiagnostic }
   | { type: "unstable-divergence"; rel: string }
   | {
       type: "mldoc-oracle-artifact";
@@ -140,13 +141,13 @@ async function runDiff(
     let lsdocKey: string;
     try {
       lsdocKey = projectionKey(parseLsdocDocument(f.text, f.format === "org"));
-    } catch (e) {
-      findings.push({ type: "mldoc-failure", rel: anonymousRels[i], status: "lsdoc-error", detail: String(e).split("\n")[0] });
+    } catch {
+      findings.push({ type: "mldoc-failure", rel: anonymousRels[i], status: "lsdoc-error", diagnostic: parserDiagnostic(f.text) });
       continue;
     }
     const m = await client.parseWarm(f.text, f.format, opts.timeoutMs);
     if (!m.ok) {
-      findings.push({ type: "mldoc-failure", rel: anonymousRels[i], status: m.status, detail: m.detail });
+      findings.push({ type: "mldoc-failure", rel: anonymousRels[i], status: m.status, diagnostic: m.diagnostic });
       continue;
     }
     if (lsdocKey !== projectionKey(m.projection)) candidates.push({ file: f, rel: anonymousRels[i] });
@@ -248,12 +249,12 @@ async function runBench(
   // mldoc: warm worker timing (reused; matches graph-check's benchMldoc).
   const mldocRuns: BenchRun[] = [];
   for (let run = 0; run < BENCH_RUNS; run++) {
-    const results = new Map<string, { ok: boolean; parseMicros?: number; status?: string; detail?: string; overTimeout?: boolean }>();
+    const results = new Map<string, { ok: boolean; parseMicros?: number; status?: string; diagnostic?: ParserDiagnostic; overTimeout?: boolean }>();
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       onProgress({ phase: "bench", done: run * files.length + i, total: BENCH_RUNS * files.length, current: `mldoc ${idFiles[i].rel}` });
       const m = await client.parseWarm(f.text, f.format, opts.timeoutMs);
-      results.set(idFiles[i].id, m.ok ? { ok: true, parseMicros: m.parseMicros } : { ok: false, status: m.status, detail: m.detail });
+      results.set(idFiles[i].id, m.ok ? { ok: true, parseMicros: m.parseMicros } : { ok: false, status: m.status, diagnostic: m.diagnostic });
     }
     mldocRuns.push(benchFromResults(idFiles, results));
   }
@@ -263,14 +264,14 @@ async function runBench(
   if (lsdocAvailable) {
     const lsdocRuns: BenchRun[] = [];
     for (let run = 0; run < BENCH_RUNS; run++) {
-      const results = new Map<string, { ok: boolean; parseMicros?: number; status?: string; detail?: string }>();
+      const results = new Map<string, { ok: boolean; parseMicros?: number; status?: string; diagnostic?: ParserDiagnostic }>();
       for (const [i, f] of files.entries()) {
         const start = performance.now();
         try {
           parseLsdocDocument(f.text, f.format === "org");
           results.set(idFiles[i].id, { ok: true, parseMicros: Math.round((performance.now() - start) * 1000) });
-        } catch (e) {
-          results.set(idFiles[i].id, { ok: false, status: "lsdoc-error", detail: String(e).split("\n")[0] });
+        } catch {
+          results.set(idFiles[i].id, { ok: false, status: "lsdoc-error", diagnostic: parserDiagnostic(f.text) });
         }
       }
       lsdocRuns.push(benchFromResults(idFiles, results));

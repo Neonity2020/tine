@@ -2,6 +2,25 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-W3-I5-CONTENT-OUT-OF-LOGS-001",
+   "title": "Production diagnostics cannot emit graph-authored content",
+   "family": "diagnostics-privacy",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 I5; invariants I-5 and I-11"},
+   "platforms": ["all"],
+   "layer": "rust-and-typescript-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/debug.rs::tests::diag_is_silent_when_debug_is_disabled",
+     "crates/tine-core/tests/content_out_of_logs.rs",
+     "src/contentOutOfLogs.ratchet.test.ts"
+    ],
+    "scenario": "diagnostics.content-out-of-logs",
+    "failBefore": "i5-diag-fail-before.txt and i5-lsdoc-shape-fail-before.txt at 64ed1c21838d4d7e9b75dd9ece90d90787b300fa"
+   },
+   "notes": "Detailed native diagnostics are opt-in, core print sites are content-free and flag-gated, parser failures cross worker boundaries only as fixed-shape measurements, and equality ratchets freeze the reviewed Rust and TypeScript censuses."
+  },
+  {
    "id": "REG-W3-R1-JOIN-GENERATION-COMMIT-001",
    "title": "Shared-join baseline and operation authority commit as one marker-selected generation",
    "family": "managed-storage-crash-recovery",

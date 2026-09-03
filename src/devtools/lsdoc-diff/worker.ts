@@ -20,6 +20,7 @@
 // pure libs the differential gate uses, bundled into this worker chunk.
 import { normalizeAst } from "./vendor/normalize.mjs";
 import { extractRefs } from "./vendor/refs.mjs";
+import { parserDiagnostic, type ParserDiagnostic } from "./diagnostic";
 
 type Format = "md" | "org";
 
@@ -28,7 +29,7 @@ interface MldocApi {
 }
 
 let mldoc: MldocApi | null = null;
-let loadError: string | null = null;
+let loadFailed = false;
 
 // mldoc config = OG's graph-parser default, per harness/oracle.mjs. Must stay in
 // sync with the gate so an in-app diff and the CI gate agree on divergences.
@@ -45,7 +46,7 @@ function cfg(format: Format): string {
 }
 
 async function ensureMldoc(url: string): Promise<void> {
-  if (mldoc || loadError) return;
+  if (mldoc || loadFailed) return;
   try {
     // Native dynamic import runs the js_of_ocaml IIFE (side-effect: sets
     // globalThis.Mldoc). @vite-ignore keeps Vite from bundling the asset — it must
@@ -54,12 +55,12 @@ async function ensureMldoc(url: string): Promise<void> {
     await import(/* @vite-ignore */ url);
     const api = (self as unknown as { Mldoc?: MldocApi }).Mldoc;
     if (!api || typeof api.parseJson !== "function") {
-      loadError = "mldoc loaded but exposed no parseJson";
+      loadFailed = true;
       return;
     }
     mldoc = api;
-  } catch (e) {
-    loadError = `mldoc failed to load: ${String(e).split("\n")[0]}`;
+  } catch {
+    loadFailed = true;
   }
 }
 
@@ -77,7 +78,7 @@ export interface ParseResponse {
   projection?: { blocks: unknown[]; refs: { page: string[]; block: string[] } };
   parseMicros?: number;
   status?: "load-error" | "parse-error";
-  detail?: string;
+  diagnostic?: ParserDiagnostic;
 }
 
 self.onmessage = async (ev: MessageEvent<ParseRequest>) => {
@@ -85,7 +86,7 @@ self.onmessage = async (ev: MessageEvent<ParseRequest>) => {
   if (!msg || msg.type !== "parse") return;
   await ensureMldoc(msg.mldocUrl);
   if (!mldoc) {
-    reply({ id: msg.id, ok: false, status: "load-error", detail: loadError || "mldoc unavailable" });
+    reply({ id: msg.id, ok: false, status: "load-error", diagnostic: parserDiagnostic(msg.text) });
     return;
   }
   const start = performance.now();
@@ -97,8 +98,8 @@ self.onmessage = async (ev: MessageEvent<ParseRequest>) => {
     };
     const parseMicros = Math.round((performance.now() - start) * 1000);
     reply({ id: msg.id, ok: true, projection, parseMicros });
-  } catch (e) {
-    reply({ id: msg.id, ok: false, status: "parse-error", detail: String(e).split("\n")[0] });
+  } catch {
+    reply({ id: msg.id, ok: false, status: "parse-error", diagnostic: parserDiagnostic(msg.text) });
   }
 };
 

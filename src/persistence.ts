@@ -985,12 +985,12 @@ async function doSave(
     return false;
   }
   if (dto.guide) {
-    console.warn("Refusing to persist ephemeral bundled Guide page", name);
+    console.warn("Refusing to persist ephemeral bundled Guide pages", { count: 1 });
     dirty.delete(name);
     return true;
   }
   if (dto.read_only) {
-    console.error("Refusing to persist read-only page", name);
+    console.error("Refusing to persist read-only pages", { count: 1 });
     dirty.delete(name);
     return false;
   }

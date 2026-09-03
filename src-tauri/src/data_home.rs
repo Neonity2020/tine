@@ -127,10 +127,8 @@ pub(crate) fn ensure_usable(identifier: &str) {
     ));
     eprintln!(
         "Tine cannot start: it has nowhere to keep its application data.\n\
-         Tried {} ({error}) and every fallback.\n\
-         Fix the permissions on that directory (it is normally owned by you), \n\
-         or set XDG_DATA_HOME to a directory you can write.",
-        base.display()
+         Fix the permissions on the configured application-data directory, \n\
+         or set XDG_DATA_HOME to a directory you can write."
     );
     std::process::exit(1);
 }

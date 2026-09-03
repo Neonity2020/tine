@@ -11,6 +11,7 @@
 //                authoritative re-verify / minimize / anonymize probes.
 import mldocUrl from "./vendor/mldoc.js?url";
 import type { ParseRequest, ParseResponse } from "./worker";
+import { parserDiagnostic, type ParserDiagnostic } from "./diagnostic";
 
 export type Format = "md" | "org";
 export interface Projection {
@@ -19,7 +20,7 @@ export interface Projection {
 }
 export type ParseResult =
   | { ok: true; projection: Projection; parseMicros: number }
-  | { ok: false; status: string; detail: string };
+  | { ok: false; status: string; diagnostic: ParserDiagnostic };
 
 function newWorker(): Worker {
   return new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
@@ -27,6 +28,7 @@ function newWorker(): Worker {
 
 function parseOn(worker: Worker, text: string, format: Format, timeoutMs: number): Promise<ParseResult> {
   return new Promise((resolve) => {
+    const diagnostic = parserDiagnostic(text);
     let settled = false;
     const finish = (r: ParseResult) => {
       if (settled) return;
@@ -36,13 +38,13 @@ function parseOn(worker: Worker, text: string, format: Format, timeoutMs: number
       worker.onerror = null;
       resolve(r);
     };
-    const timer = setTimeout(() => finish({ ok: false, status: "timeout", detail: `timeout after ${timeoutMs}ms` }), timeoutMs);
+    const timer = setTimeout(() => finish({ ok: false, status: "timeout", diagnostic }), timeoutMs);
     worker.onmessage = (ev: MessageEvent<ParseResponse>) => {
       const r = ev.data;
       if (r.ok && r.projection) finish({ ok: true, projection: r.projection, parseMicros: r.parseMicros ?? 0 });
-      else finish({ ok: false, status: r.status ?? "error", detail: r.detail ?? "mldoc failed" });
+      else finish({ ok: false, status: r.status ?? "error", diagnostic: r.diagnostic ?? diagnostic });
     };
-    worker.onerror = (e) => finish({ ok: false, status: "worker-error", detail: String((e as ErrorEvent).message || e) });
+    worker.onerror = () => finish({ ok: false, status: "worker-error", diagnostic });
     const msg: ParseRequest = { type: "parse", id: "p", mldocUrl, text, format };
     worker.postMessage(msg);
   });

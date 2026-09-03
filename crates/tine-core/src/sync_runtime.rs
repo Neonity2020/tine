@@ -7114,10 +7114,10 @@ fn open_clean_runtime_resources_with_progress(
     let retired_receipt_artifacts =
         receipts.retired_own_endpoint_artifacts(&retired_own_intent_ids);
     counters.retired_own_receipt_artifacts = retired_receipt_artifacts.len();
-    if !retired_receipt_artifacts.is_empty() {
+    if !retired_receipt_artifacts.is_empty() && runtime_debug_diagnostics_enabled() {
         eprintln!(
-            "retired own-endpoint receipt artifacts remain inert: {}",
-            retired_receipt_artifacts.join(", ")
+            "retired own-endpoint receipt artifacts remain inert: count={}",
+            retired_receipt_artifacts.len()
         );
     }
     trace.phase(
@@ -20510,7 +20510,9 @@ impl RuntimeActor {
                     pending.last_error()
                 );
                 #[cfg(target_os = "android")]
-                eprintln!("[tine] {detail}");
+                if runtime_debug_diagnostics_enabled() {
+                    eprintln!("[tine] foreground projection remains pending");
+                }
                 let managed = self
                     .managed_local
                     .as_mut()
@@ -20769,7 +20771,9 @@ impl RuntimeActor {
                     pending.last_error()
                 );
                 #[cfg(target_os = "android")]
-                eprintln!("[tine] {detail}");
+                if runtime_debug_diagnostics_enabled() {
+                    eprintln!("[tine] foreground projection remains pending");
+                }
                 let managed = self
                     .managed_local
                     .as_mut()
@@ -21599,10 +21603,11 @@ impl RuntimeActor {
                             // the losing text is retained in immutable local
                             // history (audit 4 follow-up).
                             Err(crate::oplog::EngineError::PageDeleted(_)) => {
-                                eprintln!(
-                                    "[tine] conflict resolution skipped: page {page_id} was deleted as a whole, block-level restore of {} does not apply",
-                                    block.block_id
-                                );
+                                if runtime_debug_diagnostics_enabled() {
+                                    eprintln!(
+                                        "[tine] conflict resolution skipped after whole-page deletion"
+                                    );
+                                }
                                 continue;
                             }
                             Err(_) => {
@@ -21638,10 +21643,11 @@ impl RuntimeActor {
                             // deletion leaves nothing for keep-both to land on
                             // and never heals on its own; requeueing would spin.
                             Err(crate::oplog::EngineError::PageDeleted(_)) => {
-                                eprintln!(
-                                    "[tine] keep-both resolution skipped: page {page_id} was deleted as a whole for block {}",
-                                    block.block_id
-                                );
+                                if runtime_debug_diagnostics_enabled() {
+                                    eprintln!(
+                                        "[tine] keep-both resolution skipped after whole-page deletion"
+                                    );
+                                }
                                 continue;
                             }
                             Err(_) => {
@@ -21669,10 +21675,11 @@ impl RuntimeActor {
                         // loudly rather than author an invalid claim or
                         // retry forever (audit 4, finding 3).
                         if original.order.len() >= 512 {
-                            eprintln!(
-                                "[tine] keep-both resolution skipped: order key at maximum length for block {}",
-                                block.block_id
-                            );
+                            if runtime_debug_diagnostics_enabled() {
+                                eprintln!(
+                                    "[tine] keep-both resolution skipped at maximum order-key length"
+                                );
+                            }
                             continue;
                         }
                         // "-" sorts before every digit, so this key lands
@@ -23481,7 +23488,7 @@ fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorReq
     SyncEditorRequestError::ActorRefusedWithCode(code)
 }
 
-fn runtime_debug_diagnostics_enabled() -> bool {
+pub(crate) fn runtime_debug_diagnostics_enabled() -> bool {
     matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
         || std::env::args().any(|argument| argument == "--debug")
 }

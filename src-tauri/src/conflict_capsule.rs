@@ -101,7 +101,7 @@ fn decode_envelope(bytes: &[u8]) -> Result<Vec<Value>, String> {
 /// (in-scope: disk error, a sync client delivering another build's envelope)
 /// must not make every later capture and retirement fail forever. The bytes
 /// are preserved, not deleted.
-fn quarantine_unreadable(path: &Path, reason: &str) -> Result<(), String> {
+fn quarantine_unreadable(path: &Path, _reason: &str) -> Result<(), String> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err("conflict capsule name is not UTF-8".into());
     };
@@ -113,10 +113,6 @@ fn quarantine_unreadable(path: &Path, reason: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         tine_core::model::sync_dir_for_rename(parent).map_err(|error| error.to_string())?;
     }
-    eprintln!(
-        "[tine] conflict capsule envelope set aside as {}: {reason}",
-        aside.display()
-    );
     Ok(())
 }
 

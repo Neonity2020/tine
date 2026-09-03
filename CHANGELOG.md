@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Diagnostics now keep graph content out of automatic output.** Native
+  detailed diagnostics are actually debug-gated, remaining core print sites and
+  frontend console calls have equality censuses, save refusals report only a
+  count, and lsdoc-diff failures cross worker/report boundaries only as fixed
+  offsets, lengths, and hashes rather than raw parser text.
+
 - **Managed shared joins now commit through one generation-bearing marker.**
   Verified baseline and operation directories are published under the next
   generation, and cold open follows the marker to one complete pair while

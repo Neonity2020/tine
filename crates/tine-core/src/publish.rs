@@ -4396,10 +4396,9 @@ pub(crate) fn publish_graph_documents(
             .unwrap_or(0)
             != 1
         {
-            eprintln!(
-                "tine export: refusing ambiguous public page identity {:?}; more than one source file claims it",
-                e.name
-            );
+            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+                eprintln!("tine export: refusing one ambiguous public page identity");
+            }
             continue;
         }
         public.push((e.name.as_str(), e.kind, Arc::clone(parsed)));
@@ -4427,10 +4426,10 @@ pub(crate) fn publish_graph_documents(
     // overwrote (DS#4). `slug(name)` is never recomputed independently downstream.
     let names: Vec<&str> = public.iter().map(|(n, _, _)| *n).collect();
     let (slugs, collisions) = build_slug_map(&names);
-    for (name, base, chosen) in &collisions {
+    if !collisions.is_empty() && crate::sync_runtime::runtime_debug_diagnostics_enabled() {
         eprintln!(
-            "tine export: page {name:?} slug {base:?} collides with another page; \
-             exporting it as {chosen:?}.html instead"
+            "tine export: resolved {} public-page slug collisions",
+            collisions.len()
         );
     }
     let slug_of = |name: &str| -> String {

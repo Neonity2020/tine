@@ -19618,7 +19618,9 @@ impl Graph {
             Ok(entry) => entry,
             Err(_error) => {
                 #[cfg(debug_assertions)]
-                eprintln!("file reconcile deferred for {}: {_error}", path.display());
+                if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+                    eprintln!("file reconcile deferred after a content-free I/O failure");
+                }
                 None
             }
         }
@@ -22452,15 +22454,10 @@ fn isolate_page_parse(
         }
         Ok(None) => Ok(None),
         Err(payload) => {
-            let detail = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("unknown panic payload");
-            eprintln!(
-                "Tine search index skipped page {:?}: page parse/projection panicked: {detail}",
-                e.rel_path
-            );
+            let _ = payload;
+            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+                eprintln!("Tine search index skipped one page after a parse/projection panic");
+            }
             Err(e.rel_path)
         }
     }
