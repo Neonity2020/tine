@@ -796,9 +796,13 @@ fn clean_join_generation_crash_cuts_recover_to_the_marker_named_pair() {
             replace_activation_marker_for_join(&enrollment, prior, marker(1)).unwrap();
         }
 
-        let resolved = resolve_clean_authority_directories(&archive, &enrollment)
-            .unwrap()
-            .expect("the marker retains one authority generation");
+        let resolved = resolve_clean_authority_directories(
+            &archive,
+            &enrollment,
+            &root.join("projection.sqlite"),
+        )
+        .unwrap()
+        .expect("the marker retains one authority generation");
         let expected = if marker_committed {
             &candidate_directories
         } else {
@@ -3767,6 +3771,10 @@ impl ActivationFixture {
             "tine-sync-local-activation-{label}-{}",
             Uuid::new_v4()
         ));
+        Self::nested_unicode_at(root, seed)
+    }
+
+    fn nested_unicode_at(root: PathBuf, seed: u128) -> Self {
         let graph_root = root.join("graph");
         fs::create_dir_all(graph_root.join("logseq")).unwrap();
         fs::write(
@@ -3799,6 +3807,37 @@ impl ActivationFixture {
         )
         .unwrap();
 
+        let private = root.join("private");
+        let request = SyncLocalActivationRequest {
+            archive_root: private.join("archive"),
+            graph_root: graph_root.clone(),
+            enrollment_root: private.join("enrollment"),
+            receipt_root: private.join("receipts"),
+            database_path: private.join("projection/bootstrap.sqlite"),
+            application_runtime_root: private.join("runtime"),
+            capture_root: private.join("capture"),
+            preparation_root: private.join("preparation"),
+            provider_root: graph_root.join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
+            identities: SyncLocalActivationIdentities {
+                workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+                lineage_digest: LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+                catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 2)),
+                device_id: DeviceId::from_uuid(Uuid::from_u128(seed + 3)),
+                preparation_id: Uuid::from_u128(seed + 4),
+                session_id: SessionId::from_uuid(Uuid::from_u128(seed + 5)),
+            },
+        };
+        Self {
+            root,
+            graph_root,
+            request,
+        }
+    }
+
+    fn reopen_at(root: PathBuf, seed: u128) -> Self {
+        let graph_root = root.join("graph");
         let private = root.join("private");
         let request = SyncLocalActivationRequest {
             archive_root: private.join("archive"),
@@ -28598,6 +28637,97 @@ fn failure_after_clean_activation_retain_completes_on_the_next_open() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+#[test]
+fn managed_activation_abort_cuts_retire_unmarked_generation_and_retry() {
+    const CUT_ENV: &str = "TINE_TEST_CLEAN_ACTIVATION_ABORT_CUT";
+    const ROOT_ENV: &str = "TINE_TEST_CLEAN_ACTIVATION_ABORT_ROOT";
+    const SEED: u128 = 0xa1f5_c2f0;
+
+    if let (Ok(cut), Ok(root)) = (std::env::var(CUT_ENV), std::env::var(ROOT_ENV)) {
+        let fixture = ActivationFixture::nested_unicode_at(PathBuf::from(root), SEED);
+        let result = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        panic!("activation did not abort at {cut}: {:?}", result.status);
+    }
+
+    for cut in [
+        "after-baseline-publication",
+        "after-sqlite-publication",
+        "after-final-source-verification",
+    ] {
+        let root = std::env::temp_dir().join(format!(
+            "tine-managed-activation-abort-{cut}-{}",
+            Uuid::new_v4()
+        ));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("sync_runtime::tests::managed_activation_abort_cuts_retire_unmarked_generation_and_retry")
+            .arg("--nocapture")
+            .env(CUT_ENV, cut)
+            .env(ROOT_ENV, &root)
+            .status()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(status.signal(), Some(libc::SIGABRT), "{cut}");
+        }
+        #[cfg(not(unix))]
+        assert!(
+            !status.success(),
+            "the activation child must abort at {cut}"
+        );
+
+        let fixture = ActivationFixture::reopen_at(root, SEED);
+        let before = user_graph_bytes(&fixture.graph_root);
+        assert!(
+            clean_baseline_directory(&fixture.request.archive_root).is_dir(),
+            "{cut} must retain the unmarked baseline generation"
+        );
+        assert_eq!(
+            fixture.request.database_path.is_file(),
+            cut != "after-baseline-publication",
+            "{cut} SQLite publication state"
+        );
+        assert!(
+            read_activation_marker(&fixture.request.enrollment_root)
+                .unwrap()
+                .is_none(),
+            "{cut} must precede the marker commit"
+        );
+
+        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(resumed.status, SyncLocalActivationStatus::Active, "{cut}");
+        let handle = resumed.handle.expect("the crash retry must become active");
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before, "{cut}");
+        let marker = read_activation_marker(&fixture.request.enrollment_root)
+            .unwrap()
+            .expect("the retry publishes one authority marker");
+        let active =
+            clean_authority_directories(&fixture.request.archive_root, marker.generation());
+        assert!(active.baseline.is_dir(), "{cut}");
+        assert!(active.operations.is_dir(), "{cut}");
+        let authority_directories = fs::read_dir(&fixture.request.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                clean_authority_generation(
+                    name,
+                    crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY,
+                )
+                .is_some()
+                    || clean_authority_generation(name, CLEAN_OPERATION_ARCHIVE_DIRECTORY).is_some()
+                    || name.starts_with(".clean-join-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authority_directories.len(),
+            2,
+            "{cut}: {authority_directories:?}"
+        );
+        drop(handle);
+    }
 }
 
 #[test]

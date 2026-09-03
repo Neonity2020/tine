@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed activation now recovers after a process abort before its authority
+  marker is published.** The marker remains the sole commit point; the next
+  activation retires a wholly recognized unmarked generation and disposable
+  SQLite projection, then rebuilds from unchanged Direct Files.
+
 - **Internal guards and Managed diagnostics now fail on the regressions they
   name.** Source ratchets detect helper-hidden error parsing and grouped
   filesystem imports, platform coverage is enumerated, projection/conflict

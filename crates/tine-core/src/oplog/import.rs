@@ -1498,8 +1498,9 @@ impl CommittedCleanActivation {
 }
 
 /// Publish both completed candidates, compare the live source bytes one final
-/// time without parsing, and write the authority marker last. A failure before
-/// the marker removes the disposable baseline and SQLite file set.
+/// time without parsing, and write the authority marker last. An ordinary
+/// returned failure before the marker removes the disposable baseline and
+/// SQLite file set; the next activation retires either one after a process abort.
 pub(crate) fn commit_clean_activation(
     graph: &Graph,
     preparation: CleanActivationPreparation,
@@ -1509,7 +1510,11 @@ pub(crate) fn commit_clean_activation(
     let (capture, baseline, sqlite, accepted_frontier) = preparation.into_parts();
     let database_path = sqlite.target_path().to_path_buf();
     let (baseline, _) = baseline.publish_durable(baseline_destination)?;
+    #[cfg(test)]
+    abort_at_clean_activation_commit_cut_for_test("after-baseline-publication");
     let projection = sqlite.publish()?;
+    #[cfg(test)]
+    abort_at_clean_activation_commit_cut_for_test("after-sqlite-publication");
 
     let watcher_fence = graph.cache_generation();
     let final_scan = match capture.verify_before_inactive_bootstrap_authoring(graph) {
@@ -1536,6 +1541,8 @@ pub(crate) fn commit_clean_activation(
         super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?,
         watcher_fence,
     )?;
+    #[cfg(test)]
+    abort_at_clean_activation_commit_cut_for_test("after-final-source-verification");
     if let Err(error) = publish_activation_marker(enrollment_root, marker) {
         drop(projection);
         super::sqlite::remove_disposable_projection(&database_path)?;
@@ -1553,6 +1560,13 @@ pub(crate) fn commit_clean_activation(
         marker,
         final_scan,
     })
+}
+
+#[cfg(test)]
+fn abort_at_clean_activation_commit_cut_for_test(cut: &str) {
+    if std::env::var("TINE_TEST_CLEAN_ACTIVATION_ABORT_CUT").as_deref() == Ok(cut) {
+        std::process::abort();
+    }
 }
 
 /// Cold-opened clean baseline and its matching disposable projection. This

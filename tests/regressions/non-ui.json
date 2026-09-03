@@ -6157,6 +6157,21 @@
     "failBefore": "A wildcard Err mapping collapsed every eligibility and capture failure to IneligibleState."
    },
    "notes": "Six enum values cover attachment, runtime shape, blocked state, unsettled work, frontier order, and unexpected capture failure; no prose crosses the boundary."
+  },
+  {
+   "id": "REG-W4-R2-ACTIVATION-ABORT-RECOVERY-001",
+   "title": "A process abort during Managed activation does not strand the graph or leak an unmarked baseline generation",
+   "family": "managed-activation-recovery",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-R2"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::managed_activation_abort_cuts_retire_unmarked_generation_and_retry"],
+    "scenario": "managed-activation.process-abort-before-marker-recovers",
+    "failBefore": "After baseline publication, the subprocess abort left an unmarked generation and the next activation returned AmbiguousOrForeignResidue instead of becoming active."
+   },
+   "notes": "Availability/recovery, not rank 1: Direct Files bytes remain unchanged. Three subprocess-abort cuts cover baseline publication, SQLite publication, and final source verification before the marker commit."
   }
  ]
 }

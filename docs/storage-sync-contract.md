@@ -2548,6 +2548,29 @@ archive that no later attempt can attribute, and every retry refuses
 `SyncConflict` permanently for a graph whose only authority is still the
 Markdown/Org tree beside it.
 
+### Harvest W4-R2 — unmarked activation-generation recovery
+
+The marker publication is the sole activation commit. A process abort can skip
+Rust destructors and the attempt-level retraction, so a current-layout
+generation published before that marker remains inert rather than becoming
+authority. On the next explicit activation, the existing generation resolver
+retires a wholly recognized unmarked archive, removes the disposable SQLite
+file set, and rebuilds from the unchanged Markdown/Org source. An unknown entry
+prevents that attribution and remains untouched for the ordinary foreign-residue
+refusal.
+
+| Crash cut | State observed by the next activation | Recovery |
+| --- | --- | --- |
+| after durable baseline publication, before SQLite publication | unmarked `lazy-genesis.0` and `operations.0`; no authority marker; SQLite absent | retire both inert generation directories and rebuild generation 0 from Direct Files |
+| after SQLite publication, before the final source proof | the same unmarked generation pair plus a disposable SQLite file set; no authority marker | retire the SQLite file set and both inert generation directories, then rebuild |
+| after the final source proof, before marker publication | complete unmarked baseline, operation archive, and SQLite projection; no authority marker | retire all uncommitted derived state and rebuild; source identity is proved again |
+| during atomic marker publication | either one of the no-marker states above or one complete valid marker | no marker follows the corresponding recovery row; a valid marker selects generation 0 and ordinary managed open follows it |
+
+`managed_activation_abort_cuts_retire_unmarked_generation_and_retry` pins the
+three pre-marker process-abort cuts. Marker atomicity is provided by the audited
+marker publication primitive and is not reproduced by a test-only partial-file
+shape.
+
 A refusal from that final source proof names what moved: the row count and, for
 the first rows, the exact path together with the field that changed (filesystem
 resource identity, link count, or content description), and whether the row

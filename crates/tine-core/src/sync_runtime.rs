@@ -6257,20 +6257,68 @@ fn clean_authority_generation(name: &str, stem: &str) -> Option<u64> {
 }
 
 /// Resolve the sole authority generation named by the durable marker and
-/// retire incomplete join candidates or generations that marker never made
-/// authoritative. The marker replacement is therefore the only join commit
-/// point; no directory swap repair state machine exists.
+/// retire incomplete candidates or generations that no marker made
+/// authoritative. The marker publication/replacement is therefore the only
+/// commit point; no directory swap repair state machine exists.
 fn resolve_clean_authority_directories(
     archive_root: &Path,
     enrollment_root: &Path,
+    database_path: &Path,
 ) -> std::io::Result<Option<CleanAuthorityDirectories>> {
-    let Some(marker) = read_activation_marker(enrollment_root)? else {
-        return Ok(None);
+    let marker = read_activation_marker(enrollment_root)?;
+    let entries = match fs::read_dir(archive_root) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(
+                marker.map(|marker| clean_authority_directories(archive_root, marker.generation()))
+            );
+        }
+        Err(error) => return Err(error),
     };
+
+    if marker.is_none() {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        for entry in entries {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let recognized = clean_authority_generation(
+                &name,
+                crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY,
+            )
+            .or_else(|| clean_authority_generation(&name, CLEAN_OPERATION_ARCHIVE_DIRECTORY))
+            .is_some()
+                || name.starts_with(".clean-join-");
+            if !recognized {
+                // Unknown bytes are not attributed to an interrupted current-
+                // layout activation. Leave them for normal discovery/refusal.
+                return Ok(None);
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("clean authority orphan is not a private directory: {name}"),
+                ));
+            }
+        }
+
+        // Without a marker every generation is inert. SQLite is likewise a
+        // disposable projection, so retire it before the generation slots;
+        // every crash cut through this cleanup remains recognizable on retry.
+        crate::oplog::sqlite::remove_disposable_projection(database_path)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        remove_disposable_clean_archive(archive_root)?;
+        if let Some(parent) = archive_root.parent() {
+            crate::filesystem_durability::sync_reconstructible_directory_path(parent)?;
+        }
+        return Ok(None);
+    }
+    let marker = marker.expect("the no-marker recovery returned above");
     let active = clean_authority_directories(archive_root, marker.generation());
     let mut removed = false;
-    for entry in fs::read_dir(archive_root)? {
-        let entry = entry?;
+    for entry in entries {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let generation = clean_authority_generation(
@@ -6908,9 +6956,12 @@ fn open_clean_runtime_resources_with_progress(
             phase: SyncLocalActivationPhase::RetainedRuntimeOpen,
         });
     }
-    let Some(authority_directories) =
-        resolve_clean_authority_directories(&request.archive_root, &request.enrollment_root)
-            .map_err(display)?
+    let Some(authority_directories) = resolve_clean_authority_directories(
+        &request.archive_root,
+        &request.enrollment_root,
+        &request.database_path,
+    )
+    .map_err(display)?
     else {
         return Ok(None);
     };
