@@ -226,7 +226,28 @@ struct FlightRecorder {
     current: Option<File>,
     current_bytes: u64,
     segment_max_bytes: u64,
-    _process_lock: File,
+    process_lock: File,
+}
+
+/// Release the single-writer lock explicitly, rather than as a side effect of
+/// dropping the descriptor.
+///
+/// `flock` belongs to the OPEN FILE DESCRIPTION, not to the descriptor, so
+/// closing one copy releases nothing while any other copy of that description
+/// is still open. This process forks — every `Command::spawn` duplicates every
+/// open description into the child, and the copy lives until the child reaches
+/// `exec` and `O_CLOEXEC` closes it. A recorder dropped inside that window
+/// leaves its lock held by the child's copy, and the next `open` on the same
+/// directory gets `EAGAIN` from `try_lock_exclusive`. That is a race against
+/// nothing but scheduler luck, which is why it only ever showed up under
+/// parallel test load — and why it cost this project four extra `cargo test -p
+/// tine` runs in one lane. `unlock` acts on the description itself, so it
+/// releases the lock for every copy at once and orders the release before the
+/// drop returns.
+impl Drop for FlightRecorder {
+    fn drop(&mut self) {
+        let _ = self.process_lock.unlock();
+    }
 }
 
 impl FlightRecorder {
@@ -258,7 +279,7 @@ impl FlightRecorder {
                 current: Some(file),
                 current_bytes: 0,
                 segment_max_bytes,
-                _process_lock: process_lock,
+                process_lock,
             },
             previous_unclean,
         ))
@@ -948,6 +969,36 @@ mod tests {
         }
         let (_, previous_unclean) = FlightRecorder::open(dir.clone(), 4096).unwrap();
         assert!(!previous_unclean);
+    }
+
+    /// The two tests above are the pair that kept failing on a first parallel
+    /// run and passing on the rerun — four extra `cargo test -p tine`
+    /// invocations in one lane alone. Both do the same thing: drop a recorder
+    /// and immediately open another on the same directory. That only works if
+    /// dropping actually released the single-writer lock, and dropping the
+    /// descriptor is NOT that: `flock` belongs to the open file description, so
+    /// it survives until the last copy of the description closes. This process
+    /// spawns children, and every spawn duplicates the description into a child
+    /// that holds it until `exec`.
+    ///
+    /// Reproduce that window deterministically with an explicit `dup`, which
+    /// leaves the kernel in exactly the state a mid-`exec` child does.
+    #[test]
+    fn a_recorder_releases_its_lock_even_while_a_duplicated_descriptor_lives() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("diagnostics");
+        let duplicate = {
+            let (recorder, _) = FlightRecorder::open(dir.clone(), 4096).unwrap();
+            recorder.process_lock.try_clone().unwrap()
+        };
+        let reopened = FlightRecorder::open(dir.clone(), 4096);
+        drop(duplicate);
+        assert!(
+            reopened.is_ok(),
+            "the recorder must unlock explicitly, not leave release to the last \
+             descriptor close: {:?}",
+            reopened.err(),
+        );
     }
 
     /// The other direction, which the fix must not trade away: a session the

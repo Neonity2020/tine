@@ -92,6 +92,22 @@ pub(crate) fn cut_turn_replay_after_pages_for_test(pages: usize) -> TurnReplayCu
     TurnReplayCutScope { previous }
 }
 
+/// Did the injected replay cut actually fire?
+///
+/// A crash-schedule oracle has to know that replay stopped AT THE CUT and not
+/// somewhere else — that is the whole claim. It used to learn this by matching
+/// the cut's own sentence in the refusal text, which W4-E3 correctly stopped
+/// publishing: an open refusal now carries a source-class code and nothing
+/// else, so `clean_open.projection` no longer separates "the cut fired" from
+/// "some other projection error". Ask the cut directly instead of asking the
+/// error to identify itself. The counter reaches zero only by being consumed
+/// page by page, so `Some(0)` means the cut was actually reached; read it
+/// before the `TurnReplayCutScope` guard is dropped.
+#[cfg(test)]
+pub(crate) fn turn_replay_cut_was_reached_for_test() -> bool {
+    TURN_REPLAY_PAGES_BEFORE_CUT.with(|cut| cut.get() == Some(0))
+}
+
 #[cfg(test)]
 pub(crate) fn reset_turn_replay_page_completions_for_test() {
     TURN_REPLAY_PAGE_COMPLETIONS.with(|count| count.set(0));
