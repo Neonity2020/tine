@@ -803,6 +803,35 @@ mod tests {
 mod file_url_tests {
     use super::{external_open_plan, file_url_to_path, ExternalOpen};
 
+    #[test]
+    fn external_open_cfg_family_accounts_for_all_five_shipped_targets() {
+        let source = include_str!("platform.rs");
+        let start = source
+            .find("pub(crate) fn open_external(")
+            .expect("open_external remains present");
+        let end = source[start..]
+            .find("\n/// Build the OS")
+            .map(|offset| start + offset)
+            .expect("the opener helper remains after open_external");
+        let function = &source[start..end];
+        let target_rows = [
+            ("linux", "#[cfg(target_os = \"linux\")]"),
+            ("macos", "#[cfg(target_os = \"macos\")]"),
+            ("windows", "#[cfg(all(desktop, target_os = \"windows\"))]"),
+            ("android", "#[cfg(not(desktop))]"),
+            ("ios", "#[cfg(not(desktop))]"),
+        ];
+
+        for (target, branch) in target_rows {
+            assert!(
+                function.contains(branch),
+                "I-16: open_external must account for {target} through {branch}"
+            );
+        }
+        assert!(function.contains("tauri_plugin_opener::OpenerExt"));
+        assert!(function.contains("opening local files is available on desktop only"));
+    }
+
     /// The three shapes GH #444 reported, plus the ordinary POSIX one. On
     /// Windows all four resolve to a real local path; elsewhere the drive-letter
     /// forms still parse to a path, they just are not meaningful there — the

@@ -22,11 +22,21 @@ describe("I-20 graph identity guard", () => {
     ).toEqual([]);
   });
 
-  it("keeps switcher resource identity and Settings busy ownership explicit", () => {
+  it("keeps switcher resource identity and forbids unowned Settings busy clears", () => {
     const switcher = readFileSync(join(process.cwd(), "src/components/QuickSwitcher.tsx"), "utf8");
     const settings = readFileSync(join(process.cwd(), "src/components/Settings.tsx"), "utf8");
     expect(switcher).toContain("graphBinding: graphBinding()");
-    expect(settings.match(/if \(busy\(\) === myKey\) setBusy\(null\)/g)?.length ?? 0).toBeGreaterThanOrEqual(4);
-    expect(settings.match(/if \(props\.busy\(\) === myKey\) props\.setBusy\(null\)/g)?.length ?? 0).toBe(2);
+
+    const normalized = settings.replace(/\s+/g, " ");
+    const unownedClears = [...normalized.matchAll(/(?:props\.)?setBusy\(null\)/g)]
+      .filter((match) => {
+        const prefix = normalized.slice(Math.max(0, match.index! - 96), match.index);
+        return !/if \((?:props\.)?busy\(\) === myKey\) (?:\{ )?$/.test(prefix);
+      })
+      .map((match) => match.index);
+    expect(
+      unownedClears,
+      "I-20: a completed Settings operation may clear only the busy token it owns",
+    ).toEqual([]);
   });
 });
