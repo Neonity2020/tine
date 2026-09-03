@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { storagePinProblems } from "./storage-pin-lib.mjs";
+import { STORAGE_REQUIRED_JOBS, storagePinProblems } from "./storage-pin-lib.mjs";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "tine-storage-pin-"));
 const commit = "a".repeat(40);
@@ -28,7 +28,10 @@ const receipt = [
   "ref=v0.3.0",
   `commit=${commit}`,
   `run=${run}`,
-  "required_jobs=linux-complete,windows-complete,android-compile,api-semver",
+  // Derived, never transcribed: a hand-copied matrix silently rots the moment a
+  // shipped target is added to STORAGE_REQUIRED_JOBS, and the failure lands on
+  // this fixture rather than on the pin it is supposed to be proving.
+  `required_jobs=${STORAGE_REQUIRED_JOBS}`,
   "format_manifest_begin",
   manifest.trimEnd(),
   "format_manifest_end",
@@ -99,8 +102,8 @@ write("docs/dependency-receipts/tine-storage-v0.3.0.txt", `${receipt}tampered\n`
 assert.ok(storagePinProblems(root).some((problem) => problem.includes("receipt SHA-256")));
 
 const incompleteReceipt = receipt.replace(
-  "required_jobs=linux-complete,windows-complete,android-compile,api-semver",
-  "required_jobs=linux-complete",
+  `required_jobs=${STORAGE_REQUIRED_JOBS}`,
+  `required_jobs=${STORAGE_REQUIRED_JOBS.split(",")[0]}`,
 );
 write("docs/dependency-receipts/tine-storage-v0.3.0.txt", incompleteReceipt);
 const incompleteMetadata = JSON.parse(fs.readFileSync(path.join(root, "docs/dependency-receipts/tine-storage.json"), "utf8"));
