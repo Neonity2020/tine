@@ -3130,7 +3130,12 @@ pub(crate) fn run_android_managed_return_to_direct_files(
         .graphs
         .write()
         .unwrap()
-        .bind("managed-storage-smoke".into(), Arc::clone(&slot))?;
+        // Phase-B bridge: `GraphRegistry::bind` is typed (W4-E2) and this
+        // Android-only helper still speaks `String`. W4-E2b retires it with the
+        // rest. It is here rather than in E2 because no local gate compiles an
+        // `#[cfg(target_os = "android")]` body — CI found it, twice.
+        .bind("managed-storage-smoke".into(), Arc::clone(&slot))
+        .map_err(|error| error.to_string())?;
 
     let private_name = private_root
         .file_name()
@@ -4661,9 +4666,7 @@ mod tests {
             let command = &tail[..end];
             let compact: String = command.split_whitespace().collect();
             assert!(
-                compact.contains(
-                    "owned_graph_context(state).map_err(|error|error.to_string())?"
-                ),
+                compact.contains("owned_graph_context(state).map_err(|error|error.to_string())?"),
                 "{name} must own the exact window binding before await"
             );
             assert!(
