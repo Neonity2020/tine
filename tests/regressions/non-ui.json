@@ -6261,6 +6261,23 @@
    "notes": "Exact safety: DirectSaveFailureCode and the conflict epoch cross the command boundary as tagged JSON; error display text is never parsed for control flow."
   },
   {
+   "id": "REG-W4-C7A-DUPLICATE-UUID-OWNERSHIP-001",
+   "title": "Duplicate block UUID ownership matches Logseq across Direct and Managed projection states",
+   "family": "managed-read-parity",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-C7a item 4; Logseq c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage-read-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::duplicate_logseq_uuid_uses_og_first_claimant_at_four_boundaries"
+    ],
+    "scenario": "managed-read.duplicate-uuid-first-parser-claimant",
+    "failBefore": "tine-agents/evidence/wave4/c7a/uuid-ownership-fail-before.log — the new test run against the pre-fix Managed SQLite branch (`claimants.len() > 1` continues without parser fallback) exits 101 with left None, right Some(\"A first\")"
+   },
+   "notes": "The exact upstream outcome is first claimant in parser order; the test covers Direct-ready, Direct-fallback, Managed-drained, and Managed-pending boundaries."
+  },
+  {
    "id": "REG-FLAKE-FLIGHT-RECORDER-LOCK-001",
    "title": "The flight recorder releases its single-writer lock when it is dropped, not when the last forked copy of the descriptor closes",
    "family": "diagnostics-process-lifecycle",

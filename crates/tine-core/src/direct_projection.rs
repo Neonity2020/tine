@@ -674,10 +674,9 @@ impl DirectProjection {
         }
         let read = reader.as_ref()?.read();
         let block = match read.block(uuid).ok()? {
-            Some(block) => Some(block),
+            Some(block) => crate::query::logseq_uuid_owner([block], false),
             None => {
-                let mut claimants = read.blocks_by_logseq_uuid(uuid, 2).ok()?;
-                (claimants.len() == 1).then(|| claimants.pop().expect("one UUID claimant"))
+                crate::query::logseq_uuid_owner(read.blocks_by_logseq_uuid(uuid, 2).ok()?, false)
             }
         };
         let page = match block {

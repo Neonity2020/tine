@@ -1028,7 +1028,7 @@ fn append_bounded_text(out: &mut String, value: &str, max_bytes: usize) -> bool 
     true
 }
 
-fn backlink_filter_entry(
+pub(crate) fn backlink_filter_entry(
     page: &str,
     kind: PageKind,
     block: &DocBlock,
@@ -1126,107 +1126,6 @@ pub(crate) fn backlink_filter_entry_estimated_bytes(entry: &BacklinkFilterEntry)
         + entry.page.len()
         + entry.block_id.len()
         + 128
-}
-
-/// Filter metadata for one application-gateway root. This mirrors
-/// `backlink_filter_entry` while retaining managed frontend block identity.
-pub(crate) fn application_backlink_filter_entry(
-    page: &str,
-    kind: PageKind,
-    block: &BlockDto,
-    is_org: bool,
-    excluded_refs: &std::collections::HashSet<String>,
-    remaining_bytes: usize,
-) -> BacklinkFilterEntry {
-    let max_text = BACKLINK_FILTER_MAX_TEXT_BYTES.min(remaining_bytes);
-    let mut text = String::new();
-    let mut facets = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut facets_truncated = false;
-    let mut add_facet = |name: &str| {
-        let name = name.trim();
-        if name.is_empty() {
-            return;
-        }
-        let key = refs::normalize(name);
-        if excluded_refs.contains(&key) || !seen.insert(key) {
-            return;
-        }
-        if facets.len() >= BACKLINK_FILTER_MAX_FACETS {
-            facets_truncated = true;
-        } else {
-            facets.push(name.to_string());
-        }
-    };
-
-    fn visit(
-        block: &BlockDto,
-        depth: usize,
-        is_org: bool,
-        text: &mut String,
-        max_text: usize,
-        add_facet: &mut impl FnMut(&str),
-        truncated: &mut bool,
-    ) {
-        if depth > crate::model::MAX_MANAGED_BLOCK_DEPTH {
-            *truncated = true;
-            return;
-        }
-        let projected = dto_block_to_doc_block(block, is_org);
-        *truncated |= append_bounded_text(text, projected.visible_text(), max_text);
-        let projection = projected.projection();
-        for name in &projection.refs_page {
-            add_facet(name);
-        }
-        if let Some(marker) = projection.marker.as_deref() {
-            add_facet(marker);
-        }
-        for (key, value) in &projection.properties {
-            if !(key.eq_ignore_ascii_case("tags")
-                || key.eq_ignore_ascii_case("alias")
-                || key.eq_ignore_ascii_case("aliases"))
-            {
-                continue;
-            }
-            let quoted = value.trim();
-            if quoted.len() >= 2 && quoted.starts_with('"') && quoted.ends_with('"') {
-                continue;
-            }
-            for value in value.split([',', '，']) {
-                add_facet(&strip_ref(value.trim()));
-            }
-        }
-        for child in &block.children {
-            visit(
-                child,
-                depth + 1,
-                is_org,
-                text,
-                max_text,
-                add_facet,
-                truncated,
-            );
-        }
-    }
-
-    let mut text_truncated = false;
-    visit(
-        block,
-        1,
-        is_org,
-        &mut text,
-        max_text,
-        &mut add_facet,
-        &mut text_truncated,
-    );
-    BacklinkFilterEntry {
-        page: page.to_string(),
-        kind,
-        block_id: block.id.clone(),
-        text,
-        facets,
-        truncated: text_truncated || facets_truncated,
-    }
 }
 
 /// Build search/facet metadata only for the shallow backlink roots already in
@@ -2484,13 +2383,10 @@ pub(crate) struct ParserSparseQueryCandidate<'a> {
 }
 
 fn application_sparse_query_doc_block(candidate: &ApplicationSparseQueryCandidate) -> DocBlock {
-    DocBlock {
-        raw: candidate.raw.clone(),
-        children: Vec::new(),
-        uuid: candidate.identity.clone(),
-        is_org: candidate.page.is_org,
-        proj: std::sync::OnceLock::new(),
-    }
+    let mut block = DocBlock::new(candidate.raw.clone());
+    block.uuid.clone_from(&candidate.identity);
+    block.is_org = candidate.page.is_org;
+    block
 }
 
 /// Run a marker-narrowed sparse task candidate set with the ordinary simple
@@ -3557,74 +3453,31 @@ pub(crate) fn application_page_templates(
     page: &PageDto,
     allowed_indices: Option<&std::collections::HashSet<usize>>,
 ) -> Vec<TemplateDto> {
-    fn property(block: &BlockDto, wanted: &str) -> Option<String> {
-        block
-            .properties
-            .iter()
-            .find(|(name, _)| property_key_norm(name) == wanted)
-            .map(|(_, value)| value.clone())
-    }
-
-    fn template_dto_from_application(block: &BlockDto, strip_template: bool) -> BlockDto {
-        let raw = block
-            .raw
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim();
-                let drop = trimmed.starts_with("id::")
-                    || (strip_template
-                        && (trimmed.starts_with("template::")
-                            || trimmed.starts_with("template-including-parent::")));
-                !drop
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        BlockDto {
-            id: String::new(),
-            raw,
-            collapsed: false,
-            children: block
-                .children
-                .iter()
-                .map(|child| template_dto_from_application(child, false))
-                .collect(),
-            breadcrumb: Vec::new(),
-            // DUP-8: every field spelled out, at its `Default` value, so a new
-            // `BlockDto` field has to be decided here instead of arriving
-            // silently defaulted. A template copy carries no facets: the raw
-            // text still holds them and the caller re-derives on insert.
-            page_property: false,
-            marker: None,
-            priority: None,
-            heading_level: None,
-            scheduled: None,
-            deadline: None,
-            tags: Vec::new(),
-            properties: Vec::new(),
-        }
-    }
-
-    fn visit(
+    fn visit_template_blocks(
         blocks: &[BlockDto],
+        doc_blocks: &[DocBlock],
         page: &PageDto,
         allowed_indices: Option<&std::collections::HashSet<usize>>,
         next_index: &mut usize,
         out: &mut Vec<TemplateDto>,
     ) {
-        for block in blocks {
+        for (block, doc_block) in blocks.iter().zip(doc_blocks) {
             let index = *next_index;
             *next_index = next_index.saturating_add(1);
             if allowed_indices.is_none_or(|allowed| allowed.contains(&index)) {
-                if let Some(name) = property(block, "template").filter(|name| !name.is_empty()) {
+                if let Some(name) = doc_block
+                    .property("template")
+                    .filter(|name| !name.is_empty())
+                {
                     let include_parent =
-                        property(block, "template-including-parent").as_deref() != Some("false");
+                        doc_block.property("template-including-parent").as_deref() != Some("false");
                     let blocks = if include_parent {
-                        vec![template_dto_from_application(block, true)]
+                        vec![template_dto(doc_block, true)]
                     } else {
-                        block
+                        doc_block
                             .children
                             .iter()
-                            .map(|child| template_dto_from_application(child, false))
+                            .map(|child| template_dto(child, false))
                             .collect()
                     };
                     out.push(TemplateDto {
@@ -3635,14 +3488,28 @@ pub(crate) fn application_page_templates(
                     });
                 }
             }
-            visit(&block.children, page, allowed_indices, next_index, out);
+            visit_template_blocks(
+                &block.children,
+                &doc_block.children,
+                page,
+                allowed_indices,
+                next_index,
+                out,
+            );
         }
     }
 
     let mut out = Vec::new();
     let mut next_index = 0;
-    visit(
+    let is_org = page.format == Format::Org;
+    let roots = page
+        .blocks
+        .iter()
+        .map(|block| application_query_doc_block(block, is_org))
+        .collect::<Vec<_>>();
+    visit_template_blocks(
         &page.blocks,
+        &roots,
         page,
         allowed_indices,
         &mut next_index,
@@ -3673,8 +3540,8 @@ fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {
         collapsed: false,
         children: b.children.iter().map(|c| template_dto(c, false)).collect(),
         breadcrumb: Vec::new(),
-        // DUP-8: every field spelled out, at its `Default` value -- see
-        // `template_dto_from_application` above, whose behavior this mirrors.
+        // DUP-8: every non-content field is deliberately reset at insertion;
+        // both Direct and Managed template walks delegate to this one leaf.
         page_property: false,
         marker: None,
         priority: None,
@@ -4082,6 +3949,27 @@ pub fn resolve_block(graph: &Graph, uuid: &str) -> Option<RefGroup> {
 /// per-input (duplicate input uuids each get their own `Some(..)`/`None`).
 pub fn resolve_blocks(graph: &Graph, uuids: &[String]) -> Vec<Option<RefGroup>> {
     resolve_blocks_bounded(graph, uuids, usize::MAX, usize::MAX).0
+}
+
+/// Logseq file graphs keep the first block UUID claimant encountered by the
+/// parser and rewrite every later duplicate to a fresh UUID. Provenance:
+/// logseq/logseq `c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968`,
+/// `deps/graph-parser/src/logseq/graph_parser/block.cljs`,
+/// `fix-block-id-if-duplicated!`.
+///
+/// A physical index may call this only when it has parser order. With an
+/// ambiguous unordered hint, `None` deliberately requests parser fallback.
+pub(crate) fn logseq_uuid_owner<T>(
+    claimants: impl IntoIterator<Item = T>,
+    parser_ordered: bool,
+) -> Option<T> {
+    let mut claimants = claimants.into_iter();
+    let first = claimants.next()?;
+    if parser_ordered || claimants.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
 }
 
 pub fn resolve_blocks_bounded(
@@ -4578,6 +4466,8 @@ fn resolve_ids_in_page<'a>(
     resolved: &mut std::collections::HashMap<&'a str, RefGroup>,
     budget: &mut ConstructionBudget,
 ) {
+    let mut claimants = std::collections::HashMap::<&'a str, Vec<&DocBlock>>::new();
+    let mut order = Vec::new();
     walk(&doc.roots, &mut |b| {
         // A block's identity is its uuid OR its persisted `id::`; check both
         // against the wanted set with O(1) lookups (no per-id rescan).
@@ -4591,12 +4481,20 @@ fn resolve_ids_in_page<'a>(
                     .filter(|id| !resolved.contains_key(id))
             });
         if let Some(id) = hit {
+            if !claimants.contains_key(id) {
+                order.push(id);
+            }
+            claimants.entry(id).or_default().push(b);
+        }
+    });
+    for id in order {
+        if let Some(block) = logseq_uuid_owner(claimants.remove(id).unwrap_or_default(), true) {
             if budget.closed() {
                 budget.deny_match();
-                return;
+                continue;
             }
-            if budget.admit_estimated(&entry.name, shallow_dto_estimated_bytes(b, &[])) {
-                let dto = result_dto(b);
+            if budget.admit_estimated(&entry.name, shallow_dto_estimated_bytes(block, &[])) {
+                let dto = result_dto(block);
                 resolved.insert(
                     id,
                     RefGroup {
@@ -4608,7 +4506,7 @@ fn resolve_ids_in_page<'a>(
                 );
             }
         }
-    });
+    }
 }
 
 /// Is this query body an advanced datalog query we don't support?
@@ -5567,11 +5465,11 @@ mod tests {
                 ..BlockDto::default()
             };
         }
-        let entry = application_backlink_filter_entry(
+        let projected = application_query_doc_block(&block, false);
+        let entry = backlink_filter_entry(
             "Hostile",
             PageKind::Page,
-            &block,
-            false,
+            &projected,
             &std::collections::HashSet::new(),
             usize::MAX,
         );

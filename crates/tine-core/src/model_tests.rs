@@ -106,69 +106,122 @@ fn page_header_rule_stays_deliberately_distinct_from_block_rule() {
     assert_eq!(page_header_property_line("a b:: v"), None);
 }
 
-// DUP guard (2026-08-25 duplication audit): the `BlockDto` → `DocBlock`
-// field mapping existed as TWO inline copies (here in
-// `dto_blocks_to_doc_checked` and in `query.rs::application_query_doc_block`)
-// that had to be kept in agreement manually. The mapping is the contract —
-// which DTO fields carry into the parseable tree (and that the lazy
-// projection starts empty) — so it is one function and this source guard
-// forbids a second spelling.
+// I-12: every production `DocBlock` literal is a reviewed constructor boundary.
+// This is syntax-aware so a renamed `uuid: dto.id.clone()` mapping cannot evade
+// the old substring check. Managed DTO conversions use
+// `dto_block_to_doc_block`; cheap raw-only leaves use `DocBlock::new`.
 #[test]
-fn only_one_blockdto_to_docblock_field_mapping_exists() {
-    let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut spellings = Vec::new();
-    let mut stack = vec![crate_src];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
+fn production_docblock_struct_literals_are_reviewed() {
+    use syn::visit::{self, Visit};
+
+    #[derive(Default)]
+    struct Literals {
+        owner: Option<String>,
+        owners: std::collections::BTreeSet<String>,
+    }
+    fn test_only(attributes: &[syn::Attribute]) -> bool {
+        attributes.iter().any(|attribute| {
+            attribute.path().is_ident("test")
+                || (attribute.path().is_ident("cfg")
+                    && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test")))
+        })
+    }
+    impl<'ast> Visit<'ast> for Literals {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if test_only(&item.attrs) {
+                return;
             }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
+            let previous = self.owner.replace(item.sig.ident.to_string());
+            visit::visit_item_fn(self, item);
+            self.owner = previous;
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if test_only(&item.attrs) {
+                return;
             }
-            // An externalised test module (`#[cfg(test)] #[path = "x_tests.rs"]
-            // mod tests;` in the sibling `x.rs`) is entirely test code, so it
-            // is skipped whole rather than split. Proving the declaration
-            // exists — instead of trusting the `_tests.rs` name — is what keeps
-            // this exclusion from quietly swallowing a production file.
-            if let Some(owner) = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.strip_suffix("_tests"))
-            {
-                let owner_path = path.with_file_name(format!("{owner}.rs"));
-                let declaration = format!(
-                    "#[path = \"{}\"]",
-                    path.file_name().unwrap().to_string_lossy()
-                );
-                if std::fs::read_to_string(&owner_path)
-                    .is_ok_and(|owner_source| owner_source.contains(&declaration))
-                {
-                    continue;
-                }
-            }
-            let source = std::fs::read_to_string(&path).unwrap();
-            // Only production code counts: the trailing `mod tests` pins and
-            // documents the rule (inline cfg(test) items above it are rare
-            // and contain no DTO conversion).
-            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-            if production.contains("uuid: block.id.clone()") {
-                spellings.push(
-                    path.strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+            let previous = self.owner.replace(item.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, item);
+            self.owner = previous;
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                visit::visit_item_mod(self, item);
             }
         }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            if expression
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| part.ident == "DocBlock")
+            {
+                self.owners.insert(
+                    self.owner
+                        .clone()
+                        .expect("a production DocBlock literal has an enclosing item"),
+                );
+            }
+            visit::visit_expr_struct(self, expression);
+        }
     }
-    spellings.sort();
+
+    let allowed = [
+        (
+            "crates/tine-core/src/doc.rs",
+            "clone",
+            "Clone resets the lazy projection memo",
+        ),
+        (
+            "crates/tine-core/src/doc.rs",
+            "new",
+            "DocBlock::new is the raw-only canonical constructor",
+        ),
+        (
+            "crates/tine-core/src/model.rs",
+            "dto_block_to_doc_block",
+            "the one BlockDto field mapping",
+        ),
+        (
+            "crates/tine-core/src/pdf.rs",
+            "highlight_block",
+            "PDF import constructs parser-native highlight blocks",
+        ),
+        (
+            "crates/tine-core/src/query.rs",
+            "property_projection",
+            "page pre-block projection has no BlockDto source",
+        ),
+    ];
+    let reasons = allowed
+        .iter()
+        .map(|(file, owner, reason)| ((*file, *owner), *reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut actual = Vec::new();
+    for file in crate::projection_producer_census::production_rust() {
+        let syntax = syn::parse_file(&file.raw)
+            .unwrap_or_else(|error| panic!("{} is valid Rust: {error}", file.relative));
+        let mut literals = Literals::default();
+        literals.visit_file(&syntax);
+        for owner in literals.owners {
+            let reason = reasons
+                .get(&(file.relative.as_str(), owner.as_str()))
+                .copied()
+                .unwrap_or("UNCLASSIFIED: use dto_block_to_doc_block or DocBlock::new");
+            actual.push((file.relative.as_str(), owner, reason));
+        }
+    }
+    actual.sort();
+    let mut expected = allowed
+        .into_iter()
+        .map(|(file, owner, reason)| (file, owner.to_owned(), reason))
+        .collect::<Vec<_>>();
+    expected.sort();
     assert_eq!(
-        spellings,
-        vec!["src/model.rs"],
-        "the BlockDto -> DocBlock field mapping must stay in exactly one function"
+        actual, expected,
+        "I-12: every production DocBlock literal is reviewed; managed DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
     );
 }
 
