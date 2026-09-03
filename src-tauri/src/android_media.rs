@@ -99,7 +99,7 @@ impl<R: Runtime> AndroidMedia<R> {
     fn call(&self, method: &str) -> Result<MediaCaptureResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin(method, ())
-            .map_err(crate::command_error::CommandError::from)
+            .map_err(crate::command_error::CommandError::platform)
     }
 }
 

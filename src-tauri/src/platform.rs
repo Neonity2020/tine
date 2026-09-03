@@ -346,7 +346,7 @@ pub(crate) fn open_external(
         use tauri_plugin_opener::OpenerExt;
         app.opener()
             .open_url(url, None::<&str>)
-            .map_err(crate::command_error::CommandError::from)
+            .map_err(crate::command_error::CommandError::platform)
     }
     // Mobile (Android/iOS): there is no xdg-open/open/explorer to spawn, so hand
     // the URL to the platform via the opener plugin (an ACTION_VIEW Intent on
@@ -358,7 +358,7 @@ pub(crate) fn open_external(
         use tauri_plugin_opener::OpenerExt;
         app.opener()
             .open_url(url, None::<&str>)
-            .map_err(crate::command_error::CommandError::from)
+            .map_err(crate::command_error::CommandError::platform)
     }
 }
 

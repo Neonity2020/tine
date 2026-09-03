@@ -398,7 +398,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     // Count and placement are pinned as ONE tuple on purpose: asserting them
     // separately lets a count-preserving swap (a Plugin failure re-mapped as
     // Backup) satisfy the count while the fingerprint silently moves.
-    expect(parity).toContain("(498, 5_166_399_032_487_446_848)");
+    expect(parity).toContain("(498, 17_903_180_402_005_549_371)");
     // A mismatch must print the rows, not a bare 64-bit number nobody can act on.
     expect(parity).toContain("site_rows.join");
     expect(contract).toContain("### Absolute phase-B rule");

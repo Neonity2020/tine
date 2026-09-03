@@ -127,7 +127,10 @@ pub extern "system" fn Java_page_tine_app_ManagedStorageSmoke_runManagedActivati
     }))
     .map_err(|_| crate::command_error::CommandError::prose("managed-storage smoke probe panicked"))
     .and_then(|result| result)
-    .unwrap_or_else(|error| error);
+    // The JNI boundary hands Java a String, so this IS the serialization
+    // point, not a bridge: `Display` for `CommandError` renders exactly the
+    // same `wire()` bytes the frontend would receive.
+    .unwrap_or_else(|error| error.to_string());
 
     env.new_string(result)
         .expect("managed-storage smoke result is a valid Java string")

@@ -53,7 +53,7 @@ impl<R: Runtime> IosFolderPicker<R> {
     ) -> Result<GraphFolderPickResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin("pickGraphFolder", ())
-            .map_err(crate::command_error::CommandError::from)
+            .map_err(crate::command_error::CommandError::platform)
     }
 
     fn prepare_graph_folder(
@@ -62,7 +62,7 @@ impl<R: Runtime> IosFolderPicker<R> {
     ) -> Result<PrepareGraphFolderResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin("prepareGraphFolder", PrepareGraphFolderPayload { path })
-            .map_err(crate::command_error::CommandError::from)
+            .map_err(crate::command_error::CommandError::platform)
     }
 }
 

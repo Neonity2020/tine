@@ -26,7 +26,7 @@ impl<R: Runtime> AndroidFolderPicker<R> {
     ) -> Result<GraphFolderPickResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin("pickGraphFolder", ())
-            .map_err(crate::command_error::CommandError::from)
+            .map_err(crate::command_error::CommandError::platform)
     }
 }
 

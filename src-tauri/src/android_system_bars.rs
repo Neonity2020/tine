@@ -25,7 +25,7 @@ impl<R: Runtime> AndroidSystemBars<R> {
     fn set_appearance(&self, dark: bool) -> Result<(), crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin::<()>("setAppearance", SystemBarAppearance { dark })
-            .map_err(crate::command_error::CommandError::from)
+            .map_err(crate::command_error::CommandError::platform)
     }
 }
 
