@@ -1,3 +1,9 @@
+import {
+  SharedFrontierMismatchError,
+  type SharedFrontierMismatchCategory,
+  type SharedFrontierMismatchPath,
+} from "./backend";
+
 /**
  * Reduce a native managed-storage failure to one bounded, shareable line.
  *
@@ -82,59 +88,42 @@ export interface ManagedJoinErrorDetail {
   copy: string;
 }
 
-const CLEAN_JOIN_SUMMARY = "sync join refused: notes not in the shared provider frontier";
-const CLEAN_JOIN_DETAIL = "clean join mismatch detail: ";
-const QUOTED_RUST_PATH = String.raw`("(?:\\.|[^"\\])*")`;
-const SIDE_PATH_RE = new RegExp(
-  String.raw`^(local-only|shared-only) path=${QUOTED_RUST_PATH}$`,
-  "u",
-);
-const CHANGED_PATH_RE = new RegExp(
-  String.raw`^changed path=${QUOTED_RUST_PATH} categories=([a-z-]+(?:,[a-z-]+)*)$`,
-  "u",
-);
-const OMITTED_RE = /^(\d+) additional mismatches omitted$/u;
-
-function readableJoinCategory(category: string): string {
+function readableJoinCategory(category: SharedFrontierMismatchCategory): string {
   return {
     kind: "file format",
     preamble: "text before the first block",
     outline: "blocks, content, or order",
     "explicit-ids": "explicit block IDs",
-  }[category] ?? category;
+  }[category];
+}
+
+function describeJoinPath(entry: SharedFrontierMismatchPath): string {
+  const quoted = JSON.stringify(entry.path);
+  switch (entry.side) {
+    case "local-only":
+      return `Only on this device: ${quoted}`;
+    case "shared-only":
+      return `Only in shared notes: ${quoted}`;
+    case "changed":
+      return `Changed (${entry.categories.map(readableJoinCategory).join(", ")}): ${quoted}`;
+  }
 }
 
 /**
  * Keep the general diagnostic/report boundary path-free, but expose the core's
- * narrowly-authored mismatch records to the user who explicitly attempted the
- * join. Paths are required to reconcile a refusal; Solid renders this as text,
- * and the core already bounds the list to 32 records.
+ * bounded typed mismatch records to the user who explicitly attempted the join.
+ * Paths are required to reconcile a refusal; Solid renders this as text, and
+ * the core already bounds the list to 32 records. Only the typed
+ * `SharedFrontierMismatchError` detail is ever shown; no error prose is parsed.
  */
 export function managedJoinErrorDetail(error: unknown): ManagedJoinErrorDetail {
   const summary = safeManagedErrorDetail(error);
-  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  if (!message.split(/[\r\n]/u, 1)[0]?.includes(CLEAN_JOIN_SUMMARY)) {
+  if (!(error instanceof SharedFrontierMismatchError) || !error.detail) {
     return { visible: summary, copy: summary };
   }
-
-  const details: string[] = [];
-  for (const rawLine of message.split(/\r?\n/u).slice(1, 35)) {
-    if (!rawLine.startsWith(CLEAN_JOIN_DETAIL)) continue;
-    const line = rawLine.slice(CLEAN_JOIN_DETAIL.length);
-    const side = SIDE_PATH_RE.exec(line);
-    if (side) {
-      const sideLabel = side[1] === "local-only" ? "Only on this device" : "Only in shared notes";
-      details.push(`${sideLabel}: ${side[2]}`);
-      continue;
-    }
-    const changed = CHANGED_PATH_RE.exec(line);
-    if (changed) {
-      const categories = changed[2]!.split(",").map(readableJoinCategory).join(", ");
-      details.push(`Changed (${categories}): ${changed[1]}`);
-      continue;
-    }
-    const omitted = OMITTED_RE.exec(line);
-    if (omitted) details.push(`${omitted[1]} additional affected notes omitted by the backend.`);
+  const details = error.detail.paths.map(describeJoinPath);
+  if (error.detail.omitted > 0) {
+    details.push(`${error.detail.omitted} additional affected notes omitted by the backend.`);
   }
   if (details.length === 0) return { visible: summary, copy: summary };
 

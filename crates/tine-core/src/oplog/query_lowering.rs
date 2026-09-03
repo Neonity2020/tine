@@ -388,7 +388,7 @@ mod tests {
                     .filter(|file| file.contains(source) && file.contains(read_family))
                     .count(),
                 1,
-                "{source} to {read_family} must be lowered in exactly one file"
+                "I-12: `{source}` must be lowered to `{read_family}` in exactly one file; imitate crates/tine-core/src/oplog/query_lowering.rs, the sole SQL read-family producer"
             );
         }
     }

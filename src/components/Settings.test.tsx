@@ -208,7 +208,15 @@ describe("Settings storage transitions", () => {
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
     vi.spyOn(store, "flushAll").mockResolvedValue(true);
     vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
-      new SharedFrontierMismatchError(),
+      new SharedFrontierMismatchError({
+        localPages: 1059,
+        sharedPages: 1059,
+        localOnly: 0,
+        sharedOnly: 0,
+        changed: 1,
+        paths: [{ path: "journals/2026_08_25.md", side: "changed", categories: ["outline"] }],
+        omitted: 0,
+      }),
     );
 
     const root = document.createElement("div");
@@ -226,6 +234,9 @@ describe("Settings storage transitions", () => {
     const failure = toasts().at(-1);
     expect(failure).toMatchObject({ sticky: true, action: { label: "Copy details" } });
     expect(failure?.message).toContain("notes are not in the shared provider frontier");
+    // The typed detail names the note the user must reconcile (storage-sync
+    // contract: at most 32 relative paths, never content).
+    expect(failure?.message).toContain('Changed (blocks, content, or order): "journals/2026_08_25.md"');
     expect(failure?.message).toContain("Nothing was changed on either device");
     dispose();
   });

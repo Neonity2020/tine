@@ -7347,6 +7347,48 @@ fn copy_tree(source: &Path, destination: &Path) {
 ///
 /// Opt-in, because it needs a corpus this repository does not ship:
 /// `TINE_REAL_GRAPH=~/research/logseq-anonymized`. The corpus is copied, so
+/// Wave 3 Cc C6 acceptance gate over the anonymized corpus, through the
+/// MANAGED constructor (`managed_entry_for_managed_path`), not the graph-wide
+/// converter that `crates/tine-core/tests/graph.rs::managed_inventory_kind_census`
+/// exercises. Prints aggregate kind counts only; corpus content is never
+/// printed. Before C6 every eligible file under `journals/` was a Journal
+/// regardless of its stem; after C6 identity follows the journal-title parse,
+/// so a `journals/<non-date>.md` file is a Page, as in OG and Direct mode.
+#[test]
+#[ignore = "manual Wave 3 Cc gate: managed-constructor inventory kinds; set TINE_MANAGED_INVENTORY_CENSUS_GRAPH"]
+fn managed_constructor_inventory_kind_census() {
+    let Some(source) = std::env::var_os("TINE_MANAGED_INVENTORY_CENSUS_GRAPH") else {
+        eprintln!("skipped: set TINE_MANAGED_INVENTORY_CENSUS_GRAPH to a corpus directory");
+        return;
+    };
+    let graph = Graph::open(PathBuf::from(source));
+    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
+    let (mut pages, mut journals, mut journal_dir_pages, mut rejected) =
+        (0usize, 0usize, 0usize, 0usize);
+    for (path, _bytes) in &inventory {
+        match graph.managed_entry_for_managed_path(path) {
+            Ok(entry) => match entry.kind {
+                PageKind::Journal => journals += 1,
+                PageKind::Page => {
+                    pages += 1;
+                    if entry.rel_path.starts_with("journals/") {
+                        journal_dir_pages += 1;
+                    }
+                }
+            },
+            Err(_) => rejected += 1,
+        }
+    }
+    eprintln!(
+        "managed_constructor_inventory_kind_census total={} pages={} journals={} journal_dir_pages={} rejected={}",
+        inventory.len(),
+        pages,
+        journals,
+        journal_dir_pages,
+        rejected
+    );
+}
+
 /// the source is never mutated.
 #[test]
 #[ignore = "manual real-graph probe: set TINE_REAL_GRAPH to a graph directory"]

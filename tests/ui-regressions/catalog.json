@@ -45,7 +45,7 @@
         "scenario": "concord.live-save-capsule-refresh-coalescing",
         "failBefore": "proven"
       },
-      "notes": "Blocking stateful UX: repeated save attempts while a page remains conflicted preserve the latest restart-recovery draft without paying for an atomic whole-envelope rewrite when its bytes are unchanged. Changed drafts use a capsule-specific debounce, independent of the ordinary page-save debounce."
+      "notes": "Blocking stateful UX: repeated save attempts while a page remains conflicted preserve the latest restart-recovery draft without paying for an atomic whole-envelope rewrite when its bytes are unchanged. Changed drafts use a capsule-specific debounce, independent of the ordinary page-save debounce; the close/switch barrier (flushAll) lands any pending capsule draft before resolving, so the recovery capsule never trails the in-memory draft across a close (I-2, manager review 2026-09-03)."
     },
     {
       "id": "UI-HARVEST-CF-SHEET-BOARD-DTO-FACET-TEXT",
@@ -60,7 +60,7 @@
         "all"
       ],
       "layer": "render",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/components/SheetBoard.test.tsx"
@@ -68,7 +68,7 @@
         "scenario": "sheets.board-query-dto-live-facet-text",
         "failBefore": "proven"
       },
-      "notes": "Flexible presentation: the same priority facet rendered as A on a query-result DTO card and [#A] on a live card. The board now consumes the canonical formula-row field reader for both paths; exact styling remains free to vary, but row provenance must not change the displayed value."
+      "notes": "Fail-before evidence: tine-agents/evidence/wave3/cf/necessity-c2c-fail-before.log (pre-fix DTO card rendered A where the live card rendered [#A]). Flexible presentation: the same priority facet rendered as A on a query-result DTO card and [#A] on a live card. The board now consumes the canonical formula-row field reader for both paths; exact styling remains free to vary, but row provenance must not change the displayed value."
     },
     {
       "id": "UI-PAGE-WIDTH-CONTENT-INDEPENDENT-382",
@@ -123,7 +123,7 @@
         "scenario": "concord.live-direct-save-exact-restart-handoff",
         "failBefore": "proven"
       },
-      "notes": "A guarded Direct Files save refusal retains the exact disk winner and the editor draft in app-private recovery state. The conflict is reviewed through the page-level Concord resolver, survives a real process restart, applies under the shown revision guard, and returns to ordinary editable Markdown. The blocking E2E contract also proves that the retired Keep mine / Use current global bar never reappears."
+      "notes": "A guarded Direct Files save refusal retains the exact disk winner and the editor draft in app-private recovery state. The conflict is reviewed through the page-level Concord resolver, survives a real process restart, applies under the shown revision guard, and returns to ordinary editable Markdown. Covered status rests on the Rust capsule/resolution tests and the render test; the real-app journey scripts/e2e-concord-live-save.mjs is QUARANTINED (harness selector failure before the first conflict, B3E stop-loss exhausted, tests/ui-regressions/e2e-contracts.json) and is selected only for evidence retention, so the SIGKILL restart handoff and the absence of the retired Keep mine / Use current global bar are not yet proven at the native boundary."
     },
     {
       "id": "UI-CONCORD-SYNC-COPY-HANDOFF-337",

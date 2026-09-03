@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Closing or switching graphs no longer leaves a conflicted page's
+  crash-recovery draft up to half a second stale.** The close barrier now
+  lands every pending conflict-capsule refresh before it resolves.
+- **A refused sync join names the affected notes again.** The typed
+  `shared-frontier-mismatch` refusal carries the bounded list of differing
+  relative paths (at most 32, never note content) that the join panel shows
+  and the storage/sync contract promises; the previous typed-error change had
+  dropped it.
+
 ### Changed
 
 - **Backend refusal handling now branches on typed error kinds instead of

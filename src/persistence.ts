@@ -872,7 +872,12 @@ function enqueueSave(
 }
 
 const LIVE_CONFLICT_CAPSULE_DEBOUNCE_MS = 500;
-const liveConflictCapsuleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+interface PendingLiveConflictCapsule {
+  timer: ReturnType<typeof setTimeout>;
+  page: NonNullable<ReturnType<typeof pageToDto>>;
+  token: number;
+}
+const liveConflictCapsulePending = new Map<string, PendingLiveConflictCapsule>();
 
 /** Capsule durability has its own debounce: a conflicted page remains dirty,
  * so ordinary save attempts may recur even though there is no file write to
@@ -881,18 +886,35 @@ const liveConflictCapsuleTimers = new Map<string, ReturnType<typeof setTimeout>>
 export function scheduleLiveSaveConflictDraftRefresh(
   page: NonNullable<ReturnType<typeof pageToDto>>,
 ): void {
-  const previous = liveConflictCapsuleTimers.get(page.name);
-  if (previous) clearTimeout(previous);
+  const previous = liveConflictCapsulePending.get(page.name);
+  if (previous) clearTimeout(previous.timer);
   const token = graphToken;
   const timer = setTimeout(() => {
-    if (liveConflictCapsuleTimers.get(page.name) !== timer) return;
-    liveConflictCapsuleTimers.delete(page.name);
+    if (liveConflictCapsulePending.get(page.name)?.timer !== timer) return;
+    liveConflictCapsulePending.delete(page.name);
     // A timer belongs to the graph whose draft scheduled it. Never let an old
     // graph's delayed refresh attach to a same-named page after a switch.
     if (graphToken !== token) return;
     void refreshLiveSaveConflictDraft(page);
   }, LIVE_CONFLICT_CAPSULE_DEBOUNCE_MS);
-  liveConflictCapsuleTimers.set(page.name, timer);
+  liveConflictCapsulePending.set(page.name, { timer, page, token });
+}
+
+/** Persist every debounced capsule draft NOW and wait for it. The close /
+ * switch / restore barrier (`flushAll`) drains file saves, but a conflicted
+ * page's latest draft lives only in its capsule — leaving the debounce timer
+ * pending lets the app exit with a crash-recovery envelope that trails the
+ * in-memory draft by up to the debounce window. Stale-graph entries are
+ * dropped rather than written, exactly as their timers would have done. */
+export async function flushLiveSaveConflictDrafts(): Promise<void> {
+  const pending = [...liveConflictCapsulePending.values()];
+  for (const entry of pending) clearTimeout(entry.timer);
+  liveConflictCapsulePending.clear();
+  await Promise.all(
+    pending
+      .filter((entry) => entry.token === graphToken)
+      .map((entry) => refreshLiveSaveConflictDraft(entry.page)),
+  );
 }
 
 /** Write the page's CURRENT state once. No-op success if it isn't dirty and not
@@ -1330,6 +1352,9 @@ export async function flushAll(): Promise<boolean> {
     ]);
     if (results.some(Boolean)) landed = true;
   }
+  // A conflicted page's draft is not on disk; its capsule is the only durable
+  // copy. Land the debounced refresh before the caller decides to close.
+  await flushLiveSaveConflictDrafts();
   if (landed) bumpDataRev();
   // Success only if nothing is still pending AND there are no unresolved
   // conflicts (a conflicted page's edit is NOT on disk) — so a destructive

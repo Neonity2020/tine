@@ -599,12 +599,16 @@ fallback.
    the complete disk-expressible page/outline semantics with the currently
    synchronized Markdown/Org graph. A mismatch leaves both authorities
    unchanged; equality installs the provider history without rewriting graph
-   bytes. A refusal's shareable first line reports complete page and mismatch
-   category counts. Local diagnostics additionally name at most 32 differing
-   relative paths and whether each is local-only, shared-only, or differs in
-   kind, preamble, outline, or externally supplied block IDs; they never print
-   note content or UUID values. Local-only endpoint and device identities
-   remain local.
+   bytes. The refusal crosses the native boundary as the typed
+   `shared-frontier-mismatch` payload (`docs/contracts/typed-errors.md`): its
+   detail reports complete page and mismatch category counts and names at
+   most 32 differing relative paths with whether each is local-only,
+   shared-only, or differs in kind, preamble, outline, or externally supplied
+   block IDs, plus how many further mismatches were omitted. The join panel
+   shows those paths only to the user who attempted the join; the general
+   shareable diagnostic line stays path-free, and nothing ever prints note
+   content or UUID values. Local-only endpoint and device identities remain
+   local.
 3. **SharePrepared/Joining → SharedActive.** Each device records its role
    (`Initiator` or `Joiner`) in its own enrollment. The descriptor remains the
    shared identity; local endpoint/device IDs remain local.

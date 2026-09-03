@@ -148,7 +148,8 @@ test("DUP-12b keeps every private server wait on waitForHttpServer", () => {
   assert.deepEqual(
     offenders,
     [],
-    "DUP-12 requires scripts/*.mjs readiness loops to use scripts/e2e-capabilities.mjs::waitForHttpServer",
+    "I-12 / DUP-12b: every private server readiness loop in scripts/*.mjs must use "
+      + "scripts/e2e-capabilities.mjs::waitForHttpServer (exemplar: scripts/shot-sheets.mjs)",
   );
 });
 

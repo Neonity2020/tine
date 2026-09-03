@@ -11395,10 +11395,23 @@ fn shared_provider_clean_late_join_refuses_unmatched_local_graph_without_changin
         .unwrap();
     let graph_before = user_graph_bytes(&joiner.graph_root);
     let refusal = joiner_handle.join_shared(descriptor).unwrap_err();
+    // The typed payload keeps the bounded affected-path detail the contract
+    // promises (storage-sync-contract §"Joining"): counts plus at most 32
+    // relative paths with a side/category, never note content.
+    let payload: serde_json::Value = serde_json::from_str(&refusal.to_string()).unwrap();
+    assert_eq!(payload["kind"], "shared-frontier-mismatch");
+    assert_eq!(payload["detail"]["local_only"], 1, "{payload}");
+    assert_eq!(payload["detail"]["shared_only"], 0, "{payload}");
     assert_eq!(
-        refusal.to_string(),
-        r#"{"kind":"shared-frontier-mismatch"}"#
+        payload["detail"]["paths"][0]["path"], "notes/local-only.md",
+        "{payload}"
     );
+    assert_eq!(
+        payload["detail"]["paths"][0]["side"], "local-only",
+        "{payload}"
+    );
+    assert_eq!(payload["detail"]["omitted"], 0, "{payload}");
+    assert!(!refusal.to_string().contains("unmatched local work"));
     assert_eq!(
         read_activation_marker(&joiner.request.enrollment_root)
             .unwrap()
@@ -13915,10 +13928,18 @@ fn adoption_stops_on_unconverged_files_and_leaves_the_archive_readable() {
 
     let refusal = adopted_handle.join_shared(descriptor).unwrap_err();
 
+    let payload: serde_json::Value = serde_json::from_str(&refusal.to_string()).unwrap();
+    assert_eq!(payload["kind"], "shared-frontier-mismatch");
+    assert_eq!(payload["detail"]["local_only"], 1, "{payload}");
     assert_eq!(
-        refusal.to_string(),
-        r#"{"kind":"shared-frontier-mismatch"}"#
+        payload["detail"]["paths"][0]["path"], "notes/unconverged local page.md",
+        "{payload}"
     );
+    assert_eq!(
+        payload["detail"]["paths"][0]["side"], "local-only",
+        "{payload}"
+    );
+    assert!(!refusal.to_string().contains("still only on this device"));
     assert_eq!(
         user_graph_bytes(&adopter.graph_root),
         graph_before,
@@ -22867,14 +22888,24 @@ const A3_CONFLICT_LOAD_INTERCEPT: usize = 64;
 fn conflict_history_gate_and_contract_pin_the_same_pair_bound() {
     let gate = include_str!("oplog/hot_engine_integration_tests.rs");
     let contract = include_str!("../../../docs/storage-sync-contract.md");
-    assert!(gate.contains(&format!(
-        "const LOAD_BOUND: usize = {A3_CONFLICT_LOAD_SLOPE} * UNRESOLVED_PAIRS + {A3_CONFLICT_LOAD_INTERCEPT};"
-    )));
-    assert!(contract.contains("currently unresolved pairs"));
-    assert!(contract.contains("only the currently unresolved pairs"));
-    assert!(contract.contains("full retained history"));
-    assert!(contract.contains("The index is neither resolution evidence"));
-    assert!(contract.contains("nor persisted authority"));
+    assert!(
+        gate.contains(&format!(
+            "const LOAD_BOUND: usize = {A3_CONFLICT_LOAD_SLOPE} * UNRESOLVED_PAIRS + {A3_CONFLICT_LOAD_INTERCEPT};"
+        )),
+        "I-14/I-13: the A3 scale gate and this contract pin must state the same pair bound; imitate oplog/conflict_history.rs"
+    );
+    for sentence in [
+        "currently unresolved pairs",
+        "only the currently unresolved pairs",
+        "full retained history",
+        "The index is neither resolution evidence",
+        "nor persisted authority",
+    ] {
+        assert!(
+            contract.contains(sentence),
+            "I-13: docs/storage-sync-contract.md must keep the conflict-history contract sentence {sentence:?}; the index it describes is oplog/conflict_history.rs"
+        );
+    }
 }
 
 #[test]

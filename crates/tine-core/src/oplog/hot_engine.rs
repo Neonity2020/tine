@@ -16145,8 +16145,13 @@ impl ShardedHotEngine {
     /// resolution authoring would otherwise strand the owed work forever
     /// (audit 4, finding 3). Already-settled pairs are suppressed by the
     /// descendant-touch gate during derivation, so reseeding is idempotent.
+    ///
+    /// Linearity is answered from manifests and causal containment alone; this
+    /// must NOT force the disposable conflict-history index, or every
+    /// checkpoint-restored open would load and re-derive the whole accepted
+    /// history before the first tick (I-14). The index is rebuilt lazily by
+    /// the first evaluation or acceptance that needs it.
     pub(crate) fn accepted_nonlinear_batch_ids(&self) -> Result<Vec<BatchId>, EngineError> {
-        self.ensure_conflict_history_index()?;
         let ids: Vec<BatchId> = self
             .status()
             .accepted_batches()?
@@ -19857,6 +19862,13 @@ impl ShardedHotEngine {
     #[cfg(test)]
     pub(crate) fn drop_conflict_history_index_for_test(&self) {
         *self.conflict_history_index.borrow_mut() = ConflictHistoryIndex::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conflict_history_index_is_current_for_test(&self) -> bool {
+        self.conflict_history_index
+            .borrow()
+            .is_current(self.next_acceptance_sequence)
     }
 
     fn conflict_resolution_intents_counted(

@@ -4974,19 +4974,24 @@ mod tests {
         assert_eq!(
             production.matches("fn with_hydrated_query_groups(").count(),
             1,
-            "query hydration must have one implementation"
+            "I-12: query hydration must have exactly one implementation; imitate with_hydrated_query_groups in crates/tine-core/src/publish.rs, the shared owner"
         );
         assert_eq!(
             production.matches("with_hydrated_query_groups(").count(),
             3,
             "one definition plus the flat-query and sheet callers"
         );
-        assert_eq!(production.matches("let page_by_key =").count(), 1);
+        assert_eq!(
+            production.matches("let page_by_key =").count(),
+            1,
+            "I-12: the page-key lookup belongs to the one hydration owner (publish.rs with_hydrated_query_groups)"
+        );
         assert_eq!(
             production
                 .matches("collect_wanted_doc_blocks(&doc.roots")
                 .count(),
-            1
+            1,
+            "I-12: wanted-block collection belongs to the one hydration owner (publish.rs with_hydrated_query_groups)"
         );
         assert_eq!(
             production

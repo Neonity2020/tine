@@ -81,6 +81,42 @@ describe("live-save conflict capsule refresh", () => {
       live: { page: { blocks: [{ raw: "latest draft" }] } },
     });
   });
+
+  it("flushAll persists a pending capsule draft before resolving", async () => {
+    // I-2: the close/switch barrier must not leave the crash-recovery capsule
+    // trailing the in-memory draft by the debounce window (B3E review).
+    vi.useFakeTimers();
+    const store = vi.fn(async (_root: string, _capsule: unknown) => {});
+    __setBackendForTest({
+      storeConflictCapsule: store,
+      loadConflictCapsules: async () => [],
+      retireConflictCapsule: async () => {},
+    } as unknown as Backend);
+    setGraphMeta({ root: "/graphs/A" } as never);
+    const page = {
+      name: "Closing",
+      path: "pages/Closing.md",
+      format: "md",
+      blocks: [{ id: "b1", raw: "registered draft", collapsed: false, children: [] }],
+      rev: "rev-1",
+    } as unknown as PageDto;
+    await registerLiveSaveConflict(page, "rev-1", 1);
+    scheduleLiveSaveConflictDraftRefresh({
+      ...page,
+      blocks: [{ id: "b1", raw: "draft typed just before close", collapsed: false, children: [] }],
+    });
+    expect(store).toHaveBeenCalledTimes(1);
+
+    // No timer advance: the barrier itself must land the draft.
+    await flushAll();
+
+    expect(store).toHaveBeenCalledTimes(2);
+    expect(store.mock.calls.at(-1)?.[1]).toMatchObject({
+      live: { page: { blocks: [{ raw: "draft typed just before close" }] } },
+    });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(store).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("asset write close barrier", () => {

@@ -2741,23 +2741,29 @@ fn materialization_block_collection_has_one_owner_and_no_owned_arena() {
     assert_eq!(
         region.matches("let members = read_memberships(").count(),
         1,
-        "the from-state and hot paths must share one membership/block collection loop"
+        "I-12: the from-state and hot paths must share one membership/block collection loop; imitate materialize_page_blocks in oplog/hot_engine.rs"
     );
     assert_eq!(
         region.matches("let mut by_home =").count(),
         1,
-        "the home grouping loop must have one owner"
+        "I-12: the home grouping loop must have one owner; imitate materialize_page_blocks in oplog/hot_engine.rs"
     );
     assert_eq!(
         region.matches("self.materialize_page_blocks(").count(),
         2,
-        "both materializers must delegate to the one collection helper"
+        "I-12: both materializers must delegate to the one collection helper materialize_page_blocks (oplog/hot_engine.rs)"
     );
-    assert!(region.contains("MaterializationDocument::Owned(home)"));
-    assert!(region.contains(".then(|| document(*home_document_id))"));
+    assert!(
+        region.contains("MaterializationDocument::Owned(home)"),
+        "I-9: the owned arm must hold at most one hot-document clone at a time (oplog/hot_engine.rs materialize_page_blocks)"
+    );
+    assert!(
+        region.contains(".then(|| document(*home_document_id))"),
+        "I-9: the borrowed arm must resolve documents lazily per home (oplog/hot_engine.rs materialize_page_blocks)"
+    );
     assert!(
         !region.contains("BTreeMap<DocumentId, MaterializationDocument"),
-        "a fold must not retain an all-home owned arena on the hot path"
+        "I-9: a fold must not retain an all-home owned arena on the hot path; imitate materialize_page_blocks in oplog/hot_engine.rs"
     );
 }
 
@@ -6601,7 +6607,7 @@ fn conflict_resolution_history_loads_are_bounded_by_unresolved_pairs() {
     for (history_size, median) in medians {
         assert!(
             median <= LOAD_BOUND,
-            "conflict evaluation loaded {median} accepted batches at history {history_size}; bound {LOAD_BOUND}"
+            "I-14: conflict evaluation loaded {median} accepted batches at history {history_size}; bound {LOAD_BOUND}. Evaluation cost must scale with unresolved pairs, not history; imitate oplog/conflict_history.rs"
         );
     }
 }
@@ -6647,6 +6653,63 @@ fn conflict_history_index_rebuild_matches_incremental_resolution_results() {
         .unwrap();
     assert_eq!(rebuilt, before);
     assert_eq!(engine.canonical_snapshot().unwrap(), snapshot);
+}
+
+/// I-14: the once-per-open conflict-backlog reseed classifies linearity from
+/// manifests alone. A checkpoint-restored engine (no disposable index) must
+/// answer `accepted_nonlinear_batch_ids` WITHOUT rebuilding the index, or the
+/// first tick after every open loads and re-derives the entire accepted
+/// history (wave-3 A3 review, required neighbor). The rebuild stays lazy:
+/// it happens on the first evaluation that actually needs the index.
+#[test]
+fn conflict_backlog_reseed_does_not_rebuild_the_conflict_history_index() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a3-reseed-no-rebuild");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "A3 reseed without rebuild".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(0xa3_f200, 0xa3_f200),
+        edited,
+        author(0xa3_f201, 0xa3_f201),
+        deleted,
+    );
+    let engine = apply_pair(ids, &baseline, edited, deleted.clone());
+    let expected = engine.accepted_nonlinear_batch_ids().unwrap();
+    assert_eq!(expected, vec![deleted.manifest().batch_id()]);
+
+    // Model the checkpoint-open boundary: the disposable index is absent.
+    engine.drop_conflict_history_index_for_test();
+    assert!(!engine.conflict_history_index_is_current_for_test());
+
+    let reseeded = engine.accepted_nonlinear_batch_ids().unwrap();
+    assert_eq!(reseeded, expected);
+    assert!(
+        !engine.conflict_history_index_is_current_for_test(),
+        "I-14: the reopen reseed must classify linearity from manifests, not rebuild the \
+         conflict-history index over every accepted batch; imitate \
+         accepted_batch_is_causally_linear in oplog/hot_engine.rs"
+    );
+
+    // The first real evaluation rebuilds it, once.
+    let intents = engine
+        .conflict_resolution_intents(deleted.manifest().batch_id())
+        .unwrap();
+    assert!(!intents.is_empty());
+    assert!(engine.conflict_history_index_is_current_for_test());
 }
 // ---------------------------------------------------------------------------
 // Harvest A4 — run-local identity indexes have NO fixed capacity (FIXED).

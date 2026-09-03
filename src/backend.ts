@@ -252,8 +252,29 @@ export class ManagedGraphMismatchError extends BackendError {
   }
 }
 
+export type SharedFrontierMismatchSide = "local-only" | "shared-only" | "changed";
+export type SharedFrontierMismatchCategory = "kind" | "preamble" | "outline" | "explicit-ids";
+export interface SharedFrontierMismatchPath {
+  path: string;
+  side: SharedFrontierMismatchSide;
+  categories: SharedFrontierMismatchCategory[];
+}
+/** The bounded, typed detail a clean-join refusal carries so the user who
+ * asked for the join can reconcile it: counts plus at most 32 relative note
+ * paths with their side or changed categories. Never note content. */
+export interface SharedFrontierMismatchDetail {
+  localPages: number;
+  sharedPages: number;
+  localOnly: number;
+  sharedOnly: number;
+  changed: number;
+  paths: SharedFrontierMismatchPath[];
+  omitted: number;
+}
+export const SHARED_FRONTIER_MISMATCH_MAX_PATHS = 32;
+
 export class SharedFrontierMismatchError extends BackendError {
-  constructor() {
+  constructor(readonly detail: SharedFrontierMismatchDetail | null = null) {
     super("shared-frontier-mismatch", BACKEND_ERROR_MESSAGES["shared-frontier-mismatch"]);
     this.name = "SharedFrontierMismatchError";
   }
@@ -333,7 +354,56 @@ export function classifySaveConflictWire(error: unknown): SaveConflictError | nu
   return match ? new SaveConflictError(Number(match[1])) : null;
 }
 
-type TaggedBackendPayload = { kind: string; reason_code?: unknown };
+type TaggedBackendPayload = { kind: string; reason_code?: unknown; detail?: unknown };
+
+const SHARED_FRONTIER_SIDES: readonly SharedFrontierMismatchSide[] = ["local-only", "shared-only", "changed"];
+const SHARED_FRONTIER_CATEGORIES: readonly SharedFrontierMismatchCategory[] = [
+  "kind",
+  "preamble",
+  "outline",
+  "explicit-ids",
+];
+
+function nonNegativeCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+/** Validate the native detail object field by field; anything malformed
+ * degrades to a detail-less refusal rather than trusting the payload. */
+function readSharedFrontierMismatchDetail(raw: unknown): SharedFrontierMismatchDetail | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  const localPages = nonNegativeCount(record.local_pages);
+  const sharedPages = nonNegativeCount(record.shared_pages);
+  const localOnly = nonNegativeCount(record.local_only);
+  const sharedOnly = nonNegativeCount(record.shared_only);
+  const changed = nonNegativeCount(record.changed);
+  const omitted = nonNegativeCount(record.omitted);
+  if (
+    localPages === null || sharedPages === null || localOnly === null
+    || sharedOnly === null || changed === null || omitted === null
+    || !Array.isArray(record.paths) || record.paths.length > SHARED_FRONTIER_MISMATCH_MAX_PATHS
+  ) {
+    return null;
+  }
+  const paths: SharedFrontierMismatchPath[] = [];
+  for (const entry of record.paths as unknown[]) {
+    if (!entry || typeof entry !== "object") return null;
+    const { path, side, categories } = entry as Record<string, unknown>;
+    if (typeof path !== "string" || path.length === 0) return null;
+    if (!SHARED_FRONTIER_SIDES.includes(side as SharedFrontierMismatchSide)) return null;
+    const known: SharedFrontierMismatchCategory[] = [];
+    if (categories !== undefined) {
+      if (!Array.isArray(categories)) return null;
+      for (const category of categories as unknown[]) {
+        if (!SHARED_FRONTIER_CATEGORIES.includes(category as SharedFrontierMismatchCategory)) return null;
+        known.push(category as SharedFrontierMismatchCategory);
+      }
+    }
+    paths.push({ path, side: side as SharedFrontierMismatchSide, categories: known });
+  }
+  return { localPages, sharedPages, localOnly, sharedOnly, changed, paths, omitted };
+}
 
 function classifyTaggedBackendError(error: unknown): BackendError | null {
   const message = typeof error === "string"
@@ -355,7 +425,9 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
     case "managed-graph-mismatch":
       return new ManagedGraphMismatchError();
     case "shared-frontier-mismatch":
-      return new SharedFrontierMismatchError();
+      return new SharedFrontierMismatchError(
+        payload.detail === undefined ? null : readSharedFrontierMismatchDetail(payload.detail),
+      );
     case "adoption-archived":
       return new AdoptionArchivedError();
     case "sparse-shutdown-refused":

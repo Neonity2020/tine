@@ -23,9 +23,9 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { class: string; why: string })
   { file: "main.tsx", line: 62, method: "error", class: "local-error", why: "window reveal failure stays in uncaptured WebView devtools" },
   { file: "main.tsx", line: 70, method: "error", class: "local-error", why: "parser bootstrap error stays in uncaptured WebView devtools" },
   { file: "pdfRenderCoordinator.ts", line: 341, method: "error", class: "local-error", why: "PDF renderer failure stays in uncaptured WebView devtools" },
-  { file: "persistence.ts", line: 977, method: "warn", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 982, method: "error", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1130, method: "error", class: "local-error", why: "managed conflict capture failure stays in uncaptured WebView devtools" },
+  { file: "persistence.ts", line: 999, method: "warn", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 1004, method: "error", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 1152, method: "error", class: "local-error", why: "managed conflict capture failure stays in uncaptured WebView devtools" },
   { file: "print.ts", line: 97, method: "error", class: "local-error", why: "optional local renderer failure stays in uncaptured WebView devtools" },
   { file: "print.ts", line: 112, method: "error", class: "local-error", why: "print preparation failure stays in uncaptured WebView devtools" },
   { file: "print.ts", line: 156, method: "error", class: "local-error", why: "iframe print failure stays in uncaptured WebView devtools" },
@@ -98,7 +98,12 @@ describe("I-5 content-out-of-logs ratchet", () => {
       expect(entry.class, `${entry.file}:${entry.line} needs a class`).not.toBe("");
       expect(entry.why, `${entry.file}:${entry.line} needs a reason`).not.toBe("");
     }
-    expect(variableConsoleSites()).toEqual(
+    expect(
+      variableConsoleSites(),
+      "I-5: the variable-bearing console census changed. Log a count or a fixed string, never user content "
+        + "(exemplar: persistence.ts logs `{ count }`); if a new site is legitimately content-free, add it to "
+        + "CONSOLE_ALLOWLIST with its class and reason and bump CONSOLE_ALLOWLIST_SIZE",
+    ).toEqual(
       CONSOLE_ALLOWLIST.map(({ file, line, method }) => ({ file, line, method })),
     );
   });

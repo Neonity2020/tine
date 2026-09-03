@@ -9,8 +9,14 @@ object:
 ```
 
 `kind` is a bounded code. `reason_code` is present only for the existing
-managed-actor refusal vocabulary. Payloads never carry graph paths, note text,
-or wording intended for display.
+managed-actor refusal vocabulary. Payloads never carry note text or wording
+intended for display. One kind carries a typed `detail` object:
+`shared-frontier-mismatch` includes the mismatch counts and at most 32
+relative note paths (each `local-only`, `shared-only`, or `changed` with its
+categories) plus an `omitted` count, because `docs/storage-sync-contract.md`
+promises the joining user exactly that list to reconcile a refused join. The
+funnel validates the detail field by field and degrades a malformed detail to
+`null`; the frontend still owns every displayed word.
 
 `TauriBackend.call` is the only frontend classification point. It converts a
 recognized payload into one of the 9 BackendError subclasses (including the

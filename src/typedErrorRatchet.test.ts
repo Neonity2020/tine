@@ -91,6 +91,35 @@ describe("I-9/I-11 typed backend error boundary", () => {
     }));
     expect(actor).toBeInstanceOf(ManagedActorRefusalError);
     expect(actor).toMatchObject({ reasonCode: "trusted_local.append_outcome_unknown" });
+
+    // The one kind with a typed detail object: bounded counts and paths are
+    // validated field by field; a malformed detail degrades to no detail.
+    const mismatch = classifyNativeCallError(JSON.stringify({
+      kind: "shared-frontier-mismatch",
+      detail: {
+        local_pages: 2, shared_pages: 2, local_only: 1, shared_only: 0, changed: 1, omitted: 0,
+        paths: [
+          { path: "notes/local-only.md", side: "local-only" },
+          { path: "notes/changed.md", side: "changed", categories: ["outline"] },
+        ],
+      },
+    }));
+    expect(mismatch).toBeInstanceOf(SharedFrontierMismatchError);
+    expect(mismatch).toMatchObject({
+      detail: {
+        localOnly: 1,
+        paths: [
+          { path: "notes/local-only.md", side: "local-only", categories: [] },
+          { path: "notes/changed.md", side: "changed", categories: ["outline"] },
+        ],
+      },
+    });
+    const malformed = classifyNativeCallError(JSON.stringify({
+      kind: "shared-frontier-mismatch",
+      detail: { local_pages: 1, paths: [{ path: 7, side: "elsewhere" }] },
+    }));
+    expect(malformed).toBeInstanceOf(SharedFrontierMismatchError);
+    expect(malformed).toMatchObject({ detail: null });
   });
 
   it("has no prose-parsing classifier outside the one funnel", () => {

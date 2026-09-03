@@ -51,10 +51,12 @@ describe("frontend twin ownership guards", () => {
     const store = readFileSync("src/store.ts", "utf8");
     const pdfOwnership = readFileSync("src/pdfOwnership.ts", "utf8");
 
-    expect(pluginManager).toContain("persistenceChains = new Map<string, Promise<void>>()");
-    expect(store).toContain("let managedMoveQueue: Promise<void> = Promise.resolve()");
-    expect(pdfOwnership).toContain("const mutations = new Map<number, Set<Promise<boolean>>>()");
-    expect(pdfOwnership).not.toContain("serializedWrites");
+    const rule = "I-12: promise-tail serialization has one owner, src/serializedWrites.ts; the two specialized "
+      + "tails and the PDF mutation set are the pinned exceptions (see the exception comments in each file)";
+    expect(pluginManager, rule).toContain("persistenceChains = new Map<string, Promise<void>>()");
+    expect(store, rule).toContain("let managedMoveQueue: Promise<void> = Promise.resolve()");
+    expect(pdfOwnership, rule).toContain("const mutations = new Map<number, Set<Promise<boolean>>>()");
+    expect(pdfOwnership, rule).not.toContain("serializedWrites");
   });
 
   it("keeps every fitting shared-key site on serializedWrites", () => {
@@ -65,7 +67,10 @@ describe("frontend twin ownership guards", () => {
       "src/workspaces.ts",
       "src/mediaBlobFallback.ts",
     ]) {
-      expect(readFileSync(file, "utf8"), file).toContain("serializedWrites");
+      expect(
+        readFileSync(file, "utf8"),
+        `I-12: ${file} must serialize shared-key writes through src/serializedWrites.ts (exemplar: src/themes/manager.ts)`,
+      ).toContain("serializedWrites");
     }
   });
 });

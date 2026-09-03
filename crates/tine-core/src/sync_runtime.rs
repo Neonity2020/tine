@@ -2930,6 +2930,22 @@ impl fmt::Display for SyncEditorRefusalCode {
 /// wire remains `String` this release, but its load-bearing kinds are JSON data
 /// rather than prose that frontend components must parse back into control flow.
 pub fn tagged_backend_error(kind: &'static str, reason_code: Option<&str>) -> String {
+    encode_tagged_backend_error(kind, reason_code, None)
+}
+
+/// The same encoder for the one kind whose contract promises bounded typed
+/// data alongside the code: `shared-frontier-mismatch` carries the clean-join
+/// counts and at most [`CLEAN_JOIN_MAX_MISMATCH_DETAILS`] relative note paths
+/// (`docs/storage-sync-contract.md`, "Joining"). Never note content.
+pub fn tagged_backend_error_with_detail(kind: &'static str, detail: serde_json::Value) -> String {
+    encode_tagged_backend_error(kind, None, Some(detail))
+}
+
+fn encode_tagged_backend_error(
+    kind: &'static str,
+    reason_code: Option<&str>,
+    detail: Option<serde_json::Value>,
+) -> String {
     let mut payload = serde_json::Map::new();
     payload.insert("kind".into(), serde_json::Value::String(kind.into()));
     if let Some(reason_code) = reason_code {
@@ -2937,6 +2953,9 @@ pub fn tagged_backend_error(kind: &'static str, reason_code: Option<&str>) -> St
             "reason_code".into(),
             serde_json::Value::String(reason_code.into()),
         );
+    }
+    if let Some(detail) = detail {
+        payload.insert("detail".into(), detail);
     }
     serde_json::Value::Object(payload).to_string()
 }
@@ -8746,6 +8765,70 @@ impl CleanJoinSemanticDiff {
     fn mismatch_count(&self) -> usize {
         self.local_only + self.shared_only + self.changed
     }
+
+    /// The typed payload the join refusal carries across the native boundary
+    /// (`tagged_backend_error_with_detail`). Counts plus the bounded path
+    /// list; the frontend owns every displayed word.
+    fn typed_detail(&self) -> serde_json::Value {
+        let paths = self
+            .details
+            .iter()
+            .map(|detail| match detail {
+                CleanJoinMismatchDetail::LocalOnly(path) => {
+                    serde_json::json!({ "path": path, "side": "local-only" })
+                }
+                CleanJoinMismatchDetail::SharedOnly(path) => {
+                    serde_json::json!({ "path": path, "side": "shared-only" })
+                }
+                CleanJoinMismatchDetail::Changed {
+                    path,
+                    kind,
+                    preamble,
+                    outline,
+                    explicit_ids,
+                } => serde_json::json!({
+                    "path": path,
+                    "side": "changed",
+                    "categories": clean_join_changed_categories(*kind, *preamble, *outline, *explicit_ids),
+                }),
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "local_pages": self.local_pages,
+            "shared_pages": self.shared_pages,
+            "local_only": self.local_only,
+            "shared_only": self.shared_only,
+            "changed": self.changed,
+            "changed_kind": self.changed_kind,
+            "changed_preamble": self.changed_preamble,
+            "changed_outline": self.changed_outline,
+            "changed_explicit_ids": self.changed_explicit_ids,
+            "paths": paths,
+            "omitted": self.mismatch_count().saturating_sub(self.details.len()),
+        })
+    }
+}
+
+fn clean_join_changed_categories(
+    kind: bool,
+    preamble: bool,
+    outline: bool,
+    explicit_ids: bool,
+) -> Vec<&'static str> {
+    let mut categories = Vec::new();
+    if kind {
+        categories.push("kind");
+    }
+    if preamble {
+        categories.push("preamble");
+    }
+    if outline {
+        categories.push("outline");
+    }
+    if explicit_ids {
+        categories.push("explicit-ids");
+    }
+    categories
 }
 
 impl fmt::Display for CleanJoinSemanticDiff {
@@ -8780,19 +8863,8 @@ impl fmt::Display for CleanJoinSemanticDiff {
                     outline,
                     explicit_ids,
                 } => {
-                    let mut categories = Vec::new();
-                    if *kind {
-                        categories.push("kind");
-                    }
-                    if *preamble {
-                        categories.push("preamble");
-                    }
-                    if *outline {
-                        categories.push("outline");
-                    }
-                    if *explicit_ids {
-                        categories.push("explicit-ids");
-                    }
+                    let categories =
+                        clean_join_changed_categories(*kind, *preamble, *outline, *explicit_ids);
                     write!(
                         formatter,
                         "\nclean join mismatch detail: changed path={path:?} categories={}",
@@ -23241,9 +23313,11 @@ impl RuntimeActor {
                     &provider_semantics,
                     local_is_activation_baseline,
                 )? {
-                    let _ = diff;
                     return Err(SyncRuntimeRequestError::TaggedBackend(
-                        tagged_backend_error("shared-frontier-mismatch", None),
+                        tagged_backend_error_with_detail(
+                            "shared-frontier-mismatch",
+                            diff.typed_detail(),
+                        ),
                     ));
                 }
             }
