@@ -45,3 +45,5 @@ reddit-backup/
 /baseline-*.txt
 /necessity-*.txt
 /*-fail-before.log
+/after-*.txt
+/measurement-*.txt
