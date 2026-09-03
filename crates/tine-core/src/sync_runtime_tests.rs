@@ -5411,6 +5411,8 @@ fn run_real_store_recovery_equivalence_oracle(schedules_per_feature: usize) {
                     schedule.completed_pages,
                 );
                 let interrupted = open_clean_runtime_resources(&reopen_request(&fixture.request));
+                let cut_was_reached =
+                    crate::oplog::projection::turn_replay_cut_was_reached_for_test();
                 drop(cut);
                 let error = match interrupted {
                     Err(error) => error,
@@ -5419,9 +5421,22 @@ fn run_real_store_recovery_equivalence_oracle(schedules_per_feature: usize) {
                         feature.label()
                     ),
                 };
-                assert!(
-                    error.contains("deterministic cut during production turn replay"),
+                // Two halves, because neither alone says "it stopped at the
+                // cut" any more: the refusal is a source-class code that every
+                // projection failure shares, and the cut's own counter is what
+                // distinguishes reaching it from failing on the way there.
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&error).unwrap(),
+                    serde_json::json!({
+                        "kind": "clean-open",
+                        "reason_code": "clean_open.projection",
+                    }),
                     "{} schedule {ordinal} stopped elsewhere: {error}",
+                    feature.label()
+                );
+                assert!(
+                    cut_was_reached,
+                    "{} schedule {ordinal} refused before reaching the injected cut at {schedule:?}",
                     feature.label()
                 );
             } else {
@@ -7546,6 +7561,7 @@ fn cold_replay_error_exit_flushes_completion_before_lease_release() {
 
     let cut = crate::oplog::projection::cut_turn_replay_after_pages_for_test(1);
     let interrupted = open_clean_runtime_resources(&reopen_request(&fixture.request));
+    let cut_was_reached = crate::oplog::projection::turn_replay_cut_was_reached_for_test();
     drop(cut);
     let error = match interrupted {
         Err(error) => error,
@@ -7557,6 +7573,12 @@ fn cold_replay_error_exit_flushes_completion_before_lease_release() {
             "kind": "clean-open",
             "reason_code": "clean_open.projection",
         })
+    );
+    // The code alone is shared by every projection failure; the cut's counter
+    // is what says replay got as far as the injected cut.
+    assert!(
+        cut_was_reached,
+        "cold replay refused before reaching the injected cut"
     );
     assert!(fixture.graph_root.join(path.as_str()).is_file());
 
