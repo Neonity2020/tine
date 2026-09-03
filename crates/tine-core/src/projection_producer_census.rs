@@ -1664,9 +1664,22 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename`).
     // Re-pinned 2026-09-02 (wave-3 packet S): the certified dependency moved
     // from v0.12.0 to v0.12.2; the audited call surface remains unchanged.
+    // Re-pinned 2026-09-03 (wave-4 packet B4b): collapsing the ten hand-written
+    // cursor drains in `direct_projection.rs` onto the shared `drain_after`
+    // added exactly ONE token to this surface —
+    // `direct_projection.rs`'s `tine_storage::sqlite::MaterializationError::Corrupt(`
+    // went 1 -> 2, because `block_ref_counts`'s `usize::try_from` conversion
+    // must now return the read's typed error where the hand-written loop used
+    // `.ok()?`. Derived, not assumed: the direct-call token multiset, the
+    // `use tine_storage::…` declarations, and the imported-name call and
+    // associated-function surfaces were diffed for every production file this
+    // packet touched (`direct_projection.rs`, `oplog/query_lowering.rs`,
+    // `model.rs`, `query.rs`) against `d1f98c61`, and that single count is the
+    // only difference. No new write crossing: the write-boundary table above is
+    // byte-identical, and the change is an error mapping, not a publication.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "ec01efb9d3f89d8f3369f46f9f1a46382772bcceb16268d4a62f571d915d7ed1",
+        "e976185b39e6b1addedf04fe418ce60750f4cf19f5b6580fded17bc19e626e08",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

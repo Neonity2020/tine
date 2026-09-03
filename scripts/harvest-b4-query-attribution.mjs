@@ -118,19 +118,37 @@ for (let run = 0; run < runs; run += 1) {
 }
 
 if (phase === "after") {
+  // Classes whose candidate set is selective enough to stay on the projection.
   const candidateOnlyClasses = new Set([
-    "sparse_task", "page_ref", "task_non_sparse", "block_property",
-    "page_property", "page_tags", "page", "namespace", "journal",
+    "sparse_task", "page_ref", "block_property",
+    "page_property", "page_tags", "page", "namespace",
     "mixed_and", "complete_or", "boolean_composition",
   ]);
+  // Classes whose candidate set exceeds the cutoff on this corpus, so the
+  // escape hatch abandons the projection and the parser walk answers. Their
+  // signature is the exact complement: no candidate query completes, exactly
+  // one fallback read is recorded on the existing hatch, and exactly one
+  // full-graph evaluation runs. A driver that accepted either signature would
+  // not notice the hatch silently ceasing to fire.
+  const abandonedClasses = new Set(["task_non_sparse", "journal"]);
   for (const row of sampleRows) {
-    if (!candidateOnlyClasses.has(row.class)) continue;
-    if (
-      Number.parseInt(row.candidateQueriesCompleted, 10) !== 1 ||
-      Number.parseInt(row.fallbackReads, 10) !== 0 ||
-      Number.parseInt(row.fullGraphEvaluations, 10) !== 0
-    ) {
-      throw new Error(`post-fix candidate-only sample failed: ${JSON.stringify(row)}`);
+    if (candidateOnlyClasses.has(row.class)) {
+      if (
+        Number.parseInt(row.candidateQueriesCompleted, 10) !== 1 ||
+        Number.parseInt(row.fallbackReads, 10) !== 0 ||
+        Number.parseInt(row.fullGraphEvaluations, 10) !== 0
+      ) {
+        throw new Error(`post-fix candidate-only sample failed: ${JSON.stringify(row)}`);
+      }
+    } else if (abandonedClasses.has(row.class)) {
+      if (
+        Number.parseInt(row.candidateQueriesCompleted, 10) !== 0 ||
+        Number.parseInt(row.fallbackReads, 10) !== 1 ||
+        Number.parseInt(row.fullGraphEvaluations, 10) !== 1 ||
+        Number.parseInt(row.evaluatedPages, 10) !== 0
+      ) {
+        throw new Error(`post-fix abandoned sample failed: ${JSON.stringify(row)}`);
+      }
     }
   }
 }

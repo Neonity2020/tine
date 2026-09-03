@@ -6092,7 +6092,18 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        let paths = projection.simple_query_candidate_paths(generation, plan)?;
+        // The candidate-count escape hatch scales with the graph, so the
+        // projection needs the graph's page count to apply it. `None` here
+        // covers both "the projection could not answer" and "its candidate set
+        // was not selective enough to be worth materializing"; either way the
+        // caller notes one fallback read and takes the parser walk.
+        let graph_page_count = self
+            .cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |pages| pages.len());
+        let paths = projection.simple_query_candidate_paths(generation, plan, graph_page_count)?;
         #[cfg(test)]
         DIRECT_CANDIDATE_EVALUATED_PATHS.with(|recorded| {
             *recorded.borrow_mut() = paths.iter().cloned().collect();
@@ -6350,17 +6361,22 @@ impl Graph {
             .map_or(0, |projection| projection.fallback_reads())
     }
 
+    /// The candidate set the lowering produces, with the escape hatch driven
+    /// explicitly: `graph_page_count` sets the cutoff exactly as production
+    /// does, so a test can observe both the routed and the abandoned side.
+    /// Pass `usize::MAX` for the raw, uncapped lowering result.
     #[cfg(test)]
     pub(crate) fn direct_projection_candidate_paths_test(
         &self,
         plan: &crate::query::SimpleQueryCandidatePlan,
+        graph_page_count: usize,
     ) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         self.direct_projection
             .lock()
             .unwrap()
             .as_ref()?
-            .simple_query_candidate_paths(generation, plan)
+            .simple_query_candidate_paths(generation, plan, graph_page_count)
     }
 
     #[cfg(test)]

@@ -506,6 +506,26 @@ also use that parser fallback. All other query, navigation, and search families 
 implementation until an equivalent generation-bound differential packet
 replaces and deletes each old route.
 
+When the exact current parser-cache generation is ready, every
+`SimpleQueryCandidatePlan::Indexed` plan obtains its candidate page set from the
+shared lowering and evaluates only those pages, unless the candidate set is
+larger than one thirty-second of the graph's page count or 32 pages, whichever
+is greater, in which case the projection read is abandoned and the parser
+fallback runs instead. `Empty` returns without projection or graph access. `All`
+uses the parser whole-graph evaluator. An unavailable, stale, failed, or raced
+projection uses the parser fallback.
+
+That cutoff is a cost decision, not a correctness one: both routes return the
+same answer, and abandoning simply returns the query to the behaviour it had
+before the route existed. It exists because the shared lowering returns a page
+SUPERSET rather than the answer, so an unselective plan names most of the graph;
+measured on the 1,045-file anonymized corpus, routing such a plan cost
+1.08 -> 11.19 ms for a non-sparse task query and 0.46 -> 3.31 ms for `(journal)`,
+while every plan below the cutoff got between 1.6x and 13x faster. The cutoff
+scales with the graph because the walk it replaces costs one cheap in-memory
+predicate per page, so the route only wins while the candidate set is a small
+fraction of the whole.
+
 ## 2. Enrollment and synchronization state machine
 
 ### 2.1 Actors and authority

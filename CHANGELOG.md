@@ -135,6 +135,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   absence-decision-map open. Diagnostics only: nothing in the open path reads a
   counter, and no user-visible behavior changes.
 
+- **Direct Files indexed queries now avoid the whole-graph parser walk when
+  their generation-bound projection is ready.** Candidate selection uses the
+  shared Managed/Direct lowering, so a `{{query}}` block on a page property,
+  block property, page, namespace, or boolean composition no longer re-reads
+  every page after every keystroke. A query whose candidate set is not
+  selective — more than one thirty-second of the graph — keeps the parser walk,
+  which is faster for those shapes; stale or unavailable projections keep it
+  too. Both routes return the same answer.
+
 ### Fixed
 
 - **Managed recovery moves and Windows backup restore close their publication

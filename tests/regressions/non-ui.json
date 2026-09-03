@@ -6293,6 +6293,32 @@
     "failBefore": "proven \u2014 with the Drop impl removed the new test fails with the exact signature the census recorded from the real flakes: Os { code: 11, kind: WouldBlock, message: \"Resource temporarily unavailable\" }"
    },
    "notes": "FlightRecorder held its process.lock in a `_process_lock: File` field with no Drop and no unlock, so release was a side effect of closing that descriptor. An flock belongs to the open file description, not to the descriptor: every process spawn duplicates the description into a child that holds it until exec, so a recorder dropped inside that window left the lock held and the next open on the same directory got EAGAIN. Observed twice in campaign evidence (wave3 I5, wave4 G1) as a first-run failure of the two session-cleanliness tests that then passed on rerun \u2014 four extra `cargo test -p tine` invocations in the G1 lane alone, on the gate every lane runs. Drop now calls unlock, which acts on the description and so releases every copy at once."
+  },
+  {
+   "id": "REG-W4-B4B-DIRECT-INDEXED-QUERY-ROUTING-001",
+   "title": "Direct Files indexed queries evaluate only the shared lowering's candidate pages, and abandon the projection when that candidate set is not selective",
+   "family": "waited-path-query-cost",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Harvest W4-B4b"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
+     "crates/tine-core/src/direct_projection.rs::tests::b4_unselective_candidate_set_abandons_the_projection_for_the_parser_walk",
+     "crates/tine-core/src/direct_projection.rs::tests::storage_contract_names_the_generation_bound_cutover",
+     "crates/tine-core/tests/retirement_candidates.rs::retirement_candidate_markers_are_pinned"
+    ],
+    "scenario": "direct-query.selective-indexed-plans-candidate-only",
+    "failBefore": "proven — tine-agents/evidence/wave4/b4b-pass2/. Routing, checked at 9bad907f: every newly routed shape (non-sparse Task, BlockProperty, PageProperty, Page, Namespace, Journal, mixed And, complete Or) left the candidate-read counter unchanged and entered the full-graph evaluator. Hatch, checked at 9bad907f with the cutoff neutralised (hatch-fail-before.log): the unselective plan completed a candidate query instead of abandoning — `an abandoned plan must complete no candidate query, left: 2, right: 1`."
+   },
+   "notes": "The user outcome: a {{query}} block in Direct mode walked the whole graph after every keystroke even though the projection could answer it. Indexed plans now take the shared Managed/Direct lowering; Empty returns without projection or graph access; All keeps the walk. The lowering returns a page SUPERSET rather than the answer, so an unselective plan names most of the graph and materialising it through SQLite is slower than the walk — measured on the 1,045-file anonymized corpus at 1.08 -> 11.19 ms for non-sparse Task and 0.46 -> 3.31 ms for (journal). A candidate-count escape hatch (more than graph_pages/32, floor 32) therefore abandons the projection and reuses the existing parser-fallback path with a second reason. Both routes return identical groups/total/exceeded. The hatch carries the codebase's first `// RETIREMENT-CANDIDATE:` marker, censused by tests/retirement_candidates.rs; the walk is also the differential correctness oracle for the real lowering that would replace it, so it outlives the hatch."
   }
  ]
 }
