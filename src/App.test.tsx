@@ -304,7 +304,10 @@ describe("conflict requires per-page divergence, not just a notification", () =>
           if (observation === null || observation === undefined || observation !== live) {
             // The exact family the backend uses when a force names an
             // observation that is not the live one.
-            return Promise.reject(new Error("conflict_authority.superseded: ..."));
+            return Promise.reject({
+              kind: "direct-save-failure",
+              reasonCode: "conflict_authority.superseded",
+            });
           }
           live = null;
           return Promise.resolve({ revision: "rev-forced" });

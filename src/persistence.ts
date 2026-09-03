@@ -565,37 +565,36 @@ export function saveFailureDisposition(error: unknown): SaveFailureDisposition {
     : "ordinary";
 }
 
-/** Extract a bounded save-failure code from either backend contract.
- * Managed actor refusals arrive as a typed funnel error; only the legacy Direct
- * save contract still has a bounded code prefix. */
+/** Extract a bounded save-failure code from the typed backend contracts.
+ *
+ *  W4-E4 retired the Direct save prefix parser that used to live here. The
+ *  command funnel has already validated the tagged JSON payload, so a Direct
+ *  failure arrives as an object with a closed `reasonCode`; no user-controlled
+ *  path or page text participates in classification, and a page legitimately
+ *  named `conflict_authority.notes` can no longer make an unrelated
+ *  `precheck.symlink` failure look like a spent override. (GH #254 increment 2,
+ *  fourth correction-delta re-verification.)
+ *
+ *  The `managed.conflict` prefix below is a Managed producer's own tagged
+ *  string, not Direct save prose; E2/E2b move it onto the shared typed carrier.
+ *  Returns `""` when nothing typed is present. */
 function saveFailureCode(error: unknown): string {
   if (error instanceof ManagedActorRefusalError) return error.reasonCode;
-  const message = String(error).replace(/^Error: /, "");
-  return directSaveFailureCode(message);
-}
-
-/** The bounded failure code the Direct backend prefixes to a save error.
- *
- *  `direct_save_error_message` emits `"{code}: {raw error}"`, and many raw errors
- *  carry a graph-relative PATH. So a family test has to read the code, not search
- *  the whole string: a page legitimately named `conflict_authority.notes` would
- *  otherwise make an unrelated `precheck.symlink` failure look like a spent
- *  override, and its handler would keep re-observing a save that can never
- *  succeed. (GH #254 increment 2, fourth correction-delta re-verification.)
- *
- *  Returns `""` when there is no code separator or the prefix is not code-shaped
- *  — including the banner-class `conflict` / `conflict:<n>` shape, which is
- *  matched by `conflictObservationEpoch` before this is consulted. */
-function directSaveFailureCode(message: string): string {
-  const separator = message.indexOf(": ");
-  if (separator <= 0) return ""; // no code at all — never a family
-  const code = message.slice(0, separator);
-  // A bounded code is dot-separated, lower-case and underscored — usually
-  // `family.condition`, but `unknown` is a genuine single-segment one. Requiring
-  // the SHAPE means an error that merely opens with code-like prose cannot be
-  // read as one: without it, `Error("conflict_authority.spent while reporting
-  // …")` was accepted whole and routed into the authority handler.
-  return /^[a-z][a-z_]*(\.[a-z][a-z_]*)*$/.test(code) ? code : "";
+  if (typeof error === "object" && error !== null && "kind" in error && "reasonCode" in error) {
+    const typed = error as { kind: unknown; reasonCode: unknown };
+    if (
+      (typed.kind === "direct-save-failure" || typed.kind === "save-conflict")
+      && typeof typed.reasonCode === "string"
+    ) {
+      return typed.reasonCode;
+    }
+  }
+  // Managed storage still owns this pre-existing tagged string producer; E2/E2b
+  // will move it through the shared typed carrier. It is not Direct save prose.
+  if (typeof error === "string" && error.startsWith("managed.conflict: ")) {
+    return "managed.conflict";
+  }
+  return "";
 }
 
 /** The observation epoch a banner-class conflict was raised at.

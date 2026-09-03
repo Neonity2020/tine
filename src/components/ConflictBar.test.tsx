@@ -319,7 +319,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     const current = page(strayPath, "the current managed DTO");
     const getPageByPath = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(current);
     const savePage = vi.spyOn(backend(), "savePage")
-      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"));
+      .mockRejectedValueOnce("managed.conflict: stale_base");
     expect(await flushPage(sharedName)).toBe(false);
     expect(conflicts()).toEqual([sharedName]);
     activate.mockClear();
@@ -353,7 +353,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
       .mockResolvedValueOnce(observed)
       .mockReturnValueOnce(heldRead);
     const savePage = vi.spyOn(backend(), "savePage")
-      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"));
+      .mockRejectedValueOnce("managed.conflict: stale_base");
     expect(await flushPage(sharedName)).toBe(false);
     expect(conflicts()).toEqual([sharedName]);
     activate.mockClear();
@@ -395,8 +395,8 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
       .mockReturnValueOnce(heldRead)
       .mockResolvedValueOnce(newerWinner);
     const savePage = vi.spyOn(backend(), "savePage")
-      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"))
-      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"));
+      .mockRejectedValueOnce("managed.conflict: stale_base")
+      .mockRejectedValueOnce("managed.conflict: stale_base");
     expect(await flushPage(sharedName)).toBe(false);
     expect(conflicts()).toEqual([sharedName]);
     activate.mockClear();

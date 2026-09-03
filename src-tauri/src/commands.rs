@@ -1020,26 +1020,24 @@ const DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS: u128 = 150;
 /// can classify it without sniffing prose and the user gets an error they can
 /// read instead of a prompt that cannot help.
 fn direct_save_error_message(error: std::io::Error) -> String {
+    let error = tine_core::model::DirectSaveError::ensure_io(error);
     let code = tine_core::model::direct_save_failure_code(&error);
-    // `conflict.*` is the one family the frontend turns into the keep-mine /
-    // use-disk banner, so membership is decided in `direct_save_failure_code`
-    // by naming the condition, never by a catch-all on an error kind. Matching
-    // the prefix keeps that set open to new named conflicts without this arm
-    // silently widening to cover unclassified failures.
+    let io_error_kind = format!("{:?}", error.kind());
     if code.starts_with("conflict.") {
-        // The observation epoch rides with the banner so "Keep mine" can name
-        // the conflict the user actually saw. Without it a second, already-issued
-        // force request consumes authority minted for a NEWER unseen winner and
-        // overwrites it (GH #254 increment 2, implementation verification,
-        // finding 1). A conflict that somehow carries no epoch stays the bare
-        // literal, and the frontend then has nothing to present, so its force is
-        // refused rather than silently allowed.
-        return match tine_core::model::direct_save_conflict_epoch(&error) {
-            Some(epoch) => format!("conflict:{epoch}"),
-            None => "conflict".to_string(),
-        };
+        return tine_core::sync_runtime::tagged_backend_error_with_reason_and_detail(
+            "save-conflict",
+            code,
+            serde_json::json!({
+                "io_error_kind": io_error_kind,
+                "epoch": tine_core::model::direct_save_conflict_epoch(&error),
+            }),
+        );
     }
-    format!("{code}: {error}")
+    tine_core::sync_runtime::tagged_backend_error_with_reason_and_detail(
+        "direct-save-failure",
+        code,
+        serde_json::json!({ "io_error_kind": io_error_kind }),
+    )
 }
 
 /// Report what a slow or failed Direct-Markdown save actually did.
@@ -1173,9 +1171,12 @@ pub(crate) async fn save_page(
                                 base_rev.as_deref(),
                                 tine_core::ConflictOverride { observation_epoch },
                             ),
-                            None => Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                "conflict override authority is missing or already consumed",
+                            None => Err(tine_core::model::DirectSaveError::into_io(
+                                tine_core::model::DirectSaveFailureCode::ConflictAuthoritySpent,
+                                std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "conflict override authority is missing or already consumed",
+                                ),
                             )),
                         }
                     } else {
@@ -5250,6 +5251,25 @@ pub(crate) fn rollback_pdf_area_image(
 mod direct_save_error_tests {
     use super::direct_save_error_message;
     use std::io;
+    use tine_core::model::{DirectSaveError, DirectSaveFailureCode};
+
+    fn code(value: &str) -> DirectSaveFailureCode {
+        DirectSaveFailureCode::ALL
+            .into_iter()
+            .find(|code| code.as_str() == value)
+            .unwrap_or_else(|| panic!("missing DirectSaveFailureCode for {value}"))
+    }
+
+    fn payload(
+        value: &str,
+        kind: io::ErrorKind,
+        epoch: Option<u64>,
+        message: &str,
+    ) -> serde_json::Value {
+        let source = io::Error::new(kind, message.to_owned());
+        let error = DirectSaveError::into_io_with_conflict_epoch(code(value), epoch, source);
+        serde_json::from_str(&direct_save_error_message(error)).unwrap()
+    }
 
     /// The frontend puts up a conflict prompt ("Keep mine" / "Use disk version")
     /// for exactly one message, and a page it marks conflicted stops saving until
@@ -5259,8 +5279,17 @@ mod direct_save_error_tests {
     #[test]
     fn only_a_real_base_revision_conflict_raises_the_conflict_prompt() {
         assert_eq!(
-            direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, "conflict")),
-            "conflict"
+            payload(
+                "conflict.base_rev",
+                io::ErrorKind::AlreadyExists,
+                None,
+                "conflict",
+            ),
+            serde_json::json!({
+                "kind": "save-conflict",
+                "reason_code": "conflict.base_rev",
+                "detail": { "io_error_kind": "AlreadyExists", "epoch": null },
+            })
         );
 
         for (message, expected_code) in [
@@ -5303,17 +5332,14 @@ mod direct_save_error_tests {
                 "unknown",
             ),
         ] {
-            let reported =
-                direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, message));
-            assert!(
-                reported.starts_with(expected_code),
-                "{message} should report as {expected_code}, got {reported}"
+            let reported = payload(
+                expected_code,
+                io::ErrorKind::AlreadyExists,
+                None,
+                message,
             );
-            assert_ne!(
-                reported, "conflict",
-                "{message} cannot be resolved by keep-mine or use-disk, so it must not \
-                 raise the conflict prompt"
-            );
+            assert_eq!(reported["kind"], "direct-save-failure");
+            assert_eq!(reported["reason_code"], expected_code);
         }
     }
 
@@ -5322,44 +5348,99 @@ mod direct_save_error_tests {
     /// it. It must reach the prompt.
     #[test]
     fn an_unobserved_external_change_still_raises_the_conflict_prompt() {
-        assert_eq!(
-            direct_save_error_message(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "path-pinned page does not match its captured exact owner",
-            )),
-            "conflict"
+        let reported = payload(
+            "conflict.pinned_owner",
+            io::ErrorKind::AlreadyExists,
+            Some(17),
+            "path-pinned page does not match its captured exact owner",
         );
+        assert_eq!(reported["kind"], "save-conflict");
+        assert_eq!(reported["reason_code"], "conflict.pinned_owner");
+        assert_eq!(reported["detail"]["epoch"], 17);
     }
 
     #[test]
     fn every_minted_site_and_no_tokenless_site_reaches_the_banner() {
-        for message in [
-            "editor conflict: save baseline present",
-            "editor conflict: save baseline absent",
-            "editor conflict: commit recheck",
-            "editor conflict: replace pre-retirement",
-            "editor conflict: retired mismatch",
-            "editor conflict: publication collision",
-            "editor conflict: create publication collision",
-            "editor conflict: final reread absent",
-            "editor conflict: final reread present",
-            "editor conflict: post-publication validation",
-        ] {
+        for code in DirectSaveFailureCode::ALL {
+            let value = code.as_str();
+            let conflict = value.starts_with("conflict.");
+            let reported = payload(
+                value,
+                io::ErrorKind::Other,
+                conflict.then_some(1),
+                "display text is not classification data",
+            );
+            assert_eq!(reported["reason_code"], value);
             assert_eq!(
-                direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, message,)),
-                "conflict",
-                "minted authority at {message} must reach the two-arm banner"
+                reported["kind"],
+                if conflict {
+                    "save-conflict"
+                } else {
+                    "direct-save-failure"
+                }
             );
         }
-        for message in [
-            "tokenless editor conflict: commit recheck: continued churn",
-            "tokenless editor conflict: replace pre-retirement: transient I/O",
-            "tokenless editor conflict: final reread present: transient I/O",
+
+        for (code, message) in [
+            (
+                "conflict.save_baseline_present",
+                "editor conflict: save baseline present",
+            ),
+            (
+                "conflict.save_baseline_absent",
+                "editor conflict: save baseline absent",
+            ),
+            ("conflict.commit_recheck", "editor conflict: commit recheck"),
+            (
+                "conflict.replace_pre_retirement",
+                "editor conflict: replace pre-retirement",
+            ),
+            (
+                "conflict.replace_retired_mismatch",
+                "editor conflict: retired mismatch",
+            ),
+            (
+                "conflict.replace_publication_collision",
+                "editor conflict: publication collision",
+            ),
+            (
+                "conflict.create_publication_collision",
+                "editor conflict: create publication collision",
+            ),
+            (
+                "conflict.final_reread_absent",
+                "editor conflict: final reread absent",
+            ),
+            (
+                "conflict.final_reread_present",
+                "editor conflict: final reread present",
+            ),
+            (
+                "conflict.replace_post_publication",
+                "editor conflict: post-publication validation",
+            ),
         ] {
-            let reported =
-                direct_save_error_message(io::Error::new(io::ErrorKind::WouldBlock, message));
-            assert!(reported.starts_with("conflict_retry."), "{reported}");
-            assert_ne!(reported, "conflict");
+            let reported = payload(code, io::ErrorKind::AlreadyExists, Some(1), message);
+            assert_eq!(reported["kind"], "save-conflict");
+            assert_eq!(reported["reason_code"], code);
+        }
+        for (code, message) in [
+            (
+                "conflict_retry.commit_recheck",
+                "tokenless editor conflict: commit recheck: continued churn",
+            ),
+            (
+                "conflict_retry.replace_pre_retirement",
+                "tokenless editor conflict: replace pre-retirement: transient I/O",
+            ),
+            (
+                "conflict_retry.final_reread_present",
+                "tokenless editor conflict: final reread present: transient I/O",
+            ),
+        ] {
+            let reported = payload(code, io::ErrorKind::WouldBlock, None, message);
+            assert_eq!(reported["kind"], "direct-save-failure");
+            assert_eq!(reported["reason_code"], code);
         }
     }
 }

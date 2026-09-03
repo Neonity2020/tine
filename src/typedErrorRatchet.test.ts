@@ -6,9 +6,11 @@ import {
   AdoptionArchivedError,
   AssetTooLargeError,
   BackendError,
+  DirectSaveFailureError,
   ManagedActorRefusalError,
   ManagedGraphMismatchError,
   OperationCancelledError,
+  SaveConflictError,
   SharedFrontierMismatchError,
   SparseShutdownRefusedError,
   SyncDataUnavailableError,
@@ -37,18 +39,6 @@ const ERROR_STRING_CLASSIFIER_ALLOWLIST: readonly ClassifierSite[] = [
     line: 26,
     class: "bounded-result-code",
     why: "the references boundary's result-too-large prefix is a bounded wire code, not prose",
-  },
-  {
-    file: "persistence.ts",
-    line: 571,
-    class: "temporary-direct-save-parser",
-    why: "retired by W4-E4",
-  },
-  {
-    file: "persistence.ts",
-    line: 592,
-    class: "temporary-direct-save-parser",
-    why: "retired by W4-E4",
   },
 ];
 
@@ -170,6 +160,22 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(actor).toBeInstanceOf(ManagedActorRefusalError);
     expect(actor).toMatchObject({ reasonCode: "trusted_local.append_outcome_unknown" });
 
+    const direct = classifyNativeCallError(JSON.stringify({
+      kind: "direct-save-failure",
+      reason_code: "precheck.symlink",
+      detail: { io_error_kind: "InvalidInput" },
+    }));
+    expect(direct).toBeInstanceOf(DirectSaveFailureError);
+    expect(direct).toMatchObject({ reasonCode: "precheck.symlink", ioErrorKind: "InvalidInput" });
+
+    const conflict = classifyNativeCallError(JSON.stringify({
+      kind: "save-conflict",
+      reason_code: "conflict.base_rev",
+      detail: { io_error_kind: "AlreadyExists", epoch: 23 },
+    }));
+    expect(conflict).toBeInstanceOf(SaveConflictError);
+    expect(conflict).toMatchObject({ reasonCode: "conflict.base_rev", epoch: 23 });
+
     // The one kind with a typed detail object: bounded counts and paths are
     // validated field by field; a malformed detail degrades to no detail.
     const mismatch = classifyNativeCallError(JSON.stringify({
@@ -212,16 +218,51 @@ describe("I-9/I-11 typed backend error boundary", () => {
   it("pins the Rust typed boundaries and the living contract", () => {
     const wire = source("crates/tine-core/src/oplog/wire.rs");
     const runtime = source("crates/tine-core/src/sync_runtime.rs");
+    const model = source("crates/tine-core/src/model.rs");
     const contract = source("docs/contracts/typed-errors.md");
     expect(wire).toContain("Io(std::io::ErrorKind)");
     expect(wire).not.toMatch(/ScenarioError::Io\([^)]*(?:to_string|format!)/s);
+    const directClassifier = model.slice(
+      model.indexOf("pub fn direct_save_conflict_epoch"),
+      model.indexOf("fn initial_shadow_limit_error"),
+    );
+    expect(directClassifier).toContain("downcast_ref::<DirectSaveError>()");
+    expect(directClassifier).not.toMatch(/(?:to_string|contains|starts_with)\s*\(/);
     // Item 3 checkpoint: freeze the compile-probed census rather than let
     // the pre-existing stringification debt expand while its public typed
     // carrier is split into a later packet.
     expect(runtime.match(/map_err\(display\)/g) ?? []).toHaveLength(89);
     expect(runtime.match(/fn display\(/g) ?? []).toHaveLength(1);
-    expect(contract).toContain("9 BackendError subclasses");
+    expect(contract).toContain("10 BackendError subclasses");
     expect(contract).toContain("item 3 checkpoint");
     expect(contract).toContain("TauriBackend.call");
+
+    const directImpl = model.slice(
+      model.indexOf("impl DirectSaveFailureCode"),
+      model.indexOf("/// Typed inner error", model.indexOf("impl DirectSaveFailureCode")),
+    );
+    const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority)\.[a-z_]+|unknown)"/g)]
+      .map((match) => match[1]);
+    expect(directCodes).toHaveLength(36);
+
+    const managedImpl = runtime.slice(
+      runtime.indexOf("impl SyncEditorRefusalCode"),
+      runtime.indexOf("impl fmt::Display for SyncEditorRefusalCode"),
+    );
+    const managedCodes = [...managedImpl.matchAll(/"([a-z][a-z_]*(?:\.[a-z][a-z_]*)+)"/g)]
+      .map((match) => match[1]);
+    expect(managedCodes).toHaveLength(22);
+    for (const code of [...directCodes, ...managedCodes]) expect(contract).toContain(code);
+
+    const persistence = source("src/persistence.ts");
+    const policy = persistence.slice(
+      persistence.indexOf("export function isRetryableSaveFailure"),
+      persistence.indexOf("export type SaveFailureDisposition"),
+    );
+    const frontendCodes = [...policy.matchAll(/"([a-z][a-z_]*(?:\.[a-z][a-z_]*)+)"/g)]
+      .map((match) => match[1])
+      .filter((code) => code !== "managed.conflict");
+    const producerUnion = new Set([...directCodes, ...managedCodes]);
+    expect(frontendCodes.filter((code) => !producerUnion.has(code))).toEqual([]);
   });
 });

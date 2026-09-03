@@ -203,6 +203,7 @@ export interface PluginRegistryCacheEnvelope {
 
 export type BackendErrorKind =
   | "save-conflict"
+  | "direct-save-failure"
   | "sync-data-unavailable"
   | "managed-graph-mismatch"
   | "shared-frontier-mismatch"
@@ -213,7 +214,7 @@ export type BackendErrorKind =
   | "managed-actor-refusal";
 
 const BACKEND_ERROR_MESSAGES: Record<
-  Exclude<BackendErrorKind, "save-conflict" | "managed-actor-refusal">,
+  Exclude<BackendErrorKind, "save-conflict" | "direct-save-failure" | "managed-actor-refusal">,
   string
 > = {
   "sync-data-unavailable": "This graph does not yet contain sync data from another device.",
@@ -315,18 +316,23 @@ export class ManagedActorRefusalError extends BackendError {
   }
 }
 
+export class DirectSaveFailureError extends BackendError {
+  constructor(readonly reasonCode: string, readonly ioErrorKind: string) {
+    super("direct-save-failure", `Direct Files could not save (reason code: ${reasonCode}).`);
+    this.name = "DirectSaveFailureError";
+  }
+}
+
 /** A Direct Files revision conflict, classified once at the Tauri wire boundary.
  * Callers branch on this tag and never inspect arbitrary backend prose. */
 export class SaveConflictError extends BackendError {
-
-  constructor(readonly epoch: number | null) {
-    super("save-conflict", epoch === null ? "conflict" : `conflict:${epoch}`);
+  constructor(
+    readonly epoch: number | null,
+    readonly reasonCode: string = "conflict.base_rev",
+    readonly ioErrorKind: string | null = null,
+  ) {
+    super("save-conflict", "The page changed on disk while it was being edited.");
     this.name = "SaveConflictError";
-  }
-
-  /** Display sites that stringify a rejection keep seeing the bare wire code. */
-  override toString(): string {
-    return this.message;
   }
 }
 
@@ -334,24 +340,9 @@ export function isSaveConflictError(error: unknown): error is SaveConflictError 
   return error instanceof SaveConflictError;
 }
 
-/** The one place a native rejection becomes a typed error. Every guarded
- * Direct Files write — `save_page` and the seven conflict-resolution
- * commands — rejects with the same `conflict` / `conflict:<epoch>` wire code;
- * classifying here means no caller needs to know which commands can conflict.
- * Anything else passes through untouched. */
+/** The one place a native rejection becomes a typed error. */
 export function classifyNativeCallError(error: unknown): unknown {
-  return classifySaveConflictWire(error) ?? classifyTaggedBackendError(error) ?? error;
-}
-
-export function classifySaveConflictWire(error: unknown): SaveConflictError | null {
-  const message = typeof error === "string"
-    ? error
-    : error instanceof Error
-      ? error.message
-      : null;
-  if (message === "conflict") return new SaveConflictError(null);
-  const match = message?.match(/^conflict:(\d+)$/);
-  return match ? new SaveConflictError(Number(match[1])) : null;
+  return classifyTaggedBackendError(error) ?? error;
 }
 
 type TaggedBackendPayload = { kind: string; reason_code?: unknown; detail?: unknown };
@@ -366,6 +357,14 @@ const SHARED_FRONTIER_CATEGORIES: readonly SharedFrontierMismatchCategory[] = [
 
 function nonNegativeCount(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+const REASON_CODE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*)*$/;
+
+function readIoErrorKind(detail: unknown): string | null {
+  if (!detail || typeof detail !== "object") return null;
+  const value = (detail as Record<string, unknown>).io_error_kind;
+  return typeof value === "string" && /^[A-Z][A-Za-z]{0,63}$/.test(value) ? value : null;
 }
 
 /** Validate the native detail object field by field; anything malformed
@@ -420,6 +419,25 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
   }
   if (!payload || typeof payload !== "object") return null;
   switch (payload.kind) {
+    case "direct-save-failure": {
+      const ioErrorKind = readIoErrorKind(payload.detail);
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        && ioErrorKind !== null
+        ? new DirectSaveFailureError(payload.reason_code, ioErrorKind)
+        : null;
+    }
+    case "save-conflict": {
+      const ioErrorKind = readIoErrorKind(payload.detail);
+      const epoch = payload.detail && typeof payload.detail === "object"
+        ? (payload.detail as Record<string, unknown>).epoch
+        : undefined;
+      const validEpoch = epoch === null
+        || (typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 0);
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        && payload.reason_code.startsWith("conflict.") && ioErrorKind !== null && validEpoch
+        ? new SaveConflictError(epoch as number | null, payload.reason_code, ioErrorKind)
+        : null;
+    }
     case "sync-data-unavailable":
       return new SyncDataUnavailableError();
     case "managed-graph-mismatch":
@@ -437,7 +455,7 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
     case "operation-cancelled":
       return new OperationCancelledError();
     case "managed-actor-refusal":
-      return typeof payload.reason_code === "string" && /^[a-z][a-z_]*(?:\.[a-z][a-z_]*)*$/.test(payload.reason_code)
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         ? new ManagedActorRefusalError(payload.reason_code)
         : null;
     default:

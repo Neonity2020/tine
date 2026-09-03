@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __setBackendForTest,
-  classifySaveConflictWire,
+  classifyNativeCallError,
+  DirectSaveFailureError,
   ManagedActorRefusalError,
   type Backend,
   SaveConflictError,
@@ -166,19 +167,23 @@ describe("managed move persistence barrier", () => {
 });
 
 describe("save failure classification", () => {
-  it("tags only the complete Direct Files conflict wire shape at the backend boundary", () => {
-    expect(classifySaveConflictWire("conflict")).toMatchObject({ kind: "save-conflict", epoch: null });
-    expect(classifySaveConflictWire(new Error("conflict:17"))).toMatchObject({ kind: "save-conflict", epoch: 17 });
-    expect(classifySaveConflictWire("conflict:17 suffix")).toBeNull();
-    expect(classifySaveConflictWire("ordinary prose says conflict:17")).toBeNull();
-    expect(classifySaveConflictWire({ toString: () => "conflict:17" })).toBeNull();
+  it("tags only the complete Direct Files conflict payload at the backend boundary", () => {
+    const payload = JSON.stringify({
+      kind: "save-conflict",
+      reason_code: "conflict.base_rev",
+      detail: { io_error_kind: "AlreadyExists", epoch: 17 },
+    });
+    expect(classifyNativeCallError(payload)).toMatchObject({ kind: "save-conflict", epoch: 17 });
+    expect(classifyNativeCallError("conflict")).toBe("conflict");
+    expect(classifyNativeCallError("conflict:17")).toBe("conflict:17");
+    expect(classifyNativeCallError("ordinary prose says conflict:17")).toBe("ordinary prose says conflict:17");
   });
 
   it("recognizes only bounded content-conflict contracts", () => {
     expect(isSaveConflictFailure(new SaveConflictError(17))).toBe(true);
     expect(isSaveConflictFailure("managed.conflict: stale_base")).toBe(true);
     expect(isSaveConflictFailure(new ManagedActorRefusalError("managed.conflict"))).toBe(true);
-    expect(isSaveConflictFailure("precheck.portable_collision: page already exists")).toBe(false);
+    expect(isSaveConflictFailure(new DirectSaveFailureError("precheck.portable_collision", "AlreadyExists"))).toBe(false);
     expect(isSaveConflictFailure("ordinary prose says conflict or already exists")).toBe(false);
     expect(isSaveConflictFailure("conflict:17")).toBe(false);
   });
@@ -203,30 +208,34 @@ describe("save failure classification", () => {
       // conflict banner (an exact comparison) nor any bounded code, so it
       // retried silently forever and the user could quit believing the page
       // had been written.
-      "managed.conflict",
       "trusted_local.append_outcome_unknown",
     ]) {
-      expect(isRetryableSaveFailure(`${code}: something specific`)).toBe(false);
+      expect(isRetryableSaveFailure(
+        code === "trusted_local.append_outcome_unknown"
+          ? new ManagedActorRefusalError(code)
+          : new DirectSaveFailureError(code, "Other"),
+      )).toBe(false);
     }
+    expect(isRetryableSaveFailure("managed.conflict: something specific")).toBe(false);
   });
 
   it("still retries failures that a later attempt can succeed at", () => {
     // The graph moved under the capture (a sync client mid-pull), or the file
     // was replaced and the watcher has not re-pinned its identity yet. Both
     // resolve on their own.
-    expect(isRetryableSaveFailure("precheck.interrupted: inventory changed")).toBe(true);
-    expect(isRetryableSaveFailure("identity.changed_since_load: ...")).toBe(true);
+    expect(isRetryableSaveFailure(new DirectSaveFailureError("precheck.interrupted", "Interrupted"))).toBe(true);
+    expect(isRetryableSaveFailure(new DirectSaveFailureError("identity.changed_since_load", "AlreadyExists"))).toBe(true);
     expect(
-      isRetryableSaveFailure("conflict_retry.replace_pre_retirement: continued delivery churn")
+      isRetryableSaveFailure(new DirectSaveFailureError("conflict_retry.replace_pre_retirement", "WouldBlock"))
     ).toBe(true);
-    expect(isRetryableSaveFailure("unknown: disk full")).toBe(true);
+    expect(isRetryableSaveFailure(new DirectSaveFailureError("unknown", "StorageFull"))).toBe(true);
     expect(isRetryableSaveFailure(new Error("EBUSY"))).toBe(true);
   });
 
   it("classifies append uncertainty from the actor reason-code envelope before retry policy", () => {
     expect(
       saveFailureDisposition("trusted_local.append_outcome_unknown: storage receipt did not escape")
-    ).toBe("append_outcome_unknown");
+    ).toBe("ordinary");
     const actorFailure = new ManagedActorRefusalError("trusted_local.append_outcome_unknown");
     expect(saveFailureDisposition(actorFailure)).toBe("append_outcome_unknown");
     expect(isRetryableSaveFailure(actorFailure)).toBe(false);

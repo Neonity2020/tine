@@ -9842,6 +9842,17 @@
       "status": "covered",
       "coverage": { "tests": ["src/components/Settings.backups.test.tsx", "src/frontendStaleness.guard.test.ts", "src/components/Settings.mediaEditors.platform.test.tsx"], "scenario": "settings.busy-owner-and-mobile-gate", "failBefore": "proven" },
       "notes": "Only the owning operation clears a busy token, restore is busy during confirmation, and desktop-only media settings are absent on mobile."
+    },
+    {
+      "id": "UI-HARVEST-W4-E4-DIRECT-SAVE-CONFLICT-ROUTING",
+      "title": "Page text resembling a conflict never raises the discard-capable conflict banner",
+      "family": "direct-save-typed-errors",
+      "sources": { "issues": [], "commits": [], "internal": "Harvest W4-E4" },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": { "tests": ["src/backendCallFunnel.test.ts"], "scenario": "direct-save.typed-disposition-and-banner-routing", "failBefore": "The tagged direct-save payload remained a string, so its true non-retryable producer code was unavailable to the save policy." },
+      "notes": "Exact safety: only a typed SaveConflictError reaches conflict resolution; DirectSaveFailureError follows its producer reasonCode even when detail contains conflict-like page text."
     }
   ]
 }

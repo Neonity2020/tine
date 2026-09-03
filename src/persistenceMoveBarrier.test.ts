@@ -56,7 +56,10 @@ vi.mock("./backend", () => ({
       saved.push({ name: page.name, force: !!force, observation: observation ?? null });
       if (force) {
         if (observation === null || observation !== live) {
-          return Promise.reject(new Error("conflict_authority.superseded: ..."));
+          return Promise.reject({
+            kind: "direct-save-failure",
+            reasonCode: "conflict_authority.superseded",
+          });
         }
         live = null;
         return Promise.resolve({ revision: "rev-forced" });

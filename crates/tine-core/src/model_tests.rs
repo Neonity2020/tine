@@ -7431,6 +7431,41 @@ fn real_graph_direct_save_does_not_rebuild_the_identity_index() {
     );
 }
 
+#[test]
+#[ignore = "manual W4-E4 gate: unchanged Direct saves on an anonymized corpus copy"]
+fn direct_save_typed_errors_accept_anonymized_corpus_copy() {
+    let root = fs::canonicalize(PathBuf::from(
+        std::env::var_os("TINE_DIRECT_SAVE_CORPUS_COPY")
+            .expect("set TINE_DIRECT_SAVE_CORPUS_COPY to a disposable anonymized graph copy"),
+    ))
+    .expect("the disposable anonymized graph copy must be readable");
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    let mut attempted = 0_usize;
+    let mut failures = 0_usize;
+
+    for entry in graph.list_pages() {
+        let Ok(Some(page)) = graph.load_by_path(&entry.rel_path) else {
+            failures += 1;
+            continue;
+        };
+        if page.read_only || page.guide {
+            continue;
+        }
+        attempted += 1;
+        if graph.save_page(&page, page.rev.as_deref()).is_err() {
+            failures += 1;
+        }
+    }
+
+    eprintln!("direct_save_corpus_copy attempted={attempted} failures={failures}");
+    assert!(attempted > 0, "the corpus copy contained no writable pages");
+    assert_eq!(
+        failures, 0,
+        "unchanged Direct saves failed on the corpus copy"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn resource_epoch_uses_local_existing_proofs_and_cached_creation_proof() {
@@ -11432,14 +11467,18 @@ fn projection_boundary_race_is_rejected_before_displacement() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Pins every bounded save-failure code to the exact message its production
-/// site emits. If someone rewords one of those messages, this fails and they
-/// have to update the classifier deliberately -- which is the point, because
-/// a silently-reclassified failure reads as `unknown` in a user's report and
-/// tells us nothing.
+/// Pins every bounded save-failure string to the typed code assigned at its
+/// production site. Rewording the display source cannot reclassify the error.
 #[test]
 fn direct_save_failure_codes_are_stable() {
     use std::io::{Error, ErrorKind};
+    let typed = |code: &str, source: Error| {
+        let code = DirectSaveFailureCode::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+            .unwrap_or_else(|| panic!("missing DirectSaveFailureCode variant for {code}"));
+        DirectSaveError::into_io(code, source)
+    };
     for (code, error) in [
         // model.rs `capture_managed_text_entries` symlink arm.
         (
@@ -11595,44 +11634,98 @@ fn direct_save_failure_codes_are_stable() {
             Error::new(ErrorKind::PermissionDenied, "permission denied"),
         ),
     ] {
+        let error = typed(code, error);
         assert_eq!(
             direct_save_failure_code(&error),
             code,
             "classifier drifted for: {error}"
         );
     }
-    for (suffix, message) in [
-        ("save_baseline_present", "save baseline present"),
-        ("save_baseline_absent", "save baseline absent"),
-        ("commit_recheck", "commit recheck"),
-        ("replace_pre_retirement", "replace pre-retirement"),
-        ("replace_retired_mismatch", "retired mismatch"),
-        ("replace_publication_collision", "publication collision"),
-        (
-            "create_publication_collision",
-            "create publication collision",
-        ),
-        ("final_reread_absent", "final reread absent"),
-        ("final_reread_present", "final reread present"),
-        ("replace_post_publication", "post-publication validation"),
-    ] {
-        let minted = Error::new(
-            ErrorKind::AlreadyExists,
-            format!("editor conflict: {message}"),
-        );
+}
+
+/// The site-to-code binding for the whole conflict vocabulary, driven through
+/// the REAL producers rather than through a stamped fixture.
+///
+/// This is the half that can discard a user's work. `conflict.*` is the
+/// banner class, and the banner's "Use disk version" throws away the unsaved
+/// edit, so a site that mints the wrong `conflict.*` code -- or mints one at
+/// all where the failure is not a conflict -- is a data-loss defect. Before
+/// the classifier was typed, the prose test caught that by construction;
+/// stamping the expected code onto a fixture and reading it back would not,
+/// so every case here goes through `EditorConflictSite`'s own accessors and
+/// through `Graph::tokenless_conflict_error`.
+///
+/// `EditorConflictSite::ALL` has a pinned length, so a new site cannot be
+/// added without appearing here.
+#[test]
+fn direct_save_conflict_sites_produce_their_own_codes() {
+    for (site, suffix) in EditorConflictSite::ALL.into_iter().zip([
+        "save_baseline_present",
+        "save_baseline_absent",
+        "commit_recheck",
+        "replace_pre_retirement",
+        "replace_retired_mismatch",
+        "replace_publication_collision",
+        "create_publication_collision",
+        "final_reread_absent",
+        "final_reread_present",
+        "replace_post_publication",
+    ]) {
+        // The banner class, as `conflict_error_from_snapshot` reads it. That
+        // producer needs a graph to mint an authority epoch; the branch under
+        // test is its code selection, which is this accessor.
         assert_eq!(
-            direct_save_failure_code(&minted),
-            format!("conflict.{suffix}")
+            site.conflict_code().as_str(),
+            format!("conflict.{suffix}"),
+            "conflict site drifted from its banner code: {}",
+            site.message()
         );
-        let tokenless = Error::new(
-            ErrorKind::WouldBlock,
-            format!("tokenless editor conflict: {message}: continued churn"),
+
+        // The retry class, through the real producer end to end.
+        let tokenless = Graph::tokenless_conflict_error(
+            site,
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "continued churn"),
         );
         assert_eq!(
             direct_save_failure_code(&tokenless),
-            format!("conflict_retry.{suffix}")
+            format!("conflict_retry.{suffix}"),
+            "tokenless conflict site drifted from its retry code: {}",
+            site.tokenless_message()
+        );
+        assert_eq!(
+            direct_save_conflict_epoch(&tokenless),
+            None,
+            "a tokenless conflict has no authority epoch to present"
         );
     }
+}
+
+/// The same binding for the precheck helpers, which are free functions and so
+/// can be driven directly. `initial_shadow_limit_error` and
+/// `managed_text_inventory_limit_error` are the two the save path calls when a
+/// bound is exceeded; both are `precheck.limit`, and neither may become a
+/// conflict.
+#[test]
+fn direct_save_precheck_helpers_produce_their_own_codes() {
+    for error in [
+        initial_shadow_limit_error("entries"),
+        managed_text_inventory_limit_error("bytes"),
+    ] {
+        assert_eq!(direct_save_failure_code(&error), "precheck.limit");
+        assert_eq!(direct_save_conflict_epoch(&error), None);
+    }
+}
+
+
+#[test]
+fn direct_save_failure_code_does_not_inherit_conflict_from_page_text() {
+    let error = std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "exact-identity restore failed for pages/path-pinned page does not match its captured exact owner.md",
+    );
+
+    assert_eq!(direct_save_failure_code(&error), "unknown");
+    assert_eq!(direct_save_conflict_epoch(&error), None);
 }
 
 /// Existing saves inspect only their exact retained parent, and skip

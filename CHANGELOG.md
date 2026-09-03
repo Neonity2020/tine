@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Direct save errors can no longer become discard-capable conflicts because
+  of a page title or block text.** The save producer carries a closed reason
+  code and conflict epoch through tagged JSON, and the frontend no longer
+  reconstructs either value from error wording.
+
 - **Managed activation now recovers after a process abort before its authority
   marker is published.** The marker remains the sole commit point; the next
   activation retires a wholly recognized unmarked generation and disposable

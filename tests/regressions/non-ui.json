@@ -6172,6 +6172,24 @@
     "failBefore": "After baseline publication, the subprocess abort left an unmarked generation and the next activation returned AmbiguousOrForeignResidue instead of becoming active."
    },
    "notes": "Availability/recovery, not rank 1: Direct Files bytes remain unchanged. Three subprocess-abort cuts cover baseline publication, SQLite publication, and final source verification before the marker commit."
+  },
+  {
+   "id": "REG-W4-E4-DIRECT-SAVE-TYPED-CODE-001",
+   "title": "Direct save failures retain the producer code when page text resembles a conflict",
+   "family": "direct-save-typed-errors",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-E4"},
+   "platforms": ["all"],
+   "layer": "rust-core-tauri-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model_tests.rs::direct_save_failure_code_does_not_inherit_conflict_from_page_text",
+     "src-tauri/src/commands.rs::direct_save_error_tests"
+    ],
+    "scenario": "direct-save.page-text-cannot-mint-conflict",
+    "failBefore": "An unrelated error whose page path contained the pinned-owner sentence classified as conflict.pinned_owner."
+   },
+   "notes": "Exact safety: DirectSaveFailureCode and the conflict epoch cross the command boundary as tagged JSON; error display text is never parsed for control flow."
   }
  ]
 }

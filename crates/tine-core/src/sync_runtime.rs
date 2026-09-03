@@ -2946,6 +2946,17 @@ pub fn tagged_backend_error_with_detail(kind: &'static str, detail: serde_json::
     encode_tagged_backend_error(kind, None, Some(detail))
 }
 
+/// The same encoder for a closed reason vocabulary plus bounded typed detail.
+/// Direct save failures use this to carry the producer code and filesystem
+/// error kind without reparsing display text at the command boundary.
+pub fn tagged_backend_error_with_reason_and_detail(
+    kind: &'static str,
+    reason_code: &str,
+    detail: serde_json::Value,
+) -> String {
+    encode_tagged_backend_error(kind, Some(reason_code), Some(detail))
+}
+
 fn encode_tagged_backend_error(
     kind: &'static str,
     reason_code: Option<&str>,
