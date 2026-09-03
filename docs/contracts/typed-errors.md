@@ -188,6 +188,36 @@ same error boundary: `Result<_, String>` and the temporary
 third-party exception rows. `Worker` is used only immediately after
 `spawn_blocking(...).await`; non-worker Tauri errors remain `Tauri`.
 
+### Conversions inside a platform `cfg` body
+
+`CommandError` implements `From` for `std::io::Error`, `tauri::Error`,
+`serde_json::Error` and the typed `Sync*` request errors, and for nothing else.
+Two native error types you will meet only inside a platform `cfg` body are
+therefore NOT convertible with `CommandError::from`:
+
+| source | where | mapper |
+| --- | --- | --- |
+| `PluginInvokeError` (`run_mobile_plugin`) | Android, iOS | `CommandError::platform` |
+| `tauri_plugin_opener::Error` (`open_url`) | Windows, Android, iOS | `CommandError::platform` |
+
+`platform` is the family for an OS capability — a folder picker, media capture,
+system bars, opening a URL. `plugin` means the **Tine** plugin system; its only
+producer is `plugins.rs`. Prefer the family constructor over adding a `From`
+impl: `From` widens what inference will silently accept, which is the surface
+this contract exists to keep narrow.
+
+**Nothing on a Linux host compiles any of these bodies.** W4-E2b wrote
+`CommandError::from` at nine such sites, passed every local gate, and hosted CI
+then failed Android with nine errors and Windows with one. The two iOS sites
+were not caught by CI at all — no job compiles iOS — only by enumerating all
+five shipped targets by hand, the same gap that left `rename_noreplace` without
+an iOS arm through v0.10.0. When you touch a `cfg`-gated conversion, enumerate
+Linux, Windows, macOS, iOS and Android deliberately, and expect CI to be the
+first thing that compiles what you wrote.
+
+Guard: `backend_command_parity::tests::native_platform_calls_convert_through_a_family_constructor`.
+Exemplar to imitate: `android_media::call`.
+
 ### `Prose` census
 
 The phase-A syntactic census remains 113 production sites (92 in `commands.rs`,

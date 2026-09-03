@@ -648,6 +648,78 @@ mod tests {
         }
     }
 
+    /// Calls into a native platform capability convert with a FAMILY
+    /// CONSTRUCTOR, never `CommandError::from`.
+    ///
+    /// `CommandError` has `From` for `std::io::Error`, `tauri::Error`,
+    /// `serde_json::Error` and the typed `Sync*` request errors — and for
+    /// nothing else. `run_mobile_plugin` yields `PluginInvokeError` and
+    /// `open_url` yields `tauri_plugin_opener::Error`; neither has a `From`
+    /// impl, so `CommandError::from` at those sites does not compile.
+    ///
+    /// Why this needs a guard rather than the compiler: **every one of these
+    /// sites is inside a `cfg` body no Linux host compiles.** W4-E2b wrote
+    /// `CommandError::from` at nine of them and passed every local gate;
+    /// hosted CI then failed Android with 9 errors and Windows with 1, and
+    /// the two iOS sites were caught only by reading all five targets by hand
+    /// because NO CI job compiles iOS (compare the `rename_noreplace` iOS gap).
+    ///
+    /// Exemplar to imitate: `android_media::call` —
+    /// `.run_mobile_plugin(method, ()).map_err(CommandError::platform)`.
+    /// `platform` is the family for OS capabilities; `plugin` means the Tine
+    /// plugin system, whose only producer is `plugins.rs`.
+    #[test]
+    fn native_platform_calls_convert_through_a_family_constructor() {
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut checked = 0_usize;
+        for entry in std::fs::read_dir(&source_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            if file == "backend_command_parity.rs" {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            for call in ["run_mobile_plugin", ".open_url("] {
+                let mut offset = 0;
+                while let Some(relative) = source[offset..].find(call) {
+                    let start = offset + relative;
+                    offset = start + call.len();
+                    checked += 1;
+                    // The mapper is the next `CommandError::` after the call,
+                    // within the same statement (up to the terminating `;` or
+                    // the end of the expression block).
+                    let tail = &source[start..];
+                    let stop = tail.find(";\n").unwrap_or(tail.len().min(400));
+                    let statement = &tail[..stop];
+                    if !statement.contains("CommandError::") {
+                        continue;
+                    }
+                    if statement.contains("CommandError::from") {
+                        offenders.push(format!("{file}|{}", enclosing_symbol(&source[..start])));
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "the native-platform-call scan found only {checked} sites -- the scanner broke, \
+             not the code"
+        );
+        assert!(
+            offenders.is_empty(),
+            "I-9 / platform-cfg rule: these native platform calls convert with \
+             `CommandError::from`, which has no `From` impl for `PluginInvokeError` or \
+             `tauri_plugin_opener::Error` and therefore does NOT COMPILE on the target that \
+             selects the body -- a target your Linux gates never build. Use the family \
+             constructor instead: `.map_err(CommandError::platform)`. Exemplar: \
+             `android_media::call`. Offending sites (file|enclosing symbol): {offenders:?}"
+        );
+    }
+
     #[test]
     fn phase_b_command_error_manifest_is_exact_for_every_target() {
         let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
