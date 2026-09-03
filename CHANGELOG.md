@@ -51,6 +51,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Direct and Managed reads now share template, backlink, and block-UUID
+  ownership rules.** Duplicate UUIDs consistently resolve to Logseq's
+  parser-order owner across projection, fallback, pending, and drained states,
+  while Managed adapters reuse the shared template and backlink producers.
+
 - **Phase-A native commands now keep typed errors to the Tauri boundary without
   changing rejection bytes.** `CommandError` retains tagged, coded, I/O,
   worker, Tauri, and core sources behind one legacy-string serializer; the

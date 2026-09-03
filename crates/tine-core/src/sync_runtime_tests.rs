@@ -8,6 +8,620 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+fn production_function_and_constructor_census() -> (
+    Vec<(String, String)>,
+    Vec<(String, String, String)>,
+    Vec<(String, String, String)>,
+) {
+    use syn::visit::{self, Visit};
+
+    fn test_only(attributes: &[syn::Attribute]) -> bool {
+        attributes.iter().any(|attribute| {
+            attribute.path().is_ident("test")
+                || (attribute.path().is_ident("cfg")
+                    && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test")))
+        })
+    }
+
+    #[derive(Default)]
+    struct Census {
+        file: String,
+        owner: Option<String>,
+        functions: Vec<(String, String)>,
+        constructors: Vec<(String, String, String)>,
+        calls: Vec<(String, String, String)>,
+    }
+    impl Census {
+        fn visit_function<'ast>(&mut self, name: String, visit_body: impl FnOnce(&mut Self)) {
+            self.functions.push((self.file.clone(), name.clone()));
+            let previous = self.owner.replace(name);
+            visit_body(self);
+            self.owner = previous;
+        }
+    }
+    impl<'ast> Visit<'ast> for Census {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                self.visit_function(item.sig.ident.to_string(), |this| {
+                    visit::visit_item_fn(this, item)
+                });
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !test_only(&item.attrs) {
+                self.visit_function(item.sig.ident.to_string(), |this| {
+                    visit::visit_impl_item_fn(this, item)
+                });
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                visit::visit_item_mod(self, item);
+            }
+        }
+
+        fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+            if let (Some(owner), Some(kind)) = (
+                self.owner.as_ref(),
+                expression
+                    .path
+                    .segments
+                    .last()
+                    .map(|part| part.ident.to_string()),
+            ) {
+                self.constructors
+                    .push((self.file.clone(), owner.clone(), kind));
+            }
+            visit::visit_expr_struct(self, expression);
+        }
+
+        fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
+            if let (Some(owner), syn::Expr::Path(path)) = (self.owner.as_ref(), &*expression.func) {
+                if let Some(callee) = path.path.segments.last() {
+                    self.calls
+                        .push((self.file.clone(), owner.clone(), callee.ident.to_string()));
+                }
+            }
+            visit::visit_expr_call(self, expression);
+        }
+    }
+
+    let mut census = Census::default();
+    for file in crate::projection_producer_census::production_rust() {
+        census.file.clone_from(&file.relative);
+        let syntax = syn::parse_file(&file.raw)
+            .unwrap_or_else(|error| panic!("{} is valid Rust: {error}", file.relative));
+        census.visit_file(&syntax);
+    }
+    census.functions.sort();
+    census.constructors.sort();
+    census.calls.sort();
+    (census.functions, census.constructors, census.calls)
+}
+
+#[test]
+fn managed_backlink_boundary_uses_one_docblock_producer() {
+    let (functions, constructors, calls) = production_function_and_constructor_census();
+    let producers = constructors
+        .iter()
+        .filter(|(_, _, kind)| kind == "BacklinkFilterEntry")
+        .map(|(file, owner, _)| (file.as_str(), owner.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        producers,
+        [("crates/tine-core/src/query.rs", "backlink_filter_entry")],
+        "I-12: BacklinkFilterEntry has one DocBlock producer; a BlockDto twin is forbidden"
+    );
+    assert!(
+        !functions
+            .iter()
+            .any(|(_, name)| name == "application_backlink_filter_entry"),
+        "the BlockDto backlink twin must be retired"
+    );
+    assert!(
+        calls.iter().any(
+            |(file, owner, callee)| file == "crates/tine-core/src/sync_runtime.rs"
+                && owner == "application_backlink_filter_context_ready"
+                && callee == "backlink_filter_entry"
+        ),
+        "the managed backlink boundary must call the canonical DocBlock producer"
+    );
+}
+
+#[test]
+fn managed_editor_dto_has_one_canonical_builder() {
+    let (_, constructors, calls) = production_function_and_constructor_census();
+    let builders = constructors
+        .iter()
+        .filter(|(_, _, kind)| kind == "SyncEditorBlockDto")
+        .map(|(file, owner, _)| (file.as_str(), owner.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        builders,
+        [
+            (
+                "crates/tine-core/src/sync_runtime.rs",
+                "application_editor_blocks"
+            ),
+            (
+                "crates/tine-core/src/sync_runtime.rs",
+                "ordered_editor_blocks"
+            ),
+        ],
+        "Existing and New save arms must delegate to one SyncEditorBlockDto builder"
+    );
+    for wrapper in [
+        "application_editor_blocks_existing",
+        "application_editor_blocks_new",
+    ] {
+        assert!(
+            calls.iter().any(|(file, owner, callee)| file
+                == "crates/tine-core/src/sync_runtime.rs"
+                && owner == wrapper
+                && callee == "application_editor_blocks"),
+            "{wrapper} must delegate to the shared builder"
+        );
+    }
+}
+
+#[test]
+fn managed_template_dto_has_one_canonical_leaf() {
+    let (_, constructors, calls) = production_function_and_constructor_census();
+    let leaves = constructors
+        .iter()
+        .filter(|(_, owner, kind)| kind == "BlockDto" && owner.contains("template"))
+        .map(|(file, owner, _)| (file.as_str(), owner.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        leaves,
+        [("crates/tine-core/src/query.rs", "template_dto")],
+        "template DTO construction must have one parser-owned leaf"
+    );
+    assert!(
+        calls.iter().any(|(file, owner, callee)| file == "crates/tine-core/src/query.rs"
+            && owner == "application_page_templates"
+            && callee == "visit_template_blocks")
+            && calls.iter().any(|(file, owner, callee)| file == "crates/tine-core/src/query.rs"
+                && owner == "visit_template_blocks"
+                && callee == "template_dto"),
+        "the managed template boundary must reach the canonical DocBlock leaf through its syntax walker"
+    );
+}
+
+#[test]
+fn duplicate_uuid_policy_owner_is_shared_by_every_producer() {
+    let (_, _, calls) = production_function_and_constructor_census();
+    for (file, owner) in [
+        (
+            "crates/tine-core/src/direct_projection.rs",
+            "block_page_hint",
+        ),
+        ("crates/tine-core/src/query.rs", "resolve_ids_in_page"),
+        (
+            "crates/tine-core/src/sync_runtime.rs",
+            "application_block_candidates_ready",
+        ),
+    ] {
+        assert!(
+            calls
+                .iter()
+                .any(|(call_file, caller, callee)| call_file == file
+                    && caller == owner
+                    && callee == "logseq_uuid_owner"),
+            "{file}::{owner} must delegate claimant choice to logseq_uuid_owner"
+        );
+    }
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync_runtime.rs"),
+    )
+    .unwrap();
+    let body = source
+        .split_once("fn find_application_blocks")
+        .and_then(|(_, tail)| tail.split_once("fn shallow_application_block"))
+        .map(|(body, _)| body)
+        .expect("find_application_blocks remains a narrow leaf");
+    assert!(
+        body.contains("Vec<(String, &'a BlockDto)>") && !body.contains("or_insert"),
+        "find_application_blocks must retain every claimant until policy runs"
+    );
+}
+
+#[test]
+fn shallow_application_block_measured_exception_is_bounded() {
+    let (functions, _, calls) = production_function_and_constructor_census();
+    assert!(
+        functions
+            .iter()
+            .any(|(_, name)| name == "shallow_application_block"),
+        "the measured parsing/allocation exception remains explicit"
+    );
+    let shallow_calls = calls
+        .iter()
+        .filter(|(_, _, callee)| callee == "shallow_application_block")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shallow_calls.len(),
+        4,
+        "AST-visible calls stay in the three reviewed owners (the fifth is inside the resolve closure): {shallow_calls:#?}"
+    );
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync_runtime.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        source.match_indices("shallow_application_block(").count(),
+        6,
+        "one definition plus exactly five reviewed production calls"
+    );
+}
+
+#[test]
+#[ignore = "manual advisory timing; the structural test pins all five callers"]
+fn managed_shallow_application_block_manual_probe() {
+    let mut parsed = crate::doc::DocBlock::new(
+        "TODO representative [[Page]] #tag\npriority:: A\nscheduled:: <2026-09-03 Thu>",
+    );
+    parsed.uuid = "3a2a1f90-bc3d-4e55-8f66-123456789abc".into();
+    let block = crate::model::block_to_shallow_dto(&parsed);
+    const ITERATIONS: usize = 100_000;
+    let started = std::time::Instant::now();
+    for _ in 0..ITERATIONS {
+        std::hint::black_box(shallow_application_block(std::hint::black_box(&block)));
+    }
+    let retained = started.elapsed();
+    let started = std::time::Instant::now();
+    for _ in 0..ITERATIONS {
+        let parsed = crate::model::dto_block_to_doc_block(std::hint::black_box(&block), false);
+        std::hint::black_box(crate::model::block_to_shallow_dto(&parsed));
+    }
+    let canonical = started.elapsed();
+    assert_eq!(
+        serde_json::to_value(shallow_application_block(&block)).unwrap(),
+        serde_json::to_value(crate::model::block_to_shallow_dto(
+            &crate::model::dto_block_to_doc_block(&block, false),
+        ))
+        .unwrap()
+    );
+    eprintln!(
+        "c7a shallow probe iterations={ITERATIONS} retained_ns={} canonical_ns={} temporary_docblocks_retained=0 temporary_docblocks_canonical={ITERATIONS}",
+        retained.as_nanos(),
+        canonical.as_nanos()
+    );
+}
+
+#[test]
+fn application_family_is_pinned_by_name() {
+    let contract = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/contracts/managed-read-surface.md"),
+    )
+    .expect("docs/contracts/managed-read-surface.md must exist");
+    let expected = contract
+        .lines()
+        .filter_map(|line| {
+            let columns = line
+                .split('|')
+                .map(str::trim)
+                .filter(|column| !column.is_empty())
+                .collect::<Vec<_>>();
+            (columns.len() == 5
+                && columns[0].starts_with("application_")
+                && matches!(columns[2], "necessary" | "adapter"))
+            .then(|| {
+                (
+                    columns[1].trim_matches('`').to_owned(),
+                    columns[0].to_owned(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let (functions, _, calls) = production_function_and_constructor_census();
+    let actual = functions
+        .into_iter()
+        .filter(|(_, name)| name.starts_with("application_"))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "a new application_* function must be a thin mode adapter over a shared core (I-12/D-4); exemplars application_equivalent_page_names_ready + equivalent_page_names and journal_feed.rs; a twin body is forbidden — see docs/contracts/managed-read-surface.md");
+
+    for line in contract.lines() {
+        let columns = line
+            .split('|')
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.len() == 5 && columns[2] == "adapter" {
+            let symbol = columns[0];
+            let file = columns[1].trim_matches('`');
+            let owner = columns[3].trim_matches('`');
+            assert!(
+                owner != "—" && !owner.is_empty(),
+                "adapter {symbol} names its canonical owner"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|(call_file, caller, callee)| call_file == file
+                        && caller == symbol
+                        && callee == owner),
+                "adapter {symbol} must call canonical owner {owner}"
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_read_surface_contract_and_changelog_are_pinned() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let contract = std::fs::read_to_string(repo.join("docs/contracts/managed-read-surface.md"))
+        .expect("managed read contract exists");
+    for required in [
+        "| symbol | file | class | canonical owner | justification/evidence |",
+        "| symbol | former file | canonical replacement | packet item |",
+        "| boundary | exact outcome/rule | OG commit | OG path |",
+        "c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968",
+        "deps/graph-parser/src/logseq/graph_parser/block.cljs",
+        "src/main/frontend/db/model.cljs",
+        "Direct-ready",
+        "Direct-fallback",
+        "Managed-pending",
+        "Managed-drained",
+        "Property extraction",
+        "Template discovery",
+    ] {
+        assert!(contract.contains(required), "contract missing {required}");
+    }
+    let retired = contract
+        .split_once("## Retired producers")
+        .and_then(|(_, tail)| tail.split_once("## UUID ownership policy"))
+        .map(|(table, _)| table)
+        .expect("retired table is bounded by the UUID policy section");
+    let (functions, _, _) = production_function_and_constructor_census();
+    for line in retired.lines().filter(|line| line.starts_with('|')) {
+        let columns = line
+            .split('|')
+            .map(str::trim)
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.len() == 4 && columns[0] != "symbol" && columns[0] != "---" {
+            assert!(
+                !functions.iter().any(|(_, name)| name == columns[0]),
+                "retired producer {} must be absent from production",
+                columns[0]
+            );
+        }
+    }
+    let changelog = std::fs::read_to_string(repo.join("CHANGELOG.md")).unwrap();
+    let unreleased = changelog
+        .split("## [Unreleased]")
+        .nth(1)
+        .and_then(|tail| tail.split("\n## ").next())
+        .expect("Unreleased section");
+    let changed = unreleased
+        .split_once("### Changed")
+        .map(|(_, tail)| tail)
+        .expect("Unreleased has a Changed section");
+    assert!(
+        changed.contains("Direct")
+            && changed.contains("Managed")
+            && unreleased.contains("ownership"),
+        "the Unreleased/Changed note must name Direct/Managed parity and shared ownership"
+    );
+    application_family_is_pinned_by_name();
+}
+
+fn resolved_block_page(handle: &SyncRuntimeHandle, uuid: &str) -> Option<(String, String)> {
+    let outcome = handle
+        .application_navigation(SyncApplicationNavigationRequest::ResolveBlocks {
+            uuids: vec![uuid.to_owned()],
+        })
+        .unwrap();
+    let SyncApplicationNavigationOutcome::Loaded {
+        reply: SyncApplicationNavigationReply::ResolveBlocks(mut groups),
+    } = outcome
+    else {
+        panic!("resolve-blocks returned the wrong outcome: {outcome:?}")
+    };
+    groups
+        .pop()
+        .flatten()
+        .map(|group| (group.page, group.blocks[0].raw.clone()))
+}
+
+#[test]
+fn duplicate_logseq_uuid_uses_og_first_claimant_at_four_boundaries() {
+    const UUID: &str = "3a2a1f90-bc3d-4e55-8f66-123456789abc";
+    let fixture = ActivationFixture::empty("c7a-duplicate-uuid", 0xc7a4);
+    fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/A first.md"),
+        format!("- OG first claimant\n  id:: {UUID}\n"),
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/B second.md"),
+        format!("- later duplicate claimant\n  id:: {UUID}\n"),
+    )
+    .unwrap();
+
+    let direct = Graph::open(&fixture.graph_root);
+    let direct_projection = fixture.root.join("direct-projection.sqlite");
+    direct.attach_direct_projection(direct_projection).unwrap();
+    direct.warm_cache();
+    let started = std::time::Instant::now();
+    while !direct.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "Direct projection did not converge for duplicate-uuid parity"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(direct.direct_projection_ready_test());
+    let ready = direct.resolve_blocks(&[UUID.to_owned()]);
+    assert_eq!(ready[0].as_ref().unwrap().page, "A first");
+    direct.direct_projection_mark_stale_test();
+    let fallback = direct.resolve_blocks(&[UUID.to_owned()]);
+    assert_eq!(fallback[0].as_ref().unwrap().page, "A first");
+
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("duplicate fixture activates");
+    drive_initial_feed(&handle);
+    assert_eq!(
+        resolved_block_page(&handle, UUID),
+        Some((
+            "A first".into(),
+            "OG first claimant\nid:: 3a2a1f90-bc3d-4e55-8f66-123456789abc".into()
+        ))
+    );
+
+    let (mut second, revision) = load_application_exact(&handle, "pages/B second.md");
+    second.blocks[0].raw.push_str("\nchanged while pending");
+    let pending = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: second.path.clone(),
+                revision,
+            },
+            page: second,
+        })
+        .unwrap();
+    assert!(matches!(
+        pending,
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+    assert!(handle.status().unwrap().managed_local_pending > 0);
+    assert_eq!(resolved_block_page(&handle, UUID).unwrap().0, "A first");
+}
+
+#[test]
+fn managed_new_then_existing_save_preserves_nested_editor_identity() {
+    let fixture = ActivationFixture::empty("c7a-editor-builder", 0xc7a2);
+    fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/C7a seed.md"),
+        b"- seed before managed activation\n",
+    )
+    .unwrap();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("editor fixture activates");
+    drive_initial_feed(&handle);
+    let page = new_application_page(
+        "C7a nested editor",
+        SyncPageKind::Page,
+        None,
+        vec![BlockDto {
+            id: "temporary-parent".into(),
+            raw: "parent content".into(),
+            children: vec![BlockDto {
+                id: "temporary-child".into(),
+                raw: "child content".into(),
+                ..BlockDto::default()
+            }],
+            ..BlockDto::default()
+        }],
+    );
+    let created = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: "C7a nested editor".into(),
+                page_kind: SyncPageKind::Page,
+            },
+            page,
+        })
+        .unwrap();
+    let SyncApplicationPageSaveOutcome::Saved {
+        page, revision: _, ..
+    } = created
+    else {
+        panic!("new save did not succeed: {created:?}")
+    };
+    let parent_id = page.blocks[0].id.clone();
+    let child_id = page.blocks[0].children[0].id.clone();
+    assert_ne!(parent_id, "temporary-parent");
+    assert_ne!(child_id, "temporary-child");
+    let path = page.path.clone();
+    drain_managed_local(&handle);
+    let (mut page, revision) = load_application_exact(&handle, &path);
+    assert_eq!(page.blocks[0].id, parent_id);
+    assert_eq!(page.blocks[0].children[0].id, child_id);
+    page.blocks[0].children[0].raw = "child content after existing save".into();
+    let saved = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    let SyncApplicationPageSaveOutcome::Saved { page, .. } = saved else {
+        panic!("existing save did not succeed: {saved:?}")
+    };
+    assert_eq!(page.blocks[0].id, parent_id);
+    assert_eq!(page.blocks[0].children[0].id, child_id);
+    assert_eq!(
+        page.blocks[0].children[0].raw,
+        "child content after existing save"
+    );
+}
+
+#[test]
+fn template_extraction_matches_og_property_rule_in_md_and_org() {
+    fn signature(templates: Vec<TemplateDto>) -> Vec<(String, String, Vec<String>)> {
+        let mut rows = templates
+            .into_iter()
+            .map(|template| {
+                (
+                    template.name,
+                    template.page,
+                    template.blocks.into_iter().map(|block| block.raw).collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    let fixture = ActivationFixture::empty("c7a-template-og-rule", 0xc7a3);
+    fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/Template MD.md"),
+        "template:: page pre-block is not a block template\n\n- md parent\n  TeMPLate:: Md odd\n  template_including_parent:: false\n  - md child\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("pages/Template Org.org"),
+        "* org parent\n:PROPERTIES:\n:TeMPLate: Org odd\n:template_including_parent: true\n:END:\n** org child\n",
+    )
+    .unwrap();
+    let direct = Graph::open(&fixture.graph_root);
+    let expected = vec![
+        ("Md odd".into(), "Template MD".into(), vec!["md child".into()]),
+        (
+            "Org odd".into(),
+            "Template Org".into(),
+            vec!["org parent\n:PROPERTIES:\n:TeMPLate: Org odd\n:template_including_parent: true\n:END:".into()],
+        ),
+    ];
+    assert_eq!(signature(direct.templates()), expected);
+
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("template fixture activates");
+    drive_initial_feed(&handle);
+    let SyncApplicationNavigationOutcome::Loaded {
+        reply: SyncApplicationNavigationReply::Templates(templates),
+    } = handle
+        .application_navigation(SyncApplicationNavigationRequest::ListTemplates)
+        .unwrap()
+    else {
+        panic!("managed templates did not load")
+    };
+    assert_eq!(signature(templates), expected);
+}
+
 #[test]
 fn clean_open_source_matrix_has_one_conversion_per_source_class() {
     fn assert_from<T>()
@@ -27823,6 +28437,259 @@ fn managed_application_read_real_graph_copy_manual_gate() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+/// Strip session-local block identities from a resolve/backlink reply.
+///
+/// Two fields carry one: `BlockDto::id` and the `block_id` locator inside a
+/// backlink `evidence` row (Managed namespaces the latter `sparse-v2:`, which
+/// is itself the tell that it is an internal handle, not a durable identity).
+///
+/// `BlockDto::id` is minted per mode: Managed adopts the durable `id::` uuid,
+/// Direct synthesizes a session uuid even for a block that already carries
+/// `id::`. Neither identity is written to disk and the user never types one —
+/// a `((ref))` carries the durable `id::`, which stays in `properties` and is
+/// still compared. Two modes numbering the same block differently, while
+/// returning identical content, page, breadcrumb and `id::`, is a
+/// representation difference a user would regard as equivalent, so the parity
+/// oracle compares everything else.
+///
+/// This is safe, not merely tolerated: every user-facing reference path goes
+/// through `ensureBlockId` (`src/store.ts`), which reads the durable `id::`
+/// out of the block's raw text and never writes a second one, so a runtime id
+/// cannot reach a `((ref))`. What this field must NOT become is an identity a
+/// consumer treats as durable; see `docs/contracts/managed-read-surface.md`.
+fn without_session_block_ids(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "id" | "block_id"))
+                .map(|(key, nested)| (key.clone(), without_session_block_ids(nested)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(without_session_block_ids).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+#[test]
+#[ignore = "manual release gate: C7a regression on an explicitly supplied disposable graph copy"]
+fn managed_c7a_real_graph_copy_manual_gate() {
+    assert!(
+        !cfg!(debug_assertions),
+        "this C7a graph-copy gate is release-only"
+    );
+    let source_root = real_graph_copy_source_from_env("TINE_MANAGED_READ_REAL_GRAPH_COPY");
+    let fixture = ActivationFixture::copied_graph("managed-c7a-real-copy", 0xc7a0, &source_root);
+    let original_bytes = user_graph_bytes(&fixture.graph_root);
+    let direct = Graph::open(&fixture.graph_root);
+    let mut pages = direct.list_pages();
+    pages.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    assert!(
+        !pages.is_empty(),
+        "the supplied disposable graph copy has pages"
+    );
+
+    // Resolve the DURABLE `id::` uuids, not `BlockDto::id`. A DTO id is a
+    // session-local identity that Direct synthesizes for every block; Managed
+    // mints its own and cannot know Direct's, so comparing DTO ids across modes
+    // asserts something no user can observe and fails for every block. What a
+    // user actually writes in a `((uuid))` ref is the durable `id::` property,
+    // so that is the identity both read surfaces must resolve identically.
+    fn ids(blocks: &[BlockDto], out: &mut Vec<String>) {
+        for block in blocks {
+            for (key, value) in &block.properties {
+                if key == "id" {
+                    out.push(value.clone());
+                }
+            }
+            ids(&block.children, out);
+        }
+    }
+    let mut block_ids = Vec::new();
+    for entry in &pages {
+        ids(&direct.load_page(entry).unwrap().blocks, &mut block_ids);
+    }
+    block_ids.sort();
+    block_ids.dedup();
+    assert!(
+        !block_ids.is_empty(),
+        "the supplied disposable graph copy carries durable `id::` block refs"
+    );
+    let direct_templates = serde_json::to_value(direct.templates()).unwrap();
+    // `ResolveBlocks` is validated against MAX_SYNC_APPLICATION_PAGE_BLOCKS
+    // (= MAX_MATERIALIZATION_QUERY_ROWS - 1), not the raw row cap, so a full
+    // 10_000-uuid chunk is rejected as RequestTooLarge. Both sides chunk by the
+    // request cap so the flattened comparison stays element-for-element equal.
+    let direct_resolved = block_ids
+        .chunks(MAX_SYNC_APPLICATION_PAGE_BLOCKS)
+        .flat_map(|chunk| direct.resolve_blocks(chunk))
+        .collect::<Vec<_>>();
+    let direct_resolved = serde_json::to_value(direct_resolved).unwrap();
+    let direct_backlinks = pages
+        .iter()
+        .map(|entry| {
+            let result = direct.backlinks_bounded(
+                &entry.name,
+                MAX_SYNC_APPLICATION_RESULT_ROWS,
+                MAX_SYNC_APPLICATION_RESULT_BYTES,
+            );
+            (
+                entry.name.clone(),
+                serde_json::to_value((&*result.groups, result.total, result.exceeded)).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let started = Instant::now();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("C7a graph copy activates");
+    drive_initial_feed(&handle);
+    let activation = started.elapsed();
+
+    let managed_snapshot = || {
+        let templates = match handle
+            .application_navigation(SyncApplicationNavigationRequest::ListTemplates)
+            .unwrap()
+        {
+            SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::Templates(templates),
+            } => serde_json::to_value(templates).unwrap(),
+            other => panic!("managed templates did not load: {other:?}"),
+        };
+        let mut resolved = Vec::new();
+        for chunk in block_ids.chunks(MAX_SYNC_APPLICATION_PAGE_BLOCKS) {
+            match handle
+                .application_navigation(SyncApplicationNavigationRequest::ResolveBlocks {
+                    uuids: chunk.to_vec(),
+                })
+                .unwrap()
+            {
+                SyncApplicationNavigationOutcome::Loaded {
+                    reply: SyncApplicationNavigationReply::ResolveBlocks(rows),
+                } => resolved.extend(rows),
+                other => panic!("managed UUID batch did not load: {other:?}"),
+            }
+        }
+        let backlinks = pages
+            .iter()
+            .map(|entry| {
+                let result = match handle
+                    .application_navigation(SyncApplicationNavigationRequest::Backlinks {
+                        name: entry.name.clone(),
+                        max_rows: MAX_SYNC_APPLICATION_RESULT_ROWS,
+                        max_bytes: MAX_SYNC_APPLICATION_RESULT_BYTES,
+                    })
+                    .unwrap()
+                {
+                    SyncApplicationNavigationOutcome::Loaded {
+                        reply: SyncApplicationNavigationReply::Backlinks(result),
+                    } => result,
+                    other => panic!("managed backlinks did not load: {other:?}"),
+                };
+                (
+                    entry.name.clone(),
+                    serde_json::to_value((result.groups, result.total, result.exceeded)).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            templates,
+            serde_json::to_value(resolved).unwrap(),
+            backlinks,
+        )
+    };
+    let before_save = managed_snapshot();
+    // Non-vacuity: a gate that resolves nothing on either side would compare
+    // two empty results and pass while proving nothing.
+    let resolved_groups = before_save
+        .1
+        .as_array()
+        .expect("resolved reply is an array")
+        .iter()
+        .filter(|group| !group.is_null())
+        .count();
+    assert_eq!(
+        resolved_groups,
+        block_ids.len(),
+        "every durable `id::` ref resolves in Managed mode"
+    );
+    assert_eq!(before_save.0, direct_templates);
+    assert_eq!(
+        without_session_block_ids(&before_save.1),
+        without_session_block_ids(&direct_resolved)
+    );
+    assert_eq!(
+        without_session_block_ids(&serde_json::to_value(&before_save.2).unwrap()),
+        without_session_block_ids(&serde_json::to_value(&direct_backlinks).unwrap())
+    );
+
+    fn count_blocks(blocks: &[BlockDto]) -> usize {
+        blocks
+            .iter()
+            .map(|block| 1 + count_blocks(&block.children))
+            .sum()
+    }
+
+    // A whole-page Managed save is bounded by MAX_SYNC_EDITOR_BLOCKS (= 511:
+    // two operations per retained block plus a preamble, inside
+    // MAX_LOCAL_MUTATION_ROWS = 1024), while a Managed LOAD is bounded by
+    // MAX_SYNC_APPLICATION_PAGE_BLOCKS (= 9_999). A page between the two
+    // ceilings therefore opens and cannot be saved. That asymmetry is a real
+    // pre-existing defect, not something C7a introduced — this corpus contains
+    // exactly one such page — so the gate PINS it rather than crashing on it.
+    // When the ceiling is raised or the save is chunked, this expectation flips,
+    // and that flip must be a deliberate edit.
+    let mut unchanged_saves = 0_usize;
+    let mut refused_oversized_saves = 0_usize;
+    for entry in &pages {
+        let (page, revision) = load_application_exact(&handle, &entry.rel_path);
+        if page.read_only || page.guide {
+            continue;
+        }
+        let blocks = count_blocks(&page.blocks);
+        let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        });
+        if blocks > MAX_SYNC_EDITOR_BLOCKS {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(SyncApplicationPageRequestError::RequestTooLarge(_))
+                ),
+                "a {blocks}-block page is above the {MAX_SYNC_EDITOR_BLOCKS} whole-page save ceiling \
+                 and must be refused as RequestTooLarge, not saved: {outcome:?}"
+            );
+            refused_oversized_saves += 1;
+            continue;
+        }
+        assert!(matches!(
+            outcome.unwrap(),
+            SyncApplicationPageSaveOutcome::Unchanged { .. }
+        ));
+        unchanged_saves += 1;
+    }
+    drain_managed_local(&handle);
+    assert_eq!(user_graph_bytes(&fixture.graph_root), original_bytes);
+    assert_eq!(managed_snapshot(), before_save);
+    eprintln!(
+        "c7a_real_graph pages={} block_ids={} templates={} backlink_queries={} unchanged_saves={} refused_oversized_saves={} activation_ms={:.3}",
+        pages.len(),
+        block_ids.len(),
+        direct_templates.as_array().map_or(0, Vec::len),
+        direct_backlinks.len(),
+        unchanged_saves,
+        refused_oversized_saves,
+        startup_ms(activation),
+    );
 }
 
 /// A graph whose journals exercise every feed selection rule at once: a

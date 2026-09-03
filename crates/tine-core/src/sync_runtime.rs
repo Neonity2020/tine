@@ -12512,8 +12512,8 @@ fn bound_application_reference_sources(
 fn find_application_blocks<'a>(
     blocks: &'a [BlockDto],
     wanted: &HashSet<&str>,
-) -> HashMap<String, &'a BlockDto> {
-    let mut found = HashMap::new();
+) -> Vec<(String, &'a BlockDto)> {
+    let mut found = Vec::new();
     let mut stack = blocks.iter().rev().collect::<Vec<_>>();
     while let Some(block) = stack.pop() {
         let explicit_ids = block
@@ -12524,12 +12524,12 @@ fn find_application_blocks<'a>(
             .collect::<Vec<_>>();
         if explicit_ids.is_empty() {
             if wanted.contains(block.id.as_str()) {
-                found.entry(block.id.clone()).or_insert(block);
+                found.push((block.id.clone(), block));
             }
         } else {
             for id in explicit_ids {
                 if wanted.contains(id) {
-                    found.entry(id.to_owned()).or_insert(block);
+                    found.push((id.to_owned(), block));
                 }
             }
         }
@@ -12538,6 +12538,10 @@ fn find_application_blocks<'a>(
     found
 }
 
+/// Measured exception to the DocBlock mapping consolidation: these boundaries
+/// already carry parser-derived facets. Re-parsing `raw` via a temporary
+/// `DocBlock` just to reconstruct the same shallow DTO adds allocation and
+/// parsing work to every reference/resolve/preview result.
 fn shallow_application_block(block: &BlockDto) -> BlockDto {
     BlockDto {
         id: block.id.clone(),
@@ -12590,13 +12594,8 @@ fn application_page_block_reference_counts(
 /// throwaway `DocBlock` to reach the projection -- but the truncation rule
 /// itself is [`crate::doc::crumb_line`], not a third copy of it (DUP-8).
 fn application_crumb_line(raw: &str, is_org: bool) -> String {
-    let block = crate::doc::DocBlock {
-        raw: raw.to_owned(),
-        children: Vec::new(),
-        uuid: String::new(),
-        is_org,
-        proj: std::sync::OnceLock::new(),
-    };
+    let mut block = crate::doc::DocBlock::new(raw);
+    block.is_org = is_org;
     crate::doc::crumb_line(&block)
 }
 
@@ -14352,51 +14351,49 @@ impl RuntimeActor {
         &self,
         uuids: &[String],
         retain_subtrees: bool,
-    ) -> Result<HashMap<String, (String, PageKind, BlockDto)>, SyncApplicationPageRequestError>
-    {
+    ) -> Result<
+        HashMap<String, (String, PageKind, Format, BlockDto)>,
+        SyncApplicationPageRequestError,
+    > {
         let wanted = uuids.iter().map(String::as_str).collect::<HashSet<_>>();
         let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let mut resolved = HashMap::new();
+        let mut parser_fallback = HashSet::<String>::new();
 
-        // The committed overlay is the exact current suffix. Search it first,
-        // and mask every affected SQLite page even when the UUID was removed.
+        // Any pending claimant requires parser order across the exact merged
+        // page view: an older SQLite page may own the same UUID and OG keeps
+        // whichever claimant appears first in graph/parser order.
         for current in overlay.values().flatten() {
             let page = &current.1;
             for (uuid, block) in find_application_blocks(&page.blocks, &wanted) {
-                let block = if retain_subtrees {
-                    block.clone()
-                } else {
-                    shallow_application_block(block)
-                };
-                resolved
-                    .entry(uuid)
-                    .or_insert_with(|| (page.name.clone(), page.kind, block));
+                let _ = block;
+                parser_fallback.insert(uuid);
             }
         }
 
         let read = self.application_materialized_read_ready()?;
         let mut candidates: HashMap<PageId, Vec<String>> = HashMap::new();
         for uuid in wanted {
-            if resolved.contains_key(uuid) {
+            if parser_fallback.contains(uuid) {
                 continue;
             }
             let Ok(uuid_value) = Uuid::parse_str(uuid) else {
                 continue;
             };
             let logseq_uuid = LogseqUuid::from_uuid(uuid_value);
-            let mut claimants = read.blocks_by_logseq_uuid(logseq_uuid, 2).map_err(|_| {
+            let claimants = read.blocks_by_logseq_uuid(logseq_uuid, 2).map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_block_candidates_by_logseq_uuid",
                 )
             })?;
-            if claimants.len() != 1 {
-                // Zero claims are absent; multiple claims are an explicit
-                // semantic ambiguity. Never let the physical row order choose
-                // an owner for a block reference.
+            if claimants.len() > 1 {
+                parser_fallback.insert(uuid.to_owned());
                 continue;
             }
-            let block = claimants.pop().expect("one Logseq UUID claimant");
+            let Some(block) = crate::query::logseq_uuid_owner(claimants, false) else {
+                continue;
+            };
             let Some(page) = read.page(block.page_id).map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_block_candidates_page_lookup",
@@ -14430,7 +14427,46 @@ impl RuntimeActor {
                 } else {
                     shallow_application_block(block)
                 };
-                resolved.insert(uuid, (page.name.clone(), page.kind, block));
+                resolved.insert(uuid, (page.name.clone(), page.kind, page.format, block));
+            }
+        }
+
+        if !parser_fallback.is_empty() {
+            let fallback_wanted = parser_fallback
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut pages = self.application_navigation_pages_ready()?;
+            pages.sort_by(|left, right| left.0.rel_path.cmp(&right.0.rel_path));
+            let mut claimants = HashMap::<String, Vec<(String, PageKind, Format, BlockDto)>>::new();
+            for (entry, _) in pages {
+                let current = match self.load_application_exact_ready(&entry.rel_path)? {
+                    ApplicationExactLoad::Loaded(current) => current,
+                    ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => continue,
+                };
+                let page = current.page;
+                for (uuid, block) in find_application_blocks(&page.blocks, &fallback_wanted) {
+                    let block = if retain_subtrees {
+                        block.clone()
+                    } else {
+                        shallow_application_block(block)
+                    };
+                    claimants.entry(uuid).or_default().push((
+                        page.name.clone(),
+                        page.kind,
+                        page.format,
+                        block,
+                    ));
+                }
+            }
+            for uuid in parser_fallback {
+                resolved.remove(&uuid);
+                if let Some(owner) = crate::query::logseq_uuid_owner(
+                    claimants.remove(&uuid).unwrap_or_default(),
+                    true,
+                ) {
+                    resolved.insert(uuid, owner);
+                }
             }
         }
         Ok(resolved)
@@ -14444,7 +14480,7 @@ impl RuntimeActor {
         Ok(uuids
             .iter()
             .map(|uuid| {
-                candidates.get(uuid).map(|(page, kind, block)| RefGroup {
+                candidates.get(uuid).map(|(page, kind, _, block)| RefGroup {
                     page: page.clone(),
                     kind: *kind,
                     blocks: vec![shallow_application_block(block)],
@@ -14461,7 +14497,7 @@ impl RuntimeActor {
         max_bytes: usize,
     ) -> Result<Option<BlockPreview>, SyncApplicationPageRequestError> {
         let candidates = self.application_block_candidates_ready(&[uuid.to_owned()], true)?;
-        let Some((page, kind, block)) = candidates.get(uuid) else {
+        let Some((page, kind, _, block)) = candidates.get(uuid) else {
             return Ok(None);
         };
         let total = application_subtree_nodes(block);
@@ -15958,31 +15994,35 @@ impl RuntimeActor {
                     continue;
                 }
             };
-            let mut roots = Vec::new();
-            if let Some(block) = crate::query::application_page_property_dto(&current.page) {
-                if ids.contains(&block.id) {
-                    roots.push(block);
-                }
-            }
-            fn collect(blocks: &[BlockDto], ids: &HashSet<String>, out: &mut Vec<BlockDto>) {
+            let cached_roots = self.application_projection_roots(&entry.rel_path, &current.page);
+            let page_property = crate::query::application_page_property_dto(&current.page)
+                .filter(|block| ids.contains(&block.id))
+                .map(|block| {
+                    crate::model::dto_block_to_doc_block(&block, current.page.format == Format::Org)
+                });
+            let mut roots = page_property.iter().collect::<Vec<_>>();
+            fn collect<'a>(
+                blocks: &'a [crate::doc::DocBlock],
+                ids: &HashSet<String>,
+                out: &mut Vec<&'a crate::doc::DocBlock>,
+            ) {
                 for block in blocks {
-                    if ids.contains(&block.id) {
-                        out.push(block.clone());
+                    if ids.contains(&block.uuid) {
+                        out.push(block);
                     }
                     collect(&block.children, ids, out);
                 }
             }
-            collect(&current.page.blocks, ids, &mut roots);
+            collect(&cached_roots, ids, &mut roots);
             for block in roots {
                 if bytes >= crate::query::BACKLINK_FILTER_MAX_BYTES {
                     context.truncated = true;
                     break;
                 }
-                let result = crate::query::application_backlink_filter_entry(
+                let result = crate::query::backlink_filter_entry(
                     &current.page.name,
                     current.page.kind,
-                    &block,
-                    current.page.format == Format::Org,
+                    block,
                     &excluded_refs,
                     crate::query::BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
                 );
@@ -24183,7 +24223,14 @@ fn application_editor_blocks_existing(
         };
         keys.push(key);
     }
-    Ok(requested
+    Ok(application_editor_blocks(&requested, &keys))
+}
+
+fn application_editor_blocks(
+    requested: &[ApplicationBlockRef<'_>],
+    keys: &[SyncEditorBlockKey],
+) -> Vec<SyncEditorBlockDto> {
+    requested
         .iter()
         .enumerate()
         .map(|(index, block)| SyncEditorBlockDto {
@@ -24191,7 +24238,7 @@ fn application_editor_blocks_existing(
             parent: block.parent.map(|parent| keys[parent].clone()),
             content: block.block.raw.clone(),
         })
-        .collect())
+        .collect()
 }
 
 fn application_page_identity_map(
@@ -24302,15 +24349,7 @@ fn application_editor_blocks_new(
     let keys = (0..requested.len())
         .map(|index| SyncEditorBlockKey::Temporary(format!("gateway-{index}")))
         .collect::<Vec<_>>();
-    Ok(requested
-        .iter()
-        .enumerate()
-        .map(|(index, block)| SyncEditorBlockDto {
-            key: keys[index].clone(),
-            parent: block.parent.map(|parent| keys[parent].clone()),
-            content: block.block.raw.clone(),
-        })
-        .collect())
+    Ok(application_editor_blocks(&requested, &keys))
 }
 
 fn merge_markdown_page_properties(
