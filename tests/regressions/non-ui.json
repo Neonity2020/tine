@@ -6217,6 +6217,23 @@
     "failBefore": "An unrelated error whose page path contained the pinned-owner sentence classified as conflict.pinned_owner."
    },
    "notes": "Exact safety: DirectSaveFailureCode and the conflict epoch cross the command boundary as tagged JSON; error display text is never parsed for control flow."
+  },
+  {
+   "id": "REG-FLAKE-FLIGHT-RECORDER-LOCK-001",
+   "title": "The flight recorder releases its single-writer lock when it is dropped, not when the last forked copy of the descriptor closes",
+   "family": "diagnostics-process-lifecycle",
+   "sources": {"issues": [], "commits": [], "internal": "Flaky first-run census 2026-09-03, finding 2"},
+   "platforms": ["all"],
+   "layer": "rust-tauri-process-lifecycle",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/debug.rs::tests::a_recorder_releases_its_lock_even_while_a_duplicated_descriptor_lives"
+    ],
+    "scenario": "diagnostics.flight-recorder-lock-release",
+    "failBefore": "proven \u2014 with the Drop impl removed the new test fails with the exact signature the census recorded from the real flakes: Os { code: 11, kind: WouldBlock, message: \"Resource temporarily unavailable\" }"
+   },
+   "notes": "FlightRecorder held its process.lock in a `_process_lock: File` field with no Drop and no unlock, so release was a side effect of closing that descriptor. An flock belongs to the open file description, not to the descriptor: every process spawn duplicates the description into a child that holds it until exec, so a recorder dropped inside that window left the lock held and the next open on the same directory got EAGAIN. Observed twice in campaign evidence (wave3 I5, wave4 G1) as a first-run failure of the two session-cleanliness tests that then passed on rerun \u2014 four extra `cargo test -p tine` invocations in the G1 lane alone, on the gate every lane runs. Drop now calls unlock, which acts on the description and so releases every copy at once."
   }
  ]
 }

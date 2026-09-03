@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **The diagnostics flight recorder releases its single-writer lock when it
+  shuts down**, instead of leaving release to whenever the last copy of the
+  file descriptor happens to close. A process spawn duplicates that descriptor
+  into the child until it execs, so the lock could outlive the recorder that
+  held it.
+
 - **Managed clean-open failures no longer collapse source types into prose.**
   Core maps the 16 reachable error classes to stable, content-free reason codes
   and carries them through the existing open-refusal boundary as tagged JSON, so
