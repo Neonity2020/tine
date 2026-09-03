@@ -6029,7 +6029,7 @@
     "tests": [
      "src/components/ConflictResolution.test.tsx::routes ordinary prose containing conflict through the generic failure path",
      "src/components/ConflictResolution.test.tsx::has no message-sniffing conflict branch in the production component",
-     "src/persistence.test.ts::tags only the complete Direct Files conflict wire shape at the backend boundary",
+     "src/persistence.test.ts::tags only the complete Direct Files conflict payload at the backend boundary",
      "src/persistence.test.ts::recognizes only bounded content-conflict contracts"
     ],
     "scenario": "save-conflict.exact-wire-tag-no-message-sniff",
@@ -6184,6 +6184,9 @@
    "coverage": {
     "tests": [
      "crates/tine-core/src/model_tests.rs::direct_save_failure_code_does_not_inherit_conflict_from_page_text",
+     "crates/tine-core/src/model_tests.rs::direct_save_conflict_sites_produce_their_own_codes",
+     "crates/tine-core/src/model_tests.rs::direct_save_precheck_helpers_produce_their_own_codes",
+     "crates/tine-core/tests/direct_save_code_producers.rs::every_direct_save_failure_code_has_a_production_producer",
      "src-tauri/src/commands.rs::direct_save_error_tests"
     ],
     "scenario": "direct-save.page-text-cannot-mint-conflict",

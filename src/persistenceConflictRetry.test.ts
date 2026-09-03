@@ -139,10 +139,16 @@ describe("a failure is classified by its code, not by the page's name", () => {
 
       expect(await forceSave(name)).toBe(false);
 
+      // The user-visible half of the same rule: a permanent precheck failure is
+      // not a conflict, so it must not raise the banner whose only live button
+      // discards their unsaved edits.
+      expect(conflicted.has(name)).toBe(false);
+
       // Exactly the one request, then the bounded transient path — not a
       // self-feeding chain of re-observations.
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(calls.length).toBe(1);
+      expect(conflicted.has(name)).toBe(false);
     });
   }
 

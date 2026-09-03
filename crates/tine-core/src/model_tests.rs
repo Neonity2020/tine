@@ -11716,7 +11716,6 @@ fn direct_save_precheck_helpers_produce_their_own_codes() {
     }
 }
 
-
 #[test]
 fn direct_save_failure_code_does_not_inherit_conflict_from_page_text() {
     let error = std::io::Error::new(

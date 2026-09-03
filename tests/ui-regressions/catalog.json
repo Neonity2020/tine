@@ -9851,8 +9851,8 @@
       "platforms": ["all"],
       "layer": "unit",
       "status": "covered",
-      "coverage": { "tests": ["src/backendCallFunnel.test.ts"], "scenario": "direct-save.typed-disposition-and-banner-routing", "failBefore": "The tagged direct-save payload remained a string, so its true non-retryable producer code was unavailable to the save policy." },
-      "notes": "Exact safety: only a typed SaveConflictError reaches conflict resolution; DirectSaveFailureError follows its producer reasonCode even when detail contains conflict-like page text."
+      "coverage": { "tests": ["src/backendCallFunnel.test.ts", "src/persistenceConflictRetry.test.ts"], "scenario": "direct-save.typed-disposition-and-banner-routing", "failBefore": "proven" },
+      "notes": "Exact safety: only a typed SaveConflictError reaches conflict resolution; DirectSaveFailureError follows its producer reasonCode even when detail contains conflict-like page text. Fail-before: a permanent precheck failure on a page the user is entitled to name conflict_authority.notes was substring-matched into the authority handler, which deletes the epoch, re-dirties the page and fire-and-forgets another save, so one user request became four backend calls; log under tine-agents/evidence/wave4/e4/. Proven at the save-policy layer, which owns the banner STATE (markConflict/isConflicted); the rendered banner component is not driven here, so this row asserts that the banner is never raised, not how it looks when it is."
     }
   ]
 }
