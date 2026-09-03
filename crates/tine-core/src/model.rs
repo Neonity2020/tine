@@ -57,6 +57,11 @@ pub enum PageKind {
 
 const LOGSEQ_TEXT_EXTENSIONS: [&str; 3] = ["md", "markdown", "org"];
 
+#[cfg(test)]
+thread_local! {
+    static DIRECT_CANDIDATE_EVALUATED_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// On-disk file format of a page. Markdown (`.md`/`.markdown`) is the default; Logseq org
 /// graphs use `.org`. A graph may mix the two — format is decided per file by
 /// extension, never graph-wide (matching OG, which stores `:block/format` per
@@ -6073,7 +6078,7 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
 
-    fn direct_projection_page_ref_query(
+    fn direct_projection_candidate_query(
         &self,
         plan: &crate::query::SimpleQueryCandidatePlan,
         query_src: &str,
@@ -6088,6 +6093,10 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)?;
         let paths = projection.simple_query_candidate_paths(generation, plan)?;
+        #[cfg(test)]
+        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|recorded| {
+            *recorded.borrow_mut() = paths.iter().cloned().collect();
+        });
         let pages = self.direct_projection_pages_for_paths(generation, paths)?;
         let pages = pages
             .into_iter()
@@ -6339,6 +6348,32 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map_or(0, |projection| projection.fallback_reads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_candidate_paths_test(
+        &self,
+        plan: &crate::query::SimpleQueryCandidatePlan,
+    ) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .simple_query_candidate_paths(generation, plan)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_direct_projection_candidate_probe_test(&self) {
+        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|paths| paths.borrow_mut().clear());
+        crate::query::reset_full_graph_query_evaluations();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_candidate_evaluated_paths_test(
+        &self,
+    ) -> Vec<std::path::PathBuf> {
+        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|paths| paths.borrow().clone())
     }
 
     #[cfg(test)]
@@ -15569,10 +15604,17 @@ impl Graph {
             });
         }
         let plan = crate::query::simple_query_candidate_plan(query_src);
-        if plan.is_page_ref_only() {
-            if self.direct_projection_ready() {
-                return self.derived_memo(format!("q\0{query_src}"), || {
-                    self.direct_projection_page_ref_query(&plan, query_src, usize::MAX, usize::MAX)
+        match plan {
+            crate::query::SimpleQueryCandidatePlan::Empty => return Arc::new(Vec::new()),
+            crate::query::SimpleQueryCandidatePlan::Indexed(_) => {
+                if self.direct_projection_ready() {
+                    return self.derived_memo(format!("q\0{query_src}"), || {
+                        self.direct_projection_candidate_query(
+                            &plan,
+                            query_src,
+                            usize::MAX,
+                            usize::MAX,
+                        )
                         .map_or_else(
                             || {
                                 self.direct_projection_note_fallback_read();
@@ -15580,9 +15622,11 @@ impl Graph {
                             },
                             |result| result.groups,
                         )
-                });
+                    });
+                }
+                self.direct_projection_note_fallback_read();
             }
-            self.direct_projection_note_fallback_read();
+            crate::query::SimpleQueryCandidatePlan::All => {}
         }
         self.derived_memo(format!("q\0{query_src}"), || {
             crate::query::run_query(self, query_src)
@@ -15618,22 +15662,34 @@ impl Graph {
             );
         }
         let plan = crate::query::simple_query_candidate_plan(query_src);
-        if plan.is_page_ref_only() {
-            if self.direct_projection_ready() {
-                return self.derived_memo_bounded(
-                    format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"),
-                    || {
-                        self.direct_projection_page_ref_query(&plan, query_src, max_rows, max_bytes)
+        match plan {
+            crate::query::SimpleQueryCandidatePlan::Empty => {
+                return BoundedRefGroups {
+                    groups: Arc::new(Vec::new()),
+                    total: 0,
+                    exceeded: false,
+                };
+            }
+            crate::query::SimpleQueryCandidatePlan::Indexed(_) => {
+                if self.direct_projection_ready() {
+                    return self.derived_memo_bounded(
+                        format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"),
+                        || {
+                            self.direct_projection_candidate_query(
+                                &plan, query_src, max_rows, max_bytes,
+                            )
                             .unwrap_or_else(|| {
                                 self.direct_projection_note_fallback_read();
                                 crate::query::run_query_bounded(
                                     self, query_src, max_rows, max_bytes,
                                 )
                             })
-                    },
-                );
+                        },
+                    );
+                }
+                self.direct_projection_note_fallback_read();
             }
-            self.direct_projection_note_fallback_read();
+            crate::query::SimpleQueryCandidatePlan::All => {}
         }
         self.derived_memo_bounded(format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"), || {
             crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)

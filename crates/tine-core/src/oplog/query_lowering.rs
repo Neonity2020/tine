@@ -18,6 +18,39 @@ use crate::query::{SimpleQueryCandidatePlan as Plan, SimpleQueryCandidateSource 
 
 const BATCH: usize = 512;
 
+/// Drain one cursor-paged read family. Callers supply only the row-specific
+/// cursor key and emission adapter; this function owns advancement,
+/// termination, and any resource-limit batch retry.
+pub(crate) fn drain_after<K: Clone, R, E>(
+    mut fetch: impl FnMut(Option<K>, usize) -> Result<Vec<R>, E>,
+    mut key: impl FnMut(&R) -> K,
+    mut emit: impl FnMut(R) -> Result<(), E>,
+    mut retry_batch: impl FnMut(&E, usize) -> Option<usize>,
+) -> Result<(), E> {
+    let mut cursor = None;
+    let mut batch = BATCH;
+    loop {
+        let rows = match fetch(cursor.clone(), batch) {
+            Ok(rows) => rows,
+            Err(error) => match retry_batch(&error, batch) {
+                Some(next) if next > 0 && next < batch => {
+                    batch = next;
+                    continue;
+                }
+                _ => return Err(error),
+            },
+        };
+        let len = rows.len();
+        for row in rows {
+            cursor = Some(key(&row));
+            emit(row)?;
+        }
+        if len < batch {
+            return Ok(());
+        }
+    }
+}
+
 pub(crate) struct LoweredSimpleQueryCandidates {
     pub(crate) page_ids: BTreeSet<[u8; 16]>,
     pub(crate) inventory_pages: usize,
@@ -158,18 +191,15 @@ impl SimpleQuerySqlRead for SqliteMaterializedRead<'_> {
         marker: &str,
         emit: &mut dyn FnMut([u8; 16]),
     ) -> Result<(), Self::Error> {
-        let mut cursor = None;
-        loop {
-            let rows = self.task_candidate_pages_after(marker, cursor, BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some(row.page_id);
+        drain_after(
+            |cursor, batch| self.task_candidate_pages_after(marker, cursor, batch),
+            |row| row.page_id,
+            |row| {
                 emit(row.page_id.as_uuid().into_bytes());
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn page_referrer_candidates(
@@ -177,18 +207,15 @@ impl SimpleQuerySqlRead for SqliteMaterializedRead<'_> {
         normalized: &str,
         emit: &mut dyn FnMut([u8; 16]),
     ) -> Result<(), Self::Error> {
-        let mut cursor = None;
-        loop {
-            let rows = self.page_referrer_candidates_after(normalized, cursor, BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.source_page_id, row.source));
+        drain_after(
+            |cursor, batch| self.page_referrer_candidates_after(normalized, cursor, batch),
+            |row| (row.source_page_id, row.source),
+            |row| {
                 emit(row.source_page_id.as_uuid().into_bytes());
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn block_property_candidates(
@@ -196,63 +223,58 @@ impl SimpleQuerySqlRead for SqliteMaterializedRead<'_> {
         normalized: &str,
         emit: &mut dyn FnMut([u8; 16]),
     ) -> Result<(), Self::Error> {
-        let mut cursor: Option<(PageId, BlockId)> = None;
-        loop {
-            let rows = self.block_property_candidates_after(normalized, cursor, BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.page_id, row.block_id));
+        drain_after(
+            |cursor: Option<(PageId, BlockId)>, batch| {
+                self.block_property_candidates_after(normalized, cursor, batch)
+            },
+            |row| (row.page_id, row.block_id),
+            |row| {
                 emit(row.page_id.as_uuid().into_bytes());
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn page_property_candidates(
         &self,
         emit: &mut dyn FnMut([u8; 16], &str),
     ) -> Result<(), Self::Error> {
-        let mut cursor = None;
-        loop {
-            let rows = self.property_facet_rows_after(false, cursor.clone(), BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.owner, row.source_name.clone(), row.ordinal));
+        drain_after(
+            |cursor, batch| self.property_facet_rows_after(false, cursor, batch),
+            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
                 if matches!(row.owner, MaterializedEntityId::Page(_)) {
                     emit(row.page_id.as_uuid().into_bytes(), &row.normalized_name);
                 }
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn navigation_pages(
         &self,
         emit: &mut dyn FnMut([u8; 16], &str, bool),
     ) -> Result<(), Self::Error> {
-        let mut cursor: Option<(ManagedPath, PageId)> = None;
-        loop {
-            let rows = self.navigation_pages_after(
-                cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
-                BATCH,
-            )?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.path.clone(), row.page_id));
+        drain_after(
+            |cursor: Option<(ManagedPath, PageId)>, batch| {
+                self.navigation_pages_after(
+                    cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                    batch,
+                )
+            },
+            |row| (row.path.clone(), row.page_id),
+            |row| {
                 emit(
                     row.page_id.as_uuid().into_bytes(),
                     &row.name_key,
                     row.kind == ManagedTextKind::Journal,
                 );
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 }
 
@@ -264,18 +286,15 @@ impl SimpleQuerySqlRead for SqliteGraphProjectionRead<'_> {
         marker: &str,
         emit: &mut dyn FnMut([u8; 16]),
     ) -> Result<(), Self::Error> {
-        let mut cursor = None;
-        loop {
-            let rows = self.task_candidate_pages_after(marker, cursor, BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some(row.page_id);
+        drain_after(
+            |cursor, batch| self.task_candidate_pages_after(marker, cursor, batch),
+            |row| row.page_id,
+            |row| {
                 emit(row.page_id);
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn page_referrer_candidates(
@@ -283,18 +302,15 @@ impl SimpleQuerySqlRead for SqliteGraphProjectionRead<'_> {
         normalized: &str,
         emit: &mut dyn FnMut([u8; 16]),
     ) -> Result<(), Self::Error> {
-        let mut cursor = None;
-        loop {
-            let rows = self.page_referrer_candidates_after(normalized, cursor, BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.source_page_id, row.source));
+        drain_after(
+            |cursor, batch| self.page_referrer_candidates_after(normalized, cursor, batch),
+            |row| (row.source_page_id, row.source),
+            |row| {
                 emit(row.source_page_id);
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn block_property_candidates(
@@ -302,94 +318,58 @@ impl SimpleQuerySqlRead for SqliteGraphProjectionRead<'_> {
         normalized: &str,
         emit: &mut dyn FnMut([u8; 16]),
     ) -> Result<(), Self::Error> {
-        let mut cursor = None;
-        loop {
-            let rows = self.block_property_candidates_after(normalized, cursor, BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.page_id, row.block_id));
+        drain_after(
+            |cursor, batch| self.block_property_candidates_after(normalized, cursor, batch),
+            |row| (row.page_id, row.block_id),
+            |row| {
                 emit(row.page_id);
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn page_property_candidates(
         &self,
         emit: &mut dyn FnMut([u8; 16], &str),
     ) -> Result<(), Self::Error> {
-        let mut cursor = None;
-        loop {
-            let rows = self.property_facet_rows_after(false, cursor.clone(), BATCH)?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.owner, row.source_name.clone(), row.ordinal));
+        drain_after(
+            |cursor, batch| self.property_facet_rows_after(false, cursor, batch),
+            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
                 if matches!(row.owner, PhysicalEntityId::Page(_)) {
                     emit(row.page_id, &row.normalized_name);
                 }
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 
     fn navigation_pages(
         &self,
         emit: &mut dyn FnMut([u8; 16], &str, bool),
     ) -> Result<(), Self::Error> {
-        let mut cursor: Option<(String, [u8; 16])> = None;
-        loop {
-            let rows = self.navigation_pages_after_with_header_validation(
-                cursor.as_ref().map(|(path, _)| path.as_str()),
-                cursor.as_ref().map(|(_, page_id)| page_id),
-                BATCH,
-                |_, kind| match kind {
-                    0 | 1 => Ok(()),
-                    _ => Err(PhysicalReadError::Corrupt(format!(
-                        "unknown Direct Files text kind {kind}"
-                    ))),
-                },
-            )?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.path, row.page_id));
+        drain_after(
+            |cursor: Option<(String, [u8; 16])>, batch| {
+                self.navigation_pages_after_with_header_validation(
+                    cursor.as_ref().map(|(path, _)| path.as_str()),
+                    cursor.as_ref().map(|(_, page_id)| page_id),
+                    batch,
+                    |_, kind| match kind {
+                        0 | 1 => Ok(()),
+                        _ => Err(PhysicalReadError::Corrupt(format!(
+                            "unknown Direct Files text kind {kind}"
+                        ))),
+                    },
+                )
+            },
+            |row| (row.path.clone(), row.page_id),
+            |row| {
                 emit(row.page_id, &row.name_key, row.text_kind == 1);
-            }
-            if len < BATCH {
-                return Ok(());
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn source_to_sql_read_family_has_one_producer_file() {
-        let files = [
-            include_str!("query_lowering.rs"),
-            include_str!("../sync_runtime.rs"),
-            include_str!("../model.rs"),
-            include_str!("../direct_projection.rs"),
-            include_str!("../query.rs"),
-        ];
-        for (source, read_family) in [
-            ("Source::Task", "task_candidate_pages_after"),
-            ("Source::PageRef", "page_referrer_candidates_after"),
-            ("Source::BlockProperty", "block_property_candidates_after"),
-            ("Source::PageProperty", "property_facet_rows_after"),
-        ] {
-            assert_eq!(
-                files
-                    .iter()
-                    .filter(|file| file.contains(source) && file.contains(read_family))
-                    .count(),
-                1,
-                "I-12: `{source}` must be lowered to `{read_family}` in exactly one file; imitate crates/tine-core/src/oplog/query_lowering.rs, the sole SQL read-family producer"
-            );
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
     }
 }

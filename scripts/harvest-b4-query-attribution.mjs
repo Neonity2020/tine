@@ -22,6 +22,7 @@ const runs = Number.parseInt(flag("runs", "3"), 10);
 const rounds = flag("rounds", "9");
 const graph = flag("graph", "");
 const facetSizes = flag("facet-sizes", "1000,4000");
+const phase = flag("phase", "after");
 if (!graph) throw new Error("missing --graph /path/to/graph");
 if (!Number.isInteger(runs) || runs < 1) throw new Error("--runs must be positive");
 
@@ -43,6 +44,8 @@ const queryRows = new Map();
 const hitRows = [];
 const invalidationRows = new Map();
 const facetRows = new Map();
+const sampleRows = [];
+const readinessRows = [];
 let measuredPages = 0;
 let measuredBlocks = 0;
 
@@ -72,6 +75,7 @@ for (let run = 0; run < runs; run += 1) {
         TINE_DIRECT_QUERY_BENCH_GRAPH_COPY: path.resolve(graph),
         TINE_DIRECT_QUERY_BENCH_ROUNDS: rounds,
         TINE_DIRECT_QUERY_BENCH_FACET_SIZES: facetSizes,
+        TINE_B4_QUERY_BENCH_RUN: String(run + 1),
       },
     },
   );
@@ -85,6 +89,8 @@ for (let run = 0; run < runs; run += 1) {
     const hitAt = line.indexOf("b4_projection_hit_rate ");
     const invalidationAt = line.indexOf("b4_invalidation ");
     const facetAt = line.indexOf("b4_facet ");
+    const sampleAt = line.indexOf("b4_query_sample ");
+    const readinessAt = line.indexOf("b4_readiness ");
     if (queryAt >= 0) {
       const row = fields(line.slice(queryAt));
       measuredPages = Number.parseInt(row.pages, 10);
@@ -103,6 +109,28 @@ for (let run = 0; run < runs; run += 1) {
       const key = `${row.family}\0${row.pages}`;
       if (!facetRows.has(key)) facetRows.set(key, []);
       facetRows.get(key).push(row);
+    } else if (sampleAt >= 0) {
+      sampleRows.push(fields(line.slice(sampleAt)));
+    } else if (readinessAt >= 0) {
+      readinessRows.push(fields(line.slice(readinessAt)));
+    }
+  }
+}
+
+if (phase === "after") {
+  const candidateOnlyClasses = new Set([
+    "sparse_task", "page_ref", "task_non_sparse", "block_property",
+    "page_property", "page_tags", "page", "namespace", "journal",
+    "mixed_and", "complete_or", "boolean_composition",
+  ]);
+  for (const row of sampleRows) {
+    if (!candidateOnlyClasses.has(row.class)) continue;
+    if (
+      Number.parseInt(row.candidateQueriesCompleted, 10) !== 1 ||
+      Number.parseInt(row.fallbackReads, 10) !== 0 ||
+      Number.parseInt(row.fullGraphEvaluations, 10) !== 0
+    ) {
+      throw new Error(`post-fix candidate-only sample failed: ${JSON.stringify(row)}`);
     }
   }
 }
@@ -135,6 +163,23 @@ for (const className of classes) {
   );
 }
 
+report.push("");
+report.push("## Per-run invalidated-ready medians");
+report.push("| class | run 1 ms | run 2 ms | run 3 ms |");
+report.push("| --- | ---: | ---: | ---: |");
+for (const className of classes) {
+  const rows = queryRows.get(`${className}\0invalidated_ready`) ?? [];
+  report.push(`| ${className} | ${rows.map((row) => Number.parseFloat(row.median_ms).toFixed(6)).join(" | ")} |`);
+}
+
+report.push("");
+report.push("## Invalidated-ready sample counters");
+report.push("| class | run | sample | candidateQueriesCompleted | fallbackReads | fullGraphEvaluations | evaluatedPages | medianMs |");
+report.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+for (const row of sampleRows) {
+  report.push(`| ${row.class} | ${row.run} | ${row.sample} | ${row.candidateQueriesCompleted} | ${row.fallbackReads} | ${row.fullGraphEvaluations} | ${row.evaluatedPages} | ${Number.parseFloat(row.medianMs).toFixed(6)} |`);
+}
+
 const immediate = queryRows.get("sparse_task\0data_rev_immediate") ?? [];
 report.push("");
 report.push("## Projection readiness at immediate post-delta/dataRev proxy");
@@ -147,6 +192,14 @@ const indexed = hitRows.reduce((sum, row) => sum + Number.parseInt(row.indexed_r
 report.push(
   `| ${samples} | ${hits} | ${misses} | ${samples === 0 ? "n/a" : `${((hits / samples) * 100).toFixed(1)}%`} | ${indexed} | ${median(immediate.map((row) => Number.parseFloat(row.median_ms))).toFixed(6)} |`,
 );
+
+report.push("");
+report.push("## Readiness distribution");
+report.push("| save | generation | immediate ready | ready latency ms | terminal event | candidate reads | fallback reads | oracle equal |");
+report.push("| --- | ---: | --- | ---: | --- | ---: | ---: | --- |");
+for (const row of readinessRows) {
+  report.push(`| ${row.save} | ${row.generation} | ${row.immediate_ready} | ${Number.parseFloat(row.ready_latency_ms).toFixed(6)} | ${row.terminal_event} | ${row.candidate_reads} | ${row.fallback_reads} | ${row.oracle_equal} |`);
+}
 
 report.push("");
 report.push("## Scoped invalidation (median counts)");

@@ -6075,7 +6075,7 @@
     "tests": [
      "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
      "crates/tine-core/src/direct_projection.rs::tests::b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence",
-     "crates/tine-core/src/oplog/query_lowering.rs::tests::source_to_sql_read_family_has_one_producer_file"
+     "crates/tine-core/tests/query_lowering_guards.rs::simple_query_read_family_census_is_exact"
     ],
     "scenario": "direct-query.shared-facet-and-page-ref-candidate-read",
     "failBefore": "b4-indexed-routes-fail-before.log: PageRef and property-facet calls left the Direct projection indexed-read counter unchanged."

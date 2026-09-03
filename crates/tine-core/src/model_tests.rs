@@ -12873,6 +12873,13 @@ fn direct_query_bench_open() -> (PathBuf, Graph, usize, usize) {
         b"- b4-unrelated-before\n",
     )
     .unwrap();
+    fs::write(
+        dir.join("pages/B4___Measurement Namespace.md"),
+        b"- b4 namespace probe\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::write(dir.join("journals/2026_09_03.md"), b"- b4 journal probe\n").unwrap();
     let graph = Graph::open(&dir);
     graph
         .attach_direct_projection(dir.join(".b4-measurement/projection.sqlite"))
@@ -13007,9 +13014,24 @@ fn direct_query_latency_manual_benchmark() {
     let classes = [
         ("sparse_task", "(task TODO)"),
         ("page_ref", "(page-ref \"B4 Measurement Target\")"),
+        (
+            "task_non_sparse",
+            "(and (task TODO) (page \"B4 Measurement Target\"))",
+        ),
         ("block_property", "(property \"status\" \"active\")"),
         ("page_property", "(page-property \"category\" \"work\")"),
         ("page_tags", "(page-tags \"work\")"),
+        ("page", "(page \"B4 Measurement Target\")"),
+        ("namespace", "(namespace B4)"),
+        ("journal", "(journal)"),
+        (
+            "mixed_and",
+            "(and (property \"status\" \"active\") (page \"B4 Measurement Target\"))",
+        ),
+        (
+            "complete_or",
+            "(or (page \"B4 Measurement Target\") (namespace B4))",
+        ),
         ("plain_text", "\"needle\""),
         ("friendly_search", "(search \"needle\")"),
         (
@@ -13027,11 +13049,32 @@ fn direct_query_latency_manual_benchmark() {
 
         let indexed_before = graph.direct_projection_indexed_reads_test();
         let mut invalidated = Vec::with_capacity(rounds);
-        for _ in 0..rounds {
+        for sample in 0..rounds {
             serial += 1;
             direct_query_bench_edit(&graph, serial);
             wait_for_direct_query_projection(&graph);
-            invalidated.push(direct_query_bench_sample(&graph, query));
+            *graph.derived_cache.write().unwrap() = None;
+            graph.reset_direct_projection_candidate_probe_test();
+            let fallback_before = graph.direct_projection_fallback_reads_test();
+            let candidate_before = graph.direct_projection_indexed_reads_test();
+            let elapsed = direct_query_bench_sample(&graph, query);
+            let candidate_queries_completed = graph
+                .direct_projection_indexed_reads_test()
+                .saturating_sub(candidate_before);
+            let fallback_reads = graph
+                .direct_projection_fallback_reads_test()
+                .saturating_sub(fallback_before);
+            let full_graph_evaluations = crate::query::full_graph_query_evaluations();
+            let evaluated_pages = graph
+                .direct_projection_candidate_evaluated_paths_test()
+                .len();
+            println!(
+                "b4_query_sample class={class} run={} sample={} candidateQueriesCompleted={candidate_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
+                std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
+                sample + 1,
+                elapsed.as_secs_f64() * 1_000.0,
+            );
+            invalidated.push(elapsed);
         }
         let indexed_reads = graph
             .direct_projection_indexed_reads_test()
@@ -13050,16 +13093,35 @@ fn direct_query_latency_manual_benchmark() {
     let mut ready_misses = 0_usize;
     let indexed_before = graph.direct_projection_indexed_reads_test();
     let mut immediate = Vec::with_capacity(rounds);
-    for _ in 0..rounds {
+    for save in 0..rounds {
         serial += 1;
         direct_query_bench_edit(&graph, serial);
-        if graph.direct_projection_ready_test() {
+        let generation = graph.cache_generation();
+        let immediate_ready = graph.direct_projection_ready_test();
+        if immediate_ready {
             ready_hits += 1;
         } else {
             ready_misses += 1;
         }
         immediate.push(direct_query_bench_sample(&graph, "(task TODO)"));
+        let readiness_started = Instant::now();
         wait_for_direct_query_projection(&graph);
+        let ready_latency_ms = readiness_started.elapsed().as_secs_f64() * 1_000.0;
+        let oracle =
+            crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 * 1024 * 1024);
+        let candidate_before = graph.direct_projection_indexed_reads_test();
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        let actual = graph.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        let oracle_equal = (actual.total, actual.exceeded) == (oracle.total, oracle.exceeded)
+            && serde_json::to_vec(actual.groups.as_ref()).unwrap()
+                == serde_json::to_vec(&oracle.groups).unwrap();
+        println!(
+            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete candidate_reads={} fallback_reads={} oracle_equal={oracle_equal}",
+            std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
+            save + 1,
+            graph.direct_projection_indexed_reads_test().saturating_sub(candidate_before),
+            graph.direct_projection_fallback_reads_test().saturating_sub(fallback_before),
+        );
     }
     let indexed_reads = graph
         .direct_projection_indexed_reads_test()

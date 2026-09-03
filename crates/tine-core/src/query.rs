@@ -1543,6 +1543,8 @@ fn run_pred_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
+    #[cfg(test)]
+    FULL_GRAPH_QUERY_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
     // An unsorted `(sample N)` semantically needs only the first N matches in
     // deterministic traversal order. Do not construct or classify the rest as
@@ -1611,6 +1613,21 @@ fn run_pred_bounded(
     });
 
     finish_query_groups(groups, recency_by_page, opts, budget)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_GRAPH_QUERY_EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_graph_query_evaluations() {
+    FULL_GRAPH_QUERY_EVALUATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_graph_query_evaluations() -> u64 {
+    FULL_GRAPH_QUERY_EVALUATIONS.with(std::cell::Cell::get)
 }
 
 fn finish_query_groups(

@@ -1,5 +1,6 @@
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
+use crate::oplog::query_lowering::drain_after;
 use crate::query::{
     run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
     ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
@@ -225,22 +226,17 @@ impl DirectProjection {
         let read = reader.as_ref()?.read();
         let mut by_block = BTreeMap::new();
         let uses_recency = eligibility.uses_recency;
-        const BATCH: usize = 1024;
         for marker in eligibility.markers {
-            let mut after = None;
-            loop {
-                let rows = read
-                    .task_candidate_locators_after(&marker, after, BATCH)
-                    .ok()?;
-                let count = rows.len();
-                for row in rows {
-                    after = Some((row.page_id, row.block_id));
+            drain_after(
+                |after, batch| read.task_candidate_locators_after(&marker, after, batch),
+                |row| (row.page_id, row.block_id),
+                |row| {
                     by_block.entry(row.block_id).or_insert(row);
-                }
-                if count < BATCH {
-                    break;
-                }
-            }
+                    Ok(())
+                },
+                |_, _| None,
+            )
+            .ok()?;
         }
         if self.shared.ready_generation.load(Ordering::Acquire) != cache_generation
             || !self.shared.ready.load(Ordering::Acquire)
@@ -378,29 +374,22 @@ impl DirectProjection {
         } else {
             PropertyFacetAccumulator::query_builder(max_items, max_bytes)
         };
-        const INITIAL_BATCH: usize = 512;
-        let mut batch = INITIAL_BATCH;
-        let mut cursor = None;
-        loop {
-            let rows =
-                loop {
-                    match read.property_facet_rows_after(!autocomplete, cursor.clone(), batch) {
-                        Ok(rows) => break rows,
-                        Err(tine_storage::sqlite::MaterializationError::ResourceLimit {
-                            ..
-                        }) if batch > 1 => batch = (batch / 2).max(1),
-                        Err(_) => return None,
-                    }
-                };
-            let len = rows.len();
-            for row in rows {
-                cursor = Some((row.owner, row.source_name, row.ordinal));
+        drain_after(
+            |cursor, batch| read.property_facet_rows_after(!autocomplete, cursor, batch),
+            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
                 accumulator.offer(&row.normalized_name, &row.value);
-            }
-            if len < batch {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |error, batch| {
+                matches!(
+                    error,
+                    tine_storage::sqlite::MaterializationError::ResourceLimit { .. }
+                )
+                .then(|| (batch / 2).max(1))
+            },
+        )
+        .ok()?;
         if !self.ready_at(cache_generation) {
             return None;
         }
@@ -423,34 +412,33 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after: Option<(String, String, String, [u8; 16])> = None;
         let mut names = std::collections::HashMap::<String, String>::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .navigation_reference_names_after(
+        drain_after(
+            |after: Option<(String, String, String, [u8; 16])>, batch| {
+                read.navigation_reference_names_after(
                     after.as_ref().map(|(path, raw, normalized, id)| {
                         (path.as_str(), raw.as_str(), normalized.as_str(), id)
                     }),
-                    BATCH,
+                    batch,
                 )
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((
-                    row.owner_path,
+            },
+            |row| {
+                (
+                    row.owner_path.clone(),
                     row.raw_name.clone(),
-                    row.normalized_name,
+                    row.normalized_name.clone(),
                     row.source_page_id,
-                ));
+                )
+            },
+            |row| {
                 names
                     .entry(crate::refs::page_key(&row.raw_name))
                     .or_insert(row.raw_name);
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         if !self.ready_at(cache_generation) {
             return None;
         }
@@ -476,22 +464,19 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after = None;
         let mut paths = std::collections::HashSet::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .fuzzy_subsequence_candidate_pages_after(normalized_needle, after, BATCH)
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some(row.page_id);
+        drain_after(
+            |after, batch| {
+                read.fuzzy_subsequence_candidate_pages_after(normalized_needle, after, batch)
+            },
+            |row| row.page_id,
+            |row| {
                 paths.insert(row.path);
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         let current = self.ready_at(cache_generation).then_some(paths);
         #[cfg(test)]
         if current.is_some() {
@@ -514,31 +499,30 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after: Option<(String, String, [u8; 16])> = None;
         let mut aliases = Vec::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .navigation_aliases_after(
+        drain_after(
+            |after: Option<(String, String, [u8; 16])>, batch| {
+                read.navigation_aliases_after(
                     after
                         .as_ref()
                         .map(|(path, alias, id)| (path.as_str(), alias.as_str(), id)),
-                    BATCH,
+                    batch,
                 )
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((
+            },
+            |row| {
+                (
                     row.owner_path.clone(),
                     row.normalized_alias.clone(),
                     row.source_page_id,
-                ));
+                )
+            },
+            |row| {
                 aliases.push((row.normalized_alias, row.owner_name, row.owner_path));
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         self.ready_at(cache_generation).then_some(aliases)
     }
 
@@ -554,21 +538,18 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after: Option<(String, [u8; 16])> = None;
         let mut names = crate::query::RealPageNames::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .navigation_pages_after_with_header_validation(
+        drain_after(
+            |after: Option<(String, [u8; 16])>, batch| {
+                read.navigation_pages_after_with_header_validation(
                     after.as_ref().map(|(path, _)| path.as_str()),
                     after.as_ref().map(|(_, id)| id),
-                    BATCH,
+                    batch,
                     |_, _| Ok(()),
                 )
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((row.path.clone(), row.page_id));
+            },
+            |row| (row.path.clone(), row.page_id),
+            |row| {
                 let path = PathBuf::from(&row.path);
                 match names.get_mut(&row.name_key) {
                     Some((winner_path, winner_name)) if path < *winner_path => {
@@ -580,11 +561,11 @@ impl DirectProjection {
                         names.insert(row.name_key, (path, row.name));
                     }
                 }
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         self.ready_at(cache_generation).then_some(names)
     }
 
@@ -610,40 +591,31 @@ impl DirectProjection {
         }
         let read = reader.as_ref()?.read();
         let mut page_ids = std::collections::BTreeSet::new();
-        const BATCH: usize = 1024;
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
-                    let mut after = None;
-                    loop {
-                        let rows = read
-                            .page_referrer_candidates_after(name, after, BATCH)
-                            .ok()?;
-                        let count = rows.len();
-                        for row in rows {
-                            after = Some((row.source_page_id, row.source));
+                    drain_after(
+                        |after, batch| read.page_referrer_candidates_after(name, after, batch),
+                        |row| (row.source_page_id, row.source),
+                        |row| {
                             page_ids.insert(row.source_page_id);
-                        }
-                        if count < BATCH {
-                            break;
-                        }
-                    }
+                            Ok(())
+                        },
+                        |_, _| None,
+                    )
+                    .ok()?;
                 }
                 ReferenceKind::Plain => {
-                    let mut after = None;
-                    loop {
-                        let rows = read
-                            .plain_text_candidate_pages_after(name, after, BATCH)
-                            .ok()?;
-                        let count = rows.len();
-                        for row in rows {
-                            after = Some(row.page_id);
+                    drain_after(
+                        |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
+                        |row| row.page_id,
+                        |row| {
                             page_ids.insert(row.page_id);
-                        }
-                        if count < BATCH {
-                            break;
-                        }
-                    }
+                            Ok(())
+                        },
+                        |_, _| None,
+                    )
+                    .ok()?;
                 }
             }
         }
@@ -702,23 +674,22 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after = None;
         let mut counts = std::collections::HashMap::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read.block_reference_counts_after(after, BATCH).ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some(row.raw_uuid_claim);
-                counts.insert(
-                    Uuid::from_bytes(row.raw_uuid_claim).to_string(),
-                    usize::try_from(row.distinct_source_blocks).ok()?,
-                );
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+        drain_after(
+            |after, batch| read.block_reference_counts_after(after, batch),
+            |row| row.raw_uuid_claim,
+            |row| {
+                let distinct = usize::try_from(row.distinct_source_blocks).map_err(|_| {
+                    tine_storage::sqlite::MaterializationError::Corrupt(
+                        "block reference count exceeds usize".into(),
+                    )
+                })?;
+                counts.insert(Uuid::from_bytes(row.raw_uuid_claim).to_string(), distinct);
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         self.ready_at(cache_generation).then_some(counts)
     }
 
@@ -736,22 +707,17 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut after = None;
         let mut page_ids = std::collections::BTreeSet::new();
-        const BATCH: usize = 1024;
-        loop {
-            let rows = read
-                .block_referrer_candidates_after(uuid, after, BATCH)
-                .ok()?;
-            let count = rows.len();
-            for row in rows {
-                after = Some((row.source_page_id, row.source_block_id));
+        drain_after(
+            |after, batch| read.block_referrer_candidates_after(uuid, after, batch),
+            |row| (row.source_page_id, row.source_block_id),
+            |row| {
                 page_ids.insert(row.source_page_id);
-            }
-            if count < BATCH {
-                break;
-            }
-        }
+                Ok(())
+            },
+            |_, _| None,
+        )
+        .ok()?;
         let mut paths = std::collections::BTreeSet::new();
         for page_id in page_ids {
             let page = read
@@ -1447,10 +1413,13 @@ mod tests {
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
             root.join("pages/source.md"),
-            "- points to [[Target]]\n  status:: active\n",
+            "category:: work\ntags:: work\n\n- TODO points to [[Target]]\n  status:: active\n",
         )
         .unwrap();
         std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+        std::fs::write(root.join("pages/Project___Child.md"), "- namespace child\n").unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::write(root.join("journals/2026_09_03.md"), "- journal block\n").unwrap();
 
         let graph = Graph::open(&root);
         graph
@@ -1484,6 +1453,86 @@ mod tests {
         assert!(
             graph.direct_projection_indexed_reads_test() >= indexed_before + 5,
             "PageRef and both property-facet entry points must use the generation-bound SQLite read"
+        );
+
+        for query in [
+            "(and (task TODO) (page source))",
+            "(property status active)",
+            "(page-property category work)",
+            "(page source)",
+            "(namespace Project)",
+            "(journal)",
+            "(and (property status active) (page source))",
+            "(or (page source) (page Target))",
+        ] {
+            let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
+            let expected_paths = graph
+                .direct_projection_candidate_paths_test(&crate::query::simple_query_candidate_plan(
+                    query,
+                ))
+                .unwrap();
+            let indexed_before = graph.direct_projection_indexed_reads_test();
+            let fallback_before = graph.direct_projection_fallback_reads_test();
+            graph.reset_direct_projection_candidate_probe_test();
+            let actual = graph.run_query_bounded(query, 100, 1_000_000);
+            assert_eq!(
+                signature(&actual.groups),
+                signature(&oracle.groups),
+                "{query}"
+            );
+            assert_eq!(
+                (actual.total, actual.exceeded),
+                (oracle.total, oracle.exceeded),
+                "{query}"
+            );
+            assert_eq!(graph.direct_projection_indexed_reads_test(), indexed_before + 1, "{query}: exactly one candidate query must complete; expected candidate paths {expected_paths:?}");
+            assert_eq!(
+                crate::query::full_graph_query_evaluations(),
+                0,
+                "{query}: production invocation entered the forbidden full-graph evaluator"
+            );
+            assert_eq!(
+                graph.direct_projection_fallback_reads_test(),
+                fallback_before,
+                "{query}: ready candidate route fell back"
+            );
+            assert_eq!(
+                graph
+                    .direct_projection_candidate_evaluated_paths_test()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected_paths,
+                "{query}: production must evaluate exactly the lowering's candidate paths"
+            );
+        }
+
+        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.reset_direct_projection_candidate_probe_test();
+        let empty = graph.run_query_bounded("(", 100, 1_000_000);
+        assert!(empty.groups.is_empty());
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            0,
+            "Plan::Empty must not enter the graph evaluator"
+        );
+        assert_eq!(
+            graph.direct_projection_indexed_reads_test(),
+            indexed_before,
+            "Plan::Empty must not touch the projection"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallback_before,
+            "Plan::Empty must not record fallback access"
+        );
+
+        graph.reset_direct_projection_candidate_probe_test();
+        let _ = graph.run_query_bounded("\"points\"", 100, 1_000_000);
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            1,
+            "Plan::All alone uses the parser whole-graph evaluator"
         );
 
         let fallback_before = graph.direct_projection_fallback_reads_test();
@@ -1535,9 +1584,16 @@ mod tests {
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
             root.join("pages/B4 Indexed Source.md"),
-            "- synthetic [[B4 Indexed Target]]\n  b4-facet:: yes\n",
+            "b4-page-facet:: yes\ntags:: b4-tag\n\n- TODO synthetic [[B4 Indexed Target]]\n  b4-facet:: yes\n",
         )
         .unwrap();
+        std::fs::write(
+            root.join("pages/B4___Namespace.md"),
+            "- synthetic namespace\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::write(root.join("journals/2026_09_03.md"), "- synthetic journal\n").unwrap();
         std::fs::write(
             root.join("pages/B4 Indexed Target.md"),
             "- synthetic target\n",
@@ -1551,13 +1607,49 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
 
-        let query = "(page-ref \"B4 Indexed Target\")";
-        let oracle = crate::query::run_query_bounded(&graph, query, 20_000, 32 * 1024 * 1024);
-        let indexed = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
-        assert!(
-            signature(&indexed.groups) == signature(&oracle.groups),
-            "corpus PageRef indexed result differs from the parser oracle"
-        );
+        for query in [
+            "(page-ref \"B4 Indexed Target\")",
+            "(and (task TODO) (page \"B4 Indexed Source\"))",
+            "(property b4-facet yes)",
+            "(page-property b4-page-facet yes)",
+            "(page \"B4 Indexed Source\")",
+            "(namespace B4)",
+            "(journal)",
+            "(and (property b4-facet yes) (page \"B4 Indexed Source\"))",
+            "(or (page \"B4 Indexed Source\") (page \"B4 Indexed Target\"))",
+        ] {
+            let oracle = crate::query::run_query_bounded(&graph, query, 20_000, 32 * 1024 * 1024);
+            let expected_paths = graph
+                .direct_projection_candidate_paths_test(&crate::query::simple_query_candidate_plan(
+                    query,
+                ))
+                .unwrap();
+            let indexed_before = graph.direct_projection_indexed_reads_test();
+            let fallback_before = graph.direct_projection_fallback_reads_test();
+            graph.reset_direct_projection_candidate_probe_test();
+            let indexed = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
+            assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
+            assert_eq!(
+                (indexed.total, indexed.exceeded),
+                (oracle.total, oracle.exceeded)
+            );
+            assert_eq!(
+                graph.direct_projection_indexed_reads_test(),
+                indexed_before + 1
+            );
+            assert_eq!(
+                graph.direct_projection_fallback_reads_test(),
+                fallback_before
+            );
+            assert_eq!(crate::query::full_graph_query_evaluations(), 0);
+            assert_eq!(
+                graph
+                    .direct_projection_candidate_evaluated_paths_test()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected_paths
+            );
+        }
         assert!(
             graph.property_facets() == crate::query::property_facets(&graph),
             "corpus query-builder facets differ from the parser oracle"
@@ -1571,7 +1663,7 @@ mod tests {
                 ),
             "corpus autocomplete facets differ from the parser oracle"
         );
-        assert!(graph.direct_projection_indexed_reads_test() >= 3);
+        assert!(graph.direct_projection_indexed_reads_test() >= 11);
 
         let fallback_before = graph.direct_projection_fallback_reads_test();
         graph.direct_projection_mark_stale_test();
