@@ -2926,6 +2926,21 @@ impl fmt::Display for SyncEditorRefusalCode {
     }
 }
 
+/// The sole native encoder for app-internal typed rejection payloads. The Tauri
+/// wire remains `String` this release, but its load-bearing kinds are JSON data
+/// rather than prose that frontend components must parse back into control flow.
+pub fn tagged_backend_error(kind: &'static str, reason_code: Option<&str>) -> String {
+    let mut payload = serde_json::Map::new();
+    payload.insert("kind".into(), serde_json::Value::String(kind.into()));
+    if let Some(reason_code) = reason_code {
+        payload.insert(
+            "reason_code".into(),
+            serde_json::Value::String(reason_code.into()),
+        );
+    }
+    serde_json::Value::Object(payload).to_string()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncApplicationPageRequestError {
     InvalidRequest(SyncApplicationPageInvalidRequest),
@@ -2992,6 +3007,18 @@ impl fmt::Display for SyncApplicationPageRequestError {
 impl std::error::Error for SyncApplicationPageRequestError {}
 
 impl SyncApplicationPageRequestError {
+    pub fn backend_wire_string(&self) -> String {
+        match self {
+            Self::ActorRefusedWithCode(code)
+            | Self::ActorRefusedAtWithCode { code, .. }
+            | Self::ActorRefusedWithDebugDetail { code, .. }
+            | Self::ActorRefusedAtWithDebugDetail { code, .. } => {
+                tagged_backend_error("managed-actor-refusal", Some(code.as_str()))
+            }
+            _ => self.to_string(),
+        }
+    }
+
     /// Exact inner failure text for a locally enabled diagnostic trace.  This
     /// must never be shown through the normal application-error display path.
     pub fn debug_detail(&self) -> Option<&str> {
@@ -3318,6 +3345,7 @@ pub enum SyncRuntimeRequestError {
         path_bytes: usize,
     },
     ActorRefused(String),
+    TaggedBackend(String),
     ActorUnavailable,
 }
 
@@ -3340,6 +3368,7 @@ impl fmt::Display for SyncRuntimeRequestError {
                 "watcher request exceeds bounds: {observations} observations, {path_bytes} path bytes"
             ),
             Self::ActorRefused(detail) => write!(formatter, "sync actor refused request: {detail}"),
+            Self::TaggedBackend(payload) => formatter.write_str(payload),
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
@@ -23122,8 +23151,8 @@ impl RuntimeActor {
             || descriptor.lineage_digest() != self.binding.lineage_digest()
             || descriptor.catalog_document_id() != self.binding.catalog_document_id()
         {
-            return Err(SyncRuntimeRequestError::ActorRefused(
-                "clean shared descriptor names another managed graph".into(),
+            return Err(SyncRuntimeRequestError::TaggedBackend(
+                tagged_backend_error("managed-graph-mismatch", None),
             ));
         }
         let expected = inspect_shared_provider_descriptor(&self.provider_root)
@@ -23212,7 +23241,10 @@ impl RuntimeActor {
                     &provider_semantics,
                     local_is_activation_baseline,
                 )? {
-                    return Err(SyncRuntimeRequestError::ActorRefused(diff.to_string()));
+                    let _ = diff;
+                    return Err(SyncRuntimeRequestError::TaggedBackend(
+                        tagged_backend_error("shared-frontier-mismatch", None),
+                    ));
                 }
             }
             self.install_clean_join_candidate(&descriptor, candidate, marker)?;

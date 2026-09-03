@@ -1,5 +1,11 @@
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
-import { backend, type DiagnosticReport, type GraphVerificationProgress, type GraphVerificationReport } from "../backend";
+import {
+  OperationCancelledError,
+  backend,
+  type DiagnosticReport,
+  type GraphVerificationProgress,
+  type GraphVerificationReport,
+} from "../backend";
 import { writeClipboardTextResilient } from "../clipboard";
 import {
   compareGraphVerificationManifests,
@@ -87,7 +93,7 @@ export function DiagnosticsTab() {
       setVerification(result);
       if (!result.complete) pushToast("Graph verification was incomplete", "error");
     } catch (error) {
-      if (!String(error).toLowerCase().includes("cancelled")) {
+      if (!(error instanceof OperationCancelledError)) {
         pushToast(`Could not verify graph files: ${String(error)}`, "error");
       }
     } finally {

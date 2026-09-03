@@ -7942,7 +7942,7 @@ fn read_asset_limited_rejects_before_returning_oversized_bytes() {
     assert_eq!(g.read_asset_limited("large.pdf", 5).unwrap(), b"12345");
     let err = g.read_asset_limited("large.pdf", 4).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("asset exceeds 4 byte limit"));
+    assert_eq!(err.to_string(), r#"{"kind":"asset-too-large"}"#);
     let _ = fs::remove_dir_all(&dir);
 }
 

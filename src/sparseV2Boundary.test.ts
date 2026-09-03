@@ -112,11 +112,11 @@ describe("Tine-managed storage app boundary", () => {
   });
 
   it("keeps the window open when managed storage cannot stop safely", () => {
-    expect(app).toContain("sparse-v2-shutdown-refused");
+    expect(app).toContain("SparseShutdownRefusedError");
     expect(app).toContain("Tine-managed storage could not verify a clean stop.");
     expect(app).toContain("The window remains open so you can retry");
     expect(app).toMatch(
-      /sparse-v2-shutdown-refused[\s\S]*allowClose = false;[\s\S]*safeClose\.reset\(\);[\s\S]*return;/
+      /instanceof SparseShutdownRefusedError[\s\S]*allowClose = false;[\s\S]*safeClose\.reset\(\);[\s\S]*return;/
     );
   });
 });

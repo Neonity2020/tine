@@ -1,7 +1,7 @@
 import { For, Show, createEffect, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { backend } from "../backend";
+import { AssetTooLargeError, backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
 import { pushToast, isConflicted, requestBlockReferences, type PdfTarget } from "../ui";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
@@ -928,7 +928,7 @@ export function PdfViewer(props: {
       bytes = await backend().readAsset(props.filename, MAX_PDF_BYTES);
       if (disposed) return;
     } catch (err) {
-      if (String(err).includes("asset exceeds"))
+      if (err instanceof AssetTooLargeError)
         failPdf("This PDF is larger than 256 MiB and can't be opened safely.");
       else failPdf(errorMessage("Couldn't read this PDF asset", err));
       return;

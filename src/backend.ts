@@ -201,13 +201,105 @@ export interface PluginRegistryCacheEnvelope {
   signature: string;
 }
 
+export type BackendErrorKind =
+  | "save-conflict"
+  | "sync-data-unavailable"
+  | "managed-graph-mismatch"
+  | "shared-frontier-mismatch"
+  | "adoption-archived"
+  | "sparse-shutdown-refused"
+  | "asset-too-large"
+  | "operation-cancelled"
+  | "managed-actor-refusal";
+
+const BACKEND_ERROR_MESSAGES: Record<
+  Exclude<BackendErrorKind, "save-conflict" | "managed-actor-refusal">,
+  string
+> = {
+  "sync-data-unavailable": "This graph does not yet contain sync data from another device.",
+  "managed-graph-mismatch": "The shared descriptor names another managed graph.",
+  "shared-frontier-mismatch": "This device's notes are not in the shared provider frontier.",
+  "adoption-archived": "Adoption stopped after this device's own history was archived.",
+  "sparse-shutdown-refused": "Tine-managed storage could not verify a clean stop.",
+  "asset-too-large": "The asset exceeds the safe size limit.",
+  "operation-cancelled": "The operation was cancelled.",
+};
+
+/** The sole frontend family for JSON-tagged native failures. Components branch
+ * on subclasses and never parse the payload string or user-facing wording. */
+export class BackendError extends Error {
+  constructor(readonly kind: BackendErrorKind, message: string) {
+    super(message);
+    this.name = "BackendError";
+  }
+
+  override toString(): string {
+    return this.message;
+  }
+}
+
+export class SyncDataUnavailableError extends BackendError {
+  constructor() {
+    super("sync-data-unavailable", BACKEND_ERROR_MESSAGES["sync-data-unavailable"]);
+    this.name = "SyncDataUnavailableError";
+  }
+}
+
+export class ManagedGraphMismatchError extends BackendError {
+  constructor() {
+    super("managed-graph-mismatch", BACKEND_ERROR_MESSAGES["managed-graph-mismatch"]);
+    this.name = "ManagedGraphMismatchError";
+  }
+}
+
+export class SharedFrontierMismatchError extends BackendError {
+  constructor() {
+    super("shared-frontier-mismatch", BACKEND_ERROR_MESSAGES["shared-frontier-mismatch"]);
+    this.name = "SharedFrontierMismatchError";
+  }
+}
+
+export class AdoptionArchivedError extends BackendError {
+  constructor() {
+    super("adoption-archived", BACKEND_ERROR_MESSAGES["adoption-archived"]);
+    this.name = "AdoptionArchivedError";
+  }
+}
+
+export class SparseShutdownRefusedError extends BackendError {
+  constructor() {
+    super("sparse-shutdown-refused", BACKEND_ERROR_MESSAGES["sparse-shutdown-refused"]);
+    this.name = "SparseShutdownRefusedError";
+  }
+}
+
+export class AssetTooLargeError extends BackendError {
+  constructor() {
+    super("asset-too-large", BACKEND_ERROR_MESSAGES["asset-too-large"]);
+    this.name = "AssetTooLargeError";
+  }
+}
+
+export class OperationCancelledError extends BackendError {
+  constructor() {
+    super("operation-cancelled", BACKEND_ERROR_MESSAGES["operation-cancelled"]);
+    this.name = "OperationCancelledError";
+  }
+}
+
+export class ManagedActorRefusalError extends BackendError {
+  constructor(readonly reasonCode: string) {
+    super("managed-actor-refusal", `Managed storage refused the operation (reason code: ${reasonCode}).`);
+    this.name = "ManagedActorRefusalError";
+  }
+}
+
 /** A Direct Files revision conflict, classified once at the Tauri wire boundary.
  * Callers branch on this tag and never inspect arbitrary backend prose. */
-export class SaveConflictError extends Error {
-  readonly kind = "save-conflict";
+export class SaveConflictError extends BackendError {
 
   constructor(readonly epoch: number | null) {
-    super(epoch === null ? "conflict" : `conflict:${epoch}`);
+    super("save-conflict", epoch === null ? "conflict" : `conflict:${epoch}`);
     this.name = "SaveConflictError";
   }
 
@@ -227,7 +319,7 @@ export function isSaveConflictError(error: unknown): error is SaveConflictError 
  * classifying here means no caller needs to know which commands can conflict.
  * Anything else passes through untouched. */
 export function classifyNativeCallError(error: unknown): unknown {
-  return classifySaveConflictWire(error) ?? error;
+  return classifySaveConflictWire(error) ?? classifyTaggedBackendError(error) ?? error;
 }
 
 export function classifySaveConflictWire(error: unknown): SaveConflictError | null {
@@ -239,6 +331,46 @@ export function classifySaveConflictWire(error: unknown): SaveConflictError | nu
   if (message === "conflict") return new SaveConflictError(null);
   const match = message?.match(/^conflict:(\d+)$/);
   return match ? new SaveConflictError(Number(match[1])) : null;
+}
+
+type TaggedBackendPayload = { kind: string; reason_code?: unknown };
+
+function classifyTaggedBackendError(error: unknown): BackendError | null {
+  const message = typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : null;
+  if (message === null || message[0] !== "{") return null;
+  let payload: TaggedBackendPayload;
+  try {
+    payload = JSON.parse(message) as TaggedBackendPayload;
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object") return null;
+  switch (payload.kind) {
+    case "sync-data-unavailable":
+      return new SyncDataUnavailableError();
+    case "managed-graph-mismatch":
+      return new ManagedGraphMismatchError();
+    case "shared-frontier-mismatch":
+      return new SharedFrontierMismatchError();
+    case "adoption-archived":
+      return new AdoptionArchivedError();
+    case "sparse-shutdown-refused":
+      return new SparseShutdownRefusedError();
+    case "asset-too-large":
+      return new AssetTooLargeError();
+    case "operation-cancelled":
+      return new OperationCancelledError();
+    case "managed-actor-refusal":
+      return typeof payload.reason_code === "string" && /^[a-z][a-z_]*(?:\.[a-z][a-z_]*)*$/.test(payload.reason_code)
+        ? new ManagedActorRefusalError(payload.reason_code)
+        : null;
+    default:
+      return null;
+  }
 }
 
 export type PluginRegistryCacheLoad =

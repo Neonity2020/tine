@@ -27,6 +27,12 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
+  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
+    kind = "managed-actor-refusal";
+    constructor(readonly reasonCode: string) {
+      super("managed actor refusal");
+    }
+  },
   backend: () => ({
     savePage: (page: { name: string }) => {
       saves.push(page.name);
@@ -46,6 +52,7 @@ vi.mock("./ui", () => ({
 }));
 
 const { dirtyPages, markDirty, resetSaveState } = await import("./persistence");
+const { ManagedActorRefusalError } = await import("./backend");
 
 describe("managed append outcome uncertainty", () => {
   beforeEach(() => {
@@ -61,10 +68,9 @@ describe("managed append outcome uncertainty", () => {
   });
 
   it("keeps drafts dirty and suppresses every automatic retry until reset", async () => {
-    nextSave = () => Promise.reject(new Error(
-      "sync actor refused application page intent at committing the semantic page transaction "
-      + "(reason code: trusted_local.append_outcome_unknown)"
-    ));
+    nextSave = () => Promise.reject(
+      new ManagedActorRefusalError("trusted_local.append_outcome_unknown")
+    );
     markDirty("First");
     await vi.advanceTimersByTimeAsync(500);
 

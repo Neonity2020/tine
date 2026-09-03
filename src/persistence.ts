@@ -22,7 +22,7 @@ import {
   setEditorActivation,
   sweepReplaceable,
 } from "./store";
-import { backend } from "./backend";
+import { ManagedActorRefusalError, backend } from "./backend";
 import { favoritesPageChanged } from "./favoritesStore";
 import { onGraphRebound } from "./modeHooks";
 import {
@@ -566,17 +566,12 @@ export function saveFailureDisposition(error: unknown): SaveFailureDisposition {
 }
 
 /** Extract a bounded save-failure code from either backend contract.
- *
- * Direct saves prefix a bounded code. The managed actor instead returns its
- * bounded reason code in a terminal envelope, for example
- * `sync actor refused application page intent at committing the semantic page
- * transaction (reason code: trusted_local.append_outcome_unknown)`. Both forms
- * are parsed structurally so page text or ordinary error prose cannot change
- * the retry/latch disposition.
- */
+ * Managed actor refusals arrive as a typed funnel error; only the legacy Direct
+ * save contract still has a bounded code prefix. */
 function saveFailureCode(error: unknown): string {
+  if (error instanceof ManagedActorRefusalError) return error.reasonCode;
   const message = String(error).replace(/^Error: /, "");
-  return directSaveFailureCode(message) || actorReasonCode(message);
+  return directSaveFailureCode(message);
 }
 
 /** The bounded failure code the Direct backend prefixes to a save error.
@@ -601,12 +596,6 @@ function directSaveFailureCode(message: string): string {
   // read as one: without it, `Error("conflict_authority.spent while reporting
   // …")` was accepted whole and routed into the authority handler.
   return /^[a-z][a-z_]*(\.[a-z][a-z_]*)*$/.test(code) ? code : "";
-}
-
-/** Extract the managed actor's complete terminal reason-code envelope only. */
-function actorReasonCode(message: string): string {
-  const match = /^sync actor refused application page intent(?: at [^(]+)? \(reason code: ([a-z][a-z_]*(?:\.[a-z][a-z_]*)*)\)$/.exec(message);
-  return match?.[1] ?? "";
 }
 
 /** The observation epoch a banner-class conflict was raised at.

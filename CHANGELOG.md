@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Backend refusal handling now branches on typed error kinds instead of
+  English wording.** Native control-flow failures use bounded JSON tags, one
+  frontend funnel constructs the existing error family, panic records retain
+  only fixed-shape metadata, and scenario I/O errors preserve `ErrorKind`.
+  Plugin-visible errors keep their previous string shape.
+
 - **Diagnostics now keep graph content out of automatic output.** Native
   detailed diagnostics are actually debug-gated, remaining core print sites and
   frontend console calls have equality censuses, save refusals report only a

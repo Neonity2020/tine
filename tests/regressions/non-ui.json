@@ -2,6 +2,25 @@
  "schemaVersion": 1,
  "entries": [
   {
+   "id": "REG-W3-E-TYPED-ERROR-BOUNDARY-001",
+   "title": "Backend refusal handling branches on typed fixed-shape envelopes instead of prose",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 E"},
+   "platforms": ["all"],
+   "layer": "rust-tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/typedErrorRatchet.test.ts",
+     "src-tauri/src/debug.rs::tests::caught_named_thread_panic_records_fixed_shape_location_thread_and_kind",
+     "crates/tine-core/src/oplog/wire.rs::tests::scenario_io_error_keeps_only_the_typed_error_kind"
+    ],
+    "scenario": "backend-errors.typed-fixed-shape-no-prose-classification",
+    "failBefore": "e-typed-branches-fail-before.txt, e-scenario-io-fail-before.txt, and e-panic-fields-fail-before.txt at 74d00d18e292e6bde629b833e832c4bc7a7a7945"
+   },
+   "notes": "The native boundary emits bounded kind and reason-code envelopes, frontend consumers branch on BackendError subclasses, ScenarioError retains ErrorKind instead of prose, and the panic recorder keeps only location, thread, and message kind."
+  },
+  {
    "id": "REG-W3-I5-CONTENT-OUT-OF-LOGS-001",
    "title": "Production diagnostics cannot emit graph-authored content",
    "family": "diagnostics-privacy",

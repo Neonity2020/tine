@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
 import { closeSettings, dismissToast, openSettings, setGraphMeta, setGraphTransitioning, setToasts, toasts } from "../ui";
-import { backend } from "../backend";
+import {
+  AdoptionArchivedError,
+  backend,
+  ManagedGraphMismatchError,
+  SharedFrontierMismatchError,
+  SyncDataUnavailableError,
+} from "../backend";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { storageTransitionRuntime } from "../storageTransitionRuntime";
 import * as store from "../store";
@@ -202,10 +208,7 @@ describe("Settings storage transitions", () => {
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
     vi.spyOn(store, "flushAll").mockResolvedValue(true);
     vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
-      new Error(
-        "managed sync join failed at provider scan: sync actor refused request: sync join refused: notes not in the shared provider frontier; local-pages=1059 shared-pages=1059 local-only=0 shared-only=0 changed=1 (kind=0 preamble=0 outline=1 explicit-ids=0); authorities unchanged\n"
-        + 'clean join mismatch detail: changed path="journals/2026_08_25.md" categories=outline',
-      ),
+      new SharedFrontierMismatchError(),
     );
 
     const root = document.createElement("div");
@@ -222,24 +225,19 @@ describe("Settings storage transitions", () => {
 
     const failure = toasts().at(-1);
     expect(failure).toMatchObject({ sticky: true, action: { label: "Copy details" } });
-    expect(failure?.message).toContain('Changed (blocks, content, or order): "journals/2026_08_25.md"');
+    expect(failure?.message).toContain("notes are not in the shared provider frontier");
     expect(failure?.message).toContain("Nothing was changed on either device");
     dispose();
   });
 
   it("keeps the not-yet refusal actionable after the panel truncates it to one line", async () => {
-    // The native message names the file and both ordinary causes; the panel
-    // shows only its first line, which is the dead end. The remedy carries the
-    // rest, or a real device is told nothing it can act on.
+    // The native payload carries only a kind. The frontend owns both the safe
+    // wording and the actionable remedy.
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
     vi.spyOn(store, "flushAll").mockResolvedValue(true);
     vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
-      new Error(
-        "This graph does not yet contain sync data from another device.\n\n"
-        + "Tine looked for /graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json.\n\n"
-        + "Two things usually explain that."
-      )
+      new SyncDataUnavailableError(),
     );
 
     const root = document.createElement("div");
@@ -315,11 +313,7 @@ describe("Settings storage transitions", () => {
     dispose();
   });
 
-  const independentHistoryRefusal = () =>
-    new Error(
-      "managed sync join failed at provider scan: sync actor refused request: "
-        + "clean shared descriptor names another managed graph"
-    );
+  const independentHistoryRefusal = () => new ManagedGraphMismatchError();
 
   const clickManagedJoin = async (root: HTMLElement) => {
     const button = [...root.querySelectorAll("button")].find((candidate) =>
@@ -412,9 +406,7 @@ describe("Settings storage transitions", () => {
     vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(independentHistoryRefusal());
     vi.spyOn(backend(), "sparseV2RecoveryLocation").mockResolvedValue("/archive/root");
     vi.spyOn(backend(), "adoptSparseV2Shared").mockRejectedValue(
-      new Error(
-        "This device's Tine-managed storage is already shared with, or joined to, another device. Nothing was changed."
-      )
+      new AdoptionArchivedError(),
     );
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
 
@@ -426,8 +418,8 @@ describe("Settings storage transitions", () => {
 
     const message = toasts().at(-1)?.message ?? "";
     expect(message).toContain("Couldn't adopt the shared graph");
-    expect(message).toContain("already shared with, or joined to, another device");
-    expect(message).toContain("Nothing was changed");
+    expect(message).toContain("history is preserved");
+    expect(message).toContain("/archive/root");
     expect(message).not.toContain("joined the synced graph");
     dispose();
   });

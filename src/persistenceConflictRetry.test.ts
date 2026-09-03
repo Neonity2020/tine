@@ -46,6 +46,11 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
+  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
+    constructor(readonly reasonCode: string) {
+      super("managed actor refusal");
+    }
+  },
   isSaveConflictError: (error: unknown) =>
     typeof error === "object" && error !== null && "kind" in error && error.kind === "save-conflict",
   backend: () => ({

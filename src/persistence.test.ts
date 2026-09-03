@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __setBackendForTest,
   classifySaveConflictWire,
+  ManagedActorRefusalError,
   type Backend,
   SaveConflictError,
 } from "./backend";
@@ -140,9 +141,7 @@ describe("save failure classification", () => {
   it("recognizes only bounded content-conflict contracts", () => {
     expect(isSaveConflictFailure(new SaveConflictError(17))).toBe(true);
     expect(isSaveConflictFailure("managed.conflict: stale_base")).toBe(true);
-    expect(isSaveConflictFailure(
-      "sync actor refused application page intent at committing the semantic page transaction (reason code: managed.conflict)",
-    )).toBe(true);
+    expect(isSaveConflictFailure(new ManagedActorRefusalError("managed.conflict"))).toBe(true);
     expect(isSaveConflictFailure("precheck.portable_collision: page already exists")).toBe(false);
     expect(isSaveConflictFailure("ordinary prose says conflict or already exists")).toBe(false);
     expect(isSaveConflictFailure("conflict:17")).toBe(false);
@@ -192,12 +191,9 @@ describe("save failure classification", () => {
     expect(
       saveFailureDisposition("trusted_local.append_outcome_unknown: storage receipt did not escape")
     ).toBe("append_outcome_unknown");
-    const actorFailure =
-      "sync actor refused application page intent at committing the semantic page transaction "
-      + "(reason code: trusted_local.append_outcome_unknown)";
+    const actorFailure = new ManagedActorRefusalError("trusted_local.append_outcome_unknown");
     expect(saveFailureDisposition(actorFailure)).toBe("append_outcome_unknown");
-    expect(saveFailureDisposition(new Error(actorFailure))).toBe("append_outcome_unknown");
-    expect(isRetryableSaveFailure(new Error(actorFailure))).toBe(false);
+    expect(isRetryableSaveFailure(actorFailure)).toBe(false);
     expect(
       saveFailureDisposition("ordinary failure mentions trusted_local.append_outcome_unknown in prose")
     ).toBe("ordinary");

@@ -129,7 +129,28 @@ pub(crate) fn install_panic_logger() {
     }
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        record_fixed_event("runtime.panic", Map::new());
+        let current_thread = std::thread::current();
+        let mut fields = Map::new();
+        fields.insert(
+            "location".into(),
+            info.location()
+                .map(|location| format!("{}:{}", location.file(), location.line()))
+                .unwrap_or_else(|| "unknown".into())
+                .into(),
+        );
+        fields.insert(
+            "thread".into(),
+            current_thread.name().unwrap_or("unnamed").into(),
+        );
+        let message_kind = if info.payload().is::<&str>() {
+            "str"
+        } else if info.payload().is::<String>() {
+            "string"
+        } else {
+            "non_string"
+        };
+        fields.insert("message_kind".into(), message_kind.into());
+        record_fixed_event("runtime.panic", fields);
         if debug_enabled() {
             diag(format!("PANIC: {info}"));
             diag(format!(
@@ -834,6 +855,51 @@ mod tests {
         assert!(
             output.stderr.is_empty(),
             "diag leaked to stderr with debugging disabled: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "child-process probe for panic event capture"]
+    fn panic_event_child_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("diagnostics");
+        flight_init(dir.clone());
+        install_panic_logger();
+        let caught = std::thread::Builder::new()
+            .name("panic-event-probe".into())
+            .spawn(|| std::panic::catch_unwind(|| std::panic::panic_any(7_u8)))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(caught.is_err());
+        let events = std::fs::read_to_string(dir.join("current.jsonl")).unwrap();
+        let event = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "runtime.panic")
+            .expect("panic event");
+        assert_eq!(event["thread"], "panic-event-probe");
+        assert_eq!(event["message_kind"], "non_string");
+        assert!(event["location"].as_str().unwrap().contains("debug.rs:"));
+        assert!(!events.contains("7_u8"));
+    }
+
+    #[test]
+    fn caught_named_thread_panic_records_fixed_shape_location_thread_and_kind() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "debug::tests::panic_event_child_probe",
+                "--nocapture",
+            ])
+            .env_remove("TINE_DEBUG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "panic-event child failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

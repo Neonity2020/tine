@@ -6449,7 +6449,7 @@ impl Graph {
         if cancelled.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "graph verification cancelled",
+                crate::sync_runtime::tagged_backend_error("operation-cancelled", None),
             ));
         }
         let managed = ManagedPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
@@ -6478,7 +6478,7 @@ impl Graph {
             if cancelled.load(Ordering::Acquire) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "graph verification cancelled",
+                    crate::sync_runtime::tagged_backend_error("operation-cancelled", None),
                 ));
             }
             let read = file.read(&mut buffer)?;
@@ -16527,14 +16527,14 @@ impl Graph {
         if metadata.len() > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("asset exceeds {} byte limit", max_bytes),
+                crate::sync_runtime::tagged_backend_error("asset-too-large", None),
             ));
         }
         let bytes = fs::read(path)?;
         if bytes.len() as u64 > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("asset exceeds {} byte limit", max_bytes),
+                crate::sync_runtime::tagged_backend_error("asset-too-large", None),
             ));
         }
         Ok(bytes)

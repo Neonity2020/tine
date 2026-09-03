@@ -104,12 +104,18 @@ fn build_manifest(
     let mut files = Vec::with_capacity(total);
     for (index, path) in paths.iter().enumerate() {
         if cancelled.load(Ordering::Acquire) {
-            return Err("graph verification cancelled".into());
+            return Err(tine_core::sync_runtime::tagged_backend_error(
+                "operation-cancelled",
+                None,
+            ));
         }
         match graph.digest_graph_text_source(path, cancelled) {
             Ok(file) => files.push(file),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                return Err("graph verification cancelled".into());
+                return Err(tine_core::sync_runtime::tagged_backend_error(
+                    "operation-cancelled",
+                    None,
+                ));
             }
             Err(error) => errors.push(GraphVerificationError {
                 path: Some(path.clone()),

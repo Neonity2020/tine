@@ -41,6 +41,11 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
+  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
+    constructor(readonly reasonCode: string) {
+      super("managed actor refusal");
+    }
+  },
   backend: () => ({
     savePage: (
       page: { name: string },

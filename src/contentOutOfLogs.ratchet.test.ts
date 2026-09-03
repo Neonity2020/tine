@@ -15,7 +15,7 @@ interface ConsoleSite {
 
 const CONSOLE_ALLOWLIST_SIZE = 21;
 const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { class: string; why: string })[] = [
-  { file: "App.tsx", line: 1065, method: "warn", class: "local-error", why: "native listener setup error stays in uncaptured WebView devtools" },
+  { file: "App.tsx", line: 1071, method: "warn", class: "local-error", why: "native listener setup error stays in uncaptured WebView devtools" },
   { file: "capture.tsx", line: 173, method: "log", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
   { file: "capture.tsx", line: 600, method: "error", class: "local-error", why: "parser bootstrap error stays in uncaptured WebView devtools" },
   { file: "components/Block.tsx", line: 1509, method: "warn", class: "local-error", why: "optional autocomplete failure stays in uncaptured WebView devtools" },
@@ -23,9 +23,9 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { class: string; why: string })
   { file: "main.tsx", line: 62, method: "error", class: "local-error", why: "window reveal failure stays in uncaptured WebView devtools" },
   { file: "main.tsx", line: 70, method: "error", class: "local-error", why: "parser bootstrap error stays in uncaptured WebView devtools" },
   { file: "pdfRenderCoordinator.ts", line: 341, method: "error", class: "local-error", why: "PDF renderer failure stays in uncaptured WebView devtools" },
-  { file: "persistence.ts", line: 988, method: "warn", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 993, method: "error", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1141, method: "error", class: "local-error", why: "managed conflict capture failure stays in uncaptured WebView devtools" },
+  { file: "persistence.ts", line: 977, method: "warn", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 982, method: "error", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 1130, method: "error", class: "local-error", why: "managed conflict capture failure stays in uncaptured WebView devtools" },
   { file: "print.ts", line: 97, method: "error", class: "local-error", why: "optional local renderer failure stays in uncaptured WebView devtools" },
   { file: "print.ts", line: 112, method: "error", class: "local-error", why: "print preparation failure stays in uncaptured WebView devtools" },
   { file: "print.ts", line: 156, method: "error", class: "local-error", why: "iframe print failure stays in uncaptured WebView devtools" },

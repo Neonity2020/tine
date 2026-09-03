@@ -615,18 +615,20 @@ fn map_sparse_page_save(outcome: SyncApplicationPageSaveOutcome) -> Result<Strin
     }
 }
 
-fn save_sparse_page_with<E>(
+fn save_sparse_page_with(
     page: PageDto,
     base_rev: Option<String>,
     force: bool,
     managed_conflict_observation: Option<ManagedConflictObservation>,
-    save: impl FnOnce(SyncApplicationPageSaveRequest) -> Result<SyncApplicationPageSaveOutcome, E>,
-) -> Result<String, String>
-where
-    E: std::fmt::Display,
-{
+    save: impl FnOnce(
+        SyncApplicationPageSaveRequest,
+    ) -> Result<
+        SyncApplicationPageSaveOutcome,
+        tine_core::sync_runtime::SyncApplicationPageRequestError,
+    >,
+) -> Result<String, String> {
     let request = sparse_save_request(page, base_rev, force, managed_conflict_observation)?;
-    let outcome = save(request).map_err(|error| error.to_string())?;
+    let outcome = save(request).map_err(|error| error.backend_wire_string())?;
     map_sparse_page_save(outcome)
 }
 
@@ -2820,7 +2822,9 @@ where
             Ok(crate::sync_runtime::CleanShutdownSlot::Direct) => {}
             Ok(crate::sync_runtime::CleanShutdownSlot::Safe) => safe_slots.push(label),
             Err(error) => {
-                let detail = format!("sparse-v2-shutdown-refused: {error}");
+                crate::debug::diag(format!("managed shutdown refused: {error}"));
+                let detail =
+                    tine_core::sync_runtime::tagged_backend_error("sparse-shutdown-refused", None);
                 return if safe_slots.is_empty() {
                     TineQuitPreparation::Refused { detail }
                 } else {
@@ -2881,8 +2885,10 @@ pub(crate) fn close_graph_window(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<(), String> {
     let slot = crate::state::slot_for_window(&state, window.label())?;
-    crate::sync_runtime::clean_shutdown_slot(&slot)
-        .map_err(|error| format!("sparse-v2-shutdown-refused: {error}"))?;
+    crate::sync_runtime::clean_shutdown_slot(&slot).map_err(|error| {
+        crate::debug::diag(format!("managed window shutdown refused: {error}"));
+        tine_core::sync_runtime::tagged_backend_error("sparse-shutdown-refused", None)
+    })?;
     if state.graphs.read().unwrap().len() <= 1 {
         #[cfg(target_os = "linux")]
         crate::platform::kill_webkit_children();
@@ -2923,7 +2929,10 @@ mod prepare_tine_quit_tests {
             result,
             TineQuitPreparation::Partial {
                 safe_slots: vec!["A".into()],
-                detail: "sparse-v2-shutdown-refused: retained local publication".into(),
+                detail: tine_core::sync_runtime::tagged_backend_error(
+                    "sparse-shutdown-refused",
+                    None,
+                ),
             }
         );
     }
@@ -2953,14 +2962,20 @@ mod prepare_tine_quit_tests {
         assert_eq!(
             result,
             TineQuitPreparation::Refused {
-                detail: "sparse-v2-shutdown-refused: terminal runtime".into(),
+                detail: tine_core::sync_runtime::tagged_backend_error(
+                    "sparse-shutdown-refused",
+                    None,
+                ),
             }
         );
         let encoded = serde_json::to_value(result).unwrap();
         assert_eq!(encoded["status"], "refused");
         assert_eq!(
             encoded["detail"],
-            "sparse-v2-shutdown-refused: terminal runtime"
+            serde_json::Value::String(tine_core::sync_runtime::tagged_backend_error(
+                "sparse-shutdown-refused",
+                None,
+            ))
         );
     }
 }
@@ -4776,7 +4791,7 @@ mod application_page_authority_tests {
                 path: "pages/Saved.md".into(),
                 revision: "observed-current".into(),
             }),
-            |request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
+            |request| -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
                 called.set(true);
                 assert!(matches!(
                     request.target,
@@ -4804,7 +4819,7 @@ mod application_page_authority_tests {
                 path: "pages/Raced new.md".into(),
                 revision: "created-winner".into(),
             }),
-            |request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
+            |request| -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
                 assert!(matches!(
                     request.target,
                     SyncApplicationPageSaveTarget::ResolveConflict {
@@ -4827,7 +4842,7 @@ mod application_page_authority_tests {
             Some("stale".into()),
             true,
             None,
-            |_request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
+            |_request| -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
                 unreachable!("an unobserved replacement must fail before actor invocation")
             },
         )

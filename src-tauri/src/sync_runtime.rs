@@ -3566,25 +3566,10 @@ pub(crate) fn shared_enrollment_descriptor_path(graph_root: &Path) -> PathBuf {
         .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
 }
 
-/// What a device that cannot find sync data should be told.
-///
-/// "This graph does not yet contain sync data from another device" is true and
-/// a dead end: it names neither what was looked for nor either thing the user
-/// can actually check. Both causes are ordinary — the other device has not
-/// finished its half, or the file-sync tool never carried `.tine-sync/`, which
-/// several exclude by default because it starts with a dot.
-fn shared_enrollment_not_here_yet(graph_root: &Path) -> String {
-    format!(
-        concat!(
-            "This graph does not yet contain sync data from another device.\n\n",
-            "Tine looked for {}.\n\n",
-            "Two things usually explain that. The other device may not have finished ",
-            "\"Set up sync with another device\" yet. Or your file-sync tool is not copying the ",
-            "hidden .tine-sync folder — several tools skip dot-directories unless you ",
-            "tell them not to.",
-        ),
-        shared_enrollment_descriptor_path(graph_root).display()
-    )
+/// Fixed-shape wire refusal for absent shared data. The frontend owns the safe
+/// wording and actionable provider-path remedy.
+fn shared_enrollment_not_here_yet(_graph_root: &Path) -> String {
+    tine_core::sync_runtime::tagged_backend_error("sync-data-unavailable", None)
 }
 
 /// Reconstitute the sole application actor after a durable enrollment cut.
@@ -3699,6 +3684,16 @@ fn prepare_sparse_v2_join(
         format!("managed sync join failed at {stage}: {detail}")
     }
 
+    fn join_runtime_failure(
+        stage: &str,
+        error: tine_core::sync_runtime::SyncRuntimeRequestError,
+    ) -> String {
+        match error {
+            tine_core::sync_runtime::SyncRuntimeRequestError::TaggedBackend(payload) => payload,
+            other => join_failure(stage, other),
+        }
+    }
+
     let state = app.state::<crate::state::AppState>();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     if slot.root_key != root {
@@ -3715,7 +3710,7 @@ fn prepare_sparse_v2_join(
             .ok_or("Tine-managed storage setup is missing.")?;
         active_handle(&slot)?
             .join_shared(descriptor)
-            .map_err(|error| join_failure("provider scan", error))?;
+            .map_err(|error| join_runtime_failure("provider scan", error))?;
         let candidate = prepare_reopened_managed_candidate(
             app,
             &state,
@@ -3751,7 +3746,7 @@ fn prepare_sparse_v2_join(
     };
     handle
         .join_shared(descriptor)
-        .map_err(|error| join_failure("provider scan", error))?;
+        .map_err(|error| join_runtime_failure("provider scan", error))?;
     let binding = state
         .sync_runtime
         .open_record(app, &record)
@@ -3981,15 +3976,14 @@ fn adopt_sparse_v2_shared_blocking(
     let (set_aside, archive_location) =
         set_aside_managed_history_for_adoption(app, label, binding_generation)?;
     let archive_location = archive_location.map(|path| path.display().to_string());
-    // One line, because the panel's redaction keeps only the first one. The
-    // token is stable so the panel can attach the archive location it already
-    // read, rather than repeating a native path through the redactor.
-    let status = join_sparse_v2_shared_blocking(app, label, set_aside.binding_generation)
-        .map_err(|error| {
-            format!(
-                "Tine-managed storage adoption stopped after this device's own history was archived; Direct files is serving your Markdown/Org files unchanged and nothing was merged, so the join action can retry the remaining half on its own: {error}"
-            )
-        })?;
+    // The fixed kind lets the panel attach the archive location it already
+    // read without repeating a native path through the error boundary.
+    let status = join_sparse_v2_shared_blocking(app, label, set_aside.binding_generation).map_err(
+        |error| {
+            crate::debug::diag(format!("managed adoption failed after archive: {error}"));
+            tine_core::sync_runtime::tagged_backend_error("adoption-archived", None)
+        },
+    )?;
     let binding_generation = status.binding_generation;
     Ok(SparseV2AdoptionResult {
         adoption_statement: match &archive_location {
@@ -4676,27 +4670,13 @@ mod tests {
         );
     }
 
-    /// A join that finds nothing must not dead-end the user. "This graph does
-    /// not yet contain sync data from another device" is true and unactionable:
-    /// it names neither the file it looked for nor either ordinary reason it is
-    /// missing — the other device has not finished, or the sync tool is not
-    /// carrying the hidden `.tine-sync/` folder.
+    /// The native boundary carries only the fixed kind; no path or prose is
+    /// load-bearing.
     #[test]
-    fn a_join_with_no_sync_data_names_the_file_and_both_likely_causes() {
+    fn a_join_with_no_sync_data_emits_only_the_fixed_kind() {
         let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
-        assert!(
-            message.contains(
-                "/graphs/notes/.tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json"
-            ),
-            "{message}"
-        );
-        assert!(message.contains("may not have finished"), "{message}");
-        assert!(message.contains("hidden .tine-sync folder"), "{message}");
-        assert!(message.contains("skip dot-directories"), "{message}");
-        assert!(
-            !message.contains("  "),
-            "the message must not carry source-indentation runs: {message:?}"
-        );
+        assert_eq!(message, r#"{"kind":"sync-data-unavailable"}"#);
+        assert!(!message.contains("/graphs/notes"));
         assert_eq!(
             shared_enrollment_descriptor_path(Path::new("/graphs/notes")),
             PathBuf::from(
@@ -4705,25 +4685,16 @@ mod tests {
         );
     }
 
-    /// The message above is helpful and the user never saw it. The panel keeps
-    /// only the FIRST LINE of a native error (`safeManagedErrorDetail`), so the
-    /// path and both causes were cut and the dead-end sentence was all that
-    /// reached the phone. The panel re-authors the rest as a remedy; this pins
-    /// the two halves together, because a remedy keyed on text the native side
-    /// no longer emits is the same silence again.
+    /// The fixed native kind and frontend subclass are pinned together. The
+    /// frontend can reword its message without changing control flow.
     #[test]
-    fn the_not_yet_refusal_reaches_the_panel_with_its_remedy_intact() {
+    fn the_not_yet_refusal_reaches_the_panel_as_a_typed_kind() {
         let message = shared_enrollment_not_here_yet(Path::new("/graphs/notes"));
-        let first_line = message.lines().next().expect("the message has a line");
         let panel = include_str!("../../src/components/Settings.tsx");
 
-        // What the panel matches on must survive the truncation to line one.
-        let key = "does not yet contain sync data";
-        assert!(first_line.contains(key), "{first_line}");
-        assert!(
-            panel.contains(&format!("detail.includes(\"{key}\")")),
-            "the panel must recognize the refusal it re-authors"
-        );
+        assert_eq!(message, r#"{"kind":"sync-data-unavailable"}"#);
+        assert!(panel.contains("error instanceof SyncDataUnavailableError"));
+        assert!(!panel.contains("detail.includes(\"does not yet contain sync data\")"));
 
         // The relative path the panel names must be the one this message means.
         let relative = ".tine-sync/v2/shared/outbox/enrollment/shared-enrollment-v1.json";

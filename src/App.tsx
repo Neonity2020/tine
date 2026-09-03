@@ -114,7 +114,13 @@ import {
   saveBaselineFor,
 } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
-import { backend, isTauri, type GraphChange, type GraphChangedBulk } from "./backend";
+import {
+  SparseShutdownRefusedError,
+  backend,
+  isTauri,
+  type GraphChange,
+  type GraphChangedBulk,
+} from "./backend";
 import { parserFailed } from "./render/parse";
 import { warnIfSoftwareRendering } from "./gpu";
 import { initSmoothScroll } from "./smoothScroll";
@@ -1322,7 +1328,7 @@ export function App(): JSX.Element {
           await backend().closeGraphWindow();
           return;
         } catch (error) {
-          if (String(error).includes("sparse-v2-shutdown-refused")) {
+          if (error instanceof SparseShutdownRefusedError) {
             allowClose = false;
             safeClose.reset();
             closeInProgress = false;

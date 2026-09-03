@@ -121,7 +121,15 @@ import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
 import { settingsMaximized, setSettingsMaximized } from "../settingsLayout";
 import { flushAll } from "../store";
-import { backend, isTauri, type BackupInfo } from "../backend";
+import {
+  AdoptionArchivedError,
+  ManagedGraphMismatchError,
+  SharedFrontierMismatchError,
+  SyncDataUnavailableError,
+  backend,
+  isTauri,
+  type BackupInfo,
+} from "../backend";
 import { dbg } from "../debug";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, PageEntry, SparseV2ActivationProgress, SparseV2AdoptionResult, SparseV2CancelResult, SparseV2Status } from "../types";
 import { managedStorageRuntime } from "../managedStorageRuntime";
@@ -2485,12 +2493,11 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
    * the part a raw refusal string never says.
    * (`join_shared_clean` in crates/tine-core/src/sync_runtime.rs.)
    */
-  const joinFailureRemedy = (detail: string): string | null => {
-    // The native side writes a three-paragraph explanation for this one, and
-    // the panel keeps only its first line — which is the dead end the native
-    // text was written to replace. Re-author the rest here, where nothing has
-    // to survive redaction. The relative path is a constant, not user data.
-    if (detail.includes("does not yet contain sync data")) {
+  const joinFailureRemedy = (error: unknown): string | null => {
+    // The native side carries only a fixed kind. Author the explanation here,
+    // where wording is not load-bearing. The relative path is a constant, not
+    // user data.
+    if (error instanceof SyncDataUnavailableError) {
       return (
         "Nothing was changed on this device. Tine looked for "
         + `${SHARED_ENROLLMENT_RELATIVE_PATH} inside this graph's folder. `
@@ -2500,7 +2507,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         + "unless you tell them not to."
       );
     }
-    if (detail.includes("names another managed graph")) {
+    if (error instanceof ManagedGraphMismatchError) {
       return (
         "Nothing was changed on either device. This device's Tine-managed storage is its own separate history, "
         + "not the one the other device is sharing, and Tine will not merge two histories. "
@@ -2508,7 +2515,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         + "than deleting it. Use the join action again and accept the second prompt when you are ready."
       );
     }
-    if (detail.includes("not in the shared provider frontier")) {
+    if (error instanceof SharedFrontierMismatchError) {
       return (
         "Nothing was changed on either device. This device's notes differ from the shared graph, and a join can only "
         + "adopt a history whose notes already match. Let the other device's changes finish arriving, or reconcile the "
@@ -2797,14 +2804,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
    * The refused join changed nothing on either device: the native branch
    * compares identities before it stops the actor or opens the provider.
    */
-  /**
-   * The one adoption failure whose remedy depends on how far it got. The
-   * native side marks it with a stable phrase because the panel keeps only the
-   * first line of a native error, and the archive location is worth more here
-   * than anywhere else.
-   */
-  const adoptionFailureRemedy = (detail: string, location: string | null): string | null => {
-    if (!detail.includes("after this device's own history was archived")) return null;
+  /** The one typed adoption failure whose remedy depends on how far it got. */
+  const adoptionFailureRemedy = (error: unknown, location: string | null): string | null => {
+    if (!(error instanceof AdoptionArchivedError)) return null;
     return (
       "This device's own history is preserved"
       + (location ? ` in ${location}` : " in Tine's application data folder")
@@ -2831,7 +2833,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         safeManagedErrorDetail(error),
         // Adoption raises the same not-yet refusal as the join it follows,
         // and the panel truncates it the same way.
-        adoptionFailureRemedy(String(error), location) ?? joinFailureRemedy(String(error))
+        adoptionFailureRemedy(error, location) ?? joinFailureRemedy(error)
       );
       return true;
     }
@@ -2857,11 +2859,11 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
    */
   const reportJoinRefusal = async (
     summary: string,
-    detail: string,
+    error: unknown,
     visible: string,
     copy = visible,
   ) => {
-    if (detail.includes("names another managed graph")) {
+    if (error instanceof ManagedGraphMismatchError) {
       try {
         if (await offerAdoption()) return;
       } catch (error) {
@@ -2869,7 +2871,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
         return;
       }
     }
-    reportManagedFailure(summary, visible, joinFailureRemedy(detail), copy);
+    reportManagedFailure(summary, visible, joinFailureRemedy(error), copy);
   };
 
   const joinShare = async (options: { fromManaged: boolean } = { fromManaged: false }) => {
@@ -2897,7 +2899,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       const joinDetail = managedJoinErrorDetail(error);
       await reportJoinRefusal(
         "Couldn't join the synced graph",
-        String(error),
+        error,
         joinDetail.visible,
         joinDetail.copy,
       );

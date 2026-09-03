@@ -11091,9 +11091,8 @@ fn clean_share_preparation_survives_a_shared_provider_rename_capability_refusal(
 
 /// The other half of the capability policy. `EIO` is a disk error, not a
 /// filesystem saying "I do not implement that flag", so share preparation
-/// still fails closed — and the refusal names the primitive and both names
-/// rather than reporting a bare `os error 5`, because a device receipt that
-/// carries only an errno costs a ~20-minute CI round trip to localise.
+/// still fails closed. Packet E deliberately retains only ErrorKind at the
+/// ScenarioError boundary; source prose and path names do not cross it.
 #[cfg(unix)]
 #[test]
 fn a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_preparation() {
@@ -11102,12 +11101,9 @@ fn a_non_capability_errno_from_a_shared_provider_rename_still_refuses_share_prep
     let refusal =
         prepared.expect_err("a real I/O error during share preparation must not be tolerated");
     let detail = refusal.to_string();
-    assert!(
-        detail
-            .contains("renameat2(RENAME_NOREPLACE) quarantining abandoned shared provider staging")
-            && detail.contains("->"),
-        "the refusal must name the operation and both names: {detail}"
-    );
+    let kind = std::io::Error::from_raw_os_error(libc::EIO).kind();
+    assert!(detail.contains(&format!("{kind:?}")), "{detail}");
+    assert!(!detail.contains("renameat2") && !detail.contains("->"));
 }
 
 #[test]
@@ -11399,31 +11395,9 @@ fn shared_provider_clean_late_join_refuses_unmatched_local_graph_without_changin
         .unwrap();
     let graph_before = user_graph_bytes(&joiner.graph_root);
     let refusal = joiner_handle.join_shared(descriptor).unwrap_err();
-    // `da0390b9 fix(sync): explain clean join semantic mismatches` replaced
-    // the single "contains semantic changes" sentence with a counted,
-    // content-free first line plus local-only detail lines, so a user can
-    // see WHICH note blocks the join. The user-visible outcome asserted
-    // here is unchanged: the join is refused, it names the unmatched local
-    // note, and it never prints that note's content.
-    assert!(
-        refusal
-            .to_string()
-            .contains("not in the shared provider frontier"),
-        "{refusal}"
-    );
-    assert!(
-        refusal.to_string().contains("local-only=1 shared-only=0"),
-        "{refusal}"
-    );
-    assert!(
-        refusal
-            .to_string()
-            .contains("clean join mismatch detail: local-only path=\"notes/local-only.md\""),
-        "{refusal}"
-    );
-    assert!(
-        !refusal.to_string().contains("unmatched local work"),
-        "{refusal}"
+    assert_eq!(
+        refusal.to_string(),
+        r#"{"kind":"shared-frontier-mismatch"}"#
     );
     assert_eq!(
         read_activation_marker(&joiner.request.enrollment_root)
@@ -13731,10 +13705,7 @@ fn an_independently_activated_device_cannot_join_another_devices_managed_graph()
 
     let refusal = adopter_handle.join_shared(descriptor).unwrap_err();
 
-    assert_eq!(
-        refusal.to_string(),
-        "sync actor refused request: clean shared descriptor names another managed graph"
-    );
+    assert_eq!(refusal.to_string(), r#"{"kind":"managed-graph-mismatch"}"#);
     assert_eq!(
         read_activation_marker(&adopter.request.enrollment_root)
             .unwrap()
@@ -13777,10 +13748,7 @@ fn a_partially_matching_lineage_is_refused_by_the_same_identity_check() {
 
     let refusal = adopter_handle.join_shared(descriptor).unwrap_err();
 
-    assert_eq!(
-        refusal.to_string(),
-        "sync actor refused request: clean shared descriptor names another managed graph"
-    );
+    assert_eq!(refusal.to_string(), r#"{"kind":"managed-graph-mismatch"}"#);
     assert_eq!(user_graph_bytes(&adopter.graph_root), graph_before);
     assert!(matches!(
         adopter_handle.clean_shutdown(),
@@ -13947,23 +13915,10 @@ fn adoption_stops_on_unconverged_files_and_leaves_the_archive_readable() {
 
     let refusal = adopted_handle.join_shared(descriptor).unwrap_err();
 
-    assert!(
-        refusal
-            .to_string()
-            .contains("not in the shared provider frontier"),
-        "{refusal}"
+    assert_eq!(
+        refusal.to_string(),
+        r#"{"kind":"shared-frontier-mismatch"}"#
     );
-    assert!(
-        refusal.to_string().contains("local-only=1 shared-only=0"),
-        "{refusal}"
-    );
-    assert!(
-        refusal.to_string().contains(
-            "clean join mismatch detail: local-only path=\"notes/unconverged local page.md\""
-        ),
-        "{refusal}"
-    );
-    assert!(!refusal.to_string().contains("still only on this device"));
     assert_eq!(
         user_graph_bytes(&adopter.graph_root),
         graph_before,
