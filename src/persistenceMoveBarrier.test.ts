@@ -114,10 +114,9 @@ describe("cross-page move barrier vs keep-mine", () => {
     markDirty("Dest");
     await flushPage("Dest");
 
-    // Give the re-issued forced save its microtask.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(saved.map((entry) => entry.name)).toContain("Source");
+    // Wait for the re-issued forced save rather than assuming one microtask
+    // is enough for it; the assertion below is what we are waiting on.
+    await vi.waitFor(() => expect(saved.map((entry) => entry.name)).toContain("Source"));
     expect(saved.find((entry) => entry.name === "Source")?.force).toBe(true);
   });
 
