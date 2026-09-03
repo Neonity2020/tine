@@ -41,7 +41,7 @@ const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "crates/tine-core/src/oplog/import.rs", lines: &[1712, 1725], macro_name: "eprintln", class: "fixed-debug", why: "clean-genesis recovery reports one of two fixed states", gate: "TINE_DEBUG" },
     AllowedSite { file: "crates/tine-core/src/oplog/local_journal_drain.rs", lines: &[846, 873, 889, 914], macro_name: "eprintln", class: "numeric-trace", why: "managed-local drain timings contain fixed labels and durations", gate: "TINE_PHASE_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/object_store.rs", lines: &[1888], macro_name: "eprintln", class: "enum-trace", why: "immutable publication reports only a fixed artifact class", gate: "TINE_PUBLISH_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2854, 2959, 3149, 3193], macro_name: "eprintln", class: "directed-core-trace", why: "projection diagnostics are available only for an explicitly directed phase trace", gate: "TINE_PHASE_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2870, 2975, 3165, 3209], macro_name: "eprintln", class: "directed-core-trace", why: "projection diagnostics are available only for an explicitly directed phase trace", gate: "TINE_PHASE_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/semantic.rs", lines: &[935], macro_name: "eprintln", class: "numeric-trace", why: "semantic snapshot diagnostic contains counts and encoded byte sizes", gate: "TINE_SEMANTIC_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", lines: &[1893, 4501, 4505, 4512, 4525, 4537, 4545, 4557, 5317], macro_name: "eprintln", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_TERMINAL_TRACE" },
     AllowedSite { file: "crates/tine-core/src/publish.rs", lines: &[4400, 4430], macro_name: "eprintln", class: "content-free-debug", why: "publication refusals report only a fixed shape or collision count", gate: "runtime_debug_diagnostics_enabled" },
@@ -53,7 +53,7 @@ const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[21550], macro_name: "eprintln", class: "numeric-trace", why: "actor tick report contains a fixed branch label, duration, and pending count", gate: "TINE_TICK_TRACE" },
     AllowedSite { file: "src-tauri/src/data_home.rs", lines: &[128], macro_name: "eprintln", class: "fixed-terminal-failure", why: "fatal startup guidance is a fixed literal with no path or raw error", gate: "always-on fatal startup" },
     AllowedSite { file: "src-tauri/src/debug.rs", lines: &[71, 75, 89], macro_name: "eprintln", class: "directed-native-debug", why: "detailed native stderr is available only under the existing debug opt-in", gate: "debug_enabled" },
-    AllowedSite { file: "src-tauri/src/debug.rs", lines: &[347], macro_name: "eprintln", class: "content-free-error", why: "flight-recorder setup failure carries only its I/O error", gate: "always-on reviewed failure" },
+    AllowedSite { file: "src-tauri/src/debug.rs", lines: &[368], macro_name: "eprintln", class: "content-free-error", why: "flight-recorder setup failure carries only its I/O error", gate: "always-on reviewed failure" },
 ];
 
 fn print_sites() -> Vec<PrintSite> {
