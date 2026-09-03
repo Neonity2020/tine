@@ -1,12 +1,34 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { classifyNativeCallError, SaveConflictError } from "./backend";
+import { classifyNativeCallError, DirectSaveFailureError, SaveConflictError } from "./backend";
 import { isRetryableSaveFailure, isSaveConflictFailure } from "./persistence";
 
 // Every native rejection is classified once at the frontend funnel. Direct
 // save codes and conflict epochs arrive as tagged fields, never prose.
 
 describe("native call error funnel", () => {
+  it("classifies the exact legacy literals emitted by the phase-A producer manifest", () => {
+    const conflict = '{"detail":{"epoch":7,"io_error_kind":"AlreadyExists"},"kind":"save-conflict","reason_code":"conflict.base_rev"}';
+    const failure = '{"detail":{"io_error_kind":"PermissionDenied"},"kind":"direct-save-failure","reason_code":"unknown"}';
+    const shutdown = '{"kind":"sparse-shutdown-refused"}';
+
+    const classifiedConflict = classifyNativeCallError(conflict);
+    expect(classifiedConflict).toBeInstanceOf(SaveConflictError);
+    expect(classifiedConflict).toMatchObject({
+      reasonCode: "conflict.base_rev",
+      epoch: 7,
+    });
+    const classifiedFailure = classifyNativeCallError(failure);
+    expect(classifiedFailure).toBeInstanceOf(DirectSaveFailureError);
+    expect(classifiedFailure).toMatchObject({
+      reasonCode: "unknown",
+      ioErrorKind: "PermissionDenied",
+    });
+    expect(classifyNativeCallError(shutdown)).toMatchObject({ kind: "sparse-shutdown-refused" });
+    expect(classifyNativeCallError("query-too-large: 2049 bytes")).toBe("query-too-large: 2049 bytes");
+    expect(classifyNativeCallError("legacy prose")).toBe("legacy prose");
+  });
+
   it("types the tagged conflict payload and passes prose through untouched", () => {
     const typed = classifyNativeCallError(JSON.stringify({
       kind: "save-conflict",

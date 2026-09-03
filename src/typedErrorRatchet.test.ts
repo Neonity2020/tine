@@ -236,6 +236,47 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(contract).not.toContain("item 3 checkpoint");
     expect(contract).toContain("TauriBackend.call");
 
+    const commandError = source("src-tauri/src/command_error.rs");
+    const commands = source("src-tauri/src/commands.rs");
+    const state = source("src-tauri/src/state.rs");
+    const parity = source("src-tauri/src/backend_command_parity.rs");
+    expect(commandError).toContain("impl Serialize for CommandError");
+    expect(commandError).toContain("serializer.serialize_str(&self.wire())");
+    expect(commandError).not.toMatch(/impl From<(?:String|&str)> for CommandError/);
+    expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
+    expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
+    expect(contract).toContain("## Phase-A `CommandError` boundary");
+    expect(contract).toContain("The mechanically derived census has 113 production sites");
+
+    const quitFixtures = commands.slice(
+      commands.indexOf("mod prepare_tine_quit_tests"),
+      commands.indexOf("pub(crate) fn read_local_image"),
+    );
+    const proseSites = (commands.match(/CommandError::prose/g) ?? []).length
+      - (quitFixtures.match(/CommandError::prose/g) ?? []).length
+      + (state.match(/CommandError::prose/g) ?? []).length;
+    expect(proseSites).toBe(113);
+
+    const phaseB = parity.slice(
+      parity.indexOf("const PHASE_B_FALLIBLE"),
+      parity.indexOf("const INFALLIBLE"),
+    );
+    const phaseBRows = [...phaseB.matchAll(/\("([^"]+\.rs)", "([^"]+)"\)/g)];
+    expect(phaseBRows.length).toBeGreaterThan(50);
+    for (const [, file, command] of phaseBRows) {
+      expect(contract).toContain(`\`${file}\``);
+      expect(contract).toContain(`\`${command}\``);
+    }
+
+    for (const heading of ["### Conversion table", "### E2b phase-B pin", "### `Prose` census"]) {
+      const start = contract.indexOf(heading);
+      const end = contract.indexOf("\n##", start + heading.length);
+      const section = contract.slice(start, end < 0 ? undefined : end);
+      const rows = section.split("\n").filter((line) => line.startsWith("|") && !line.includes("---"));
+      expect(rows.length, `${heading} must retain a header and checked rows`).toBeGreaterThan(1);
+      for (const row of rows) expect(row.split("|").length).toBe(7);
+    }
+
     const cleanEnum = runtime.slice(
       runtime.indexOf("pub(crate) enum CleanOpenError"),
       runtime.indexOf("impl CleanOpenError"),

@@ -45,6 +45,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Phase-A native commands now keep typed errors to the Tauri boundary without
+  changing rejection bytes.** `CommandError` retains tagged, coded, I/O,
+  worker, Tauri, and core sources behind one legacy-string serializer; the
+  remaining native command files are explicitly assigned to W4-E2b.
+
 - **Backend refusal handling now branches on typed error kinds instead of
   English wording.** Native control-flow failures use bounded JSON tags, one
   frontend funnel constructs the existing error family, panic records retain

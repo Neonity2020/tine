@@ -174,7 +174,7 @@ pub(crate) async fn create_graph_verification(
     if operation_id.is_empty() || operation_id.len() > 128 {
         return Err("invalid graph verification operation id".into());
     }
-    let slot = slot_for_context(&state)?;
+    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
     drop(state);
     let cancelled = Arc::new(AtomicBool::new(false));
     {
@@ -195,9 +195,12 @@ pub(crate) async fn create_graph_verification(
     };
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
-        let manifest = slot.with_filesystem_graph(|graph| {
-            build_manifest(graph, &app, &operation_id, &cancelled)
-        })?;
+        let manifest = slot
+            .with_filesystem_graph(|graph| {
+                build_manifest(graph, &app, &operation_id, &cancelled)
+                    .map_err(crate::command_error::CommandError::prose)
+            })
+            .map_err(|error| error.to_string())?;
         let total_bytes = manifest
             .files
             .iter()

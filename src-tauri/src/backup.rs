@@ -21,7 +21,7 @@ const ASSET_RESTORE_RECOVERY_DIR: &str = ".tine-restore-recovery";
 static BACKUP_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) -> Result<(), String> {
-    let graph = slot.legacy_graph()?;
+    let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
     let source = BackupSource::from_graph(&graph);
     drop(graph);
     std::thread::spawn(move || {
@@ -420,8 +420,8 @@ pub(crate) fn set_backup_keep(
         json["backup_keep"] = serde_json::json!(keep);
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
-    let slot = slot_for_context(&state)?;
-    let graph = slot.legacy_graph()?;
+    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
+    let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
     if let Some(base) = backup_base(&app, &graph) {
         prune_backups(&base, keep);
     }
@@ -474,7 +474,12 @@ pub(crate) async fn list_backups(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<Vec<BackupInfo>, String> {
-    let root = slot_for_context(&state)?.legacy_graph()?.root.clone();
+    let root = slot_for_context(&state)
+        .map_err(|error| error.to_string())?
+        .legacy_graph()
+        .map_err(|error| error.to_string())?
+        .root
+        .clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(base) = backup_base_for_root(&app, &root) else {
             return Vec::new();
@@ -534,8 +539,10 @@ pub(crate) async fn restore_backup(
     {
         return Err("invalid backup id".into());
     }
-    let slot = slot_for_context(&state)?;
-    let graph = slot.legacy_graph_cloned()?;
+    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
+    let graph = slot
+        .legacy_graph_cloned()
+        .map_err(|error| error.to_string())?;
     let source = BackupSource::from_graph(&graph);
     let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -546,7 +553,7 @@ pub(crate) async fn restore_backup(
     })
     .await
     .map_err(|error| error.to_string())??;
-    crate::state::refresh_graph(&state)
+    crate::state::refresh_graph(&state).map_err(|error| error.to_string())
 }
 
 fn restore_from_backup_source(

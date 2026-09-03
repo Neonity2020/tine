@@ -6198,6 +6198,26 @@
    "notes": "Availability/recovery, not rank 1: Direct Files bytes remain unchanged. Three subprocess-abort cuts cover baseline publication, SQLite publication, and final source verification before the marker commit."
   },
   {
+   "id": "REG-W4-E2-COMMAND-ERROR-PHASE-A-001",
+   "title": "Phase-A backend refusals retain their typed producer while preserving the legacy rejection string",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-E2; invariants I-9, I-11, I-12"},
+   "platforms": ["linux", "windows", "macos", "android", "ios"],
+   "layer": "rust-tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/command_error.rs::tests::phase_a_production_wire_matches_legacy",
+     "src-tauri/src/backend_command_parity.rs::tests::phase_a_command_error_manifest_is_exact_for_every_target",
+     "src/backendCallFunnel.test.ts",
+     "src/typedErrorRatchet.test.ts"
+    ],
+    "scenario": "backend-errors.phase-a-command-error-keeps-kind-and-wire",
+    "failBefore": "Before W4-E2 every fallible phase-A command returned String, so typed I/O, worker, core, and DirectSaveError sources were flattened before the Tauri boundary and a blanket Prose wrapper could pass every wire-only check."
+   },
+   "notes": "CommandError has one custom string serializer, no From<String>, producer-coupled family goldens, and a per-target registration guard; E2b owns the receipt-listed command remainder."
+  },
+  {
    "id": "REG-W4-E4-DIRECT-SAVE-TYPED-CODE-001",
    "title": "Direct save failures retain the producer code when page text resembles a conflict",
    "family": "direct-save-typed-errors",

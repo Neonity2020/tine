@@ -13,6 +13,7 @@ mod android_system_bars;
 #[cfg(test)]
 mod backend_command_parity;
 mod backup;
+mod command_error;
 mod commands;
 mod conflict_capsule;
 mod data_home;

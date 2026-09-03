@@ -203,7 +203,7 @@ pub(crate) struct CaptureGraphBindingResult {
 /// it again to learn the generation it must present with IPC.
 pub(crate) fn refresh_capture_graph_binding(state: &AppState) -> Result<u64, String> {
     let target = capture_target_for_state(state)?;
-    let slot = slot_for_window(state, &target)?;
+    let slot = slot_for_window(state, &target).map_err(|error| error.to_string())?;
     let binding_generation = slot.binding_generation;
     state.bind_capture_graph(target, binding_generation);
     Ok(binding_generation)
@@ -369,7 +369,7 @@ pub(crate) fn inspect_graph_access(
 ) -> Result<GraphAccessInspection, String> {
     let root = resolve_root(&path)
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
-    let root = canonical_graph_root(&root)?;
+    let root = canonical_graph_root(&root).map_err(|error| error.to_string())?;
     let external = Graph::external_assets_target(&root).map_err(|error| error.to_string())?;
     let approved_target =
         approved_external_assets(&app, &root).and_then(|path| std::fs::canonicalize(path).ok());
@@ -391,7 +391,7 @@ pub(crate) fn approve_external_assets(
     assets_path: String,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let root = canonical_graph_root(&graph_root)?;
+    let root = canonical_graph_root(&graph_root).map_err(|error| error.to_string())?;
     let live = Graph::external_assets_target(&root)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "graph no longer uses an external assets directory".to_string())?;
@@ -526,7 +526,8 @@ fn publish_direct_files_slot(
         .graphs
         .write()
         .unwrap()
-        .bind(window_label.to_string(), Arc::clone(&slot))?;
+        .bind(window_label.to_string(), Arc::clone(&slot))
+        .map_err(|error| error.to_string())?;
     state.note_focused(window_label);
     poke_watcher(state);
     Ok((slot, warm_generation))
@@ -659,7 +660,7 @@ pub(crate) fn load_graph_for_label(
     let mut previous = started;
     let root = resolve_root(&path)
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
-    let root_key = canonical_graph_root(&root)?;
+    let root_key = canonical_graph_root(&root).map_err(|error| error.to_string())?;
     state
         .storage_supervisor
         .select_window_root(window_label, root_key.clone());
@@ -680,7 +681,7 @@ pub(crate) fn load_graph_for_label(
     )?;
     if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
         if owner == window_label {
-            let slot = slot_for_window(&state, &owner)?;
+            let slot = slot_for_window(&state, &owner).map_err(|error| error.to_string())?;
             state.storage_supervisor.finish_transition(
                 app,
                 lookup_id,
@@ -875,6 +876,7 @@ pub(crate) fn load_graph_for_label(
                 .write()
                 .unwrap()
                 .bind(window_label.to_string(), Arc::clone(&slot))
+                .map_err(|error| error.to_string())
         }) {
             // A newer operation (especially emergency Direct Files or a graph
             // switch) owns publication now. Completing this stale managed
@@ -1009,7 +1011,8 @@ pub(crate) fn load_graph_for_label(
             source_generation,
         ) {
             Ok(_) => {
-                let managed = slot_for_window(state, window_label)?;
+                let managed =
+                    slot_for_window(state, window_label).map_err(|error| error.to_string())?;
                 Ok(LoadGraphResult::Loaded {
                     meta: managed.graph_meta(),
                     binding_generation: managed.binding_generation,
@@ -1180,12 +1183,14 @@ pub(crate) async fn begin_direct_cross_page_move(
     sources: Vec<tine_core::model::PageDto>,
     state: crate::state::GraphContext<'_>,
 ) -> Result<Option<String>, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let app_state = app.state::<AppState>();
         let slot =
-            crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
-        let graph = slot.legacy_graph()?;
+            crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))
+                .map_err(|error| error.to_string())?;
+        let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             crate::debug::diag(
                 "Direct move recovery store unavailable; this cross-page move is unbracketed"
@@ -1237,12 +1242,14 @@ pub(crate) async fn finish_direct_cross_page_move(
     move_id: String,
     state: crate::state::GraphContext<'_>,
 ) -> Result<bool, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let app_state = app.state::<AppState>();
         let slot =
-            crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))?;
-        let graph = slot.legacy_graph()?;
+            crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))
+                .map_err(|error| error.to_string())?;
+        let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             return Ok(false);
         };
@@ -1290,7 +1297,9 @@ pub(crate) fn warm_cache_async(
     slot: Arc<GraphSlot>,
     warm_generation: u64,
 ) -> Result<(), String> {
-    let graph = slot.legacy_graph_cloned()?;
+    let graph = slot
+        .legacy_graph_cloned()
+        .map_err(|error| error.to_string())?;
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
@@ -1344,7 +1353,8 @@ pub(crate) fn warm_done(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    Ok(slot_for_window(&state, window.label())?
+    Ok(slot_for_window(&state, window.label())
+        .map_err(|error| error.to_string())?
         .warm_done
         .load(Ordering::Acquire))
 }

@@ -1,3 +1,4 @@
+use crate::command_error::CommandError;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -131,10 +132,10 @@ pub(crate) struct AssetStreamResolution {
     pub(crate) path: PathBuf,
 }
 
-fn require_legacy_authority(kind: GraphAuthorityKind) -> Result<(), String> {
+fn require_legacy_authority(kind: GraphAuthorityKind) -> Result<(), CommandError> {
     match kind {
         GraphAuthorityKind::Legacy => Ok(()),
-        GraphAuthorityKind::SparseV2 => Err(SPARSE_V2_UNSUPPORTED.into()),
+        GraphAuthorityKind::SparseV2 => Err(CommandError::prose(SPARSE_V2_UNSUPPORTED)),
     }
 }
 
@@ -146,7 +147,7 @@ impl GraphAuthority {
         }
     }
 
-    fn legacy_graph_cloned(&self) -> Result<Arc<Graph>, String> {
+    fn legacy_graph_cloned(&self) -> Result<Arc<Graph>, CommandError> {
         require_legacy_authority(self.kind())?;
         match self {
             Self::Legacy(graph) => Ok(Arc::clone(graph)),
@@ -263,7 +264,7 @@ impl GraphSlot {
     }
 
     /// The legacy-only authority gate used by all existing Tauri graph paths.
-    pub(crate) fn legacy_graph(&self) -> Result<LegacyGraphLease, String> {
+    pub(crate) fn legacy_graph(&self) -> Result<LegacyGraphLease, CommandError> {
         let graph = self.authority.legacy_graph_cloned()?;
         let tracker = self
             .legacy_leases
@@ -271,12 +272,12 @@ impl GraphSlot {
             .expect("legacy authority always has a lease tracker");
         let mut state = tracker.state.lock().unwrap();
         if state.retiring {
-            return Err("legacy graph authority is retiring".into());
+            return Err(CommandError::prose("legacy graph authority is retiring"));
         }
         state.active = state
             .active
             .checked_add(1)
-            .ok_or("legacy graph lease count exhausted")?;
+            .ok_or_else(|| CommandError::prose("legacy graph lease count exhausted"))?;
         drop(state);
         Ok(LegacyGraphLease {
             graph,
@@ -285,7 +286,7 @@ impl GraphSlot {
     }
 
     /// Clone the legacy writer only after the authority gate has admitted it.
-    pub(crate) fn legacy_graph_cloned(&self) -> Result<LegacyGraphLease, String> {
+    pub(crate) fn legacy_graph_cloned(&self) -> Result<LegacyGraphLease, CommandError> {
         self.legacy_graph()
     }
 
@@ -360,8 +361,8 @@ impl GraphSlot {
     /// `Graph::ensure_config_write_target`, without graph-text authority.
     pub(crate) fn with_config_graph<T>(
         &self,
-        f: impl FnOnce(&Graph) -> Result<T, String>,
-    ) -> Result<T, String> {
+        f: impl FnOnce(&Graph) -> Result<T, CommandError>,
+    ) -> Result<T, CommandError> {
         self.with_filesystem_graph(f)
     }
 
@@ -375,8 +376,8 @@ impl GraphSlot {
     /// `tine-core`, at `Graph::admit_managed_text_writer`.
     pub(crate) fn with_trash_graph<T>(
         &self,
-        f: impl FnOnce(&Graph) -> Result<T, String>,
-    ) -> Result<T, String> {
+        f: impl FnOnce(&Graph) -> Result<T, CommandError>,
+    ) -> Result<T, CommandError> {
         self.with_filesystem_graph(f)
     }
 
@@ -385,8 +386,8 @@ impl GraphSlot {
     /// cache; graph-semantic commands must use the application actor instead.
     pub(crate) fn with_filesystem_graph<T>(
         &self,
-        f: impl FnOnce(&Graph) -> Result<T, String>,
-    ) -> Result<T, String> {
+        f: impl FnOnce(&Graph) -> Result<T, CommandError>,
+    ) -> Result<T, CommandError> {
         match &self.authority {
             GraphAuthority::Legacy(_) => {
                 let lease = self.legacy_graph()?;
@@ -424,7 +425,7 @@ impl GraphSlot {
     }
 
     /// Prevent new legacy work before the registry binding is removed.
-    pub(crate) fn begin_legacy_retirement(&self) -> Result<(), String> {
+    pub(crate) fn begin_legacy_retirement(&self) -> Result<(), CommandError> {
         require_legacy_authority(self.authority.kind())?;
         let tracker = self
             .legacy_leases
@@ -438,34 +439,34 @@ impl GraphSlot {
 
     /// Bounded proof that no watcher, background task, or command can still use
     /// this legacy `Graph`.
-    pub(crate) fn wait_for_legacy_drain(&self, timeout: Duration) -> Result<(), String> {
+    pub(crate) fn wait_for_legacy_drain(&self, timeout: Duration) -> Result<(), CommandError> {
         let tracker = self
             .legacy_leases
             .as_ref()
-            .ok_or_else(|| SPARSE_V2_UNSUPPORTED.to_string())?;
+            .ok_or_else(|| CommandError::prose(SPARSE_V2_UNSUPPORTED))?;
         let deadline = Instant::now() + timeout;
         let mut state = tracker.state.lock().unwrap();
         while state.active != 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(format!(
+                return Err(CommandError::prose(format!(
                     "legacy graph authority did not drain {} retained lease(s)",
                     state.active
-                ));
+                )));
             }
             let (next, wait) = tracker.drained.wait_timeout(state, remaining).unwrap();
             state = next;
             if wait.timed_out() && state.active != 0 {
-                return Err(format!(
+                return Err(CommandError::prose(format!(
                     "legacy graph authority did not drain {} retained lease(s)",
                     state.active
-                ));
+                )));
             }
         }
         Ok(())
     }
 
-    pub(crate) fn cancel_legacy_retirement(&self) -> Result<(), String> {
+    pub(crate) fn cancel_legacy_retirement(&self) -> Result<(), CommandError> {
         require_legacy_authority(self.authority.kind())?;
         let tracker = self
             .legacy_leases
@@ -482,7 +483,7 @@ impl GraphSlot {
     /// assignment, not the particular in-memory `Graph` instance. Minting a new
     /// generation here made every later command from that window stale after a
     /// config refresh, including autosaves.
-    fn refreshed(graph: Graph, old: &GraphSlot) -> Result<Self, String> {
+    fn refreshed(graph: Graph, old: &GraphSlot) -> Result<Self, CommandError> {
         // Refresh is a legacy whole-graph reopen. Refuse before replacing the
         // slot so a sparse actor remains the sole authority for its binding.
         let old_graph = old.legacy_graph()?;
@@ -531,16 +532,20 @@ impl GraphRegistry {
         self.by_window.len()
     }
 
-    pub(crate) fn bind(&mut self, window: WindowKey, slot: Arc<GraphSlot>) -> Result<(), String> {
+    pub(crate) fn bind(
+        &mut self,
+        window: WindowKey,
+        slot: Arc<GraphSlot>,
+    ) -> Result<(), CommandError> {
         for (root, owner) in &self.by_root {
             if owner != &window
                 && (root.starts_with(&slot.root_key) || slot.root_key.starts_with(root))
             {
-                return Err(format!(
+                return Err(CommandError::prose(format!(
                     "graph {} overlaps graph {} already owned by window {owner}",
                     slot.root_key.display(),
                     root.display()
-                ));
+                )));
             }
         }
         if let Some(old) = self.by_window.insert(window.clone(), slot.clone()) {
@@ -567,20 +572,20 @@ impl GraphRegistry {
         expected_generation: u64,
         expected_root: &Path,
         successor: Arc<GraphSlot>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         let current = self
             .by_window
             .get(window)
-            .ok_or_else(|| "stale-graph-binding".to_owned())?;
+            .ok_or_else(|| CommandError::prose("stale-graph-binding"))?;
         if current.binding_generation != expected_generation || current.root_key != expected_root {
-            return Err("stale-graph-binding".into());
+            return Err(CommandError::prose("stale-graph-binding"));
         }
         if successor.root_key != expected_root
             || successor.binding_generation == expected_generation
         {
-            return Err(
-                "managed recovery successor does not replace the expected graph binding".into(),
-            );
+            return Err(CommandError::prose(
+                "managed recovery successor does not replace the expected graph binding",
+            ));
         }
         self.bind(window.to_owned(), successor)
     }
@@ -657,10 +662,12 @@ pub(crate) struct GraphContext<'a, R: Runtime = tauri::Wry> {
 
 pub(crate) fn owned_graph_context(
     state: GraphContext<'_>,
-) -> Result<(tauri::AppHandle, String, u64), String> {
+) -> Result<(tauri::AppHandle, String, u64), CommandError> {
     let app = state.window.app_handle().clone();
     let label = state.window.label().to_string();
-    let binding_generation = state.binding_generation.ok_or("missing-graph-binding")?;
+    let binding_generation = state
+        .binding_generation
+        .ok_or_else(|| CommandError::prose("missing-graph-binding"))?;
     drop(state);
     Ok((app, label, binding_generation))
 }
@@ -688,25 +695,32 @@ impl<'r, 'de: 'r, R: Runtime> CommandArg<'de, R> for GraphContext<'r, R> {
     }
 }
 
-pub(crate) fn canonical_graph_root(path: &str) -> Result<PathBuf, String> {
-    let root = std::fs::canonicalize(path)
-        .map_err(|e| format!("couldn't resolve graph path {path}: {e}"))?;
+pub(crate) fn canonical_graph_root(path: &str) -> Result<PathBuf, CommandError> {
+    let root = std::fs::canonicalize(path).map_err(|error| {
+        CommandError::coded("couldn't resolve graph path", format!("{path}: {error}"))
+    })?;
     if !root.is_dir() {
-        return Err(format!("graph path is not a folder: {}", root.display()));
+        return Err(CommandError::prose(format!(
+            "graph path is not a folder: {}",
+            root.display()
+        )));
     }
     Ok(root)
 }
 
-pub(crate) fn slot_for_window(state: &AppState, window: &str) -> Result<Arc<GraphSlot>, String> {
+pub(crate) fn slot_for_window(
+    state: &AppState,
+    window: &str,
+) -> Result<Arc<GraphSlot>, CommandError> {
     state
         .graphs
         .read()
         .unwrap()
         .slot(window)
-        .ok_or_else(|| format!("no graph loaded for window {window}"))
+        .ok_or_else(|| CommandError::prose(format!("no graph loaded for window {window}")))
 }
 
-pub(crate) fn slot_for_context(ctx: &GraphContext<'_>) -> Result<Arc<GraphSlot>, String> {
+pub(crate) fn slot_for_context(ctx: &GraphContext<'_>) -> Result<Arc<GraphSlot>, CommandError> {
     slot_for_bound_window(&ctx.state, ctx.window.label(), ctx.binding_generation)
 }
 
@@ -717,11 +731,12 @@ pub(crate) fn slot_for_bound_window(
     state: &AppState,
     window: &str,
     binding_generation: Option<u64>,
-) -> Result<Arc<GraphSlot>, String> {
+) -> Result<Arc<GraphSlot>, CommandError> {
     let slot = slot_for_window(state, window)?;
-    let generation = binding_generation.ok_or("missing-graph-binding")?;
+    let generation =
+        binding_generation.ok_or_else(|| CommandError::prose("missing-graph-binding"))?;
     if generation != slot.binding_generation {
-        return Err("stale-graph-binding".into());
+        return Err(CommandError::prose("stale-graph-binding"));
     }
     Ok(slot)
 }
@@ -733,20 +748,23 @@ pub(crate) fn capture_quick_switch_slot(
     state: &AppState,
     caller: &str,
     binding_generation: Option<u64>,
-) -> Result<Arc<GraphSlot>, String> {
+) -> Result<Arc<GraphSlot>, CommandError> {
     if caller != "capture" {
-        return Err("capture quick switch is only available to quick capture".into());
+        return Err(CommandError::prose(
+            "capture quick switch is only available to quick capture",
+        ));
     }
     let capture = state
         .capture_graph_binding()
-        .ok_or("no graph bound for quick capture")?;
-    let generation = binding_generation.ok_or("missing-graph-binding")?;
+        .ok_or_else(|| CommandError::prose("no graph bound for quick capture"))?;
+    let generation =
+        binding_generation.ok_or_else(|| CommandError::prose("missing-graph-binding"))?;
     if generation != capture.binding_generation {
-        return Err("stale-graph-binding".into());
+        return Err(CommandError::prose("stale-graph-binding"));
     }
     let slot = slot_for_window(state, &capture.target)?;
     if slot.binding_generation != capture.binding_generation {
-        return Err("stale-graph-binding".into());
+        return Err(CommandError::prose("stale-graph-binding"));
     }
     Ok(slot)
 }
@@ -755,8 +773,8 @@ pub(crate) fn capture_quick_switch_slot(
 /// uses a short-lived root capability and never opens the retained parsed view.
 pub(crate) fn with_filesystem_graph<T>(
     ctx: &GraphContext<'_>,
-    f: impl FnOnce(&Graph) -> Result<T, String>,
-) -> Result<T, String> {
+    f: impl FnOnce(&Graph) -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
     slot_for_context(ctx)?.with_filesystem_graph(f)
 }
 
@@ -764,8 +782,8 @@ pub(crate) fn with_filesystem_graph<T>(
 /// [`GraphSlot::with_config_graph`] for why a managed binding may answer it.
 pub(crate) fn with_config_graph<T>(
     ctx: &GraphContext<'_>,
-    f: impl FnOnce(&Graph) -> Result<T, String>,
-) -> Result<T, String> {
+    f: impl FnOnce(&Graph) -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
     slot_for_context(ctx)?.with_config_graph(f)
 }
 
@@ -773,8 +791,8 @@ pub(crate) fn with_config_graph<T>(
 /// [`GraphSlot::with_trash_graph`] for what it does and does not cover.
 pub(crate) fn with_trash_graph<T>(
     ctx: &GraphContext<'_>,
-    f: impl FnOnce(&Graph) -> Result<T, String>,
-) -> Result<T, String> {
+    f: impl FnOnce(&Graph) -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
     slot_for_context(ctx)?.with_trash_graph(f)
 }
 
@@ -797,7 +815,7 @@ pub(crate) enum RefreshOutcome {
     Deferred,
 }
 
-pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
+pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), CommandError> {
     let label = ctx.window.label().to_string();
     refresh_graph_for_label(
         &ctx.state,
@@ -817,7 +835,7 @@ pub(crate) fn refresh_graph_for_label(
     app: &tauri::AppHandle,
     label: &str,
     wait: RefreshLaneWait,
-) -> Result<RefreshOutcome, String> {
+) -> Result<RefreshOutcome, CommandError> {
     let label = label.to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
     // Serialize the whole operation with graph loads and sparse-v2 promotion.
@@ -833,7 +851,9 @@ pub(crate) fn refresh_graph_for_label(
     };
     let old = slot_for_window(state, &label)?;
     if old.root_key != root_hint {
-        return Err("graph changed while refresh waited for its transition lane".into());
+        return Err(CommandError::prose(
+            "graph changed while refresh waited for its transition lane",
+        ));
     }
     if old.is_sparse_v2() {
         // A managed binding has no legacy graph to reopen, and the reopen below
@@ -850,8 +870,7 @@ pub(crate) fn refresh_graph_for_label(
     }
     old.legacy_graph()?;
     let approved = crate::settings::approved_external_assets(app, &old.root_key);
-    let graph = Graph::open_checked_with_assets(&old.root_key, approved.as_deref())
-        .map_err(|e| e.to_string())?;
+    let graph = Graph::open_checked_with_assets(&old.root_key, approved.as_deref())?;
     // Concord invariant 4: a refresh re-reads configuration, it does not rewrite
     // the tree. Journal filename repairs are proposed and applied explicitly
     // (`apply_journal_filename_migrations`) — a settings change must not rename
@@ -915,7 +934,8 @@ mod tests {
         assert_eq!(
             slot.legacy_graph()
                 .err()
-                .expect("a managed binding must never yield legacy write authority"),
+                .expect("a managed binding must never yield legacy write authority")
+                .to_string(),
             SPARSE_V2_UNSUPPORTED
         );
 
@@ -923,7 +943,7 @@ mod tests {
         slot.with_config_graph(|graph| {
             graph
                 .set_favorites(&["Alpha".to_owned()])
-                .map_err(|error| error.to_string())
+                .map_err(CommandError::from)
         })
         .expect("a managed binding must be able to persist a setting");
         assert!(std::fs::read_to_string(root.join("logseq/config.edn"))
@@ -931,13 +951,13 @@ mod tests {
             .contains(":favorites [\"Alpha\"]"),);
 
         // Orphaned-asset cleanup.
-        slot.with_trash_graph(|graph| graph.trash_asset("orphan.png").map_err(|e| e.to_string()))
+        slot.with_trash_graph(|graph| graph.trash_asset("orphan.png").map_err(CommandError::from))
             .expect("a managed binding must be able to trash an orphaned asset");
         assert!(!root.join("assets/orphan.png").exists());
         slot.with_trash_graph(|graph| {
             graph
                 .trash_sync_conflict(&format!("pages/{conflict}"))
-                .map_err(|error| error.to_string())
+                .map_err(CommandError::from)
         })
         .expect("a managed binding must be able to trash excluded conflict evidence");
         assert!(!root.join("pages").join(conflict).exists());
@@ -949,7 +969,7 @@ mod tests {
                 slot.with_config_graph(|graph| {
                     graph
                         .trash_journal_file("2026_08_07.md")
-                        .map_err(|e| e.to_string())
+                        .map_err(CommandError::from)
                 }),
             ),
             (
@@ -957,7 +977,7 @@ mod tests {
                 slot.with_trash_graph(|graph| {
                     graph
                         .trash_journal_file("2026_08_07.md")
-                        .map_err(|e| e.to_string())
+                        .map_err(CommandError::from)
                 }),
             ),
         ] {
@@ -1020,7 +1040,7 @@ mod tests {
 
         let before = slot.graph_meta().start_of_week;
 
-        slot.with_config_graph(|graph| graph.set_start_of_week(3).map_err(|e| e.to_string()))
+        slot.with_config_graph(|graph| graph.set_start_of_week(3).map_err(CommandError::from))
             .expect("a managed binding must be able to persist a setting");
         assert_ne!(before, 3, "fixture must actually change the value");
         assert_eq!(
@@ -1072,6 +1092,7 @@ mod tests {
             .find("\nimpl<'r, 'de: 'r, R: Runtime> CommandArg")
             .expect("owned graph context helper boundary");
         let helper = &tail[..end];
+        let compact: String = helper.split_whitespace().collect();
         for required in [
             "state.window.app_handle().clone()",
             "state.window.label().to_string()",
@@ -1079,7 +1100,7 @@ mod tests {
             "drop(state)",
         ] {
             assert!(
-                helper.contains(required),
+                compact.contains(required),
                 "owned command context must retain `{required}` before await"
             );
         }
@@ -1109,10 +1130,12 @@ mod tests {
     #[test]
     fn sparse_type_level_legacy_gate_is_stable_and_refresh_is_legacy_only() {
         assert_eq!(
-            require_legacy_authority(GraphAuthorityKind::SparseV2),
-            Err(SPARSE_V2_UNSUPPORTED.into())
+            require_legacy_authority(GraphAuthorityKind::SparseV2)
+                .unwrap_err()
+                .to_string(),
+            SPARSE_V2_UNSUPPORTED
         );
-        assert_eq!(require_legacy_authority(GraphAuthorityKind::Legacy), Ok(()));
+        assert!(require_legacy_authority(GraphAuthorityKind::Legacy).is_ok());
 
         // `GraphSlot::refreshed` starts with the same legacy-only gate before
         // it can construct a replacement, so a sparse binding cannot be
@@ -1235,7 +1258,8 @@ mod tests {
         assert_eq!(
             slot_for_bound_window(&state, "main", Some(captured_generation))
                 .err()
-                .unwrap(),
+                .unwrap()
+                .to_string(),
             "stale-graph-binding"
         );
         let _ = std::fs::remove_dir_all(base);
@@ -1249,8 +1273,8 @@ mod tests {
 
         slot.begin_legacy_retirement().unwrap();
         assert_eq!(
-            slot.legacy_graph().err().as_deref(),
-            Some("legacy graph authority is retiring")
+            slot.legacy_graph().err().unwrap().to_string(),
+            "legacy graph authority is retiring"
         );
         assert!(slot
             .wait_for_legacy_drain(Duration::from_millis(1))
@@ -1338,7 +1362,8 @@ mod tests {
         assert_eq!(
             registry
                 .replace_if_current("main", expected_generation, &base, stale_successor)
-                .unwrap_err(),
+                .unwrap_err()
+                .to_string(),
             "stale-graph-binding"
         );
         assert_eq!(

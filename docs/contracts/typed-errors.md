@@ -1,8 +1,9 @@
 # Typed backend errors
 
-Tine's Tauri command signatures still reject with strings, but any rejection
-that changes frontend control flow crosses that boundary as a fixed-shape JSON
-object:
+Phase A Tauri commands (`commands.rs`) reject with `CommandError`; the E2b
+remainder still uses `String`. `CommandError` deliberately serializes as the
+same JSON string value each command emitted before the migration. A tagged
+error is therefore still a string whose contents are a fixed-shape JSON object:
 
 ```json
 {"kind":"managed-actor-refusal","reason_code":"trusted_local.append_outcome_unknown"}
@@ -128,6 +129,81 @@ type class (`message_kind`).
 The plugin-visible boundary is separate and unchanged. Plugin workers still
 reply with `{ id, ok: false, error: string }`, and the host still exposes that
 as `PluginRuntimeError`; JSON-tagged application errors are not sent to guests.
+
+## Phase-A `CommandError` boundary
+
+The variants are `Tagged`, `Coded`, `Io`, `Worker`, `Tauri`, `Core`, and
+`Prose`. Custom `Serialize` always calls `serialize_str`; an object-valued IPC
+wire is a future product decision, not part of wave 4. `From<String>` and
+`From<&str>` are intentionally absent. `Worker` is constructed only at
+`spawn_blocking(...).await` joins; other `tauri::Error` values use `Tauri`.
+`DirectSaveError` never reaches the generic `Io` conversion because doing so
+would discard its closed reason code and conflict epoch.
+
+### Conversion table
+
+| Source type | Production mapper | Variant | Format family | Owned producer symbols |
+| --- | --- | --- | --- | --- |
+| `DirectSaveError` | `direct_save_error_message` | `Tagged` | tagged reason + detail | `direct_save_error_message` conflict and failure branches |
+| clean shutdown refusal | `CommandError::tagged` | `Tagged` | tagged kind | `close_graph_window` |
+| `std::io::Error` | `CommandError::from` | `Io` | source display | filesystem/`Graph` calls in `commands.rs` and `state.rs` |
+| `tauri::Error` from blocking join | `CommandError::worker` | `Worker` | source display | every `spawn_blocking(...).await` site in `commands.rs` |
+| other `tauri::Error` | `CommandError::from` | `Tauri` | source display | path/window/platform calls in `commands.rs` |
+| `SyncApplicationPageRequestError`, `SyncEditorRequestError`, `SyncLocalMutationRequestError`, `SyncRuntimeRequestError`, `FastCommitError`, `MergeRefused` | `CommandError::from` | `Core` | typed display; page request retains its tagged backend wire | managed request and merge helpers in `commands.rs` |
+| bounded code + detail | `CommandError::coded` | `Coded` | `{code}: {detail}` | query/result budgets, base64 decoding, retained-page conversion, canonical path context |
+| literal/context-only remainder | `CommandError::prose` | `Prose` | unchanged prose | symbols in the census below |
+
+The source manifest in `command_error::tests` records `targets`, `file`,
+`enclosingSymbol`, `sourceErrorType`, `requiredVariant`, `productionMapper`,
+`formatFamily`, `legacyWireTemplate`, and `goldenTest`. Every format family has
+a producer-coupled golden in
+`command_error::tests::phase_a_production_wire_matches_legacy`; the structural
+guard rejects stale registration/manifest rows and a typed source routed to
+`Prose`.
+
+### E2b phase-B pin
+
+Every row temporarily returns `String`; owner `W4-E2b` removes the row. The
+guard expands `all` across desktop, Android, and iOS and checks names rather
+than a population count.
+
+| Target | File | Command names | Temporary error type | E2b owner |
+| --- | --- | --- | --- | --- |
+| all | `graph.rs` | `load_graph`, `inspect_graph_access`, `approve_external_assets`, `begin_direct_cross_page_move`, `finish_direct_cross_page_move`, `open_graph_window`, `capture_target`, `capture_graph_binding`, `create_graph`, `default_graph_parent`, `warm_done` | `String` | W4-E2b |
+| desktop + Android | `android_folder_picker.rs` | `pick_graph_folder` | `String` | W4-E2b |
+| iOS | `ios_folder_picker.rs` | `pick_graph_folder`, `prepare_graph_folder` | `String` | W4-E2b |
+| all | `android_media.rs` | `capture_photo`, `start_recording`, `stop_recording`, `cancel_recording` | `String` | W4-E2b |
+| all | `android_system_bars.rs` | `set_system_bar_appearance` | `String` | W4-E2b |
+| all | `lib.rs` | `capture_frontend_ready` | `String` | W4-E2b |
+| all | `graph_verification.rs` | `create_graph_verification`, `cancel_graph_verification`, `save_graph_verification_report` | `String` | W4-E2b |
+| all | `sync_runtime.rs` | `sparse_v2_status`, `activate_sparse_v2`, `cancel_sparse_v2`, `cancel_sparse_v2_cold`, `prepare_sparse_v2_share`, `join_sparse_v2_shared`, `adopt_sparse_v2_shared`, `sparse_v2_recovery_location`, `sparse_v2_query`, `sparse_v2_editor_load`, `sparse_v2_editor_save`, `sparse_v2_tick`, `list_absence_sweeps`, `reapply_absence_sweep`, `restore_absence_sweep`, `keep_absence_sweep_deletion`, `sparse_v2_clean_shutdown` | `String` | W4-E2b |
+| all | `platform.rs` | `open_external`, `copy_image_to_clipboard`, `clipboard_files` | `String` | W4-E2b |
+| all | `conflict_capsule.rs` | `load_conflict_capsules`, `store_conflict_capsule`, `retire_conflict_capsule` | `String` | W4-E2b |
+| all | `backup.rs` | `set_backup_keep`, `list_backups`, `restore_backup` | `String` | W4-E2b |
+| all | `settings.rs` | `set_capture_enter_files`, `set_link_first_match`, `set_smooth_scroll`, `set_app_bool`, `set_app_string`, `load_session`, `save_session`, `forget_known_graph`, `reveal_known_graph` | `String` | W4-E2b |
+| all | `watcher.rs` | `set_watch_mode` | `String` | W4-E2b |
+| all | `plugins.rs` | `install_plugin`, `uninstall_plugin`, `read_plugin_entry`, `set_plugin_enabled`, `verify_plugin_registry`, `store_plugin_registry_cache` | `String` | W4-E2b |
+| all | `debug.rs` | `save_diagnostic_report`, `clear_diagnostics` | `String` | W4-E2b |
+
+### `Prose` census
+
+The mechanically derived census has 113 production sites (92 in `commands.rs`,
+21 in `state.rs`; test fixtures excluded). These rows have no typed source:
+they are literal state assertions, bounded domain wording,
+wrong-reply/deferred outcomes, or temporary calls into an E2b `String` helper.
+The census only shrinks.
+
+| File | Enclosing symbols | Legacy template | Why no typed source exists | Retirement owner |
+| --- | --- | --- | --- | --- |
+| `state.rs` | `require_legacy_authority`, `legacy_graph`, `wait_for_legacy_drain`, `bind`, `replace_if_current` | authority/lease/binding literal or bounded contextual message | local state predicate, not a source error | typed state domain follow-up |
+| `state.rs` | `owned_graph_context`, `canonical_graph_root`, `slot_for_window`, `slot_for_bound_window`, `capture_quick_switch_slot`, `refresh_graph_for_label` | missing/stale/bound-window/canonical-path literal | local state predicate or E2b bridge | W4-E2b |
+| `commands.rs` | `load_workspaces`, `save_workspaces`, `sparse_application_handle`, `prepare_tine_quit_all_slots`, `open_page_file` | unchanged helper display | temporary E2b `String` bridge | W4-E2b |
+| `commands.rs` | `map_managed_graph_mutation`, `map_managed_sync_conflict_resolution`, `sparse_navigation`, `map_sparse_page_inventory`, `map_sparse_page_load`, `map_sparse_page_save` | conflict/deferred/refusal wording | enum outcome has no error value in that arm | managed outcome taxonomy follow-up |
+| `commands.rs` | `referenced_page_names`, `journal_feed_page`, `move_managed_application_subtrees`, `acknowledge_managed_application_move`, `recover_managed_application_subtrees`, `copy_guide_into_bound_graph` | deferred/unsupported literal | semantic outcome or local precondition | managed outcome taxonomy follow-up |
+| `commands.rs` | `get_backlinks`, `get_backlink_filter_context`, `get_unlinked_refs`, `block_ref_counts`, `block_referrers`, `run_query`, `export_query_subtrees`, `run_graph_search`, `run_advanced_query`, `query_facets`, `page_aliases`, `page_icons`, `existing_page_names`, `search`, `quick_switch`, `list_templates`, `resolve_block`, `resolve_blocks`, `preview_block`, `list_orphan_assets` | bounded-size or wrong-reply wording | bounded/local semantic refusal | query outcome taxonomy follow-up |
+| `commands.rs` | `publish_html`, `page_print_html`, `open_pdf`, `write_highlights`, `write_pdf_view_state` | deferred or `no-page` literal | semantic outcome without a source error | managed outcome taxonomy follow-up |
+| `commands.rs` | `decode_asset_b64`, `tine_quit`, `read_local_image`, `import_native_capture`, `delimited_ext`, `read_text_file`, `open_asset`, `edit_asset_external`, `build_editor_argv` | local validation/platform literal | validation branch has no source error | validation taxonomy follow-up |
+| `commands.rs` | `managed_capsule_current`, `conflict_capsule_diff`, `resolve_conflict_capsule`, `resolve_sync_conflict`, `merge_pages` | authority missing/changed literal | local state predicate | conflict taxonomy follow-up |
 
 ## Core-only clean-open boundary
 

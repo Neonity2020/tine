@@ -191,7 +191,9 @@ struct Pending {
 /// Sparse-v2 bindings use their actor; they never fall back to a second Direct
 /// Files `Graph` or watcher here.
 fn direct_watch_paths(slot: &GraphSlot) -> Result<(LegacyGraphLease, PathBuf), String> {
-    let graph = slot.legacy_graph_cloned()?;
+    let graph = slot
+        .legacy_graph_cloned()
+        .map_err(|error| error.to_string())?;
     let root = slot.root_key.clone();
     Ok((graph, root))
 }

@@ -192,7 +192,7 @@ pub(crate) fn copy_image_to_clipboard(
     bytes_b64: String,
 ) -> Result<(), String> {
     use tauri_plugin_clipboard_manager::ClipboardExt;
-    let bytes = decode_asset_b64(&bytes_b64)?;
+    let bytes = decode_asset_b64(&bytes_b64).map_err(|error| error.to_string())?;
     #[cfg(target_os = "linux")]
     if linux_copy_image(&bytes).is_ok() {
         return Ok(());

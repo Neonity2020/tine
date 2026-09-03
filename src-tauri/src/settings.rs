@@ -523,7 +523,7 @@ pub(crate) fn load_workspaces(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    let slot = slot_for_context(&state)?;
+    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
     let session = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
     let path = workspaces_path(&app, &slot.root_key).ok_or("no app-data dir")?;
     load_workspaces_at(&path, &session)
@@ -534,7 +534,7 @@ pub(crate) fn save_workspaces(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let slot = slot_for_context(&state)?;
+    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
     let path = workspaces_path(&app, &slot.root_key).ok_or("no app-data dir")?;
     save_workspaces_at(&path, &data)
 }
@@ -589,7 +589,7 @@ pub(crate) fn load_session(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<Option<String>, String> {
-    let slot = slot_for_context(&state)?;
+    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
     let path = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
     let legacy = legacy_session_path(&app);
     load_session_at(&path, legacy.as_deref())
@@ -601,7 +601,7 @@ pub(crate) fn save_session(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let slot = slot_for_context(&state)?;
+    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
     let p = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
     save_session_at(&p, &data)
 }

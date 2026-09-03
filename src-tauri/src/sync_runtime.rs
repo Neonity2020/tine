@@ -1935,12 +1935,14 @@ fn recover_managed_application_subtrees_with(
     request: SyncApplicationMoveSubtreesRequest,
     reopen: impl FnOnce(&Path) -> Result<(SparseV2Binding, tine_core::model::GraphMeta), String>,
 ) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
-    let root = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?
         .root_key
         .clone();
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
-    let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?;
+    let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?;
     if predecessor.root_key != root {
         return Err("graph changed while move recovery waited for its transition lane".into());
     }
@@ -1990,12 +1992,12 @@ fn recover_managed_application_subtrees_with(
             )?;
 
             state.storage_supervisor.publish_managed_maintenance(|| {
-                state.graphs.write().unwrap().replace_if_current(
-                    label,
-                    binding_generation,
-                    &root,
-                    Arc::clone(&successor),
-                )
+                state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .replace_if_current(label, binding_generation, &root, Arc::clone(&successor))
+                    .map_err(|error| error.to_string())
             })?;
             crate::state::poke_watcher(state);
             Ok(result)
@@ -2028,10 +2030,12 @@ pub(crate) fn recover_managed_application_subtrees_blocking(
 pub(crate) async fn sparse_v2_status(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2StatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         sparse_v2_status_for_slot(&slot)
     })
     .await
@@ -2066,7 +2070,8 @@ pub(crate) fn activate_sparse_v2_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_guard(
@@ -2126,7 +2131,8 @@ fn prepare_sparse_v2_activation(
     let started = Instant::now();
     let state = app.state::<crate::state::AppState>();
     crate::debug::diag("sparse-v2 activation requested");
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?;
     if slot.root_key != root {
         return Err("graph changed while activation waited for its transition lane".into());
     }
@@ -2191,7 +2197,7 @@ fn prepare_sparse_v2_activation(
         ));
     }
 
-    let graph = slot.legacy_graph()?;
+    let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
     let graph_meta = graph.meta();
     let direct_source_generation = graph.guarded_graph_text_identity_report().generation;
     drop(graph);
@@ -2287,7 +2293,8 @@ fn publish_managed_candidate_with(
     let source_graph = candidate
         .direct_source_generation
         .map(|_| current.legacy_graph())
-        .transpose()?;
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let _source_publication = if let Some(expected_generation) = candidate.direct_source_generation
     {
         let graph = source_graph
@@ -2833,7 +2840,8 @@ fn publish_stopped_managed_recovery_slot(
             .graphs
             .write()
             .unwrap()
-            .bind(label.to_string(), Arc::clone(&replacement))?;
+            .bind(label.to_string(), Arc::clone(&replacement))
+            .map_err(|error| error.to_string())?;
         crate::state::poke_watcher(state);
         Ok(())
     })?;
@@ -2887,7 +2895,8 @@ fn cancel_sparse_v2_at_paths_with_archive_and_publish(
                     .graphs
                     .write()
                     .unwrap()
-                    .bind(label.to_string(), current)?;
+                    .bind(label.to_string(), current)
+                    .map_err(|error| error.to_string())?;
                 crate::state::poke_watcher(state);
                 Ok(())
             })?;
@@ -3014,7 +3023,8 @@ fn cancel_sparse_v2_at_paths_with_archive(
                 .graphs
                 .write()
                 .unwrap()
-                .bind(label.to_string(), replacement)?;
+                .bind(label.to_string(), replacement)
+                .map_err(|error| error.to_string())?;
             crate::state::poke_watcher(state);
             Ok(binding_generation)
         },
@@ -3430,7 +3440,8 @@ fn cancel_sparse_v2_cold_blocking(
 pub(crate) async fn cancel_sparse_v2(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2CancelResult, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         cancel_sparse_v2_blocking(&app, &label, binding_generation)
     })
@@ -3444,7 +3455,8 @@ fn cancel_sparse_v2_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2CancelResult, String> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_recovery_guard(
@@ -3460,7 +3472,8 @@ fn cancel_sparse_v2_blocking(
         return Err("the graceful Direct Files return was superseded while waiting".into());
     }
     transition.advance(StorageTransitionPhase::ValidatingTarget)?;
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?;
     if slot.root_key != root {
         return Err("graph changed while return waited for its transition lane".into());
     }
@@ -3491,7 +3504,8 @@ fn cancel_sparse_v2_blocking(
                 .graphs
                 .write()
                 .unwrap()
-                .bind(label.to_string(), replacement)?;
+                .bind(label.to_string(), replacement)
+                .map_err(|error| error.to_string())?;
             crate::state::poke_watcher(&state);
             Ok(binding_generation)
         },
@@ -3521,7 +3535,8 @@ fn cancel_sparse_v2_blocking(
 pub(crate) async fn prepare_sparse_v2_share(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2StatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         prepare_sparse_v2_share_blocking(&app, &label, binding_generation)
     })
@@ -3535,12 +3550,14 @@ fn prepare_sparse_v2_share_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?
         .root_key
         .clone();
     let transition_gate = state.storage_supervisor.transition_lane(&root);
     let _transition = transition_gate.lock().unwrap();
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?;
     if slot.root_key != root {
         return Err("graph changed while share setup waited for its transition lane".into());
     }
@@ -3620,7 +3637,8 @@ fn prepare_reopened_managed_candidate(
 pub(crate) async fn join_sparse_v2_shared(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2StatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         join_sparse_v2_shared_blocking(&app, &label, binding_generation)
     })
@@ -3634,7 +3652,8 @@ fn join_sparse_v2_shared_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_guard(
@@ -3697,7 +3716,8 @@ fn prepare_sparse_v2_join(
     }
 
     let state = app.state::<crate::state::AppState>();
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?;
     if slot.root_key != root {
         return Err("graph changed while join waited for its transition lane".into());
     }
@@ -3722,7 +3742,7 @@ fn prepare_sparse_v2_join(
         )?;
         return Ok(PreparedActivationOutcome::Candidate(candidate));
     }
-    let graph = slot.legacy_graph()?;
+    let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
     let graph_meta = graph.meta();
     let direct_source_generation = graph.guarded_graph_text_identity_report().generation;
     drop(graph);
@@ -3916,7 +3936,8 @@ pub(crate) async fn sparse_v2_recovery_location(app: tauri::AppHandle) -> Result
 pub(crate) async fn adopt_sparse_v2_shared(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2AdoptionResult, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         adopt_sparse_v2_shared_blocking(&app, &label, binding_generation)
     })
@@ -3930,7 +3951,8 @@ fn adopt_sparse_v2_shared_blocking(
     binding_generation: u64,
 ) -> Result<SparseV2AdoptionResult, String> {
     let state = app.state::<crate::state::AppState>();
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?;
     let root = slot.root_key.clone();
     if slot.sparse_binding().is_none() {
         return Err(
@@ -4010,7 +4032,8 @@ fn set_aside_managed_history_for_adoption(
     binding_generation: u64,
 ) -> Result<(SparseV2CancelResult, Option<PathBuf>), String> {
     let state = app.state::<crate::state::AppState>();
-    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?
+    let root = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?
         .root_key
         .clone();
     let transition = state.storage_supervisor.begin_recovery_guard(
@@ -4026,7 +4049,8 @@ fn set_aside_managed_history_for_adoption(
         return Err("adoption was superseded while waiting for its graph lane".into());
     }
     transition.advance(StorageTransitionPhase::ValidatingTarget)?;
-    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))
+        .map_err(|error| error.to_string())?;
     if slot.root_key != root {
         return Err("graph changed while adoption waited for its transition lane".into());
     }
@@ -4062,7 +4086,8 @@ fn set_aside_managed_history_for_adoption(
                 .graphs
                 .write()
                 .unwrap()
-                .bind(label.to_string(), replacement)?;
+                .bind(label.to_string(), replacement)
+                .map_err(|error| error.to_string())?;
             crate::state::poke_watcher(&state);
             Ok(binding_generation)
         },
@@ -4089,10 +4114,12 @@ pub(crate) async fn sparse_v2_query(
     request: tine_core::sync_runtime::SyncRuntimeQueryRequest,
     state: crate::state::GraphContext<'_>,
 ) -> Result<tine_core::sync_runtime::SyncRuntimeQueryReply, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .query(request)
             .map_err(|error| error.to_string())
@@ -4106,10 +4133,12 @@ pub(crate) async fn sparse_v2_editor_load(
     request: tine_core::sync_runtime::SyncEditorLoadRequest,
     state: crate::state::GraphContext<'_>,
 ) -> Result<tine_core::sync_runtime::SyncEditorLoadOutcome, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .load_editor_page(request)
             .map_err(|error| error.to_string())
@@ -4123,10 +4152,12 @@ pub(crate) async fn sparse_v2_editor_save(
     request: tine_core::sync_runtime::SyncEditorSaveRequest,
     state: crate::state::GraphContext<'_>,
 ) -> Result<tine_core::sync_runtime::SyncEditorSaveOutcome, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .save_editor_page(request)
             .map_err(|error| error.to_string())
@@ -4139,10 +4170,12 @@ pub(crate) async fn sparse_v2_editor_save(
 pub(crate) async fn sparse_v2_tick(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2TickDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         let tick = active_handle(&slot)?
             .tick()
             .map_err(|error| error.to_string())?;
@@ -4164,10 +4197,12 @@ pub(crate) async fn list_absence_sweeps(
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .absence_sweep_events()
             .map_err(|error| error.to_string())
@@ -4186,10 +4221,12 @@ pub(crate) async fn reapply_absence_sweep(
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .reapply_absence_sweep(&sweep_id)
             .map_err(|error| error.to_string())
@@ -4208,10 +4245,12 @@ pub(crate) async fn restore_absence_sweep(
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .restore_absence_sweep(&sweep_id)
             .map_err(|error| error.to_string())
@@ -4230,10 +4269,12 @@ pub(crate) async fn keep_absence_sweep_deletion(
     // `ActorRequest`, not `sparse_application_handle`, so the source scanner
     // cannot see the route. Declaring NoGraphSlot here would be false: restore
     // and reapply change graph content.
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .dispose_absence_sweep_keep_deletion(&sweep_id)
             .map_err(|error| error.to_string())
@@ -4246,10 +4287,12 @@ pub(crate) async fn keep_absence_sweep_deletion(
 pub(crate) async fn sparse_v2_clean_shutdown(
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2RuntimeStatusDto, String> {
-    let (app, label, binding_generation) = crate::state::owned_graph_context(state)?;
+    let (app, label, binding_generation) =
+        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::state::AppState>();
-        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let slot = crate::state::slot_for_bound_window(&state, &label, Some(binding_generation))
+            .map_err(|error| error.to_string())?;
         active_handle(&slot)?
             .clean_shutdown()
             .map(shutdown_status)
@@ -4616,8 +4659,11 @@ mod tests {
             let tail = &source[start..];
             let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
             let command = &tail[..end];
+            let compact: String = command.split_whitespace().collect();
             assert!(
-                command.contains("owned_graph_context(state)?"),
+                compact.contains(
+                    "owned_graph_context(state).map_err(|error|error.to_string())?"
+                ),
                 "{name} must own the exact window binding before await"
             );
             assert!(
@@ -5260,13 +5306,14 @@ mod tests {
             .map(|offset| join_start + offset)
             .expect("join command boundary");
         let join = &source[join_start..join_end];
+        let compact_join: String = join.split_whitespace().collect();
         let retained_branch = join
             .find("if slot.sparse_binding().is_some()")
             .expect("already-managed join branch");
-        let direct_branch = join
-            .find("let graph = slot.legacy_graph()?;")
+        let direct_branch = compact_join
+            .find("letgraph=slot.legacy_graph().map_err(|error|error.to_string())?;")
             .expect("Direct Files join branch");
-        let direct = &join[direct_branch..];
+        let direct = &compact_join[direct_branch..];
         let archive_predecessor = direct
             .find("prepare_shared_binding_record(")
             .expect("Direct Files join must prepare a fresh descriptor-bound private root");
@@ -5598,7 +5645,8 @@ mod tests {
                     .graphs
                     .write()
                     .unwrap()
-                    .bind("main".into(), replacement)?;
+                    .bind("main".into(), replacement)
+                    .map_err(|error| error.to_string())?;
                 Ok(binding_generation)
             },
         )
@@ -7191,8 +7239,8 @@ mod tests {
         let slot =
             crate::state::GraphSlot::from_sparse_v2(binding, graph_root.clone(), meta.clone());
         assert_eq!(
-            slot.legacy_graph().err().as_deref(),
-            Some(crate::state::SPARSE_V2_UNSUPPORTED)
+            slot.legacy_graph().err().unwrap().to_string(),
+            crate::state::SPARSE_V2_UNSUPPORTED
         );
         let handle = slot
             .sparse_runtime()

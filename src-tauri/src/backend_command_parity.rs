@@ -330,6 +330,340 @@ fn registered_handlers(source: &str) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
+    const PHASE_B_FALLIBLE: &[(&str, &str)] = &[
+        ("android_folder_picker.rs", "pick_graph_folder"),
+        ("android_media.rs", "capture_photo"),
+        ("android_media.rs", "start_recording"),
+        ("android_media.rs", "stop_recording"),
+        ("android_media.rs", "cancel_recording"),
+        ("android_system_bars.rs", "set_system_bar_appearance"),
+        ("backup.rs", "list_backups"),
+        ("backup.rs", "restore_backup"),
+        ("backup.rs", "set_backup_keep"),
+        ("conflict_capsule.rs", "load_conflict_capsules"),
+        ("conflict_capsule.rs", "retire_conflict_capsule"),
+        ("conflict_capsule.rs", "store_conflict_capsule"),
+        ("debug.rs", "clear_diagnostics"),
+        ("debug.rs", "save_diagnostic_report"),
+        ("graph.rs", "approve_external_assets"),
+        ("graph.rs", "begin_direct_cross_page_move"),
+        ("graph.rs", "capture_graph_binding"),
+        ("graph.rs", "capture_target"),
+        ("graph.rs", "create_graph"),
+        ("graph.rs", "default_graph_parent"),
+        ("graph.rs", "finish_direct_cross_page_move"),
+        ("graph.rs", "inspect_graph_access"),
+        ("graph.rs", "load_graph"),
+        ("graph.rs", "open_graph_window"),
+        ("graph.rs", "warm_done"),
+        ("graph_verification.rs", "cancel_graph_verification"),
+        ("graph_verification.rs", "create_graph_verification"),
+        ("graph_verification.rs", "save_graph_verification_report"),
+        ("ios_folder_picker.rs", "pick_graph_folder"),
+        ("ios_folder_picker.rs", "prepare_graph_folder"),
+        ("lib.rs", "capture_frontend_ready"),
+        ("platform.rs", "clipboard_files"),
+        ("platform.rs", "copy_image_to_clipboard"),
+        ("platform.rs", "open_external"),
+        ("plugins.rs", "install_plugin"),
+        ("plugins.rs", "read_plugin_entry"),
+        ("plugins.rs", "set_plugin_enabled"),
+        ("plugins.rs", "store_plugin_registry_cache"),
+        ("plugins.rs", "uninstall_plugin"),
+        ("plugins.rs", "verify_plugin_registry"),
+        ("settings.rs", "forget_known_graph"),
+        ("settings.rs", "load_session"),
+        ("settings.rs", "reveal_known_graph"),
+        ("settings.rs", "save_session"),
+        ("settings.rs", "set_app_bool"),
+        ("settings.rs", "set_app_string"),
+        ("settings.rs", "set_capture_enter_files"),
+        ("settings.rs", "set_link_first_match"),
+        ("settings.rs", "set_smooth_scroll"),
+        ("sync_runtime.rs", "activate_sparse_v2"),
+        ("sync_runtime.rs", "adopt_sparse_v2_shared"),
+        ("sync_runtime.rs", "cancel_sparse_v2"),
+        ("sync_runtime.rs", "cancel_sparse_v2_cold"),
+        ("sync_runtime.rs", "join_sparse_v2_shared"),
+        ("sync_runtime.rs", "keep_absence_sweep_deletion"),
+        ("sync_runtime.rs", "list_absence_sweeps"),
+        ("sync_runtime.rs", "prepare_sparse_v2_share"),
+        ("sync_runtime.rs", "reapply_absence_sweep"),
+        ("sync_runtime.rs", "restore_absence_sweep"),
+        ("sync_runtime.rs", "sparse_v2_clean_shutdown"),
+        ("sync_runtime.rs", "sparse_v2_editor_load"),
+        ("sync_runtime.rs", "sparse_v2_editor_save"),
+        ("sync_runtime.rs", "sparse_v2_query"),
+        ("sync_runtime.rs", "sparse_v2_recovery_location"),
+        ("sync_runtime.rs", "sparse_v2_status"),
+        ("sync_runtime.rs", "sparse_v2_tick"),
+        ("watcher.rs", "set_watch_mode"),
+    ];
+
+    const INFALLIBLE: &[&str] = &[
+        "app_architecture",
+        "app_platform",
+        "apply_spellcheck",
+        "debug_info",
+        "debug_log",
+        "diagnostic_frontend_event",
+        "diagnostic_ipc_event",
+        "diagnostic_report",
+        "diagnostic_session_active",
+        "get_app_bool",
+        "get_app_string",
+        "get_backup_keep",
+        "get_capture_enter_files",
+        "get_link_first_match",
+        "get_smooth_scroll",
+        "get_watch_mode",
+        "gpu_env",
+        "list_installed_plugins",
+        "list_known_graphs",
+        "list_spellcheck_dictionaries",
+        "load_plugin_registry_cache",
+        "prepare_tine_quit",
+        "rescan_graph_now",
+        "startup_graph_path",
+        "take_data_home_fallback_notice",
+        "take_identifier_migration_notice",
+        "tine_open_devtools",
+        "watcher_latency_recent",
+    ];
+
+    fn registered_for_target(source: &str, target: &str) -> Vec<String> {
+        let start = source.find("tauri::generate_handler![").unwrap();
+        let open = start + source[start..].find('[').unwrap();
+        let mut depth = 0i32;
+        let mut end = open;
+        for (offset, c) in source[open..].char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut cfg = "all";
+        let mut paths = Vec::new();
+        for line in source[open + 1..end].lines() {
+            let line = line.trim().trim_end_matches(',');
+            if line.starts_with("#[cfg(") {
+                cfg = line;
+                continue;
+            }
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let active = cfg == "all"
+                || (cfg == "#[cfg(target_os = \"ios\")]" && target == "ios")
+                || (cfg == "#[cfg(not(target_os = \"ios\"))]" && target != "ios");
+            if active {
+                paths.push(line.to_owned());
+            }
+            cfg = "all";
+        }
+        paths
+    }
+
+    fn command_signatures(source: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut attributes = Vec::new();
+        let mut offset = 0usize;
+        for line in source.split_inclusive('\n') {
+            if line.trim() == "#[tauri::command]" {
+                attributes.push(offset + line.len());
+            }
+            offset += line.len();
+        }
+        for after in attributes {
+            let Some(fn_relative) = source[after..].find("fn ") else {
+                break;
+            };
+            let name_start = after + fn_relative + 3;
+            let name_end = source[name_start..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(|end| name_start + end)
+                .unwrap();
+            let Some(open) = source[name_end..].find('{').map(|at| name_end + at) else {
+                break;
+            };
+            out.push((
+                source[name_start..name_end].to_owned(),
+                source[name_start..open].to_owned(),
+            ));
+        }
+        out
+    }
+
+    fn command_definition(module_path: &str, name: &str) -> (String, String) {
+        if module_path == "android_media" {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/android_media.rs"),
+            )
+            .unwrap();
+            assert_eq!(source.matches("pub(crate) async fn $name").count(), 2);
+            assert!(
+                source
+                    .matches(") -> Result<MediaCaptureResult, String>")
+                    .count()
+                    >= 2
+            );
+            return (
+                "android_media.rs".into(),
+                "Result<MediaCaptureResult, String>".into(),
+            );
+        }
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let selected = if module_path.is_empty() {
+            None
+        } else {
+            Some(format!("{module_path}.rs"))
+        };
+        let mut matches = Vec::new();
+        for entry in std::fs::read_dir(source_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            if selected.as_ref().is_some_and(|selected| selected != &file) {
+                continue;
+            }
+            let source = std::fs::read_to_string(path).unwrap();
+            for (found, signature) in command_signatures(&source) {
+                if found == name {
+                    matches.push((file.clone(), signature));
+                }
+            }
+        }
+        matches.sort();
+        matches.dedup();
+        assert!(
+            !matches.is_empty(),
+            "registered command {module_path}::{name} must have a visible definition"
+        );
+        let shape = |signature: &str| {
+            (
+                signature.contains("Result<"),
+                signature.contains("CommandError"),
+                signature.contains("String>"),
+            )
+        };
+        let expected = shape(&matches[0].1);
+        assert!(
+            matches
+                .iter()
+                .all(|(_, signature)| shape(signature) == expected),
+            "cfg-split definitions for {module_path}::{name} disagree on error shape: {matches:?}"
+        );
+        matches.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn phase_a_command_error_manifest_is_exact_for_every_target() {
+        let commands = include_str!("commands.rs");
+        let state = include_str!("state.rs");
+        let command_error = include_str!("command_error.rs");
+        assert!(
+            !commands.contains("map_err(|error| error.to_string())")
+                && !commands.contains("map_err(|e| e.to_string())")
+                && !state.contains("map_err(|error| error.to_string())")
+                && !state.contains("map_err(|e| e.to_string())")
+                && !commands.contains("CommandError::prose(error.to_string())")
+                && !commands.contains("CommandError::prose(format!(\"{error}\"))")
+                && !command_error.contains("From<String> for CommandError")
+                && !command_error.contains("From<&str> for CommandError"),
+            "I-9: phase-A typed sources must not route through String/Prose; imitate command_error.rs and direct_save_error_message"
+        );
+
+        let expected_phase_b: BTreeSet<(String, String)> = PHASE_B_FALLIBLE
+            .iter()
+            .map(|(file, name)| ((*file).into(), (*name).into()))
+            .collect();
+        let expected_infallible: BTreeSet<String> =
+            INFALLIBLE.iter().map(|name| (*name).into()).collect();
+        let mut seen_phase_b = BTreeSet::new();
+        let mut seen_infallible = BTreeSet::new();
+        for target in ["desktop", "android", "ios"] {
+            for path in registered_for_target(LIB_RS, target) {
+                let name = path.rsplit("::").next().unwrap();
+                let module_path = path.rsplit_once("::").map_or("", |(module, _)| module);
+                let (file, signature) = command_definition(module_path, name);
+                let fallible = signature.contains("Result<");
+                let compact: String = signature.chars().filter(|c| !c.is_whitespace()).collect();
+                if !fallible {
+                    assert!(
+                        expected_infallible.contains(name),
+                        "{target}: infallible command {name} needs a by-name allowlist entry"
+                    );
+                    seen_infallible.insert(name.to_owned());
+                } else if file == "commands.rs" {
+                    assert!(
+                        compact.ends_with(",CommandError>"),
+                        "{target}: phase-A command {name} must return Result<_, CommandError>"
+                    );
+                } else {
+                    assert!(expected_phase_b.contains(&(file.clone(), name.to_owned())),
+                        "{target}: fallible phase-B command {file}::{name} needs an E2b allowlist row");
+                    assert!(
+                        compact.ends_with(",String>"),
+                        "{target}: stale E2b row for {file}::{name}"
+                    );
+                    seen_phase_b.insert((file, name.to_owned()));
+                }
+            }
+        }
+        assert_eq!(
+            seen_phase_b, expected_phase_b,
+            "stale/duplicate phase-B command allowlist row"
+        );
+        assert_eq!(
+            seen_infallible, expected_infallible,
+            "stale infallible command allowlist row"
+        );
+
+        let direct_mapper = commands
+            .split("pub(crate) fn direct_save_error_message")
+            .nth(1)
+            .unwrap()
+            .split("/// Report what a slow")
+            .next()
+            .unwrap();
+        assert!(
+            direct_mapper.contains("CommandError::tagged(\n            \"save-conflict\"")
+                && direct_mapper.contains("CommandError::tagged(\n        \"direct-save-failure\"")
+                && !direct_mapper.contains("CommandError::from"),
+            "DirectSaveError must retain its closed code and epoch in Tagged, never Io/Prose"
+        );
+        let close = commands
+            .split("pub(crate) fn close_graph_window")
+            .nth(1)
+            .unwrap()
+            .split("#[tauri::command]")
+            .next()
+            .unwrap();
+        assert!(
+            close.contains("CommandError::tagged(\"sparse-shutdown-refused\""),
+            "close_graph_window must delegate its refusal to the Tagged mapper"
+        );
+
+        let worker_mapper = ".map_err(CommandError::worker)";
+        let mut rest = commands;
+        while let Some(at) = rest.find(worker_mapper) {
+            assert!(
+                rest[..at].trim_end().ends_with(".await"),
+                "Worker is reserved for spawn_blocking(...).await JoinError sites"
+            );
+            rest = &rest[at + worker_mapper.len()..];
+        }
+    }
+
     /// Everything the frontend asks for must exist. A name that is not
     /// registered fails at runtime with "command not found", on whatever page
     /// happens to call it.
