@@ -8,6 +8,49 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+#[test]
+fn clean_open_source_matrix_has_one_conversion_per_source_class() {
+    fn assert_from<T>()
+    where
+        CleanOpenError: From<T>,
+    {
+    }
+
+    assert_from::<crate::oplog::import::BootstrapStreamingImportError>();
+    assert_from::<crate::oplog::hot_engine::EngineError>();
+    assert_from::<crate::oplog::enrollment::EnrollmentError>();
+    assert_from::<crate::oplog::hot_engine::ManagedLocalRecordError>();
+    assert_from::<crate::oplog::projection_store::ProjectionStoreError>();
+    assert_from::<crate::oplog::projection_turn_journal::ProjectionTurnJournalError>();
+    assert_from::<crate::oplog::receipt::ReceiptError>();
+    assert_from::<crate::oplog::local_active::RuntimePromotionError>();
+    assert_from::<crate::oplog::wire::ScenarioError>();
+    assert_from::<crate::oplog::object_store::StoreError>();
+    assert_from::<crate::oplog::absence_sweep::SweepError>();
+    assert_from::<crate::oplog::local_active::WorkspaceAuthorityRefusal>();
+    assert_from::<crate::oplog::sqlite::ProjectionError>();
+    assert_from::<crate::oplog::projection::ProjectionError>();
+    assert_from::<std::io::Error>();
+    assert_from::<tine_storage::BatchError<crate::oplog::batch::CoreDurableBatchContract>>();
+}
+
+#[test]
+fn clean_open_projection_emits_only_the_tagged_source_code() {
+    let error = CleanOpenError::from(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "source prose and /private/path must not cross the boundary",
+    ));
+    assert_eq!(error.to_string(), "clean_open.io");
+    let payload: serde_json::Value = serde_json::from_str(&clean_open_error_detail(error)).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.io",
+        })
+    );
+}
+
 fn clean_join_page(
     path: &str,
     kind: ManagedTextKind,
@@ -286,13 +329,14 @@ fn a_pre_c_private_store_is_refused_before_any_graph_mutation() {
     let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
         panic!("a pre-(c) store must surface a managed-open refusal: {result:?}");
     };
-    assert!(
-        !detail.is_empty(),
-        "the typed refusal must retain diagnostics"
-    );
-    assert!(
-        !detail.contains("re-activate"),
-        "the low-level refusal must not prescribe retired manual re-activation: {detail}"
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.projection_store",
+            "detail": { "scenario": "MS-REF-PROTOCOL-INCOMPATIBLE" },
+        }),
+        "the low-level refusal carries only its typed source and scenario codes"
     );
     assert_eq!(
         result.status.durable_refusal_scenario(),
@@ -3397,14 +3441,23 @@ fn raw_colon_path_is_classified_incompatible_before_activation() {
         "managed_raw_colon_preactivation status={:?} graph_bytes={bytes_before:?}",
         activation.status
     );
-    assert!(matches!(
-        activation.status,
-        SyncLocalActivationStatus::Retryable {
-            durable_stage: SyncLocalActivationStage::Absent,
-            ref detail,
-        } if detail.contains("source path is not portable")
-            && detail.contains(RAW_COLON_PATH)
-    ));
+    let SyncLocalActivationStatus::Retryable {
+        durable_stage: SyncLocalActivationStage::Absent,
+        detail,
+    } = &activation.status
+    else {
+        panic!(
+            "raw-colon source must refuse before activation: {:?}",
+            activation.status
+        );
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.io",
+        })
+    );
     assert!(activation.handle.is_none());
     assert_eq!(user_graph_bytes(&fixture.graph_root), bytes_before);
 }
@@ -4857,8 +4910,12 @@ fn a_journal_that_cannot_open_refuses_activation_before_any_graph_mutation() {
         Err(error) => error,
         Ok(_) => panic!("projection-turn journal unexpectedly opened twice"),
     };
-    assert!(
-        error.contains("projection turn") || error.contains("already open"),
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&error).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.projection_turn_journal",
+        }),
         "unexpected refusal: {error}"
     );
     assert_eq!(user_graph_bytes(&fixture.graph_root), before);
@@ -6046,7 +6103,14 @@ fn cold_open_repairs_only_torn_objects_covered_by_an_undrained_local_record() {
         Err(error) => error,
         Ok(_) => panic!("a torn object without an undrained record must stay a refusal"),
     };
-    assert!(refused.contains("do not match path"), "{refused}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&refused).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.store",
+        }),
+        "{refused}"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7487,7 +7551,13 @@ fn cold_replay_error_exit_flushes_completion_before_lease_release() {
         Err(error) => error,
         Ok(_) => panic!("cold replay did not stop after executing its page"),
     };
-    assert!(error.contains("deterministic cut during production turn replay"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&error).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.projection",
+        })
+    );
     assert!(fixture.graph_root.join(path.as_str()).is_file());
 
     assert_eq!(
@@ -9300,9 +9370,14 @@ fn a_pre_h_sealed_baseline_is_a_durable_protocol_refusal_not_a_retryable_dead_en
     let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
         panic!("a pre-H sealed baseline must surface a managed-open refusal: {result:?}");
     };
-    assert!(
-        detail.contains("lazy genesis manifest schema 4"),
-        "the refusal names the containing component: {detail}"
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.bootstrap_streaming_import",
+            "detail": { "scenario": "MS-REF-PROTOCOL-INCOMPATIBLE" },
+        }),
+        "the refusal names its source class and protocol scenario without source prose"
     );
     assert_eq!(
         result.status.durable_refusal_scenario(),
@@ -10001,19 +10076,8 @@ fn android_managed_storage_journey_converges_when_a_graph_file_changes_during_ac
         "the receipt must say the journey needed a second attempt: {receipt}"
     );
     assert!(
-        receipt.contains("source capture changed before final inventory proof"),
-        "a retried-past refusal must stay in the receipt verbatim, or a device that \
-             refuses on every attempt looks the same as one that never refused: {receipt}"
-    );
-    assert!(
-        receipt.contains("u{17d} pilot notes #pilot.md"),
-        "the refusal must name the moved row in a spelling its normalization twin \
-             cannot be confused with: {receipt}"
-    );
-    assert!(
-        !receipt.contains("pages/\u{17d} pilot notes #pilot.md"),
-        "the raw glyph spelling reads exactly like its decomposed twin, so it must not \
-             be what the refusal reports: {receipt}"
+        receipt.contains("clean_open.bootstrap_streaming_import"),
+        "a retried-past refusal must retain its typed source code: {receipt}"
     );
     // Write-shyness: the retry rebuilt from the OTHER writer's bytes and
     // rewrote nothing of its own, here or on the twin that differs from it
@@ -12959,6 +13023,24 @@ fn cold_shared_descriptor_discovery_uses_the_canonical_supported_regular_file() 
             inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err()
         );
     }
+}
+
+#[test]
+fn shared_inspection_boundaries_emit_the_reachable_scenario_code() {
+    let provider_root = std::env::temp_dir().join("x".repeat(4096));
+
+    let assert_scenario = |detail: String| {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&detail).unwrap(),
+            serde_json::json!({
+                "kind": "clean-open",
+                "reason_code": "clean_open.scenario",
+            })
+        );
+    };
+    assert_scenario(inspect_shared_provider_cold_prefix(&provider_root).unwrap_err());
+    assert_scenario(inspect_shared_enrollment(&provider_root).unwrap_err());
+    assert_scenario(inspect_shared_enrollment_for_cold_discovery(&provider_root).unwrap_err());
 }
 
 fn settle_shared_provider(handle: &SyncRuntimeHandle) {
@@ -28801,9 +28883,13 @@ fn activation_external_edit_before_promotion_refuses_then_retries_from_current_d
             interrupted.status
         );
     };
-    assert!(detail.contains("Root.md"), "{detail}");
-    assert!(detail.contains("changed:"), "{detail}");
-    assert!(detail.contains("content:"), "{detail}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+        serde_json::json!({
+            "kind": "clean-open",
+            "reason_code": "clean_open.bootstrap_streaming_import",
+        })
+    );
     assert!(interrupted.handle.is_none());
     // The third half, and the one that makes `Retryable` true. This lane
     // records no private activation reservation, so an archive left behind

@@ -1777,12 +1777,32 @@ fn describe_file(path: &Path) -> io::Result<BlobDescription> {
 /// Tauri graph-open lifecycle answers with preserve-and-rebuild
 /// (`SparseV2Binding::requires_blank_slate_rebuild`). Without the marker the
 /// same failure surfaced as a retryable dead end (wave-2 review H-1).
+#[derive(Debug)]
+struct SupersededContainingFormatError(String);
+
+impl std::fmt::Display for SupersededContainingFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SupersededContainingFormatError {}
+
+pub(crate) fn is_superseded_containing_format(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<SupersededContainingFormatError>())
+}
+
 fn superseded_containing_format(detail: &str) -> io::Error {
-    invalid(format!(
-        "{detail}: this pre-0.7 private baseline must be backed up and rebuilt from the \
-         intact Markdown/Org tree by the graph-open lifecycle [{}]",
-        crate::oplog::refusal::ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
-    ))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        SupersededContainingFormatError(format!(
+            "{detail}: this pre-0.7 private baseline must be backed up and rebuilt from the \
+             intact Markdown/Org tree by the graph-open lifecycle [{}]",
+            crate::oplog::refusal::ManagedStorageRefusalScenario::ProtocolIncompatible.as_str()
+        )),
+    )
 }
 
 /// Test-only: rewrite an installed, marker-bound sealed baseline as if an

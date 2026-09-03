@@ -129,13 +129,57 @@ The plugin-visible boundary is separate and unchanged. Plugin workers still
 reply with `{ id, ok: false, error: string }`, and the host still exposes that
 as `PluginRuntimeError`; JSON-tagged application errors are not sent to guests.
 
-## Clean-open item 3 checkpoint
+## Core-only clean-open boundary
 
-The item 3 checkpoint preserves the existing `fn display` debt at exactly 89
-call sites. Its source census found 16 concrete error classes across 17
-functions, including private `EngineError` in dossier-Forbidden
-`hot_engine.rs`, while the three named boundaries also receive strings already
-flattened by a larger helper graph. An honest single `CleanOpenError` cannot
-carry those sources through the public Tauri boundary without an opaque prose
-variant or a second public taxonomy. The equality ratchet prevents any new
-site while a later packet designs that split.
+`CleanOpenError` is the one core taxonomy for the 16 error classes reachable
+from clean managed construction and recovery. It is `pub(crate)`: several
+source types are crate-private, and wave 4 deliberately keeps
+`SyncRuntimeOpenStatus::OpenRefused { detail: String }` as the Tauri-facing
+boundary. The sole projection into that string is tagged JSON with
+`kind: "clean-open"` and the stable `reason_code` below. Source display text,
+paths, and note names do not enter the payload. The frontend DTO bridge and its
+current parsing of open-status detail are follow-up work; this packet adds no
+frontend subclass.
+
+| Variant | Source class | `reason_code` | Refusal scenario |
+| --- | --- | --- | --- |
+| `BootstrapStreamingImport` | `BootstrapStreamingImportError` | `clean_open.bootstrap_streaming_import` | malformed or over-bound inbound source (`MS-REF-MALFORMED-IMPORT`, `MS-REF-BOUNDS`) |
+| `Engine` | `EngineError` | `clean_open.engine` | invalid retained causal/archive state (`MS-REF-DISK-CORRUPT`) |
+| `Enrollment` | `EnrollmentError` | `clean_open.enrollment` | damaged, incompatible, contended, or unsafe enrollment authority (`MS-REF-DISK-CORRUPT`, `MS-REF-PROTOCOL-INCOMPATIBLE`, `MS-REF-CONCURRENT-WRITER`, `MS-REF-UNSAFE-FS-KIND`) |
+| `ManagedLocalRecord` | `ManagedLocalRecordError` | `clean_open.managed_local_record` | damaged foreground journal record (`MS-REF-DISK-CORRUPT`) |
+| `ProjectionStore` | `ProjectionStoreError` | `clean_open.projection_store` | damaged, incompatible, or unsafe receipt state (`MS-REF-DISK-CORRUPT`, `MS-REF-PROTOCOL-INCOMPATIBLE`, `MS-REF-UNSAFE-FS-KIND`) |
+| `ProjectionTurnJournal` | `ProjectionTurnJournalError` | `clean_open.projection_turn_journal` | damaged, contended, or unsafe turn journal (`MS-REF-DISK-CORRUPT`, `MS-REF-CONCURRENT-WRITER`, `MS-REF-UNSAFE-FS-KIND`) |
+| `Receipt` | `ReceiptError` | `clean_open.receipt` | malformed or incompatible retained receipt (`MS-REF-DISK-CORRUPT`, `MS-REF-PROTOCOL-INCOMPATIBLE`) |
+| `RuntimePromotion` | `RuntimePromotionError` | `clean_open.runtime_promotion` | stale or unavailable runtime authority (`MS-REF-STALE-GENERATION`, `MS-REF-CONCURRENT-WRITER`) |
+| `Scenario` | `ScenarioError` | `clean_open.scenario` | malformed, conflicting, or unsafe provider input (`MS-REF-MALFORMED-IMPORT`, `MS-REF-SYNC-CONFLICT`, `MS-REF-UNSAFE-FS-KIND`) |
+| `Store` | `StoreError` | `clean_open.store` | damaged, incompatible, or unsafe operation archive (`MS-REF-DISK-CORRUPT`, `MS-REF-PROTOCOL-INCOMPATIBLE`, `MS-REF-UNSAFE-FS-KIND`) |
+| `Sweep` | `SweepError` | `clean_open.sweep` | damaged retained disposition state (`MS-REF-DISK-CORRUPT`) |
+| `WorkspaceAuthority` | `WorkspaceAuthorityRefusal` | `clean_open.workspace_authority` | another instance or a stale lease identity owns the workspace (`MS-REF-CONCURRENT-WRITER`, `MS-REF-STALE-GENERATION`) |
+| `SqliteProjection` | `oplog::sqlite::ProjectionError` | `clean_open.sqlite_projection` | contended, stale, or damaged disposable projection open (`MS-REF-CONCURRENT-WRITER`, `MS-REF-STALE-GENERATION`, with rebuild for cache-only damage) |
+| `Projection` | `oplog::projection::ProjectionError` | `clean_open.projection` | malformed source or stale projection authority (`MS-REF-MALFORMED-IMPORT`, `MS-REF-STALE-GENERATION`) |
+| `Io` | `std::io::Error` (retained as `ErrorKind`) | `clean_open.io` | transient storage unavailability is retryable; unsafe or damaged authority uses the corresponding §3.1 scenario |
+| `Batch` | `tine_storage::BatchError<CoreDurableBatchContract>` | `clean_open.batch` | malformed or damaged durable batch (`MS-REF-MALFORMED-IMPORT`, `MS-REF-DISK-CORRUPT`) |
+
+Reachability is a source-class × boundary property, not a Cartesian promise.
+`yes` means that boundary calls a producer of the class; `—` means it does not.
+The three shared-inspection entry points are grouped because they all call the
+same `ScenarioError` provider primitives.
+
+| Source class | shared provider/descriptor inspection | local activation | existing managed reopen | retained actor adoption/reopen |
+| --- | --- | --- | --- | --- |
+| `BootstrapStreamingImportError` | — | yes | — | — |
+| `EngineError` | — | yes | yes | yes |
+| `EnrollmentError` | — | yes | yes | yes |
+| `ManagedLocalRecordError` | — | yes | yes | — |
+| `ProjectionStoreError` | — | yes | yes | — |
+| `ProjectionTurnJournalError` | — | yes | yes | yes |
+| `ReceiptError` | — | yes | yes | — |
+| `RuntimePromotionError` | — | yes | yes | yes |
+| `ScenarioError` | yes | yes | yes | yes |
+| `StoreError` | — | yes | yes | yes |
+| `SweepError` | — | yes | yes | yes |
+| `WorkspaceAuthorityRefusal` | — | yes | yes | — |
+| `oplog::sqlite::ProjectionError` | — | yes | yes | yes |
+| `oplog::projection::ProjectionError` | — | yes | yes | — |
+| `std::io::Error` | — | yes | yes | yes |
+| `tine_storage::BatchError<CoreDurableBatchContract>` | — | yes | yes | — |

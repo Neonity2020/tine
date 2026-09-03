@@ -11,10 +11,52 @@ import {
  * credentials, or an arbitrarily long debug chain. Recovery UI may preserve
  * the causal class, but must never echo those values to the screen or clipboard.
  */
+/** A closed backend vocabulary token: no spaces, no punctuation graph text can reach. */
+const TAGGED_TOKEN = /^[a-z][a-z0-9_.-]{0,63}$/u;
+/** A refusal scenario id, e.g. `MS-REF-PROTOCOL-INCOMPATIBLE`. */
+const TAGGED_SCENARIO = /^[A-Z][A-Z0-9-]{0,63}$/u;
+
+/**
+ * Render a tagged backend error envelope, or `null` when this is ordinary prose.
+ *
+ * A typed backend failure arrives as `{"kind":…,"reason_code":…}` — every field
+ * a closed vocabulary the backend authored, with nothing left to vouch for. The
+ * prose sanitizer below cannot read it: it collapses any `{…}` group to
+ * `[details]`, which then carries no diagnostic word, so the whole envelope
+ * became "The command failed without a safe diagnostic detail." That is the
+ * exact failure the sanitizer's own comments were written about, and typing the
+ * error was supposed to make the reason MORE legible, not less. Recognize the
+ * envelope by shape and render it from its own vocabulary; anything that is not
+ * this exact shape falls through to the prose path and is sanitized as before.
+ */
+function taggedBackendErrorDetail(firstLine: string): string | null {
+  if (!firstLine.startsWith("{")) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(firstLine);
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const { kind, reason_code: reasonCode, detail } = payload as Record<string, unknown>;
+  if (typeof kind !== "string" || !TAGGED_TOKEN.test(kind)) return null;
+  if (typeof reasonCode !== "string" || !TAGGED_TOKEN.test(reasonCode)) return null;
+  let rendered = `${kind} failure: ${reasonCode}`;
+  if (typeof detail === "object" && detail !== null) {
+    const scenario = (detail as Record<string, unknown>).scenario;
+    if (typeof scenario === "string" && TAGGED_SCENARIO.test(scenario)) {
+      rendered = `${rendered} (${scenario})`;
+    }
+  }
+  return rendered;
+}
+
 export function safeManagedErrorDetail(error: unknown): string {
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
   const firstLine = message.split(/[\r\n]/, 1)[0]?.trim() ?? "";
   if (!firstLine) return "The command did not provide a safe diagnostic detail.";
+  const tagged = taggedBackendErrorDetail(firstLine);
+  if (tagged) return tagged;
   let safe = firstLine
     .replace(/\bfile:\/\/\/[^\s"'<>]+/giu, "[path]")
     // A page path is the one path whose LAST segment routinely contains

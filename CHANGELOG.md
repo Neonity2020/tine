@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Managed clean-open failures no longer collapse source types into prose.**
+  Core maps the 16 reachable error classes to stable, content-free reason codes
+  and carries them through the existing open-refusal boundary as tagged JSON, so
+  a refusal you can read and copy no longer carries a note name or a path. The
+  reason itself still reaches Settings and the startup recovery pane: the
+  diagnostic sanitizer renders the typed envelope instead of discarding it.
+
 - **Direct save errors can no longer become discard-capable conflicts because
   of a page title or block text.** The save producer carries a closed reason
   code and conflict epoch through tagged JSON, and the frontend no longer

@@ -2900,6 +2900,25 @@ delivered entry is not replaced and the original live source remains. Linux,
 Android, macOS, iOS, and Windows are explicit compile-time arms; an unknown
 target cannot inherit a Tine platform's publication policy by negated fallback.
 
+## Harvest W4-E3 — bounded clean-open source taxonomy
+
+Clean managed construction and recovery map their 16 concrete source classes
+once into the crate-private `CleanOpenError`. Its public projection preserves
+the existing `OpenRefused { detail }` shape but makes the detail tagged JSON:
+`kind` is `clean-open` and `reason_code` identifies the source class. No source
+display text, path, or note name is serialized.
+
+The reason codes and their exact source classes are pinned in
+`docs/contracts/typed-errors.md`. Their refusal scenarios are existing §3.1
+rows: bootstrap, projection, provider-scenario, and batch validation use
+`MS-REF-MALFORMED-IMPORT`/`MS-REF-BOUNDS`; damaged authoritative records use
+`MS-REF-DISK-CORRUPT`; provider collisions use `MS-REF-SYNC-CONFLICT`;
+lease/authority races use `MS-REF-CONCURRENT-WRITER` or
+`MS-REF-STALE-GENERATION`; unsafe entries use `MS-REF-UNSAFE-FS-KIND`; and
+unknown current-format claims use `MS-REF-PROTOCOL-INCOMPATIBLE`. Plain I/O
+unavailability remains retryable. Disposable SQLite damage still rebuilds per
+§3.1 and D-3 rather than becoming a durable refusal.
+
 ## 4. Concord base ledger (Direct Files)
 
 The Concord base ledger (ADR 0056) is **disposable state**, in the invariant-3

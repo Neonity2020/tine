@@ -1226,10 +1226,192 @@ pub enum SyncSharedProviderColdPrefix {
     Refused,
 }
 
+/// The bounded source taxonomy for failures encountered while constructing or
+/// recovering a clean managed runtime. Source values stay typed until the
+/// public string boundary; [`fmt::Display`] deliberately exposes only the
+/// stable code, never source prose, paths, or note names.
+#[derive(Debug)]
+pub(crate) enum CleanOpenError {
+    BootstrapStreamingImport(Box<crate::oplog::import::BootstrapStreamingImportError>),
+    Engine(Box<crate::oplog::hot_engine::EngineError>),
+    Enrollment(Box<crate::oplog::enrollment::EnrollmentError>),
+    ManagedLocalRecord(Box<crate::oplog::hot_engine::ManagedLocalRecordError>),
+    ProjectionStore(Box<crate::oplog::projection_store::ProjectionStoreError>),
+    ProjectionTurnJournal(Box<crate::oplog::projection_turn_journal::ProjectionTurnJournalError>),
+    Receipt(Box<crate::oplog::receipt::ReceiptError>),
+    RuntimePromotion(Box<crate::oplog::local_active::RuntimePromotionError>),
+    Scenario(Box<crate::oplog::wire::ScenarioError>),
+    Store(Box<crate::oplog::object_store::StoreError>),
+    Sweep(Box<crate::oplog::absence_sweep::SweepError>),
+    WorkspaceAuthority(Box<crate::oplog::local_active::WorkspaceAuthorityRefusal>),
+    SqliteProjection(Box<crate::oplog::sqlite::ProjectionError>),
+    Projection(Box<crate::oplog::projection::ProjectionError>),
+    Io(std::io::ErrorKind),
+    Batch(Box<tine_storage::BatchError<crate::oplog::batch::CoreDurableBatchContract>>),
+}
+
+impl CleanOpenError {
+    pub(crate) const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::BootstrapStreamingImport(_) => "clean_open.bootstrap_streaming_import",
+            Self::Engine(_) => "clean_open.engine",
+            Self::Enrollment(_) => "clean_open.enrollment",
+            Self::ManagedLocalRecord(_) => "clean_open.managed_local_record",
+            Self::ProjectionStore(_) => "clean_open.projection_store",
+            Self::ProjectionTurnJournal(_) => "clean_open.projection_turn_journal",
+            Self::Receipt(_) => "clean_open.receipt",
+            Self::RuntimePromotion(_) => "clean_open.runtime_promotion",
+            Self::Scenario(_) => "clean_open.scenario",
+            Self::Store(_) => "clean_open.store",
+            Self::Sweep(_) => "clean_open.sweep",
+            Self::WorkspaceAuthority(_) => "clean_open.workspace_authority",
+            Self::SqliteProjection(_) => "clean_open.sqlite_projection",
+            Self::Projection(_) => "clean_open.projection",
+            Self::Io(_) => "clean_open.io",
+            Self::Batch(_) => "clean_open.batch",
+        }
+    }
+
+    fn refusal_scenario(&self) -> Option<ManagedStorageRefusalScenario> {
+        match self {
+            Self::BootstrapStreamingImport(error) => match error.as_ref() {
+                crate::oplog::import::BootstrapStreamingImportError::Io(error)
+                    if crate::oplog::lazy_genesis::is_superseded_containing_format(error) =>
+                {
+                    Some(ManagedStorageRefusalScenario::ProtocolIncompatible)
+                }
+                _ => None,
+            },
+            Self::ProjectionStore(error) => projection_store_refusal_scenario(error),
+            _ => None,
+        }
+    }
+}
+
+fn projection_store_refusal_scenario(
+    error: &crate::oplog::projection_store::ProjectionStoreError,
+) -> Option<ManagedStorageRefusalScenario> {
+    match error {
+        crate::oplog::projection_store::ProjectionStoreError::UnknownStoreVersion(_)
+        | crate::oplog::projection_store::ProjectionStoreError::UpgradeRequired { .. } => {
+            Some(ManagedStorageRefusalScenario::ProtocolIncompatible)
+        }
+        crate::oplog::projection_store::ProjectionStoreError::Operation { source, .. } => {
+            projection_store_refusal_scenario(source)
+        }
+        _ => None,
+    }
+}
+
+impl fmt::Display for CleanOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.reason_code())
+    }
+}
+
+impl std::error::Error for CleanOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BootstrapStreamingImport(error) => Some(error.as_ref()),
+            Self::Engine(error) => Some(error.as_ref()),
+            Self::Enrollment(error) => Some(error.as_ref()),
+            Self::ManagedLocalRecord(error) => Some(error.as_ref()),
+            Self::ProjectionStore(error) => Some(error.as_ref()),
+            Self::ProjectionTurnJournal(error) => Some(error.as_ref()),
+            Self::Receipt(error) => Some(error.as_ref()),
+            Self::RuntimePromotion(error) => Some(error.as_ref()),
+            Self::Scenario(error) => Some(error.as_ref()),
+            Self::Store(error) => Some(error.as_ref()),
+            Self::Sweep(error) => Some(error.as_ref()),
+            Self::WorkspaceAuthority(error) => Some(error.as_ref()),
+            Self::SqliteProjection(error) => Some(error.as_ref()),
+            Self::Projection(error) => Some(error.as_ref()),
+            Self::Batch(error) => Some(error.as_ref()),
+            Self::Io(_) => None,
+        }
+    }
+}
+
+macro_rules! clean_open_from {
+    ($source:ty, $variant:ident) => {
+        impl From<$source> for CleanOpenError {
+            fn from(error: $source) -> Self {
+                Self::$variant(Box::new(error))
+            }
+        }
+    };
+}
+
+clean_open_from!(
+    crate::oplog::import::BootstrapStreamingImportError,
+    BootstrapStreamingImport
+);
+clean_open_from!(crate::oplog::hot_engine::EngineError, Engine);
+clean_open_from!(crate::oplog::enrollment::EnrollmentError, Enrollment);
+clean_open_from!(
+    crate::oplog::hot_engine::ManagedLocalRecordError,
+    ManagedLocalRecord
+);
+clean_open_from!(
+    crate::oplog::projection_store::ProjectionStoreError,
+    ProjectionStore
+);
+clean_open_from!(
+    crate::oplog::projection_turn_journal::ProjectionTurnJournalError,
+    ProjectionTurnJournal
+);
+clean_open_from!(crate::oplog::receipt::ReceiptError, Receipt);
+clean_open_from!(
+    crate::oplog::local_active::RuntimePromotionError,
+    RuntimePromotion
+);
+clean_open_from!(crate::oplog::wire::ScenarioError, Scenario);
+clean_open_from!(crate::oplog::object_store::StoreError, Store);
+clean_open_from!(crate::oplog::absence_sweep::SweepError, Sweep);
+clean_open_from!(
+    crate::oplog::local_active::WorkspaceAuthorityRefusal,
+    WorkspaceAuthority
+);
+clean_open_from!(crate::oplog::sqlite::ProjectionError, SqliteProjection);
+clean_open_from!(crate::oplog::projection::ProjectionError, Projection);
+clean_open_from!(
+    tine_storage::BatchError<crate::oplog::batch::CoreDurableBatchContract>,
+    Batch
+);
+
+impl From<std::io::Error> for CleanOpenError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
+/// The single projection from the typed clean-open taxonomy to the existing
+/// string transport. The transport is tagged JSON so callers never need to
+/// recover control flow from source display text.
+fn clean_open_error_detail(error: CleanOpenError) -> String {
+    match error.refusal_scenario() {
+        Some(scenario) => tagged_backend_error_with_reason_and_detail(
+            "clean-open",
+            error.reason_code(),
+            serde_json::json!({ "scenario": scenario.as_str() }),
+        ),
+        None => tagged_backend_error("clean-open", Some(error.reason_code())),
+    }
+}
+
+impl From<CleanOpenError> for String {
+    fn from(error: CleanOpenError) -> Self {
+        clean_open_error_detail(error)
+    }
+}
+
 pub fn inspect_shared_provider_cold_prefix(
     provider_root: &Path,
 ) -> Result<SyncSharedProviderColdPrefix, String> {
-    match inspect_cold_shared_provider_prefix(provider_root).map_err(display)? {
+    match inspect_cold_shared_provider_prefix(provider_root)
+        .map_err(CleanOpenError::from)
+        .map_err(clean_open_error_detail)?
+    {
         ColdSharedProviderPrefix::Partial => Ok(SyncSharedProviderColdPrefix::Partial),
         ColdSharedProviderPrefix::ReadyForDescriptorInspection => {
             Ok(SyncSharedProviderColdPrefix::ReadyForDescriptorInspection)
@@ -1239,30 +1421,38 @@ pub fn inspect_shared_provider_cold_prefix(
 }
 
 impl SyncSharedEnrollmentDescriptor {
-    fn from_clean(descriptor: CleanSharedEnrollmentDescriptorV1) -> Result<Self, String> {
+    fn from_clean(descriptor: CleanSharedEnrollmentDescriptorV1) -> Result<Self, CleanOpenError> {
         Ok(Self {
-            encoded: descriptor.encode().map_err(display)?,
+            encoded: descriptor.encode().map_err(CleanOpenError::from)?,
             workspace_id: descriptor.workspace_id(),
             lineage_digest: descriptor.lineage_digest(),
             catalog_document_id: descriptor.catalog_document_id(),
-            descriptor_digest: descriptor.digest().map_err(display)?.to_string(),
+            descriptor_digest: descriptor
+                .digest()
+                .map_err(CleanOpenError::from)?
+                .to_string(),
         })
     }
 
-    fn decode(&self) -> Result<CleanSharedEnrollmentDescriptorV1, String> {
-        CleanSharedEnrollmentDescriptorV1::decode(&self.encoded).map_err(display)
+    fn decode(&self) -> Result<CleanSharedEnrollmentDescriptorV1, CleanOpenError> {
+        CleanSharedEnrollmentDescriptorV1::decode(&self.encoded).map_err(CleanOpenError::from)
     }
 }
 
 pub fn inspect_shared_enrollment(
     provider_root: &Path,
 ) -> Result<Option<SyncSharedEnrollmentDescriptor>, String> {
-    inspect_shared_provider_descriptor(provider_root)
-        .map_err(display)?
-        .map(|bytes| CleanSharedEnrollmentDescriptorV1::decode(&bytes).map_err(display))
-        .transpose()?
-        .map(SyncSharedEnrollmentDescriptor::from_clean)
-        .transpose()
+    (|| {
+        inspect_shared_provider_descriptor(provider_root)
+            .map_err(CleanOpenError::from)?
+            .map(|bytes| {
+                CleanSharedEnrollmentDescriptorV1::decode(&bytes).map_err(CleanOpenError::from)
+            })
+            .transpose()?
+            .map(SyncSharedEnrollmentDescriptor::from_clean)
+            .transpose()
+    })()
+    .map_err(clean_open_error_detail)
 }
 
 pub fn inspect_shared_enrollment_for_cold_discovery(
@@ -1273,7 +1463,10 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
     // filesystem sync is settling (temporary files, conflict copies, or newer
     // append-only namespaces), so cold discovery must not require the
     // enrollment directory to contain literally one entry.
-    let Some(bytes) = inspect_shared_provider_descriptor(provider_root).map_err(display)? else {
+    let Some(bytes) = inspect_shared_provider_descriptor(provider_root)
+        .map_err(CleanOpenError::from)
+        .map_err(clean_open_error_detail)?
+    else {
         return Ok(None);
     };
     // File-sync providers may expose the canonical filename before its final
@@ -3599,9 +3792,7 @@ impl SyncRuntimeHandle {
                     );
                 }
                 Ok(None) => {}
-                Err(detail) => {
-                    return refused(format!("clean managed runtime open failed: {detail}"))
-                }
+                Err(detail) => return refused(detail),
             }
         }
         progress(SyncRuntimeOpenProgress::Phase {
@@ -4107,9 +4298,9 @@ impl SyncRuntimeHandle {
         descriptor: SyncSharedEnrollmentDescriptor,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         let _enrollment_operation = self.enrollment_operation();
-        let descriptor = descriptor
-            .decode()
-            .map_err(SyncRuntimeRequestError::InvalidRequest)?;
+        let descriptor = descriptor.decode().map_err(|error| {
+            SyncRuntimeRequestError::InvalidRequest(clean_open_error_detail(error))
+        })?;
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::JoinShared {
@@ -6366,20 +6557,21 @@ fn retained_local_completion_intents(
 ) -> Result<BTreeSet<crate::oplog::ProjectionIntentId>, String> {
     let mut retained = BTreeSet::new();
     for frame in &managed.frames {
-        let record = crate::oplog::decode_managed_local_record(frame).map_err(display)?;
+        let record =
+            crate::oplog::decode_managed_local_record(frame).map_err(CleanOpenError::from)?;
         for projection in record.projections() {
             retained.insert(
                 projection
                     .completion_intent()
                     .and_then(|intent| intent.id())
-                    .map_err(display)?,
+                    .map_err(CleanOpenError::from)?,
             );
         }
     }
-    for turn in turns.undrained_turns().map_err(display)? {
+    for turn in turns.undrained_turns().map_err(CleanOpenError::from)? {
         retained.extend(
             crate::oplog::projection::local_completion_intent_ids_for_turn(&turn)
-                .map_err(display)?,
+                .map_err(CleanOpenError::from)?,
         );
     }
     Ok(retained)
@@ -6484,12 +6676,17 @@ fn drain_open_managed_local_journal(
         }
     }
 
-    let accepted = runtime.engine().accepted_frontier_root().map_err(display)?;
-    let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
-    let (_, engine, _) = session.parts().map_err(display)?;
+    let accepted = runtime
+        .engine()
+        .accepted_frontier_root()
+        .map_err(CleanOpenError::from)?;
+    let mut session = runtime
+        .admit_clean_mutation(graph)
+        .map_err(CleanOpenError::from)?;
+    let (_, engine, _) = session.parts().map_err(CleanOpenError::from)?;
     engine
         .collapse_managed_local_prefix(&accepted)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     Ok(recovered_batches)
 }
 
@@ -6507,14 +6704,16 @@ fn drain_open_projection_turn_journal(
         // that held reservation instead of minting a competing one.
         let handoff = graph
             .reconstruct_published_handoff_safe(runtime.engine().workspace_id(), endpoint)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         handoff
             .verify_binding(graph, runtime.engine().workspace_id(), endpoint)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let published = handoff.into_publisher_guard().into_published_latch();
         {
-            let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
-            let (_, engine, database) = session.parts().map_err(display)?;
+            let mut session = runtime
+                .admit_clean_mutation(graph)
+                .map_err(CleanOpenError::from)?;
+            let (_, engine, database) = session.parts().map_err(CleanOpenError::from)?;
             crate::oplog::projection::replay_projection_turn(
                 graph,
                 receipts,
@@ -6523,7 +6722,7 @@ fn drain_open_projection_turn_journal(
                 &turn,
                 Some(&published),
             )
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         }
         turns.checkpoint_front()?;
         published.complete();
@@ -6541,16 +6740,18 @@ fn append_and_replay_terminal_projection_turns(
     let terminal_work = runtime
         .engine()
         .clean_terminal_projection_work()
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     let mut groups: Vec<(crate::oplog::TurnOrigin, Vec<crate::oplog::ProjectionWork>)> = Vec::new();
     for work in terminal_work {
         let already_exact = {
-            let mut session = runtime.admit_clean_mutation(graph).map_err(display)?;
-            let (_, engine, database) = session.parts().map_err(display)?;
+            let mut session = runtime
+                .admit_clean_mutation(graph)
+                .map_err(CleanOpenError::from)?;
+            let (_, engine, database) = session.parts().map_err(CleanOpenError::from)?;
             crate::oplog::projection::projection_work_is_already_exact(
                 graph, engine, database, &work,
             )
-            .map_err(display)?
+            .map_err(CleanOpenError::from)?
         };
         if already_exact {
             continue;
@@ -6577,8 +6778,8 @@ fn append_and_replay_terminal_projection_turns(
     for (origin, work) in groups {
         let pages =
             crate::oplog::projection::projection_turn_pages_for_work(runtime.engine(), &work)
-                .map_err(display)?;
-        turns.append(origin, pages).map_err(display)?;
+                .map_err(CleanOpenError::from)?;
+        turns.append(origin, pages).map_err(CleanOpenError::from)?;
     }
     drain_open_projection_turn_journal(graph, receipts, runtime, turns)
 }
@@ -6664,7 +6865,7 @@ fn activate_clean_runtime_resources_retaining_archive(
     });
     let capture = graph
         .capture_inactive_bootstrap_sources(&request.capture_root)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::BootstrapImportPreparation,
     });
@@ -6678,7 +6879,7 @@ fn activate_clean_runtime_resources_retaining_archive(
         &request.database_path,
         &ReferenceCatalogPolicyV1::default(),
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     progress(SyncLocalActivationProgress::ReadinessSample {
         largest_page_path: preparation.instrumentation().largest_source_path.clone(),
     });
@@ -6695,7 +6896,7 @@ fn activate_clean_runtime_resources_retaining_archive(
         &clean_baseline_directory(&request.archive_root),
         &request.enrollment_root,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     let (baseline, projection, accepted_frontier, marker) = committed.into_parts();
     #[cfg(test)]
     if CLEAN_ACTIVATION_POST_RETAIN_TEST_CUT.with(std::cell::Cell::take) {
@@ -6714,23 +6915,23 @@ fn activate_clean_runtime_resources_retaining_archive(
     );
     engine
         .configure_reference_catalog_policy(ReferenceCatalogPolicyV1::default())
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .install_lazy_genesis_baseline(Arc::new(baseline))
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .attach_clean_archive_store(operation_store)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::SqliteOpenBuild,
     });
     let store = ObjectStore::open(&operation_archive_path, request.identities.workspace_id)
-        .map_err(display)?;
-    let lease =
-        WorkspaceRuntimeLease::acquire(&store, request.identities.workspace_id).map_err(display)?;
+        .map_err(CleanOpenError::from)?;
+    let lease = WorkspaceRuntimeLease::acquire(&store, request.identities.workspace_id)
+        .map_err(CleanOpenError::from)?;
     let projection = LeasedWorkspaceProjection::adopt_clean_genesis(
         lease,
         &request.database_path,
@@ -6743,26 +6944,26 @@ fn activate_clean_runtime_resources_retaining_archive(
         &engine,
         projection,
     )
-    .map_err(|(_, error)| display(error))?;
+    .map_err(|(_, error)| CleanOpenError::from(error))?;
     engine
         .open_local_completion_index(&store)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     let accepted_batch_ids = engine
         .status()
         .accepted_batch_ids()
-        .map_err(display)?
+        .map_err(CleanOpenError::from)?
         .into_iter()
         .collect();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
+    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
     let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
         engine,
         projection,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     let binding = ActorRuntimeBinding::from_clean(&request.identities, endpoint, &receipts);
     let managed_local = open_clean_foreground_journal(
         &request.application_runtime_root,
@@ -6777,11 +6978,11 @@ fn activate_clean_runtime_resources_retaining_archive(
         binding.endpoint_id,
         binding.device_id().as_uuid(),
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     runtime
         .engine()
         .open_absence_decision_map(&receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     Ok(CleanRuntimeResources {
         graph,
         receipts,
@@ -6833,7 +7034,7 @@ impl ColdOpenLocalCompletionGuard {
         let retained = self.retained_intents.clone();
         self.runtime_mut()
             .flush_local_projection_completions(retained)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         Ok(self
             .runtime
             .take()
@@ -6972,7 +7173,7 @@ fn open_clean_runtime_resources_with_progress(
         &request.enrollment_root,
         &request.database_path,
     )
-    .map_err(display)?
+    .map_err(CleanOpenError::from)?
     else {
         return Ok(None);
     };
@@ -6982,7 +7183,7 @@ fn open_clean_runtime_resources_with_progress(
         identities.catalog_document_id,
         ReferenceCatalogPolicyV1::default(),
     )
-    .map_err(display)?
+    .map_err(CleanOpenError::from)?
     else {
         return Ok(None);
     };
@@ -6997,25 +7198,26 @@ fn open_clean_runtime_resources_with_progress(
     // authoritative and its claim provably predates the authority marker. A
     // fresh store never reaches this line. The full in-place validation inside
     // the receipt-store open below stays as defense in depth.
-    ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root).map_err(display)?;
+    ProjectionReceiptStore::precheck_authoritative_claim(&request.receipt_root)
+        .map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::ReceiptClaimPrecheck,
         stage_progress,
     );
-    let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
+    let graph = Graph::open_checked(&request.graph_root).map_err(CleanOpenError::from)?;
     trace.phase(SyncRuntimeCleanOpenStage::GraphOpen, stage_progress);
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
         identities.endpoint_id,
         identities.device_id,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     let receipts = ProjectionReceiptStore::open_for_endpoint(
         &request.receipt_root,
         identities.workspace_id,
         endpoint,
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::EndpointAndReceiptOpen,
         stage_progress,
@@ -7029,24 +7231,29 @@ fn open_clean_runtime_resources_with_progress(
     let binding = ActorRuntimeBinding::from_clean(identities, endpoint, &receipts);
     let operation_archive_path = authority_directories.operations;
     let store = ObjectStore::open_structural(&operation_archive_path, identities.workspace_id)
-        .map_err(display)?;
-    let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id).map_err(display)?;
+        .map_err(CleanOpenError::from)?;
+    let lease = WorkspaceRuntimeLease::acquire(&store, identities.workspace_id)
+        .map_err(CleanOpenError::from)?;
     let covered =
         clean_undrained_object_repair_coverage(&request.application_runtime_root, &binding)?;
     store
         .repair_covered_object_mismatches(&covered)
-        .map_err(display)?;
-    store.validate_namespace().map_err(display)?;
+        .map_err(CleanOpenError::from)?;
+    store.validate_namespace().map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
         stage_progress,
     );
     engine
-        .attach_clean_archive_store(store.duplicate_retained_capability().map_err(display)?)
-        .map_err(display)?;
+        .attach_clean_archive_store(
+            store
+                .duplicate_retained_capability()
+                .map_err(CleanOpenError::from)?,
+        )
+        .map_err(CleanOpenError::from)?;
     let baseline_claim_source = engine
         .clean_transient_projection_claim_snapshot()
-        .map_err(display)?
+        .map_err(CleanOpenError::from)?
         .ok_or_else(|| "clean runtime has no immutable baseline claim snapshot".to_owned())?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeTailReplay,
@@ -7086,7 +7293,7 @@ fn open_clean_runtime_resources_with_progress(
                 Ok(()) => {
                     engine
                         .reset_clean_checkpoint_publisher(durable_sequence)
-                        .map_err(display)?;
+                        .map_err(CleanOpenError::from)?;
                     restored_checkpoint = true;
                     counters.checkpoint_opens = 1;
                     match engine.replay_clean_checkpoint_tail(&tail, baseline_claim_source.as_ref())
@@ -7098,7 +7305,7 @@ fn open_clean_runtime_resources_with_progress(
                             );
                             engine
                                 .reset_clean_checkpoint_to_baseline()
-                                .map_err(display)?;
+                                .map_err(CleanOpenError::from)?;
                             restored_checkpoint = false;
                             counters.checkpoint_opens = 0;
                         }
@@ -7120,7 +7327,7 @@ fn open_clean_runtime_resources_with_progress(
         counters.full_replay_opens = 1;
         replayed = engine
             .replay_clean_committed_tail(baseline_claim_source.as_ref())
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
     }
     counters.committed_tail_replayed = replayed;
     counters.checkpoint_durable_lag = engine.clean_checkpoint_durable_lag();
@@ -7129,15 +7336,20 @@ fn open_clean_runtime_resources_with_progress(
         SyncRuntimeCleanOpenStage::CommittedTailReplay,
         stage_progress,
     );
-    let projection = if engine.is_clean_genesis_frontier().map_err(display)? {
-        let expected = engine.accepted_frontier_root().map_err(display)?;
+    let projection = if engine
+        .is_clean_genesis_frontier()
+        .map_err(CleanOpenError::from)?
+    {
+        let expected = engine
+            .accepted_frontier_root()
+            .map_err(CleanOpenError::from)?;
         let baseline_projection = open_or_rebuild_clean_genesis_projection(
             &request.database_path,
             ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
             &baseline,
             ReferenceCatalogPolicyV1::default(),
         )
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
         LeasedWorkspaceProjection::adopt_clean_genesis(
             lease,
             &request.database_path,
@@ -7147,12 +7359,12 @@ fn open_clean_runtime_resources_with_progress(
             &engine,
             baseline_projection,
         )
-        .map_err(|(_, error)| display(error))?
+        .map_err(|(_, error)| CleanOpenError::from(error))?
     } else {
         let application_runtime =
             ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-                .map_err(display)?;
-        let source = RebuildSource::new(&engine, &store).map_err(display)?;
+                .map_err(CleanOpenError::from)?;
+        let source = RebuildSource::new(&engine, &store).map_err(CleanOpenError::from)?;
         LeasedWorkspaceProjection::open_under(lease, |slot| {
             let opened = crate::oplog::SqliteFrontier::open_or_rebuild_with_applier_slot(
                 &request.database_path,
@@ -7164,15 +7376,15 @@ fn open_clean_runtime_resources_with_progress(
             Ok::<_, crate::oplog::SqliteProjectionError>((opened, ()))
         })
         .map(|(projection, ())| projection)
-        .map_err(|(_, error)| display(error))?
+        .map_err(|(_, error)| CleanOpenError::from(error))?
     };
     trace.phase(SyncRuntimeCleanOpenStage::ProjectionOpen, stage_progress);
     engine
         .attach_clean_projection_endpoint(&graph, &receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     engine
         .open_local_completion_index(&store)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     // Packet C-4 open order: enumerate and reconcile sweep chains under the
     // workspace lease before either journal drain or any actor publication
     // path can run. Open/in-grace records therefore re-establish the barrier
@@ -7180,11 +7392,11 @@ fn open_clean_runtime_resources_with_progress(
     let accepted_batch_ids: BTreeSet<_> = engine
         .status()
         .accepted_batch_ids()
-        .map_err(display)?
+        .map_err(CleanOpenError::from)?
         .into_iter()
         .collect();
     counters.accepted_batches = accepted_batch_ids.len();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(display)?;
+    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
     counters.sweep_chains = sweeps.chain_count();
     counters.local_completion_entries = engine.local_completion_entry_count();
     if let Some(stats) = engine.local_completion_open_stats() {
@@ -7202,7 +7414,7 @@ fn open_clean_runtime_resources_with_progress(
         .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
     let runtime =
         CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
     let mut completion_guard = ColdOpenLocalCompletionGuard::new(runtime);
     // §4.7 steps 5-6: both journals become available before terminal work can
     // mutate the graph; the semantic managed-local queue drains first.
@@ -7219,7 +7431,7 @@ fn open_clean_runtime_resources_with_progress(
         binding.endpoint_id,
         binding.device_id().as_uuid(),
     )
-    .map_err(display)?;
+    .map_err(CleanOpenError::from)?;
     trace.phase(
         SyncRuntimeCleanOpenStage::RetainedJournalsOpen,
         stage_progress,
@@ -7245,7 +7457,7 @@ fn open_clean_runtime_resources_with_progress(
         .runtime_mut()
         .engine()
         .open_absence_decision_map(&receipts)
-        .map_err(display)?;
+        .map_err(CleanOpenError::from)?;
     if let Some(stats) = completion_guard
         .runtime_mut()
         .engine()
@@ -11155,8 +11367,14 @@ impl ManagedLocalRuntimeState {
                 }
             }
         }
-        let directory = self.directory.try_clone().map_err(display)?.into_std_file();
-        crate::durability_counters::sync_directory(&directory).map_err(display)
+        let directory = self
+            .directory
+            .try_clone()
+            .map_err(CleanOpenError::from)?
+            .into_std_file();
+        crate::durability_counters::sync_directory(&directory)
+            .map_err(CleanOpenError::from)
+            .map_err(String::from)
     }
 }
 
@@ -11389,15 +11607,17 @@ fn recover_clean_foreground_journal_only(
     }
     let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
         .map_err(|error| format!("cannot retain clean foreground journal root: {error}"))?;
-    ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
-    let namespace = open_dir_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
+    ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE)
+        .map_err(CleanOpenError::from)?;
+    let namespace =
+        open_dir_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(CleanOpenError::from)?;
     let workspace_name = format!(
         "{CLEAN_FOREGROUND_JOURNAL_WORKSPACE_PREFIX}-{}-{}",
         binding.workspace_id(),
         binding.lineage_digest()
     );
-    ensure_directory_nofollow(&namespace, &workspace_name).map_err(display)?;
-    let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(display)?;
+    ensure_directory_nofollow(&namespace, &workspace_name).map_err(CleanOpenError::from)?;
+    let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(CleanOpenError::from)?;
     let device_id = binding.device_id().as_uuid();
     let names = clean_foreground_journal_names(&directory)?;
     let mut anchors = names
@@ -11520,7 +11740,8 @@ fn recover_clean_foreground_journal_only(
         return Err("clean foreground checkpoint is ahead of its journal generation".into());
     }
     for frame in &recovered_frames[..checkpointed] {
-        let record = crate::oplog::decode_managed_local_record(frame).map_err(display)?;
+        let record =
+            crate::oplog::decode_managed_local_record(frame).map_err(CleanOpenError::from)?;
         checkpoint_batch_id = Some(record.prepared_batch().manifest().batch_id());
     }
     let recovered_frames = recovered_frames.split_off(checkpointed);
@@ -11554,7 +11775,7 @@ fn clean_undrained_object_repair_coverage(
             )
         })?;
         for object in record.prepared_batch().objects() {
-            let bytes = object.encode().map_err(display)?;
+            let bytes = object.encode().map_err(CleanOpenError::from)?;
             let digest = ContentDigest::of(&bytes);
             match covered.entry(digest) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -12817,7 +13038,7 @@ impl RuntimeActor {
             .runtime
             .database()
             .materialized_read()
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let mut page_count_at_open = || {
             let mut count = 0_usize;
             let mut cursor = None;
@@ -12898,7 +13119,8 @@ impl RuntimeActor {
             .ok_or_else(|| "clean actor has no local runtime".to_owned())?
             .runtime
             .flush_local_projection_completions(retained)
-            .map_err(display)
+            .map_err(CleanOpenError::from)
+            .map_err(String::from)
     }
 
     fn flush_local_completions_if_required(&mut self) -> Result<bool, String> {
@@ -13051,28 +13273,29 @@ impl RuntimeActor {
         let promoted_state_digest = runtime
             .engine()
             .accepted_frontier_root()
-            .map_err(display)?
+            .map_err(CleanOpenError::from)?
             .state_digest();
-        let enrollment_root =
-            open_existing_enrollment_application_root(&request.enrollment_root).map_err(display)?;
+        let enrollment_root = open_existing_enrollment_application_root(&request.enrollment_root)
+            .map_err(CleanOpenError::from)?;
         ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let application_runtime_directory =
             Dir::open_ambient_dir(&request.application_runtime_root, ambient_authority())
                 .map_err(|error| format!("cannot retain application runtime root: {error}"))?;
         ensure_directory_nofollow(&application_runtime_directory, "move-episodes")
-            .map_err(display)?;
+            .map_err(CleanOpenError::from)?;
         let move_episode_directory =
-            open_dir_nofollow(&application_runtime_directory, "move-episodes").map_err(display)?;
+            open_dir_nofollow(&application_runtime_directory, "move-episodes")
+                .map_err(CleanOpenError::from)?;
         let move_episode_cold_scan =
             Some(move_episode_directory.entries().map_err(|error| {
                 format!("cannot begin cold move episode cleanup scan: {error}")
             })?);
         let marker = read_activation_marker(enrollment_root.path())
-            .map_err(display)?
+            .map_err(CleanOpenError::from)?
             .ok_or_else(|| "clean runtime has no activation marker".to_owned())?;
         let clean_shared_state =
-            read_clean_shared_state(enrollment_root.path()).map_err(display)?;
+            read_clean_shared_state(enrollment_root.path()).map_err(CleanOpenError::from)?;
         if let Some(state) = &clean_shared_state {
             let descriptor = state.descriptor();
             if descriptor.workspace_id() != binding.workspace_id()
@@ -13098,7 +13321,7 @@ impl RuntimeActor {
                     &request.provider_root,
                     &request.provider_journal_root,
                 )
-                .map_err(display)?,
+                .map_err(CleanOpenError::from)?,
             )
         } else {
             None
@@ -23077,8 +23300,9 @@ impl RuntimeActor {
         }
         self.clean_shutdown()?;
         if let Some(descriptor) = self.clean_shared_descriptor.clone() {
-            return SyncSharedEnrollmentDescriptor::from_clean(descriptor)
-                .map_err(SyncRuntimeRequestError::ActorRefused);
+            return SyncSharedEnrollmentDescriptor::from_clean(descriptor).map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(clean_open_error_detail(error))
+            });
         }
         let marker = read_activation_marker(self.enrollment_root.path())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
@@ -23126,7 +23350,7 @@ impl RuntimeActor {
         self.shared_role = Some(SyncSharedRole::Initiator);
         self.shared_phase = Some(SyncSharedPhase::Active);
         SyncSharedEnrollmentDescriptor::from_clean(descriptor)
-            .map_err(SyncRuntimeRequestError::ActorRefused)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(clean_open_error_detail(error)))
     }
 
     fn join_shared(
@@ -23433,7 +23657,9 @@ impl RuntimeActor {
         let state = CleanSharedStateV1::new(descriptor.clone(), CleanSharedRoleV1::Joiner)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         let public_descriptor = SyncSharedEnrollmentDescriptor::from_clean(descriptor.clone())
-            .map_err(SyncRuntimeRequestError::ActorRefused)?;
+            .map_err(|error| {
+                SyncRuntimeRequestError::ActorRefused(clean_open_error_detail(error))
+            })?;
         publish_clean_shared_state(self.enrollment_root.path(), &state)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         self.clean_shared_descriptor = Some(descriptor.clone());
@@ -25532,10 +25758,6 @@ fn sync_reference_hit(hit: FrontierReferenceHit) -> SyncReferenceHitDto {
         resolved_page_id: hit.resolved_page_id.map(|id| id.to_string()),
         resolved_block_id: hit.resolved_block_id.map(|id| id.to_string()),
     }
-}
-
-fn display(error: impl fmt::Display) -> String {
-    error.to_string()
 }
 
 fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {

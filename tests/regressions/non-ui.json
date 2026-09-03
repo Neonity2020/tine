@@ -18,7 +18,31 @@
     "scenario": "backend-errors.typed-fixed-shape-no-prose-classification",
     "failBefore": "e-typed-branches-fail-before.txt, e-scenario-io-fail-before.txt, and e-panic-fields-fail-before.txt at 74d00d18e292e6bde629b833e832c4bc7a7a7945"
    },
-   "notes": "The native boundary emits bounded kind and reason-code envelopes, frontend consumers branch on BackendError subclasses, ScenarioError retains ErrorKind instead of prose, and the panic recorder keeps only location, thread, and message kind."
+   "notes": "The native boundary emits bounded kind and reason-code envelopes, frontend consumers branch on BackendError subclasses, ScenarioError retains ErrorKind instead of prose, and the panic recorder keeps only location, thread, and message kind. The clean-open source taxonomy that completes this family for managed open is REG-W4-E3-CLEAN-OPEN-TAXONOMY-001."
+  },
+  {
+   "id": "REG-W4-E3-CLEAN-OPEN-TAXONOMY-001",
+   "title": "A managed open refusal names its source class instead of the page it choked on, and still tells the user something",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 4 E3; invariants I-5, I-9, I-12"},
+   "platforms": ["all"],
+   "layer": "rust-core-to-frontend-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::clean_open_source_matrix_has_one_conversion_per_source_class",
+     "crates/tine-core/src/sync_runtime_tests.rs::clean_open_projection_emits_only_the_tagged_source_code",
+     "crates/tine-core/src/sync_runtime_tests.rs::shared_inspection_boundaries_emit_the_reachable_scenario_code",
+     "crates/tine-core/src/sync_runtime_tests.rs::a_pre_c_private_store_is_refused_before_any_graph_mutation",
+     "crates/tine-core/src/sync_runtime_tests.rs::raw_colon_path_is_classified_incompatible_before_activation",
+     "crates/tine-core/src/sync_runtime_tests.rs::activation_external_edit_before_promotion_refuses_then_retries_from_current_direct_files",
+     "src/typedErrorRatchet.test.ts",
+     "src/managedDiagnostics.test.ts"
+    ],
+    "scenario": "backend-errors.clean-open-source-taxonomy",
+    "failBefore": "proven — tine-agents/evidence/wave4/e3/necessity-typed-error-ratchet-fail-before.log (the re-pinned 0/0 ratchet reports 'expected length 0 but got 89' on the pre-fix tree) and tine-agents/evidence/wave4/e3/necessity-tagged-envelope-fail-before.log (the pre-fix sanitizer answers the tagged envelope with 'The command failed without a safe diagnostic detail.')"
+   },
+   "notes": "Two halves of one user outcome. Failing to open a managed graph used to flatten 16 typed source classes through one `display` helper, so the refusal the user could see and copy carried source prose — a page path, a note name, a changed-content excerpt — and the frontend redactor was the only thing standing between that and the screen. Core now maps each source class once to a stable `clean_open.*` code and projects tagged JSON, so there is nothing private left to redact. The second half is the one a typed wire is easy to lose: `safeManagedErrorDetail` collapses any brace group to `[details]`, which carries no diagnostic word, so a correctly typed envelope reached Settings and the startup recovery pane as \"The command failed without a safe diagnostic detail.\" It now renders the envelope from its own closed vocabulary, and a payload whose fields are not that vocabulary still takes the sanitizing path."
   },
   {
    "id": "REG-W3-I5-CONTENT-OUT-OF-LOGS-001",

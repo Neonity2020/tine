@@ -18,6 +18,35 @@ function joinDetail(
 }
 
 describe("managed-storage diagnostics", () => {
+  // W4-E3 typed the 16 clean-open source classes and made the open-refusal
+  // detail a tagged envelope instead of prose. The sanitizer collapses any
+  // `{…}` group to `[details]`, which carries no diagnostic word — so without
+  // this path every managed open refusal reaches Settings and the startup
+  // recovery pane as "The command failed without a safe diagnostic detail."
+  it("renders a tagged clean-open envelope instead of discarding it", () => {
+    expect(
+      safeManagedErrorDetail('{"kind":"clean-open","reason_code":"clean_open.io"}'),
+    ).toBe("clean-open failure: clean_open.io");
+  });
+
+  it("keeps the refusal scenario when the envelope carries one", () => {
+    expect(
+      safeManagedErrorDetail(
+        '{"kind":"clean-open","reason_code":"clean_open.projection_store","detail":{"scenario":"MS-REF-PROTOCOL-INCOMPATIBLE"}}',
+      ),
+    ).toBe("clean-open failure: clean_open.projection_store (MS-REF-PROTOCOL-INCOMPATIBLE)");
+  });
+
+  it("sanitizes an envelope whose fields are not the closed backend vocabulary", () => {
+    // Only `kind` and `reason_code` drawn from the closed vocabulary bypass the
+    // prose sanitizer. A payload carrying graph text takes the ordinary path.
+    const rendered = safeManagedErrorDetail(
+      '{"kind":"clean-open","reason_code":"pages/My private proposal.md"}',
+    );
+    expect(rendered).not.toContain("My private proposal");
+    expect(rendered).not.toContain("clean_open");
+  });
+
   it("preserves the reason while redacting a graph-relative Markdown path", () => {
     expect(safeManagedErrorDetail(
       "pages/My private proposal.md: external Markdown source is read-only because parsing and reserialization change its block structure",

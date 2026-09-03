@@ -228,14 +228,30 @@ describe("I-9/I-11 typed backend error boundary", () => {
     );
     expect(directClassifier).toContain("downcast_ref::<DirectSaveError>()");
     expect(directClassifier).not.toMatch(/(?:to_string|contains|starts_with)\s*\(/);
-    // Item 3 checkpoint: freeze the compile-probed census rather than let
-    // the pre-existing stringification debt expand while its public typed
-    // carrier is split into a later packet.
-    expect(runtime.match(/map_err\(display\)/g) ?? []).toHaveLength(89);
-    expect(runtime.match(/fn display\(/g) ?? []).toHaveLength(1);
+    // Clean-open failures stay typed until the single OpenRefused projection.
+    expect(runtime.match(/map_err\(display\)/g) ?? []).toHaveLength(0);
+    expect(runtime.match(/fn display\(/g) ?? []).toHaveLength(0);
     expect(contract).toContain("10 BackendError subclasses");
-    expect(contract).toContain("item 3 checkpoint");
+    expect(contract).toContain("Core-only clean-open boundary");
+    expect(contract).not.toContain("item 3 checkpoint");
     expect(contract).toContain("TauriBackend.call");
+
+    const cleanEnum = runtime.slice(
+      runtime.indexOf("pub(crate) enum CleanOpenError"),
+      runtime.indexOf("impl CleanOpenError"),
+    );
+    expect(cleanEnum).not.toMatch(/\bString\b/);
+    const cleanImpl = runtime.slice(
+      runtime.indexOf("impl CleanOpenError"),
+      runtime.indexOf("impl fmt::Display for CleanOpenError"),
+    );
+    const cleanCodes = [...cleanImpl.matchAll(/"(clean_open\.[a-z_]+)"/g)]
+      .map((match) => match[1]);
+    expect(cleanCodes).toHaveLength(16);
+    expect(new Set(cleanCodes).size).toBe(16);
+    for (const code of cleanCodes) expect(contract).toContain(code);
+    expect(runtime.match(/fn clean_open_error_detail\(/g) ?? []).toHaveLength(1);
+    expect(runtime).toContain('tagged_backend_error("clean-open", Some(error.reason_code()))');
 
     const directImpl = model.slice(
       model.indexOf("impl DirectSaveFailureCode"),
