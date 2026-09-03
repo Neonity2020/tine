@@ -104,7 +104,13 @@ import { hydrateVisibleQueryPages, SHEET_RENDER_PAGE } from "../sheet/queryHydra
 
 interface RowRecord extends FormulaEvalRow {}
 
-export const __sheetTableTestHooks: { onIndexRow?: (rowId: string) => void } = {};
+export const __sheetTableTestHooks: {
+  onIndexRow?: (rowId: string) => void;
+  /** Fires once per EFFECTIVE sort-key derivation, whichever branch (title /
+   *  formula / ordinary property) produced it. One seam, so a test counting it
+   *  cannot be satisfied by moving an equivalent derivation elsewhere. */
+  onSortKey?: (rowId: string) => void;
+} = {};
 
 type SortState = { col: number; dir: 1 | -1 } | null;
 type SortKey = { kind: "number"; value: number; text: string } | { kind: "text"; text: string };
@@ -507,18 +513,29 @@ export function SheetTable(props: {
     const rs = rows();
     if (!s) return rs;
     const col = columns()[s.col];
+    const types = fieldTypes();
+    // The ONE seam that derives a row's effective sort key, whichever branch
+    // answers. Deriving it inside the comparator cost ~2·(R log R) derivations
+    // per sort — each one a `visibleBody(rowRaw(row))` parse, a formula-result
+    // lookup, or a property read. Harvest W4-P1 item 1.
     const value = (r: RowRecord): SortKey => {
+      __sheetTableTestHooks.onSortKey?.(r.id);
       if (col === "title") return { kind: "text", text: rowTitle(r, "joined-with-placeholder") };
       const formula = formulaValue(r, col);
       if (formula?.kind === "number") return { kind: "number", value: formula.value, text: String(formula.value) };
       const field = rowFieldValue(r, col);
       const text = field?.raw ?? field?.text ?? "";
-      if (fieldTypes().get(col) === "number" && isPlainDecimalNumber(text.trim())) {
+      if (types.get(col) === "number" && isPlainDecimalNumber(text.trim())) {
         return { kind: "number", value: Number(text.trim()), text };
       }
       return { kind: "text", text };
     };
-    return [...rs].sort((a, b) => compareSortKeys(value(a), value(b)) * s.dir);
+    // Decorate–sort–undecorate: exactly R derivations, then a comparator that
+    // only compares. `Array.prototype.sort` is stable, so equal keys keep their
+    // document order exactly as they did when the comparator derived in place.
+    const decorated = rs.map((row) => ({ row, key: value(row) }));
+    decorated.sort((a, b) => compareSortKeys(a.key, b.key) * s.dir);
+    return decorated.map((entry) => entry.row);
   });
   const [renderLimit, setRenderLimit] = createSignal(SHEET_RENDER_PAGE);
   createEffect(() => {

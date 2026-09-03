@@ -1816,6 +1816,53 @@ keyed by `(page, path)`. Its answer is the frontier-maximal completion across
 both halves; a defensive incomparable maximal set with mixed target kinds
 chooses the reversible Present/defer direction.
 
+Normal Managed opens attach the clean archive store **before** they open the
+absence-decision map, on both the activation and the clean-reopen path, so
+`archive_store == None` — whose full-validated-catalog fallback
+`HotEngine::open_absence_decision_map` retains — is the generic/offline-engine
+case, not a normal-session fork. That ordering is pinned by
+`w4_p1_storage_contract_pins_receiver_summary_frequency_schema`, which also
+keeps the measured table below in step with the probe that produced it.
+
+**Measured open attribution (Harvest W4-P1 item 5, B052).** Ordinary
+single-device desktop Managed cycles on a real-scale anonymized graph copy: each
+cycle performs the stated accepted saves, a clean shutdown, and one cold
+`SyncRuntimeHandle::open_with_progress` whose `SyncRuntimeCleanOpenCounters` are
+captured. Reproduce with
+`sync_runtime::tests::w4_p1_receiver_summary_reopen_frequency_probe`
+(`#[ignore]`, release-only, `TINE_MS_AUDIT_GRAPH_COPY`). Content-read and delta
+figures are totals across the cycles.
+
+| field | value |
+| --- | --- |
+| `checkedHead` | `d1f98c61fe9422ab70b58d38b374604ae499b6da` |
+| `corpusFiles` | `1046` |
+| `corpusPages` | `1045` |
+| `corpusBlocks` | `4758` |
+| `cycles` | `20` |
+| `savesPerCycle` | `1` |
+| `shutdownKind` | `clean-safe` |
+| `archiveStoreAttached` | `yes-by-production-call-order` |
+| `fullCatalogPass0` | `20` |
+| `fullCatalogPass1` | `0` |
+| `summaryRebuiltFalse` | `20` |
+| `summaryRebuiltTrue` | `0` |
+| `receiptContentReads` | `0` |
+| `summaryContentReads` | `20` |
+| `deltaCompletions` | `0` |
+| `deltaIntents` | `0` |
+
+The full-catalog fallback fired in none of the 20 opens and the delta path ran
+in all 20, so it is reachable in a normal session rather than dead code. The
+measurement is bounded: this corpus carries no foreign receiver evidence, so the
+delta path was exercised against an empty evidence set; it says nothing about
+delta-read cost under a populated evidence set or about multi-device sessions.
+It also attributes no cause, because `open_cache(..).ok().flatten()` collapses
+`Ok(None)` with every `Err`, a coverage mismatch reaches the same
+`rebuilt`/`full_catalog_passes` values, and the no-archive branch synthesizes
+those same values; separating them needs a producer reason counter that does not
+exist yet.
+
 The receiver executor consults that answer only after a fresh,
 capability-bound reread of the target path and before publishing a new intent:
 

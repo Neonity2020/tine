@@ -51,6 +51,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Sorting a sheet now derives each row's sort key once.** The key was
+  previously recomputed inside the comparator, so a 200-row sheet parsed,
+  looked up or read one about 12.7 times per row per sort. Sort order and
+  displayed values are unchanged.
+
+- **Several query builders on one page now share a single facets request.**
+  Every mounted builder previously asked the same whole-graph question
+  independently on each data revision; they now share one request per graph and
+  data revision, and all of them still show the current answer.
+
 - **Direct and Managed reads now share template, backlink, and block-UUID
   ownership rules.** Duplicate UUIDs consistently resolve to Logseq's
   parser-order owner across projection, fallback, pending, and drained states,
