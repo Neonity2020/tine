@@ -22779,17 +22779,11 @@ fn managed_one_block_save_stays_within_two_parser_passes() {
     drive_initial_feed(&handle);
     let (page, revision) = load_application_exact(&handle, "Root.md");
 
-    crate::outline::start_managed_parse_census();
     let _ = save_application_block_text(
         &handle,
         page,
         revision,
         "managed one-block two-parser-pass budget",
-    );
-    let primitive_parses = crate::outline::finish_managed_parse_census();
-    assert!(
-        primitive_parses <= 2,
-        "one-block foreground save exceeded its two-parser-primitive budget: {primitive_parses}"
     );
     let stages = handle
         .managed_application_save_instrumentation()
@@ -22808,6 +22802,70 @@ fn managed_one_block_save_stays_within_two_parser_passes() {
 
     drain_managed_local(&handle);
     let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(
+        &handle,
+        page,
+        revision,
+        "managed one-block second parser-pass budget",
+    );
+    let steady = handle
+        .managed_application_save_instrumentation()
+        .expect("the actor reports foreground parse accounting")
+        .application_stages;
+    assert_eq!(steady.editor_accepted_parses, 1);
+    assert_eq!(steady.editor_target_parses, 1);
+    assert_eq!(steady.response_target_exact_dto_reparses, 0);
+
+    drain_managed_local(&handle);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The same budget, counted at the parser primitive instead of the save stage.
+///
+/// This one CANNOT run in the parallel suite, and it is `#[ignore]`d for a
+/// reason worth stating: the census arms a process-global counter, and the save
+/// it measures does not run on the calling thread — a probe on 2026-09-03 read
+/// `global = 1, caller_thread_local = 0`, so the work happens on the runtime
+/// actor. A thread-local counter would therefore always read zero and pass
+/// vacuously, while the global one counts every OTHER test parsing
+/// concurrently. Run alone it reported 2; run inside
+/// `cargo test -p tine-core --lib` it reported **34**, and it had been sitting
+/// in master's red baseline as noise ever since.
+///
+/// The sibling test above keeps the live gate, because
+/// `managed_application_save_instrumentation` is scoped to one handle and no
+/// other test can contribute to it. This test adds what that one cannot see:
+/// parser primitives entered below the named stages.
+#[test]
+#[ignore = "process-global parse census: run with --test-threads=1"]
+fn managed_one_block_save_parser_primitive_budget_census() {
+    let fixture = ActivationFixture::nested_unicode("managed-save-parse-census", 0xa0d9);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("the parse-budget fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+
+    crate::outline::start_managed_parse_census();
+    let _ = save_application_block_text(
+        &handle,
+        page,
+        revision,
+        "managed one-block two-parser-pass budget",
+    );
+    let primitive_parses = crate::outline::finish_managed_parse_census();
+    assert!(
+        primitive_parses <= 2,
+        "one-block foreground save exceeded its two-parser-primitive budget: {primitive_parses}"
+    );
+
+    drain_managed_local(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
     crate::outline::start_managed_parse_census();
     let _ = save_application_block_text(
         &handle,
@@ -22817,14 +22875,76 @@ fn managed_one_block_save_stays_within_two_parser_passes() {
     );
     let second_primitive_parses = crate::outline::finish_managed_parse_census();
     assert!(
-            second_primitive_parses <= 2,
-            "steady one-block foreground save exceeded its two-parser-primitive budget: {second_primitive_parses}"
-        );
+        second_primitive_parses <= 2,
+        "steady one-block foreground save exceeded its two-parser-primitive budget: {second_primitive_parses}"
+    );
     drain_managed_local(&handle);
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+/// A process-global counter cannot be read from a parallel test runner.
+///
+/// The managed parse census arms one `AtomicUsize` for the whole process, so
+/// any test that reads it also counts every unrelated test parsing at the same
+/// moment. `managed_one_block_save_stays_within_two_parser_passes` used to do
+/// exactly that and reported 2 alone but **34** inside
+/// `cargo test -p tine-core --lib` — it lived in master's red baseline as noise
+/// until 2026-09-03. The counter is not broken; reading it from a parallel test
+/// is.
+///
+/// So: every consumer of the census is `#[ignore]`d and run with
+/// `--test-threads=1`. If you need a budget assertion in the ordinary suite,
+/// use `managed_application_save_instrumentation()` instead — it is scoped to
+/// one handle, so no other test can contribute to it. The exemplar pair is
+/// `managed_one_block_save_stays_within_two_parser_passes` (live, per-handle)
+/// and `managed_one_block_save_parser_primitive_budget_census` (ignored,
+/// process-global).
+#[test]
+fn every_managed_parse_census_consumer_is_ignored_from_the_parallel_suite() {
+    let source = include_str!("sync_runtime_tests.rs");
+    let lines: Vec<&str> = source.lines().collect();
+    let mut offenders = Vec::new();
+
+    // Split so this scanner's own source does not match itself.
+    let census_call = concat!("start_managed", "_parse_census()");
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains(census_call) {
+            continue;
+        }
+        // Walk back to the enclosing `fn`, then over its attributes.
+        let Some(signature) = (0..index)
+            .rev()
+            .find(|candidate| lines[*candidate].starts_with("fn "))
+        else {
+            continue;
+        };
+        let mut attribute = signature;
+        let mut ignored = false;
+        while attribute > 0 && lines[attribute - 1].starts_with("#[") {
+            attribute -= 1;
+            ignored |= lines[attribute].starts_with("#[ignore");
+        }
+        if !ignored {
+            offenders.push(format!(
+                "{} (census read at line {})",
+                lines[signature].trim(),
+                index + 1
+            ));
+        }
+    }
+
+    offenders.dedup();
+    assert!(
+        offenders.is_empty(),
+        "the managed parse census is a PROCESS-GLOBAL counter and these tests read it \
+         from the parallel suite, so they also count unrelated tests' parses: {offenders:#?}. \
+         Add #[ignore = \"process-global parse census: run with --test-threads=1\"], or assert \
+         on managed_application_save_instrumentation() instead — it is scoped to one handle. \
+         Imitate managed_one_block_save_stays_within_two_parser_passes."
+    );
 }
 
 fn assert_search_index_matches_materialized_sources(database_path: &Path) {
