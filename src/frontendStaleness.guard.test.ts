@@ -27,7 +27,22 @@ describe("I-20 graph identity guard", () => {
     const settings = readFileSync(join(process.cwd(), "src/components/Settings.tsx"), "utf8");
     expect(switcher).toContain("graphBinding: graphBinding()");
 
-    const normalized = settings.replace(/\s+/g, " ");
+    const pluginsStart = settings.indexOf("function PluginsTab(): JSX.Element");
+    const pluginsTab = settings.slice(
+      pluginsStart,
+      settings.indexOf("function OgField(", pluginsStart),
+    );
+    const normalized = pluginsTab.replace(/\s+/g, " ");
+    const ownedClears = [...normalized.matchAll(/if \(busy\(\) === myKey\) setBusy\(null\)/g)];
+    const busySets = [...normalized.matchAll(/setBusy\(myKey\)/g)];
+    expect(
+      ownedClears.length,
+      "I-20: Settings PluginsTab must retain its five identity-owned busy clears; imitate managedStorageRuntime.ts",
+    ).toBe(5);
+    expect(
+      ownedClears.length,
+      "I-20: every Settings PluginsTab busy-setting operation must have an identity-owned clear; imitate managedStorageRuntime.ts",
+    ).toBeGreaterThanOrEqual(busySets.length);
     const unownedClears = [...normalized.matchAll(/(?:props\.)?setBusy\(null\)/g)]
       .filter((match) => {
         const prefix = normalized.slice(Math.max(0, match.index! - 96), match.index);

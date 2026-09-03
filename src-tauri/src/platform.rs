@@ -814,20 +814,39 @@ mod file_url_tests {
             .map(|offset| start + offset)
             .expect("the opener helper remains after open_external");
         let function = &source[start..end];
-        let target_rows = [
-            ("linux", "#[cfg(target_os = \"linux\")]"),
-            ("macos", "#[cfg(target_os = \"macos\")]"),
-            ("windows", "#[cfg(all(desktop, target_os = \"windows\"))]"),
-            ("android", "#[cfg(not(desktop))]"),
-            ("ios", "#[cfg(not(desktop))]"),
-        ];
-
-        for (target, branch) in target_rows {
-            assert!(
-                function.contains(branch),
-                "I-16: open_external must account for {target} through {branch}"
-            );
+        let url_family = function
+            .split_once("// Linux/macOS:")
+            .map(|(_, family)| family)
+            .expect("URL opener cfg family remains explicit");
+        let mut coverage = std::collections::BTreeMap::<&str, usize>::new();
+        for cfg in url_family
+            .lines()
+            .filter(|line| line.starts_with("    #[cfg("))
+            .map(str::trim)
+        {
+            let targets: &[&str] = match cfg {
+                "#[cfg(all(desktop, not(target_os = \"windows\")))]" => &["linux", "macos"],
+                "#[cfg(all(desktop, target_os = \"windows\"))]" => &["windows"],
+                // `desktop` is Tauri's shipped-target split. This shared arm is
+                // deliberately and explicitly attributable to both mobile OSes.
+                "#[cfg(not(desktop))]" => &["android", "ios"],
+                other => panic!("unaccounted top-level open_external cfg arm: {other}"),
+            };
+            for target in targets {
+                *coverage.entry(target).or_default() += 1;
+            }
         }
+        assert_eq!(
+            coverage,
+            std::collections::BTreeMap::from([
+                ("android", 1),
+                ("ios", 1),
+                ("linux", 1),
+                ("macos", 1),
+                ("windows", 1),
+            ]),
+            "AGENTS §2 cfg golden rule: each shipped target must belong to exactly one opener arm; imitate tine-storage::filesystem::rename_noreplace"
+        );
         assert!(function.contains("tauri_plugin_opener::OpenerExt"));
         assert!(function.contains("opening local files is available on desktop only"));
     }

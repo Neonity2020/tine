@@ -30,6 +30,23 @@ Frontend `console` output is not captured, persisted, or included in reports.
 Variable-bearing calls nevertheless require an exact reviewed entry. Graph
 identity on the save path is represented by a count, never a page name.
 
+## Managed runtime tick vocabulary
+
+The native bridge emits only these bounded tick states: `idle`,
+`checkpoint_capture_skipped`, `local_mutation`, `provider_mutation`,
+`recovery_blocked`, `recovering`, `retry_full`, `blocked`, `failed`,
+`admitted_noop`, `admitted_complete`, and `terminal`.
+`checkpoint_capture_skipped` is deliberately distinct from `recovering`:
+the disposable checkpoint was not captured, while accepted authority and the
+foreground runtime continue unchanged. This vocabulary is pinned by
+`checkpoint_capture_skip_has_its_own_tick_value`.
+
+The fixed `managed.checkpoint_capture_skipped` receipt carries exactly one of
+`runtime_not_attached`, `indexed_runtime`, `blocked_runtime`,
+`unsettled_runtime`, `durable_frontier_ahead`, or `capture_failed`.
+These are bounded causes, never error prose, and are pinned by
+`fixed_event_shape_contains_no_free_form_message_fields`.
+
 Parser failures cross the lsdoc-diff worker boundary only as a status plus
 `ParserDiagnostic`: a nullable numeric offset, UTF-8 input length, and opaque
 input hash. An exception object or free-form parser detail cannot inhabit that

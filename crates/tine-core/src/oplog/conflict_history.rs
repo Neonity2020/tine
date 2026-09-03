@@ -11,6 +11,18 @@ use super::{
     ContentDigest, ManagedPath, PageId,
 };
 
+/// The one causal-clock membership predicate used by accepted admission and
+/// the disposable conflict index. Clocks are canonical peer-sorted vectors.
+pub(crate) fn causal_clock_contains_dot(
+    clock: &[(CausalPeerId, u64)],
+    dot: BatchCausalDot,
+) -> bool {
+    clock
+        .binary_search_by_key(&dot.peer_id(), |(peer, _)| *peer)
+        .ok()
+        .is_some_and(|index| clock[index].1 >= dot.counter())
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ProjectionCreateKey {
     page_id: PageId,
@@ -62,11 +74,7 @@ impl ConflictHistoryBatch {
 
     fn contains(&self, ancestor: &Self) -> bool {
         self.batch_id == ancestor.batch_id
-            || self
-                .causal_clock
-                .binary_search_by_key(&ancestor.causal_dot.peer_id(), |(peer, _)| *peer)
-                .ok()
-                .is_some_and(|index| self.causal_clock[index].1 >= ancestor.causal_dot.counter())
+            || causal_clock_contains_dot(&self.causal_clock, ancestor.causal_dot)
     }
 
     pub(crate) fn post_state(&self, block_id: BlockId) -> Option<&BlockState> {

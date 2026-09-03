@@ -1797,7 +1797,12 @@ pub struct SyncWatcherStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncCheckpointCaptureSkip {
-    IneligibleState,
+    RuntimeNotAttached,
+    IndexedRuntime,
+    BlockedRuntime,
+    UnsettledRuntime,
+    DurableFrontierAhead,
+    CaptureFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6280,6 +6285,8 @@ fn resolve_clean_authority_directories(
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            // §3.1 MS-REF-UNSAFE-FS-KIND pins the in-scope substituted-entry
+            // scenario for this exact refusal stem.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("clean authority orphan is not a private directory: {name}"),
@@ -21318,14 +21325,32 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
-        if self
+        if let Some(reason) = self
             .clean
             .as_ref()
             .and_then(|clean| clean.runtime.engine().take_clean_checkpoint_capture_skip())
-            .is_some()
         {
             return SyncRuntimeTick::CheckpointCaptureSkipped {
-                reason: SyncCheckpointCaptureSkip::IneligibleState,
+                reason: match reason {
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::RuntimeNotAttached => {
+                        SyncCheckpointCaptureSkip::RuntimeNotAttached
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::IndexedRuntime => {
+                        SyncCheckpointCaptureSkip::IndexedRuntime
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::BlockedRuntime => {
+                        SyncCheckpointCaptureSkip::BlockedRuntime
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::UnsettledRuntime => {
+                        SyncCheckpointCaptureSkip::UnsettledRuntime
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::DurableFrontierAhead => {
+                        SyncCheckpointCaptureSkip::DurableFrontierAhead
+                    }
+                    crate::oplog::hot_engine::CleanCheckpointCaptureSkip::CaptureFailed => {
+                        SyncCheckpointCaptureSkip::CaptureFailed
+                    }
+                },
             };
         }
         match self.cleanup_acknowledged_move_episodes() {
@@ -23082,10 +23107,12 @@ impl RuntimeActor {
             match fs::symlink_metadata(destination) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => {
+                    // §3.1 MS-REF-STALE-GENERATION pins the honest concurrent
+                    // generation-advance scenario for this exact refusal stem.
                     return Err(SyncRuntimeRequestError::ActorRefused(format!(
                         "clean shared join generation destination already exists: {}",
                         destination.display()
-                    )))
+                    )));
                 }
                 Err(error) => return Err(SyncRuntimeRequestError::ActorRefused(error.to_string())),
             }

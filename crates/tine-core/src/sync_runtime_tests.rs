@@ -535,6 +535,35 @@ fn public_durable_refusal_scenarios_exactly_match_the_storage_contract() {
 }
 
 #[test]
+fn clean_generation_refusal_stems_are_pinned_to_in_scope_scenarios() {
+    let runtime = include_str!("sync_runtime.rs");
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    for (stem, scenario) in [
+        (
+            "clean authority orphan is not a private directory",
+            "MS-REF-UNSAFE-FS-KIND",
+        ),
+        (
+            "clean shared join generation destination already exists",
+            "MS-REF-STALE-GENERATION",
+        ),
+    ] {
+        assert!(
+            runtime.contains(stem),
+            "production refusal stem drifted: {stem}"
+        );
+        let row = contract
+            .lines()
+            .find(|line| line.contains(stem))
+            .unwrap_or_else(|| panic!("I-8: refusal '{stem}' has no §3.1 scenario row"));
+        assert!(
+            row.contains(scenario),
+            "I-8: refusal '{stem}' must name its in-scope {scenario} scenario"
+        );
+    }
+}
+
+#[test]
 fn every_public_durable_open_and_activation_class_has_a_scenario() {
     let open = [
         SyncRuntimeOpenStatus::Blocked {
@@ -22883,6 +22912,41 @@ const A5_ACCEPTED_CAPTURE_RATIO: f64 = 1.25;
 
 const A3_CONFLICT_LOAD_SLOPE: usize = 8;
 const A3_CONFLICT_LOAD_INTERCEPT: usize = 64;
+
+#[test]
+fn accepted_capture_ratio_and_contract_are_pinned_to_the_same_value() {
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    let pinned = format!("A5_ACCEPTED_CAPTURE_RATIO = {A5_ACCEPTED_CAPTURE_RATIO}");
+    assert!(
+        contract.contains(&pinned),
+        "I-11: the accepted-history capture-ratio gate and storage contract must pin the same constant and value"
+    );
+}
+
+#[test]
+fn og_journal_identity_provenance_is_revision_and_path_pinned() {
+    const OG_REVISION: &str = "6e7afa8eb040686ff057156ee877193b581dd369";
+    const EXTRACT_PATH: &str = "deps/graph-parser/src/logseq/graph_parser/extract.cljc";
+    const BLOCK_PATH: &str = "deps/graph-parser/src/logseq/graph_parser/block.cljs";
+    for (label, source) in [
+        ("model", include_str!("model.rs")),
+        (
+            "import integration",
+            include_str!("oplog/import_integration_tests.rs"),
+        ),
+        (
+            "storage contract",
+            include_str!("../../../docs/storage-sync-contract.md"),
+        ),
+    ] {
+        assert!(
+            source.contains(OG_REVISION)
+                && source.contains(EXTRACT_PATH)
+                && source.contains(BLOCK_PATH),
+            "I-11/D-9: {label} must pin the OG journal-identity rule to one revision and both exact source paths"
+        );
+    }
+}
 
 #[test]
 fn conflict_history_gate_and_contract_pin_the_same_pair_bound() {

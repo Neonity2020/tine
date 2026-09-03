@@ -934,7 +934,9 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
 pub(crate) fn tick_dto(tick: SyncRuntimeTick) -> SparseV2TickDto {
     match tick {
         SyncRuntimeTick::Idle => tick_value("idle", None, None),
-        SyncRuntimeTick::CheckpointCaptureSkipped { .. } => tick_value("recovering", None, None),
+        SyncRuntimeTick::CheckpointCaptureSkipped { .. } => {
+            tick_value("checkpoint_capture_skipped", None, None)
+        }
         SyncRuntimeTick::LocalMutation(outcome) => {
             tick_value("local_mutation", Some(format!("{outcome:?}")), None)
         }
@@ -4351,6 +4353,25 @@ mod tests {
         SyncLocalMutationOutcome, SyncPageKind, SyncPageNameResolutionDto, SyncRuntimeQueryReply,
         SyncRuntimeQueryRequest, SyncSearchHitDto, SyncWatcherObservation,
     };
+
+    #[test]
+    fn checkpoint_capture_skip_has_its_own_tick_value() {
+        let skipped = tick_dto(SyncRuntimeTick::CheckpointCaptureSkipped {
+            reason: tine_core::sync_runtime::SyncCheckpointCaptureSkip::RuntimeNotAttached,
+        });
+        let recovering = tick_dto(SyncRuntimeTick::Recovering);
+        assert_eq!(skipped.state, "checkpoint_capture_skipped");
+        assert_ne!(
+            skipped.state, recovering.state,
+            "I-11: a skipped disposable checkpoint capture is not recovery; keep the diagnostics tick vocabulary distinct"
+        );
+        let contract = include_str!("../../docs/contracts/diagnostics.md");
+        assert!(
+            contract.contains("`checkpoint_capture_skipped`")
+                && contract.contains("checkpoint_capture_skip_has_its_own_tick_value"),
+            "I-11: the diagnostics contract and native tick vocabulary must change together"
+        );
+    }
 
     #[test]
     fn emergency_direct_selection_is_atomic_sticky_and_graph_scoped() {

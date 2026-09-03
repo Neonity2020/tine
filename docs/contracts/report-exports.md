@@ -15,3 +15,7 @@ Unsupported directory flushing follows the shared atomic-write policy; real
 I/O and capacity errors are returned to the UI. The destination remains the
 user's explicit authority boundary—this contract does not authorize saving a
 report anywhere the chooser did not select.
+
+Pinned by `src/livingContracts.contract.test.ts`: both
+`save_diagnostic_report` and the graph-verification exporter publish through
+`tine_core::model::atomic_write`.

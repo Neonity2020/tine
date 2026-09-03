@@ -40,7 +40,18 @@ pub(crate) fn assert_production_region_uses_named_audited_writes(
         if allowed {
             continue;
         }
-        let imports_fs = trimmed.starts_with("use std::fs") || trimmed.contains(" use std::fs");
+        let imports_grouped_fs = trimmed
+            .strip_prefix("use std::{")
+            .and_then(|items| items.split_once("};").map(|(items, _)| items))
+            .is_some_and(|items| {
+                items.split(',').any(|item| {
+                    let item = item.trim();
+                    item == "fs" || item.starts_with("fs as ")
+                })
+            });
+        let imports_fs = trimmed.starts_with("use std::fs")
+            || trimmed.contains(" use std::fs")
+            || imports_grouped_fs;
         let calls_raw_fs = [
             "fs::write(",
             "fs::rename(",
@@ -72,6 +83,7 @@ fn audited_write_guard_rejects_import_alias_and_constructor_evasions() {
         "fn write() { std::fs::File::create(\"x\").unwrap(); }",
         "fn write() { std::fs::OpenOptions::new(); }",
         "fn write() { std::fs::create_dir_all(\"x\").unwrap(); }",
+        "use std::{fs, io}; fn write() { let _ = io::empty(); fs::write(\"x\", b\"x\").unwrap(); }",
     ] {
         let source =
             format!("fn named_audited_path() {{}}\n{evasion}\n#[cfg(test)]\nmod tests {{}}");

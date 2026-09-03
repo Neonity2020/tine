@@ -471,9 +471,18 @@ pub(crate) fn record_checkpoint_capture_skip(
     fields.insert(
         "reason".into(),
         json!(match reason {
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::IneligibleState => {
-                "ineligible_state"
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::RuntimeNotAttached => {
+                "runtime_not_attached"
             }
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::IndexedRuntime => "indexed_runtime",
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::BlockedRuntime => "blocked_runtime",
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::UnsettledRuntime => {
+                "unsettled_runtime"
+            }
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::DurableFrontierAhead => {
+                "durable_frontier_ahead"
+            }
+            tine_core::sync_runtime::SyncCheckpointCaptureSkip::CaptureFailed => "capture_failed",
         }),
     );
     record_fixed_event("managed.checkpoint_capture_skipped", fields);
@@ -995,12 +1004,26 @@ mod tests {
     #[test]
     fn fixed_event_shape_contains_no_free_form_message_fields() {
         let source = include_str!("debug.rs");
+        let contract = include_str!("../../docs/contracts/diagnostics.md");
         assert!(!source.contains("fields.insert(\"message\""));
         assert!(!source.contains("fields.insert(\"path\""));
         assert!(!source.contains("fields.insert(\"detail\""));
         assert!(source.contains("verboseDebugLogIncluded\": false"));
         assert!(source.contains("managed.checkpoint_capture_skipped"));
-        assert!(source.contains("ineligible_state"));
+        for reason in [
+            "runtime_not_attached",
+            "indexed_runtime",
+            "blocked_runtime",
+            "unsettled_runtime",
+            "durable_frontier_ahead",
+            "capture_failed",
+        ] {
+            assert!(source.contains(reason));
+            assert!(
+                contract.contains(reason),
+                "the bounded checkpoint-skip cause and diagnostics contract must change together"
+            );
+        }
     }
 
     #[test]

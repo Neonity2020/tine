@@ -4638,6 +4638,51 @@ mod tests {
     }
 
     #[test]
+    fn projection_drain_completion_passes_the_carried_plan_without_replanning() {
+        let source = include_str!("projection.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("projection tests remain behind one top-level boundary");
+        assert_eq!(
+            production
+                .matches("record_completed_path(engine, &plan)")
+                .count(),
+            3,
+            "I-15: every receiver/recovery drain completion must pass its existing plan; a plan-less completion silently replans"
+        );
+        assert_eq!(
+            production
+                .matches("record_adopted_formatting_path(engine, &plan)")
+                .count(),
+            2,
+            "I-15: formatting-adoption drains must carry the same existing plan"
+        );
+        assert!(
+            !production.contains("record_completed_path(receipts, engine")
+                && !production.contains("record_adopted_formatting_path(store, engine"),
+            "I-15: the pre-cut plan-less drain completion signature returned"
+        );
+
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_072));
+        let state = structural_layout_state(
+            "pages/drain-completion-plan.md",
+            vec![(80_073, None, "a", "drained".into(), None)],
+        );
+        reset_projection_planning_counts_for_test(workspace);
+        let plan = plan_projection(workspace, &state, Some(b"- drained\n")).unwrap();
+        assert!(completed_plan_matches_current(workspace, &state, &plan));
+        assert_eq!(
+            projection_planning_counts_for_test(workspace),
+            ProjectionPlanningCounts {
+                planner_invocations: 1,
+                base_parses: 1,
+            },
+            "I-15: the whole carried-plan completion boundary performs one plan and one base parse"
+        );
+    }
+
+    #[test]
     fn prepared_editor_projection_matches_the_complete_planner_for_markdown_and_org() {
         let markdown_uuid = LogseqUuid::from_uuid(Uuid::from_u128(80_081));
         let mut markdown = structural_layout_state(

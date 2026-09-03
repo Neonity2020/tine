@@ -37,3 +37,8 @@ operation made no change.
 The in-scope threat is crash, power loss, disk failure, and honest concurrent
 filesystem activity. An attacker with arbitrary local filesystem mutation is
 out of scope.
+
+Pinned by `src/livingContracts.contract.test.ts`: the production front doors
+`move_live_to_recovery`, `atomic_copy_new_into_live`, and
+`rename_noreplace_between` retain the retire-before-publish order and the
+capability-bound no-replace primitive.

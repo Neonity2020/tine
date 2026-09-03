@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Internal guards and Managed diagnostics now fail on the regressions they
+  name.** Source ratchets detect helper-hidden error parsing and grouped
+  filesystem imports, platform coverage is enumerated, projection/conflict
+  counters cover their real drain/rebuild boundaries, generation refusals are
+  scenario-pinned, and skipped checkpoint captures retain a bounded cause
+  without being mislabeled as recovery.
+
 - **Closing or switching graphs no longer leaves a conflicted page's
   crash-recovery draft up to half a second stale.** The close barrier now
   lands every pending conflict-capsule refresh before it resolves.

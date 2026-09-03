@@ -21,7 +21,9 @@ use tine_storage::{
 use uuid::Uuid;
 
 use super::absence_decision::{AbsenceCompletionAnchor, AbsenceDecision, AbsenceDecisionMap};
-use super::conflict_history::{ConflictHistoryBatch, ConflictHistoryIndex, ProjectionCreateKey};
+use super::conflict_history::{
+    causal_clock_contains_dot, ConflictHistoryBatch, ConflictHistoryIndex, ProjectionCreateKey,
+};
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::import::ImportExecutionMaterial;
 use super::lazy_genesis::{
@@ -6283,7 +6285,38 @@ pub(crate) struct CleanCheckpointCapture {
 /// underlying free-form error as authority or control flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanCheckpointCaptureSkip {
-    IneligibleState,
+    RuntimeNotAttached,
+    IndexedRuntime,
+    BlockedRuntime,
+    UnsettledRuntime,
+    DurableFrontierAhead,
+    CaptureFailed,
+}
+
+/// Fixed, privacy-safe wording for each skip cause (I-9). The refusal
+/// `capture_clean_checkpoint` returns is derived from the same cause the tick
+/// reports, so the two can never describe the engine differently.
+pub(crate) fn clean_checkpoint_capture_skip_detail(
+    reason: CleanCheckpointCaptureSkip,
+) -> &'static str {
+    match reason {
+        CleanCheckpointCaptureSkip::RuntimeNotAttached => {
+            "clean checkpoint capture requires an attached lazy-genesis and archive store"
+        }
+        CleanCheckpointCaptureSkip::IndexedRuntime => {
+            "clean checkpoint capture is not available while native semantic index stores are open"
+        }
+        CleanCheckpointCaptureSkip::BlockedRuntime => {
+            "clean checkpoint capture requires a nonterminal engine"
+        }
+        CleanCheckpointCaptureSkip::UnsettledRuntime => {
+            "clean checkpoint capture requires a settled accepted fixed point"
+        }
+        CleanCheckpointCaptureSkip::DurableFrontierAhead => {
+            "clean checkpoint durable frontier is ahead of the engine"
+        }
+        CleanCheckpointCaptureSkip::CaptureFailed => "clean checkpoint capture failed",
+    }
 }
 
 /// The semantic state section of the disposable checkpoint. Accepted roster,
@@ -7010,12 +7043,44 @@ impl ShardedHotEngine {
             return;
         };
         let durable_sequence = publisher.durable_sequence();
+        if let Some(reason) = self.clean_checkpoint_capture_skip_reason(durable_sequence) {
+            self.clean_checkpoint_capture_skip.set(Some(reason));
+            return;
+        }
         match self.capture_clean_checkpoint(durable_sequence) {
             Ok(capture) => publisher.enqueue(capture),
             Err(_) => self
                 .clean_checkpoint_capture_skip
-                .set(Some(CleanCheckpointCaptureSkip::IneligibleState)),
+                .set(Some(CleanCheckpointCaptureSkip::CaptureFailed)),
         }
+    }
+
+    /// The single eligibility predicate for a disposable clean-checkpoint
+    /// capture. Both the scheduler (which reports the cause on the tick) and
+    /// [`Self::capture_clean_checkpoint`] (which refuses) ask exactly this.
+    fn clean_checkpoint_capture_skip_reason(
+        &self,
+        durable_sequence: u64,
+    ) -> Option<CleanCheckpointCaptureSkip> {
+        if self.lazy_genesis.is_none() || self.archive_store.is_none() {
+            return Some(CleanCheckpointCaptureSkip::RuntimeNotAttached);
+        }
+        if self.has_native_semantic_index_stores() {
+            return Some(CleanCheckpointCaptureSkip::IndexedRuntime);
+        }
+        if self.history_failure.is_some() || self.fatal_evidence.is_some() {
+            return Some(CleanCheckpointCaptureSkip::BlockedRuntime);
+        }
+        if !self.staged_batches.is_empty()
+            || !self.persisted_staged.is_empty()
+            || !self.archive.is_empty()
+        {
+            return Some(CleanCheckpointCaptureSkip::UnsettledRuntime);
+        }
+        if durable_sequence > self.next_acceptance_sequence {
+            return Some(CleanCheckpointCaptureSkip::DurableFrontierAhead);
+        }
+        None
     }
 
     pub(crate) fn take_clean_checkpoint_capture_skip(&self) -> Option<CleanCheckpointCaptureSkip> {
@@ -7240,23 +7305,13 @@ impl ShardedHotEngine {
         &self,
         durable_sequence: u64,
     ) -> Result<CleanCheckpointCapture, EngineError> {
-        if self.lazy_genesis.is_none()
-            || self.archive_store.is_none()
-            || self.has_native_semantic_index_stores()
-            || self.history_failure.is_some()
-            || self.fatal_evidence.is_some()
-            || !self.staged_batches.is_empty()
-            || !self.persisted_staged.is_empty()
-            || !self.archive.is_empty()
-        {
+        // I-12: capture eligibility has ONE producer. `schedule_clean_checkpoint`
+        // asks the same question to name the tick's skip cause, and a second copy
+        // of these predicates here would let the two answers drift — the engine
+        // would refuse a capture the tick reported as eligible, or the reverse.
+        if let Some(reason) = self.clean_checkpoint_capture_skip_reason(durable_sequence) {
             return Err(EngineError::Archive(
-                "clean checkpoint capture requires a nonterminal accepted fixed point".into(),
-            ));
-        }
-
-        if durable_sequence > self.next_acceptance_sequence {
-            return Err(EngineError::Archive(
-                "clean checkpoint durable frontier is ahead of the engine".into(),
+                clean_checkpoint_capture_skip_detail(reason).into(),
             ));
         }
         let delta_len = self.next_acceptance_sequence - durable_sequence;
@@ -10472,11 +10527,7 @@ impl ShardedHotEngine {
     ) -> Result<AcceptedBatchCausalContainment, EngineError> {
         self.ensure_not_blocked()?;
         let clock = self.derive_inline_causal_clock(causal_dot, causal_dependency_heads)?;
-        if !clock
-            .binary_search_by_key(&causal_dot.peer_id(), |(peer, _)| *peer)
-            .ok()
-            .is_some_and(|index| clock[index].1 >= causal_dot.counter())
-        {
+        if !causal_clock_contains_dot(&clock, causal_dot) {
             return Err(EngineError::Archive(
                 "accepted batch causal clock does not contain its own dot".into(),
             ));
@@ -19851,10 +19902,11 @@ impl ShardedHotEngine {
         &self,
         batch_id: BatchId,
     ) -> Result<Vec<ConflictResolutionIntent>, EngineError> {
-        self.ensure_conflict_history_index()?;
         self.conflict_resolution_history_loads.set(0);
         self.conflict_resolution_evaluation_active.set(true);
-        let result = self.conflict_resolution_intents_counted(batch_id);
+        let result = self
+            .ensure_conflict_history_index()
+            .and_then(|()| self.conflict_resolution_intents_counted(batch_id));
         self.conflict_resolution_evaluation_active.set(false);
         result
     }
@@ -19869,6 +19921,11 @@ impl ShardedHotEngine {
         self.conflict_history_index
             .borrow()
             .is_current(self.next_acceptance_sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conflict_history_unresolved_pair_count_for_test(&self) -> usize {
+        self.conflict_history_index.borrow().unresolved_pair_count()
     }
 
     fn conflict_resolution_intents_counted(

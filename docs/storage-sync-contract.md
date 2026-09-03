@@ -799,7 +799,11 @@ published by that construction pass, and SQLite does not re-read, re-parse, or
 replay the graph to derive the same terminal state a second time.
 Managed inventory derives Page-versus-Journal identity from the decoded file
 name and configured journal title format, matching Logseq's
-`convert-page-if-journal`; the containing configured pages/journals directory
+`get-page-name` and `convert-page-if-journal` at OG revision
+`6e7afa8eb040686ff057156ee877193b581dd369`, respectively in
+`deps/graph-parser/src/logseq/graph_parser/extract.cljc` and
+`deps/graph-parser/src/logseq/graph_parser/block.cljs`; the containing
+configured pages/journals directory
 is path ownership, not semantic-kind evidence. Both current-hot and
 caller-borrowed materialization use one membership/block collector. The hot
 arm clones at most one non-page home at a time (no all-home arena), preserves
@@ -919,7 +923,7 @@ the accepted roster and required-object additions after the publisher's durable
 frontier. The background publisher folds that delta into the preceding payload
 using the same `clean-open-checkpoint-v1` format; no second reader or authority
 is introduced. At the accepted 2026-09-02 gate, capture work at N=800 divided
-by N=50 must be at most the named `A5_ACCEPTED_CAPTURE_RATIO` of 1.25. Each
+by N=50 must be at most `A5_ACCEPTED_CAPTURE_RATIO = 1.25`. Each
 capture hands immutable canonical bytes to at most one background writer; one
 newest snapshot replaces any queued snapshot. This coalescing bounds memory,
 not freshness. Publication failure is logged and the next trigger retries
@@ -1267,6 +1271,14 @@ table:
 | shared-join generation publication is interrupted before or after marker replacement | Crash lands between baseline generation publication, operation generation publication, the archive-directory barrier, and the marker commit point | Resolve the baseline and operation archive named by the durable marker, reclaim every unreferenced generation/candidate, and resume from that complete pair; no durable refusal is emitted |
 | prepare-share while an absence publication barrier is active | A half-synced folder or dying mount delivers mass absence; publishing the first shared baseline would propagate history-bearing deletions before disposition | Refuse with `external deletions awaiting disposition`; retain all local durability and retry after sweep close/grace expiry or explicit disposition |
 | exact provider removal whose caller requires the source present, on a path that is already absent | Sync-service delivery, an honest concurrent instance, or this device's own earlier completed removal has already taken the path; the completed journal record for that removal has since been compacted against provider state (§2.10c-i) | Report `UnknownProviderPath` for the exact path. This is the same answer the `RequirePresent` policy gives for any absent source; the caller re-observes provider state (the clean provider path walk reads the path before it asks for the removal). A caller whose policy is `SettleIfAbsent` settles instead. |
+
+The two internal generation refusals below are pinned to the durable scenario
+vocabulary above. They are not new public scenario IDs.
+
+| Refusal stem | Scenario ID | In-scope scenario and required response |
+| --- | --- | --- |
+| `clean authority orphan is not a private directory` | `MS-REF-UNSAFE-FS-KIND` | Sync delivery, filesystem damage, or an external tool substituted a symlink, special file, or regular file where cleanup owns only private directories. Refuse without following or removing the substituted entry. |
+| `clean shared join generation destination already exists` | `MS-REF-STALE-GENERATION` | An honest concurrent instance advanced the generation after this join validated its prior marker. Abort the stale join; reopen follows the marker-named complete pair and reclaims unreferenced generation state. |
 
 #### Checks with no in-scope scenario, and what happened to them
 

@@ -84,3 +84,8 @@ first place:
 
 `EIO`, `ENOSPC` and everything else surface to the caller. Page saves keep their
 own `sync_projection_chain_required` contract, untouched.
+
+Pinned by `src/livingContracts.contract.test.ts`: production retains
+`atomic_replace_expected`, `Graph::recover_interrupted_publishes()`,
+`RETIRED_SUFFIX = ".retired"`, and the four-attempt `atomic_update` retry
+bound.

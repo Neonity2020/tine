@@ -38,6 +38,18 @@ const ERROR_STRING_CLASSIFIER_ALLOWLIST: readonly ClassifierSite[] = [
     class: "bounded-result-code",
     why: "the references boundary's result-too-large prefix is a bounded wire code, not prose",
   },
+  {
+    file: "persistence.ts",
+    line: 571,
+    class: "temporary-direct-save-parser",
+    why: "retired by W4-E4",
+  },
+  {
+    file: "persistence.ts",
+    line: 592,
+    class: "temporary-direct-save-parser",
+    why: "retired by W4-E4",
+  },
 ];
 
 function sourceFiles(dir: string, files: string[] = []): string[] {
@@ -66,8 +78,74 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
         sites.push({ file: relative(ROOT, file).replaceAll("\\", "/"), line: index + 1 });
       }
     }
+
+    const lines = text.split("\n");
+    const functions: { name: string; start: number; end: number; parameter: string | null }[] = [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const signature = lines[index].match(
+        /(?:function\s+([A-Za-z_$][\w$]*)|(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?)\s*\([^)]*\)\s*(?::[^={]+)?(?:=>\s*)?\{/,
+      );
+      if (!signature) continue;
+      const parameter = lines[index].match(/\b(message|text)\s*:\s*string\b/)?.[1] ?? null;
+      let depth = 0;
+      let end = index;
+      for (; end < lines.length; end += 1) {
+        depth += (lines[end].match(/\{/g) ?? []).length;
+        depth -= (lines[end].match(/\}/g) ?? []).length;
+        if (depth === 0) break;
+      }
+      functions.push({ name: signature[1] ?? signature[2], start: index, end, parameter });
+      index = end;
+    }
+
+    const helperNames = new Set<string>();
+    for (const fn of functions) {
+      if (!fn.parameter || !/(?:error|failure|classif)/i.test(fn.name)) continue;
+      const aliases = new Set([fn.parameter]);
+      let firstDerivedInput: number | null = null;
+      let classifierLine: number | null = null;
+      for (let index = fn.start + 1; index <= fn.end; index += 1) {
+        const line = lines[index];
+        const derived = line.match(/\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\.(?:slice|substring|replace|trim)\b/);
+        if (derived && aliases.has(derived[2])) {
+          aliases.add(derived[1]);
+          firstDerivedInput ??= index;
+        }
+        const classifiesAlias = [...aliases].some((alias) =>
+          new RegExp(`\\b${alias}\\.(?:includes|match|startsWith)\\(`).test(line)
+          || new RegExp(`\\.(?:exec|test)\\(${alias}\\)`).test(line),
+        );
+        if (classifiesAlias) {
+          classifierLine = firstDerivedInput ?? index;
+          break;
+        }
+      }
+      if (classifierLine !== null) {
+        helperNames.add(fn.name);
+        sites.push({
+          file: relative(ROOT, file).replaceAll("\\", "/"),
+          line: classifierLine + 1,
+        });
+      }
+    }
+
+    for (const fn of functions) {
+      if (fn.parameter) continue;
+      const body = lines.slice(fn.start, fn.end + 1).join("\n");
+      const convertsErrorToText = /\b(?:message|text)\s*=\s*String\((?:error|err|e)\)/.test(body);
+      const delegatesToHelper = [...helperNames].some((name) =>
+        new RegExp(`\\b${name}\\((?:message|text)\\)`).test(body),
+      );
+      if (convertsErrorToText && delegatesToHelper) {
+        sites.push({ file: relative(ROOT, file).replaceAll("\\", "/"), line: fn.start + 1 });
+      }
+    }
   }
-  return sites.sort((left, right) => left.file.localeCompare(right.file) || left.line - right.line);
+  return sites
+    .filter((site, index, all) =>
+      all.findIndex((candidate) => candidate.file === site.file && candidate.line === site.line) === index,
+    )
+    .sort((left, right) => left.file.localeCompare(right.file) || left.line - right.line);
 }
 
 describe("I-9/I-11 typed backend error boundary", () => {
@@ -123,7 +201,10 @@ describe("I-9/I-11 typed backend error boundary", () => {
   });
 
   it("has no prose-parsing classifier outside the one funnel", () => {
-    expect(errorStringClassifierSites()).toEqual(
+    expect(
+      errorStringClassifierSites(),
+      "I-9: error classification must use src/backend.ts SaveConflictError/classifyTaggedBackendError; helper indirection may not restore prose parsing",
+    ).toEqual(
       ERROR_STRING_CLASSIFIER_ALLOWLIST.map(({ file, line }) => ({ file, line })),
     );
   });

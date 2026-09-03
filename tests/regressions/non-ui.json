@@ -6079,6 +6079,84 @@
     "failBefore": "Structural on the host: the source-scan guard fails on the v0.6.981 code, which routes every Direct Files create, retirement, publication and restore through tine-storage's DurableDirectoryPublication::move_exact_no_replace; its Android arm is hard-link-then-unlink, Android shared storage (FUSE) refuses hard links, and the raw errno surfaced as 'unknown: Permission denied (os error 13)'. Reporter receipt on GH #466: 0.6.98 saves, 0.6.981 fails on every save, Android 16, Direct Files. The host has no Android runtime harness; same-platform confirmation is pending the reporter on the next release, so platform confidence is tentative."
    },
    "notes": "Blocking core operation. Fix carries the exact-byte move protocol over the graph tree's own no-clobber rename (renameat2(RENAME_NOREPLACE) through the raw syscall on Linux/Android, renameatx_np on Apple, FileRenameInformation on Windows: the primitive 0.6.98 shipped on every target); tine-storage's typed boundary stays for app-private authorities where hard links exist. A refused call now names itself in the receipt instead of a bare errno."
+  },
+  {
+   "id": "REG-W4-G1-PROJECTION-DRAIN-PLAN-001",
+   "title": "A managed projection drain carries its existing page plan through completion instead of silently replanning",
+   "family": "managed-projection-drain-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 5"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/oplog/projection.rs::tests::projection_drain_completion_passes_the_carried_plan_without_replanning"],
+    "scenario": "managed-save.projection-drain-carries-authorized-plan",
+    "failBefore": "The helper-only oracle stayed green when a drain-level completion was pointed at the old plan-less replay shape."
+   },
+   "notes": "The drain-level counter oracle pins one planner invocation and one base parse for the carried page plan."
+  },
+  {
+   "id": "REG-W4-G1-CONFLICT-REBUILD-COUNTER-001",
+   "title": "The conflict-resolution counter exposes the once-per-open accepted-history rebuild",
+   "family": "managed-conflict-rebuild-cost",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 6"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/oplog/hot_engine_integration_tests.rs::conflict_resolution_history_loads_are_bounded_by_unresolved_pairs"],
+    "scenario": "managed-open.conflict-index-rebuild-visible-to-counter",
+    "failBefore": "The counter reset ran after ensure_conflict_history_index, making every once-per-open O(N) rebuild invisible."
+   },
+   "notes": "The scale gate records rebuild loads separately from steady-state pair-bounded evaluations without changing production work."
+  },
+  {
+   "id": "REG-W4-G1-REFUSAL-SCENARIOS-001",
+   "title": "Clean-generation refusals name an actionable in-scope failure scenario",
+   "family": "managed-refusal-scenario",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 9"},
+   "platforms": ["all"],
+   "layer": "rust-core-storage-contract",
+   "status": "covered",
+   "coverage": {
+    "tests": ["crates/tine-core/src/sync_runtime_tests.rs::clean_generation_refusal_stems_are_pinned_to_in_scope_scenarios"],
+    "scenario": "managed-open.clean-generation-refusal-is-actionable",
+    "failBefore": "Both production refusal stems were absent from the §3.1 scenario table."
+   },
+   "notes": "Unsafe orphan kinds map to MS-REF-UNSAFE-FS-KIND; a concurrently advanced join generation maps to MS-REF-STALE-GENERATION. The authority-generation overflow guard remains outside I-8."
+  },
+  {
+   "id": "REG-W4-G1-CHECKPOINT-SKIP-TICK-001",
+   "title": "A skipped checkpoint capture reports its own state instead of claiming recovery",
+   "family": "managed-runtime-status",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 10"},
+   "platforms": ["all"],
+   "layer": "tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": ["src-tauri/src/sync_runtime.rs::tests::checkpoint_capture_skip_has_its_own_tick_value"],
+    "scenario": "managed-runtime.checkpoint-skip-is-not-recovering",
+    "failBefore": "CheckpointCaptureSkipped mapped to the same recovering tick string as real recovery."
+   },
+   "notes": "checkpoint_capture_skipped is a bounded diagnostics vocabulary value and does not re-arm recovered-state UI behavior."
+  },
+  {
+   "id": "REG-W4-G1-CHECKPOINT-SKIP-CAUSE-001",
+   "title": "A skipped checkpoint capture retains a bounded cause through the core and diagnostics boundary",
+   "family": "managed-checkpoint-diagnostics",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-G1 item 11"},
+   "platforms": ["all"],
+   "layer": "rust-core-tauri-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/debug.rs::tests::fixed_event_shape_contains_no_free_form_message_fields",
+     "src-tauri/src/sync_runtime.rs::tests::checkpoint_capture_skip_has_its_own_tick_value"
+    ],
+    "scenario": "managed-checkpoint.skipped-capture-cause-retained",
+    "failBefore": "A wildcard Err mapping collapsed every eligibility and capture failure to IneligibleState."
+   },
+   "notes": "Six enum values cover attachment, runtime shape, blocked state, unsettled work, frontier order, and unexpected capture failure; no prose crosses the boundary."
   }
  ]
 }

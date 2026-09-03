@@ -7690,11 +7690,13 @@ impl Graph {
     /// configured-root interpretation this authority has always produced.
     /// Ordinary graph text outside those roots is decoded from its file name
     /// alone through the same graph-wide decoder `Graph::list_pages` already
-    /// uses, because that is what OG does: `logseq.common.graph/get-files`
-    /// walks the whole graph directory, `graph-parser.extract/get-page-name`
-    /// takes only the last path component, and
-    /// `graph-parser.block/convert-page-if-journal` decides journal-ness by
-    /// parsing that title as a date. The containing directory therefore never
+    /// uses, because that is what OG does at
+    /// 6e7afa8eb040686ff057156ee877193b581dd369:
+    /// `deps/graph-parser/src/logseq/graph_parser/extract.cljc`
+    /// (`get-page-name`) takes only the last path component, and
+    /// `deps/graph-parser/src/logseq/graph_parser/block.cljs`
+    /// (`convert-page-if-journal`) decides journal-ness by parsing that title
+    /// as a date. The containing directory therefore never
     /// chooses Page versus Journal, and the exact nested spelling is retained.
     pub(crate) fn managed_entry_for_managed_path(
         &self,

@@ -6506,7 +6506,7 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
         .is_empty());
 }
 
-fn a3_conflict_history_load_samples(history_size: usize) -> Vec<usize> {
+fn a3_conflict_history_load_samples(history_size: usize) -> (usize, Vec<usize>) {
     let ids = Ids::new();
     let dir = TestDir::new(&format!("a3-conflict-history-{history_size}"));
     let archive = store(&dir, ids);
@@ -6576,7 +6576,20 @@ fn a3_conflict_history_load_samples(history_size: usize) -> Vec<usize> {
         evaluation_engine.stage_ready(deleted.clone()).disposition,
         BatchDisposition::Accepted { .. }
     ));
-    (0..3)
+    // Model the checkpoint-open boundary before the first evaluation. That
+    // once-per-open O(N) rebuild is deliberately visible in the same counter;
+    // the following steady-state samples remain pair-bounded.
+    evaluation_engine.drop_conflict_history_index_for_test();
+    let rebuild_loads = {
+        assert!(!evaluation_engine
+            .conflict_resolution_intents(deleted.manifest().batch_id())
+            .unwrap()
+            .is_empty());
+        evaluation_engine
+            .instrumentation()
+            .conflict_resolution_history_loads
+    };
+    let steady_state = (0..3)
         .map(|_| {
             assert!(!evaluation_engine
                 .conflict_resolution_intents(deleted.manifest().batch_id())
@@ -6586,7 +6599,8 @@ fn a3_conflict_history_load_samples(history_size: usize) -> Vec<usize> {
                 .instrumentation()
                 .conflict_resolution_history_loads
         })
-        .collect()
+        .collect();
+    (rebuild_loads, steady_state)
 }
 
 #[test]
@@ -6596,11 +6610,15 @@ fn conflict_resolution_history_loads_are_bounded_by_unresolved_pairs() {
     const LOAD_BOUND: usize = 8 * UNRESOLVED_PAIRS + 64;
     let mut medians = Vec::new();
     for history_size in [50_usize, 400, 800] {
-        let mut samples = a3_conflict_history_load_samples(history_size);
+        let (rebuild_loads, mut samples) = a3_conflict_history_load_samples(history_size);
+        assert!(
+            rebuild_loads >= history_size,
+            "I-15: the once-per-open conflict-index rebuild must remain visible to the A3 counter; imitate conflict_backlog_reseed_does_not_rebuild_the_conflict_history_index"
+        );
         samples.sort_unstable();
         let median = samples[1];
         eprintln!(
-            "A3 history={history_size} unresolved={UNRESOLVED_PAIRS} samples={samples:?} median={median} bound={LOAD_BOUND}"
+            "A3 history={history_size} unresolved={UNRESOLVED_PAIRS} rebuild_loads={rebuild_loads} steady_samples={samples:?} median={median} bound={LOAD_BOUND}"
         );
         medians.push((history_size, median));
     }
@@ -6610,6 +6628,100 @@ fn conflict_resolution_history_loads_are_bounded_by_unresolved_pairs() {
             "I-14: conflict evaluation loaded {median} accepted batches at history {history_size}; bound {LOAD_BOUND}. Evaluation cost must scale with unresolved pairs, not history; imitate oplog/conflict_history.rs"
         );
     }
+}
+
+#[test]
+fn conflict_resolution_is_invariant_to_concurrent_batch_delivery_order() {
+    let ids = Ids::new();
+    let dir = TestDir::new("a3-conflict-permutation");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let edited = tx(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: ids.block_a,
+            home_document_id: ids.home_a,
+        },
+        content: "permuted concurrent edit".into(),
+    }]);
+    let deleted = tx(vec![SemanticOperation::DeleteSubtree {
+        root_block_id: ids.block_a,
+        page_id: ids.page_a,
+    }]);
+    let (edited, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(0xa3_f300, 0xa3_f300),
+        edited,
+        author(0xa3_f301, 0xa3_f301),
+        deleted,
+    );
+    let child = {
+        let mut author_engine = ids.engine();
+        author_engine.stage_ready(baseline.clone());
+        author_engine.stage_ready(edited.clone());
+        let transaction = tx(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            content: "causal child of the permuted edit".into(),
+        }]);
+        let prepared = author_engine
+            .prepare_fixture_transaction(author(0xa3_f302, 0xa3_f302), &transaction)
+            .unwrap();
+        ready(&archive, &prepared)
+    };
+    let edited_id = edited.manifest().batch_id();
+    let deleted_id = deleted.manifest().batch_id();
+    let child_id = child.manifest().batch_id();
+    let build = |order: [ValidatedBatch; 3]| {
+        let mut engine = ids.engine();
+        engine.stage_ready(baseline.clone());
+        for batch in order {
+            assert!(!matches!(
+                engine.stage_ready(batch).disposition,
+                BatchDisposition::Rejected { .. }
+            ));
+        }
+        engine
+    };
+    let forward = build([edited.clone(), child.clone(), deleted.clone()]);
+    let reverse = build([deleted, child, edited]);
+    let collect = |engine: &ShardedHotEngine| {
+        let mut intents = Vec::new();
+        for batch_id in [edited_id, deleted_id, child_id] {
+            for intent in engine.conflict_resolution_intents(batch_id).unwrap() {
+                if !intents.contains(&intent) {
+                    intents.push(intent);
+                }
+            }
+        }
+        intents.sort_by_key(|intent| format!("{intent:?}"));
+        intents
+    };
+
+    let forward_intents = collect(&forward);
+    let reverse_intents = collect(&reverse);
+    assert_eq!(
+        forward_intents.len(),
+        2,
+        "the four-batch permutation fixture must retain both real conflict intents"
+    );
+    assert_eq!(
+        forward_intents, reverse_intents,
+        "I-12: four accepted batches delivered in either valid order must derive identical conflict intents; imitate causal_clock_contains_dot"
+    );
+    let forward_pairs = forward.conflict_history_unresolved_pair_count_for_test();
+    let reverse_pairs = reverse.conflict_history_unresolved_pair_count_for_test();
+    assert_eq!(
+        forward_pairs, 2,
+        "the four-batch permutation fixture must retain both unresolved causal pairs"
+    );
+    assert_eq!(
+        forward_pairs, reverse_pairs,
+        "I-12: unresolved-pair accounting must be permutation invariant"
+    );
 }
 
 #[test]
@@ -7096,4 +7208,30 @@ fn a4_measure_committed_tail_replay_cost_by_lifetime_page_names() {
             replay.instrumentation().block_claim_hot_entries
         );
     }
+}
+
+/// I-12 guard for W4-G1 item 11. The tick's skip cause and the capture's
+/// refusal must come from ONE predicate; the wave-4 manager review found them
+/// forked (`capture_clean_checkpoint` kept its own copy of the eight
+/// eligibility predicates while the scheduler had grown a second answer), so
+/// the engine could have refused a capture the tick reported as eligible.
+#[test]
+fn clean_checkpoint_capture_eligibility_has_one_producer() {
+    let source = include_str!("hot_engine.rs");
+    assert_eq!(
+        source.matches("self.persisted_staged.is_empty()").count(),
+        1,
+        "I-12: clean-checkpoint capture eligibility must have exactly ONE producer, \
+         `clean_checkpoint_capture_skip_reason`. A second copy of these predicates lets \
+         the tick's reported cause and the capture's refusal drift apart. \
+         Imitate `causal_clock_contains_dot` in `oplog/conflict_history.rs`."
+    );
+    assert_eq!(
+        source
+            .matches("clean_checkpoint_capture_skip_reason(durable_sequence)")
+            .count(),
+        2,
+        "I-12: both `schedule_clean_checkpoint` and `capture_clean_checkpoint` must ask \
+         the single eligibility predicate rather than re-deriving it"
+    );
 }
