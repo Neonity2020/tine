@@ -506,7 +506,10 @@ pub(crate) struct StorageRecoveryTransitionGuard<'a> {
 }
 
 impl<'a> StorageTransitionGuard<'a> {
-    pub(crate) fn advance(&self, phase: StorageTransitionPhase) -> Result<(), String> {
+    pub(crate) fn advance(
+        &self,
+        phase: StorageTransitionPhase,
+    ) -> Result<(), crate::command_error::CommandError> {
         self.supervisor
             .advance_transition(self.app, self.operation_id, phase)
     }
@@ -517,8 +520,8 @@ impl<'a> StorageTransitionGuard<'a> {
 
     pub(crate) fn publish<T>(
         mut self,
-        publish: impl FnOnce() -> Result<T, String>,
-    ) -> Result<(PublishedStorageTransitionGuard<'a>, T), String> {
+        publish: impl FnOnce() -> Result<T, crate::command_error::CommandError>,
+    ) -> Result<(PublishedStorageTransitionGuard<'a>, T), crate::command_error::CommandError> {
         let value = self
             .supervisor
             .commit_if_current(self.operation_id, publish)?;
@@ -534,7 +537,10 @@ impl<'a> StorageTransitionGuard<'a> {
         ))
     }
 
-    pub(crate) fn succeed(mut self, mode: StableStorageMode) -> Result<(), String> {
+    pub(crate) fn succeed(
+        mut self,
+        mode: StableStorageMode,
+    ) -> Result<(), crate::command_error::CommandError> {
         self.supervisor.finish_transition(
             self.app,
             self.operation_id,
@@ -559,7 +565,10 @@ impl<'a> StorageTransitionGuard<'a> {
 }
 
 impl PublishedStorageTransitionGuard<'_> {
-    pub(crate) fn succeed(mut self, mode: StableStorageMode) -> Result<(), String> {
+    pub(crate) fn succeed(
+        mut self,
+        mode: StableStorageMode,
+    ) -> Result<(), crate::command_error::CommandError> {
         self.supervisor.finish_transition(
             self.app,
             self.operation_id,
@@ -598,7 +607,10 @@ impl Drop for PublishedStorageTransitionGuard<'_> {
 }
 
 impl StorageRecoveryTransitionGuard<'_> {
-    pub(crate) fn advance(&self, phase: StorageTransitionPhase) -> Result<(), String> {
+    pub(crate) fn advance(
+        &self,
+        phase: StorageTransitionPhase,
+    ) -> Result<(), crate::command_error::CommandError> {
         self.supervisor
             .advance_transition(self.app, self.operation_id, phase)
     }
@@ -609,13 +621,16 @@ impl StorageRecoveryTransitionGuard<'_> {
 
     pub(crate) fn commit_recovery_step<T>(
         &self,
-        publish: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
+        publish: impl FnOnce() -> Result<T, crate::command_error::CommandError>,
+    ) -> Result<T, crate::command_error::CommandError> {
         self.supervisor
             .commit_if_current(self.operation_id, publish)
     }
 
-    pub(crate) fn succeed(mut self, mode: StableStorageMode) -> Result<(), String> {
+    pub(crate) fn succeed(
+        mut self,
+        mode: StableStorageMode,
+    ) -> Result<(), crate::command_error::CommandError> {
         self.supervisor.finish_transition(
             self.app,
             self.operation_id,
@@ -686,14 +701,14 @@ impl StorageModeSupervisor {
         window: &str,
         canonical_root: PathBuf,
         kind: StorageTransitionKind,
-    ) -> Result<StorageTransitionGuard<'a>, String> {
+    ) -> Result<StorageTransitionGuard<'a>, crate::command_error::CommandError> {
         if !matches!(
             kind,
             StorageTransitionKind::ActivateManaged | StorageTransitionKind::JoinManaged
         ) {
-            return Err(
-                "serving transition guard is limited to managed activation and join".into(),
-            );
+            return Err(crate::command_error::CommandError::sync_runtime(
+                "serving transition guard is limited to managed activation and join",
+            ));
         }
         let operation_id = self.begin_transition(app, window, Some(canonical_root), kind)?;
         Ok(StorageTransitionGuard {
@@ -710,11 +725,11 @@ impl StorageModeSupervisor {
         window: &str,
         canonical_root: PathBuf,
         kind: StorageTransitionKind,
-    ) -> Result<StorageRecoveryTransitionGuard<'a>, String> {
+    ) -> Result<StorageRecoveryTransitionGuard<'a>, crate::command_error::CommandError> {
         if !matches!(kind, StorageTransitionKind::ReturnGracefully) {
-            return Err(
-                "recovery transition guard is limited to graceful Direct Files return".into(),
-            );
+            return Err(crate::command_error::CommandError::sync_runtime(
+                "recovery transition guard is limited to graceful Direct Files return",
+            ));
         }
         let operation_id = self.begin_transition(app, window, Some(canonical_root), kind)?;
         Ok(StorageRecoveryTransitionGuard {
@@ -742,7 +757,7 @@ impl StorageModeSupervisor {
         window: &str,
         canonical_root: Option<PathBuf>,
         kind: StorageTransitionKind,
-    ) -> Result<StorageOperationId, String> {
+    ) -> Result<StorageOperationId, crate::command_error::CommandError> {
         let _publication = self.publication.lock().unwrap();
         let now_ms = self.now_ms();
         let begun = self
@@ -750,7 +765,11 @@ impl StorageModeSupervisor {
             .lock()
             .unwrap()
             .begin(window, canonical_root, kind, now_ms)
-            .map_err(|error| format!("storage transition refused: {error:?}"))?;
+            .map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "storage transition refused: {error:?}"
+                ))
+            })?;
         if let Some(superseded) = begun.superseded {
             self.emit(app, superseded);
         }
@@ -781,16 +800,15 @@ impl StorageModeSupervisor {
         app: &tauri::AppHandle,
         window: &str,
         canonical_root: PathBuf,
-    ) -> Result<StorageOperationId, String> {
+    ) -> Result<StorageOperationId, crate::command_error::CommandError> {
         let _publication = self.publication.lock().unwrap();
         let now_ms = self.now_ms();
         let begun = {
             let mut model = self.model.lock().unwrap();
             if model.selected_root(window) != Some(canonical_root.as_path()) {
-                return Err(
-                    "This recovery action no longer matches the native-selected graph. Retry graph lookup before returning to Direct Files."
-                        .into(),
-                );
+                return Err(crate::command_error::CommandError::sync_runtime(
+                    "This recovery action no longer matches the native-selected graph. Retry graph lookup before returning to Direct Files.",
+                ));
             }
             model
                 .begin(
@@ -799,7 +817,11 @@ impl StorageModeSupervisor {
                     StorageTransitionKind::ReturnEmergency,
                     now_ms,
                 )
-                .map_err(|error| format!("storage transition refused: {error:?}"))?
+                .map_err(|error| {
+                    crate::command_error::CommandError::sync_runtime(format!(
+                        "storage transition refused: {error:?}"
+                    ))
+                })?
         };
         if let Some(superseded) = begun.superseded {
             self.emit(app, superseded);
@@ -825,12 +847,16 @@ impl StorageModeSupervisor {
         &self,
         operation_id: StorageOperationId,
         canonical_root: PathBuf,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::command_error::CommandError> {
         self.model
             .lock()
             .unwrap()
             .bind_root(operation_id, canonical_root)
-            .map_err(|error| format!("storage transition root refused: {error:?}"))
+            .map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "storage transition root refused: {error:?}"
+                ))
+            })
     }
 
     pub(crate) fn advance_transition(
@@ -838,13 +864,17 @@ impl StorageModeSupervisor {
         app: &tauri::AppHandle,
         operation_id: StorageOperationId,
         phase: StorageTransitionPhase,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::command_error::CommandError> {
         let event = self
             .model
             .lock()
             .unwrap()
             .advance(operation_id, phase, self.now_ms())
-            .map_err(|error| format!("storage transition progress refused: {error:?}"))?;
+            .map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "storage transition progress refused: {error:?}"
+                ))
+            })?;
         self.emit(app, event);
         Ok(())
     }
@@ -856,7 +886,7 @@ impl StorageModeSupervisor {
         outcome: StorageTransitionOutcome,
         stable_mode: Option<StableStorageMode>,
         outcome_code: Option<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::command_error::CommandError> {
         let event = self
             .model
             .lock()
@@ -868,7 +898,11 @@ impl StorageModeSupervisor {
                 outcome_code,
                 self.now_ms(),
             )
-            .map_err(|error| format!("storage transition completion refused: {error:?}"))?;
+            .map_err(|error| {
+                crate::command_error::CommandError::sync_runtime(format!(
+                    "storage transition completion refused: {error:?}"
+                ))
+            })?;
         self.emit(app, event);
         Ok(())
     }
@@ -885,8 +919,8 @@ impl StorageModeSupervisor {
     pub(crate) fn commit_if_current<T>(
         &self,
         operation_id: StorageOperationId,
-        publish: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
+        publish: impl FnOnce() -> Result<T, crate::command_error::CommandError>,
+    ) -> Result<T, crate::command_error::CommandError> {
         let _publication = self.publication.lock().unwrap();
         {
             let model = self.model.lock().unwrap();
@@ -895,7 +929,9 @@ impl StorageModeSupervisor {
                 .values()
                 .any(|active| active.operation.operation_id == operation_id)
             {
-                return Err("storage transition was superseded before publication".into());
+                return Err(crate::command_error::CommandError::prose(
+                    "storage transition was superseded before publication",
+                ));
             }
         }
         publish()
@@ -907,8 +943,8 @@ impl StorageModeSupervisor {
     /// activation/join guard.
     pub(crate) fn publish_managed_maintenance<T>(
         &self,
-        publish: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
+        publish: impl FnOnce() -> Result<T, crate::command_error::CommandError>,
+    ) -> Result<T, crate::command_error::CommandError> {
         let _publication = self.publication.lock().unwrap();
         publish()
     }

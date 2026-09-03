@@ -13,6 +13,10 @@ const MANIFEST_ALGORITHM: &str = "sha256";
 
 static VERIFICATIONS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
+pub(crate) fn graph_verification_cancelled_error() -> crate::command_error::CommandError {
+    crate::command_error::CommandError::tagged("operation-cancelled", None::<String>, None)
+}
+
 fn verifications() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     VERIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -87,7 +91,7 @@ fn build_manifest(
     app: &AppHandle,
     operation_id: &str,
     cancelled: &AtomicBool,
-) -> Result<GraphVerificationManifest, String> {
+) -> Result<GraphVerificationManifest, crate::command_error::CommandError> {
     let mut errors = Vec::new();
     let mut paths = match graph.graph_text_source_paths() {
         Ok(paths) => paths,
@@ -104,18 +108,12 @@ fn build_manifest(
     let mut files = Vec::with_capacity(total);
     for (index, path) in paths.iter().enumerate() {
         if cancelled.load(Ordering::Acquire) {
-            return Err(tine_core::sync_runtime::tagged_backend_error(
-                "operation-cancelled",
-                None,
-            ));
+            return Err(graph_verification_cancelled_error());
         }
         match graph.digest_graph_text_source(path, cancelled) {
             Ok(file) => files.push(file),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                return Err(tine_core::sync_runtime::tagged_backend_error(
-                    "operation-cancelled",
-                    None,
-                ));
+                return Err(graph_verification_cancelled_error());
             }
             Err(error) => errors.push(GraphVerificationError {
                 path: Some(path.clone()),
@@ -170,23 +168,27 @@ pub(crate) async fn create_graph_verification(
     state: GraphContext<'_>,
     app: AppHandle,
     operation_id: String,
-) -> Result<GraphVerificationReport, String> {
+) -> Result<GraphVerificationReport, crate::command_error::CommandError> {
     if operation_id.is_empty() || operation_id.len() > 128 {
-        return Err("invalid graph verification operation id".into());
+        return Err(crate::command_error::CommandError::prose(
+            "invalid graph verification operation id",
+        ));
     }
-    let slot = slot_for_context(&state).map_err(|error| error.to_string())?;
+    let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
     drop(state);
     let cancelled = Arc::new(AtomicBool::new(false));
     {
-        let mut jobs = verifications()
-            .lock()
-            .map_err(|_| "graph verification registry is unavailable")?;
+        let mut jobs = verifications().lock().map_err(|_| {
+            crate::command_error::CommandError::prose("graph verification registry is unavailable")
+        })?;
         match jobs.entry(operation_id.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(Arc::clone(&cancelled));
             }
             Entry::Occupied(_) => {
-                return Err("graph verification operation id is already active".into());
+                return Err(crate::command_error::CommandError::prose(
+                    "graph verification operation id is already active",
+                ));
             }
         }
     }
@@ -200,14 +202,19 @@ pub(crate) async fn create_graph_verification(
                 build_manifest(graph, &app, &operation_id, &cancelled)
                     .map_err(crate::command_error::CommandError::prose)
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(crate::command_error::CommandError::from)?;
         let total_bytes = manifest
             .files
             .iter()
             .try_fold(0_u64, |sum, file| sum.checked_add(file.length))
-            .ok_or("graph verification byte count overflow")?;
-        let text = serde_json::to_string_pretty(&manifest)
-            .map_err(|error| format!("graph verification report could not be encoded: {error}"))?;
+            .ok_or_else(|| {
+                crate::command_error::CommandError::prose("graph verification byte count overflow")
+            })?;
+        let text = serde_json::to_string_pretty(&manifest).map_err(|error| {
+            crate::command_error::CommandError::json(format!(
+                "graph verification report could not be encoded: {error}"
+            ))
+        })?;
         Ok(GraphVerificationReport {
             text,
             suggested_file_name: format!(
@@ -221,14 +228,20 @@ pub(crate) async fn create_graph_verification(
         })
     })
     .await
-    .map_err(|error| format!("graph verification task failed: {error}"))?
+    .map_err(|error| {
+        crate::command_error::CommandError::graph_verification(format!(
+            "graph verification task failed: {error}"
+        ))
+    })?
 }
 
 #[tauri::command]
-pub(crate) fn cancel_graph_verification(operation_id: String) -> Result<(), String> {
-    let jobs = verifications()
-        .lock()
-        .map_err(|_| "graph verification registry is unavailable")?;
+pub(crate) fn cancel_graph_verification(
+    operation_id: String,
+) -> Result<(), crate::command_error::CommandError> {
+    let jobs = verifications().lock().map_err(|_| {
+        crate::command_error::CommandError::prose("graph verification registry is unavailable")
+    })?;
     if let Some(cancelled) = jobs.get(&operation_id) {
         cancelled.store(true, Ordering::Release);
     }
@@ -239,14 +252,19 @@ pub(crate) fn cancel_graph_verification(operation_id: String) -> Result<(), Stri
 pub(crate) async fn save_graph_verification_report(
     app: AppHandle,
     text: String,
-) -> Result<bool, String> {
-    let manifest: GraphVerificationManifest = serde_json::from_str(&text)
-        .map_err(|error| format!("graph verification report is invalid: {error}"))?;
+) -> Result<bool, crate::command_error::CommandError> {
+    let manifest: GraphVerificationManifest = serde_json::from_str(&text).map_err(|error| {
+        crate::command_error::CommandError::json(format!(
+            "graph verification report is invalid: {error}"
+        ))
+    })?;
     if manifest.schema_version != 1
         || manifest.tool != MANIFEST_TOOL
         || manifest.algorithm != MANIFEST_ALGORITHM
     {
-        return Err("graph verification report has an unsupported format".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph verification report has an unsupported format",
+        ));
     }
     #[cfg(desktop)]
     {
@@ -263,21 +281,32 @@ pub(crate) async fn save_graph_verification_report(
                 .blocking_save_file()
         })
         .await
-        .map_err(|error| format!("graph verification save dialog failed: {error}"))?;
+        .map_err(|error| {
+            crate::command_error::CommandError::graph_verification(format!(
+                "graph verification save dialog failed: {error}"
+            ))
+        })?;
         let Some(chosen) = chosen else {
             return Ok(false);
         };
-        let path = chosen
-            .into_path()
-            .map_err(|_| "graph verification destination is not a local file".to_string())?;
-        tine_core::model::atomic_write(&path, text.as_bytes())
-            .map_err(|error| format!("graph verification report could not be saved: {error}"))?;
+        let path = chosen.into_path().map_err(|_| {
+            crate::command_error::CommandError::prose(
+                "graph verification destination is not a local file",
+            )
+        })?;
+        tine_core::model::atomic_write(&path, text.as_bytes()).map_err(|error| {
+            crate::command_error::CommandError::graph_verification(format!(
+                "graph verification report could not be saved: {error}"
+            ))
+        })?;
         Ok(true)
     }
     #[cfg(not(desktop))]
     {
         let _ = (app, manifest, text);
-        Err("Save report is available on desktop; use Copy report on this device.".into())
+        Err(crate::command_error::CommandError::prose(
+            "Save report is available on desktop; use Copy report on this device.",
+        ))
     }
 }
 

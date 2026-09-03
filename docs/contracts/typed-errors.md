@@ -1,8 +1,9 @@
 # Typed backend errors
 
-Phase A Tauri commands (`commands.rs`) reject with `CommandError`; the E2b
-remainder still uses `String`. `CommandError` deliberately serializes as the
-same JSON string value each command emitted before the migration. A tagged
+Every Tauri command and helper under `src-tauri/src` now rejects with
+`CommandError`; the phase-B migration removed the remaining `String` error
+boundaries. `CommandError` deliberately serializes as the same JSON string
+value each command emitted before the migration. A tagged
 error is therefore still a string whose contents are a fixed-shape JSON object:
 
 ```json
@@ -130,10 +131,12 @@ The plugin-visible boundary is separate and unchanged. Plugin workers still
 reply with `{ id, ok: false, error: string }`, and the host still exposes that
 as `PluginRuntimeError`; JSON-tagged application errors are not sent to guests.
 
-## Phase-A `CommandError` boundary
+## `CommandError` boundary
 
-The variants are `Tagged`, `Coded`, `Io`, `Worker`, `Tauri`, `Core`, and
-`Prose`. Custom `Serialize` always calls `serialize_str`; an object-valued IPC
+The variants are `Tagged`, `Coded`, `Io`, `Worker`, `Tauri`, `Json`, `Plugin`,
+`Clipboard`, `Platform`, `GraphVerification`, `Graph`, `SyncRuntime`,
+`Settings`, `Diagnostic`, `Backup`, `Core`, and `Prose`. Custom `Serialize`
+always calls `serialize_str`; an object-valued IPC
 wire is a future product decision, not part of wave 4. `From<String>` and
 `From<&str>` are intentionally absent. `Worker` is constructed only at
 `spawn_blocking(...).await` joins; other `tauri::Error` values use `Tauri`.
@@ -151,59 +154,73 @@ would discard its closed reason code and conflict epoch.
 | other `tauri::Error` | `CommandError::from` | `Tauri` | source display | path/window/platform calls in `commands.rs` |
 | `SyncApplicationPageRequestError`, `SyncEditorRequestError`, `SyncLocalMutationRequestError`, `SyncRuntimeRequestError`, `FastCommitError`, `MergeRefused` | `CommandError::from` | `Core` | typed display; page request retains its tagged backend wire | managed request and merge helpers in `commands.rs` |
 | bounded code + detail | `CommandError::coded` | `Coded` | `{code}: {detail}` | query/result budgets, base64 decoding, retained-page conversion, canonical path context |
+| `serde_json::Error` | `CommandError::from` / `CommandError::json` when legacy context is retained | `Json` | source display or unchanged contextual display | JSON producers in `conflict_capsule.rs`, `graph_verification.rs`, `plugins.rs`, `settings.rs`, and `sync_runtime.rs` |
+| plugin package/registry source | `CommandError::plugin` | `Plugin` | unchanged source/context display | plugin validation, recovery, publication, and retirement helpers |
+| clipboard provider source | `CommandError::clipboard` | `Clipboard` | unchanged source display | `read_clipboard_files`, `copy_image_to_clipboard` |
+| platform/host source | `CommandError::platform` | `Platform` | unchanged source/context display | platform opener and capture-host helpers |
+| graph-verification source | `CommandError::graph_verification` | `GraphVerification` | unchanged source/context display | verification task, dialog, and report helpers (non-JSON) |
+| graph lifecycle source | `CommandError::graph` | `Graph` | unchanged source/context display | `graph.rs` and `watcher.rs` lifecycle helpers |
+| managed lifecycle source | `CommandError::sync_runtime` | `SyncRuntime` | unchanged source/context display | `storage_mode_supervisor.rs` and `sync_runtime.rs` helpers |
+| settings source | `CommandError::settings` | `Settings` | unchanged source/context display | settings validation/load helpers |
+| diagnostic source | `CommandError::diagnostic` | `Diagnostic` | unchanged source/context display | diagnostic recorder and dialog helpers |
+| backup source | `CommandError::backup` | `Backup` | unchanged source/context display | backup validation and restore helpers |
 | literal/context-only remainder | `CommandError::prose` | `Prose` | unchanged prose | symbols in the census below |
 
 The source manifest in `command_error::tests` records `targets`, `file`,
 `enclosingSymbol`, `sourceErrorType`, `requiredVariant`, `productionMapper`,
 `formatFamily`, `legacyWireTemplate`, and `goldenTest`. Every format family has
 a producer-coupled golden in
-`command_error::tests::phase_a_production_wire_matches_legacy`; the structural
-guard rejects stale registration/manifest rows and a typed source routed to
-`Prose`.
+`command_error::tests::phase_a_production_wire_matches_legacy` and
+`command_error::tests::phase_b_production_wire_matches_legacy`; the structural
+guard expands every `CommandError` mapper occurrence into a
+file/enclosing-symbol/mapper site row, equality-pins the 498-row manifest and
+its placement fingerprint, rejects stale registration/manifest rows, and
+rejects a typed source routed to `Prose`. The family rows supply source type,
+required variant, format family, legacy wire template, and producer-coupled
+golden for those site rows.
 
-### E2b phase-B pin
+### Absolute phase-B rule
 
-Every row temporarily returns `String`; owner `W4-E2b` removes the row. The
-guard expands `all` across desktop, Android, and iOS and checks names rather
-than a population count.
-
-| Target | File | Command names | Temporary error type | E2b owner |
-| --- | --- | --- | --- | --- |
-| all | `graph.rs` | `load_graph`, `inspect_graph_access`, `approve_external_assets`, `begin_direct_cross_page_move`, `finish_direct_cross_page_move`, `open_graph_window`, `capture_target`, `capture_graph_binding`, `create_graph`, `default_graph_parent`, `warm_done` | `String` | W4-E2b |
-| desktop + Android | `android_folder_picker.rs` | `pick_graph_folder` | `String` | W4-E2b |
-| iOS | `ios_folder_picker.rs` | `pick_graph_folder`, `prepare_graph_folder` | `String` | W4-E2b |
-| all | `android_media.rs` | `capture_photo`, `start_recording`, `stop_recording`, `cancel_recording` | `String` | W4-E2b |
-| all | `android_system_bars.rs` | `set_system_bar_appearance` | `String` | W4-E2b |
-| all | `lib.rs` | `capture_frontend_ready` | `String` | W4-E2b |
-| all | `graph_verification.rs` | `create_graph_verification`, `cancel_graph_verification`, `save_graph_verification_report` | `String` | W4-E2b |
-| all | `sync_runtime.rs` | `sparse_v2_status`, `activate_sparse_v2`, `cancel_sparse_v2`, `cancel_sparse_v2_cold`, `prepare_sparse_v2_share`, `join_sparse_v2_shared`, `adopt_sparse_v2_shared`, `sparse_v2_recovery_location`, `sparse_v2_query`, `sparse_v2_editor_load`, `sparse_v2_editor_save`, `sparse_v2_tick`, `list_absence_sweeps`, `reapply_absence_sweep`, `restore_absence_sweep`, `keep_absence_sweep_deletion`, `sparse_v2_clean_shutdown` | `String` | W4-E2b |
-| all | `platform.rs` | `open_external`, `copy_image_to_clipboard`, `clipboard_files` | `String` | W4-E2b |
-| all | `conflict_capsule.rs` | `load_conflict_capsules`, `store_conflict_capsule`, `retire_conflict_capsule` | `String` | W4-E2b |
-| all | `backup.rs` | `set_backup_keep`, `list_backups`, `restore_backup` | `String` | W4-E2b |
-| all | `settings.rs` | `set_capture_enter_files`, `set_link_first_match`, `set_smooth_scroll`, `set_app_bool`, `set_app_string`, `load_session`, `save_session`, `forget_known_graph`, `reveal_known_graph` | `String` | W4-E2b |
-| all | `watcher.rs` | `set_watch_mode` | `String` | W4-E2b |
-| all | `plugins.rs` | `install_plugin`, `uninstall_plugin`, `read_plugin_entry`, `set_plugin_enabled`, `verify_plugin_registry`, `store_plugin_registry_cache` | `String` | W4-E2b |
-| all | `debug.rs` | `save_diagnostic_report`, `clear_diagnostics` | `String` | W4-E2b |
+Every fallible command registered for desktop, Android, or iOS returns
+`Result<_, CommandError>`. Every helper under `src-tauri/src` is subject to the
+same error boundary: `Result<_, String>` and the temporary
+`map_err(|error| error.to_string())` bridge are both strict zero, with no
+third-party exception rows. `Worker` is used only immediately after
+`spawn_blocking(...).await`; non-worker Tauri errors remain `Tauri`.
 
 ### `Prose` census
 
-The mechanically derived census has 113 production sites (92 in `commands.rs`,
-21 in `state.rs`; test fixtures excluded). These rows have no typed source:
-they are literal state assertions, bounded domain wording,
-wrong-reply/deferred outcomes, or temporary calls into an E2b `String` helper.
-The census only shrinks.
+The phase-A syntactic census remains 113 production sites (92 in `commands.rs`,
+21 in `state.rs`; test fixtures excluded). `CommandError::prose` is an identity
+adapter when a phase-B helper already returns `CommandError`, so those retained
+E2 call sites do not erase the typed variant. Phase B adds the placement rows
+below. Other rows have no typed source: they are literal state assertions,
+bounded domain wording, or wrong-reply/deferred outcomes. The census only
+shrinks.
 
 | File | Enclosing symbols | Legacy template | Why no typed source exists | Retirement owner |
 | --- | --- | --- | --- | --- |
 | `state.rs` | `require_legacy_authority`, `legacy_graph`, `wait_for_legacy_drain`, `bind`, `replace_if_current` | authority/lease/binding literal or bounded contextual message | local state predicate, not a source error | typed state domain follow-up |
 | `state.rs` | `owned_graph_context`, `canonical_graph_root`, `slot_for_window`, `slot_for_bound_window`, `capture_quick_switch_slot`, `refresh_graph_for_label` | missing/stale/bound-window/canonical-path literal | local state predicate or E2b bridge | W4-E2b |
-| `commands.rs` | `load_workspaces`, `save_workspaces`, `sparse_application_handle`, `prepare_tine_quit_all_slots`, `open_page_file` | unchanged helper display | temporary E2b `String` bridge | W4-E2b |
+| `commands.rs` | `load_workspaces`, `save_workspaces`, `sparse_application_handle`, `prepare_tine_quit_all_slots`, `open_page_file` | unchanged helper display | E2 compatibility adapter; typed phase-B errors pass through unchanged | phase-A adapter cleanup |
 | `commands.rs` | `map_managed_graph_mutation`, `map_managed_sync_conflict_resolution`, `sparse_navigation`, `map_sparse_page_inventory`, `map_sparse_page_load`, `map_sparse_page_save` | conflict/deferred/refusal wording | enum outcome has no error value in that arm | managed outcome taxonomy follow-up |
 | `commands.rs` | `referenced_page_names`, `journal_feed_page`, `move_managed_application_subtrees`, `acknowledge_managed_application_move`, `recover_managed_application_subtrees`, `copy_guide_into_bound_graph` | deferred/unsupported literal | semantic outcome or local precondition | managed outcome taxonomy follow-up |
 | `commands.rs` | `get_backlinks`, `get_backlink_filter_context`, `get_unlinked_refs`, `block_ref_counts`, `block_referrers`, `run_query`, `export_query_subtrees`, `run_graph_search`, `run_advanced_query`, `query_facets`, `page_aliases`, `page_icons`, `existing_page_names`, `search`, `quick_switch`, `list_templates`, `resolve_block`, `resolve_blocks`, `preview_block`, `list_orphan_assets` | bounded-size or wrong-reply wording | bounded/local semantic refusal | query outcome taxonomy follow-up |
 | `commands.rs` | `publish_html`, `page_print_html`, `open_pdf`, `write_highlights`, `write_pdf_view_state` | deferred or `no-page` literal | semantic outcome without a source error | managed outcome taxonomy follow-up |
 | `commands.rs` | `decode_asset_b64`, `tine_quit`, `read_local_image`, `import_native_capture`, `delimited_ext`, `read_text_file`, `open_asset`, `edit_asset_external`, `build_editor_argv` | local validation/platform literal | validation branch has no source error | validation taxonomy follow-up |
 | `commands.rs` | `managed_capsule_current`, `conflict_capsule_diff`, `resolve_conflict_capsule`, `resolve_sync_conflict`, `merge_pages` | authority missing/changed literal | local state predicate | conflict taxonomy follow-up |
+| `backup.rs` | `collect`, `collect_scoped_restore_graph_text`, `restore_backup`, `restore_from_backup_source` | backup path/schema/safety literal | local validation branch, not a source error | backup outcome taxonomy follow-up |
+| `conflict_capsule.rs` | `capsule_page_name`, `decode_envelope`, `quarantine_unreadable`, `reclaim_torn_temps`, `retire_at`, `write_unlocked` | capsule validation literal | local validation branch, not a source error | capsule outcome taxonomy follow-up |
+| `debug.rs` | `clear_diagnostics`, `save_diagnostic_report` | recorder/destination literal | local availability or validation branch | diagnostic outcome taxonomy follow-up |
+| `graph.rs` | `approve_external_assets`, `capture_graph_binding`, `capture_target_for_state`, `create_graph`, `inspect_graph_access`, `load_graph`, `load_graph_for_label`, `open_graph_window`, `refuse_unclaimed_sparse_archive_with` | graph state/selection literal | local predicate, not a source error | graph outcome taxonomy follow-up |
+| `graph_verification.rs` | `cancel_graph_verification`, `create_graph_verification`, `save_graph_verification_report` | operation/registry/destination literal | local predicate, not a source error | verification outcome taxonomy follow-up |
+| `lib.rs`, `android_folder_picker.rs`, `android_managed_storage_smoke.rs` | `capture_frontend_ready`, `pick_graph_folder`, `Java_page_tine_app_ManagedStorageSmoke_runManagedActivationSmoke` | platform availability/JNI validation literal | local platform predicate | platform outcome taxonomy follow-up |
+| `android_media.rs` | `$name` in the non-Android `android_media_command` template | unsupported-platform literal | cfg-split macro command has no source error | platform outcome taxonomy follow-up |
+| `platform.rs` | `external_open_plan`, `open_external`, `reveal_page_source` | unsupported URL/platform/path literal | local validation branch | platform outcome taxonomy follow-up |
+| `plugins.rs` | `install_plugin`, `install_plugin_package_at`, `manifest_identity`, `package_dir`, `plugins_dir`, `read_plugin_entry`, `set_plugin_enabled`, `set_plugin_enabled_at`, `store_plugin_registry_cache`, `store_plugin_registry_cache_at`, `uninstall_package`, `validate_uninstall_target`, `verify_plugin_registry` | plugin identity/bounds/availability literal | local validation branch, not a source error | plugin outcome taxonomy follow-up |
+| `settings.rs` | `atomic_write_workspaces`, `load_session`, `load_workspaces`, `managed_sync_device_id`, `managed_sync_device_id_at`, `migrate_legacy_session_at`, `reveal_known_graph`, `save_session`, `save_session_at`, `save_workspaces`, `update_settings`, `validate_workspaces_json` | settings shape/availability literal | local validation branch, not a source error | settings outcome taxonomy follow-up |
+| `storage_mode_supervisor.rs` | `commit_if_current` | superseded-transition literal | local state predicate | transition outcome taxonomy follow-up |
+| `sync_runtime.rs` | `activate_sparse_v2`, `activate_sparse_v2_blocking`, `adopt_sparse_v2_shared_blocking`, `archive_graph_provider_namespace_with`, `archive_private_root`, `blank_slate_recovery_key`, `cancel_sparse_v2_at_paths_with_archive_and_publish`, `cancel_sparse_v2_blocking`, `cancel_sparse_v2_cold`, `join_runtime_failure`, `join_sparse_v2_shared_blocking`, `move_recovery_result`, `prepare_sparse_v2_activation`, `prepare_sparse_v2_share_blocking`, `prove_managed_application_ready`, `recover_managed_application_subtrees_with`, `replace_failed_blank_slate_candidate`, `run_android_managed_return_to_direct_files`, `set_aside_managed_history_for_adoption`, `validate_for` | managed lifecycle/state literal | local predicate or enum outcome without a source error | managed outcome taxonomy follow-up |
 
 ## Core-only clean-open boundary
 

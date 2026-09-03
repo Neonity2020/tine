@@ -190,10 +190,12 @@ struct Pending {
 /// Resolve the filesystem watcher inputs for an existing Direct Files binding.
 /// Sparse-v2 bindings use their actor; they never fall back to a second Direct
 /// Files `Graph` or watcher here.
-fn direct_watch_paths(slot: &GraphSlot) -> Result<(LegacyGraphLease, PathBuf), String> {
+fn direct_watch_paths(
+    slot: &GraphSlot,
+) -> Result<(LegacyGraphLease, PathBuf), crate::command_error::CommandError> {
     let graph = slot
         .legacy_graph_cloned()
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::command_error::CommandError::from)?;
     let root = slot.root_key.clone();
     Ok((graph, root))
 }
@@ -2989,7 +2991,7 @@ pub(crate) fn set_watch_mode(
     mode: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let mode = if mode == "poll" { "poll" } else { "inotify" };
     update_settings(&app, |json| {
         json["watch_mode"] = serde_json::json!(mode);

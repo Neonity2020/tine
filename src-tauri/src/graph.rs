@@ -170,11 +170,15 @@ pub(crate) async fn startup_graph_path(
 }
 
 #[tauri::command]
-pub(crate) fn capture_target(state: State<'_, AppState>) -> Result<String, String> {
+pub(crate) fn capture_target(
+    state: State<'_, AppState>,
+) -> Result<String, crate::command_error::CommandError> {
     capture_target_for_state(&state)
 }
 
-fn capture_target_for_state(state: &AppState) -> Result<String, String> {
+fn capture_target_for_state(
+    state: &AppState,
+) -> Result<String, crate::command_error::CommandError> {
     let preferred = state.last_focused.lock().unwrap().clone();
     if let Some(label) =
         preferred.filter(|label| state.graphs.read().unwrap().slot(label).is_some())
@@ -189,7 +193,7 @@ fn capture_target_for_state(state: &AppState) -> Result<String, String> {
         .into_iter()
         .next()
         .map(|entry| entry.0)
-        .ok_or_else(|| "no graph window is open".to_string())
+        .ok_or_else(|| crate::command_error::CommandError::prose("no graph window is open"))
 }
 
 #[derive(serde::Serialize)]
@@ -201,9 +205,11 @@ pub(crate) struct CaptureGraphBindingResult {
 /// native show path revokes the prior capture lease before a focused, persistent
 /// capture WebView can issue a query against an older graph. The frontend calls
 /// it again to learn the generation it must present with IPC.
-pub(crate) fn refresh_capture_graph_binding(state: &AppState) -> Result<u64, String> {
+pub(crate) fn refresh_capture_graph_binding(
+    state: &AppState,
+) -> Result<u64, crate::command_error::CommandError> {
     let target = capture_target_for_state(state)?;
-    let slot = slot_for_window(state, &target).map_err(|error| error.to_string())?;
+    let slot = slot_for_window(state, &target).map_err(crate::command_error::CommandError::from)?;
     let binding_generation = slot.binding_generation;
     state.bind_capture_graph(target, binding_generation);
     Ok(binding_generation)
@@ -218,13 +224,17 @@ pub(crate) fn refresh_capture_graph_binding(state: &AppState) -> Result<u64, Str
 pub(crate) fn capture_graph_binding(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
-) -> Result<CaptureGraphBindingResult, String> {
+) -> Result<CaptureGraphBindingResult, crate::command_error::CommandError> {
     if window.label() != "capture" {
-        return Err("capture graph binding is only available to quick capture".into());
+        return Err(crate::command_error::CommandError::prose(
+            "capture graph binding is only available to quick capture",
+        ));
     }
     let binding_generation = state
         .capture_graph_binding()
-        .ok_or("no graph bound for quick capture")?
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose("no graph bound for quick capture")
+        })?
         .binding_generation;
     Ok(CaptureGraphBindingResult { binding_generation })
 }
@@ -245,10 +255,14 @@ enum ColdSparseArchive {
     Refused(ManagedStorageRefusalScenario),
 }
 
-pub(crate) fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
+pub(crate) fn refuse_unclaimed_sparse_archive(
+    root: &Path,
+) -> Result<(), crate::command_error::CommandError> {
     refuse_unclaimed_sparse_archive_with(root, |shared| match inspect_shared_provider_cold_prefix(
         shared,
-    )? {
+    )
+    .map_err(crate::command_error::CommandError::graph)?
+    {
         SyncSharedProviderColdPrefix::Partial => Ok(false),
         SyncSharedProviderColdPrefix::ReadyForDescriptorInspection => {
             inspect_shared_enrollment_for_cold_discovery(shared)
@@ -258,35 +272,37 @@ pub(crate) fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String>
                 // incomplete arrival, not proof of hostile graph state.
                 .or(Ok(false))
         }
-        SyncSharedProviderColdPrefix::Refused => Err(format!(
-            "shared provider namespace has an unsafe filesystem kind [scenario_id={}]",
-            ManagedStorageRefusalScenario::UnsafeFilesystemKind
-        )),
+        SyncSharedProviderColdPrefix::Refused => {
+            Err(crate::command_error::CommandError::graph(format!(
+                "shared provider namespace has an unsafe filesystem kind [scenario_id={}]",
+                ManagedStorageRefusalScenario::UnsafeFilesystemKind
+            )))
+        }
     })
 }
 
 fn refuse_unclaimed_sparse_archive_with(
     root: &Path,
-    inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
-) -> Result<(), String> {
+    inspect_shared: impl FnOnce(&Path) -> Result<bool, crate::command_error::CommandError>,
+) -> Result<(), crate::command_error::CommandError> {
     match inspect_unclaimed_sparse_archive(root, inspect_shared)? {
         ColdSparseArchive::Absent | ColdSparseArchive::Joinable => Ok(()),
         ColdSparseArchive::Partial => {
             crate::debug::diag(
                 "sparse-v2 cold discovery: phase=provider_evidence; outcome=partial_provider_refusal",
             );
-            Err(PARTIAL_PROVIDER_REFUSAL.into())
+            Err(crate::command_error::CommandError::prose(PARTIAL_PROVIDER_REFUSAL))
         }
-        ColdSparseArchive::Refused(scenario) => Err(format!(
+        ColdSparseArchive::Refused(scenario) => Err(crate::command_error::CommandError::graph(format!(
             "Tine-managed storage data has an unsafe filesystem kind, so this graph could not be opened safely. [scenario_id={scenario}]"
-        )),
+        ))),
     }
 }
 
 fn inspect_unclaimed_sparse_archive(
     root: &Path,
-    inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
-) -> Result<ColdSparseArchive, String> {
+    inspect_shared: impl FnOnce(&Path) -> Result<bool, crate::command_error::CommandError>,
+) -> Result<ColdSparseArchive, crate::command_error::CommandError> {
     let archive = root.join(".tine-sync/v2");
     let metadata = match std::fs::symlink_metadata(&archive) {
         Ok(metadata) => metadata,
@@ -294,9 +310,9 @@ fn inspect_unclaimed_sparse_archive(
             return Ok(ColdSparseArchive::Absent)
         }
         Err(error) => {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::graph(format!(
                 "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-            ));
+            )));
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -311,9 +327,9 @@ fn inspect_unclaimed_sparse_archive(
             return Ok(ColdSparseArchive::Partial)
         }
         Err(error) => {
-            return Err(format!(
+            return Err(crate::command_error::CommandError::graph(format!(
                 "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-            ))
+            )))
         }
     };
     if shared_metadata.file_type().is_symlink() || !shared_metadata.is_dir() {
@@ -330,15 +346,19 @@ fn inspect_unclaimed_sparse_archive(
         // Refused (and then to a generic recovery message) previously made a
         // legitimate Android shared-storage incompatibility look exactly like
         // provider bytes that were still arriving.
-        Err(error) => Err(format!(
+        Err(error) => Err(crate::command_error::CommandError::graph(format!(
             "Couldn't validate Tine-managed sync data on this device: {error}"
-        )),
+        ))),
     }
 }
 
-fn open_graph_for_load(root: &str, approved_assets: Option<&Path>) -> Result<LoadedGraph, String> {
-    let graph = Graph::open_checked_with_assets(root, approved_assets)
-        .map_err(|e| format!("unsafe graph layout: {e}"))?;
+fn open_graph_for_load(
+    root: &str,
+    approved_assets: Option<&Path>,
+) -> Result<LoadedGraph, crate::command_error::CommandError> {
+    let graph = Graph::open_checked_with_assets(root, approved_assets).map_err(|e| {
+        crate::command_error::CommandError::graph(format!("unsafe graph layout: {e}"))
+    })?;
     let meta = graph.meta();
     // Concord invariant 4 (write-shyness). Opening a graph used to RENAME every
     // title-named journal file to its date stem, behind a synchronous launch
@@ -366,11 +386,15 @@ pub(crate) struct GraphAccessInspection {
 pub(crate) fn inspect_graph_access(
     path: String,
     app: tauri::AppHandle,
-) -> Result<GraphAccessInspection, String> {
-    let root = resolve_root(&path)
-        .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
-    let root = canonical_graph_root(&root).map_err(|error| error.to_string())?;
-    let external = Graph::external_assets_target(&root).map_err(|error| error.to_string())?;
+) -> Result<GraphAccessInspection, crate::command_error::CommandError> {
+    let root = resolve_root(&path).ok_or_else(|| {
+        crate::command_error::CommandError::prose(
+            "no graph path provided (set TINE_GRAPH or pass a path)",
+        )
+    })?;
+    let root = canonical_graph_root(&root).map_err(crate::command_error::CommandError::from)?;
+    let external =
+        Graph::external_assets_target(&root).map_err(crate::command_error::CommandError::from)?;
     let approved_target =
         approved_external_assets(&app, &root).and_then(|path| std::fs::canonicalize(path).ok());
     let approved = external
@@ -390,18 +414,26 @@ pub(crate) fn approve_external_assets(
     graph_root: String,
     assets_path: String,
     app: tauri::AppHandle,
-) -> Result<(), String> {
-    let root = canonical_graph_root(&graph_root).map_err(|error| error.to_string())?;
+) -> Result<(), crate::command_error::CommandError> {
+    let root =
+        canonical_graph_root(&graph_root).map_err(crate::command_error::CommandError::from)?;
     let live = Graph::external_assets_target(&root)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "graph no longer uses an external assets directory".to_string())?;
-    let submitted = std::fs::canonicalize(&assets_path)
-        .map_err(|error| format!("couldn't resolve external assets path: {error}"))?;
+        .map_err(crate::command_error::CommandError::from)?
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose(
+                "graph no longer uses an external assets directory",
+            )
+        })?;
+    let submitted = std::fs::canonicalize(&assets_path).map_err(|error| {
+        crate::command_error::CommandError::graph(format!(
+            "couldn't resolve external assets path: {error}"
+        ))
+    })?;
     if submitted != live {
-        return Err(format!(
+        return Err(crate::command_error::CommandError::graph(format!(
             "external assets directory changed before approval (now {})",
             live.display()
-        ));
+        )));
     }
     remember_external_assets_approval(&app, &root, &live)
 }
@@ -412,7 +444,7 @@ pub(crate) async fn load_graph(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
-) -> Result<LoadGraphResult, String> {
+) -> Result<LoadGraphResult, crate::command_error::CommandError> {
     let label = window.label().to_string();
     drop((window, state));
     let worker_app = app.clone();
@@ -422,7 +454,9 @@ pub(crate) async fn load_graph(
         load_graph_for_label(path, &worker_app, &worker_label, &state)
     })
     .await
-    .map_err(|error| format!("graph-open worker failed: {error}"))??;
+    .map_err(|error| {
+        crate::command_error::CommandError::graph(format!("graph-open worker failed: {error}"))
+    })??;
 
     if app.get_webview_window(&label).is_none() {
         let binding_generation = match &result {
@@ -447,7 +481,9 @@ pub(crate) async fn load_graph(
                 poke_watcher(&state);
             }
         }
-        return Err("graph window closed while storage was opening".into());
+        return Err(crate::command_error::CommandError::prose(
+            "graph window closed while storage was opening",
+        ));
     }
 
     // The iOS Simulator probe exercises the same bound-graph helper as the
@@ -464,7 +500,11 @@ pub(crate) async fn load_graph(
             } => Some(*binding_generation),
             LoadGraphResult::FocusedExisting { .. } => None,
         }
-        .ok_or_else(|| "iOS Guide-copy probe did not retain the requested graph".to_string())?;
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose(
+                "iOS Guide-copy probe did not retain the requested graph",
+            )
+        })?;
         let worker_app = app.clone();
         let worker_label = label.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -476,8 +516,16 @@ pub(crate) async fn load_graph(
             )
         })
         .await
-        .map_err(|error| format!("iOS Guide-copy probe worker failed: {error}"))?
-        .map_err(|error| format!("iOS Guide-copy probe failed: {error}"))?;
+        .map_err(|error| {
+            crate::command_error::CommandError::graph(format!(
+                "iOS Guide-copy probe worker failed: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            crate::command_error::CommandError::graph(format!(
+                "iOS Guide-copy probe failed: {error}"
+            ))
+        })?;
         crate::debug::diag("iOS Guide-copy probe completed".to_string());
     }
 
@@ -519,7 +567,7 @@ fn publish_direct_files_slot(
     window_label: &str,
     graph: Graph,
     root_key: PathBuf,
-) -> Result<(Arc<GraphSlot>, u64), String> {
+) -> Result<(Arc<GraphSlot>, u64), crate::command_error::CommandError> {
     let slot = Arc::new(GraphSlot::new(graph, root_key));
     let warm_generation = begin_warm_cache(&slot);
     state
@@ -527,17 +575,21 @@ fn publish_direct_files_slot(
         .write()
         .unwrap()
         .bind(window_label.to_string(), Arc::clone(&slot))
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::command_error::CommandError::from)?;
     state.note_focused(window_label);
     poke_watcher(state);
     Ok((slot, warm_generation))
 }
 
-fn direct_files_projection_path(app: &tauri::AppHandle, root: &Path) -> Result<PathBuf, String> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("app data directory is unavailable: {error}"))?;
+fn direct_files_projection_path(
+    app: &tauri::AppHandle,
+    root: &Path,
+) -> Result<PathBuf, crate::command_error::CommandError> {
+    let app_data = app.path().app_data_dir().map_err(|error| {
+        crate::command_error::CommandError::graph(format!(
+            "app data directory is unavailable: {error}"
+        ))
+    })?;
     let mut digest = Sha256::new();
     digest.update(b"tine-direct-projection-path-v1\0");
     digest.update(root.to_string_lossy().as_bytes());
@@ -563,7 +615,7 @@ pub(crate) struct PreparedDirectFilesOpen {
 pub(crate) fn prepare_direct_files_open(
     app: &tauri::AppHandle,
     root_key: PathBuf,
-) -> Result<PreparedDirectFilesOpen, String> {
+) -> Result<PreparedDirectFilesOpen, crate::command_error::CommandError> {
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
     // Convergent cross-page moves (packet B2, I-3/I-2). A move writes N+1 files
@@ -622,7 +674,7 @@ pub(crate) fn publish_prepared_direct_files(
     window_label: &str,
     state: &AppState,
     prepared: PreparedDirectFilesOpen,
-) -> Result<DirectFilesOpen, String> {
+) -> Result<DirectFilesOpen, crate::command_error::CommandError> {
     let PreparedDirectFilesOpen {
         graph,
         meta,
@@ -655,12 +707,15 @@ pub(crate) fn load_graph_for_label(
     app: &tauri::AppHandle,
     window_label: &str,
     state: &State<'_, AppState>,
-) -> Result<LoadGraphResult, String> {
+) -> Result<LoadGraphResult, crate::command_error::CommandError> {
     let started = crate::debug::debug_enabled().then(Instant::now);
     let mut previous = started;
-    let root = resolve_root(&path)
-        .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
-    let root_key = canonical_graph_root(&root).map_err(|error| error.to_string())?;
+    let root = resolve_root(&path).ok_or_else(|| {
+        crate::command_error::CommandError::prose(
+            "no graph path provided (set TINE_GRAPH or pass a path)",
+        )
+    })?;
+    let root_key = canonical_graph_root(&root).map_err(crate::command_error::CommandError::from)?;
     state
         .storage_supervisor
         .select_window_root(window_label, root_key.clone());
@@ -681,7 +736,8 @@ pub(crate) fn load_graph_for_label(
     )?;
     if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
         if owner == window_label {
-            let slot = slot_for_window(&state, &owner).map_err(|error| error.to_string())?;
+            let slot = slot_for_window(&state, &owner)
+                .map_err(crate::command_error::CommandError::from)?;
             state.storage_supervisor.finish_transition(
                 app,
                 lookup_id,
@@ -850,9 +906,9 @@ pub(crate) fn load_graph_for_label(
                 None,
                 Some("managed_open_not_serving".into()),
             );
-            return Err(format!(
+            return Err(crate::command_error::CommandError::graph(format!(
                 "Managed storage could not serve this workspace: {detail}"
-            ));
+            )));
         }
         let slot = Arc::new(GraphSlot::from_sparse_v2(
             binding,
@@ -860,14 +916,16 @@ pub(crate) fn load_graph_for_label(
             meta.clone(),
         ));
         crate::sync_runtime::prove_managed_application_ready(&slot, None).map_err(|error| {
-            let _ = state.storage_supervisor.finish_transition(
-                app,
-                managed_id,
-                StorageTransitionOutcome::Failed,
-                None,
-                Some("managed_readiness_failed".into()),
-            );
-            format!("Managed storage opened but its pages are not usable: {error}")
+            crate::command_error::CommandError::graph({
+                let _ = state.storage_supervisor.finish_transition(
+                    app,
+                    managed_id,
+                    StorageTransitionOutcome::Failed,
+                    None,
+                    Some("managed_readiness_failed".into()),
+                );
+                format!("Managed storage opened but its pages are not usable: {error}")
+            })
         })?;
         graph_load_phase(started, &mut previous, "managed application readiness");
         if let Err(error) = state.storage_supervisor.commit_if_current(managed_id, || {
@@ -876,7 +934,7 @@ pub(crate) fn load_graph_for_label(
                 .write()
                 .unwrap()
                 .bind(window_label.to_string(), Arc::clone(&slot))
-                .map_err(|error| error.to_string())
+                .map_err(crate::command_error::CommandError::from)
         }) {
             // A newer operation (especially emergency Direct Files or a graph
             // switch) owns publication now. Completing this stale managed
@@ -1011,8 +1069,8 @@ pub(crate) fn load_graph_for_label(
             source_generation,
         ) {
             Ok(_) => {
-                let managed =
-                    slot_for_window(state, window_label).map_err(|error| error.to_string())?;
+                let managed = slot_for_window(state, window_label)
+                    .map_err(crate::command_error::CommandError::from)?;
                 Ok(LoadGraphResult::Loaded {
                     meta: managed.graph_meta(),
                     binding_generation: managed.binding_generation,
@@ -1043,7 +1101,7 @@ pub(crate) async fn open_graph_window(
     path: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<LoadGraphResult, String> {
+) -> Result<LoadGraphResult, crate::command_error::CommandError> {
     #[cfg(desktop)]
     {
         let id = state.next_window.fetch_add(1, Ordering::Relaxed);
@@ -1091,7 +1149,9 @@ pub(crate) async fn open_graph_window(
                 Err(error) => {
                     state.graphs.write().unwrap().remove(&label);
                     poke_watcher(&state);
-                    return Err(format!("couldn't create graph window: {error}"));
+                    return Err(crate::command_error::CommandError::graph(format!(
+                        "couldn't create graph window: {error}"
+                    )));
                 }
             }
         }
@@ -1100,7 +1160,9 @@ pub(crate) async fn open_graph_window(
     #[cfg(not(desktop))]
     {
         let _ = (path, app, state);
-        Err("multiple graph windows are desktop-only".to_string())
+        Err(crate::command_error::CommandError::prose(
+            "multiple graph windows are desktop-only",
+        ))
     }
 }
 
@@ -1134,14 +1196,18 @@ fn dir_is_empty(p: &Path) -> bool {
 /// write into a user's existing files. Does NOT load the graph — the frontend
 /// calls `load_graph` with the returned path (matching the "open existing" flow).
 #[tauri::command]
-pub(crate) fn create_graph(dir: String) -> Result<String, String> {
+pub(crate) fn create_graph(dir: String) -> Result<String, crate::command_error::CommandError> {
     let dir = dir.trim();
     if dir.is_empty() {
-        return Err("no folder was chosen".into());
+        return Err(crate::command_error::CommandError::prose(
+            "no folder was chosen",
+        ));
     }
     let base = Path::new(dir);
     if !base.is_dir() {
-        return Err(format!("{dir} is not a folder"));
+        return Err(crate::command_error::CommandError::graph(format!(
+            "{dir} is not a folder"
+        )));
     }
     let root = if dir_is_empty(base) {
         base.to_path_buf()
@@ -1152,11 +1218,14 @@ pub(crate) fn create_graph(dir: String) -> Result<String, String> {
             cand = base.join(format!("tine-demo-{n}"));
             n += 1;
         }
-        std::fs::create_dir(&cand).map_err(|e| format!("couldn't create folder: {e}"))?;
+        std::fs::create_dir(&cand).map_err(|e| {
+            crate::command_error::CommandError::graph(format!("couldn't create folder: {e}"))
+        })?;
         cand
     };
-    tine_core::onboarding::create_demo_graph(&root)
-        .map_err(|e| format!("couldn't create the demo graph: {e}"))?;
+    tine_core::onboarding::create_demo_graph(&root).map_err(|e| {
+        crate::command_error::CommandError::graph(format!("couldn't create the demo graph: {e}"))
+    })?;
     Ok(root.display().to_string())
 }
 
@@ -1182,15 +1251,17 @@ pub(crate) async fn begin_direct_cross_page_move(
     destination: tine_core::model::PageDto,
     sources: Vec<tine_core::model::PageDto>,
     state: crate::state::GraphContext<'_>,
-) -> Result<Option<String>, String> {
-    let (app, label, binding_generation) =
-        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
+) -> Result<Option<String>, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let app_state = app.state::<AppState>();
         let slot =
             crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))
-                .map_err(|error| error.to_string())?;
-        let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
+                .map_err(crate::command_error::CommandError::from)?;
+        let graph = slot
+            .legacy_graph()
+            .map_err(crate::command_error::CommandError::from)?;
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             crate::debug::diag(
                 "Direct move recovery store unavailable; this cross-page move is unbracketed"
@@ -1226,7 +1297,7 @@ pub(crate) async fn begin_direct_cross_page_move(
         }
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 /// Retire a move record once every participant is durably terminal.
@@ -1241,15 +1312,17 @@ pub(crate) async fn begin_direct_cross_page_move(
 pub(crate) async fn finish_direct_cross_page_move(
     move_id: String,
     state: crate::state::GraphContext<'_>,
-) -> Result<bool, String> {
-    let (app, label, binding_generation) =
-        crate::state::owned_graph_context(state).map_err(|error| error.to_string())?;
+) -> Result<bool, crate::command_error::CommandError> {
+    let (app, label, binding_generation) = crate::state::owned_graph_context(state)
+        .map_err(crate::command_error::CommandError::from)?;
     tauri::async_runtime::spawn_blocking(move || {
         let app_state = app.state::<AppState>();
         let slot =
             crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))
-                .map_err(|error| error.to_string())?;
-        let graph = slot.legacy_graph().map_err(|error| error.to_string())?;
+                .map_err(crate::command_error::CommandError::from)?;
+        let graph = slot
+            .legacy_graph()
+            .map_err(crate::command_error::CommandError::from)?;
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             return Ok(false);
         };
@@ -1260,7 +1333,7 @@ pub(crate) async fn finish_direct_cross_page_move(
         ))
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(crate::command_error::CommandError::worker)?
 }
 
 #[tauri::command]
@@ -1275,12 +1348,15 @@ pub(crate) fn app_platform() -> &'static str {
 }
 
 #[tauri::command]
-pub(crate) fn default_graph_parent(app: tauri::AppHandle) -> Result<String, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("couldn't resolve app data dir: {e}"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create app data dir: {e}"))?;
+pub(crate) fn default_graph_parent(
+    app: tauri::AppHandle,
+) -> Result<String, crate::command_error::CommandError> {
+    let dir = app.path().app_data_dir().map_err(|e| {
+        crate::command_error::CommandError::graph(format!("couldn't resolve app data dir: {e}"))
+    })?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        crate::command_error::CommandError::graph(format!("couldn't create app data dir: {e}"))
+    })?;
     Ok(dir.display().to_string())
 }
 
@@ -1296,10 +1372,10 @@ pub(crate) fn warm_cache_async(
     window_label: String,
     slot: Arc<GraphSlot>,
     warm_generation: u64,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let graph = slot
         .legacy_graph_cloned()
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::command_error::CommandError::from)?;
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
@@ -1352,9 +1428,9 @@ pub(crate) fn warm_cache_async(
 pub(crate) fn warm_done(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
-) -> Result<bool, String> {
+) -> Result<bool, crate::command_error::CommandError> {
     Ok(slot_for_window(&state, window.label())
-        .map_err(|error| error.to_string())?
+        .map_err(crate::command_error::CommandError::from)?
         .warm_done
         .load(Ordering::Acquire))
 }
@@ -1372,7 +1448,7 @@ mod tests {
         dir
     }
 
-    fn assert_unsafe_provider_refusal(error: &str) {
+    fn assert_unsafe_provider_refusal(error: &crate::command_error::CommandError) {
         assert!(
             error.contains("unsafe filesystem kind"),
             "the refusal must name the user-actionable class: {error}"
@@ -1629,7 +1705,10 @@ mod tests {
             PARTIAL_PROVIDER_REFUSAL
         );
         assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Err("malformed".into())).unwrap_err(),
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Err(
+                crate::command_error::CommandError::prose("malformed")
+            ))
+            .unwrap_err(),
             "Couldn't validate Tine-managed sync data on this device: malformed"
         );
 

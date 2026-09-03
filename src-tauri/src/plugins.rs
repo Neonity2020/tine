@@ -85,13 +85,17 @@ fn store_plugin_registry_cache_at(
     path: &Path,
     index_json: String,
     signature: String,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     if index_json.is_empty() || index_json.len() > MAX_REGISTRY_INDEX_BYTES {
-        return Err("plugin registry index is empty or too large".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin registry index is empty or too large",
+        ));
     }
     let signature = signature.trim().to_string();
     if signature.is_empty() || signature.len() > MAX_REGISTRY_SIGNATURE_BYTES {
-        return Err("plugin registry signature is empty or too large".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin registry signature is empty or too large",
+        ));
     }
     verify_plugin_registry(index_json.clone(), signature.clone())?;
     let envelope = PluginRegistryCacheEnvelope {
@@ -101,7 +105,7 @@ fn store_plugin_registry_cache_at(
     };
     crate::settings::update_settings_strict_at(path, |json| {
         json[REGISTRY_CACHE_KEY] =
-            serde_json::to_value(&envelope).map_err(|error| error.to_string())?;
+            serde_json::to_value(&envelope).map_err(crate::command_error::CommandError::from)?;
         Ok(())
     })
 }
@@ -119,8 +123,9 @@ pub(crate) fn store_plugin_registry_cache(
     index_json: String,
     signature: String,
     app: tauri::AppHandle,
-) -> Result<(), String> {
-    let path = crate::settings::settings_path(&app).ok_or("no app-data dir")?;
+) -> Result<(), crate::command_error::CommandError> {
+    let path = crate::settings::settings_path(&app)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
     store_plugin_registry_cache_at(&path, index_json, signature)
 }
 
@@ -184,31 +189,35 @@ fn unique_transient_name(prefix: &str, id: &str, version: &str) -> String {
     format!(".{prefix}-{id}-{version}-{}-{sequence}", std::process::id())
 }
 
-fn manifest_identity(manifest_json: &str) -> Result<(String, String), String> {
+fn manifest_identity(
+    manifest_json: &str,
+) -> Result<(String, String), crate::command_error::CommandError> {
     if manifest_json.len() > MAX_MANIFEST_BYTES {
-        return Err("plugin manifest is too large".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin manifest is too large",
+        ));
     }
-    let manifest: serde_json::Value =
-        serde_json::from_str(manifest_json).map_err(|_| "plugin manifest is invalid JSON")?;
+    let manifest: serde_json::Value = serde_json::from_str(manifest_json)
+        .map_err(|_| crate::command_error::CommandError::json("plugin manifest is invalid JSON"))?;
     let id = manifest
         .get("id")
         .and_then(|value| value.as_str())
         .filter(|value| safe_component(value, true))
-        .ok_or("plugin id is invalid")?;
+        .ok_or_else(|| crate::command_error::CommandError::prose("plugin id is invalid"))?;
     let version = manifest
         .get("version")
         .and_then(|value| value.as_str())
         .filter(|value| safe_version(value))
-        .ok_or("plugin version is invalid")?;
+        .ok_or_else(|| crate::command_error::CommandError::prose("plugin version is invalid"))?;
     Ok((id.to_string(), version.to_string()))
 }
 
-fn plugins_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn plugins_dir(app: &tauri::AppHandle) -> Result<PathBuf, crate::command_error::CommandError> {
     let root = app
         .path()
         .app_data_dir()
         .map(|dir| dir.join("plugins"))
-        .map_err(|_| "no app-data dir".to_string())?;
+        .map_err(|_| crate::command_error::CommandError::prose("no app-data dir"))?;
     recover_plugin_store_once(&root)?;
     Ok(root)
 }
@@ -222,7 +231,7 @@ static RECOVERED_PLUGIN_STORES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mute
 /// in-flight `.install-*` staging directory (in-scope: honest concurrent
 /// instances; wave-2 review F-8). A crash-cut from a previous process is still
 /// reclaimed at the next first use.
-fn recover_plugin_store_once(root: &Path) -> Result<(), String> {
+fn recover_plugin_store_once(root: &Path) -> Result<(), crate::command_error::CommandError> {
     let mut recovered = RECOVERED_PLUGIN_STORES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -234,13 +243,20 @@ fn recover_plugin_store_once(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn recover_plugin_store_at(root: &Path) -> Result<(), String> {
-    tine_storage::recover_package_store(root, PACKAGE_FILES).map_err(|error| error.to_string())
+fn recover_plugin_store_at(root: &Path) -> Result<(), crate::command_error::CommandError> {
+    tine_storage::recover_package_store(root, PACKAGE_FILES)
+        .map_err(crate::command_error::CommandError::plugin)
 }
 
-fn package_dir(root: &Path, id: &str, version: &str) -> Result<PathBuf, String> {
+fn package_dir(
+    root: &Path,
+    id: &str,
+    version: &str,
+) -> Result<PathBuf, crate::command_error::CommandError> {
     if !safe_component(id, true) || !safe_version(version) {
-        return Err("plugin identity is invalid".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin identity is invalid",
+        ));
     }
     Ok(root.join(id).join(version))
 }
@@ -251,39 +267,50 @@ fn validate_uninstall_target(
     root: &Path,
     id: &str,
     version: &str,
-) -> Result<(PathBuf, PathBuf, bool), String> {
+) -> Result<(PathBuf, PathBuf, bool), crate::command_error::CommandError> {
     let target = package_dir(root, id, version)?;
     let id_dir = root.join(id);
     let id_meta = std::fs::symlink_metadata(&id_dir).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            "plugin version is not installed".to_string()
-        } else {
-            error.to_string()
-        }
+        crate::command_error::CommandError::plugin({
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "plugin version is not installed".to_string()
+            } else {
+                error.to_string()
+            }
+        })
     })?;
     if id_meta.file_type().is_symlink() || !id_meta.is_dir() {
-        return Err("installed plugin directory is unsafe".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "installed plugin directory is unsafe",
+        ));
     }
     let target_meta = std::fs::symlink_metadata(&target).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            "plugin version is not installed".to_string()
-        } else {
-            error.to_string()
-        }
+        crate::command_error::CommandError::plugin({
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "plugin version is not installed".to_string()
+            } else {
+                error.to_string()
+            }
+        })
     })?;
     if target_meta.file_type().is_symlink() || !target_meta.is_dir() {
-        return Err("installed plugin package is unsafe".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "installed plugin package is unsafe",
+        ));
     }
-    let manifest_json = std::fs::read_to_string(target.join("manifest.json"))
-        .map_err(|_| "installed plugin manifest is unreadable".to_string())?;
+    let manifest_json = std::fs::read_to_string(target.join("manifest.json")).map_err(|_| {
+        crate::command_error::CommandError::prose("installed plugin manifest is unreadable")
+    })?;
     if manifest_identity(&manifest_json).ok().as_ref()
         != Some(&(id.to_string(), version.to_string()))
     {
-        return Err("installed plugin manifest identity does not match its directory".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "installed plugin manifest identity does not match its directory",
+        ));
     }
     let mut last_version = true;
-    for entry in std::fs::read_dir(&id_dir).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
+    for entry in std::fs::read_dir(&id_dir).map_err(crate::command_error::CommandError::from)? {
+        let entry = entry.map_err(crate::command_error::CommandError::from)?;
         if entry.path() != target {
             last_version = false;
             break;
@@ -295,17 +322,23 @@ fn validate_uninstall_target(
 /// Remove exactly one validated immutable package without ever following a
 /// symlink out of plugin storage. Returns true when no versions of this plugin
 /// remain and the now-empty id directory was removed too.
-fn uninstall_package(root: &Path, id: &str, version: &str) -> Result<bool, String> {
+fn uninstall_package(
+    root: &Path,
+    id: &str,
+    version: &str,
+) -> Result<bool, crate::command_error::CommandError> {
     validate_uninstall_target(root, id, version)?;
     for _ in 0..128 {
         let retired_name = unique_transient_name("retired", id, version);
         match tine_storage::retire_package(root, id, version, &retired_name, PACKAGE_FILES) {
             Ok(last_version) => return Ok(last_version),
             Err(tine_storage::PackageStoreError::TransientNameCollision) => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(crate::command_error::CommandError::plugin(error)),
         }
     }
-    Err("could not allocate a private plugin retirement name".to_string())
+    Err(crate::command_error::CommandError::prose(
+        "could not allocate a private plugin retirement name",
+    ))
 }
 
 fn install_plugin_package_at(
@@ -314,7 +347,7 @@ fn install_plugin_package_at(
     version: &str,
     manifest_json: &str,
     wasm: &[u8],
-) -> Result<tine_storage::PackagePublishOutcome, String> {
+) -> Result<tine_storage::PackagePublishOutcome, crate::command_error::CommandError> {
     let files = [
         tine_storage::PackageFile {
             name: "manifest.json",
@@ -331,15 +364,16 @@ fn install_plugin_package_at(
             Ok(outcome) => return Ok(outcome),
             Err(tine_storage::PackageStoreError::TransientNameCollision) => continue,
             Err(tine_storage::PackageStoreError::ImmutableVersionCollision) => {
-                return Err(
-                    "that immutable plugin version is already installed with different bytes"
-                        .to_string(),
-                )
+                return Err(crate::command_error::CommandError::plugin(
+                    "that immutable plugin version is already installed with different bytes",
+                ))
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(crate::command_error::CommandError::plugin(error)),
         }
     }
-    Err("could not allocate a private plugin install name".to_string())
+    Err(crate::command_error::CommandError::prose(
+        "could not allocate a private plugin install name",
+    ))
 }
 
 fn clear_uninstalled_plugin_settings(
@@ -376,20 +410,27 @@ fn sha256(bytes: &[u8]) -> String {
 pub(crate) fn verify_plugin_registry(
     index_json: String,
     signature_b64: String,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     if index_json.len() > MAX_REGISTRY_INDEX_BYTES {
-        return Err("plugin registry index is too large".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin registry index is too large",
+        ));
     }
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(signature_b64.trim())
-        .map_err(|_| "plugin registry signature is invalid base64")?;
-    let signature = Signature::from_slice(&signature_bytes)
-        .map_err(|_| "plugin registry signature has the wrong length")?;
-    let key = VerifyingKey::from_bytes(&REGISTRY_PUBLIC_KEY)
-        .map_err(|_| "embedded plugin registry key is invalid")?;
-    key.verify(index_json.as_bytes(), &signature)
-        .map_err(|_| "plugin registry signature did not verify".to_string())
+        .map_err(|_| {
+            crate::command_error::CommandError::prose("plugin registry signature is invalid base64")
+        })?;
+    let signature = Signature::from_slice(&signature_bytes).map_err(|_| {
+        crate::command_error::CommandError::prose("plugin registry signature has the wrong length")
+    })?;
+    let key = VerifyingKey::from_bytes(&REGISTRY_PUBLIC_KEY).map_err(|_| {
+        crate::command_error::CommandError::prose("embedded plugin registry key is invalid")
+    })?;
+    key.verify(index_json.as_bytes(), &signature).map_err(|_| {
+        crate::command_error::CommandError::prose("plugin registry signature did not verify")
+    })
 }
 
 fn plugin_states(app: &tauri::AppHandle) -> std::collections::HashMap<String, PluginState> {
@@ -409,16 +450,22 @@ pub(crate) fn install_plugin(
     manifest_json: String,
     wasm_b64: String,
     app: tauri::AppHandle,
-) -> Result<InstalledPlugin, String> {
+) -> Result<InstalledPlugin, crate::command_error::CommandError> {
     let (id, version) = manifest_identity(&manifest_json)?;
     let wasm = base64::engine::general_purpose::STANDARD
         .decode(wasm_b64)
-        .map_err(|_| "plugin entry is not valid base64")?;
+        .map_err(|_| {
+            crate::command_error::CommandError::prose("plugin entry is not valid base64")
+        })?;
     if wasm.len() > MAX_WASM_BYTES {
-        return Err("plugin entry is too large".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin entry is too large",
+        ));
     }
     if !wasm.starts_with(b"\0asm\x01\0\0\0") {
-        return Err("plugin entry is not WebAssembly".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin entry is not WebAssembly",
+        ));
     }
     let digest = sha256(&wasm);
     let root = plugins_dir(&app)?;
@@ -442,7 +489,7 @@ pub(crate) fn uninstall_plugin(
     id: String,
     version: String,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let root = plugins_dir(&app)?;
     let (_, _, last_version) = validate_uninstall_target(&root, &id, &version)?;
     crate::settings::update_settings(&app, |json| {
@@ -513,11 +560,13 @@ pub(crate) fn read_plugin_entry(
     id: String,
     version: String,
     app: tauri::AppHandle,
-) -> Result<tauri::ipc::Response, String> {
+) -> Result<tauri::ipc::Response, crate::command_error::CommandError> {
     let path = package_dir(&plugins_dir(&app)?, &id, &version)?.join("plugin.wasm");
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(path).map_err(crate::command_error::CommandError::from)?;
     if bytes.len() > MAX_WASM_BYTES || !bytes.starts_with(b"\0asm\x01\0\0\0") {
-        return Err("installed plugin entry is invalid".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "installed plugin entry is invalid",
+        ));
     }
     Ok(tauri::ipc::Response::new(bytes))
 }
@@ -528,9 +577,10 @@ pub(crate) fn set_plugin_enabled(
     version: String,
     enabled: bool,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let root = plugins_dir(&app)?;
-    let settings = crate::settings::settings_path(&app).ok_or("no app-data dir")?;
+    let settings = crate::settings::settings_path(&app)
+        .ok_or_else(|| crate::command_error::CommandError::prose("no app-data dir"))?;
     set_plugin_enabled_at(&root, &settings, &id, &version, enabled)
 }
 
@@ -540,10 +590,12 @@ fn set_plugin_enabled_at(
     id: &str,
     version: &str,
     enabled: bool,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     let target = package_dir(plugins_root, id, version)?;
     if !target.join("manifest.json").is_file() || !target.join("plugin.wasm").is_file() {
-        return Err("plugin version is not installed".to_string());
+        return Err(crate::command_error::CommandError::prose(
+            "plugin version is not installed",
+        ));
     }
     crate::settings::update_settings_strict_at(settings_path, |json| {
         json["plugin_states"][id] = serde_json::json!({ "version": version, "enabled": enabled });

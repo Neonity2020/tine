@@ -56,6 +56,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   worker, Tauri, and core sources behind one legacy-string serializer; the
   remaining native command files are explicitly assigned to W4-E2b.
 
+- **Every remaining native command and helper now uses `CommandError`.** The
+  phase-B conversion drives command/helper `Result<_, String>` and temporary
+  stringify bridges to zero, retains JSON, durability, worker, plugin,
+  clipboard, platform, and graph-verification source families, keeps every
+  legacy rejection string byte-identical, and makes the cross-target guard
+  absolute.
+
 - **Backend refusal handling now branches on typed error kinds instead of
   English wording.** Native control-flow failures use bounded JSON tags, one
   frontend funnel constructs the existing error family, panic records retain

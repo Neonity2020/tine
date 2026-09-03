@@ -6220,6 +6220,26 @@
    "notes": "CommandError has one custom string serializer, no From<String>, producer-coupled family goldens, and a per-target registration guard; E2b owns the receipt-listed command remainder."
   },
   {
+   "id": "REG-W4-E2B-COMMAND-ERROR-PHASE-B-001",
+   "title": "All native backend refusals retain their production family while preserving the legacy rejection string",
+   "family": "typed-error-boundary",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W4-E2b; invariants I-9, I-11, I-12"},
+   "platforms": ["linux", "windows", "macos", "android", "ios"],
+   "layer": "rust-tauri-frontend-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/command_error.rs::tests::phase_b_production_wire_matches_legacy",
+     "src-tauri/src/backend_command_parity.rs::tests::phase_b_command_error_manifest_is_exact_for_every_target",
+     "src/backendCallFunnel.test.ts",
+     "src/typedErrorRatchet.test.ts"
+    ],
+    "scenario": "backend-errors.phase-b-command-error-keeps-kind-and-wire",
+    "failBefore": "proven — on post-E2 commit 0b5ebd899 the production guard failed on live stringify bridges and the structural guard named every remaining phase-B String-result file"
+   },
+   "notes": "All registered fallible commands and src-tauri helpers share CommandError; JSON, durability, worker, plugin, clipboard, platform, graph-verification and managed-runtime producers remain distinct while Serialize emits the unchanged string rejection."
+  },
+  {
    "id": "REG-W4-E4-DIRECT-SAVE-TYPED-CODE-001",
    "title": "Direct save failures retain the producer code when page text resembles a conflict",
    "family": "direct-save-typed-errors",

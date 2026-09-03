@@ -330,7 +330,7 @@ fn registered_handlers(source: &str) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
-    const PHASE_B_FALLIBLE: &[(&str, &str)] = &[
+    const PHASE_B_COMMANDS: &[(&str, &str)] = &[
         ("android_folder_picker.rs", "pick_graph_folder"),
         ("android_media.rs", "capture_photo"),
         ("android_media.rs", "start_recording"),
@@ -510,13 +510,13 @@ mod tests {
             assert_eq!(source.matches("pub(crate) async fn $name").count(), 2);
             assert!(
                 source
-                    .matches(") -> Result<MediaCaptureResult, String>")
+                    .matches(") -> Result<MediaCaptureResult, crate::command_error::CommandError>")
                     .count()
                     >= 2
             );
             return (
                 "android_media.rs".into(),
-                "Result<MediaCaptureResult, String>".into(),
+                "Result<MediaCaptureResult, crate::command_error::CommandError>".into(),
             );
         }
         let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -571,24 +571,19 @@ mod tests {
         let state = include_str!("state.rs");
         let command_error = include_str!("command_error.rs");
         assert!(
-            !commands.contains("map_err(|error| error.to_string())")
-                && !commands.contains("map_err(|e| e.to_string())")
-                && !state.contains("map_err(|error| error.to_string())")
-                && !state.contains("map_err(|e| e.to_string())")
-                && !commands.contains("CommandError::prose(error.to_string())")
+            !commands.contains(&["map_err(|error| error", ".to_string())"].concat())
+                && !commands.contains(&["map_err(|e| e", ".to_string())"].concat())
+                && !state.contains(&["map_err(|error| error", ".to_string())"].concat())
+                && !state.contains(&["map_err(|e| e", ".to_string())"].concat())
+                && !commands.contains(&["CommandError::prose(error", ".to_string())"].concat())
                 && !commands.contains("CommandError::prose(format!(\"{error}\"))")
-                && !command_error.contains("From<String> for CommandError")
-                && !command_error.contains("From<&str> for CommandError"),
+                && !command_error.contains(&["From<", "String> for CommandError"].concat())
+                && !command_error.contains(&["From<", "&str> for CommandError"].concat()),
             "I-9: phase-A typed sources must not route through String/Prose; imitate command_error.rs and direct_save_error_message"
         );
 
-        let expected_phase_b: BTreeSet<(String, String)> = PHASE_B_FALLIBLE
-            .iter()
-            .map(|(file, name)| ((*file).into(), (*name).into()))
-            .collect();
         let expected_infallible: BTreeSet<String> =
             INFALLIBLE.iter().map(|name| (*name).into()).collect();
-        let mut seen_phase_b = BTreeSet::new();
         let mut seen_infallible = BTreeSet::new();
         for target in ["desktop", "android", "ios"] {
             for path in registered_for_target(LIB_RS, target) {
@@ -603,26 +598,15 @@ mod tests {
                         "{target}: infallible command {name} needs a by-name allowlist entry"
                     );
                     seen_infallible.insert(name.to_owned());
-                } else if file == "commands.rs" {
-                    assert!(
-                        compact.ends_with(",CommandError>"),
-                        "{target}: phase-A command {name} must return Result<_, CommandError>"
-                    );
                 } else {
-                    assert!(expected_phase_b.contains(&(file.clone(), name.to_owned())),
-                        "{target}: fallible phase-B command {file}::{name} needs an E2b allowlist row");
                     assert!(
-                        compact.ends_with(",String>"),
-                        "{target}: stale E2b row for {file}::{name}"
+                        compact.ends_with("CommandError>")
+                            || compact.ends_with("CommandError,>"),
+                        "{target}: every fallible command {file}::{name} must return the one CommandError"
                     );
-                    seen_phase_b.insert((file, name.to_owned()));
                 }
             }
         }
-        assert_eq!(
-            seen_phase_b, expected_phase_b,
-            "stale/duplicate phase-B command allowlist row"
-        );
         assert_eq!(
             seen_infallible, expected_infallible,
             "stale infallible command allowlist row"
@@ -662,6 +646,246 @@ mod tests {
             );
             rest = &rest[at + worker_mapper.len()..];
         }
+    }
+
+    #[test]
+    fn phase_b_command_error_manifest_is_exact_for_every_target() {
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut string_results = Vec::new();
+        let mut phase_b_sources = Vec::new();
+        for entry in std::fs::read_dir(source_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            if result_error_is_string(&source) {
+                string_results.push(path.file_name().unwrap().to_string_lossy().to_string());
+            }
+            phase_b_sources.push((
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                source,
+            ));
+        }
+        assert!(
+            string_results.is_empty(),
+            "I-9: src-tauri String error results must be structurally zero; found {string_results:?}"
+        );
+        let (site_count, site_fingerprint, site_rows) =
+            phase_b_mapper_site_fingerprint(&phase_b_sources);
+        // Count and placement are pinned separately on purpose: an equal count
+        // with a different fingerprint is the count-preserving swap (a Plugin
+        // failure mapped as Backup), which is the vacuous implementation this
+        // whole packet exists to make unwritable.
+        assert_eq!(
+            (site_count, site_fingerprint),
+            (498, 5_166_399_032_487_446_848),
+            "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
+             sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
+             genuinely moved, changed family, appeared or disappeared. Diff these against \
+             the last accepted run and re-pin both values only once every row is intended:\n{}",
+            site_rows.join("\n")
+        );
+
+        let expected_phase_b: BTreeSet<(String, String)> = PHASE_B_COMMANDS
+            .iter()
+            .map(|(file, name)| ((*file).into(), (*name).into()))
+            .collect();
+        let mut seen_phase_b = BTreeSet::new();
+        for target in ["desktop", "android", "ios"] {
+            for path in registered_for_target(LIB_RS, target) {
+                let name = path.rsplit("::").next().unwrap();
+                let module_path = path.rsplit_once("::").map_or("", |(module, _)| module);
+                let (file, signature) = command_definition(module_path, name);
+                let compact: String = signature.chars().filter(|c| !c.is_whitespace()).collect();
+                if expected_phase_b.contains(&(file.clone(), name.to_owned())) {
+                    assert!(
+                        compact.ends_with("CommandError>") || compact.ends_with("CommandError,>"),
+                        "{target}: phase-B command {file}::{name} must return CommandError"
+                    );
+                    seen_phase_b.insert((file, name.to_owned()));
+                }
+            }
+        }
+        assert_eq!(
+            seen_phase_b, expected_phase_b,
+            "phase-B command manifest drift"
+        );
+
+        let compact_sources: Vec<(String, String)> = phase_b_sources
+            .iter()
+            .map(|(file, source)| {
+                (
+                    file.clone(),
+                    source.chars().filter(|c| !c.is_whitespace()).collect(),
+                )
+            })
+            .collect();
+        for (_, compact) in &compact_sources {
+            assert!(!compact.contains(&["map_err(|error|error", ".to_string())"].concat()));
+            assert!(!compact.contains(&["map_err(|e|e", ".to_string())"].concat()));
+            assert!(!compact.contains(&["CommandError::prose(error", ".to_string())"].concat()));
+        }
+        let command_error = include_str!("command_error.rs");
+        assert!(!command_error.contains(&["From<", "String> for CommandError"].concat()));
+        assert!(!command_error.contains(&["From<", "&str> for CommandError"].concat()));
+
+        for (file, source) in &phase_b_sources {
+            if matches!(
+                file.as_str(),
+                "commands.rs" | "state.rs" | "command_error.rs" | "backend_command_parity.rs"
+            ) {
+                continue;
+            }
+            assert_eq!(assert_mapper_placement(file, source), None);
+            let worker = ".map_err(crate::command_error::CommandError::worker)";
+            let mut rest = source.as_str();
+            while let Some(at) = rest.find(worker) {
+                assert!(
+                    rest[..at].trim_end().ends_with(".await"),
+                    "{file}: Worker is reserved for spawn_blocking(...).await JoinError sites"
+                );
+                rest = &rest[at + worker.len()..];
+            }
+        }
+
+        let plugins = include_str!("plugins.rs").replacen(
+            "CommandError::plugin(",
+            "CommandError::backup(",
+            1,
+        );
+        let backup =
+            include_str!("backup.rs").replacen("CommandError::backup(", "CommandError::plugin(", 1);
+        assert!(assert_mapper_placement("plugins.rs", &plugins).is_some());
+        assert!(assert_mapper_placement("backup.rs", &backup).is_some());
+    }
+
+    fn assert_mapper_placement(file: &str, source: &str) -> Option<String> {
+        const PLACEMENT: &[(&str, &[&str])] = &[
+            ("plugin", &["plugins.rs"]),
+            ("clipboard", &["platform.rs"]),
+            (
+                "platform",
+                &[
+                    "platform.rs",
+                    "lib.rs",
+                    "android_folder_picker.rs",
+                    "android_media.rs",
+                    "android_system_bars.rs",
+                    "ios_folder_picker.rs",
+                ],
+            ),
+            ("graph_verification", &["graph_verification.rs"]),
+            ("graph", &["graph.rs", "watcher.rs"]),
+            (
+                "sync_runtime",
+                &["sync_runtime.rs", "storage_mode_supervisor.rs"],
+            ),
+            ("settings", &["settings.rs"]),
+            ("diagnostic", &["debug.rs"]),
+            ("backup", &["backup.rs"]),
+            (
+                "json",
+                &[
+                    "conflict_capsule.rs",
+                    "graph_verification.rs",
+                    "plugins.rs",
+                    "settings.rs",
+                    "sync_runtime.rs",
+                ],
+            ),
+        ];
+        for (mapper, allowed) in PLACEMENT {
+            let needle = format!("CommandError::{mapper}(");
+            if source.contains(&needle) && !allowed.contains(&file) {
+                return Some(format!("{file}: mapper {mapper} belongs to {allowed:?}"));
+            }
+        }
+        None
+    }
+
+    /// `(file, enclosing symbol, mapper)` for every phase-B mapper use — sorted,
+    /// so it is stable under line drift. Deliberately NOT `(file, line)`: a
+    /// line-anchored census reddens on any edit above a site, which is how the
+    /// print census cost this campaign five re-anchoring rounds in one day.
+    ///
+    /// The rows come back beside the hash because a bare 64-bit mismatch tells
+    /// the next reader nothing about WHAT moved. Print them and diff.
+    fn phase_b_mapper_site_fingerprint(sources: &[(String, String)]) -> (usize, u64, Vec<String>) {
+        let mut rows = Vec::new();
+        for (file, source) in sources {
+            if matches!(
+                file.as_str(),
+                "commands.rs" | "state.rs" | "command_error.rs" | "backend_command_parity.rs"
+            ) {
+                continue;
+            }
+            let mut offset = 0;
+            while let Some(relative) = source[offset..].find("CommandError::") {
+                let start = offset + relative;
+                let mapper_start = start + "CommandError::".len();
+                let mapper_end = source[mapper_start..]
+                    .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .map(|end| mapper_start + end)
+                    .unwrap_or(source.len());
+                let mapper = &source[mapper_start..mapper_end];
+                if mapper.chars().next().is_some_and(char::is_lowercase) {
+                    let symbol = enclosing_symbol(&source[..start]);
+                    rows.push(format!("{file}|{symbol}|{mapper}"));
+                }
+                offset = mapper_end;
+            }
+        }
+        rows.sort();
+        let mut hash = 0xcbf29ce484222325_u64;
+        for row in &rows {
+            for byte in row.bytes().chain(std::iter::once(b'\n')) {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        (rows.len(), hash, rows)
+    }
+
+    fn enclosing_symbol(prefix: &str) -> &str {
+        let Some(start) = prefix.rfind("fn ").map(|at| at + 3) else {
+            return "<module>";
+        };
+        let end = prefix[start..]
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+            .map(|end| start + end)
+            .unwrap_or(prefix.len());
+        &prefix[start..end]
+    }
+
+    fn result_error_is_string(source: &str) -> bool {
+        let mut rest = source;
+        while let Some(start) = rest.find("Result<") {
+            rest = &rest[start + "Result<".len()..];
+            let mut depth = 1_i32;
+            let mut last_comma = None;
+            let mut end = None;
+            for (index, byte) in rest.bytes().enumerate() {
+                match byte {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(index);
+                            break;
+                        }
+                    }
+                    b',' if depth == 1 => last_comma = Some(index),
+                    _ => {}
+                }
+            }
+            let Some(end) = end else { return false };
+            if last_comma.is_some_and(|comma| rest[comma + 1..end].trim() == "String") {
+                return true;
+            }
+            rest = &rest[end + 1..];
+        }
+        false
     }
 
     /// Everything the frontend asks for must exist. A name that is not

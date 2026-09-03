@@ -81,11 +81,11 @@ pub(crate) fn debug_init() {
 
 /// Emit one detailed line to stderr and, when explicitly enabled, the directed
 /// debug file. This function does not write to the privacy-safe flight recorder.
-pub(crate) fn diag(msg: impl AsRef<str>) {
+pub(crate) fn diag(msg: impl std::fmt::Display) {
     if !debug_enabled() {
         return;
     }
-    let msg = msg.as_ref();
+    let msg = msg.to_string();
     eprintln!("[tine] {msg}");
     if let Some(Some(lock)) = DEBUG_LOG.get() {
         if let Ok(mut file) = lock.lock() {
@@ -809,7 +809,7 @@ pub(crate) async fn save_diagnostic_report(
     state: State<'_, AppState>,
     build_commit: String,
     build_time: String,
-) -> Result<bool, String> {
+) -> Result<bool, crate::command_error::CommandError> {
     let report = build_diagnostic_report(&state, build_commit, build_time);
     #[cfg(desktop)]
     {
@@ -823,34 +823,51 @@ pub(crate) async fn save_diagnostic_report(
                 .blocking_save_file()
         })
         .await
-        .map_err(|error| format!("diagnostic save dialog failed: {error}"))?;
+        .map_err(|error| {
+            crate::command_error::CommandError::diagnostic(format!(
+                "diagnostic save dialog failed: {error}"
+            ))
+        })?;
         let Some(chosen) = chosen else {
             return Ok(false);
         };
-        let path = chosen
-            .into_path()
-            .map_err(|_| "diagnostic save destination is not a local file".to_string())?;
-        tine_core::model::atomic_write(&path, report.text.as_bytes())
-            .map_err(|error| format!("diagnostic report could not be saved: {error}"))?;
+        let path = chosen.into_path().map_err(|_| {
+            crate::command_error::CommandError::prose(
+                "diagnostic save destination is not a local file",
+            )
+        })?;
+        tine_core::model::atomic_write(&path, report.text.as_bytes()).map_err(|error| {
+            crate::command_error::CommandError::diagnostic(format!(
+                "diagnostic report could not be saved: {error}"
+            ))
+        })?;
         Ok(true)
     }
     #[cfg(not(desktop))]
     {
         let _ = (app, report);
-        Err("Save report is available on desktop; use Copy report on this device.".into())
+        Err(crate::command_error::CommandError::prose(
+            "Save report is available on desktop; use Copy report on this device.",
+        ))
     }
 }
 
 #[tauri::command]
-pub(crate) fn clear_diagnostics() -> Result<(), String> {
+pub(crate) fn clear_diagnostics() -> Result<(), crate::command_error::CommandError> {
     let Some(Some(recorder)) = FLIGHT.get() else {
         return Ok(());
     };
     recorder
         .lock()
-        .map_err(|_| "diagnostic recorder is unavailable".to_string())?
+        .map_err(|_| {
+            crate::command_error::CommandError::prose("diagnostic recorder is unavailable")
+        })?
         .clear()
-        .map_err(|error| format!("diagnostic events could not be cleared: {error}"))?;
+        .map_err(|error| {
+            crate::command_error::CommandError::diagnostic(format!(
+                "diagnostic events could not be cleared: {error}"
+            ))
+        })?;
     record_fixed_event("diagnostics.cleared", Map::new());
     Ok(())
 }

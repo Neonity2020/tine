@@ -96,10 +96,10 @@ pub(crate) struct AndroidMedia<R: Runtime>(PluginHandle<R>);
 
 #[cfg(target_os = "android")]
 impl<R: Runtime> AndroidMedia<R> {
-    fn call(&self, method: &str) -> Result<MediaCaptureResult, String> {
+    fn call(&self, method: &str) -> Result<MediaCaptureResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin(method, ())
-            .map_err(|e| e.to_string())
+            .map_err(crate::command_error::CommandError::from)
     }
 }
 
@@ -110,7 +110,7 @@ macro_rules! android_media_command {
         pub(crate) async fn $name<R: Runtime>(
             _app: AppHandle<R>,
             media: State<'_, AndroidMedia<R>>,
-        ) -> Result<MediaCaptureResult, String> {
+        ) -> Result<MediaCaptureResult, crate::command_error::CommandError> {
             media.call($method)
         }
     };
@@ -120,8 +120,8 @@ macro_rules! android_media_command {
 macro_rules! android_media_command {
     ($name:ident, $method:literal) => {
         #[tauri::command]
-        pub(crate) async fn $name() -> Result<MediaCaptureResult, String> {
-            Err("Media capture is only supported on Android".to_string())
+        pub(crate) async fn $name() -> Result<MediaCaptureResult, crate::command_error::CommandError> {
+            Err(crate::command_error::CommandError::prose("Media capture is only supported on Android"))
         }
     };
 }

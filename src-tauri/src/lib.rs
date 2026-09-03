@@ -333,14 +333,21 @@ fn activate_capture_window(app: &tauri::AppHandle) {
 fn capture_frontend_ready(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     #[cfg(desktop)]
     {
         if window.label() != "capture" {
-            return Err("capture activation is only available to the capture window".into());
+            return Err(crate::command_error::CommandError::prose(
+                "capture activation is only available to the capture window",
+            ));
         }
-        if !window.is_visible().map_err(|error| error.to_string())? {
-            return Err("capture window is hidden".into());
+        if !window
+            .is_visible()
+            .map_err(crate::command_error::CommandError::from)?
+        {
+            return Err(crate::command_error::CommandError::prose(
+                "capture window is hidden",
+            ));
         }
         activate_capture_window(&app);
         Ok(())
@@ -349,7 +356,9 @@ fn capture_frontend_ready(
     #[cfg(not(desktop))]
     {
         let _ = (window, app);
-        Err("quick capture is only available on desktop".into())
+        Err(crate::command_error::CommandError::prose(
+            "quick capture is only available on desktop",
+        ))
     }
 }
 

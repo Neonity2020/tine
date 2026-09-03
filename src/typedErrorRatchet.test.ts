@@ -20,6 +20,53 @@ import {
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
 
+function hasStringErrorResult(text: string): boolean {
+  let rest = text;
+  while (true) {
+    const start = rest.indexOf("Result<");
+    if (start < 0) return false;
+    rest = rest.slice(start + "Result<".length);
+    let depth = 1;
+    let comma = -1;
+    let end = -1;
+    for (let index = 0; index < rest.length; index += 1) {
+      if (rest[index] === "<") depth += 1;
+      else if (rest[index] === ">") {
+        depth -= 1;
+        if (depth === 0) { end = index; break; }
+      } else if (rest[index] === "," && depth === 1) comma = index;
+    }
+    if (end < 0) return false;
+    if (comma >= 0 && rest.slice(comma + 1, end).trim() === "String") return true;
+    rest = rest.slice(end + 1);
+  }
+}
+
+function enclosingRustSymbol(text: string, offset: number): string | null {
+  const prefix = text.slice(0, offset);
+  const functions = [...prefix.matchAll(/\b(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]+"\s+)?fn\s+([A-Za-z_$][\w$]*)/g)];
+  return functions.at(-1)?.[1] ?? null;
+}
+
+function withoutRustTestModules(text: string): string {
+  const chars = [...text];
+  const module = /#\[cfg\(test\)\]\s*(?:pub\(crate\)\s+)?mod\s+\w+\s*\{/g;
+  for (const match of text.matchAll(module)) {
+    const open = match.index + match[0].lastIndexOf("{");
+    let depth = 0;
+    let end = open;
+    for (; end < text.length; end += 1) {
+      if (text[end] === "{") depth += 1;
+      else if (text[end] === "}") {
+        depth -= 1;
+        if (depth === 0) { end += 1; break; }
+      }
+    }
+    for (let index = match.index; index < end; index += 1) chars[index] = " ";
+  }
+  return chars.join("");
+}
+
 interface ClassifierSite {
   file: string;
   line: number;
@@ -215,6 +262,18 @@ describe("I-9/I-11 typed backend error boundary", () => {
     );
   });
 
+  it("keeps phase-B legacy literals compatible with the frontend funnel", () => {
+    expect(classifyNativeCallError('{"kind":"operation-cancelled"}')).toBeInstanceOf(OperationCancelledError);
+    expect(classifyNativeCallError('{"kind":"sync-data-unavailable"}')).toBeInstanceOf(SyncDataUnavailableError);
+    expect(classifyNativeCallError('{"kind":"adoption-archived"}')).toBeInstanceOf(AdoptionArchivedError);
+    for (const literal of [
+      "denied", "asset not found: worker", "asset not found: tauri", "json failure",
+      "plugin failure", "clipboard failure", "platform failure", "graph verification failure",
+      "graph failure", "sync runtime failure", "settings failure", "diagnostic failure",
+      "backup failure", "phase-B prose",
+    ]) expect(classifyNativeCallError(literal)).toBe(literal);
+  });
+
   it("pins the Rust typed boundaries and the living contract", () => {
     const wire = source("crates/tine-core/src/oplog/wire.rs");
     const runtime = source("crates/tine-core/src/sync_runtime.rs");
@@ -245,8 +304,8 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(commandError).not.toMatch(/impl From<(?:String|&str)> for CommandError/);
     expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
-    expect(contract).toContain("## Phase-A `CommandError` boundary");
-    expect(contract).toContain("The mechanically derived census has 113 production sites");
+    expect(contract).toContain("## `CommandError` boundary");
+    expect(contract).toContain("The phase-A syntactic census remains 113 production sites");
 
     const quitFixtures = commands.slice(
       commands.indexOf("mod prepare_tine_quit_tests"),
@@ -258,17 +317,14 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(proseSites).toBe(113);
 
     const phaseB = parity.slice(
-      parity.indexOf("const PHASE_B_FALLIBLE"),
+      parity.indexOf("const PHASE_B_COMMANDS"),
       parity.indexOf("const INFALLIBLE"),
     );
     const phaseBRows = [...phaseB.matchAll(/\("([^"]+\.rs)", "([^"]+)"\)/g)];
     expect(phaseBRows.length).toBeGreaterThan(50);
-    for (const [, file, command] of phaseBRows) {
-      expect(contract).toContain(`\`${file}\``);
-      expect(contract).toContain(`\`${command}\``);
-    }
+    expect(contract).toContain("Every fallible command registered for desktop, Android, or iOS");
 
-    for (const heading of ["### Conversion table", "### E2b phase-B pin", "### `Prose` census"]) {
+    for (const heading of ["### Conversion table", "### `Prose` census"]) {
       const start = contract.indexOf(heading);
       const end = contract.indexOf("\n##", start + heading.length);
       const section = contract.slice(start, end < 0 ? undefined : end);
@@ -321,5 +377,68 @@ describe("I-9/I-11 typed backend error boundary", () => {
       .filter((code) => code !== "managed.conflict");
     const producerUnion = new Set([...directCodes, ...managedCodes]);
     expect(frontendCodes.filter((code) => !producerUnion.has(code))).toEqual([]);
+  });
+
+  it("phase-B contract artifacts are complete", () => {
+    const rustDir = join(process.cwd(), "src-tauri/src");
+    const rustFiles = readdirSync(rustDir)
+      .filter((file) => file.endsWith(".rs"))
+      .map((file) => ({ file, text: readFileSync(join(rustDir, file), "utf8") }));
+    expect(rustFiles.filter(({ text }) => hasStringErrorResult(text)).map(({ file }) => file)).toEqual([]);
+    expect(
+      rustFiles.filter(({ text }) => /map_err\(\|\w+\|\s*\w+\.to_string\(\)\)/.test(text)).map(({ file }) => file),
+    ).toEqual([]);
+
+    const commandError = source("src-tauri/src/command_error.rs");
+    const parity = source("src-tauri/src/backend_command_parity.rs");
+    const contract = source("docs/contracts/typed-errors.md");
+    expect(commandError).toContain("PHASE_B_PRODUCER_MANIFEST");
+    expect(commandError).toContain("phase_b_production_wire_matches_legacy");
+    expect(parity).toContain("phase_b_command_error_manifest_is_exact_for_every_target");
+    // Count and placement are pinned as ONE tuple on purpose: asserting them
+    // separately lets a count-preserving swap (a Plugin failure re-mapped as
+    // Backup) satisfy the count while the fingerprint silently moves.
+    expect(parity).toContain("(498, 5_166_399_032_487_446_848)");
+    // A mismatch must print the rows, not a bare 64-bit number nobody can act on.
+    expect(parity).toContain("site_rows.join");
+    expect(contract).toContain("### Absolute phase-B rule");
+    expect(contract).not.toContain("### E2b phase-B pin");
+    for (const family of [
+      "Json", "Plugin", "Clipboard", "Platform", "GraphVerification", "Graph",
+      "SyncRuntime", "Settings", "Diagnostic", "Backup",
+    ]) expect(commandError).toContain(`${family} {`);
+    for (const file of [
+      "backup.rs", "conflict_capsule.rs", "debug.rs", "graph.rs",
+      "graph_verification.rs", "platform.rs", "plugins.rs", "settings.rs",
+      "storage_mode_supervisor.rs", "sync_runtime.rs",
+    ]) expect(contract).toContain(`\`${file}\``);
+
+    const proseStart = contract.indexOf("### `Prose` census");
+    const proseEnd = contract.indexOf("\n##", proseStart + 1);
+    const proseRows = contract.slice(proseStart, proseEnd).split("\n")
+      .filter((line) => line.startsWith("|") && !line.includes("---")).slice(1);
+    const allowedProse = new Map<string, Set<string>>();
+    for (const row of proseRows) {
+      const cells = row.split("|").slice(1, -1).map((cell) => cell.trim());
+      const files = [...cells[0].matchAll(/`([^`]+\.rs)`/g)].map((match) => match[1]);
+      const symbols = [...cells[1].matchAll(/`([^`]+)`/g)].map((match) => match[1]);
+      for (const file of files) {
+        const owned = allowedProse.get(file) ?? new Set<string>();
+        for (const symbol of symbols) owned.add(symbol);
+        allowedProse.set(file, owned);
+      }
+    }
+    const misplaced: string[] = [];
+    for (const { file, text } of rustFiles) {
+      if (["commands.rs", "state.rs", "command_error.rs", "backend_command_parity.rs"].includes(file)) continue;
+      const production = file === "sync_runtime.rs"
+        ? text.slice(0, text.indexOf("#[cfg(test)]\nmod tests"))
+        : withoutRustTestModules(text);
+      for (const match of production.matchAll(/CommandError::prose\b/g)) {
+        const symbol = enclosingRustSymbol(production, match.index);
+        if (symbol === null || !allowedProse.get(file)?.has(symbol)) misplaced.push(`${file}::${symbol ?? "<none>"}`);
+      }
+    }
+    expect(misplaced, "I-9: every phase-B Prose production site must stay in its contract-pinned symbol").toEqual([]);
   });
 });

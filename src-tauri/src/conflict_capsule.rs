@@ -29,67 +29,80 @@ fn capsule_path(app_data: &Path, root: &Path) -> PathBuf {
 
 static CONFLICT_CAPSULE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn capsule_page_name(capsule: &Value) -> Result<&str, String> {
+fn capsule_page_name(capsule: &Value) -> Result<&str, crate::command_error::CommandError> {
     let source = capsule
         .get("source")
         .and_then(Value::as_str)
-        .ok_or("conflict capsule requires a source")?;
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose("conflict capsule requires a source")
+        })?;
     if source != "live-save" {
-        return Err("conflict capsule source must be live-save".into());
+        return Err(crate::command_error::CommandError::prose(
+            "conflict capsule source must be live-save",
+        ));
     }
     capsule
         .get("page_name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| "conflict capsule requires a page_name".into())
+        .ok_or_else(|| {
+            crate::command_error::CommandError::prose("conflict capsule requires a page_name")
+        })
 }
 
-fn reclaim_torn_temps(path: &Path) -> Result<(), String> {
+fn reclaim_torn_temps(path: &Path) -> Result<(), crate::command_error::CommandError> {
     let Some(parent) = path.parent() else {
-        return Err("conflict capsule has no parent directory".into());
+        return Err(crate::command_error::CommandError::prose(
+            "conflict capsule has no parent directory",
+        ));
     };
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Err("conflict capsule name is not UTF-8".into());
+        return Err(crate::command_error::CommandError::prose(
+            "conflict capsule name is not UTF-8",
+        ));
     };
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(crate::command_error::CommandError::from(error)),
     };
     let prefix = format!(".{name}.");
     let mut reclaimed = false;
     for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
+        let entry = entry.map_err(crate::command_error::CommandError::from)?;
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
         if file_name.starts_with(&prefix) && file_name.ends_with(".tmp") {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => reclaimed = true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(crate::command_error::CommandError::from(error)),
             }
         }
     }
     if reclaimed {
-        tine_core::model::sync_dir_for_rename(parent).map_err(|error| error.to_string())?;
+        tine_core::model::sync_dir_for_rename(parent)
+            .map_err(crate::command_error::CommandError::from)?;
     }
     Ok(())
 }
 
-fn decode_envelope(bytes: &[u8]) -> Result<Vec<Value>, String> {
+fn decode_envelope(bytes: &[u8]) -> Result<Vec<Value>, crate::command_error::CommandError> {
     let envelope: ConflictCapsuleEnvelope =
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        serde_json::from_slice(bytes).map_err(crate::command_error::CommandError::from)?;
     if envelope.version != ENVELOPE_VERSION {
-        return Err(format!(
+        return Err(crate::command_error::CommandError::prose(format!(
             "unsupported conflict capsule version {}",
             envelope.version
-        ));
+        )));
     }
     let mut names = std::collections::HashSet::new();
     for capsule in &envelope.capsules {
         let name = capsule_page_name(capsule)?;
         if !names.insert(name.to_owned()) {
-            return Err(format!("duplicate conflict capsule for {name}"));
+            return Err(crate::command_error::CommandError::prose(format!(
+                "duplicate conflict capsule for {name}"
+            )));
         }
     }
     Ok(envelope.capsules)
@@ -101,27 +114,33 @@ fn decode_envelope(bytes: &[u8]) -> Result<Vec<Value>, String> {
 /// (in-scope: disk error, a sync client delivering another build's envelope)
 /// must not make every later capture and retirement fail forever. The bytes
 /// are preserved, not deleted.
-fn quarantine_unreadable(path: &Path, _reason: &str) -> Result<(), String> {
+fn quarantine_unreadable(
+    path: &Path,
+    _reason: &crate::command_error::CommandError,
+) -> Result<(), crate::command_error::CommandError> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Err("conflict capsule name is not UTF-8".into());
+        return Err(crate::command_error::CommandError::prose(
+            "conflict capsule name is not UTF-8",
+        ));
     };
     let aside = path.with_file_name(format!(
         "{name}.unreadable-{}",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::rename(path, &aside).map_err(|error| error.to_string())?;
+    std::fs::rename(path, &aside).map_err(crate::command_error::CommandError::from)?;
     if let Some(parent) = path.parent() {
-        tine_core::model::sync_dir_for_rename(parent).map_err(|error| error.to_string())?;
+        tine_core::model::sync_dir_for_rename(parent)
+            .map_err(crate::command_error::CommandError::from)?;
     }
     Ok(())
 }
 
-fn load_unlocked(path: &Path) -> Result<Vec<Value>, String> {
+fn load_unlocked(path: &Path) -> Result<Vec<Value>, crate::command_error::CommandError> {
     reclaim_torn_temps(path)?;
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(crate::command_error::CommandError::from(error)),
     };
     match decode_envelope(&bytes) {
         Ok(capsules) => Ok(capsules),
@@ -132,30 +151,33 @@ fn load_unlocked(path: &Path) -> Result<Vec<Value>, String> {
     }
 }
 
-fn load_at(path: &Path) -> Result<Vec<Value>, String> {
+fn load_at(path: &Path) -> Result<Vec<Value>, crate::command_error::CommandError> {
     let _guard = CONFLICT_CAPSULE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     load_unlocked(path)
 }
 
-fn write_unlocked(path: &Path, capsules: Vec<Value>) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or("conflict capsule has no parent directory")?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+fn write_unlocked(
+    path: &Path,
+    capsules: Vec<Value>,
+) -> Result<(), crate::command_error::CommandError> {
+    let parent = path.parent().ok_or_else(|| {
+        crate::command_error::CommandError::prose("conflict capsule has no parent directory")
+    })?;
+    std::fs::create_dir_all(parent).map_err(crate::command_error::CommandError::from)?;
     let bytes = serde_json::to_vec(&ConflictCapsuleEnvelope {
         version: ENVELOPE_VERSION,
         capsules,
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(crate::command_error::CommandError::from)?;
     // Named audited B3 conflict-capsule publication protocol (I-1/I-2):
     // unique create-new temp, complete file barrier, atomic replacement,
     // failed-temp cleanup, and strict directory-barrier error reporting.
-    tine_core::model::atomic_write(path, &bytes).map_err(|error| error.to_string())
+    tine_core::model::atomic_write(path, &bytes).map_err(crate::command_error::CommandError::from)
 }
 
-fn upsert_at(path: &Path, capsule: Value) -> Result<(), String> {
+fn upsert_at(path: &Path, capsule: Value) -> Result<(), crate::command_error::CommandError> {
     let page_name = capsule_page_name(&capsule)?.to_owned();
     let _guard = CONFLICT_CAPSULE_LOCK
         .lock()
@@ -172,7 +194,7 @@ fn upsert_at(path: &Path, capsule: Value) -> Result<(), String> {
     write_unlocked(path, capsules)
 }
 
-fn retire_at(path: &Path, page_name: &str) -> Result<(), String> {
+fn retire_at(path: &Path, page_name: &str) -> Result<(), crate::command_error::CommandError> {
     let _guard = CONFLICT_CAPSULE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -185,21 +207,25 @@ fn retire_at(path: &Path, page_name: &str) -> Result<(), String> {
     if !capsules.is_empty() {
         return write_unlocked(path, capsules);
     }
-    let parent = path
-        .parent()
-        .ok_or("conflict capsule has no parent directory")?;
+    let parent = path.parent().ok_or_else(|| {
+        crate::command_error::CommandError::prose("conflict capsule has no parent directory")
+    })?;
     match std::fs::remove_file(path) {
-        Ok(()) => tine_core::model::sync_dir_for_rename(parent).map_err(|error| error.to_string()),
+        Ok(()) => tine_core::model::sync_dir_for_rename(parent)
+            .map_err(crate::command_error::CommandError::from),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(crate::command_error::CommandError::from(error)),
     }
 }
 
-fn app_capsule_path(app: &tauri::AppHandle, root: &str) -> Result<PathBuf, String> {
+fn app_capsule_path(
+    app: &tauri::AppHandle,
+    root: &str,
+) -> Result<PathBuf, crate::command_error::CommandError> {
     let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::command_error::CommandError::from)?;
     Ok(capsule_path(&app_data, Path::new(root)))
 }
 
@@ -207,7 +233,7 @@ fn app_capsule_path(app: &tauri::AppHandle, root: &str) -> Result<PathBuf, Strin
 pub(crate) fn load_conflict_capsules(
     root: String,
     app: tauri::AppHandle,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, crate::command_error::CommandError> {
     load_at(&app_capsule_path(&app, &root)?)
 }
 
@@ -216,7 +242,7 @@ pub(crate) fn store_conflict_capsule(
     root: String,
     capsule: Value,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     upsert_at(&app_capsule_path(&app, &root)?, capsule)
 }
 
@@ -225,7 +251,7 @@ pub(crate) fn retire_conflict_capsule(
     root: String,
     page_name: String,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     retire_at(&app_capsule_path(&app, &root)?, &page_name)
 }
 

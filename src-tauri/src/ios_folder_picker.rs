@@ -48,16 +48,21 @@ pub(crate) struct PrepareGraphFolderResult {
 pub(crate) struct IosFolderPicker<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> IosFolderPicker<R> {
-    fn pick_graph_folder(&self) -> Result<GraphFolderPickResult, String> {
+    fn pick_graph_folder(
+        &self,
+    ) -> Result<GraphFolderPickResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin("pickGraphFolder", ())
-            .map_err(|e| e.to_string())
+            .map_err(crate::command_error::CommandError::from)
     }
 
-    fn prepare_graph_folder(&self, path: &str) -> Result<PrepareGraphFolderResult, String> {
+    fn prepare_graph_folder(
+        &self,
+        path: &str,
+    ) -> Result<PrepareGraphFolderResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin("prepareGraphFolder", PrepareGraphFolderPayload { path })
-            .map_err(|e| e.to_string())
+            .map_err(crate::command_error::CommandError::from)
     }
 }
 
@@ -65,7 +70,7 @@ impl<R: Runtime> IosFolderPicker<R> {
 pub(crate) async fn pick_graph_folder<R: Runtime>(
     _app: AppHandle<R>,
     picker: State<'_, IosFolderPicker<R>>,
-) -> Result<GraphFolderPickResult, String> {
+) -> Result<GraphFolderPickResult, crate::command_error::CommandError> {
     picker.pick_graph_folder()
 }
 
@@ -74,7 +79,7 @@ pub(crate) async fn prepare_graph_folder<R: Runtime>(
     _app: AppHandle<R>,
     picker: State<'_, IosFolderPicker<R>>,
     path: String,
-) -> Result<PrepareGraphFolderResult, String> {
+) -> Result<PrepareGraphFolderResult, crate::command_error::CommandError> {
     picker.prepare_graph_folder(&path)
 }
 

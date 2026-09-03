@@ -21,10 +21,12 @@ pub(crate) struct AndroidFolderPicker<R: Runtime>(PluginHandle<R>);
 
 #[cfg(target_os = "android")]
 impl<R: Runtime> AndroidFolderPicker<R> {
-    fn pick_graph_folder(&self) -> Result<GraphFolderPickResult, String> {
+    fn pick_graph_folder(
+        &self,
+    ) -> Result<GraphFolderPickResult, crate::command_error::CommandError> {
         self.0
             .run_mobile_plugin("pickGraphFolder", ())
-            .map_err(|e| e.to_string())
+            .map_err(crate::command_error::CommandError::from)
     }
 }
 
@@ -33,7 +35,7 @@ impl<R: Runtime> AndroidFolderPicker<R> {
 pub(crate) async fn pick_graph_folder<R: Runtime>(
     _app: AppHandle<R>,
     picker: State<'_, AndroidFolderPicker<R>>,
-) -> Result<GraphFolderPickResult, String> {
+) -> Result<GraphFolderPickResult, crate::command_error::CommandError> {
     picker.pick_graph_folder()
 }
 
@@ -44,8 +46,11 @@ pub(crate) async fn pick_graph_folder<R: Runtime>(
 // ever registered.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
-pub(crate) async fn pick_graph_folder() -> Result<GraphFolderPickResult, String> {
-    Err("Android folder picker is unsupported on this platform".to_string())
+pub(crate) async fn pick_graph_folder(
+) -> Result<GraphFolderPickResult, crate::command_error::CommandError> {
+    Err(crate::command_error::CommandError::prose(
+        "Android folder picker is unsupported on this platform",
+    ))
 }
 
 #[cfg(target_os = "android")]

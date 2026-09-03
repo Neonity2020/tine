@@ -23,11 +23,13 @@ pub(crate) struct ClipboardFileList {
 /// restricted to regular files before they cross into the WebView. Directories
 /// are intentionally skipped rather than recursively importing arbitrary trees.
 #[cfg(desktop)]
-fn read_clipboard_files() -> Result<ClipboardFileList, String> {
+fn read_clipboard_files() -> Result<ClipboardFileList, crate::command_error::CommandError> {
     use clipboard_rs::{Clipboard, ClipboardContext};
 
-    let context = ClipboardContext::new().map_err(|e| e.to_string())?;
-    let paths = context.get_files().map_err(|e| e.to_string())?;
+    let context = ClipboardContext::new().map_err(crate::command_error::CommandError::clipboard)?;
+    let paths = context
+        .get_files()
+        .map_err(crate::command_error::CommandError::clipboard)?;
     Ok(clipboard_file_list(paths))
 }
 
@@ -75,11 +77,12 @@ fn clipboard_file_list(paths: Vec<String>) -> ClipboardFileList {
 }
 
 #[tauri::command]
-pub(crate) async fn clipboard_files() -> Result<ClipboardFileList, String> {
+pub(crate) async fn clipboard_files(
+) -> Result<ClipboardFileList, crate::command_error::CommandError> {
     #[cfg(desktop)]
     return tauri::async_runtime::spawn_blocking(read_clipboard_files)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(crate::command_error::CommandError::worker)?;
 
     #[cfg(not(desktop))]
     return Ok(ClipboardFileList {
@@ -131,7 +134,7 @@ mod clipboard_file_tests {
 /// Tauri plugin uses) tries to do this in-process and frequently drops the image
 /// on WebKitGTK, so we prefer the native tools and only fall back to the plugin.
 #[cfg(target_os = "linux")]
-fn linux_copy_image(bytes: &[u8]) -> Result<(), String> {
+fn linux_copy_image(bytes: &[u8]) -> Result<(), crate::command_error::CommandError> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     // Prefer the tool matching the active session, but try all — a Wayland session
@@ -183,22 +186,25 @@ fn linux_copy_image(bytes: &[u8]) -> Result<(), String> {
         });
         return Ok(());
     }
-    Err(last_err)
+    Err(crate::command_error::CommandError::platform(last_err))
 }
 
 #[tauri::command]
 pub(crate) fn copy_image_to_clipboard(
     app: tauri::AppHandle,
     bytes_b64: String,
-) -> Result<(), String> {
+) -> Result<(), crate::command_error::CommandError> {
     use tauri_plugin_clipboard_manager::ClipboardExt;
-    let bytes = decode_asset_b64(&bytes_b64).map_err(|error| error.to_string())?;
+    let bytes = decode_asset_b64(&bytes_b64).map_err(crate::command_error::CommandError::from)?;
     #[cfg(target_os = "linux")]
     if linux_copy_image(&bytes).is_ok() {
         return Ok(());
     }
-    let img = tauri::image::Image::from_bytes(&bytes).map_err(|e| e.to_string())?;
-    app.clipboard().write_image(&img).map_err(|e| e.to_string())
+    let img = tauri::image::Image::from_bytes(&bytes)
+        .map_err(crate::command_error::CommandError::clipboard)?;
+    app.clipboard()
+        .write_image(&img)
+        .map_err(crate::command_error::CommandError::clipboard)
 }
 
 /// What the backend knows about the rendering path, so the UI can warn — loudly
@@ -269,36 +275,49 @@ pub(crate) enum ExternalOpen {
 /// this gate rejected `file:` outright and the frontend then discarded the
 /// rejection) is worse for the honest case than the parity behaviour is for the
 /// hostile one. Every other scheme stays refused, which is stricter than OG.
-pub(crate) fn external_open_plan(url: &str) -> Result<ExternalOpen, String> {
+pub(crate) fn external_open_plan(
+    url: &str,
+) -> Result<ExternalOpen, crate::command_error::CommandError> {
     if url.starts_with("file:") {
-        let path = file_url_to_path(url)
-            .ok_or_else(|| "that file link does not name a local file".to_string())?;
+        let path = file_url_to_path(url).ok_or_else(|| {
+            crate::command_error::CommandError::prose("that file link does not name a local file")
+        })?;
         return Ok(ExternalOpen::LocalPath(path));
     }
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
         return Ok(ExternalOpen::Url);
     }
-    Err("unsupported url scheme".into())
+    Err(crate::command_error::CommandError::prose(
+        "unsupported url scheme",
+    ))
 }
 
 /// Open a web/mail URL, or a local `file:` link, in the user's default external
 /// application. The URL is passed as a single argument (no shell), so it can't
 /// inject commands.
 #[tauri::command]
-pub(crate) fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
+pub(crate) fn open_external(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<(), crate::command_error::CommandError> {
     if let ExternalOpen::LocalPath(path) = external_open_plan(&url)? {
         // Every OS opener accepts a path that is not there — `explorer.exe` even
         // opens an unrelated window for one — so without this check a stale link
         // reproduces the reported "clicking does nothing" from the other side.
         if !path.exists() {
-            return Err(format!("{} could not be found", path.display()));
+            return Err(crate::command_error::CommandError::platform(format!(
+                "{} could not be found",
+                path.display()
+            )));
         }
         #[cfg(desktop)]
         return open_page_source(&path);
         #[cfg(not(desktop))]
         {
             let _ = (path, &app);
-            return Err("opening local files is available on desktop only".into());
+            return Err(crate::command_error::CommandError::prose(
+                "opening local files is available on desktop only",
+            ));
         }
     }
     // Linux/macOS: spawn the desktop-session URL opener directly (Linux needs
@@ -310,7 +329,10 @@ pub(crate) fn open_external(app: tauri::AppHandle, url: String) -> Result<(), St
         let mut command = opener_command_env("xdg-open", OpenerEnvPolicy::Browser);
         #[cfg(target_os = "macos")]
         let mut command = opener_command("open");
-        command.arg(&url).spawn().map_err(|e| e.to_string())?;
+        command
+            .arg(&url)
+            .spawn()
+            .map_err(crate::command_error::CommandError::from)?;
         Ok(())
     }
     // Windows: do NOT spawn `explorer <url>`. explorer.exe treats an http(s)/
@@ -324,7 +346,7 @@ pub(crate) fn open_external(app: tauri::AppHandle, url: String) -> Result<(), St
         use tauri_plugin_opener::OpenerExt;
         app.opener()
             .open_url(url, None::<&str>)
-            .map_err(|e| e.to_string())
+            .map_err(crate::command_error::CommandError::from)
     }
     // Mobile (Android/iOS): there is no xdg-open/open/explorer to spawn, so hand
     // the URL to the platform via the opener plugin (an ACTION_VIEW Intent on
@@ -336,7 +358,7 @@ pub(crate) fn open_external(app: tauri::AppHandle, url: String) -> Result<(), St
         use tauri_plugin_opener::OpenerExt;
         app.opener()
             .open_url(url, None::<&str>)
-            .map_err(|e| e.to_string())
+            .map_err(crate::command_error::CommandError::from)
     }
 }
 
@@ -403,7 +425,9 @@ fn opener_command_env(
 }
 
 #[cfg(desktop)]
-pub(crate) fn open_page_source(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn open_page_source(
+    path: &std::path::Path,
+) -> Result<(), crate::command_error::CommandError> {
     #[cfg(target_os = "linux")]
     let mut command = opener_command("xdg-open");
     #[cfg(target_os = "macos")]
@@ -414,18 +438,20 @@ pub(crate) fn open_page_source(path: &std::path::Path) -> Result<(), String> {
         .arg(path)
         .spawn()
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(crate::command_error::CommandError::from)
 }
 
 #[cfg(desktop)]
-pub(crate) fn reveal_page_source(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn reveal_page_source(
+    path: &std::path::Path,
+) -> Result<(), crate::command_error::CommandError> {
     #[cfg(target_os = "macos")]
     return opener_command("open")
         .arg("-R")
         .arg(path)
         .spawn()
         .map(|_| ())
-        .map_err(|error| error.to_string());
+        .map_err(crate::command_error::CommandError::from);
 
     #[cfg(target_os = "windows")]
     return opener_command("explorer")
@@ -433,7 +459,7 @@ pub(crate) fn reveal_page_source(path: &std::path::Path) -> Result<(), String> {
         .arg(path)
         .spawn()
         .map(|_| ())
-        .map_err(|error| error.to_string());
+        .map_err(crate::command_error::CommandError::from);
 
     #[cfg(target_os = "linux")]
     {
@@ -456,14 +482,14 @@ pub(crate) fn reveal_page_source(path: &std::path::Path) -> Result<(), String> {
                 return Ok(());
             }
         }
-        let parent = path
-            .parent()
-            .ok_or_else(|| "page source has no parent directory".to_string())?;
+        let parent = path.parent().ok_or_else(|| {
+            crate::command_error::CommandError::prose("page source has no parent directory")
+        })?;
         opener_command("xdg-open")
             .arg(parent)
             .spawn()
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(crate::command_error::CommandError::from)
     }
 }
 

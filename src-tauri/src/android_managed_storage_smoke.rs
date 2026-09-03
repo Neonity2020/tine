@@ -105,19 +105,27 @@ pub extern "system" fn Java_page_tine_app_ManagedStorageSmoke_runManagedActivati
         let graph_root = env
             .get_string(&graph_root)
             .map(|value| PathBuf::from(value.to_string_lossy().into_owned()))
-            .map_err(|error| format!("invalid graph-root JNI string: {error}"))?;
+            .map_err(|error| {
+                crate::command_error::CommandError::prose(format!(
+                    "invalid graph-root JNI string: {error}"
+                ))
+            })?;
         let private_root = env
             .get_string(&private_root)
             .map(|value| PathBuf::from(value.to_string_lossy().into_owned()))
-            .map_err(|error| format!("invalid private-root JNI string: {error}"))?;
-        Ok::<_, String>(run(
+            .map_err(|error| {
+                crate::command_error::CommandError::prose(format!(
+                    "invalid private-root JNI string: {error}"
+                ))
+            })?;
+        Ok::<_, crate::command_error::CommandError>(run(
             graph_root,
             private_root,
             write_fixture != 0,
             return_to_direct_files != 0,
         ))
     }))
-    .map_err(|_| "managed-storage smoke probe panicked".to_string())
+    .map_err(|_| crate::command_error::CommandError::prose("managed-storage smoke probe panicked"))
     .and_then(|result| result)
     .unwrap_or_else(|error| error);
 
