@@ -630,9 +630,12 @@ describe("QuickSwitcher search syntax help", () => {
     const dispose = render(() => <QuickSwitcher />, root);
     openSwitcher();
     const graphSearch = vi.spyOn(backend(), "runGraphSearch");
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await vi.waitFor(() =>
+      expect((root.querySelector("[data-open-search-tab]") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
     const openTab = root.querySelector("[data-open-search-tab]") as HTMLButtonElement;
-    expect(openTab.disabled).toBe(false);
     expect(openTab.textContent).toContain("Open search tab");
     openTab.click();
     expect(route()).toMatchObject({ kind: "query", sourceKind: "search", source: "", presentation: "search" });
@@ -673,8 +676,11 @@ describe("QuickSwitcher search syntax help", () => {
     openSwitcher(); await Promise.resolve();
     const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
     input.value = "/(unclosed/"; input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    expect((root.querySelector("[data-open-search-tab]") as HTMLButtonElement).disabled).toBe(false);
+    await vi.waitFor(() =>
+      expect((root.querySelector("[data-open-search-tab]") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
     closeSwitcher();
 
     const other = splitPane("main", "row")!;
@@ -723,8 +729,13 @@ describe("QuickSwitcher search syntax help", () => {
     const input = root.querySelector(".switcher-input") as HTMLInputElement;
     input.value = "Tine";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    await Promise.resolve();
+    // The debounced graph search is what this waits on; assert on the rows it
+    // produces rather than on a fixed delay.
+    await vi.waitFor(() =>
+      expect(
+        root.querySelector('.switcher-row[role="option"] .search-result-excerpt'),
+      ).not.toBeNull(),
+    );
 
     expect(input.getAttribute("role")).toBe("combobox");
     expect(input.getAttribute("aria-controls")).toBe("switcher-results");

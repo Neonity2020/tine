@@ -275,15 +275,15 @@ describe("update checks", () => {
     await update.checkForUpdateNow();
     const offer = toastCalls(pushToastMock).find(([, , options]) => options?.action?.label === "Install update");
     offer?.[2]?.action?.run();
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    expect(diagnosticFrontendEventMock).toHaveBeenCalledWith(
-      "updater_failure",
-      undefined,
-      undefined,
-      undefined,
-      "manifest_fetch",
-      "network",
+    await vi.waitFor(() =>
+      expect(diagnosticFrontendEventMock).toHaveBeenCalledWith(
+        "updater_failure",
+        undefined,
+        undefined,
+        undefined,
+        "manifest_fetch",
+        "network",
+      ),
     );
     const debugCalls = debugLogMock.mock.calls as unknown as Array<[string]>;
     const debugLine = String(debugCalls.at(-1)?.[0] ?? "");

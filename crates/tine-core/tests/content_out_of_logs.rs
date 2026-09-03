@@ -1,3 +1,9 @@
+#[path = "support/production_source.rs"]
+mod production_source;
+
+use production_source::{
+    compiled_source, line_of, production_source_files, relative_path, repo_root,
+};
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,126 +56,14 @@ const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "src-tauri/src/debug.rs", lines: &[347], macro_name: "eprintln", class: "content-free-error", why: "flight-recorder setup failure carries only its I/O error", gate: "always-on reviewed failure" },
 ];
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("tine-core lives at crates/tine-core")
-        .to_path_buf()
-}
-
-fn collect_rs_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if entry.file_type().unwrap().is_dir() {
-            if path
-                .strip_prefix(root)
-                .unwrap()
-                .components()
-                .any(|part| part.as_os_str() == "bin")
-            {
-                continue;
-            }
-            collect_rs_files(root, &path, files);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            files.push(path);
-        }
-    }
-}
-
-fn test_only_include(path: &Path) -> bool {
-    let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    if !file.ends_with("_tests.rs") {
-        return false;
-    }
-    let stem = file.trim_end_matches(".rs");
-    let escaped_file = regex::escape(file);
-    let escaped_stem = regex::escape(stem);
-    let include = Regex::new(&format!(
-        r#"(?m)^#\[cfg\(test\)\]\s*\n(?:#\[path\s*=\s*"{escaped_file}"\]\s*\nmod\s+\w+;|mod\s+{escaped_stem};)"#
-    ))
-    .unwrap();
-    fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
-        let sibling = entry.unwrap().path();
-        sibling != path
-            && sibling
-                .extension()
-                .is_some_and(|extension| extension == "rs")
-            && include.is_match(&fs::read_to_string(sibling).unwrap())
-    })
-}
-
-fn compiled_source(path: &Path) -> String {
-    if test_only_include(path) {
-        return String::new();
-    }
-    let source = fs::read_to_string(path).unwrap();
-    let trailing_tests = Regex::new(r"(?m)^#\[cfg\(test\)\]\s*\nmod\s+tests\s*\{").unwrap();
-    let source = trailing_tests
-        .find(&source)
-        .map_or(source.clone(), |found| source[..found.start()].to_string());
-    erase_cfg_test_regions(source)
-}
-
-fn erase_cfg_test_regions(mut source: String) -> String {
-    let marker = "#[cfg(test)]";
-    let mut search_from = 0;
-    while let Some(relative) = source[search_from..].find(marker) {
-        let start = search_from + relative;
-        let after = start + marker.len();
-        let next_brace = source[after..].find('{').map(|offset| after + offset);
-        let next_semicolon = source[after..].find(';').map(|offset| after + offset);
-        let end = match (next_brace, next_semicolon) {
-            (Some(brace), Some(semicolon)) if semicolon < brace => semicolon + 1,
-            (None, Some(semicolon)) => semicolon + 1,
-            (Some(brace), _) => {
-                let bytes = source.as_bytes();
-                let mut depth = 1_usize;
-                let mut cursor = brace + 1;
-                while cursor < bytes.len() && depth > 0 {
-                    match bytes[cursor] {
-                        b'{' => depth += 1,
-                        b'}' => depth -= 1,
-                        _ => {}
-                    }
-                    cursor += 1;
-                }
-                cursor
-            }
-            (None, None) => source.len(),
-        };
-        let replacement = source.as_bytes()[start..end]
-            .iter()
-            .map(|byte| if *byte == b'\n' { b'\n' } else { b' ' })
-            .collect::<Vec<_>>();
-        source.replace_range(start..end, std::str::from_utf8(&replacement).unwrap());
-        search_from = end;
-    }
-    source
-}
-
 fn print_sites() -> Vec<PrintSite> {
     let root = repo_root();
-    let mut files = Vec::new();
-    for entry in fs::read_dir(root.join("crates")).unwrap() {
-        let source_root = entry.unwrap().path().join("src");
-        if source_root.is_dir() {
-            collect_rs_files(&root, &source_root, &mut files);
-        }
-    }
-    collect_rs_files(&root, &root.join("src-tauri/src"), &mut files);
+    let files = production_source_files();
     let print_macro = Regex::new(r"\b(eprintln|println|dbg)!\s*[({\[]").unwrap();
     let mut sites = Vec::new();
     for file in files {
         let source = compiled_source(&file);
-        let relative = file
-            .strip_prefix(&root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
+        let relative = relative_path(&root, &file);
         for found in print_macro.captures_iter(&source) {
             let whole = found.get(0).unwrap();
             if source[..whole.start()]
@@ -182,11 +76,7 @@ fn print_sites() -> Vec<PrintSite> {
             }
             sites.push(PrintSite {
                 file: relative.clone(),
-                line: source[..whole.start()]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1,
+                line: line_of(&source, whole.start()),
                 macro_name: found[1].to_string(),
             });
         }
