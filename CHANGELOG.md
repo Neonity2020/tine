@@ -8,6 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **The whole left-sidebar row opens its page again, and the right sidebar's
+  spare width is now the drag handle it was meant to be.** v0.6.981 narrowed the
+  wrong pane: it made only the page title clickable in the left sidebar, which
+  turned a page named `test` into a target a few characters wide, and it left
+  untouched the right sidebar, where the reported problem actually was. Both are
+  corrected. In the left sidebar every pixel of a row navigates, including the
+  blank space beside a short name — a deliberate divergence from Logseq, since
+  reordering a favourite is protected by the drag threshold, not by keeping part
+  of the row inert. In the right sidebar the title anchor no longer stretches
+  across the row, so the empty space beside it belongs to the reorder drag and
+  the hand cursor stops following the pointer out over nothing (GH #468,
+  GH #464).
+
 ## [0.6.982] - 2026-09-04
 
 ### Added

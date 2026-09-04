@@ -9668,7 +9668,7 @@
     },
     {
       "id": "UI-SIDEBAR-ROW-LINK-HITBOX-464",
-      "title": "Only the page title in a left-sidebar row navigates; the blank remainder of the row does not, and dragging a favourite by its title reorders it instead of opening it",
+      "title": "In a RIGHT-sidebar item, only the page title is the link; the blank space beside it belongs to the reorder drag",
       "family": "sidebar-navigation",
       "sources": {
         "issues": [
@@ -9680,16 +9680,43 @@
       "platforms": [
         "all"
       ],
-      "layer": "render",
-      "status": "reported",
+      "layer": "browser",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/Sidebar.rowHitbox.test.tsx"
+          "scripts/check-sidebar-row-hitbox.mjs"
         ],
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "User outcome: grabbing a sidebar row to move it does not navigate away, and the empty space to the right of a short page name is not a link. Classification: blocking stateful UX - the reporter lost his place in the graph while reordering, on Windows 10, daily. Root cause: .nav-item/.nav-page painted cursor:pointer across the whole flex row and the click/auxclick handlers lived on the row, so every pixel of it opened a page - including the blank remainder that looks like padding, which is exactly where a drag is grabbed and where a press that falls short of rowReorder's 4px threshold lands. Recent and All-pages rows made it worse: they offer a row-wide link with no drag semantics at all. Fix: the title is its own .nav-page-label element, navigation (click and auxclick) is gated on it in all three lists, the pointer cursor moved to the label, and favourites rows advertise their spare width with grab/grabbing. Context menu deliberately keeps the whole row: it is not navigation and cannot be confused with a drag. The 4px threshold and rowReorder's post-drag click suppression are unchanged - they already worked, and the test proves a title-grabbed drag reorders without navigating. OG provenance: the reporter is right that Logseq makes only the text clickable; the hover highlight still spans the row in both. Evidence at the render layer because what is asserted is which element answers a click and what a drag does to the order, both observable in jsdom; necessity gate: 5 of the 6 assertions fail against pre-fix Sidebar.tsx. Label sizing was checked separately in a real browser (label sized to its text at 80-94px in a 222px row, long names still truncating with an ellipsis, row cursor default and label cursor pointer) - that is presentation and is not a blocking assertion."
+      "notes": "User outcome: dragging a right-sidebar item to reorder it does not open the page instead, and the hand cursor does not follow the pointer out over empty space. Classification: blocking stateful UX - the reporter lost his place while reordering, on Windows 10. SURFACE CORRECTION: the reporter meant the RIGHT sidebar; the v0.6.981 fix changed the LEFT sidebar, which both missed this issue and caused the regression reported as GH #468. Root cause: the markup already made only the anchor a link - navigation lives on <a class=rs-item-title> in RightSidebar.tsx, not on the row - but .rs-item-title carried flex:1 1 auto, so the ANCHOR ELEMENT stretched across the rest of .rs-item-head. Every pixel right of a short title was still the <a>, painting cursor:pointer over the head's own cursor:grab and racing the reorder drag. Fix: flex:0 1 auto so the anchor is sized to its own text (min-width:0 keeps it the element that ellipsises), plus margin-left:auto on .rs-close, which had been relying on the stretched title to push it to the right edge. Evidence at the browser layer because which element sits under a given pixel is CSS layout, which jsdom does not apply; necessity gate: the harness reports a 221px overhang against pre-fix CSS. OG provenance: Logseq makes only the text clickable, and Tine agrees here - the pane where Tine deliberately diverges is the left sidebar, see UI-SIDEBAR-LEFT-ROW-FULL-CLICK-468."
+    },
+    {
+      "id": "UI-SIDEBAR-LEFT-ROW-FULL-CLICK-468",
+      "title": "The whole left-sidebar row opens its page, including the blank space beside a short name",
+      "family": "sidebar-navigation",
+      "sources": {
+        "issues": [
+          468,
+          464
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Sidebar.rowHitbox.test.tsx",
+          "scripts/check-sidebar-row-hitbox.mjs"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: clicking anywhere in a left-sidebar row - favourites, Recent or All pages - opens that page, so a page named 'test' is not a target a few characters wide. Classification: blocking stateful UX; the row-shaped hover highlight promises a row-shaped target, and the reporter hit the gap in normal navigation. Root cause: v0.6.981 gated click and auxclick on a .nav-page-label wrapper (the onLabel helper) for GH #464, and moved cursor:pointer onto that label, so the rest of the row became inert. Fix: the gate is removed in all three lists and cursor:pointer is back on .nav-page; the .nav-page-label span stays, because it is what ellipsises a long name in an overflow:hidden row. Favourites also lose the cursor:grab they carried since GH #211: a row that opens a page on click has to say pointer, and grab said the opposite. INTENTIONAL DIVERGENCE FROM OG (Martin, GH #468 thread): Logseq makes only the text clickable; Tine makes the whole left row clickable because the larger target is worth more than the parity here. It costs the reorder nothing, and that is the load-bearing part: rowReorder's 4px threshold and post-drag click suppression are what separate a reorder from a click, not an un-clickable region, so the same file asserts that a drag grabbed by the blank space reorders WITHOUT navigating. The context menu still takes the whole row. Necessity gate: 4 of the 6 render assertions fail against pre-fix Sidebar.tsx, and the two that pass are exactly the invariants the change had to preserve. The browser harness adds the affordance the render layer cannot see - the row's cursor and that nothing else owns the row's spare pixels."
     },
     {
       "id": "UI-BLOCK-BACKGROUND-BULLET-SPACING-INTERNAL",

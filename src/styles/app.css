@@ -1496,23 +1496,30 @@ textarea {
   text-overflow: ellipsis;
 }
 
-/* GH #464. A sidebar row is far wider than the page name in it, and all of that
-   width used to be the link: the hand cursor followed the pointer out over empty
-   space, and a reorder drag that ended a little short of the 4px threshold
-   navigated instead of moving the row. Only the TITLE is the link now — in the
-   cursor and in the hit test (`onLabel` in Sidebar.tsx) — and the rest of the
-   row belongs to the drag. This is also what Logseq does. `.nav-item` (Journals)
-   is one indivisible row with nothing to reorder, so it keeps the whole-row
-   link. */
+/* GH #468. The whole left-sidebar row is the link, blank remainder included, and
+   the cursor says so across all of it. v0.6.981 briefly narrowed this to the
+   title alone for GH #464 — that is what Logseq does — and it turned a page
+   named `test` into a ~30px target in a 222px row. Tine diverges from OG here on
+   purpose: the larger target is worth more than the parity, and it costs the
+   favourites drag nothing, because rowReorder's 4px threshold and its post-drag
+   click suppression are what separate a reorder from a click. The pane that
+   really did need a title-only link is the RIGHT sidebar — see `.rs-item-title`,
+   which is what GH #464 reported.
+
+   Favourites get `pointer` like every other row, not the `grab` they carried
+   since GH #211. A row that opens a page on click has to say so; `grab` says the
+   opposite, which is the confusion #468 is about. The drag stays discoverable
+   and unchanged — the right sidebar, whose rows reorder but do NOT navigate from
+   their spare width, is where `grab` is the honest cursor. */
 .nav-item,
+.nav-page,
 .nav-page-more {
   cursor: pointer;
 }
 .nav-page-label {
-  cursor: pointer;
-  /* Sized to its own text, so the blank remainder of the row is genuinely blank
-     — but still the element that truncates, since the row is `overflow: hidden`
-     and a flex item will not shrink below its content without `min-width: 0`. */
+  /* Not the link — the row is. This span exists so that a long name is what
+     truncates: the row is `overflow: hidden`, and a flex item will not shrink
+     below its content without `min-width: 0`. */
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1632,12 +1639,6 @@ textarea {
   padding-top: 3px;
   padding-bottom: 3px;
   gap: 4px;
-  /* Favorites are the rows that reorder, so their spare width says so (GH #464).
-     The title inside still shows the link cursor. */
-  cursor: grab;
-}
-#sidebar-favorites-list .nav-page:active {
-  cursor: grabbing;
 }
 /* The insertion line starts where the row WOULD land, so a drop that nests is
    visibly different from one that does not before the pointer is released. A
@@ -9567,9 +9568,6 @@ html.drag-selection-suppressed * {
 .nav-page.row-drop-after {
   box-shadow: inset 0 -2px 0 var(--link-color);
 }
-#sidebar-favorites-list .nav-page {
-  cursor: grab;
-}
 .rs-item.collapsed .rs-item-head {
   border-bottom: 0;
 }
@@ -9587,8 +9585,15 @@ html.drag-selection-suppressed * {
   transform: rotate(90deg);
 }
 
+/* GH #464. The markup already made only this anchor the link, but `flex: 1 1
+   auto` stretched the ELEMENT across the rest of the head, so every pixel right
+   of a short title was still the <a>: the hand cursor followed the pointer out
+   over empty space (the reporter's screenshot), and a press there raced the
+   reorder drag that `.rs-item-head` advertises with `cursor: grab`. Sizing the
+   anchor to its own text hands that space back to the head. `min-width: 0` keeps
+   it the element that ellipsises a long title. */
 .rs-item-title {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   font-weight: 600;
   color: var(--link-color);
@@ -9600,6 +9605,9 @@ html.drag-selection-suppressed * {
 }
 
 .rs-close {
+  /* The title no longer stretches, so the close button needs its own reason to
+     stay at the right edge (GH #464). */
+  margin-left: auto;
   background: none;
   border: none;
   color: var(--text-muted);

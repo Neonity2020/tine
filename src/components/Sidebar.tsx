@@ -199,16 +199,16 @@ export function Sidebar(props: {
   // text-selection AND middle-click autoscroll up front (GH #207 — the old
   // shift-only guard let the middle gesture leak to the browser here).
   const shiftGuard = internalLinkMouseDown;
-  // GH #464: the link is the page TITLE, not the row. A row stretches the full
-  // width of the sidebar, so most of it was blank space that still opened a
-  // page — the hand cursor followed the pointer out over nothing, and a reorder
-  // drag that fell short of the 4px threshold navigated instead of moving the
-  // row. The remainder of the row is grab space now. `closest` rather than
-  // `===`, so the ⭐ prefix and an emoji <img> inside the title still count as
-  // the title. The context menu deliberately stays on the whole row: it is not
-  // navigation, it cannot be confused with a drag, and right-clicking anywhere
-  // on a row to get that page's menu is worth keeping.
-  const onLabel = (e: Event) => !!(e.target as HTMLElement | null)?.closest(".nav-page-label");
+  // GH #468: the WHOLE row navigates, including the blank space beside a short
+  // page name. v0.6.981 briefly gated navigation on the title alone, which is
+  // what Logseq does, and it made a page called `test` a ~30px target in a
+  // 222px row; #468 reported that within days. Tine diverges from OG here
+  // deliberately (Martin, GH #468): a large click target is worth more than the
+  // parity, and it costs the drag nothing — rowReorder's 4px threshold and its
+  // post-drag click suppression already separate a reorder from a click, so a
+  // favourite is moved by moving the pointer, not by aiming at spare width. The
+  // pane that genuinely needed a title-only link was the RIGHT sidebar, which
+  // is what GH #464 actually reported; see `.rs-item-title` in app.css.
   const openRowMenu = (e: MouseEvent, name: string, kind: PageKind) => {
     e.preventDefault();
     openPageContextMenu(e.clientX, e.clientY, name, kind);
@@ -337,7 +337,7 @@ export function Sidebar(props: {
                         onPointerDown={(e) => startFavoriteDrag(i(), e)}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
-                          if (rowReorderClickSuppressed() || !onLabel(e)) return;
+                          if (rowReorderClickSuppressed()) return;
                           const dest = internalLinkDest(e);
                           if (dest === "pane") {
                             // Alt+click (GH #438): the same other-pane route the
@@ -347,10 +347,9 @@ export function Sidebar(props: {
                             openRouteInOtherPane({ kind: "page", name: t.name, pageKind: t.kind });
                           } else openSidebarPageTarget(name, itemKind(name), dest === "sidebar" ? "sidebar" : dest === "background" ? "new-tab" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
                         }}
-                        onAuxClick={(e) => {
-                          if (!onLabel(e)) return;
-                          internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"));
-                        }}
+                        onAuxClick={(e) =>
+                          internalLinkAuxClick(e, () => openSidebarPageTarget(name, itemKind(name), "new-tab"))
+                        }
                         onContextMenu={(e) => {
                           e.preventDefault();
                           openSidebarPageTarget(name, itemKind(name), "context", { x: e.clientX, y: e.clientY });
@@ -360,8 +359,10 @@ export function Sidebar(props: {
                         {/* ⭐ + name via EmojiText: WebKitGTK's Skia COLRv1 path
                             crashes painting a raw color-emoji glyph on hardened
                             libstdc++ (#29); Twemoji <img> never touches the font.
-                            Wrapped in .nav-page-label: that span IS the link, and
-                            everything beside it is grab space (GH #464). */}
+                            `.nav-page-label` is the element that ELLIPSISES a long
+                            name (the row is overflow:hidden and a flex item will
+                            not shrink below its content without min-width:0). It
+                            is not the link — the row is (GH #468). */}
                         <span class="nav-page-label"><EmojiText text={`⭐ ${name}`} /></span>
                       </div>
                     );
@@ -404,17 +405,13 @@ export function Sidebar(props: {
                         classList={{ active: isActive(target().name, target().path) }}
                         onMouseDown={shiftGuard}
                         onClick={(e) => {
-                          if (!onLabel(e)) return;
                           const dest = internalLinkDest(e);
                           if (dest === "sidebar") openPageInSidebar(target());
                           else if (dest === "background") openPageTargetInNewTab(target());
                           else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target() });
                           else { openPageTarget(target()); props.onActiveNavigationComplete?.(); }
                         }}
-                        onAuxClick={(e) => {
-                          if (!onLabel(e)) return;
-                          internalLinkAuxClick(e, () => openPageTargetInNewTab(target()));
-                        }}
+                        onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab(target()))}
                         onContextMenu={(e) => {
                           e.preventDefault();
                           openPageContextMenu(e.clientX, e.clientY, target());
@@ -449,7 +446,6 @@ export function Sidebar(props: {
                   classList={{ active: isActive(p.name, p.path) }}
                   onMouseDown={shiftGuard}
                   onClick={(e) => {
-                    if (!onLabel(e)) return;
                     const dest = internalLinkDest(e);
                     if (dest === "sidebar") openPageInSidebar({ name: p.name, pageKind: "page", path: p.path });
                     else if (dest === "background") p.path
@@ -458,13 +454,12 @@ export function Sidebar(props: {
                     else if (dest === "pane") openRouteInOtherPane({ kind: "page", name: p.name, pageKind: "page", ...(p.path ? { path: p.path } : {}) });
                     else openEntry(p.path, p.name);
                   }}
-                  onAuxClick={(e) => {
-                    if (!onLabel(e)) return;
+                  onAuxClick={(e) =>
                     internalLinkAuxClick(e, () =>
                       p.path
                         ? openInNewTab({ kind: "page", name: p.name, pageKind: "page", path: p.path })
-                        : openPageInNewTab(p.name, "page"));
-                  }}
+                        : openPageInNewTab(p.name, "page"))
+                  }
                   onContextMenu={(e) => {
                     e.preventDefault();
                     openPageContextMenu(e.clientX, e.clientY, { name: p.name, pageKind: "page", path: p.path });
