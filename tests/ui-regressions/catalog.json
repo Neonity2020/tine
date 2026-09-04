@@ -10058,6 +10058,31 @@
         "failBefore": "proven"
       },
       "notes": "User harm: a Query Builder clause menu stayed open after the user clicked away -- the reporter's words, `the menu even stays open after clicking into and editing a different block` -- while the sort popover beside it closed correctly. Root cause is ownership, not the clause menu: `the user pressed outside` had no producer, so each popover answered it or did not. Twelve popovers across the app had hand-rolled a capture listener (drifting between mousedown/pointerdown and document/window) and four had not: QueryBuilder's clause menu and add-filter picker, and the two PdfViewer popups were correct only by accident of where the user clicked. Fixed by one producer, `dismissOnOutsidePointer` in src/transientLayers.ts, alongside the Escape/Back registry that deliberately does not answer this question; the class is now at zero hand-rolled copies and a source-scan guard (I-12) fails on the next one. The popover trigger counts as inside, so its own click still toggles. Also corrected in the same file: `+ sort` re-opened rather than toggled when its trigger was clicked while open, the only one of the four that did not toggle. Two existing tests asserted states that only jsdom could reach (two clause menus open at once; a modal header press leaving a child menu open) and were rewritten to the real-browser outcome. Known adjacent defect NOT fixed here: the operator-node ChipMenu (`op:` keys) is unreachable -- nothing ever sets openMenu to an `op:` key -- so its Unwrap action cannot be invoked."
+    },
+    {
+      "id": "UI-SIDEBAR-EMPTY-PAGE-EDIT-483",
+      "title": "A page with no body can be typed into from the right sidebar without visiting it in the main pane first",
+      "family": "editing-entry",
+      "sources": {
+        "issues": [
+          483
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/RightSidebar.test.tsx::right sidebar page with nothing to type into (GH #483)::offers a caret for a page with no blocks at all",
+          "src/components/RightSidebar.test.tsx::right sidebar page with nothing to type into (GH #483)::offers a caret for a page whose only block is its properties"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User harm: a page created and never opened in the main pane, then opened in the right sidebar, rendered an empty box -- no bullet, no trailing target, nowhere to click. The reporter's own conditional is the proof of the root cause: adding text to the page FIRST made the sidebar editable, because the main pane had run the re-seed on their behalf. Both halves of `always somewhere to type` -- the phantom empty bullet for an empty body and the trailing `+ Add block` -- lived inside PageSection, so every other page surface silently lacked them. Fixed by extracting them into one exported producer, PageTypingTarget in src/components/Page.tsx, used by both PageSection and the sidebar's PageItem; `ensureEmptyBlock` stays the single emptiness authority, so a properties-only page counts as empty on both surfaces without a second predicate. Layer: render tests drive the real RightSidebar over the real store and assert the store node the caret lands in; no same-platform WebKitGTK/Windows E2E was run for this behaviour. NOT addressed here, and raised by the same reporter as a possible separate issue: the sidebar renders a page's `key:: value` header as a raw block rather than the main pane's property table."
     }
   ]
 }

@@ -31,6 +31,7 @@ import { doc, ensurePageLoaded, onPageBecameReplaceable, pageByName, resolveBloc
 import { visibleBody } from "../render/block";
 import { Block, OutlineScopeContext, SurfaceContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
+import { PageTypingTarget } from "./Page";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { endEditForSurface } from "../editorController";
 import { graphBinding } from "../persistence";
@@ -406,6 +407,10 @@ function PageItem(props: {
         <Show when={page()} fallback={<div id={bodyId} class="rs-item-body rs-item-loading" />}>
           <div id={bodyId} class="rs-item-body">
             <For each={page()!.roots}>{(id) => <Block id={id} />}</For>
+            {/* The same producer the main pane uses: a page opened only here still
+                gets its phantom empty bullet and a trailing target, so a page with
+                no body is editable without visiting it first (GH #483). */}
+            <PageTypingTarget page={page} surface={props.surfaceKey} />
             {/* OG shows a page's Linked/Unlinked References in the sidebar view too,
                 not just the main pane. Same lazy components, so this stays cheap. */}
             <LinkedReferences name={props.item.name} />
