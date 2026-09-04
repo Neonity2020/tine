@@ -10083,6 +10083,31 @@
         "failBefore": "proven"
       },
       "notes": "User harm: a page created and never opened in the main pane, then opened in the right sidebar, rendered an empty box -- no bullet, no trailing target, nowhere to click. The reporter's own conditional is the proof of the root cause: adding text to the page FIRST made the sidebar editable, because the main pane had run the re-seed on their behalf. Both halves of `always somewhere to type` -- the phantom empty bullet for an empty body and the trailing `+ Add block` -- lived inside PageSection, so every other page surface silently lacked them. Fixed by extracting them into one exported producer, PageTypingTarget in src/components/Page.tsx, used by both PageSection and the sidebar's PageItem; `ensureEmptyBlock` stays the single emptiness authority, so a properties-only page counts as empty on both surfaces without a second predicate. Layer: render tests drive the real RightSidebar over the real store and assert the store node the caret lands in; no same-platform WebKitGTK/Windows E2E was run for this behaviour. NOT addressed here, and raised by the same reporter as a possible separate issue: the sidebar renders a page's `key:: value` header as a raw block rather than the main pane's property table."
+    },
+    {
+      "id": "UI-REFERENCE-HEADER-COPY-ALIGN-475",
+      "title": "The Linked and Unlinked References copy buttons sit on the same right edge",
+      "family": "reference-sections",
+      "sources": {
+        "issues": [
+          475
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/LinkedReferences.test.tsx::Linked References header control order (GH #475)::renders the copy button last, on the same edge as Unlinked References",
+          "scripts/shot-reference-header-align.mjs"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User harm: the copy button floated in the middle of the Linked References row while the Unlinked one sat at the right edge, so two near-identical sections read as different controls. Root cause is a flexbox rule, not a value to tune: `.reference-export-toggle` and `.reference-filter-toggle` each claimed `margin-left: auto`, and two auto margins SPLIT the free space between them rather than one absorbing it. Unlinked References has no filter button, so its copy button kept the whole gap and landed at the edge. Fixed by giving the header one owner of that push -- the first trailing button takes the free space, the rest sit on the row gap -- and by rendering copy last in Linked References so it lands on the same edge as the section that has copy alone. Measured in a real engine (headless Chromium over the built app), not modelled: before, the two right edges were 766px and 1030px in a 1100px viewport; after, both are 1030px. jsdom applies no layout, so the render test pins only the DOM order that the CSS rule depends on."
     }
   ]
 }

@@ -372,18 +372,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
             </svg>
           </span>
           Linked References <span class="references-count">{count()}</span>
-          <button
-            type="button"
-            class="reference-export-toggle"
-            aria-label="Copy / export linked references"
-            title="Copy / export selected linked references"
-            onClick={(event) => {
-              event.stopPropagation();
-              setExportChooserOpen(true);
-            }}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
-          </button>
+          {/* Copy is rendered LAST so it lands on the same right edge as the
+              Unlinked References copy button, which has no filter beside it
+              (GH #475). Do not reorder without checking that section too. */}
           <button
             type="button"
             class="reference-filter-toggle"
@@ -397,6 +388,18 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
             }}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.2 7.1v5.4l-3.6 1.8v-7.2z" /></svg>
+          </button>
+          <button
+            type="button"
+            class="reference-export-toggle"
+            aria-label="Copy / export linked references"
+            title="Copy / export selected linked references"
+            onClick={(event) => {
+              event.stopPropagation();
+              setExportChooserOpen(true);
+            }}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z" fill="currentColor" /></svg>
           </button>
         </div>
         <Show when={!collapsed()}>

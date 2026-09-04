@@ -600,3 +600,29 @@ describe("Linked References filter summary is honest while indexing (GH #173)", 
     dispose();
   });
 });
+
+// GH #475. The copy button sits at the section's right edge, which in a flex row
+// means being the LAST control: Unlinked References has copy alone there, so
+// Linked References must not put its filter after it. This is the ordering half
+// of the fix; the layout itself is measured in a real engine by
+// scripts/shot-reference-header-align.mjs, since jsdom applies no layout.
+describe("Linked References header control order (GH #475)", () => {
+  it("renders the copy button last, on the same edge as Unlinked References", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([
+      { page: "Source", kind: "page", blocks: [block("b1", "[[Target]] one")] },
+    ] as RefGroup[]);
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    try {
+      await vi.waitFor(() => {
+        expect(root.querySelector(".references-header .reference-export-toggle")).not.toBeNull();
+      });
+      const controls = [...root.querySelectorAll<HTMLButtonElement>(".references-header > button")]
+        .map((button) => button.className.split(" ")[0]);
+      expect(controls).toEqual(["reference-filter-toggle", "reference-export-toggle"]);
+    } finally {
+      dispose();
+    }
+  });
+});

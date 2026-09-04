@@ -2150,11 +2150,11 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
 }
 
 /* Reference batch export: header affordance (GH #348), mirrored on the
-   filter toggle. */
+   filter toggle. Pushing to the right edge is owned by the header rule near
+   `.references-header`, NOT by either button — see GH #475. */
 .reference-export-toggle {
   width: 26px;
   height: 26px;
-  margin-left: auto;
   padding: 5px;
   border: 0;
   border-radius: 5px;
@@ -8118,10 +8118,23 @@ img.emoji {
   user-select: none;
 }
 
+/* One owner for "push this header's trailing controls to the right": the FIRST
+   of them takes the free space and the rest sit beside it on the row's gap.
+   Two siblings each claiming `margin-left: auto` SPLIT the free space between
+   them, which is what left the Linked References copy button floating in the
+   middle of its row while the Unlinked one sat at the edge (GH #475). Copy is
+   rendered last in both sections, so it lands at the same edge in both. */
+.references-header > button {
+  margin-left: 0;
+}
+
+.references-header > button:first-of-type {
+  margin-left: auto;
+}
+
 .reference-filter-toggle {
   width: 26px;
   height: 26px;
-  margin-left: auto;
   padding: 5px;
   border: 0;
   border-radius: 5px;
