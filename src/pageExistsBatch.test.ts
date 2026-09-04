@@ -4,6 +4,7 @@ let existing: string[] = [];
 const calls: string[][] = [];
 let epoch = 1;
 let inventory = 0;
+let aliases = 0;
 let queuedResponses: Promise<string[]>[] = [];
 
 vi.mock("./backend", () => ({
@@ -16,7 +17,11 @@ vi.mock("./backend", () => ({
     },
   }),
 }));
-vi.mock("./ui", () => ({ graphEpoch: () => epoch, pageInventoryRev: () => inventory }));
+vi.mock("./ui", () => ({
+  graphEpoch: () => epoch,
+  pageInventoryRev: () => inventory,
+  aliasRev: () => aliases,
+}));
 
 const { pageIsMissing, resetPageExistsBatch } = await import("./pageExistsBatch");
 
@@ -28,6 +33,7 @@ describe("pageExistsBatch", () => {
     existing = [];
     epoch = 1;
     inventory = 0;
+    aliases = 0;
     queuedResponses = [];
     resetPageExistsBatch();
   });
@@ -146,6 +152,60 @@ describe("pageExistsBatch", () => {
       await settle();
       expect(pageIsMissing("Racing Target")).toBe(false);
       expect(calls).toEqual([["Racing Target"], ["Racing Target"]]);
+    });
+  });
+
+  describe("GH #484: alias changes invalidate batched answers", () => {
+    // `existing_page_names` answers over page names UNION alias names, so an
+    // alias edit changes the answer without touching the physical page
+    // inventory: adding `alias:: page1` to page2 creates and deletes no file.
+    // Keying the cache on the inventory alone therefore left every `[[page1]]`
+    // painted as a dead link until the next restart.
+    it("restyles a reference the moment its name becomes an alias (missing → existing)", async () => {
+      pageIsMissing("page1");
+      await settle();
+      expect(pageIsMissing("page1")).toBe(true);
+
+      // The user adds `alias:: page1` to page2. No file is created or removed,
+      // so the page inventory does NOT move — only the alias map does.
+      aliases++;
+      existing = ["page1"];
+      pageIsMissing("page1");
+      await settle();
+
+      expect(pageIsMissing("page1")).toBe(false);
+      expect(calls).toEqual([["page1"], ["page1"]]);
+    });
+
+    it("does not leave a stale positive result after an alias is removed", async () => {
+      existing = ["page1"];
+      pageIsMissing("page1");
+      await settle();
+      expect(pageIsMissing("page1")).toBe(false);
+
+      aliases++;
+      existing = [];
+      pageIsMissing("page1");
+      await settle();
+
+      expect(pageIsMissing("page1")).toBe(true);
+      expect(calls).toEqual([["page1"], ["page1"]]);
+    });
+
+    it("keeps one name asked once per (graph × inventory × alias) state", async () => {
+      existing = ["A"];
+      pageIsMissing("A");
+      await settle();
+      pageIsMissing("A");
+      await settle();
+      expect(calls).toEqual([["A"]]);
+
+      aliases++;
+      pageIsMissing("A");
+      await settle();
+      pageIsMissing("A");
+      await settle();
+      expect(calls).toEqual([["A"], ["A"]]);
     });
   });
 });

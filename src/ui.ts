@@ -1010,6 +1010,16 @@ export const [pageInventoryRev, setPageInventoryRev] = createSignal(0);
 export function bumpPageInventoryRev() {
   setPageInventoryRev((n) => n + 1);
 }
+// Which names RESOLVE to a page, as opposed to which pages exist on disk.
+// `existing_page_names` answers over page names UNION alias names, so adding or
+// removing an `alias::` changes that answer while creating and deleting no file
+// — `pageInventoryRev` never moves for it (GH #484). Anything caching a
+// name-resolves-to-a-page answer keys on BOTH revisions. Bumped only when the
+// alias map actually changes, so an ordinary keystroke save costs nothing.
+export const [aliasRev, setAliasRev] = createSignal(0);
+export function bumpAliasRev() {
+  setAliasRev((n) => n + 1);
+}
 export function toggleTheme() {
   // Manual flip between light and dark — leaves System mode if it was active,
   // picking the opposite of the currently resolved theme (GH #193).

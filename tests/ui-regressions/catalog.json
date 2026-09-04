@@ -8917,7 +8917,7 @@
         "scenario": "diagnostics.clean-quit-marker",
         "failBefore": "proven"
       },
-      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after. Retrofitted to GH #426 on 2026-08-31: this internal find and the Linux/Windows half of that public report are the same defect, and the reporter's own diagnostics attachment (v0.6.98, build 94579a0, which predates the fix) confirms it \u2014 its previous session records runtime.started and 26 later events but no runtime.clean_shutdown. The mobile half of #426 is a different orderly-end question and is UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426."
+      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after. Retrofitted to GH #426 on 2026-08-31: this internal find and the Linux/Windows half of that public report are the same defect, and the reporter's own diagnostics attachment (v0.6.98, build 94579a0, which predates the fix) confirms it — its previous session records runtime.started and 26 later events but no runtime.clean_shutdown. The mobile half of #426 is a different orderly-end question and is UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426."
     },
     {
       "id": "UI-SETTINGS-SECTION-SWITCH-FLICKER-409",
@@ -8942,7 +8942,7 @@
         "scenario": "settings.section-switch-keeps-the-dialog",
         "failBefore": "proven"
       },
-      "notes": "User outcome: choosing a section inside Settings changes the pane, and the dialog, its section list and the search box stay where they are. Classification: blocking stateful UX. Root cause: Settings is lazy() and mounted under a FALLBACK-LESS <Suspense> in App.tsx, so any panel that starts loading a resource as it mounts suspended the whole dialog and Solid removed it from the document until the load settled \u2014 the user saw Settings vanish and come back. The three sections the reporter names are exactly the three whose panels load on mount: Journals (the template list), Backups & recovery (the journal-filename inventory) and Graph (the home-page picker, confirmed by removing HomePageField and watching the Graph case go green). Sections with nothing to load never flickered, which is why the report names only those three. Fix: a <Suspense> inside settings-pane-body, so a section that loads shows a blank pane for that moment instead of taking the dialog with it; the modal has a fixed height, so nothing resizes. Fixed at the boundary rather than at each of the three panels so a fourth loading panel cannot reintroduce it. The regression reproduces the App.tsx wrapper deliberately \u2014 rendering Settings bare hides the defect entirely \u2014 and asserts synchronously after the click, because the flash is one frame wide and a settled assertion cannot see it."
+      "notes": "User outcome: choosing a section inside Settings changes the pane, and the dialog, its section list and the search box stay where they are. Classification: blocking stateful UX. Root cause: Settings is lazy() and mounted under a FALLBACK-LESS <Suspense> in App.tsx, so any panel that starts loading a resource as it mounts suspended the whole dialog and Solid removed it from the document until the load settled — the user saw Settings vanish and come back. The three sections the reporter names are exactly the three whose panels load on mount: Journals (the template list), Backups & recovery (the journal-filename inventory) and Graph (the home-page picker, confirmed by removing HomePageField and watching the Graph case go green). Sections with nothing to load never flickered, which is why the report names only those three. Fix: a <Suspense> inside settings-pane-body, so a section that loads shows a blank pane for that moment instead of taking the dialog with it; the modal has a fixed height, so nothing resizes. Fixed at the boundary rather than at each of the three panels so a fourth loading panel cannot reintroduce it. The regression reproduces the App.tsx wrapper deliberately — rendering Settings bare hides the defect entirely — and asserts synchronously after the click, because the flash is one frame wide and a settled assertion cannot see it."
     },
     {
       "id": "UI-SETTINGS-MAXIMIZE-PERSISTS-427",
@@ -8968,7 +8968,7 @@
         "scenario": "settings.maximize-is-remembered",
         "failBefore": "proven"
       },
-      "notes": "User outcome: someone who maximizes Settings finds it maximized the next time they open it, and after restarting Tine; someone who restores it finds it small. Classification: blocking stateful UX (a preference the user re-enters several times a day). GH #287 shipped the control as deliberately transient and #427 asked for the opposite on the reporter's case: 'I never want the small version \u2014 having to press the control on every open is a small tax paid several times a day.' The state moved out of the dialog into src/settingsLayout.ts, because Settings is lazy() and unmounts on close, and is persisted through the same device-local app_bool store the other remembered preferences use. Hydrated at startup rather than at dialog mount, so a remembered wide dialog opens wide instead of opening small and snapping. Default is unchanged (small) for anyone who never presses the control. #287's 'does not persist across modal close/reopen' assertion was the old contract and is replaced, not grandfathered; both directions of the store round trip are asserted, since either half alone would look right while the setting evaporated on restart."
+      "notes": "User outcome: someone who maximizes Settings finds it maximized the next time they open it, and after restarting Tine; someone who restores it finds it small. Classification: blocking stateful UX (a preference the user re-enters several times a day). GH #287 shipped the control as deliberately transient and #427 asked for the opposite on the reporter's case: 'I never want the small version — having to press the control on every open is a small tax paid several times a day.' The state moved out of the dialog into src/settingsLayout.ts, because Settings is lazy() and unmounts on close, and is persisted through the same device-local app_bool store the other remembered preferences use. Hydrated at startup rather than at dialog mount, so a remembered wide dialog opens wide instead of opening small and snapping. Default is unchanged (small) for anyone who never presses the control. #287's 'does not persist across modal close/reopen' assertion was the old contract and is replaced, not grandfathered; both directions of the store round trip are asserted, since either half alone would look right while the setting evaporated on restart."
     },
     {
       "id": "UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426",
@@ -8995,7 +8995,7 @@
         "scenario": "diagnostics.mobile-background-session-end",
         "failBefore": "proven"
       },
-      "notes": "User outcome: backgrounding Tine on a phone or tablet and coming back later does not greet the user with 'Tine did not close cleanly last time'. Classification: blocking stateful UX (a permanent false alarm that trains users to ignore a real crash notice). Root cause: the flight recorder's session-active marker is removed at the one orderly end the app knew about, the desktop event loop's RunEvent::Exit. iOS and Android have no such moment \u2014 the OS suspends a backgrounded app and reaps it later without notice \u2014 so the marker always survived and EVERY launch warned. The reporter said exactly that: 'It does happen every time in iOS/iPadOS. The OS kills the app when in background so I am having this issue all the time.' Fix: on mobile the recorded session follows webview visibility, ending when the app is hidden and restarting when the user returns, so a crash they witness is still reported and a reap they never see is not. Desktop is deliberately excluded, because a minimised window is still a live session and honouring visibility there would hide exactly the background crashes the recorder exists to catch; that exclusion is asserted on both sides (src/sessionActivity.test.ts 'never ends a desktop session on visibility', and the cfg gate pinned by debug.rs 'visibility_ends_a_session_only_where_the_os_reaps_backgrounded_apps'). Fail-before is causal: making the marker removal a no-op turns debug.rs 'a_session_the_os_reaps_after_backgrounding_is_not_reported_unclean' red while its companion 'a_session_that_dies_after_coming_back_is_still_reported_unclean' stays green. EVIDENCE LIMIT: no iOS or Android runtime was available, so the recorder contract and the platform gating are proven at unit layer on Linux and the on-device toast is not; confidence stays moderate. One further warning is expected on the first launch after upgrading, from the marker the previous build left behind."
+      "notes": "User outcome: backgrounding Tine on a phone or tablet and coming back later does not greet the user with 'Tine did not close cleanly last time'. Classification: blocking stateful UX (a permanent false alarm that trains users to ignore a real crash notice). Root cause: the flight recorder's session-active marker is removed at the one orderly end the app knew about, the desktop event loop's RunEvent::Exit. iOS and Android have no such moment — the OS suspends a backgrounded app and reaps it later without notice — so the marker always survived and EVERY launch warned. The reporter said exactly that: 'It does happen every time in iOS/iPadOS. The OS kills the app when in background so I am having this issue all the time.' Fix: on mobile the recorded session follows webview visibility, ending when the app is hidden and restarting when the user returns, so a crash they witness is still reported and a reap they never see is not. Desktop is deliberately excluded, because a minimised window is still a live session and honouring visibility there would hide exactly the background crashes the recorder exists to catch; that exclusion is asserted on both sides (src/sessionActivity.test.ts 'never ends a desktop session on visibility', and the cfg gate pinned by debug.rs 'visibility_ends_a_session_only_where_the_os_reaps_backgrounded_apps'). Fail-before is causal: making the marker removal a no-op turns debug.rs 'a_session_the_os_reaps_after_backgrounding_is_not_reported_unclean' red while its companion 'a_session_that_dies_after_coming_back_is_still_reported_unclean' stays green. EVIDENCE LIMIT: no iOS or Android runtime was available, so the recorder contract and the platform gating are proven at unit layer on Linux and the on-device toast is not; confidence stays moderate. One further warning is expected on the first launch after upgrading, from the marker the previous build left behind."
     },
     {
       "id": "UI-ABSENCE-RESTORE-PANEL-AUTOCLOSE-INTERNAL",
@@ -9474,7 +9474,7 @@
         "scenario": "outline-controls.fold-all-guide-hitbox",
         "failBefore": "proven"
       },
-      "notes": "User outcome: aiming at a block's fold arrow folds that one block, never the whole subtree. Classification: blocking stateful UX. Root cause: the children guide (the vertical line that folds EVERY descendant) is position:absolute z-index:1 with left:-9px width:14px, while the child row's 18px fold arrow begins at the children container's left edge \u2014 so the guide was painted over the arrow's leftmost 5px and answered clicks there. The reporter, three weeks into daily use, kept hitting it; aim cannot adapt to a control that is invisibly on top of another. Fix: the guide is now 5px wide, centred within 0.5px on the 1px line it draws, and stops exactly at the arrow's edge, so the arrow keeps all 18 of its pixels. OG provenance: og-1.0.0 components/block.css .block-children-left-border is 4px wide at left:-1px, i.e. it hugs its line and overlaps nothing; the reporter's 'hitbox is smaller' is accurate. The reported 'right-skewed' is not literally true \u2014 the old box was centred on the line to within 0.5px \u2014 but the harm was real and is what the fix targets. Fail-before is quantitative: restoring left:-9px/width:14px makes the guard report the guide covering exactly 5px of the per-block controls at x=29..33. jsdom applies no CSS layout, so a headless-Chromium geometry guard is the only layer that can see this; scripts/check-outline-guide-hitbox.mjs asserts the user-visible contract (covers no pixel of the neighbouring controls, centred on its own line, no larger than the per-block control) rather than the constants."
+      "notes": "User outcome: aiming at a block's fold arrow folds that one block, never the whole subtree. Classification: blocking stateful UX. Root cause: the children guide (the vertical line that folds EVERY descendant) is position:absolute z-index:1 with left:-9px width:14px, while the child row's 18px fold arrow begins at the children container's left edge — so the guide was painted over the arrow's leftmost 5px and answered clicks there. The reporter, three weeks into daily use, kept hitting it; aim cannot adapt to a control that is invisibly on top of another. Fix: the guide is now 5px wide, centred within 0.5px on the 1px line it draws, and stops exactly at the arrow's edge, so the arrow keeps all 18 of its pixels. OG provenance: og-1.0.0 components/block.css .block-children-left-border is 4px wide at left:-1px, i.e. it hugs its line and overlaps nothing; the reporter's 'hitbox is smaller' is accurate. The reported 'right-skewed' is not literally true — the old box was centred on the line to within 0.5px — but the harm was real and is what the fix targets. Fail-before is quantitative: restoring left:-9px/width:14px makes the guard report the guide covering exactly 5px of the per-block controls at x=29..33. jsdom applies no CSS layout, so a headless-Chromium geometry guard is the only layer that can see this; scripts/check-outline-guide-hitbox.mjs asserts the user-visible contract (covers no pixel of the neighbouring controls, centred on its own line, no larger than the per-block control) rather than the constants."
     },
     {
       "id": "UI-SIDEBAR-RESIZER-COVERS-SCROLLBAR-435",
@@ -9501,7 +9501,7 @@
         "scenario": "app-shell.sidebar-resizer-and-scrollbar-columns",
         "failBefore": "proven"
       },
-      "notes": "User outcome: the left sidebar's scrollbar can be grabbed and dragged with the mouse. Classification: blocking core operation (the surface is scrollable but its scrollbar is unreachable). Root cause: .sidebar-resizer is position:absolute right:0 width:7px z-index:20 inside .left-sidebar, and .left-sidebar-scroll fills that same box \u2014 so on any platform whose scrollbar consumes layout width (Windows/WebView2 is the reported one) the drag strip was painted over the outer 7px of a 10px scrollbar. Resizing worked; scrolling by mouse did not, which is exactly what two Windows reporters described. Fix: .left-sidebar-scroll reserves a transparent right border of --sidebar-resizer-width, the same token the strip's width now uses, so the scrollbar column and the drag column are disjoint and moving a few pixels left off the strip reaches the bar, as the reporter asked. The border is transparent so the sidebar background is unchanged; the mobile drawer, where the strip is hidden, sets the border back to 0 and keeps its full width. Siblings reviewed: .rs-resizer sits at the RIGHT sidebar's LEFT edge while that pane scrolls on its right, and the main pane's scrollbar ends where the right sidebar begins, so neither pair overlaps \u2014 the left sidebar was the only conflicting pair. The frameless-window .grip-e strip does overlay the rightmost 4px of whatever pane touches the window edge, but that is the ordinary window-edge resize zone every frameless app has, not this defect. Fail-before is quantitative: removing the gutter makes the guard report the strip covering 7.0px of the 10px scrollbar. EVIDENCE LIMIT: no Windows runtime was available. jsdom applies no CSS layout and this headless Chromium always draws overlay scrollbars, so scripts/check-sidebar-resizer-scrollbar.mjs reproduces the Windows condition with scrollbar-gutter:stable in the fixture; the column geometry is proven, the WebView2 bar itself is not, so confidence stays moderate."
+      "notes": "User outcome: the left sidebar's scrollbar can be grabbed and dragged with the mouse. Classification: blocking core operation (the surface is scrollable but its scrollbar is unreachable). Root cause: .sidebar-resizer is position:absolute right:0 width:7px z-index:20 inside .left-sidebar, and .left-sidebar-scroll fills that same box — so on any platform whose scrollbar consumes layout width (Windows/WebView2 is the reported one) the drag strip was painted over the outer 7px of a 10px scrollbar. Resizing worked; scrolling by mouse did not, which is exactly what two Windows reporters described. Fix: .left-sidebar-scroll reserves a transparent right border of --sidebar-resizer-width, the same token the strip's width now uses, so the scrollbar column and the drag column are disjoint and moving a few pixels left off the strip reaches the bar, as the reporter asked. The border is transparent so the sidebar background is unchanged; the mobile drawer, where the strip is hidden, sets the border back to 0 and keeps its full width. Siblings reviewed: .rs-resizer sits at the RIGHT sidebar's LEFT edge while that pane scrolls on its right, and the main pane's scrollbar ends where the right sidebar begins, so neither pair overlaps — the left sidebar was the only conflicting pair. The frameless-window .grip-e strip does overlay the rightmost 4px of whatever pane touches the window edge, but that is the ordinary window-edge resize zone every frameless app has, not this defect. Fail-before is quantitative: removing the gutter makes the guard report the strip covering 7.0px of the 10px scrollbar. EVIDENCE LIMIT: no Windows runtime was available. jsdom applies no CSS layout and this headless Chromium always draws overlay scrollbars, so scripts/check-sidebar-resizer-scrollbar.mjs reproduces the Windows condition with scrollbar-gutter:stable in the fixture; the column geometry is proven, the WebView2 bar itself is not, so confidence stays moderate."
     },
     {
       "id": "UI-CLICK-PAST-END-TRAILING-MARKUP-465",
@@ -9530,7 +9530,7 @@
         "scenario": "click-caret.past-end-of-block-with-trailing-markup",
         "failBefore": "proven"
       },
-      "notes": "User outcome: clicking in the empty space to the right of a block's last line puts the caret at the end of what the editor will show, so Enter starts the next block instead of splitting the construct. Classification: blocking stateful UX (the caret is one byte short, inside markup the reader cannot see). Root cause: the click was answered by the span map, which for a trailing construct like *italics* legitimately maps the end of the visible text to the source byte BEFORE the invisible closing delimiter \u2014 a valid interior offset, so the existing 'mapping failed' fallback never ran. Proven at the mapping layer: for `*some text in italics.*` the end of the rendered text maps to 22, one short of the 23-character source. Fix: recognise the click by WHERE it landed, not what it landed on \u2014 beyondFinalGlyph() in src/render/spans.ts asks whether the point lies past the rightmost glyph of the bottom-most line band, and Block.tsx consults it before the span map, returning the end of the editor's VISIBLE value (not raw.length, which counts hidden property lines). Deliberately geometric rather than per-syntax: a rule keyed on emphasis would have to be repeated for bold, inline code, strikethrough and the Org forms, and a rule that snapped any span-end to the construct end would break precise clicks inside formatted text. Siblings preserved: a precise interior click still maps exactly (asserted for the italic body), a click past an EARLIER wrapped line still lands at that line's end rather than the block's, and the trailing-link behaviour of GH #34 is unchanged because there the editable end and the span end coincide. Real-app proof drives WebKitGTK pointer clicks at computed run-out coordinates for three trailing constructs (emphasis, strong, inline code); fail-before was reproduced by running the same extended journey against the pre-fix release binary. The geometric probe declines where the environment has no layout engine: jsdom does not implement Range.getClientRects, and calling it there threw out of the click handler and disabled the whole rendered-block edit gesture until guarded (pinned in src/render/clickSpans.test.tsx). It also measures only the IN-FLOW content: a float is drawn hard against the block's right edge, and one TALLER than the line it rides owns the bottom band, so a single range over the whole block answered \"where does the text end?\" with the full content width and the past-the-end caret was dead in that block. The live case is `{{img \u2026 right}}` \u2014 measured in the running app at wrapper right 1080 / bottom 545.2 against text right 665.5 / bottom 542.2, fail-before caret 85 of 86 and pass-after 86, asserted by scripts/e2e-clickcaret-repro.mjs block 11. Out-of-flow children are skipped recursively because that wrapper sits inside the inline tree. The reference-count badge floats too but is shorter than the line and never defined the bottom band: it is the control in the same scenario (block 9), after a synthetic fixture wrongly indicated otherwise."
+      "notes": "User outcome: clicking in the empty space to the right of a block's last line puts the caret at the end of what the editor will show, so Enter starts the next block instead of splitting the construct. Classification: blocking stateful UX (the caret is one byte short, inside markup the reader cannot see). Root cause: the click was answered by the span map, which for a trailing construct like *italics* legitimately maps the end of the visible text to the source byte BEFORE the invisible closing delimiter — a valid interior offset, so the existing 'mapping failed' fallback never ran. Proven at the mapping layer: for `*some text in italics.*` the end of the rendered text maps to 22, one short of the 23-character source. Fix: recognise the click by WHERE it landed, not what it landed on — beyondFinalGlyph() in src/render/spans.ts asks whether the point lies past the rightmost glyph of the bottom-most line band, and Block.tsx consults it before the span map, returning the end of the editor's VISIBLE value (not raw.length, which counts hidden property lines). Deliberately geometric rather than per-syntax: a rule keyed on emphasis would have to be repeated for bold, inline code, strikethrough and the Org forms, and a rule that snapped any span-end to the construct end would break precise clicks inside formatted text. Siblings preserved: a precise interior click still maps exactly (asserted for the italic body), a click past an EARLIER wrapped line still lands at that line's end rather than the block's, and the trailing-link behaviour of GH #34 is unchanged because there the editable end and the span end coincide. Real-app proof drives WebKitGTK pointer clicks at computed run-out coordinates for three trailing constructs (emphasis, strong, inline code); fail-before was reproduced by running the same extended journey against the pre-fix release binary. The geometric probe declines where the environment has no layout engine: jsdom does not implement Range.getClientRects, and calling it there threw out of the click handler and disabled the whole rendered-block edit gesture until guarded (pinned in src/render/clickSpans.test.tsx). It also measures only the IN-FLOW content: a float is drawn hard against the block's right edge, and one TALLER than the line it rides owns the bottom band, so a single range over the whole block answered \"where does the text end?\" with the full content width and the past-the-end caret was dead in that block. The live case is `{{img … right}}` — measured in the running app at wrapper right 1080 / bottom 545.2 against text right 665.5 / bottom 542.2, fail-before caret 85 of 86 and pass-after 86, asserted by scripts/e2e-clickcaret-repro.mjs block 11. Out-of-flow children are skipped recursively because that wrapper sits inside the inline tree. The reference-count badge floats too but is shorter than the line and never defined the bottom band: it is the control in the same scenario (block 9), after a synthetic fixture wrongly indicated otherwise."
     },
     {
       "id": "UI-BULLET-MODIFIED-CLICK-456",
@@ -9558,7 +9558,7 @@
         "scenario": "navigation.bullet-modified-click",
         "failBefore": "proven"
       },
-      "notes": "User outcome: a modifier held over a bullet sends the block where the same modifier sends a [[page ref]] \u2014 Ctrl/Cmd or middle-click to a background tab, Alt to the other pane, Shift to the right sidebar \u2014 instead of silently zooming in place. Classification: blocking stateful UX (the gesture is learned from links and the app answered it differently in one place). Root cause: the bullet's own handler tested `e.shiftKey` alone rather than the shared decision in src/linkGesture.ts, so every other modifier fell through to the plain zoom. Sibling swept in the same change: the read-only reference bullet in RefBlocks.tsx (linked references, query results, embeds) had the identical Shift-only handler. Both bullets also ran their own onMouseDown and skipped GH #207's other half, so shift-range text selection and middle-button autoscroll / PRIMARY-paste were never suppressed there; they now go through internalLinkMouseDown, asserted in both files. Not covered here: the ref-count badge and the query workspace's result rows, which are separate surfaces that ignore all modifiers today \u2014 recorded as follow-ups, not part of this row. Fail-before: with the handlers reverted, the Ctrl and Alt assertions fail in both files while the Shift and plain-click controls pass."
+      "notes": "User outcome: a modifier held over a bullet sends the block where the same modifier sends a [[page ref]] — Ctrl/Cmd or middle-click to a background tab, Alt to the other pane, Shift to the right sidebar — instead of silently zooming in place. Classification: blocking stateful UX (the gesture is learned from links and the app answered it differently in one place). Root cause: the bullet's own handler tested `e.shiftKey` alone rather than the shared decision in src/linkGesture.ts, so every other modifier fell through to the plain zoom. Sibling swept in the same change: the read-only reference bullet in RefBlocks.tsx (linked references, query results, embeds) had the identical Shift-only handler. Both bullets also ran their own onMouseDown and skipped GH #207's other half, so shift-range text selection and middle-button autoscroll / PRIMARY-paste were never suppressed there; they now go through internalLinkMouseDown, asserted in both files. Not covered here: the ref-count badge and the query workspace's result rows, which are separate surfaces that ignore all modifiers today — recorded as follow-ups, not part of this row. Fail-before: with the handlers reverted, the Ctrl and Alt assertions fail in both files while the Shift and plain-click controls pass."
     },
     {
       "id": "UI-ALT-SHORTCUT-WHILE-EDITING-461",
@@ -9585,7 +9585,7 @@
         "scenario": "keybindings.alt-only-chord-while-editing",
         "failBefore": "proven"
       },
-      "notes": "User outcome: a shortcut the user bound to a bare Alt chord (the reporter's Alt+S for the next tab) fires with the caret in a block, the same as it does everywhere else in the app. Classification: blocking core operation (the binding is configured and simply does not run in the place the user spends most of their time). Root cause: the global dispatcher's while-typing guard admitted only `mod`/`ctrl` chords, so Ctrl+Alt+S worked and Alt+S did not. Alt now counts as a modifier there. Only `scope: \"global\"` commands with a `run` are matched by that dispatcher, so the block editor's own bare-Alt bindings (alt+f/alt+b/alt+w/alt+d/alt+u/alt+k/alt+l) are untouched, and an Alt chord nothing is bound to still reaches the textarea unprevented \u2014 asserted directly, because on macOS that event is an Option-composed character. Fail-before: with the guard reverted the Alt+S assertion fails while both control assertions pass."
+      "notes": "User outcome: a shortcut the user bound to a bare Alt chord (the reporter's Alt+S for the next tab) fires with the caret in a block, the same as it does everywhere else in the app. Classification: blocking core operation (the binding is configured and simply does not run in the place the user spends most of their time). Root cause: the global dispatcher's while-typing guard admitted only `mod`/`ctrl` chords, so Ctrl+Alt+S worked and Alt+S did not. Alt now counts as a modifier there. Only `scope: \"global\"` commands with a `run` are matched by that dispatcher, so the block editor's own bare-Alt bindings (alt+f/alt+b/alt+w/alt+d/alt+u/alt+k/alt+l) are untouched, and an Alt chord nothing is bound to still reaches the textarea unprevented — asserted directly, because on macOS that event is an Option-composed character. Fail-before: with the guard reverted the Alt+S assertion fails while both control assertions pass."
     },
     {
       "id": "UI-SWITCHER-CTRL-ENTER-NEW-TAB-463",
@@ -9613,7 +9613,7 @@
         "scenario": "navigation.switcher-modifier-enter",
         "failBefore": "proven"
       },
-      "notes": "User outcome: driving search from the keyboard reaches the same destinations as the mouse \u2014 Ctrl/Cmd+Enter fans the highlighted result into a background tab and leaves the switcher open, so several results can be opened without searching again. Classification: blocking stateful UX (the modifier is already learned from the click established by GH #288 and did nothing on the keyboard). Root cause: the Enter handler implemented Shift and Alt but had no Ctrl/Cmd rung, so the chord fell through to plain navigation. Page and block rows only, matching the click; create and command rows keep their existing single action. Fail-before: with the new branch removed the switcher closes and no tab is added."
+      "notes": "User outcome: driving search from the keyboard reaches the same destinations as the mouse — Ctrl/Cmd+Enter fans the highlighted result into a background tab and leaves the switcher open, so several results can be opened without searching again. Classification: blocking stateful UX (the modifier is already learned from the click established by GH #288 and did nothing on the keyboard). Root cause: the Enter handler implemented Shift and Alt but had no Ctrl/Cmd rung, so the chord fell through to plain navigation. Page and block rows only, matching the click; create and command rows keep their existing single action. Fail-before: with the new branch removed the switcher closes and no tab is added."
     },
     {
       "id": "UI-BULLET-FIRST-LINE-459",
@@ -9722,8 +9722,14 @@
       "id": "UI-HARVEST-F-MACRO-LINK-BOUNDARY-001",
       "title": "A malicious graph-authored macro link cannot execute by navigating the privileged WebView",
       "family": "hostile-content-consumption",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest F macro-link bypass" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest F macro-link bypass"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
@@ -9741,12 +9747,20 @@
       "id": "UI-HARVEST-F-HTML-PASTE-STRUCTURE-001",
       "title": "External HTML clipboard text cannot inject Markdown link or heading structure into a block",
       "family": "hostile-content-consumption",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest F htmlPaste boundary" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest F htmlPaste boundary"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
-        "tests": ["src/editor/htmlPaste.test.tsx"],
+        "tests": [
+          "src/editor/htmlPaste.test.tsx"
+        ],
         "scenario": "clipboard.external-html-markdown-escaping",
         "failBefore": "proven"
       },
@@ -9781,100 +9795,241 @@
       "id": "UI-HARVEST-D-QUICK-SWITCHER-GRAPH-OWNERSHIP",
       "title": "Quick Switcher never shows or opens a result from the graph that was switched away",
       "family": "frontend-staleness",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 1" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest D site 1"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
-      "coverage": { "tests": ["src/components/QuickSwitcher.test.tsx", "src/frontendStaleness.guard.test.ts"], "scenario": "quick-switcher.graph-binding", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/components/QuickSwitcher.test.tsx",
+          "src/frontendStaleness.guard.test.ts"
+        ],
+        "scenario": "quick-switcher.graph-binding",
+        "failBefore": "proven"
+      },
       "notes": "A search or page creation begun under one graph is discarded after a binding change instead of navigating the new graph."
     },
     {
       "id": "UI-HARVEST-D-PINNED-TAB-CONFIRM-LANDING",
       "title": "A tab opened while a pinned-tab close confirmation is visible is not silently discarded",
       "family": "frontend-staleness",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 2" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest D site 2"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "unit",
       "status": "covered",
-      "coverage": { "tests": ["src/router.test.ts"], "scenario": "router.pinned-close-reread", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/router.test.ts"
+        ],
+        "scenario": "router.pinned-close-reread",
+        "failBefore": "proven"
+      },
       "notes": "The live tab roster and closeability are rechecked after the native confirmation wait."
     },
     {
       "id": "UI-HARVEST-D-ASSET-EDITOR-OWNERSHIP",
       "title": "A delayed asset import or recording never inserts into a different graph or block",
       "family": "frontend-staleness",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 3" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest D site 3"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
-      "coverage": { "tests": ["src/components/Block.assetPaste.test.tsx", "src/frontendStaleness.guard.test.ts"], "scenario": "assets.editor-graph-owner", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/components/Block.assetPaste.test.tsx",
+          "src/frontendStaleness.guard.test.ts"
+        ],
+        "scenario": "assets.editor-graph-owner",
+        "failBefore": "proven"
+      },
       "notes": "Every asset initiator captures graph and editor identity before its first wait; a durable orphan is safer than a wrong-note reference."
     },
     {
       "id": "UI-HARVEST-D-PLUGIN-BINDING-NOT-REPAINT",
       "title": "Changing typography while a plugin runs does not discard its otherwise valid result",
       "family": "frontend-staleness",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 4" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest D site 4"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "unit",
       "status": "covered",
-      "coverage": { "tests": ["src/plugins/ownership.test.ts", "src/frontendStaleness.guard.test.ts"], "scenario": "plugins.graph-binding-not-render-epoch", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/plugins/ownership.test.ts",
+          "src/frontendStaleness.guard.test.ts"
+        ],
+        "scenario": "plugins.graph-binding-not-render-epoch",
+        "failBefore": "proven"
+      },
       "notes": "Plugin ownership follows graphBindingRev; a render epoch is not graph identity."
     },
     {
       "id": "UI-HARVEST-D-FOCUS-RESCAN-REBIND",
       "title": "The first focus rescan for a newly selected graph is neither skipped nor cross-wired",
       "family": "frontend-staleness",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest D site 5" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest D site 5"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
-      "coverage": { "tests": ["src/reloadOnFocus.test.tsx"], "scenario": "focus-rescan.graph-rebind", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/reloadOnFocus.test.tsx"
+        ],
+        "scenario": "focus-rescan.graph-rebind",
+        "failBefore": "proven"
+      },
       "notes": "Old completion/application state is retired and one replacement refresh waits for the stale tail to settle."
     },
     {
       "id": "UI-HARVEST-D-SETTINGS-BUSY-OWNERSHIP",
       "title": "Settings controls stay disabled until their own plugin or restore operation finishes",
       "family": "frontend-staleness",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest D sites 6-7" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest D sites 6-7"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
-      "coverage": { "tests": ["src/components/Settings.backups.test.tsx", "src/frontendStaleness.guard.test.ts", "src/components/Settings.mediaEditors.platform.test.tsx"], "scenario": "settings.busy-owner-and-mobile-gate", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/components/Settings.backups.test.tsx",
+          "src/frontendStaleness.guard.test.ts",
+          "src/components/Settings.mediaEditors.platform.test.tsx"
+        ],
+        "scenario": "settings.busy-owner-and-mobile-gate",
+        "failBefore": "proven"
+      },
       "notes": "Only the owning operation clears a busy token, restore is busy during confirmation, and desktop-only media settings are absent on mobile."
     },
     {
       "id": "UI-HARVEST-W4-E4-DIRECT-SAVE-CONFLICT-ROUTING",
       "title": "Page text resembling a conflict never raises the discard-capable conflict banner",
       "family": "direct-save-typed-errors",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest W4-E4" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest W4-E4"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "unit",
       "status": "covered",
-      "coverage": { "tests": ["src/backendCallFunnel.test.ts", "src/persistenceConflictRetry.test.ts"], "scenario": "direct-save.typed-disposition-and-banner-routing", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/backendCallFunnel.test.ts",
+          "src/persistenceConflictRetry.test.ts"
+        ],
+        "scenario": "direct-save.typed-disposition-and-banner-routing",
+        "failBefore": "proven"
+      },
       "notes": "Exact safety: only a typed SaveConflictError reaches conflict resolution; DirectSaveFailureError follows its producer reasonCode even when detail contains conflict-like page text. Fail-before: a permanent precheck failure on a page the user is entitled to name conflict_authority.notes was substring-matched into the authority handler, which deletes the epoch, re-dirties the page and fire-and-forgets another save, so one user request became four backend calls; log under tine-agents/evidence/wave4/e4/. Proven at the save-policy layer, which owns the banner STATE (markConflict/isConflicted); the rendered banner component is not driven here, so this row asserts that the banner is never raised, not how it looks when it is."
     },
     {
       "id": "UI-HARVEST-W4-P1-SHEET-SORT-KEY-DERIVATION",
       "title": "Sorting a sheet derives each row's sort key once, not once per comparison",
       "family": "sheet-table-sorting",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest W4-P1 item 1" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest W4-P1 item 1"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
-      "coverage": { "tests": ["src/components/SheetTable.test.tsx::SheetTable sort-key derivation (Harvest W4-P1 item 1)::derives at most one sort key per row for title, property, and formula sorts", "src/components/SheetTable.test.tsx::SheetTable sort-key derivation (Harvest W4-P1 item 1)::keeps the full sorted row index so off-window navigation still reaches a sorted row"], "scenario": "sheet-table.sort-key-derivation-bound", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/components/SheetTable.test.tsx::SheetTable sort-key derivation (Harvest W4-P1 item 1)::derives at most one sort key per row for title, property, and formula sorts",
+          "src/components/SheetTable.test.tsx::SheetTable sort-key derivation (Harvest W4-P1 item 1)::keeps the full sorted row index so off-window navigation still reaches a sorted row"
+        ],
+        "scenario": "sheet-table.sort-key-derivation-bound",
+        "failBefore": "proven"
+      },
       "notes": "Flexible presentation/heuristic cost bound, not exact behavior: sorting by title, by an ordinary property, or by a formula column derives at most R effective sort keys for R rows, and the sorted order and displayed values are unchanged. Fail-before: deriving inside the comparator cost 2532 derivations for R=200 on a deterministically shuffled fixture, a 12.66x multiplier; after the decorate-sort-undecorate cut, 200 in each of the three cases. Logs under tine-agents/evidence/wave4/p1/ (necessity-p1-1.txt, after-p1-1.txt). This row claims the measured multiplier and the <= R bound only; the packet has no timing metric for this path and does not claim a UI freeze. The second test pins the deliberate exception: rowIndexes still walks the full sorted list because off-window keyboard/block navigation needs the complete map."
     },
     {
       "id": "UI-HARVEST-W4-P1-QUERY-BUILDER-FACET-SHARING",
       "title": "Several query builders on one page ask for the graph's facets once, and all of them show the answer",
       "family": "query-builder-facets",
-      "sources": { "issues": [], "commits": [], "internal": "Harvest W4-P1 item 3" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Harvest W4-P1 item 3"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
-      "coverage": { "tests": ["src/components/QueryBuilder.transient.test.tsx::QueryBuilder facet sharing (Harvest W4-P1 item 3)::issues one shared facets request per (graph scope, dataRev) for five mounted builders"], "scenario": "query-builder.shared-facets-per-graph-scope-and-datarev", "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/components/QueryBuilder.transient.test.tsx::QueryBuilder facet sharing (Harvest W4-P1 item 3)::issues one shared facets request per (graph scope, dataRev) for five mounted builders"
+        ],
+        "scenario": "query-builder.shared-facets-per-graph-scope-and-datarev",
+        "failBefore": "proven"
+      },
       "notes": "Blocking stateful UX plus a cost bound: one queryFacets(false) request per (graph scope, dataRev) however many builders are mounted, AND every mounted builder offers the current payload through its own Property picker, so the reduction cannot be met by starving a consumer or serving an earlier revision. Fail-before: five mounted builders issued five identical whole-graph requests per revision (log under tine-agents/evidence/wave4/p1/necessity-p1-3.txt); after routing the resource through sharedQueryResult under a query-facets key namespace, one per mount, one per dataRev bump, one per graph-scope change (after-p1-3.txt). The autocomplete producer's queryFacets(true) is a different question and is asserted to remain its own call."
+    },
+    {
+      "id": "UI-PAGE-REF-ALIAS-RESTYLE-484",
+      "title": "A page reference restyles from dead link to live the moment its name becomes an alias, without a restart",
+      "family": "reference-styling",
+      "sources": {
+        "issues": [
+          484
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/pageExistsBatch.test.ts::pageExistsBatch::GH #484: alias changes invalidate batched answers::restyles a reference the moment its name becomes an alias (missing → existing)",
+          "src/pageExistsBatch.test.ts::pageExistsBatch::GH #484: alias changes invalidate batched answers::does not leave a stale positive result after an alias is removed",
+          "src/pageExistsBatch.test.ts::pageExistsBatch::GH #484: alias changes invalidate batched answers::keeps one name asked once per (graph × inventory × alias) state"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User harm: after adding `alias:: page1` to another page, every existing [[page1]] kept the missing-page styling until Tine was restarted, so a link that now resolves still looked dead. Root cause is one shared invariant, not this one surface: `existing_page_names` answers over page names UNION alias names, so an alias edit changes the answer while creating and deleting no file -- and the batched exists-cache was keyed only on (graphEpoch, pageInventoryRev), neither of which moves for a property-only save. Fixed by publishing an `aliasRev` from the single alias-map commit point and keying the cache on it too; it bumps only when the map actually changes, so an ordinary keystroke save still costs nothing. Sibling reviewed and deliberately NOT changed: pageIconBatch keys on graphEpoch alone by documented design (`icons refresh on graph switch / reopen, not on every edit`), so its staleness is a stated tradeoff rather than this defect."
     }
   ]
 }

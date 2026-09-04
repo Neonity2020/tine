@@ -3,7 +3,7 @@
 
 import { backend } from "./backend";
 import { managedStorageRuntime } from "./managedStorageRuntime";
-import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
+import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
@@ -281,6 +281,9 @@ export async function loadGraphPath(
 
 let navigationEpoch = -1;
 let aliasEntries: Record<string, string> = {};
+/** The last map `commitNavigationIndex` published; the comparison basis for
+ *  `aliasRev` (GH #484). Cleared with the rest of the index. */
+let committedAliasMap: Record<string, string> = {};
 let pageIdentities: Record<string, string> = {};
 let aliasRequest = 0;
 let pageIdentityRequest = 0;
@@ -291,6 +294,7 @@ function resetNavigationIndex(): void {
   pageIdentities = {};
   aliasRequest++;
   pageIdentityRequest++;
+  committedAliasMap = {};
   setAliasMap({});
 }
 
@@ -301,12 +305,31 @@ function bindNavigationIndex(epoch: number): void {
   pageIdentities = {};
   aliasRequest++;
   pageIdentityRequest++;
+  committedAliasMap = {};
   setAliasMap({});
 }
 
 function commitNavigationIndex(): void {
   // Existing files win a colliding alias, matching core `load_named`.
-  setAliasMap({ ...aliasEntries, ...pageIdentities });
+  const next = { ...aliasEntries, ...pageIdentities };
+  // An alias edit changes which NAMES resolve to a page without creating or
+  // deleting a file, so it never moves `pageInventoryRev`. Publish it as its own
+  // revision, or every `[[alias]]` stays painted as a dead link until the next
+  // restart (GH #484). Bump only on a real change: this runs after every save.
+  // Compare against what THIS function last published rather than reading the
+  // signal back, so the one writer owns the comparison.
+  if (aliasMapChanged(committedAliasMap, next)) bumpAliasRev();
+  committedAliasMap = next;
+  setAliasMap(next);
+}
+
+function aliasMapChanged(
+  previous: Record<string, string>,
+  next: Record<string, string>,
+): boolean {
+  const previousKeys = Object.keys(previous);
+  if (previousKeys.length !== Object.keys(next).length) return true;
+  return previousKeys.some((key) => previous[key] !== next[key]);
 }
 
 /** Refresh semantic aliases after content saves. Request sequencing prevents an

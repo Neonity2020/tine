@@ -77,6 +77,7 @@ async function loadHarness(
     ]),
   };
   const setAliasMap = vi.fn();
+  const bumpAliasRev = vi.fn();
   const applyTemplateVars = vi.fn((raw: string, _currentPage?: string) => raw);
   const prepareTemplateVars = vi.fn(async () => {});
   const drainPdfWork = vi.fn(async () => {
@@ -108,6 +109,7 @@ async function loadHarness(
     setWorkflow: vi.fn(),
     setRightSidebar: vi.fn(),
     setAliasMap,
+    bumpAliasRev,
     pageIdentityKey: (name: string) => {
       const lowered = name.trim().toLowerCase();
       const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
@@ -177,7 +179,7 @@ async function loadHarness(
   const { createNewGraph, ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph } = await import("./graph");
   return {
     createNewGraph, ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph,
-    api, events, setAliasMap, pushToast,
+    api, events, setAliasMap, bumpAliasRev, pushToast,
     drainPdfWork, retirePdfOwnership, activatePdfOwnership,
     suspendPdfForGraphTransition, restorePdfSessionTarget,
     restorePendingPdfSessionTarget,
@@ -376,6 +378,47 @@ describe("default journal template graph bind", () => {
 
     await refreshPageIdentities();
     expect(api.listPages).toHaveBeenCalledTimes(2);
+  });
+
+  // GH #484. `existing_page_names` answers over page names UNION alias names, so
+  // an alias edit changes which [[refs]] resolve while creating no file — and
+  // `pageInventoryRev` never moves for it. This commit point is the one producer
+  // of that revision, so both halves of its contract are pinned here: it fires on
+  // a real change, and it stays silent on a recommit of the same map (this runs
+  // after EVERY save, so a bump-always version would drop the exists-cache on
+  // every keystroke lull).
+  it("publishes an alias revision when the alias map actually changes", async () => {
+    const { loadGraphPath, refreshAliases, refreshPageIdentities, api, bumpAliasRev } =
+      await loadHarness(null, undefined, true, true);
+    await loadGraphPath(META.root);
+    await vi.waitFor(() => expect(api.listPages).toHaveBeenCalledTimes(1));
+    bumpAliasRev.mockClear();
+
+    api.pageAliases.mockResolvedValue([["page1", "Page Two"]]);
+    api.listPages.mockResolvedValue([
+      { name: "Page Two", kind: "page" as const, date_key: null, path: "pages/Page Two.md" },
+    ]);
+    await Promise.all([refreshAliases(), refreshPageIdentities()]);
+
+    expect(bumpAliasRev).toHaveBeenCalled();
+  });
+
+  it("publishes no alias revision when the same map is recommitted", async () => {
+    const { loadGraphPath, refreshAliases, refreshPageIdentities, api, bumpAliasRev } =
+      await loadHarness(null, undefined, true, true);
+    await loadGraphPath(META.root);
+    await vi.waitFor(() => expect(api.listPages).toHaveBeenCalledTimes(1));
+
+    api.pageAliases.mockResolvedValue([["page1", "Page Two"]]);
+    api.listPages.mockResolvedValue([
+      { name: "Page Two", kind: "page" as const, date_key: null, path: "pages/Page Two.md" },
+    ]);
+    await Promise.all([refreshAliases(), refreshPageIdentities()]);
+    bumpAliasRev.mockClear();
+
+    // A second save with no alias edit: same answer, same map, no revision.
+    await Promise.all([refreshAliases(), refreshPageIdentities()]);
+    expect(bumpAliasRev).not.toHaveBeenCalled();
   });
 
   it("refreshes real-page precedence after a same-session page creation", async () => {

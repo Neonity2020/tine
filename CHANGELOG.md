@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A `[[link]]` stops looking dead the moment its name becomes an alias.** After
+  you added `alias:: page1` to another page, every existing `[[page1]]` kept the
+  faded missing-page styling until you restarted Tine — even though clicking it
+  went to the right page. Tine now notices that the set of names which resolve to
+  a page has changed, not just the set of files on disk (GH #484).
+
 - **Journal-day queries such as `(between …)` work in Managed Storage on a graph
   with a custom journal page-title format.** Tine's Managed reader worked out
   which day a journal page was from the DEFAULT title format rather than the one
