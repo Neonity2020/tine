@@ -14,8 +14,10 @@
 //!     output and are not part of the application;
 //!   * NOT a `*_tests.rs` file that a sibling pulls in under `#[cfg(test)]`;
 //!   * NOT a trailing `#[cfg(test)] mod tests { .. }`, nor any other
-//!     `#[cfg(test)]` region — those are blanked in place, so line numbers
-//!     stay true to the file on disk.
+//!     `#[cfg(test)]` or `#[cfg(all(test, ..))]` region — those are blanked in
+//!     place, so line numbers stay true to the file on disk. `#[cfg(not(test))]`
+//!     and `#[cfg(any(test, ..))]` ARE production: the latter ships on at least
+//!     one target, so it stays in the census.
 //!
 //! Exemplar consumers: `content_out_of_logs.rs` (I-5 print sites) and
 //! `process_termination_sites.rs` (I-10 abort/exit sites).
@@ -90,12 +92,39 @@ pub fn compiled_source(path: &Path) -> String {
     erase_cfg_test_regions(source)
 }
 
+/// Byte offset just past the `]` that closes the attribute starting at `start`.
+fn attribute_end(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut depth = 0_usize;
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return cursor + 1;
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    source.len()
+}
+
 pub fn erase_cfg_test_regions(mut source: String) -> String {
-    let marker = "#[cfg(test)]";
+    // `#[cfg(test)]` and `#[cfg(all(test, ..))]` are both compiled ONLY under
+    // `cfg(test)`; `#[cfg(any(test, ..))]` and `#[cfg(not(test))]` are not, and
+    // must stay. Missing the `all(..)` shape was not hypothetical: it left
+    // `src-tauri/src/lib.rs`'s `#[cfg(all(test, desktop))] mod multi_window_tests`
+    // and `src-tauri/src/data_home.rs`'s test module inside "production source"
+    // for every census built on this walker.
+    let marker = Regex::new(r"#\[cfg\((?:test\)\]|all\(\s*test\s*[,)])").unwrap();
     let mut search_from = 0;
-    while let Some(relative) = source[search_from..].find(marker) {
-        let start = search_from + relative;
-        let after = start + marker.len();
+    while let Some(found) = marker.find(&source[search_from..]) {
+        let start = search_from + found.start();
+        let after = attribute_end(&source, start);
         let next_brace = source[after..].find('{').map(|offset| after + offset);
         let next_semicolon = source[after..].find(';').map(|offset| after + offset);
         let end = match (next_brace, next_semicolon) {

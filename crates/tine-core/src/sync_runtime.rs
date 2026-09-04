@@ -23949,9 +23949,29 @@ fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorReq
     SyncEditorRequestError::ActorRefusedWithCode(code)
 }
 
-pub(crate) fn runtime_debug_diagnostics_enabled() -> bool {
-    matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
-        || std::env::args().any(|argument| argument == "--debug")
+/// The process-wide answer to "are runtime debug diagnostics on?".
+///
+/// Core cannot call src-tauri, so the flag lives here and the host process
+/// pushes its answer down: `debug_init` parses `TINE_DEBUG=1` / `--debug` once
+/// at startup and calls [`set_runtime_debug_diagnostics`]. Default `false`, so
+/// tests, benches, CLI tools and any other non-Tauri consumer get diagnostics
+/// off unless they opt in deliberately.
+static RUNTIME_DEBUG_DIAGNOSTICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the process-wide debug-diagnostics flag. Plain and idempotent: calling
+/// it twice is a second answer to the same question, not an error, and a test
+/// must be able to turn the flag back off — which is why this is not an
+/// init-once cell that would silently ignore the second call (I-11).
+pub fn set_runtime_debug_diagnostics(enabled: bool) {
+    RUNTIME_DEBUG_DIAGNOSTICS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The ONE producer of "are runtime debug diagnostics on?" (I-12). Every
+/// diagnostic in `tine-core` and in `src-tauri` — where `debug_enabled()` is a
+/// thin delegate to this function — asks here.
+pub fn runtime_debug_diagnostics_enabled() -> bool {
+    RUNTIME_DEBUG_DIAGNOSTICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn map_application_conflict(reason: SyncEditorConflict) -> SyncApplicationPageConflict {

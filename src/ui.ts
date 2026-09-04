@@ -20,6 +20,7 @@ import {
   storeConflictCapsule,
 } from "./backend";
 import { pageIdentityKey } from "./pageIdentity";
+import { failureShape } from "./failureShape";
 import { membershipChanged, resetFavoritesLayout, setMembershipSink, storedFavoritesLayout } from "./favoritesStore";
 import { reconcileLayout } from "./favoritesLayout";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
@@ -487,7 +488,7 @@ export function registerLiveSaveConflict(
       "error",
       { sticky: true },
     );
-    console.error("[tine] conflict capsule store failed", error);
+    console.error("[tine] conflict capsule store failed", failureShape(error));
   });
 }
 
@@ -512,7 +513,7 @@ export async function refreshLiveSaveConflictDraft(page: PageDto): Promise<void>
   // The refreshed draft is already the in-memory truth; a failed capsule
   // rewrite (disk full, I/O error) must not reject out of the autosave path.
   await persistLiveSaveConflict(conflict).catch((error) => {
-    console.error("[tine] conflict capsule refresh failed", error);
+    console.error("[tine] conflict capsule refresh failed", failureShape(error));
   });
 }
 
@@ -549,7 +550,7 @@ export function clearLiveSaveConflict(name: string): void {
       "error",
       { sticky: true },
     );
-    console.error("[tine] conflict capsule retire failed", error);
+    console.error("[tine] conflict capsule retire failed", failureShape(error));
   });
 }
 

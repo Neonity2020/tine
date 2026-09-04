@@ -46,9 +46,20 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn debug_enabled() -> bool {
+/// Parse the process-level debug opt-in. The ONLY production reader of
+/// `TINE_DEBUG` / `--debug`: `debug_init` calls it once, at startup, and pushes
+/// the answer into `tine-core`, which owns the flag because core cannot call
+/// src-tauri (I-12). Nothing else may re-derive it from the environment.
+fn debug_opt_in_requested() -> bool {
     matches!(std::env::var("TINE_DEBUG"), Ok(v) if !v.is_empty() && v != "0")
         || std::env::args().any(|a| a == "--debug")
+}
+
+/// Thin delegate to the one producer, `tine-core`'s
+/// `runtime_debug_diagnostics_enabled()`. Kept because 15 src-tauri callers
+/// read better against a local name; it computes nothing of its own.
+pub(crate) fn debug_enabled() -> bool {
+    tine_core::sync_runtime::runtime_debug_diagnostics_enabled()
 }
 
 fn debug_log_path() -> PathBuf {
@@ -60,6 +71,10 @@ fn debug_log_path() -> PathBuf {
 /// Initialize the directed, detailed trace before Tauri exists. It remains
 /// opt-in and retains its historical path/format contract.
 pub(crate) fn debug_init() {
+    // The one place the opt-in is parsed, and the one place the flag is set.
+    // Everything downstream — in this crate and in `tine-core` — reads it back
+    // through `runtime_debug_diagnostics_enabled()`.
+    tine_core::sync_runtime::set_runtime_debug_diagnostics(debug_opt_in_requested());
     DEBUG_START.get_or_init(std::time::Instant::now);
     DEBUG_LOG.get_or_init(|| {
         if !debug_enabled() {

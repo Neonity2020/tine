@@ -125,12 +125,25 @@ pub(crate) fn ensure_usable(identifier: &str) {
         "no writable app-data home; refusing to start (base {}: {error})",
         base.display()
     ));
-    eprintln!(
-        "Tine cannot start: it has nowhere to keep its application data.\n\
+    eprintln!("{}", fatal_no_data_home_message(error.kind()));
+    std::process::exit(1);
+}
+
+/// The always-on fatal line for "nowhere to keep the application data".
+///
+/// I-9: the user cannot get past this refusal — `ensure_usable` exits right
+/// after it — so the family of the failure has to be identifiable here, in the
+/// always-on record, without relaunching under `TINE_DEBUG`. `ErrorKind` is a
+/// bounded enum, so it says `PermissionDenied` or `ReadOnlyFilesystem` without
+/// carrying the OS prose or the directory (I-5); the path and raw error stay on
+/// the directed `diag` channel above.
+#[cfg(all(desktop, target_os = "linux"))]
+fn fatal_no_data_home_message(kind: std::io::ErrorKind) -> String {
+    format!(
+        "Tine cannot start: it has nowhere to keep its application data ({kind:?}).\n\
          Fix the permissions on the configured application-data directory, \n\
          or set XDG_DATA_HOME to a directory you can write."
-    );
-    std::process::exit(1);
+    )
 }
 
 #[cfg(not(all(desktop, target_os = "linux")))]
@@ -196,6 +209,33 @@ mod tests {
         assert!(probe_writable(&base, "page.tine.Tine").is_err());
         writable(&app);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn fatal_data_home_message_keeps_error_kind_without_prose_or_path() {
+        let denied = std::io::Error::from_raw_os_error(13);
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        let message = fatal_no_data_home_message(denied.kind());
+        assert!(
+            message.contains("PermissionDenied"),
+            "I-9: the always-on fatal line must name the failure family — the user cannot \
+             relaunch past `std::process::exit(1)` to read the debug channel. Message: {message}"
+        );
+        assert!(
+            !message.contains(&denied.to_string()) && !message.contains("os error"),
+            "I-5: the always-on line carries the bounded ErrorKind token, never the OS prose. \
+             Message: {message}"
+        );
+        let base = tmp("fatal-message");
+        assert!(
+            !message.contains(&base.display().to_string()) && !message.contains('/'),
+            "I-5: the always-on line carries no directory — the path stays on the directed \
+             `diag` channel. Message: {message}"
+        );
+        assert!(
+            fatal_no_data_home_message(std::io::ErrorKind::NotFound).contains("NotFound"),
+            "the token must follow the actual kind, not be a constant"
+        );
     }
 
     #[test]

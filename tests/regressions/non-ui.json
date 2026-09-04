@@ -58,10 +58,14 @@
     "tests": [
      "src-tauri/src/debug.rs::tests::diag_is_silent_when_debug_is_disabled",
      "crates/tine-core/tests/content_out_of_logs.rs",
-     "src/contentOutOfLogs.ratchet.test.ts"
+     "src/contentOutOfLogs.ratchet.test.ts",
+     "crates/tine-core/src/direct_projection.rs::tests::retired_class_c_projection_database_open_emits_no_planted_marker",
+     "crates/tine-core/src/direct_projection.rs::tests::retired_class_c_projection_apply_failure_emits_no_planted_marker",
+     "src/failureShape.test.ts",
+     "src/pdfRenderCoordinator.test.ts"
     ],
     "scenario": "diagnostics.content-out-of-logs",
-    "failBefore": "i5-diag-fail-before.txt and i5-lsdoc-shape-fail-before.txt at 64ed1c21838d4d7e9b75dd9ece90d90787b300fa"
+    "failBefore": "i5-diag-fail-before.txt and i5-lsdoc-shape-fail-before.txt at 64ed1c21838d4d7e9b75dd9ece90d90787b300fa; class-c retirement: class-c-projection-fail-before.log and frontend-class-c-fail-before.log at 20bb15de"
    },
    "notes": "Detailed native diagnostics are opt-in, core print sites are content-free and flag-gated, parser failures cross worker boundaries only as fixed-shape measurements, and equality ratchets freeze the reviewed Rust and TypeScript censuses."
   },
@@ -6319,6 +6323,31 @@
     "failBefore": "proven — tine-agents/evidence/wave4/b4b-pass2/. Routing, checked at 9bad907f: every newly routed shape (non-sparse Task, BlockProperty, PageProperty, Page, Namespace, Journal, mixed And, complete Or) left the candidate-read counter unchanged and entered the full-graph evaluator. Hatch, checked at 9bad907f with the cutoff neutralised (hatch-fail-before.log): the unselective plan completed a candidate query instead of abandoning — `an abandoned plan must complete no candidate query, left: 2, right: 1`."
    },
    "notes": "The user outcome: a {{query}} block in Direct mode walked the whole graph after every keystroke even though the projection could answer it. Indexed plans now take the shared Managed/Direct lowering; Empty returns without projection or graph access; All keeps the walk. The lowering returns a page SUPERSET rather than the answer, so an unselective plan names most of the graph and materialising it through SQLite is slower than the walk — measured on the 1,045-file anonymized corpus at 1.08 -> 11.19 ms for non-sparse Task and 0.46 -> 3.31 ms for (journal). A candidate-count escape hatch (more than graph_pages/32, floor 32) therefore abandons the projection and reuses the existing parser-fallback path with a second reason. Both routes return identical groups/total/exceeded. The hatch carries the codebase's first `// RETIREMENT-CANDIDATE:` marker, censused by tests/retirement_candidates.rs; the walk is also the differential correctness oracle for the real lowering that would replace it, so it outlives the hatch."
+  },
+  {
+   "id": "REG-W4-I5B-DEBUG-FLAG-FRONT-DOOR-001",
+   "title": "One producer answers \"are debug diagnostics on\", and the fatal app-data refusal names its error kind",
+   "family": "diagnostics-privacy",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "Harvest Wave 4 I5b; invariants I-12, I-9, I-5, I-11"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "rust-core-and-tauri-diagnostics",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/tests/content_out_of_logs.rs::exactly_one_function_reads_the_debug_diagnostics_flag",
+     "crates/tine-core/src/sync_runtime_tests.rs::setting_the_debug_flag_gates_a_core_diagnostic_line",
+     "src-tauri/src/data_home.rs::tests::fatal_data_home_message_keeps_error_kind_without_prose_or_path"
+    ],
+    "scenario": "diagnostics.one-debug-flag-and-identifiable-fatal-refusal",
+    "failBefore": "i12-front-door-fail-before.log, flag-fold-fail-before.log and data-home-kind-fail-before.log at 20bb15de"
+   },
+   "notes": "Four production readers parsed TINE_DEBUG/--debug independently (src-tauri/src/debug.rs, crates/tine-core/src/sync_runtime.rs and twice in crates/tine-core/src/oplog/import.rs), so the host process could not steer core diagnostics and the answer could drift per crate. Separately, the always-on fatal 'nowhere to keep its application data' line carried no error kind: the only diagnosable detail sat on the debug-only channel behind a process::exit the user cannot get past."
   }
  ]
 }

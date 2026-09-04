@@ -130,4 +130,46 @@ describe("Tine PDF render coordination", () => {
     expect(coordinator.retainedPixels()).toBe(700);
     queue.dispose();
   });
+
+  // I-5 (class (c) retirement): a pdf.js render rejection is prose about the
+  // document the user opened — pdf.js puts the failing resource in it. This
+  // site is always-on, so it must report the failure's SHAPE, never its text.
+  // I-9: the failure still has to be identifiable, hence the non-vacuity check.
+  it("reports a render failure without its message", async () => {
+    const marker = "planted-pdf-marker-Zq7Page";
+    const errors: unknown[][] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args);
+    });
+    try {
+      const coordinator = new PdfRenderCoordinator(1_000, 800);
+      const view = fakeView(1, 0);
+      view.draw = vi.fn(() => Promise.reject(new Error(`render of ${marker} failed`)));
+      const queue = new TinePdfRenderingQueue({ coordinator, cachedViews: () => [view] });
+      queue.setViewer({ getCachedPageViews: () => new Set([view]), forceRendering: () => false });
+      queue.renderView(view);
+      await turns(5);
+      queue.dispose();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(errors.length, "the failure must still be reported (I-9)").toBe(1);
+    // Render the way devtools does: an Error's own message is what the panel
+    // expands, and `JSON.stringify` alone would hide it behind `{}`.
+    const rendered = errors
+      .flat()
+      .map((argument) =>
+        argument instanceof Error
+          ? `${argument.name}: ${argument.message}`
+          : (JSON.stringify(argument) ?? String(argument)),
+      )
+      .join(" | ");
+    expect(
+      rendered.includes(marker),
+      "I-5: an always-on console site may not carry the failure's message — pass it "
+        + "through failureShape() (exemplar: src/failureShape.ts). Logged: " + rendered,
+    ).toBe(false);
+    expect(rendered, "I-9: the failure family and identity must survive").toContain("Error");
+  });
 });

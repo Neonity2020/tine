@@ -842,6 +842,24 @@ impl Drop for DirectProjection {
     }
 }
 
+/// Report a Direct Files projection failure that leaves the parser fallback in
+/// charge.
+///
+/// The always-on line names the failure family in fixed words and carries
+/// nothing else. I-5: the detail at both call sites is free-form prose from the
+/// projection WRITE path, and that path names the graph — `apply_pending`
+/// formats `entry.rel_path` straight into its error string, and
+/// `MaterializationError`'s payloads are free-form `String`s produced while
+/// storing parsed page text. I-9: the family still reaches the always-on
+/// record, because a user who is not running under `TINE_DEBUG` otherwise sees
+/// only a silently slower graph. The prose stays on the directed debug channel.
+fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
+    eprintln!("[tine] Direct Files SQLite projection {family}");
+    if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+        eprintln!("[tine] Direct Files SQLite projection {family}; directed detail: {detail}");
+    }
+}
+
 fn projection_worker(shared: Arc<ProjectionShared>) {
     let Some(parent) = shared.path.parent() else {
         shared.worker_available.store(false, Ordering::Release);
@@ -878,7 +896,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     let mut database = match open_projection_database(&shared.path) {
         Ok(database) => database,
         Err(error) => {
-            eprintln!("[tine] Direct Files SQLite projection disabled: {error}");
+            report_projection_failure("disabled: its database could not be opened", &error);
             shared.worker_available.store(false, Ordering::Release);
             shared.changed.notify_all();
             return;
@@ -921,9 +939,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             shared.worker_failed.store(true, Ordering::Release);
             shared.worker_busy.store(false, Ordering::Release);
             shared.changed.notify_all();
-            eprintln!(
-                "[tine] Direct Files SQLite projection is stale; using parser fallback: {error}"
-            );
+            report_projection_failure("is stale; using parser fallback", &error);
             continue;
         }
         if had_full {
@@ -2812,5 +2828,101 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// Child half of the two `retired_class_c_*` probes. Emits BOTH retired
+    /// class-(c) reports, each with its own planted marker, through the exact
+    /// production reporter and the exact error types the call sites hand it.
+    #[test]
+    #[ignore = "child process for the retired class-(c) stderr probe"]
+    fn w4_i5b_projection_failure_marker_child() {
+        if std::env::var("TINE_I5B_SET_FLAG").as_deref() == Ok("1") {
+            crate::sync_runtime::set_runtime_debug_diagnostics(true);
+        }
+        // Exactly what `open_projection_database` returns: a free-form
+        // `MaterializationError` payload.
+        report_projection_failure(
+            "disabled: its database could not be opened",
+            &tine_storage::sqlite::MaterializationError::Sqlite(
+                "planted-open-marker-Zq7Page".to_owned(),
+            ),
+        );
+        // Exactly what `apply_pending` returns: a `String` naming the
+        // graph-relative page it was projecting.
+        report_projection_failure(
+            "is stale; using parser fallback",
+            &"parsed page has no exact source revision: pages/planted-apply-marker-Zq7Page.md"
+                .to_owned(),
+        );
+    }
+
+    fn projection_failure_child_stderr(set_flag: &str) -> String {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "direct_projection::tests::w4_i5b_projection_failure_marker_child",
+                "--nocapture",
+            ])
+            .env_remove("TINE_DEBUG")
+            .env("TINE_I5B_SET_FLAG", set_flag)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "projection-failure child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// I-5, retired class-(c) row `direct_projection.rs` "projection database
+    /// could not be opened": the always-on line carried a free-form
+    /// `MaterializationError` payload.
+    #[test]
+    fn retired_class_c_projection_database_open_emits_no_planted_marker() {
+        let marker = "planted-open-marker-Zq7Page";
+        assert!(
+            !projection_failure_child_stderr("0").contains(marker),
+            "I-5: the always-on projection-open failure still carried its error prose. \
+             The always-on line names the failure family only; the detail belongs behind \
+             `runtime_debug_diagnostics_enabled()` (I-9 keeps the family, not the prose)."
+        );
+        assert!(
+            projection_failure_child_stderr("1").contains(marker),
+            "the directed debug channel must still carry the detail, or this probe proves \
+             nothing about where the prose went"
+        );
+    }
+
+    /// I-5, retired class-(c) row `direct_projection.rs` "projection is stale;
+    /// using parser fallback": `apply_pending` formats the graph-relative page
+    /// path into the error this line used to print always-on.
+    #[test]
+    fn retired_class_c_projection_apply_failure_emits_no_planted_marker() {
+        let marker = "planted-apply-marker-Zq7Page";
+        assert!(
+            source_of_this_file().contains("parsed page has no exact source revision: {}"),
+            "non-vacuity: this probe exists because `apply_pending` names the page it was \
+             projecting in its error string. If that error no longer does, re-derive the row's \
+             class before relaxing the probe."
+        );
+        assert!(
+            !projection_failure_child_stderr("0").contains(marker),
+            "I-5: the always-on parser-fallback line still carried the graph-relative page \
+             path from `apply_pending`. The always-on line names the failure family only."
+        );
+        assert!(
+            projection_failure_child_stderr("1").contains(marker),
+            "the directed debug channel must still carry the detail, or this probe proves \
+             nothing about where the prose went"
+        );
+    }
+
+    fn source_of_this_file() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/direct_projection.rs"),
+        )
+        .unwrap()
     }
 }

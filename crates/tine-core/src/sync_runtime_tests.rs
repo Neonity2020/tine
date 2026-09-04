@@ -31305,3 +31305,57 @@ fn a4_repro_managed_block_budget_and_what_it_does_to_the_next_open() {
         reopened.status
     );
 }
+
+/// Child half of `setting_the_debug_flag_gates_a_core_diagnostic_line`. Runs in
+/// its own process so the process-wide flag cannot leak into sibling tests.
+#[test]
+#[ignore = "child process for the debug-flag gate probe"]
+fn w4_i5b_debug_flag_gate_child() {
+    if std::env::var("TINE_I5B_SET_FLAG").as_deref() == Ok("1") {
+        set_runtime_debug_diagnostics(true);
+    }
+    let mut trace = CleanOpenStageTrace::new();
+    trace.phase(
+        SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
+        &mut |_, _| {},
+    );
+}
+
+/// I-12: the host process, not the environment, decides whether core emits its
+/// debug diagnostics. Both children run with `TINE_DEBUG=1` set; only the one
+/// that went through the setter may print.
+#[test]
+fn setting_the_debug_flag_gates_a_core_diagnostic_line() {
+    let marker = "managed clean open stage";
+    let run = |set_flag: &str| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "sync_runtime::tests::w4_i5b_debug_flag_gate_child",
+                "--nocapture",
+            ])
+            .env("TINE_DEBUG", "1")
+            .env("TINE_I5B_SET_FLAG", set_flag)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "debug-flag gate child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    assert!(
+        !run("0").contains(marker),
+        "I-12: a bare TINE_DEBUG in the environment still switched a core diagnostic on. \
+         Core owns the flag and src-tauri's `debug_init` pushes the parsed opt-in into it \
+         through `set_runtime_debug_diagnostics`; nothing in core may re-read the environment."
+    );
+    assert!(
+        run("1").contains(marker),
+        "I-11: `set_runtime_debug_diagnostics(true)` did not switch the core diagnostic on, \
+         so the flag's name and its gate disagree. The setter is plain and idempotent over an \
+         AtomicBool; `runtime_debug_diagnostics_enabled()` is the only reader."
+    );
+}

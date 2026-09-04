@@ -28,6 +28,7 @@ import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairE
 import { typoTypeReplace } from "../render/typography";
 import { blockDropPosition, type BlockDropPosition } from "../editor/blockDrag";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
+import { failureShape } from "../failureShape";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
 import {
@@ -1506,7 +1507,7 @@ export function Editor(props: { id: string }): JSX.Element {
       } catch (error) {
         // Completion is an optional aid. A transient facet-query failure must
         // never reject the editor input event or pile up global error toasts.
-        console.warn("Property autocomplete unavailable", error);
+        console.warn("Property autocomplete unavailable", failureShape(error));
         if (sameAcTrigger(ac(), t)) setAcItems([]);
         return;
       }

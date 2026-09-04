@@ -9,6 +9,7 @@
 // the app chrome, so the PDF is the page, nothing else.
 import { backend } from "./backend";
 import { pushToast } from "./ui";
+import { failureShape } from "./failureShape";
 import type { PrintOpts } from "./types";
 
 /** The default export options (match the Rust `PrintOpts::default`). */
@@ -94,7 +95,7 @@ export async function preparePrintHtml(html: string): Promise<string> {
   } catch (error) {
     // A failed optional renderer must not make printing unavailable. The core
     // markup already contains readable raw TeX and escaped plain code.
-    console.error("local print rendering failed", error);
+    console.error("local print rendering failed", failureShape(error));
   }
 
   for (const link of bundledStylesheets()) parsed.head.appendChild(link);
@@ -109,7 +110,7 @@ export async function exportPagePdf(name: string, opts: PrintOpts = DEFAULT_PRIN
   } catch (e) {
     // `no-page` (deleted mid-action) or any core error — never leave a dangling frame.
     pushToast(`Couldn't prepare “${name}” for PDF`, "error");
-    console.error("pagePrintHtml failed", e);
+    console.error("pagePrintHtml failed", failureShape(e));
     return;
   }
 

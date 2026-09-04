@@ -1707,8 +1707,7 @@ pub(crate) fn open_or_rebuild_clean_genesis_projection(
     let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
     match super::sqlite::open_clean_genesis_projection(database_path, claim, &accepted_frontier) {
         Ok(projection) => {
-            if matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
-            {
+            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
                 eprintln!("[tine] clean genesis projection recovery: opened-existing");
             }
             super::sqlite::record_projection_open_test_observation(
@@ -1720,8 +1719,7 @@ pub(crate) fn open_or_rebuild_clean_genesis_projection(
             Ok(projection)
         }
         Err(error) => {
-            if matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
-            {
+            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
                 eprintln!("[tine] clean genesis projection recovery: rebuilt");
             }
             let reason = error.to_string();

@@ -13,29 +13,47 @@ interface ConsoleSite {
   method: "log" | "warn" | "error" | "debug";
 }
 
+// Every console site carries one of four buckets. They are the same four the
+// Rust print census uses (`crates/tine-core/tests/content_out_of_logs.rs`), so
+// one classification answers "is this line safe?" on both sides:
+//
+//   a — content-free or fixed-shape payload, and gated behind a debug opt-in.
+//   b — a directed investigation channel behind its OWN named opt-in; may
+//       carry detail, because the user asked for it.
+//   c — always-on, with a variable that CAN carry user content (a page name,
+//       a graph path, block text, or error prose from an operation over any
+//       of those). MUST BE ZERO; the assertion below enforces it.
+//   d — always-on, payload provably content-free.
+//
+// Nothing on the frontend is gated: the WebView inspector ships in release
+// builds (`src-tauri/Cargo.toml`, feature `devtools`), so every site here is
+// either (c) or (d) and (c) is empty. `failureShape()` is what moved ten rows
+// from (c) to (d): it keeps a failure's type, size and identity and drops its
+// message.
+type ConsoleBucket = "a" | "b" | "c" | "d";
 const CONSOLE_ALLOWLIST_SIZE = 21;
-const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { class: string; why: string })[] = [
-  { file: "App.tsx", line: 1071, method: "warn", class: "local-error", why: "native listener setup error stays in uncaptured WebView devtools" },
-  { file: "capture.tsx", line: 173, method: "log", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
-  { file: "capture.tsx", line: 600, method: "error", class: "local-error", why: "parser bootstrap error stays in uncaptured WebView devtools" },
-  { file: "components/Block.tsx", line: 1509, method: "warn", class: "local-error", why: "optional autocomplete failure stays in uncaptured WebView devtools" },
-  { file: "logbook.ts", line: 42, method: "error", class: "local-error", why: "marker transition failure stays in uncaptured WebView devtools" },
-  { file: "main.tsx", line: 62, method: "error", class: "local-error", why: "window reveal failure stays in uncaptured WebView devtools" },
-  { file: "main.tsx", line: 70, method: "error", class: "local-error", why: "parser bootstrap error stays in uncaptured WebView devtools" },
-  { file: "pdfRenderCoordinator.ts", line: 341, method: "error", class: "local-error", why: "PDF renderer failure stays in uncaptured WebView devtools" },
-  { file: "persistence.ts", line: 998, method: "warn", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1003, method: "error", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", line: 1151, method: "error", class: "local-error", why: "managed conflict capture failure stays in uncaptured WebView devtools" },
-  { file: "print.ts", line: 97, method: "error", class: "local-error", why: "optional local renderer failure stays in uncaptured WebView devtools" },
-  { file: "print.ts", line: 112, method: "error", class: "local-error", why: "print preparation failure stays in uncaptured WebView devtools" },
-  { file: "print.ts", line: 156, method: "error", class: "local-error", why: "iframe print failure stays in uncaptured WebView devtools" },
-  { file: "render/parse.ts", line: 51, method: "warn", class: "build-token", why: "compares two public parser build tags" },
-  { file: "sheet/formulaEval.ts", line: 193, method: "warn", class: "internal-id-count", why: "performance warning carries an internal owner id and numeric count" },
-  { file: "store.ts", line: 6936, method: "warn", class: "local-error", why: "post-commit cleanup failure stays in uncaptured WebView devtools" },
-  { file: "ui.ts", line: 490, method: "error", class: "local-error", why: "capsule persistence failure stays in uncaptured WebView devtools" },
-  { file: "ui.ts", line: 515, method: "error", class: "local-error", why: "capsule refresh failure stays in uncaptured WebView devtools" },
-  { file: "ui.ts", line: 552, method: "error", class: "local-error", why: "capsule retirement failure stays in uncaptured WebView devtools" },
-  { file: "update.ts", line: 148, method: "error", class: "scrubbed-error", why: "safeUpdaterErrorChain permits only classified updater stages and causes" },
+const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class: string; why: string })[] = [
+  { file: "App.tsx", line: 1071, method: "warn", bucket: "d", class: "local-error", why: "SafeBack listener registration failed; a Tauri plugin-setup error names no graph object" },
+  { file: "capture.tsx", line: 173, method: "log", bucket: "d", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
+  { file: "capture.tsx", line: 600, method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
+  { file: "components/Block.tsx", line: 1510, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — the facet query carries the property prefix being typed" },
+  { file: "logbook.ts", line: 43, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — the marker transition runs over the block's own text" },
+  { file: "main.tsx", line: 62, method: "error", bucket: "d", class: "local-error", why: "window reveal failure is a native window-manager error, not a graph operation" },
+  { file: "main.tsx", line: 70, method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
+  { file: "pdfRenderCoordinator.ts", line: 343, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pdf.js render rejections name the document they failed on" },
+  { file: "persistence.ts", line: 999, method: "warn", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 1004, method: "error", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
+  { file: "persistence.ts", line: 1152, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a managed conflict capture error is prose about the saved page" },
+  { file: "print.ts", line: 98, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a KaTeX/highlight rejection quotes the source it refused" },
+  { file: "print.ts", line: 113, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pagePrintHtml errors name the page" },
+  { file: "print.ts", line: 157, method: "error", bucket: "d", class: "local-error", why: "iframe print failure is a DOM/print-subsystem error over no page identity" },
+  { file: "render/parse.ts", line: 51, method: "warn", bucket: "d", class: "build-token", why: "compares two public parser build tags" },
+  { file: "sheet/formulaEval.ts", line: 193, method: "warn", bucket: "d", class: "internal-id-count", why: "performance warning carries an internal owner id and numeric count" },
+  { file: "store.ts", line: 6937, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — replay-evidence retirement errors carry the private store path" },
+  { file: "ui.ts", line: 491, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
+  { file: "ui.ts", line: 516, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },
+  { file: "ui.ts", line: 553, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
+  { file: "update.ts", line: 148, method: "error", bucket: "d", class: "scrubbed-error", why: "safeUpdaterErrorChain permits only classified updater stages and causes" },
 ];
 
 function sourceFiles(dir: string, files: string[] = []): string[] {
@@ -98,6 +116,12 @@ describe("I-5 content-out-of-logs ratchet", () => {
       expect(entry.class, `${entry.file}:${entry.line} needs a class`).not.toBe("");
       expect(entry.why, `${entry.file}:${entry.line} needs a reason`).not.toBe("");
     }
+    expect(
+      CONSOLE_ALLOWLIST.filter((entry) => entry.bucket === "c").map((entry) => `${entry.file}:${entry.line}`),
+      "I-5: class (c) is always-on plus a variable that can carry user content, and it is ZERO here. "
+        + "Do not classify a site into (c); fix it — pass the value through failureShape() (exemplar: "
+        + "src/failureShape.ts, used at ui.ts) or log a count (exemplar: persistence.ts logs `{ count }`)",
+    ).toEqual([]);
     expect(
       variableConsoleSites(),
       "I-5: the variable-bearing console census changed. Log a count or a fixed string, never user content "

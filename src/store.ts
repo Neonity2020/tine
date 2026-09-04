@@ -30,6 +30,7 @@ import {
 } from "./clipboard";
 import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
+import { failureShape } from "./failureShape";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
 import { clearHeldExternalChanges } from "./conflictPolicy";
@@ -6933,7 +6934,7 @@ async function drainManagedMoveAcknowledgements(): Promise<void> {
           // its pair deliberately remains exact crash-response evidence; do
           // not turn cleanup failure into a false move failure or retry the
           // semantic transaction.
-          console.warn("Could not retire managed move replay evidence", error);
+          console.warn("Could not retire managed move replay evidence", failureShape(error));
           continue;
         }
         await managedMoveAcknowledgementDelay(item.attempt);

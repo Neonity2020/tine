@@ -10,6 +10,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Failure messages no longer reach the logs with your notes inside them.**
+  Twelve always-on diagnostic lines used to print whatever a failed operation
+  said — and a failed save, print, or conflict capture says it about the page it
+  was working on, by name or by path. Each failure is still reported, and still
+  just as visible; what it prints is now the failure's kind and a content-free
+  identity for it. Two of the twelve, in the Direct Files projection, keep their
+  full text behind `TINE_DEBUG`/`--debug`, so you can still ask for it; the ten
+  in the app itself do not print the text anywhere, which also means a debug log
+  you send us will no longer contain it.
+
+- **A Tine that cannot find anywhere to store its application data now says
+  why.** The fatal startup message names the reason (for example
+  `PermissionDenied`) rather than only that something went wrong — you cannot
+  relaunch past that message to go looking for the cause.
+
 - **The diagnostics flight recorder releases its single-writer lock when it
   shuts down**, instead of leaving release to whenever the last copy of the
   file descriptor happens to close. A process spawn duplicates that descriptor

@@ -38,6 +38,7 @@ import {
 } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
+import { failureShape } from "./failureShape";
 import { recordClipboardAcceptedSaveForTest } from "./clipboardWorkProbe";
 
 // ---------------------------------------------------------------------------
@@ -1148,7 +1149,7 @@ async function doSave(
       } catch (error) {
         // The capture only enriches the review; the retained draft below is
         // the recovery material and must still reach the banner and capsule.
-        console.error("[tine] managed conflict capture failed", error);
+        console.error("[tine] managed conflict capture failed", failureShape(error));
       }
       // Re-notify an already visible banner so its Keep mine enabled state
       // reflects this newly observed (or now unobservable) managed owner. Clear

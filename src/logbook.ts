@@ -4,6 +4,7 @@ import {
 } from "./render/wasm/lsdoc_wasm.js";
 import { parserReady } from "./render/parse";
 import { leadingMarker } from "./editor/marker";
+import { failureShape } from "./failureShape";
 import type { Format } from "./types";
 
 export interface LogbookRow {
@@ -39,7 +40,7 @@ export function applyMarkerTransition(
       withSeconds,
     );
   } catch (e) {
-    console.error("logbook marker transition failed", e);
+    console.error("logbook marker transition failed", failureShape(e));
     return nextRaw;
   }
 }

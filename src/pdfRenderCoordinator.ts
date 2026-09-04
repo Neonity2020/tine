@@ -2,6 +2,8 @@
 // structural adapter implements the queue methods used by PDFPageView while a
 // single coordinator owns render admission and backing-store accounting.
 
+import { failureShape } from "./failureShape";
+
 export const PDF_RENDERING_INITIAL = 0;
 export const PDF_RENDERING_RUNNING = 1;
 export const PDF_RENDERING_PAUSED = 2;
@@ -338,7 +340,7 @@ export class TinePdfRenderingQueue {
         void view.draw().catch((error: unknown) => {
           if ((error as { name?: string } | undefined)?.name !== "RenderingCancelledException") {
             if (this.options.onRenderError) this.options.onRenderError(view, error);
-            else console.error("PDF page render failed", error);
+            else console.error("PDF page render failed", failureShape(error));
           }
         }).finally(() => this.options.coordinator.complete(this, view));
         break;
