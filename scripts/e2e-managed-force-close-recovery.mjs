@@ -13,6 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
 
 await ensureDisplay();
 
@@ -251,24 +252,11 @@ async function refreshSelectedManagedBlock() {
   if (receipt.selectedPage) receipt.selectedPage.blockId = selected.blockId;
 }
 
-async function openPageThroughSwitcher(name) {
-  await browser.keys(["Control", "k"]);
-  const input = await browser.$(".switcher-input");
-  await input.waitForExist({ timeout: 15_000 });
-  await input.setValue(name);
-  await browser.waitUntil(() => browser.execute((expected) => {
-    const active = document.querySelector(".switcher-row.active");
-    return active?.querySelector(".switcher-kind")?.textContent?.trim() === "page"
-      && active.querySelector(".switcher-name")?.textContent?.trim().normalize("NFC") === expected.normalize("NFC");
-  }, name), { timeout: 30_000, timeoutMsg: `switcher did not select existing page ${JSON.stringify(name)}` });
-  await browser.keys("Enter");
-  const title = await browser.$("h1.page-title");
-  await title.waitForExist({ timeout: 30_000 });
-  await browser.waitUntil(async () => (await title.getText()).trim().normalize("NFC") === name.normalize("NFC"), {
-    timeout: 30_000,
-    timeoutMsg: `visible UI did not open ${JSON.stringify(name)}`,
-  });
-}
+// One shared readiness contract for opening a page: find and activate the
+// exact non-block row in a single round trip, retry against the routed
+// title. scripts/lib/e2e-navigation.mjs explains the re-render flake and
+// the block-hit and NFC bugs this removes.
+const openPageThroughSwitcher = (name) => openPageByName(browser, name, { timeout: 30_000 });
 
 async function focusSelectedEditor(blockId) {
   const target = await browser.$(

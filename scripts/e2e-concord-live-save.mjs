@@ -13,6 +13,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { openPageByLink } from "./lib/e2e-navigation.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
 import {
   freeLoopbackPort,
@@ -178,40 +179,14 @@ async function enableManagedStorage(browser, env) {
 }
 
 async function openPage(browser, title) {
+  // Route to the journal feed first: the page-ref links only exist there. The
+  // `[[ ]]` tolerance this journey needed (`:ui/show-brackets?` defaults to on)
+  // is now the shared link route's contract, along with re-finding the link on
+  // each attempt. See scripts/lib/e2e-navigation.mjs.
   const journals = await browser.$(".nav-item*=Journals");
   await journals.waitForClickable({ timeout: 30_000 });
   await journals.click();
-  let link;
-  try {
-    link = await waitFor(async () => {
-      for (const candidate of await browser.$$(".page-ref")) {
-        // A `.page-ref` anchor carries OG's `[[ ]]` decoration inside itself
-        // whenever `:ui/show-brackets?` is on, and that key defaults to ON
-        // (src/render/inline.tsx, pinned by src/render/showBrackets.test.tsx).
-        // The contract here is "a link to this page is reachable", not how the
-        // link is decorated, so compare the name with the decoration removed —
-        // the same tolerance every other journey gets from its `*=Name`
-        // fallback selector.
-        const text = (await candidate.getText()).trim();
-        if (text.replace(/^\[\[/, "").replace(/\]\]$/, "").trim() === title) return candidate;
-      }
-      return undefined;
-    }, 30_000, `${title} was absent from the routed journal links`);
-  } catch (error) {
-    const state = await browser.execute(() => ({
-      body: document.body?.innerText.slice(0, 4000),
-      pageRefs: [...document.querySelectorAll(".page-ref")]
-        .map((node) => node.textContent?.trim() ?? ""),
-      titles: [...document.querySelectorAll(".page-title, .journal-title, .journal-day")]
-        .map((node) => node.textContent?.trim() ?? ""),
-    }));
-    throw new Error(`${String(error)}; routed state: ${JSON.stringify(state)}`);
-  }
-  await link.click();
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()) === title, {
-    timeout: 15_000,
-    timeoutMsg: `${title} did not open`,
-  });
+  await openPageByLink(browser, title, { timeout: 30_000 });
 }
 
 async function editPage(browser, text) {

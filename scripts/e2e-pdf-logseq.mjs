@@ -1468,12 +1468,31 @@ try {
     timeoutMsg: "Linked references did not open the annotation block with its ordinary referrers visible",
   });
   await browser.$('button[title="Go back"]').click();
-  await browser.waitUntil(() => browser.execute(() =>
-    document.querySelectorAll(".pdf-link").length >= 2 &&
-    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-sample.pdf"), {
-    timeout: 10_000,
-    timeoutMsg: "returning from PDF highlight references did not restore the journal surface",
-  });
+  try {
+    await browser.waitUntil(() => browser.execute(() =>
+      document.querySelectorAll(".pdf-link").length >= 2 &&
+      document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-sample.pdf"), {
+      timeout: 10_000,
+      timeoutMsg: "returning from PDF highlight references did not restore the journal surface",
+    });
+  } catch (error) {
+    const state = await browser.execute(() => ({
+      pdfLinks: document.querySelectorAll(".pdf-link").length,
+      filename: document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") ?? null,
+      viewers: document.querySelectorAll(".pdf-viewer").length,
+      panes: [...document.querySelectorAll("[data-pane-id]")].map((pane) => pane.getAttribute("data-pane-id")),
+      title: document.querySelector("h1.page-title")?.textContent?.trim() ?? null,
+      // Tine routes in-app: `location` and `history.length` are constant ("/", 1)
+      // and are NOT routing signals. Report the tab strip instead.
+      tabs: [...document.querySelectorAll(".tab")].map((tab) => ({
+        title: tab.querySelector(".tab-title")?.textContent?.trim() ?? "",
+        active: tab.classList.contains("active"),
+        pane: tab.closest("[data-pane-id]")?.getAttribute("data-pane-id") ?? null,
+      })),
+      backButtons: document.querySelectorAll('button[title="Go back"]').length,
+    })).catch((driverError) => ({ driverError: String(driverError) }));
+    throw new Error(`${error.message}: ${JSON.stringify(state)}`, { cause: error });
+  }
 
   // OG carries an annotation entity through block-ref navigation, then scrolls
   // to that exact highlight. A filename is the resource identity; a second

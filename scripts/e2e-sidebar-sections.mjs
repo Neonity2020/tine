@@ -9,6 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { openPageByLink } from "./lib/e2e-navigation.mjs";
 
 await ensureDisplay();
 
@@ -77,15 +78,11 @@ async function withApp(graph, index, fn) {
   }
 }
 
-async function navigatePage(browser, name) {
-  for (const selector of [`a.page-ref=${name}`, `span.page-ref=${name}`, `*=${name}`]) {
-    const link = await browser.$(selector);
-    if (await link.isExisting()) { await link.click(); break; }
-  }
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
-    timeout: 10_000, timeoutMsg: `${name} did not open`,
-  });
-}
+// One shared contract for routing through a rendered link: tolerate the
+// `[[ ]]` decoration `:ui/show-brackets?` adds by default, click and
+// retry in one round trip, and wait on the routed title. See
+// scripts/lib/e2e-navigation.mjs.
+const navigatePage = (browser, name) => openPageByLink(browser, name);
 
 async function section(browser, name) {
   const control = await browser.$(`[data-sidebar-section="${name}"]`);

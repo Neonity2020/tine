@@ -15,6 +15,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { openPageByLink } from "./lib/e2e-navigation.mjs";
 
 await ensureDisplay();
 
@@ -79,20 +80,13 @@ try {
   // Every page is reached from the journal feed, so return there first: the
   // page-ref links only exist on the journal.
   const openPage = async (name) => {
+    // Route to the journal feed first — this journey is about links the feed
+    // offers after an external whole-graph change — then use the shared link
+    // route, which tolerates `[[ ]]` decoration and retries the click in one
+    // round trip. See scripts/lib/e2e-navigation.mjs.
     const journals = await browser.$(".nav-item*=Journals");
     await journals.click();
-    const selectors = [`a.page-ref=${name}`, `span.page-ref=${name}`, `*=${name}`];
-    const link = await browser.waitUntil(async () => {
-      for (const selector of selectors) {
-        const candidate = await browser.$(selector);
-        if (await candidate.isExisting()) return candidate;
-      }
-      return false;
-    }, { timeout: 15_000, interval: 300, timeoutMsg: `journal feed did not offer a link to ${name}` });
-    await link.click();
-    await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
-      timeout: 15_000, timeoutMsg: `${name} did not open`,
-    });
+    await openPageByLink(browser, name, { timeout: 15_000 });
   };
 
   // The page body is the user's observation surface. Poll it rather than the

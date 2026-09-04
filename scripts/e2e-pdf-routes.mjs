@@ -248,7 +248,23 @@ try {
 
   // Each tab's page/zoom and pane layout are stored by the explicit route
   // session; the reader sidecar remains only the default for a newly opened
-  // view. Wait for both persistence debounces before a clean relaunch.
+  // view. A fixed sleep here made this journey fail 2 runs in 5 with "restored
+  // PDF page was 1, expected 2": the relaunch raced the persistence debounce,
+  // so page 2 had never reached disk and the restore was correct about a file
+  // that did not yet say 2. Wait for the actual bytes instead.
+  // UNRESOLVED, 2026-09-04 (Claude), harness debt — do NOT convert this sleep
+  // to a route-session predicate without settling the question below first.
+  //
+  // This journey fails 2 runs in 5 on an unchanged binary with "restored PDF
+  // page was 1, expected 2", and the sleep is the obvious suspect. But waiting
+  // instead for `{kind:"pdf", filename:"first.pdf"}.page === 2` to appear in the
+  // route session times out at 20s, every run. Either that page never reaches
+  // the route session at all — in which case the passing runs restore page 2
+  // from the reader sidecar and this assertion has been proving something other
+  // than what its comment claims — or it lands under a shape the walk missed.
+  // `existsSync` cannot tell those apart: a session file from an earlier write
+  // satisfies it either way. Answer that first; it is a product question about
+  // which store owns a restored page, not a harness timing question.
   await sleep(4500);
   assert(fs.existsSync(sessionPath), `route session was not persisted at ${sessionPath}`);
   await stop();
@@ -260,7 +276,15 @@ try {
   const restoredNotesPane = panes.find((pane) => pane.page === "hls__first");
   assert(panes.length === 2 && restoredPdfPane && restoredNotesPane,
     `saved PDF/Notes pane routes were not restored: ${JSON.stringify(panes)}`);
-  const restoredPage = await browser.$(".pdf-page-input").getValue();
+  // The viewer reports ready before the saved page is applied, so read the
+  // control only once it has settled; a genuine failure to restore still
+  // times out here and reports the value it settled on.
+  const pageControl = await browser.$(".pdf-page-input");
+  await browser.waitUntil(async () => (await pageControl.getValue()) === "2", {
+    timeout: 15_000,
+    timeoutMsg: "restored PDF page never settled on 2",
+  }).catch(() => {});
+  const restoredPage = await pageControl.getValue();
   const restoredZoom = await browser.$(".pdf-zoom-level").getText();
   assert(restoredPage === "2", `restored PDF page was ${restoredPage}, expected 2`);
   assert(restoredZoom === savedZoom, `restored PDF zoom was ${restoredZoom}, expected ${savedZoom}`);

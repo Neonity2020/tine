@@ -17,6 +17,7 @@ import {
   tauriCapabilities,
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
 
 if (process.platform !== "win32") throw new Error("Windows managed-storage smoke must run on Windows");
 const APP = process.env.TINE_APP;
@@ -298,31 +299,14 @@ async function waitForActivation() {
 }
 
 async function openPage(title, { expectedMarker = nestedMarker, requireHeading = true } = {}) {
-  // WebView2 attachment does not guarantee native keyboard focus. Fixture
-  // navigation is not a shortcut assertion, so enter the switcher through its
-  // visible application control.
-  const search = await browser.$('button[title^="Search (Ctrl+K)"]');
-  await search.waitForClickable({ timeout: 15_000 });
-  await search.click();
-  const input = await browser.$(".switcher-input");
-  await input.waitForExist({ timeout: 15_000 });
-  await input.setValue(title);
-  let row;
-  await browser.waitUntil(async () => {
-    // Block-search hits can contain the exact page title while still routing
-    // back to the current page. Select the typed page result itself: its kind
-    // is page/journal and its displayed page name is an exact match.
-    for (const candidate of await browser.$$(".switcher-row:not(.block-result)")) {
-      const kind = await candidate.$(".switcher-kind").getText();
-      const name = await candidate.$(".switcher-name").getText();
-      if ((kind === "page" || kind === "journal") && name === title) {
-        row = candidate;
-        return true;
-      }
-    }
-    return false;
-  }, { timeout: 30_000, timeoutMsg: `Ctrl+K did not find ${title}` });
-  await row.click();
+  // WebView2 attachment does not guarantee native keyboard focus, so this
+  // journey enters the switcher through the visible Search control rather than
+  // Ctrl+K; fixture navigation is not a shortcut assertion. Everything else --
+  // excluding block hits (a block whose text contained the page title is what
+  // broke run 33350869828), exact name matching, and activating in ONE round
+  // trip so no row handle outlives the switcher's re-render -- is now the
+  // shared contract in scripts/lib/e2e-navigation.mjs.
+  await openPageByName(browser, title, { entry: "button", timeout: 30_000 });
   if (requireHeading) {
     const heading = await browser.$("h1.page-title");
     await heading.waitForExist({ timeout: 30_000 });

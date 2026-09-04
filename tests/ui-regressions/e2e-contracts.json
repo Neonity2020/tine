@@ -96,8 +96,7 @@
    "nonRequirements": [
     "Exact pixels, menu geometry, coordinate values, CSS/DOM nesting, timing, palette/order, or animation."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-08-17: harness debt, source-proven, not a product defect. The journey was written on 2026-08-11 (981e8ffd) and no suite, npm script or workflow ever selected it, so nothing noticed when 3d79497f \"fix(outliner): add OG-compatible nested block drops\" (2026-08-12, GH #326) landed one day later. That change added blockDropPosition(), which returns \"child\" whenever clientX - blockRect.left > 50 -- OG's deeper-than-50px nesting zone. This journey drops at target.left + width * 0.65, far beyond 50px, so B+C are now nested under E and the visible roots are A,D,E rather than A,D,E,B,C. Failed identically on two unchanged-binary runs at 4253d52b (72.3s, 72.0s; capsule step \"drag B+C from A bullet to after E\"). The drop x-coordinate is explicitly a nonRequirement of this very contract, so the repair belongs to the harness, not the product: aim the drop inside E's shallow (<= 50px from its left edge) zone and keep the vertical half that means \"after\". Quarantined under the AGENTS.md 2b E2E stop-loss after two attempts instead of debugging further; it stays selected by linux-release so its evidence is retained, and returns to stable with that coordinate repair."
+   "stability": "stable"
   },
   "scripts/e2e-capabilities.mjs": {
    "contracts": [
@@ -384,8 +383,7 @@
     "Exact breakpoint pixel value, drawer width, overlay opacity, or transition duration.",
     "Exact pane coordinates or DOM parentage once the persistent-sidebar mode and workspace containment are proven."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-09-01: the v0.6.981 release gate exhausted the two-attempt stop-loss on presentation-only oracles after the semantic outcomes succeeded. The exact candidate remained in roomy persistent mode with no modal roles, scrims, inert surfaces, or active drawer; the PDF and source panes both remained bounded by the workspace beside the persistent right sidebar. The journey first rejected the sidebar's changed absolute x coordinate and, after that non-requirement was removed, rejected that .pdf-pane was no longer a direct child of .drawer-workspace after the new ordinary-pane PDF route. Keep the compact and roomy state diagnostics selected, but restore blocking only after the final neighbor assertion is expressed through persistent mode and workspace ownership rather than coordinates or DOM ancestry."
+   "stability": "stable"
   },
   "scripts/e2e-multigraph.mjs": {
    "contracts": [
@@ -529,7 +527,7 @@
     "Exact CSS filter/DOM strategy."
    ],
    "stability": "quarantined",
-   "quarantineReason": "2026-09-01: openOutlineWithNativePointer cannot reach the Outline control. The inline button[title=\"Outline\"] probe reports not-visible, so the journey falls through to the More-settings overflow, where .pdf-settings-overflow button Outline has a 0x0 rect and receivesPointer:false -- its computed display is inline-block, i.e. the @container pdfviewer (max-width: 520px) rule that turns that row into a grid did NOT match, which is the same width at which the inline action should have been visible. The two probes therefore disagree about the pane width. Reproduced identically on 20712e3c and on its parent 3a123bc1, so it is independent of the graph-text gate-order fix that surfaced it. UNRESOLVED and deliberately not reasoned away: this is either a harness visibility probe defect or a real product defect in which the Outline is unreachable by pointer at this pane width. Requeue before the next release; the journey still runs for diagnostics, it is only non-blocking."
+   "quarantineReason": "2026-09-04 (Claude): the ORIGINAL reason is void, and one inference in it was wrong. It read the overflow button's computed `display: inline-block` as proof the container query \"did NOT match\"; a bare <button> computes inline-block from the UA stylesheet whatever its parent does, and its 0x0 rect is simply what a child of a `display: none` parent measures. The two probes never disagreed \u2014 the toolbar copy WAS hidden and the menu copy WAS unhittable, both at once, which is the bug. That was the shipped cascade-order defect, now fixed (see e2e-pdf-routes). The journey now advances ~540 lines past its old blocker to a boundary never reached before: after Linked references opens the annotation block, `button[title=\"Go back\"]` is matched document-wide while two panes exist, so the click can land on a pane with no history and .pdf-link stays 0 while the viewer is correctly restored (filename intact). Tine routes in-app \u2014 location and history.length are constant (\"/\", 1) and are NOT routing signals; the retained diagnostic dumps the tab strip and back-button count instead. Next step is a pane-scoped back selector. Stop-loss spent."
   },
   "scripts/e2e-pdf-routes.mjs": {
    "contracts": [
@@ -551,7 +549,7 @@
     "Exact PDF pixels, pane dimensions, DOM nesting, drag geometry, or mobile navigation."
    ],
    "stability": "quarantined",
-   "quarantineReason": "2026-09-01: the v0.6.981 release gate first exposed and then verified the fixed typed-page blur race, advancing the journey to its Notes action. At the narrow companion width the direct .pdf-notes-btn probe reports not displayed, while opening More settings leaves the overflow Notes button present but not clickable; this is the same contradictory inline-versus-overflow visibility boundary as the separately quarantined PDF Outline-pointer journey. The stop-loss is exhausted, so the route/tab/page-state diagnostics stay selected but non-blocking. Restore blocking only after one user-pointer strategy can reach Notes at this width and the complete unchanged-binary route/relaunch journey passes burn-in."
+   "quarantineReason": "2026-09-04 (Claude): the ORIGINAL reason is void. It read the inline-versus-overflow visibility contradiction as a possible harness defect; it was a shipped product defect, now fixed \u2014 .pdf-settings-overflow's plain `display: none` default was written AFTER the @container pdfviewer (max-width: 520px) rule that turns the row into a grid, and at-rules add no specificity, so five tools (Fit width, Fit height, Area highlight, Notes, Outline) were unreachable by any pointer at 520px or narrower. Guarded by scripts/check-pdf-overflow-reachability.mjs and src/styles/cascadeOrder.test.ts. The journey now runs to completion but flakes 2 in 5 on an unchanged binary: \"restored PDF page was 1, expected 2\" after a kill-and-relaunch. The restore-side read now waits for the page control to settle. The persist side is an OPEN PRODUCT QUESTION written above the sleep in the journey: waiting for page 2 to appear in the route session times out every run, so either the route session never carries it and the passing runs restore from the reader sidecar, or the walk missed its shape. Settle that before restoring blocking; the two-attempt stop-loss for this batch is spent."
   },
   "scripts/e2e-pdf-scroll-resources.mjs": {
    "contracts": [

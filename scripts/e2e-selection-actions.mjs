@@ -17,6 +17,7 @@ import {
 } from "./e2e-capabilities.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
 import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+import { openPageByLink } from "./lib/e2e-navigation.mjs";
 
 const CANDIDATE_COMMIT = process.env.TINE_CANDIDATE_COMMIT;
 if (!CANDIDATE_COMMIT || !/^[0-9a-f]{40}$/.test(CANDIDATE_COMMIT)) {
@@ -176,32 +177,11 @@ async function openSession() {
 }
 
 async function openPage(name) {
-  await browser.waitUntil(async () => {
-    const refs = await browser.$$(".page-ref");
-    for (const ref of refs) {
-      const text = (await ref.getText()).trim();
-      if (text === name || text === `[[${name}]]`) return true;
-    }
-    return false;
-  }, {
-    timeout: 15_000,
-    timeoutMsg: `journal did not render a normal page link for ${name}`,
-  });
-  const refs = await browser.$$(".page-ref");
-  let pageRef;
-  for (const ref of refs) {
-    const text = (await ref.getText()).trim();
-    if (text === name || text === `[[${name}]]`) {
-      pageRef = ref;
-      break;
-    }
-  }
-  assert(pageRef, `rendered journal link for ${name} disappeared before click`, []);
-  await pageRef.click();
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
-    timeout: 10_000,
-    timeoutMsg: `rendered journal link did not route to ${name}`,
-  });
+  // The shared link route already tolerates `[[ ]]` decoration and re-finds the
+  // link on each attempt, so a rendered journal link replaced between discovery
+  // and click can no longer strand this journey. See
+  // scripts/lib/e2e-navigation.mjs.
+  await openPageByLink(browser, name, { timeout: 15_000 });
   await waitForRoots((rows) => rows.length === 5, "routed page roots did not load");
 }
 

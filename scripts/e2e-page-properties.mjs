@@ -16,6 +16,7 @@ import {
 } from "./e2e-capabilities.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
 
 await ensureDisplay();
 
@@ -91,41 +92,11 @@ const driver = spawn(TD, driverArgs, {
 await sleep(2500);
 let browser;
 
-async function openPage(name) {
-  const current = await browser.$("h1.page-title").getText().catch(() => "");
-  if (current.trim() === name) return;
-  // Fixture routing is not a sidebar contract. Windows can attach WebDriver
-  // while the sidebar is still absent or intentionally collapsed, so use the
-  // app's visible search control and wait for the exact indexed page instead
-  // of treating one incidental startup surface as readiness proof.
-  // The global shortcut is also the production route when compact/native
-  // chrome has the sidebar button outside the current viewport. Requiring that
-  // incidental button to be WebDriver-clickable made the Windows journey fail
-  // behind an otherwise ready journal at narrow/default window geometry.
-  await browser.keys(["Control", "k"]);
-  const input = await browser.$(".switcher-input");
-  await input.waitForExist({ timeout: 10_000 });
-  await input.setValue(name);
-  await browser.waitUntil(() => browser.execute((target) =>
-    [...document.querySelectorAll(".switcher-row")].some((row) =>
-      row.querySelector(".switcher-kind")?.textContent?.trim() === "page"
-      && row.querySelector(".switcher-name")?.textContent?.trim() === target), name), {
-    timeout: 20_000,
-    timeoutMsg: `switcher did not expose exact page ${name}`,
-  });
-  const opened = await browser.execute((target) => {
-    const row = [...document.querySelectorAll(".switcher-row")].find((candidate) =>
-      candidate.querySelector(".switcher-kind")?.textContent?.trim() === "page"
-      && candidate.querySelector(".switcher-name")?.textContent?.trim() === target);
-    row?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
-    return Boolean(row);
-  }, name);
-  if (!opened) throw new Error(`exact switcher result disappeared for ${name}`);
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
-    timeout: 10_000,
-    timeoutMsg: `could not open ${name}`,
-  });
-}
+// One shared readiness contract for opening a page: find and activate the
+// exact non-block row in a single round trip and retry against the routed
+// title, so no element handle outlives the switcher's re-render. See
+// scripts/lib/e2e-navigation.mjs.
+const openPage = (name) => openPageByName(browser, name);
 
 async function openPageProperties() {
   await browser.$("[data-page-actions-trigger]").click();

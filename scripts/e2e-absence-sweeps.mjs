@@ -13,6 +13,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { remote } from "webdriverio";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
 import {
   createWebdriverLifecycle,
   tauriCapabilities,
@@ -360,30 +361,11 @@ async function clickPanelAction(text) {
   throw new Error(`recovery panel exposed no exact ${JSON.stringify(text)} action`);
 }
 
-async function openPageThroughSwitcher(name) {
-  await browser.keys(["Control", "k"]);
-  const input = await browser.$('[role="combobox"]');
-  await input.waitForDisplayed({ timeout: 15_000 });
-  await input.setValue(name);
-  await browser.waitUntil(() => browser.execute((expected) => {
-    const selected = document.querySelector('[role="option"][aria-selected="true"]');
-    const text = (selected?.textContent ?? "").trim().replace(/\s+/g, " ").normalize("NFC");
-    return text.includes("page") && text.includes(expected.normalize("NFC"));
-  }, name), {
-    timeout: 60_000,
-    interval: 200,
-    timeoutMsg: `switcher did not select restored page ${JSON.stringify(name)}`,
-  });
-  await browser.keys("Enter");
-  await browser.waitUntil(() => browser.execute((expected) =>
-    [...document.querySelectorAll("h1")].some((heading) =>
-      (heading.textContent ?? "").trim().normalize("NFC") === expected.normalize("NFC")
-    ), name), {
-    timeout: 60_000,
-    interval: 200,
-    timeoutMsg: `visible UI did not navigate to restored page ${JSON.stringify(name)}`,
-  });
-}
+// One shared readiness contract for opening a page: find and activate the
+// exact non-block row in a single round trip, retry against the routed
+// title. scripts/lib/e2e-navigation.mjs explains the re-render flake and
+// the block-hit and NFC bugs this removes.
+const openPageThroughSwitcher = (name) => openPageByName(browser, name, { timeout: 60_000 });
 
 async function acceptNativeConfirmation(label, before) {
   const dialog = await waitFor(() => windowIds("^Tine$").find((id) => !before.has(id)), 30_000,

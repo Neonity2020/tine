@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { openPageByLink } from "./lib/e2e-navigation.mjs";
 
 await ensureDisplay();
 
@@ -46,19 +47,11 @@ const td = spawn(TD, webdriverServerArgs(DRIVER_PORT, NATIVE_PORT, process.env.W
 await sleep(2500);
 
 let browser;
-async function openPage(label) {
-  for (const selector of [`a.page-ref=${label}`, `span.page-ref=${label}`, `*=${label}`]) {
-    const link = await browser.$(selector);
-    if (await link.isExisting()) {
-      await link.click();
-      await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === label, {
-        timeout: 10_000, timeoutMsg: `${label} did not open`,
-      });
-      return;
-    }
-  }
-  throw new Error(`no page link for ${label}`);
-}
+// One shared contract for routing through a rendered link: tolerate the
+// `[[ ]]` decoration `:ui/show-brackets?` adds by default, click and
+// retry in one round trip, and wait on the routed title. See
+// scripts/lib/e2e-navigation.mjs.
+const openPage = (label) => openPageByLink(browser, label);
 
 try {
   browser = await remote({

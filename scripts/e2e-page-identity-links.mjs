@@ -14,6 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
 
 await ensureDisplay();
 
@@ -60,18 +61,11 @@ try {
   });
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 30_000 });
 
-  const gotoPage = async (name) => {
-    await browser.keys(["Control", "k"]);
-    const input = await browser.$(".switcher-input");
-    await input.waitForExist({ timeout: 10_000 });
-    await input.setValue(name);
-    await browser.waitUntil(() => browser.execute((wanted) => [...document.querySelectorAll(".switcher-row .switcher-name")]
-      .some((element) => element.textContent?.trim() === wanted), name),
-      { timeout: 15_000, interval: 100, timeoutMsg: `switcher never offered ${name}` });
-    await browser.keys(["Enter"]);
-    await browser.waitUntil(async () => (await browser.execute(() => document.querySelector("h1.page-title")?.textContent?.trim())) === name,
-      { timeout: 20_000, timeoutMsg: `never reached ${name}` });
-  };
+  // One shared readiness contract for opening a page: find and activate the
+  // exact non-block row in a single round trip and retry against the routed
+  // title, so no element handle outlives the switcher's re-render. See
+  // scripts/lib/e2e-navigation.mjs.
+  const gotoPage = (name) => openPageByName(browser, name);
 
   // 1. The title::-bearing file is reachable under its TITLE, not its filename.
   await gotoPage("Real Title");
