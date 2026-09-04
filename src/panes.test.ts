@@ -26,6 +26,7 @@ import {
   splitPane,
   type LayoutNode,
 } from "./panes";
+import { pdfNavigationIntent } from "./pdfNavigation";
 import { hasSelection, selectBlock, setDoc } from "./store";
 import { cellSel, setCellSel } from "./sheet/selection";
 import type { PaneSnapshot } from "./router";
@@ -783,6 +784,46 @@ describe("PDF pane routes", () => {
     expect(reused?.viewId).toBe(alpha.viewId);
     expect(layoutPaneIds()).toHaveLength(2);
     expect(paneRouter(pdfPane).route()).toMatchObject({ kind: "pdf", viewId: alpha.viewId, page: 9 });
+  });
+
+  it("reopening the PDF you are already reading keeps your place", () => {
+    // OG parity: clicking the link for the current resource, with no page and
+    // no highlight asked for, is a NO-OP. Tine published a navigation intent
+    // anyway, and the viewer's navigation effect resolves `target.page ?? 1`
+    // and clears the highlight overlay -- so clicking the link for the PDF
+    // already on screen threw away your scroll position and your highlight.
+    // The intent channel is the seam: an intent published here IS a request to
+    // move, so "no new intent" is the same statement as "no jump".
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const opened = openPdf("assets/alpha.pdf", "Alpha", 4, "hl-4", { sourcePaneId: "main" })!;
+    const afterOpen = pdfNavigationIntent(opened.viewId)();
+    expect(afterOpen).toMatchObject({ page: 4, highlightId: "hl-4" });
+
+    focusPane("main");
+    const reopened = openPdf("assets/alpha.pdf", "Alpha", undefined, undefined, {
+      sourcePaneId: "main",
+    });
+
+    expect(reopened?.viewId).toBe(opened.viewId);
+    expect(pdfNavigationIntent(opened.viewId)()).toBe(afterOpen);
+  });
+
+  it("still navigates when reopening the current PDF DOES ask for a page", () => {
+    // The other half: the no-op above must not swallow a real request.
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const opened = openPdf("assets/alpha.pdf", "Alpha", 4, undefined, { sourcePaneId: "main" })!;
+    const afterOpen = pdfNavigationIntent(opened.viewId)();
+
+    focusPane("main");
+    openPdf("assets/alpha.pdf", "Alpha", 7, undefined, { sourcePaneId: "main" });
+    const afterJump = pdfNavigationIntent(opened.viewId)();
+
+    expect(afterJump).not.toBe(afterOpen);
+    expect(afterJump).toMatchObject({ page: 7 });
+
+    focusPane("main");
+    openPdf("assets/alpha.pdf", "Alpha", undefined, "hl-9", { sourcePaneId: "main" });
+    expect(pdfNavigationIntent(opened.viewId)()).toMatchObject({ highlightId: "hl-9" });
   });
 
   it("does not expose deliberate duplicate views before shared annotation ownership lands", () => {

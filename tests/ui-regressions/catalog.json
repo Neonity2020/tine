@@ -24,6 +24,29 @@
       "notes": "Go to page 2 of a PDF, zoom in, and the reader jumped back to page 1; quit and reopen and you were on page 1 rather than where you left off. Traced in the real app, the chain was: a zoom transiently collapses the scroll container so the browser clamps scrollTop to 0; the scroll observer (updateCurPage) reads that half-resized layout and publishes page 1 as reader view state; that write mutates the pdf route, which rebuilds resolvedTarget, which re-fires the navigation effect, which navigates to page 1 — locking it in. A load-time fit-width scale change made it worse by capturing a zoom anchor on page 1 that settleZoom re-asserted AFTER the reader had deliberately moved to page 2. Four coupled changes in src/components/PdfViewer.tsx: suppress the scroll-derived page while a zoom is settling; anchor a zoom to the page being read rather than a whole-document scroll ratio; let an explicit navigation supersede a pending zoom anchor; and stop navigateToTarget silently substituting page 1 when the target page's wrapper is merely not mounted yet. Evidence: fail-before 2/3 on the exact symptom against master's binary affe9be1, pass-after 8/8 on the branch binary. This is also the defect behind the e2e-pdf-routes flake that had it quarantined."
     },
     {
+      "id": "UI-PDF-REOPEN-CURRENT-RESOURCE-JUMPS-20260904",
+      "title": "Opening a link to the PDF you are already reading keeps your place instead of jumping to page 1",
+      "family": "pdf-reader-routes",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/panes.test.ts",
+          "scripts/e2e-pdf-logseq.mjs"
+        ],
+        "scenario": "pdf.reopening-the-current-resource-is-a-no-op",
+        "failBefore": "proven"
+      },
+      "notes": "Clicking an asset link to the PDF already open in that pane — a plain ![](....pdf) with no page and no highlight — threw away the reader's position and the highlight overlay. openPdf's existing-tab branch published a PDF navigation intent unconditionally, and an intent IS a request to move: the viewer's navigation effect resolves target.page ?? 1 and clears the highlight overlay, so an empty intent navigated to page 1. Publishing it only when a page or a highlight is actually requested is the fix (src/panes.ts). Necessity gate proven at the unit layer: 'reopening the PDF you are already reading keeps your place' fails pre-fix with the intent rebuilt as {page: undefined}, and its companion test proves a real page or highlight request still navigates. e2e-pdf-logseq already encoded this exact OG-parity contract ('reopening the already-current resource without a page/highlight intent is a no-op, not an implicit jump to page 1') and master fails it: with the one-line change reverted in the same tree, the journey dies at that assertion with {overlay: null, target: null}. An earlier batch mistook this fix for a regression in a later Close PDF step; the real cause was that the close helper assumed one click empties the pane, which is false when the journey deliberately keeps two PDF tabs open."
+    },
+    {
       "id": "UI-CONCORD-DEFAULT-FULL-WIDTH-20260901",
       "title": "Concord opens at the pane's full content width without requiring the user to discover wide mode",
       "family": "external-change-conflict-resolution",

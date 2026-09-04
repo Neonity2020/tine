@@ -526,8 +526,7 @@
     "Exact theme palette/RGB.",
     "Exact CSS filter/DOM strategy."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-09-04 (Claude, stop-loss lifted by Martin for this batch). Two earlier blockers are FIXED and the journey now runs ~1,600 lines: (1) the recorded inline-versus-overflow \"probes disagree about pane width\" was a shipped CSS cascade-order defect, fixed in c79ddbd0; (2) returning from a highlight's Linked references used a document-wide `button[title=\"Go back\"]` while two panes exist. Linked references opens the annotation in its own TAB, so that pane's Back is legitimately DISABLED and the way back is the source tab; the journey now accepts either and states the user outcome rather than the mechanism. CURRENT BLOCKER, a genuine product candidate never reached before: clicking the .pdf-link for the PDF you are ALREADY reading, with no page and no highlight requested, discards your place -- both data-pdf-highlight-target and the .pdf-hl-target overlay go null, where OG treats it as a no-op. Reproduced against master's binary affe9be1 as well as the branch, so it is not caused by this batch. The obvious one-line fix (skip publishPdfNavigationIntent in panes.ts openPdf when both page and highlightId are undefined) was TRIED AND REVERTED: it reproducibly regressed PDF closing, failing at closePdfWithNativePointer 900 lines earlier, 3/3, where master passes. So the empty intent is load-bearing for some close/---focus path; find that before removing it. Do not re-apply that patch without running the whole journey."
+   "stability": "stable"
   },
   "scripts/e2e-pdf-routes.mjs": {
    "contracts": [

@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Clicking a link to the PDF you are already reading keeps your place.**
+  Opening a PDF link with no page or highlight attached — a plain `![](…​.pdf)`
+  asset link to the document already open in that pane — jumped the reader back
+  to page 1 and cleared the highlight you were looking at. Reopening the
+  resource you are already on is now a no-op; a link that does name a page or a
+  highlight still navigates.
+
 - **Zooming a PDF no longer throws you back to page 1, and your place in a PDF
   survives quitting and reopening.** A zoom briefly collapses the reader's
   scroll position, and the reader was recording that momentary position as

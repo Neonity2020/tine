@@ -589,7 +589,17 @@ export function openPdf(
     const router = paneRouter(existing.paneId);
     router.setActiveTab(existing.tabId);
     if (page !== undefined) router.updateActivePdfViewState({ page });
-    publishPdfNavigationIntent(existing.route.viewId, { page, highlightId });
+    // Reopening the resource that is ALREADY current, with no page and no
+    // highlight asked for, is a no-op -- not an implicit jump. An intent IS a
+    // request to move: the viewer's navigation effect resolves `target.page ?? 1`
+    // and clears the highlight overlay, so publishing an empty one here threw
+    // away your place in the PDF you were already reading. Pinned by
+    // "reopening the PDF you are already reading keeps your place" in
+    // src/panes.test.ts, together with its companion proving a real page or
+    // highlight request still navigates.
+    if (page !== undefined || highlightId !== undefined) {
+      publishPdfNavigationIntent(existing.route.viewId, { page, highlightId });
+    }
     if (!options.background) focusPane(existing.paneId);
     return existing.route;
   }
