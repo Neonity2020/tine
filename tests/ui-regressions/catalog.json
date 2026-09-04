@@ -10216,6 +10216,33 @@
         "failBefore": "proven"
       },
       "notes": "User outcome (blocking core operation): `{{query \"xyz\"}}` listed the page it was written on, and that rendering contained the query again, so the results nested into themselves -- the reporter's screenshot is the same page repeating down the pane. The backend is not wrong: the host block's own text really does contain the search term. The missing rule is at the presentation boundary, which is the only layer that knows which block hosts the query. OG parity provenance: logseq/og at 6e7afa8e, frontend/components/query/result.cljs get-query-result computes `remove-blocks (if current-block-uuid [current-block-uuid] nil)` with the comment 'exclude the current one, otherwise it'll loop forever', and frontend/db/query_react.cljs custom-query-result-transform removes exactly those uuids -- the host block only, NOT its children, which remain ordinary results. Tine now does the same in one place per membership decision: `withoutHostBlock` over the RefGroups (all three fetch paths funnel through it) and the equivalent filter over `execution.hits`, because the Search presentation renders those hits directly rather than the groups. Diagnostics and the query explanation keep the unfiltered execution: the hit was really found, it is simply not shown to itself. Breadth: every query-execution call site was inventoried -- the tag-page query (Page.tsx), the virtual query workspace and the quick switcher have no host block at all, so QueryMacro is the whole class. Evidence layer: jsdom render over the real Block/QueryMacro path with the backend mocked to answer honestly; the fail-before run reproduces the recursion literally (the list rendered 'query' nine times)."
+    },
+    {
+      "id": "UI-LINKED-REFS-COLLAPSE-THRESHOLD-479",
+      "title": "A page's Linked References honor :ref/linked-references-collapsed-threshold from config.edn",
+      "family": "references",
+      "sources": {
+        "issues": [
+          479
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/LinkedReferences.test.tsx::Linked References honor :ref/linked-references-collapsed-threshold (GH #479)::starts collapsed at a threshold of 0, however few backlinks there are",
+          "src/components/LinkedReferences.test.tsx::Linked References honor :ref/linked-references-collapsed-threshold (GH #479)::starts expanded below a configured threshold and collapsed at it",
+          "src/components/LinkedReferences.test.tsx::Linked References honor :ref/linked-references-collapsed-threshold (GH #479)::falls back to OG's 100 when the graph does not set the key",
+          "crates/tine-core/src/config.rs::config::tests::linked_references_collapsed_threshold_reads_the_og_key"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome (flexible presentation behavior, but the setting itself is the requirement): the reporter set `:ref/linked-references-collapsed-threshold 0` in config.edn and Tine ignored it. Tine already implemented OG's RULE correctly -- collapse when the TOTAL backlink count reaches the threshold, which is `default-collapsed? (>= total threshold)` in logseq/og components/reference.cljs at 6e7afa8e -- but wired the threshold to a hard-coded 100 and never read the key. Now plumbed config.edn -> Config -> GraphMeta -> LinkedReferences, with OG's own fallback of 100 when the key is absent or not an integer (state.cljs get-linked-references-collapsed-threshold). Zero is deliberately a real value meaning `always collapsed` -- the request in the Logseq discussion thread the key came from -- so the frontend uses `?? 100`, never a falsy test; a test pins the 0 case for exactly that reason. Scope: Linked References only. OG gives Unlinked References `:default-collapsed? true` unconditionally with no threshold, and Tine matches that already, so the key is deliberately NOT applied there. The section's own expand/collapse override (GH #272) still wins over the computed default, so this changes the default and not the control. Also note the parser: int_value reads ASCII digits, so a negative threshold falls back to 100 where OG would collapse always -- a value no sane config carries, recorded rather than special-cased."
     }
   ]
 }

@@ -5307,6 +5307,11 @@ fn rename_source_remove_failpoint() -> io::Result<()> {
     Ok(())
 }
 
+/// OG's default when `:ref/linked-references-collapsed-threshold` is absent.
+fn default_linked_references_collapsed_threshold() -> u32 {
+    100
+}
+
 // `PartialEq` is load-bearing, not a convenience: the config watcher refreshes
 // a graph and then compares the meta it produced against the meta the frontend
 // already has, so a rewrite that changes no setting emits nothing.
@@ -5322,6 +5327,10 @@ pub struct GraphMeta {
     pub start_of_week: u32,
     /// Extra property keys to hide from the rendered properties area.
     pub block_hidden_properties: Vec<String>,
+    /// Backlink count at which a page opens its Linked References collapsed
+    /// (`:ref/linked-references-collapsed-threshold`, OG default 100).
+    #[serde(default = "default_linked_references_collapsed_threshold")]
+    pub linked_references_collapsed_threshold: u32,
     /// Template name applied to a new, empty journal page (if configured).
     pub default_journal_template: Option<String>,
     /// Graph-portable startup page from `:default-home {:page "..."}`.
@@ -11442,6 +11451,9 @@ impl Graph {
             },
             shortcuts: self.config.shortcuts.clone(),
             start_of_week: self.config.start_of_week,
+            linked_references_collapsed_threshold: self
+                .config
+                .linked_references_collapsed_threshold,
             block_hidden_properties: self.config.block_hidden_properties.clone(),
             default_journal_template: self.config.default_journal_template.clone(),
             default_home: self.config.default_home.clone(),

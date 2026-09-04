@@ -986,6 +986,10 @@ export interface GraphMeta {
   shortcuts: Record<string, string>;
   start_of_week: number; // Logseq :start-of-week, 0=Monday … 6=Sunday (default 6)
   block_hidden_properties: string[];
+  /** Logseq `:ref/linked-references-collapsed-threshold` — a page opens its
+   *  Linked References collapsed once the total backlink count reaches this.
+   *  Absent or non-integer in config.edn means OG's default, 100. */
+  linked_references_collapsed_threshold: number;
   default_journal_template: string | null;
   /** Graph-portable startup page from config.edn `:default-home {:page "..."}`. */
   default_home?: string | null;

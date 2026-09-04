@@ -4,6 +4,7 @@ import { backend } from "../backend";
 import type { BacklinkFilterContext, BlockDto, RefGroup } from "../types";
 import { LinkedReferences } from "./LinkedReferences";
 import { resetReferenceSectionState } from "../referenceSectionState";
+import { setGraphMeta } from "../ui";
 
 vi.mock("./LiveRefGroup", () => ({
   LiveRefGroup: (props: { blocks: BlockDto[]; showBreadcrumb?: boolean }) => (
@@ -33,6 +34,7 @@ afterEach(() => {
   document.body.innerHTML = "";
   localStorage.clear();
   resetReferenceSectionState();
+  setGraphMeta(null);
   vi.restoreAllMocks();
 });
 
@@ -624,5 +626,63 @@ describe("Linked References header control order (GH #475)", () => {
     } finally {
       dispose();
     }
+  });
+});
+
+// GH #479. Tine implemented OG's rule — a page opens its Linked References
+// collapsed once the TOTAL backlink count reaches the threshold — but wired the
+// threshold to a constant 100 and never read
+// `:ref/linked-references-collapsed-threshold` from config.edn. The reporter's
+// case is 0, which the Logseq discussion that produced the key uses to mean
+// "always collapsed"; it must not be mistaken for "unset".
+describe("Linked References honor :ref/linked-references-collapsed-threshold (GH #479)", () => {
+  const backlinks = (count: number): RefGroup[] => [{
+    page: "Source",
+    kind: "page",
+    blocks: Array.from({ length: count }, (_, index) => block(`b${index}`, `[[Target]] ${index}`)),
+  }];
+
+  async function mountWithThreshold(count: number, threshold?: number) {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(backlinks(count));
+    setGraphMeta(
+      threshold === undefined
+        ? ({ root: "/graphs/A" } as never)
+        : ({ root: "/graphs/A", linked_references_collapsed_threshold: threshold } as never),
+    );
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    return { root, dispose };
+  }
+
+  it("starts collapsed at a threshold of 0, however few backlinks there are", async () => {
+    const { root, dispose } = await mountWithThreshold(3, 0);
+    expect(root.querySelector(".test-ref-group")).toBeNull();
+    // Still the user's to open — this changes the default, not the control.
+    (root.querySelector(".references-header") as HTMLElement).click();
+    await tick();
+    expect(root.querySelector(".test-ref-group")).not.toBeNull();
+    dispose();
+  });
+
+  it("starts expanded below a configured threshold and collapsed at it", async () => {
+    const below = await mountWithThreshold(4, 5);
+    expect(below.root.querySelector(".test-ref-group")).not.toBeNull();
+    below.dispose();
+
+    const at = await mountWithThreshold(5, 5);
+    expect(at.root.querySelector(".test-ref-group")).toBeNull();
+    at.dispose();
+  });
+
+  it("falls back to OG's 100 when the graph does not set the key", async () => {
+    const under = await mountWithThreshold(99);
+    expect(under.root.querySelector(".test-ref-group")).not.toBeNull();
+    under.dispose();
+
+    const over = await mountWithThreshold(100);
+    expect(over.root.querySelector(".test-ref-group")).toBeNull();
+    over.dispose();
   });
 });

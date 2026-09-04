@@ -1030,6 +1030,11 @@ mod tests {
             .markdown
             .contains("- # Pages, links, references, and search"));
         assert!(page.markdown.contains("Unlinked References"));
+        // The graph, not a constant, decides when Linked References open folded
+        // (GH #479), so the key the user has to set is named here.
+        assert!(page
+            .markdown
+            .contains(":ref/linked-references-collapsed-threshold"));
         assert!(page.markdown.contains("available page/tag chips"));
         assert!(page.markdown.contains("**Copy / export**"));
         assert!(page.markdown.contains("dotted underline"));

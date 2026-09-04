@@ -18,6 +18,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **`:ref/linked-references-collapsed-threshold` in `config.edn` is honored.**
+  Tine already collapsed a page's Linked References once the backlink count got
+  large, matching Logseq's rule, but the number was hard-wired to Logseq's
+  default of 100 and your setting was ignored. Setting it to `0` now means what
+  it means in Logseq: every page opens with the panel folded (GH #479).
+
 - **A query no longer returns the block it is written in.** `{{query "xyz"}}`
   matched its own text, so the results listed the page the query lives on —
   which renders the query again, which lists the page again. Matching Logseq,

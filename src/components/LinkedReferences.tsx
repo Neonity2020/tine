@@ -2,7 +2,7 @@ import { For, Show, createResource, createSignal, createMemo, createEffect, onCl
 import { backend } from "../backend";
 import { openPage, openPageInNewTab } from "../router";
 import { openRouteInOtherPane } from "../panes";
-import { openPageInSidebar, openPageContextMenu } from "../ui";
+import { graphMeta, openPageInSidebar, openPageContextMenu } from "../ui";
 import { LiveRefGroup } from "./LiveRefGroup";
 import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
@@ -90,10 +90,21 @@ function fallbackFilterEntry(block: BlockDto): SearchableFilterEntry {
   return searchableFilterEntry({ text: text.join("\n"), facets: [...facets.values()] });
 }
 
+/** How many backlinks a page needs before its Linked References open collapsed.
+ *
+ *  The graph decides: `:ref/linked-references-collapsed-threshold` in config.edn,
+ *  which Tine used to ignore in favour of a hard-wired 100 (GH #479). The
+ *  constant survives only as OG's own fallback for a graph that does not set the
+ *  key. Zero is a real setting — "always collapsed", which is what the users in
+ *  the Logseq thread behind that key wanted — so this must not treat a falsy
+ *  threshold as "unset". */
+const OG_REFERENCE_COLLAPSE_THRESHOLD = 100;
+const referenceCollapseThreshold = () =>
+  graphMeta()?.linked_references_collapsed_threshold ?? OG_REFERENCE_COLLAPSE_THRESHOLD;
+
 // The "Linked References" section (backlinks). Live, editable, collapsible, and
 // filterable by co-referenced page (click a chip: include → exclude → off),
 // mirroring OG's reference filter.
-const OG_REFERENCE_COLLAPSE_THRESHOLD = 100;
 
 export function LinkedReferences(props: { name: string }): JSX.Element {
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
@@ -307,7 +318,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   };
   const count = () => shown().reduce((acc, g) => acc + g.blocks.length, 0);
   const totalCount = () => mergedGroups().reduce((acc, g) => acc + g.blocks.length, 0);
-  const collapsed = () => collapsedOverride() ?? totalCount() >= OG_REFERENCE_COLLAPSE_THRESHOLD;
+  // OG: `default-collapsed? (>= total threshold)` over the TOTAL backlink count,
+  // not the filtered one (components/reference.cljs at 6e7afa8e).
+  const collapsed = () => collapsedOverride() ?? totalCount() >= referenceCollapseThreshold();
   const occurrenceLimit = createMemo(() => {
     let shown = 0;
     let total = 0;
