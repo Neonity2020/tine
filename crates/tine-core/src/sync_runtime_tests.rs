@@ -392,32 +392,44 @@ fn managed_read_surface_contract_and_changelog_are_pinned() {
         }
     }
     let changelog = std::fs::read_to_string(repo.join("CHANGELOG.md")).unwrap();
-    let unreleased = changelog
-        .split("## [Unreleased]")
-        .nth(1)
-        .and_then(|tail| tail.split("\n## ").next())
-        .expect("Unreleased section");
-    let changed = unreleased
-        .split_once("### Changed")
-        .map(|(_, tail)| tail)
-        .expect("Unreleased has a Changed section");
-    assert!(
-        changed.contains("Direct")
-            && changed.contains("Managed")
-            && unreleased.contains("ownership"),
-        "the Unreleased/Changed note must name Direct/Managed parity and shared ownership"
-    );
-    // W4-C7b extends this ONE changelog pin rather than adding a second
-    // changelog-pinning test (I-12: one producer per question).
-    for required in [
+    // Pin the NOTE, not the heading it happens to sit under today. Cutting a
+    // release moves every bullet out of `[Unreleased]` into a dated section, so
+    // anchoring this pin to `[Unreleased]` broke it by construction on the first
+    // release after it was written (v0.6.982: "Unreleased has a Changed
+    // section"). What the pin actually owes is that these notes were published
+    // under a `### Changed` heading — `[Unreleased]` while unreleased, the dated
+    // section once shipped — so search every section for the one that carries
+    // them rather than assuming which one that is.
+    let required_changed = [
         "share one evaluator per
   question",
         "loads its pending overlay at most
   once",
-    ] {
+    ];
+    let changed_sections = changelog
+        .split("\n## ")
+        .filter_map(|section| {
+            section
+                .split_once("### Changed")
+                .map(|(_, tail)| (section, tail.split("\n### ").next().unwrap_or(tail)))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        changed_sections
+            .iter()
+            .any(|(section, changed)| changed.contains("Direct")
+                && changed.contains("Managed")
+                && section.contains("ownership")),
+        "a Changed section must name Direct/Managed parity and shared ownership"
+    );
+    // W4-C7b extends this ONE changelog pin rather than adding a second
+    // changelog-pinning test (I-12: one producer per question).
+    for required in required_changed {
         assert!(
-            changed.contains(required),
-            "the Unreleased/Changed note must state the W4-C7b outcome: {required}"
+            changed_sections
+                .iter()
+                .any(|(_, changed)| changed.contains(required)),
+            "a Changed section must state the W4-C7b outcome: {required}"
         );
     }
     application_family_is_pinned_by_name();

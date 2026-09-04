@@ -2476,7 +2476,10 @@ mod tests {
         // GH #479. OG: `(>= total threshold)`, default 100 when the key is absent
         // or not an integer (`state.cljs` get-linked-references-collapsed-threshold
         // at `6e7afa8e`). Zero is a real setting — collapse always — not "unset".
-        assert_eq!(Config::parse("{}").linked_references_collapsed_threshold, 100);
+        assert_eq!(
+            Config::parse("{}").linked_references_collapsed_threshold,
+            100
+        );
         assert_eq!(
             Config::parse("{:ref/linked-references-collapsed-threshold 0}")
                 .linked_references_collapsed_threshold,
