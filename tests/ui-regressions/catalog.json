@@ -2,6 +2,28 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-PDF-READER-POSITION-LOST-ON-ZOOM-20260904",
+      "title": "Zooming a PDF no longer throws the reader back to page 1, and the reading position survives a relaunch",
+      "family": "pdf-reader-routes",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-pdf-routes.mjs"
+        ],
+        "scenario": "pdf.reader-position-survives-zoom-and-relaunch",
+        "failBefore": "proven"
+      },
+      "notes": "Go to page 2 of a PDF, zoom in, and the reader jumped back to page 1; quit and reopen and you were on page 1 rather than where you left off. Traced in the real app, the chain was: a zoom transiently collapses the scroll container so the browser clamps scrollTop to 0; the scroll observer (updateCurPage) reads that half-resized layout and publishes page 1 as reader view state; that write mutates the pdf route, which rebuilds resolvedTarget, which re-fires the navigation effect, which navigates to page 1 — locking it in. A load-time fit-width scale change made it worse by capturing a zoom anchor on page 1 that settleZoom re-asserted AFTER the reader had deliberately moved to page 2. Four coupled changes in src/components/PdfViewer.tsx: suppress the scroll-derived page while a zoom is settling; anchor a zoom to the page being read rather than a whole-document scroll ratio; let an explicit navigation supersede a pending zoom anchor; and stop navigateToTarget silently substituting page 1 when the target page's wrapper is merely not mounted yet. Evidence: fail-before 2/3 on the exact symptom against master's binary affe9be1, pass-after 8/8 on the branch binary. This is also the defect behind the e2e-pdf-routes flake that had it quarantined."
+    },
+    {
       "id": "UI-CONCORD-DEFAULT-FULL-WIDTH-20260901",
       "title": "Concord opens at the pane's full content width without requiring the user to discover wide mode",
       "family": "external-change-conflict-resolution",

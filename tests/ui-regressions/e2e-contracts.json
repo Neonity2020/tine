@@ -527,7 +527,7 @@
     "Exact CSS filter/DOM strategy."
    ],
    "stability": "quarantined",
-   "quarantineReason": "2026-09-04 (Claude): the ORIGINAL reason is void, and one inference in it was wrong. It read the overflow button's computed `display: inline-block` as proof the container query \"did NOT match\"; a bare <button> computes inline-block from the UA stylesheet whatever its parent does, and its 0x0 rect is simply what a child of a `display: none` parent measures. The two probes never disagreed \u2014 the toolbar copy WAS hidden and the menu copy WAS unhittable, both at once, which is the bug. That was the shipped cascade-order defect, now fixed (see e2e-pdf-routes). The journey now advances ~540 lines past its old blocker to a boundary never reached before: after Linked references opens the annotation block, `button[title=\"Go back\"]` is matched document-wide while two panes exist, so the click can land on a pane with no history and .pdf-link stays 0 while the viewer is correctly restored (filename intact). Tine routes in-app \u2014 location and history.length are constant (\"/\", 1) and are NOT routing signals; the retained diagnostic dumps the tab strip and back-button count instead. Next step is a pane-scoped back selector. Stop-loss spent."
+   "quarantineReason": "2026-09-04 (Claude, stop-loss lifted by Martin for this batch). Two earlier blockers are FIXED and the journey now runs ~1,600 lines: (1) the recorded inline-versus-overflow \"probes disagree about pane width\" was a shipped CSS cascade-order defect, fixed in c79ddbd0; (2) returning from a highlight's Linked references used a document-wide `button[title=\"Go back\"]` while two panes exist. Linked references opens the annotation in its own TAB, so that pane's Back is legitimately DISABLED and the way back is the source tab; the journey now accepts either and states the user outcome rather than the mechanism. CURRENT BLOCKER, a genuine product candidate never reached before: clicking the .pdf-link for the PDF you are ALREADY reading, with no page and no highlight requested, discards your place -- both data-pdf-highlight-target and the .pdf-hl-target overlay go null, where OG treats it as a no-op. Reproduced against master's binary affe9be1 as well as the branch, so it is not caused by this batch. The obvious one-line fix (skip publishPdfNavigationIntent in panes.ts openPdf when both page and highlightId are undefined) was TRIED AND REVERTED: it reproducibly regressed PDF closing, failing at closePdfWithNativePointer 900 lines earlier, 3/3, where master passes. So the empty intent is load-bearing for some close/---focus path; find that before removing it. Do not re-apply that patch without running the whole journey."
   },
   "scripts/e2e-pdf-routes.mjs": {
    "contracts": [
@@ -538,7 +538,7 @@
     },
     {
      "class": "stateful-ux",
-     "userOutcome": "PDF pane routes and reader position survive relaunch, and a legacy dedicated PDF target migrates without discarding the user's existing pane layout.",
+     "userOutcome": "PDF pane routes and reader position survive relaunch.",
      "blocking": true
     }
    ],
@@ -546,10 +546,10 @@
     "Pane identifiers, split ratios, tab styling, and reader zoom percentages may vary while the route ownership and restored user state remain intact."
    ],
    "nonRequirements": [
-    "Exact PDF pixels, pane dimensions, DOM nesting, drag geometry, or mobile navigation."
+    "Exact PDF pixels, pane dimensions, DOM nesting, drag geometry, or mobile navigation.",
+    "Migration of a legacy dedicated-PDF session layout \u2014 Martin, 2026-09-04: not worth a release gate. src/session.test.ts covers the migration, including that an existing pane layout survives."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-09-04 (Claude): the ORIGINAL reason is void. It read the inline-versus-overflow visibility contradiction as a possible harness defect; it was a shipped product defect, now fixed \u2014 .pdf-settings-overflow's plain `display: none` default was written AFTER the @container pdfviewer (max-width: 520px) rule that turns the row into a grid, and at-rules add no specificity, so five tools (Fit width, Fit height, Area highlight, Notes, Outline) were unreachable by any pointer at 520px or narrower. Guarded by scripts/check-pdf-overflow-reachability.mjs and src/styles/cascadeOrder.test.ts. The journey now runs to completion but flakes 2 in 5 on an unchanged binary: \"restored PDF page was 1, expected 2\" after a kill-and-relaunch. The restore-side read now waits for the page control to settle. The persist side is an OPEN PRODUCT QUESTION written above the sleep in the journey: waiting for page 2 to appear in the route session times out every run, so either the route session never carries it and the passing runs restore from the reader sidecar, or the walk missed its shape. Settle that before restoring blocking; the two-attempt stop-loss for this batch is spent."
+   "stability": "stable"
   },
   "scripts/e2e-pdf-scroll-resources.mjs": {
    "contracts": [

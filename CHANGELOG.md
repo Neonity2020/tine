@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Zooming a PDF no longer throws you back to page 1, and your place in a PDF
+  survives quitting and reopening.** A zoom briefly collapses the reader's
+  scroll position, and the reader was recording that momentary position as
+  "where you are" — so zooming jumped to page 1, and a reopened PDF often
+  started at the beginning instead of where you left off.
+
 - **The PDF reader's Fit width, Fit height, Area highlight, Notes and Outline
   are reachable again in a narrow reader pane.** Below 520px — a split pane, a
   companion pane, a phone — the toolbar correctly moved those five tools into

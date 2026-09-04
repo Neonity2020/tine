@@ -48,9 +48,6 @@ const ALLOWED: Record<string, number> = {
   "e2e-compat-home-current-page.mjs": 1,
   "e2e-concord-sync-copy.mjs": 1,
   "e2e-pdf-ownership.mjs": 1,
-  // Documented in the journey itself: converting this one needs a product
-  // answer about which store owns a restored PDF page, not a harness change.
-  "e2e-pdf-routes.mjs": 1,
   "e2e-query-workspace.mjs": 1,
   "e2e-rename.mjs": 1,
   "e2e-search-parity.mjs": 1,

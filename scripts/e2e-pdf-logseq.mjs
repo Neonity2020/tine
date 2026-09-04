@@ -1467,7 +1467,39 @@ try {
     timeout: 10_000,
     timeoutMsg: "Linked references did not open the annotation block with its ordinary referrers visible",
   });
-  await browser.$('button[title="Go back"]').click();
+  // Back belongs to a PANE. `button[title="Go back"]` is matched document-wide,
+  // and by this point the journey has two panes, so the bare selector could
+  // click the back button of a pane with no history -- leaving the annotation
+  // page on screen while the assertion below waited for the journal. Click the
+  // back button of the pane that actually shows the annotation block.
+  //
+  // The user outcome is "you can get back to where you were", not "Back is the
+  // control that does it". Linked references opens the annotation in its own
+  // TAB, so that pane's Back is legitimately disabled; the way back is the tab
+  // the reader came from. Accept either -- and note that the old bare
+  // `button[title="Go back"]` selector was matched document-wide across two
+  // panes, so it could click a pane with no history at all.
+  const returned = await browser.execute((highlightId) => {
+    const block = document.querySelector(`.ls-block[data-block-ref="${highlightId}"]`);
+    const pane = block?.closest("[data-pane-id]") ?? document;
+    const back = pane.querySelector('button[title="Go back"]');
+    if (back && !back.disabled) { back.click(); return "back"; }
+    const tab = [...pane.querySelectorAll(".tab")].find((candidate) =>
+      !candidate.classList.contains("active")
+      && /journal/i.test(candidate.querySelector(".tab-title")?.textContent ?? ""));
+    if (tab) { tab.click(); return "tab"; }
+    return null;
+  }, SAMPLE_ID);
+  if (!returned) {
+    const surfaces = await browser.execute(() =>
+      [...document.querySelectorAll("[data-pane-id]")].map((pane) => ({
+        pane: pane.getAttribute("data-pane-id"),
+        backDisabled: pane.querySelector('button[title="Go back"]')?.disabled ?? null,
+        tabs: [...pane.querySelectorAll(".tab")].map((tab) =>
+          `${tab.querySelector(".tab-title")?.textContent?.trim()}${tab.classList.contains("active") ? "*" : ""}`),
+      })));
+    throw new Error(`no way back from the annotation surface: ${JSON.stringify(surfaces)}`);
+  }
   try {
     await browser.waitUntil(() => browser.execute(() =>
       document.querySelectorAll(".pdf-link").length >= 2 &&

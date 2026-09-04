@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createSignal, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { AssetTooLargeError, backend } from "../backend";
@@ -164,6 +164,7 @@ export const PDF_FIND_TEXT_CACHE_BYTES = isMobilePlatform ? 4 * 1024 * 1024 : 8 
 export const PDF_FIND_PAGE_TEXT_BYTES = 1024 * 1024;
 export const PDF_FIND_MATCH_CAP = 10_000;
 
+
 export function isPdfAreaModifier(
   event: Pick<MouseEvent, "metaKey" | "shiftKey">,
   mac: boolean
@@ -197,6 +198,8 @@ export function KeyedPdfViewer(props: {
   onClose?: () => void;
   onOpenNotes?: (block?: string) => void;
   onViewState?: (state: { page: number; scale: number }) => void;
+  /** Identity of the latest navigation REQUEST. See the navigation effect. */
+  navigationKey?: () => string;
 }): JSX.Element {
   const resolvedTarget = (): PdfTarget | null => {
     const legacy = props.target?.();
@@ -231,6 +234,18 @@ export function KeyedPdfViewer(props: {
             page={resolvedTarget()?.page}
             scale={resolvedTarget()?.scale}
             navigation={resolvedTarget}
+            navigationKey={() => {
+              // Route path: a navigation happens when an INTENT is published,
+              // never merely because the route's remembered page/zoom changed.
+              const route = props.route?.();
+              if (route) return `intent:${pdfNavigationIntent(route.viewId)()?.serial ?? 0}`;
+              // Legacy `target` path (no route): the target itself IS the
+              // request, so key on its identity.
+              const legacy = props.target?.();
+              return legacy
+                ? `target:${legacy.filename}|${legacy.page ?? ""}|${legacy.highlightId ?? ""}`
+                : "none";
+            }}
             focused={props.focused}
             onClose={props.onClose}
             onOpenNotes={props.onOpenNotes}
@@ -253,6 +268,8 @@ export function PdfViewer(props: {
   onClose?: () => void;
   onOpenNotes?: (block?: string) => void;
   onViewState?: (state: { page: number; scale: number }) => void;
+  /** Identity of the latest navigation REQUEST. See the navigation effect. */
+  navigationKey?: () => string;
 }): JSX.Element {
   const owner = props.owner;
   const instanceStem = `pdf-viewer-${createUniqueId()}`;
@@ -385,7 +402,17 @@ export function PdfViewer(props: {
   // Scroll anchor captured at the START of a zoom burst (pre-resize), restored
   // once on settle — so a 5×Ctrl+ burst keeps the document position without an
   // anchor calc per press.
-  let zoomAnchorRatio: number | null = null;
+  // A zoom anchors to the PAGE you are reading, not to a whole-document scroll
+  // ratio. onZoom resizes only the VISIBLE wrappers before applying its
+  // transform, so between it and settleZoom every other wrapper still carries
+  // its old offsetTop -- and updateCurPage, which derives the page by comparing
+  // scrollTop against those offsets, reports page 1. That value was published
+  // as reader view state and persisted, so zooming lost the reader's place:
+  // zoom, quit, reopen, and you were on page 1. Hence both the page anchor and
+  // the suppression flag below.
+  let zoomAnchorPage: number | null = null;
+  let zoomAnchorOffsetInPage = 0;
+  let zoomSettling = false;
 
   async function exactPageDimensions(pageNumber: number): Promise<PdfPageDimensions> {
     if (dimsKnown.has(pageNumber) && dims[pageNumber]) return dims[pageNumber];
@@ -785,7 +812,27 @@ export function PdfViewer(props: {
     activeHighlightId = highlight?.id;
     repaintPage(highlight?.page ?? target.page ?? 1);
     const requestedPage = highlight?.page ?? target.page ?? 1;
-    const page = pageEls[requestedPage] ? requestedPage : 1;
+    // "Go to page N" must not silently become "go to page 1". Wrappers are
+    // created as pages come into view, so on a fresh open or a restore the
+    // target's element can simply not exist YET -- falling back to 1 there made
+    // a restored reader position land on page 1 about half the time, and made
+    // the same thing happen after a zoom. Only a page genuinely outside the
+    // document falls back.
+    const total = numPages() || pdfDoc?.numPages || 0;
+    const inRange = requestedPage >= 1 && (total === 0 || requestedPage <= total);
+    let page = requestedPage;
+    if (!pageEls[page]) {
+      if (!inRange) {
+        page = 1;
+      } else {
+        for (let attempt = 0; attempt < 40 && !pageEls[page]; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          if (token !== navigationToken || disposed) return;
+        }
+        if (!pageEls[page]) page = 1;
+      }
+    }
+    retargetZoomAnchor(page);
     setCurPage(page);
     setPageField(String(page));
     pageEls[page]?.scrollIntoView({ block: "start" });
@@ -853,12 +900,29 @@ export function PdfViewer(props: {
   // The expensive work — resizing EVERY wrapper (scroll geometry), restoring the
   // anchor, and re-rastering — is coalesced to one debounced `settleZoom`, so a
   // burst of Ctrl+ presses does that heavy pass once, not once per press.
+  /** An explicit page navigation supersedes any zoom anchor still in flight.
+   *  Without this, an onZoom during initial load captured page 1 and settleZoom
+   *  re-asserted it AFTER the reader had deliberately gone to page 2. */
+  const retargetZoomAnchor = (page: number) => {
+    if (zoomAnchorPage === null) return;
+    zoomAnchorPage = page;
+    zoomAnchorOffsetInPage = 0;
+  };
+
   function onZoom() {
     if (!pdfDoc) return;
     const s = scale();
-    if (zoomAnchorRatio === null) {
-      zoomAnchorRatio = scrollRef.scrollTop / (scrollRef.scrollHeight || 1);
+    if (!zoomSettling) {
+      const anchor = curPage();
+      const element = pageEls[anchor];
+      zoomAnchorPage = anchor;
+      // Keep the position WITHIN the page too, as a fraction of its height, so
+      // a zoom does not jump to the page top.
+      zoomAnchorOffsetInPage = element && element.offsetHeight > 0
+        ? (scrollRef.scrollTop - element.offsetTop) / element.offsetHeight
+        : 0;
     }
+    zoomSettling = true;
     for (const n of visible) sizeWrapper(n, s);
     applyZoomTransform();
     clearTimeout(zoomTimer);
@@ -869,10 +933,22 @@ export function PdfViewer(props: {
     if (!pdfDoc) return;
     const s = scale();
     for (let n = 1; n <= pdfDoc.numPages; n++) sizeWrapper(n, s);
-    if (zoomAnchorRatio !== null) {
-      scrollRef.scrollTop = zoomAnchorRatio * (scrollRef.scrollHeight || 1);
-      zoomAnchorRatio = null;
+    if (zoomAnchorPage !== null) {
+      const anchor = zoomAnchorPage;
+      const element = pageEls[anchor];
+      if (element) {
+        scrollRef.scrollTop = element.offsetTop + zoomAnchorOffsetInPage * element.offsetHeight;
+      }
+      zoomAnchorPage = null;
+      zoomAnchorOffsetInPage = 0;
+      // Every wrapper is now sized for the new scale, so the observer may run
+      // again -- but publish the anchor first, so the settled value is the page
+      // the reader was on and not whatever the half-resized layout implied.
+      zoomSettling = false;
+      setCurPage(anchor);
+      setPageField(String(anchor));
     }
+    zoomSettling = false;
     for (const n of visible) {
       const view = pageRenderer?.getPageView(n);
       if (view) pageRenderer?.updateScale(n, s);
@@ -1027,10 +1103,22 @@ export function PdfViewer(props: {
   }));
   // A new intent within the same asset must navigate without remounting the
   // PDF. Asset switches are handled by KeyedPdfViewer's filename key.
+  //
+  // Key this on the INTENT's serial, never on the target object.
+  // `navigation` is `resolvedTarget`, which builds a fresh object on every call,
+  // so `on(() => props.navigation?.())` re-fired on every route mutation --
+  // including the route mutation that publishing our OWN view state causes.
+  // That closed a loop: publish page 2 -> route changes -> effect re-fires ->
+  // navigateToTarget falls back to page 1 whenever `pageEls[2]` is not mounted
+  // at that instant -> page 1 is published and persisted. The user saw it as
+  // "zoom the PDF and it jumps back to page 1", and as a reader position that
+  // did not survive a relaunch. A serial changes only when someone actually
+  // asks to navigate.
   createEffect(
     on(
-      () => props.navigation?.(),
-      (target) => {
+      () => props.navigationKey?.() ?? "none",
+      () => {
+        const target = untrack(() => props.navigation?.());
         if (pdfDoc && target?.filename === props.filename && pageEls[1]) {
           void navigateToTarget(target);
         }
@@ -1388,6 +1476,7 @@ export function PdfViewer(props: {
     // A typed page jump blurs the input immediately after assigning scrollTop.
     // Publish the requested page synchronously so that blur cannot restore the
     // previous observer-derived value before the next scroll rAF runs.
+    retargetZoomAnchor(p);
     setCurPage(p);
     setPageField(String(p));
   };
@@ -1423,6 +1512,7 @@ export function PdfViewer(props: {
   // Track the page filling the viewport's upper region (rAF-throttled).
   const updateCurPage = () => {
     scrollRaf = undefined;
+    if (zoomSettling) return;
     const np = numPages();
     if (!np) return;
     const probe = scrollRef.scrollTop + scrollRef.clientHeight * 0.25;
