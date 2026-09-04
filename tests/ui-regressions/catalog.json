@@ -9681,7 +9681,7 @@
         "all"
       ],
       "layer": "render",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
         "tests": [
           "src/components/Sidebar.rowHitbox.test.tsx"
