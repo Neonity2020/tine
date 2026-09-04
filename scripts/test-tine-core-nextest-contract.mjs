@@ -28,9 +28,13 @@ import {
   oneReleaseCiExceptionActive,
   releaseE2eScenarioIsNonblocking,
   windowsRequiredTestNames,
-} from "./release-0.6.981-ci-exception.mjs";
+} from "./release-ci-exception.mjs";
 
-const NEXT_RELEASE_VERSION = "0.6.982";
+// Advance this with every re-baselining of the CI exception. It is the ratchet
+// that forces the waiver to be re-measured and re-approved each release instead
+// of quietly becoming permanent: the assertions below prove the exception is
+// INACTIVE here, so a release that has not re-decided cannot inherit it.
+const NEXT_RELEASE_VERSION = "0.6.983";
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -152,18 +156,18 @@ assert.deepEqual(
   []
 );
 assert.equal(linuxCoreReleaseFilterset(NEXT_RELEASE_VERSION), "all()");
-const release981OnlyRed = ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames[0];
-assert.match(LINUX_CORE_RELEASE_FILTERSET, new RegExp(`test\\(=${escapeRegExp(release981OnlyRed)}\\)`));
+const releaseWaivedOnlyRed = ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames[0];
+assert.match(LINUX_CORE_RELEASE_FILTERSET, new RegExp(`test\\(=${escapeRegExp(releaseWaivedOnlyRed)}\\)`));
 assert.doesNotMatch(
   linuxCoreReleaseFilterset(NEXT_RELEASE_VERSION),
-  new RegExp(`test\\(=${escapeRegExp(release981OnlyRed)}\\)`)
+  new RegExp(`test\\(=${escapeRegExp(releaseWaivedOnlyRed)}\\)`)
 );
 assert.throws(
   () => verifyLinuxReleaseSelection(
     listedInventory("tine-core", [
       ...releaseSelectedNames,
       ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
-      release981OnlyRed,
+      releaseWaivedOnlyRed,
     ]),
     listedInventory("tine-core", [
       ...releaseSelectedNames,
@@ -171,7 +175,7 @@ assert.throws(
     ]),
     NEXT_RELEASE_VERSION
   ),
-  new RegExp(`Linux release exclusion contract changed.*${release981OnlyRed}`)
+  new RegExp(`Linux release exclusion contract changed.*${releaseWaivedOnlyRed}`)
 );
 assert.deepEqual(
   verifyLinuxReleaseSelection(coreWithKnownRedOracle, coreWithKnownRedOracle, NEXT_RELEASE_VERSION),
@@ -297,18 +301,18 @@ assert.deepEqual(
   }
 );
 
-const retired981Problem = ONE_RELEASE_CI_EXCEPTION.retiredManagedV1AllowedProblems[0];
+const retiredWaivedProblem = ONE_RELEASE_CI_EXCEPTION.retiredManagedV1AllowedProblems[0];
 assert.deepEqual(
-  classifyRetiredManagedV1Problems([retired981Problem]),
-  { allowed: [retired981Problem], unexpected: [] }
+  classifyRetiredManagedV1Problems([retiredWaivedProblem]),
+  { allowed: [retiredWaivedProblem], unexpected: [] }
 );
 assert.deepEqual(
-  classifyRetiredManagedV1Problems([retired981Problem], NEXT_RELEASE_VERSION),
-  { allowed: [], unexpected: [retired981Problem] }
+  classifyRetiredManagedV1Problems([retiredWaivedProblem], NEXT_RELEASE_VERSION),
+  { allowed: [], unexpected: [retiredWaivedProblem] }
 );
 assert.deepEqual(
-  classifyRetiredManagedV1Problems([retired981Problem, "new retired-v1 problem"]),
-  { allowed: [retired981Problem], unexpected: ["new retired-v1 problem"] }
+  classifyRetiredManagedV1Problems([retiredWaivedProblem, "new retired-v1 problem"]),
+  { allowed: [retiredWaivedProblem], unexpected: ["new retired-v1 problem"] }
 );
 assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_live_graph_root_move_is_denied_without_rebinding\)/);
 assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt\)/);

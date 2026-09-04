@@ -11,7 +11,7 @@ import {
   PROJECT_VERSION,
   classifyRetiredManagedV1Problems,
   oneReleaseCiExceptionActive,
-} from "./release-0.6.981-ci-exception.mjs";
+} from "./release-ci-exception.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const problems = [];

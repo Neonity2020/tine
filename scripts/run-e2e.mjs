@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   ONE_RELEASE_CI_EXCEPTION_VERSION,
   releaseE2eScenarioIsNonblocking,
-} from "./release-0.6.981-ci-exception.mjs";
+} from "./release-ci-exception.mjs";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
 import { freeLoopbackPort, windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
 import { assertPromotionPlan, validatePromotionPlanForCheckout } from "./release-proof-reuse-lib.mjs";

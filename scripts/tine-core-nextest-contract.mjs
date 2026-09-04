@@ -9,7 +9,7 @@ import {
   linuxReleaseExcludedTestNames,
   oneReleaseCiExceptionActive,
   windowsRequiredTestNames,
-} from "./release-0.6.981-ci-exception.mjs";
+} from "./release-ci-exception.mjs";
 
 export const LINUX_TINE_CORE_SHARD_COUNT = 4;
 
