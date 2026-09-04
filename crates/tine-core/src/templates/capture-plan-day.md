@@ -5,7 +5,8 @@ icon:: ✅
 - ## Describe your day in bullets
   - 1. Click **Journals** in the sidebar — the feed opens with today first. Click into today's first bullet and type what happened or what you mean to do.
   - 2. Press **Enter** for the next bullet, **Tab** / **Shift+Tab** to nest or flatten it.
-  - 3. What you should see: the text saves to today's journal file on its own — there is no Save button. For where writes go and what happens if a file changes on disk, see [[Reference/Files, external edits, and backups]].
+  - 3. To put a bullet *above* an existing one, press **Enter** with the caret at its very start. Some bullets keep Enter for themselves — inside a code block it adds a line of code — so for those, right-click the bullet's dot and choose **Insert block above**. That works on any bullet, including the first one on a page.
+  - 4. What you should see: the text saves to today's journal file on its own — there is no Save button. For where writes go and what happens if a file changes on disk, see [[Reference/Files, external edits, and backups]].
 - ## Not at your desk? Quick capture
   - When a thought arrives while you are in another app, press your desktop quick-capture shortcut, type, and the note is appended to today's journal without switching windows. One-time setup, the optional page-title field, and the Enter-key tuning are all in [[Features/Quick capture]].
 - ## Turn a bullet into a task

@@ -10164,6 +10164,32 @@
         "failBefore": "proven"
       },
       "notes": "User harm: pressing Tab on a bullet inside a block embed indented the bullet correctly but threw the caret out of the embed onto the source copy of the same block elsewhere on the page, so the next keystrokes landed somewhere the user was not looking. Root cause is a shared invariant, not the Tab key: a store operation that reopens the editor must name the surface the caret belongs to, and `indentBlock`/`outdentBlock` did not take one. With no surface named, `editing()` in Block.tsx deliberately prefers the non-`ref:`/`embed:` rendering (the agenda-copy rule), so the editor remounted on the source. `splitBlock`, `mergeWithPrev` and `mergeWithNext` had already been given the parameter; indent, outdent and the Alt+Shift+Up/Down move had been missed. Fixed by giving all three the same `editingSurface` parameter that the split/merge family takes and passing `structuralSurface()` from the command table, and the class is now held at zero by a source scan over src/store.ts (proven to fire by reverting one call). Deliberately NOT changed in this packet: the paste and template-insert sites in Block.tsx also drop the surface, but they focus a NEWLY CREATED sibling, which may legitimately fall outside the embed's subtree -- pinning those to the embed surface could mount no editor at all. That is a separate question about which surface renders a new block, recorded rather than guessed. Evidence layer: jsdom render, driving the literal keydown path over a host page that renders the target block twice (once in the embed, once as an ordinary root) -- with a single rendering there is no wrong surface to land on and the bug is invisible. Not re-run natively; the surfaces here are DOM structure, not WebKitGTK layout."
+    },
+    {
+      "id": "UI-INSERT-BLOCK-ABOVE-480",
+      "title": "A block can be inserted above the first block of a page even when that block is a code block",
+      "family": "context-menu",
+      "sources": {
+        "issues": [
+          480
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ContextMenu.test.tsx::BlockMenu — insert a block above (GH #480)::puts an empty block above the first block of a page and moves the caret into it",
+          "src/components/ContextMenu.test.tsx::BlockMenu — insert a block above (GH #480)::inserts before a nested block without leaving its parent",
+          "src/components/ContextMenu.test.tsx::BlockMenu — insert a block above (GH #480)::does not offer it on a read-only page"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome (blocking core operation): the top of a page was unreachable. The only route to 'a block above this one' was Enter at offset 0, which splits the block; a code block owns its own Enter key (it inserts a line of code and never splits), so with a code block first on the page there was no keyboard route AND no earlier block to insert after. The reporter could edit the code block and add blocks after it, but could not put anything above it at all. Fixed by adding the missing capability rather than by changing what Enter means inside a code editor: `insertOutlineBefore` in the store (the existing `insertOutlineAfter` was refactored so both sides share one implementation and cannot drift) and an 'Insert block above' item in the block context menu, offered on every writable block because the same dead end exists for the first child of any subtree. The read-only branch of `blockActions` deliberately does not carry it. Guide: crates/tine-core/src/templates/capture-plan-day.md documents both routes, pinned by an onboarding assertion. NOT done, and left to Martin as a product question: whether Shift+Enter inside a code editor should also mean 'new block' (today it is a second way to say newline, so the binding is free, and it would match the documented inverse pair) — that changes what a key means inside a code block and is not decision-free."
     }
   ]
 }

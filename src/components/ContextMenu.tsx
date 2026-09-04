@@ -49,6 +49,7 @@ import {
   blockWritable,
   pageByName,
   buildClipboardPayload,
+  insertOutlineBefore,
 } from "../store";
 import { canFlatten, flatten, hierarchify } from "../sheet/restructure";
 import { canConvertPipeTableToGrid, convertGridToPipeTable, convertPipeTableToGrid } from "../sheet/conversions";
@@ -1158,6 +1159,20 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
     { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
     { label: "Zoom into block", run: () => zoomInto(id) },
     { label: "Open in new tab", run: () => openBlockInNewTab(id) },
+    // The keyboard route to "a block above this one" is Enter at offset 0, which
+    // splits. A block that owns its own Enter key — a code block, where Enter
+    // inserts a newline — therefore has no keyboard route, and when it is the
+    // FIRST block of a page there is no earlier block to insert after either, so
+    // the top of the page was unreachable (GH #480). This item is the route, and
+    // it is offered on every block rather than only that case: the same dead end
+    // exists for the first child of any subtree whose first block is a code block.
+    {
+      label: "Insert block above",
+      run: () => {
+        const inserted = insertOutlineBefore(id, [{ raw: "", children: [] }]);
+        if (inserted !== id) startEditing(inserted, 0);
+      },
+    },
     { label: "Copy block ref", run: () => void copyBlockRef(id, (u) => `((${u}))`, "Copied block ref") },
     { label: "Copy block embed", run: () => void copyBlockRef(id, (u) => `{{embed ((${u}))}}`, "Copied block embed") },
     { label: "Copy block", run: () => { const text = blockSubtreeMarkdown(id, 0, true, copyStripCollapsed()); void copyBlockOutline("copy", text, buildClipboardPayload([id])); pushToast("Copied block", "success"); } },

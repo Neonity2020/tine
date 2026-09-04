@@ -898,6 +898,9 @@ mod tests {
             .expect("capture-and-plan workflow was copied");
         assert!(copied_markdown.contains("{{query (task TODO DOING NOW LATER)}}"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Quick capture]]"));
+        // The page teaches both routes to a bullet ABOVE an existing one, because
+        // Enter-at-the-start does not exist inside a code block (GH #480).
+        assert!(copied_markdown.contains("**Insert block above**"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

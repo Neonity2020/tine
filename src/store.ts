@@ -3826,19 +3826,27 @@ export function mergeWithNext(
   return true;
 }
 
-/** Insert a parsed outline (from a paste) as siblings right after `afterId`.
- *  Returns the last top-level inserted block id (to focus). */
-export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): string {
-  if (!nodes.length) return afterId;
+/** Insert a parsed outline as siblings of `anchorId`, on the given side.
+ *
+ *  Returns the inserted top-level block the caller should focus: the LAST one
+ *  after the anchor, the FIRST one before it — in both cases the one adjacent
+ *  to the anchor is not the answer; the one the reading order ends on is. */
+function insertOutlineBeside(
+  anchorId: string,
+  nodes: OutlineNode[],
+  side: "before" | "after",
+  undoLabel: string,
+): string {
+  if (!nodes.length) return anchorId;
   // Read-only gate at the choke point — file drops (and any future caller)
   // must not mutate a page the round-trip self-check marked read-only
   // (Phase-6 review finding, validated).
-  if (!blockWritable(afterId)) return afterId;
-  pushUndo("paste", [doc.byId[afterId].page]);
-  const parent = doc.byId[afterId].parent;
-  const pageName = doc.byId[afterId].page;
+  if (!blockWritable(anchorId)) return anchorId;
+  pushUndo(undoLabel, [doc.byId[anchorId].page]);
+  const parent = doc.byId[anchorId].parent;
+  const pageName = doc.byId[anchorId].page;
   const format = formatForPage(pageName);
-  let lastId = afterId;
+  let focusId = anchorId;
   setDoc(
     produce((s) => {
       const create = (n: OutlineNode, par: string | null): string => {
@@ -3846,7 +3854,7 @@ export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): strin
         const childIds = n.children.map((c) => create(c, id));
         s.byId[id] = {
           id,
-          raw: rawWithInheritedOrderListType(n.raw, format, afterId),
+          raw: rawWithInheritedOrderListType(n.raw, format, anchorId),
           collapsed: false,
           parent: par,
           page: pageName,
@@ -3859,12 +3867,29 @@ export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): strin
         parent === null
           ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
           : s.byId[parent].children;
-      sibs.splice(sibs.indexOf(afterId) + 1, 0, ...created);
-      lastId = created[created.length - 1];
+      sibs.splice(sibs.indexOf(anchorId) + (side === "after" ? 1 : 0), 0, ...created);
+      focusId = side === "after" ? created[created.length - 1] : created[0];
     })
   );
   markDirty(pageName);
-  return lastId;
+  return focusId;
+}
+
+/** Insert a parsed outline (from a paste) as siblings right after `afterId`.
+ *  Returns the last top-level inserted block id (to focus). */
+export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): string {
+  return insertOutlineBeside(afterId, nodes, "after", "paste");
+}
+
+/** Insert a parsed outline as siblings right BEFORE `beforeId`.
+ *
+ *  This is the only way to put something above a block that owns its own Enter
+ *  key: inside a code editor Enter inserts a newline and never splits, so the
+ *  FIRST block of a page being a code block left the top of the page
+ *  unreachable — there was no earlier block to insert after (GH #480).
+ *  Returns the first top-level inserted block id (to focus). */
+export function insertOutlineBefore(beforeId: string, nodes: OutlineNode[]): string {
+  return insertOutlineBeside(beforeId, nodes, "before", "insert-block");
 }
 
 /** Replace one empty leaf with a parsed outline in one store transaction and one

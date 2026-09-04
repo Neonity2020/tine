@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **"Insert block above" in a bullet's right-click menu.** The keyboard route to
+  a bullet above an existing one is Enter with the caret at its very start,
+  which splits the bullet — but a code block keeps Enter for adding a line of
+  code, so a page whose first block was a code block had no way to get anything
+  above it. The menu item works on any bullet, at any depth (GH #480).
+
 ### Fixed
 
 - **Tab inside a block embed no longer throws the caret out of the embed.**
