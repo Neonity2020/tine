@@ -282,10 +282,18 @@ describe("QueryWorkspace", () => {
 
       root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
       expect(root.querySelector(".qb-menu")).not.toBeNull();
+
+      // Rung one: Escape peels the child popover and leaves the modal standing.
+      expect(dismissTopTransient("escape")).toBe(true);
+      expect(root.querySelector(".qb-menu")).toBeNull();
+      expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
+
+      // Same rung by pointer (GH #472): a press on the modal's own header is an
+      // outside press for the clause menu, so the menu closes and only the menu.
+      root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
+      expect(root.querySelector(".qb-menu")).not.toBeNull();
       dialog.querySelector(".query-advanced-header")!
         .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
-
-      expect(dismissTopTransient("escape")).toBe(true);
       expect(root.querySelector(".qb-menu")).toBeNull();
       expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
       expect(root.querySelector<HTMLTextAreaElement>(".query-dsl-editor textarea")?.value).toBe(route.source);

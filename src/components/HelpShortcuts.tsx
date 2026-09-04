@@ -11,7 +11,7 @@ import {
 import { BUILTIN_KEYS, type BuiltinKeyDef, type ShortcutScope } from "../keybindings";
 import { EmojiText } from "../render/emoji";
 import { openGuide } from "../guide";
-import { registerTransientLayer } from "../transientLayers";
+import { dismissOnOutsidePointer, registerTransientLayer } from "../transientLayers";
 import "../styles/help.css";
 
 const REPO = "https://github.com/martinkoutecky/tine";
@@ -60,18 +60,7 @@ function openExternal(url: string) {
 export function HelpPopup(): JSX.Element {
   let root: HTMLDivElement | undefined;
 
-  createEffect(() => {
-    if (!helpPopupOpen()) return;
-
-    const onPointerDown = (e: PointerEvent) => {
-      const target = e.target as Node | null;
-      if (root && target && !root.contains(target)) closeHelpPopup();
-    };
-    window.addEventListener("pointerdown", onPointerDown, true);
-    onCleanup(() => {
-      window.removeEventListener("pointerdown", onPointerDown, true);
-    });
-  });
+  dismissOnOutsidePointer({ open: helpPopupOpen, inside: () => [root], dismiss: closeHelpPopup });
   createEffect(() => {
     if (!helpPopupOpen()) return;
     const unregister = registerTransientLayer({ id: "help", root: () => root ?? null, dismiss: () => { closeHelpPopup(); return true; } });

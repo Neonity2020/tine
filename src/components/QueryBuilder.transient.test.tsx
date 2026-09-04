@@ -108,7 +108,12 @@ describe("QueryBuilder transient ownership (post-GH #161)", () => {
     }
   });
 
-  it("keeps two builder instances independent and reactivates an older visible peer", () => {
+  it("keeps two builder instances independent: a press in one closes only the other's menu", () => {
+    // Reactivation of an older visible peer by an inside pointer is pinned
+    // generically in transientRegistry.p1d1.lifecycle.test.tsx. What is specific
+    // here is that two builders on one page own separate popover state, and that
+    // a press inside one is an OUTSIDE press for the other (GH #472) — so they
+    // cannot both stay open, and the one pressed survives.
     const first = mountBuilder("(and (task TODO))");
     const second = mountBuilder("(and (priority A))");
     try {
@@ -118,15 +123,109 @@ describe("QueryBuilder transient ownership (post-GH #161)", () => {
       expect(second.host.querySelector(".qb-menu")).not.toBeNull();
 
       first.host.querySelector(".qb-menu")!.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+      expect(first.host.querySelector(".qb-menu")).not.toBeNull();
+      expect(second.host.querySelector(".qb-menu")).toBeNull();
+
       expect(dismissTopTransient("escape")).toBe(true);
       expect(first.host.querySelector(".qb-menu")).toBeNull();
-      expect(second.host.querySelector(".qb-menu")).not.toBeNull();
-
-      expect(dismissTopTransient("back")).toBe(true);
-      expect(second.host.querySelector(".qb-menu")).toBeNull();
     } finally {
       first.dispose();
       second.dispose();
+    }
+  });
+});
+
+describe("GH #472: every Query Builder popover closes on an outside press", () => {
+  // The reported failure: the leftmost (clause) menu stayed open when the user
+  // clicked away — "the menu even stays open after clicking into and editing a
+  // different block" — while the sort popover next to it closed correctly. The
+  // difference was that two of the four popovers had hand-rolled an
+  // outside-click effect and two had not, so the cases below drive ALL FOUR
+  // through the same gesture rather than only the reported one.
+  const popovers: Array<{ name: string; open: (host: HTMLElement) => HTMLButtonElement; visible: string }> = [
+    { name: "clause menu", open: (host) => host.querySelector<HTMLButtonElement>(".qb-chip")!, visible: ".qb-menu" },
+    { name: "add-filter picker", open: (host) => host.querySelector<HTMLButtonElement>(".qb-add")!, visible: ".qb-picker" },
+    {
+      name: "sort popover",
+      open: (host) => [...host.querySelectorAll<HTMLButtonElement>(".qb-sort")]
+        .find((button) => button.textContent?.trim() === "+ sort")!,
+      visible: ".qb-sort-picker",
+    },
+    {
+      name: "summarize popover",
+      open: (host) => [...host.querySelectorAll<HTMLButtonElement>(".qb-sort")]
+        .find((button) => button.textContent?.includes("summarize"))!,
+      visible: ".qb-picker",
+    },
+  ];
+
+  // A press elsewhere in the document — the page background, another block.
+  const pressOutside = (type: "mousedown" | "pointerdown") => {
+    const elsewhere = document.createElement("div");
+    document.body.append(elsewhere);
+    elsewhere.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+    elsewhere.remove();
+  };
+
+  const expectAllClosedBy = (type: "mousedown" | "pointerdown") => {
+    for (const popover of popovers) {
+      const { host, source, dispose } = mountBuilder();
+      const original = source();
+      try {
+        popover.open(host).click();
+        expect(host.querySelector(popover.visible), `${popover.name} did not open`).not.toBeNull();
+
+        pressOutside(type);
+
+        expect(host.querySelector(popover.visible), `${popover.name} stayed open`).toBeNull();
+        expect(source()).toBe(original);
+      } finally {
+        dispose();
+      }
+    }
+  };
+
+  // Both event types, because touch and pen deliver only the first and some
+  // synthesized/compatibility paths only the second.
+  it("closes each popover on an outside mousedown without changing the DSL", () => {
+    expectAllClosedBy("mousedown");
+  });
+
+  it("closes each popover on an outside pointerdown without changing the DSL", () => {
+    expectAllClosedBy("pointerdown");
+  });
+
+  it("keeps a popover open when the press lands inside it", () => {
+    for (const popover of popovers) {
+      const { host, dispose } = mountBuilder();
+      try {
+        popover.open(host).click();
+        const panel = host.querySelector(popover.visible)!;
+        panel.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        expect(host.querySelector(popover.visible), `${popover.name} closed on an inside press`).not.toBeNull();
+      } finally {
+        dispose();
+      }
+    }
+  });
+
+  it("lets the trigger of an open popover toggle it shut instead of reopening it", () => {
+    // The trigger must count as INSIDE: dismissing on its press would close the
+    // popover, and the click that follows would immediately reopen it.
+    for (const popover of popovers) {
+      const { host, dispose } = mountBuilder();
+      try {
+        const trigger = popover.open(host);
+        trigger.click();
+        expect(host.querySelector(popover.visible)).not.toBeNull();
+
+        trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        expect(host.querySelector(popover.visible), `${popover.name} closed before its own click`).not.toBeNull();
+        trigger.click();
+        expect(host.querySelector(popover.visible), `${popover.name} did not toggle shut`).toBeNull();
+      } finally {
+        dispose();
+      }
     }
   });
 });

@@ -1,6 +1,22 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { serializedWrites } from "./serializedWrites";
+
+/** Every non-test frontend source under `src/`, so an ownership rule cannot be
+ *  escaped by putting the offending copy in a directory the scan forgot. */
+function frontendSources(): string[] {
+  const out: string[] = [];
+  const pending = ["src"];
+  while (pending.length > 0) {
+    const dir = pending.pop()!;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) pending.push(path);
+      else if (/\.tsx?$/.test(entry.name) && !/\.(test|spec)\.tsx?$/.test(entry.name)) out.push(path);
+    }
+  }
+  return out;
+}
 
 describe("frontend twin ownership guards", () => {
   it("keeps Sheets field questions on their canonical owners", () => {
@@ -13,6 +29,35 @@ describe("frontend twin ownership guards", () => {
         ).not.toContain(twin);
       }
     }
+  });
+
+  it("keeps 'the user pressed outside' on its one owner", () => {
+    // GH #472. Eight popovers had hand-rolled this listener and four had not, so
+    // whether a menu closed on an outside press was decided per component: the
+    // Query Builder's sort popover closed and its clause menu did not. The
+    // producer is `dismissOnOutsidePointer` in src/transientLayers.ts; anything
+    // that registers a transient layer calls it instead of reaching for the
+    // document. (A capture listener with no layer — blockDrag's drag start —
+    // is not this question and is not scanned.)
+    const owner = "src/transientLayers.ts";
+    expect(readFileSync(owner, "utf8")).toContain("export function dismissOnOutsidePointer");
+
+    const files = frontendSources().filter((path) => path !== owner);
+    for (const file of files) {
+      const source = readFileSync(file, "utf8");
+      if (!source.includes("registerTransientLayer")) continue;
+      for (const type of ["pointerdown", "mousedown"]) {
+        expect(
+          source,
+          `I-12: ${file} registers a transient layer and its own "${type}" listener. ` +
+            `Outside-press dismissal has one owner — call dismissOnOutsidePointer from ` +
+            `${owner}; src/components/TopbarOverflowMenu.tsx is the one-line exemplar.`,
+        ).not.toContain(`addEventListener("${type}"`);
+      }
+    }
+    // Non-vacuity: the scan must actually reach the components this rule is about.
+    expect(files.filter((path) => readFileSync(path, "utf8").includes("registerTransientLayer")).length)
+      .toBeGreaterThanOrEqual(20);
   });
 
   it("serializes operations, propagates their errors, and keeps the tail usable", async () => {

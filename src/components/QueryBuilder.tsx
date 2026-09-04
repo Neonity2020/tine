@@ -35,7 +35,7 @@ import {
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
 import { sharedQueryResult } from "../queryResultCache";
 import { dataRev, graphEpoch, graphMeta, pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
-import { registerTransientLayer, type TransientLayer } from "../transientLayers";
+import { dismissOnOutsidePointer, registerTransientLayer, type TransientLayer } from "../transientLayers";
 
 // Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
 // The DSL text is the single source of truth — we parse it to a tree, apply an
@@ -52,11 +52,22 @@ const locKey = (l: number[]) => l.join(".");
 
 type ClauseKind = Clause["kind"];
 
+// Every popover in the bar — clause menu, add-filter picker, sort, summarize —
+// registers here, so all four answer Escape/Back AND "the user pressed somewhere
+// else" the same way. GH #472 is what happens when they do not: two of the four
+// had hand-rolled the outside-press effect and two had not, so a clause menu
+// stayed open while the user clicked into and edited a different block.
+// The trigger is passed as inside-the-popover so its own click can toggle.
 function registerVisiblePopover(open: () => boolean, layer: TransientLayer) {
   createEffect(() => {
     if (!open()) return;
     const unregister = registerTransientLayer(layer);
     onCleanup(unregister);
+  });
+  dismissOnOutsidePointer({
+    open,
+    inside: () => [layer.root?.(), layer.trigger?.()],
+    dismiss: () => layer.dismiss("explicit"),
   });
 }
 
@@ -113,7 +124,6 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
   // The free-text escape hatch: sort by an arbitrary property name.
   const [field, setField] = createSignal("");
   const [dir, setDir] = createSignal<"asc" | "desc">("asc");
-  let wrapEl: HTMLSpanElement | undefined;
   let triggerEl: HTMLButtonElement | undefined;
   let pickerEl: HTMLDivElement | undefined;
   const layerId = `query-sort-${createUniqueId()}`;
@@ -123,17 +133,6 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
     root: () => pickerEl ?? null,
     trigger: () => triggerEl ?? null,
     dismiss: () => { setOpen(false); return true; },
-  });
-  // Dismiss the popover when clicking anywhere outside it (another chip, the bar
-  // background, or off the block). Capture phase so it fires regardless of the
-  // bar's stopPropagation; only active while open.
-  createEffect(() => {
-    if (!open()) return;
-    const onDown = (e: MouseEvent) => {
-      if (wrapEl && !wrapEl.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown, true);
-    onCleanup(() => document.removeEventListener("mousedown", onDown, true));
   });
   const isPreset = (c: { field: string; dir: "asc" | "desc" } | null) =>
     !!c && SORT_PRESETS.some((p) => p.field === c.field && p.dir === c.dir);
@@ -163,7 +162,7 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
     setOpen(false);
   };
   return (
-    <span class="qb-add-wrap" ref={wrapEl}>
+    <span class="qb-add-wrap">
       {/* A stable "+ sort" affordance — it does NOT morph into the current sort
           value (the active sort shows as its own chip in the bar). It just gains
           an `active` highlight and opens the popover to change/clear. */}
@@ -172,7 +171,7 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
         class="qb-sort"
         classList={{ active: !!cur() }}
         title={cur() ? `Sorted by ${clauseLabel({ kind: "sortBy", field: cur()!.field, dir: cur()!.dir })}. Click to change.` : "Sort results"}
-        onClick={(e) => { stop(e); openPopover(); }}
+        onClick={(e) => { stop(e); open() ? setOpen(false) : openPopover(); }}
       >
         + sort
       </button>
@@ -234,7 +233,6 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
   const agg = () => currentAgg(props.tree());
   const group = () => currentGroup(props.tree());
   const active = () => !!agg() || !!group();
-  let wrapEl: HTMLSpanElement | undefined;
   let triggerEl: HTMLButtonElement | undefined;
   let pickerEl: HTMLDivElement | undefined;
   const layerId = `query-summarize-${createUniqueId()}`;
@@ -244,14 +242,6 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
     root: () => pickerEl ?? null,
     trigger: () => triggerEl ?? null,
     dismiss: () => { setOpen(false); return true; },
-  });
-  createEffect(() => {
-    if (!open()) return;
-    const onDown = (e: MouseEvent) => {
-      if (wrapEl && !wrapEl.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown, true);
-    onCleanup(() => document.removeEventListener("mousedown", onDown, true));
   });
   const openPopover = () => {
     setPick(null);
@@ -279,7 +269,7 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
     return parts.join(", ");
   };
   return (
-    <span class="qb-add-wrap" ref={wrapEl}>
+    <span class="qb-add-wrap">
       <button
         ref={triggerEl}
         class="qb-sort"

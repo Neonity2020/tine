@@ -10030,6 +10030,34 @@
         "failBefore": "proven"
       },
       "notes": "User harm: after adding `alias:: page1` to another page, every existing [[page1]] kept the missing-page styling until Tine was restarted, so a link that now resolves still looked dead. Root cause is one shared invariant, not this one surface: `existing_page_names` answers over page names UNION alias names, so an alias edit changes the answer while creating and deleting no file -- and the batched exists-cache was keyed only on (graphEpoch, pageInventoryRev), neither of which moves for a property-only save. Fixed by publishing an `aliasRev` from the single alias-map commit point and keying the cache on it too; it bumps only when the map actually changes, so an ordinary keystroke save still costs nothing. Sibling reviewed and deliberately NOT changed: pageIconBatch keys on graphEpoch alone by documented design (`icons refresh on graph switch / reopen, not on every edit`), so its staleness is a stated tradeoff rather than this defect."
+    },
+    {
+      "id": "UI-QUERY-BUILDER-POPOVER-DISMISS-472",
+      "title": "Every Query Builder popover closes when the user presses outside it",
+      "family": "transient-dismissal",
+      "sources": {
+        "issues": [
+          472
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::closes each popover on an outside mousedown without changing the DSL",
+          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::closes each popover on an outside pointerdown without changing the DSL",
+          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::keeps a popover open when the press lands inside it",
+          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::lets the trigger of an open popover toggle it shut instead of reopening it",
+          "src/frontendTwins.guard.test.ts::frontend twin ownership guards::keeps 'the user pressed outside' on its one owner"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User harm: a Query Builder clause menu stayed open after the user clicked away -- the reporter's words, `the menu even stays open after clicking into and editing a different block` -- while the sort popover beside it closed correctly. Root cause is ownership, not the clause menu: `the user pressed outside` had no producer, so each popover answered it or did not. Twelve popovers across the app had hand-rolled a capture listener (drifting between mousedown/pointerdown and document/window) and four had not: QueryBuilder's clause menu and add-filter picker, and the two PdfViewer popups were correct only by accident of where the user clicked. Fixed by one producer, `dismissOnOutsidePointer` in src/transientLayers.ts, alongside the Escape/Back registry that deliberately does not answer this question; the class is now at zero hand-rolled copies and a source-scan guard (I-12) fails on the next one. The popover trigger counts as inside, so its own click still toggles. Also corrected in the same file: `+ sort` re-opened rather than toggled when its trigger was clicked while open, the only one of the four that did not toggle. Two existing tests asserted states that only jsdom could reach (two clause menus open at once; a modal header press leaving a child menu open) and were rewritten to the real-browser outcome. Known adjacent defect NOT fixed here: the operator-node ChipMenu (`op:` keys) is unreachable -- nothing ever sets openMenu to an `op:` key -- so its Unwrap action cannot be invoked."
     }
   ]
 }
