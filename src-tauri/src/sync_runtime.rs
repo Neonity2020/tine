@@ -7252,6 +7252,7 @@ mod tests {
             logbook_with_second_support: true,
             logbook_enabled_in_timestamped_blocks: false,
             logbook_enabled_in_all_blocks: false,
+            linked_references_collapsed_threshold: 100,
             guide_announced: false,
         };
         let record = SparseV2ActivationRecord::new(&graph, meta, DeviceId::new());
