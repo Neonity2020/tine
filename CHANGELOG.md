@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.982] - 2026-09-04
+
 ### Added
 
 - **"Insert block above" in a bullet's right-click menu.** The keyboard route to
@@ -15,117 +17,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   which splits the bullet — but a code block keeps Enter for adding a line of
   code, so a page whose first block was a code block had no way to get anything
   above it. The menu item works on any bullet, at any depth (GH #480).
-
-### Fixed
-
-- **`:ref/linked-references-collapsed-threshold` in `config.edn` is honored.**
-  Tine already collapsed a page's Linked References once the backlink count got
-  large, matching Logseq's rule, but the number was hard-wired to Logseq's
-  default of 100 and your setting was ignored. Setting it to `0` now means what
-  it means in Logseq: every page opens with the panel folded (GH #479).
-
-- **A query no longer returns the block it is written in.** `{{query "xyz"}}`
-  matched its own text, so the results listed the page the query lives on —
-  which renders the query again, which lists the page again. Matching Logseq,
-  the query's own block is left out of its results; blocks under it are not
-  (GH #469).
-
-- **Tab inside a block embed no longer throws the caret out of the embed.**
-  Indenting, outdenting or moving a bullet inside a `{{embed}}` did the right
-  thing to the outline but reopened the editor on the block's other rendering
-  further down the page, so the following keystrokes landed out of sight. These
-  three operations now keep the caret on the surface you were typing on, as
-  splitting and merging already did (GH #477).
-
-- **Query Builder dropdowns close when you click somewhere else.** Its clause
-  menu and add-filter picker stayed open while you clicked away and started
-  editing a different block, even though the sort and summarize popovers beside
-  them closed correctly. Closing on an outside press now has one implementation
-  that every popover in Tine shares, so this cannot differ per menu again; the
-  `+ sort` button also toggles shut when you press it a second time (GH #472).
-
-- **A context submenu stays on screen.** Opened near the right edge of the
-  window — over a wide table, say — the `Show children as →` submenu was drawn
-  past the edge and its items could not be reached. It now mirrors to the left,
-  or overlays its own menu when the window is too narrow for either side
-  (GH #471).
-
-- **A page opened only in the right sidebar can be typed into.** An empty page,
-  or one whose only content is its `key:: value` header, offered nothing to
-  click and no place for the caret unless you first opened it in the main pane
-  (GH #483).
-
-- **Both copy buttons in the references sections sit on the same edge.** The one
-  in Linked References floated in the middle of its row because it and the
-  filter button each claimed the row's free space (GH #475).
-
-- **A `[[link]]` stops looking dead the moment its name becomes an alias.** After
-  you added `alias:: page1` to another page, every existing `[[page1]]` kept the
-  faded missing-page styling until you restarted Tine — even though clicking it
-  went to the right page. Tine now notices that the set of names which resolve to
-  a page has changed, not just the set of files on disk (GH #484).
-
-- **Journal-day queries such as `(between …)` work in Managed Storage on a graph
-  with a custom journal page-title format.** Tine's Managed reader worked out
-  which day a journal page was from the DEFAULT title format rather than the one
-  your graph configures, so on any graph that sets `:journal/page-title-format`
-  every journal page looked like it had no date and every journal-day query came
-  back empty — while the same query over the same files answered normally in
-  Direct Files. Both now read the day from your configured format.
-
-- **Failure messages no longer reach the logs with your notes inside them.**
-  Twelve always-on diagnostic lines used to print whatever a failed operation
-  said — and a failed save, print, or conflict capture says it about the page it
-  was working on, by name or by path. Each failure is still reported, and still
-  just as visible; what it prints is now the failure's kind and a content-free
-  identity for it. Two of the twelve, in the Direct Files projection, keep their
-  full text behind `TINE_DEBUG`/`--debug`, so you can still ask for it; the ten
-  in the app itself do not print the text anywhere, which also means a debug log
-  you send us will no longer contain it.
-
-- **A Tine that cannot find anywhere to store its application data now says
-  why.** The fatal startup message names the reason (for example
-  `PermissionDenied`) rather than only that something went wrong — you cannot
-  relaunch past that message to go looking for the cause.
-
-- **The diagnostics flight recorder releases its single-writer lock when it
-  shuts down**, instead of leaving release to whenever the last copy of the
-  file descriptor happens to close. A process spawn duplicates that descriptor
-  into the child until it execs, so the lock could outlive the recorder that
-  held it.
-
-- **Managed clean-open failures no longer collapse source types into prose.**
-  Core maps the 16 reachable error classes to stable, content-free reason codes
-  and carries them through the existing open-refusal boundary as tagged JSON, so
-  a refusal you can read and copy no longer carries a note name or a path. The
-  reason itself still reaches Settings and the startup recovery pane: the
-  diagnostic sanitizer renders the typed envelope instead of discarding it.
-
-- **Direct save errors can no longer become discard-capable conflicts because
-  of a page title or block text.** The save producer carries a closed reason
-  code and conflict epoch through tagged JSON, and the frontend no longer
-  reconstructs either value from error wording.
-
-- **Managed activation now recovers after a process abort before its authority
-  marker is published.** The marker remains the sole commit point; the next
-  activation retires a wholly recognized unmarked generation and disposable
-  SQLite projection, then rebuilds from unchanged Direct Files.
-
-- **Internal guards and Managed diagnostics now fail on the regressions they
-  name.** Source ratchets detect helper-hidden error parsing and grouped
-  filesystem imports, platform coverage is enumerated, projection/conflict
-  counters cover their real drain/rebuild boundaries, generation refusals are
-  scenario-pinned, and skipped checkpoint captures retain a bounded cause
-  without being mislabeled as recovery.
-
-- **Closing or switching graphs no longer leaves a conflicted page's
-  crash-recovery draft up to half a second stale.** The close barrier now
-  lands every pending conflict-capsule refresh before it resolves.
-- **A refused sync join names the affected notes again.** The typed
-  `shared-frontier-mismatch` refusal carries the bounded list of differing
-  relative paths (at most 32, never note content) that the join panel shows
-  and the storage/sync contract promises; the previous typed-error change had
-  dropped it.
 
 ### Changed
 
@@ -242,6 +133,115 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   too. Both routes return the same answer.
 
 ### Fixed
+
+- **`:ref/linked-references-collapsed-threshold` in `config.edn` is honored.**
+  Tine already collapsed a page's Linked References once the backlink count got
+  large, matching Logseq's rule, but the number was hard-wired to Logseq's
+  default of 100 and your setting was ignored. Setting it to `0` now means what
+  it means in Logseq: every page opens with the panel folded (GH #479).
+
+- **A query no longer returns the block it is written in.** `{{query "xyz"}}`
+  matched its own text, so the results listed the page the query lives on —
+  which renders the query again, which lists the page again. Matching Logseq,
+  the query's own block is left out of its results; blocks under it are not
+  (GH #469).
+
+- **Tab inside a block embed no longer throws the caret out of the embed.**
+  Indenting, outdenting or moving a bullet inside a `{{embed}}` did the right
+  thing to the outline but reopened the editor on the block's other rendering
+  further down the page, so the following keystrokes landed out of sight. These
+  three operations now keep the caret on the surface you were typing on, as
+  splitting and merging already did (GH #477).
+
+- **Query Builder dropdowns close when you click somewhere else.** Its clause
+  menu and add-filter picker stayed open while you clicked away and started
+  editing a different block, even though the sort and summarize popovers beside
+  them closed correctly. Closing on an outside press now has one implementation
+  that every popover in Tine shares, so this cannot differ per menu again; the
+  `+ sort` button also toggles shut when you press it a second time (GH #472).
+
+- **A context submenu stays on screen.** Opened near the right edge of the
+  window — over a wide table, say — the `Show children as →` submenu was drawn
+  past the edge and its items could not be reached. It now mirrors to the left,
+  or overlays its own menu when the window is too narrow for either side
+  (GH #471).
+
+- **A page opened only in the right sidebar can be typed into.** An empty page,
+  or one whose only content is its `key:: value` header, offered nothing to
+  click and no place for the caret unless you first opened it in the main pane
+  (GH #483).
+
+- **Both copy buttons in the references sections sit on the same edge.** The one
+  in Linked References floated in the middle of its row because it and the
+  filter button each claimed the row's free space (GH #475).
+
+- **A `[[link]]` stops looking dead the moment its name becomes an alias.** After
+  you added `alias:: page1` to another page, every existing `[[page1]]` kept the
+  faded missing-page styling until you restarted Tine — even though clicking it
+  went to the right page. Tine now notices that the set of names which resolve to
+  a page has changed, not just the set of files on disk (GH #484).
+
+- **Journal-day queries such as `(between …)` work in Managed Storage on a graph
+  with a custom journal page-title format.** Tine's Managed reader worked out
+  which day a journal page was from the DEFAULT title format rather than the one
+  your graph configures, so on any graph that sets `:journal/page-title-format`
+  every journal page looked like it had no date and every journal-day query came
+  back empty — while the same query over the same files answered normally in
+  Direct Files. Both now read the day from your configured format.
+
+- **Failure messages no longer reach the logs with your notes inside them.**
+  Twelve always-on diagnostic lines used to print whatever a failed operation
+  said — and a failed save, print, or conflict capture says it about the page it
+  was working on, by name or by path. Each failure is still reported, and still
+  just as visible; what it prints is now the failure's kind and a content-free
+  identity for it. Two of the twelve, in the Direct Files projection, keep their
+  full text behind `TINE_DEBUG`/`--debug`, so you can still ask for it; the ten
+  in the app itself do not print the text anywhere, which also means a debug log
+  you send us will no longer contain it.
+
+- **A Tine that cannot find anywhere to store its application data now says
+  why.** The fatal startup message names the reason (for example
+  `PermissionDenied`) rather than only that something went wrong — you cannot
+  relaunch past that message to go looking for the cause.
+
+- **The diagnostics flight recorder releases its single-writer lock when it
+  shuts down**, instead of leaving release to whenever the last copy of the
+  file descriptor happens to close. A process spawn duplicates that descriptor
+  into the child until it execs, so the lock could outlive the recorder that
+  held it.
+
+- **Managed clean-open failures no longer collapse source types into prose.**
+  Core maps the 16 reachable error classes to stable, content-free reason codes
+  and carries them through the existing open-refusal boundary as tagged JSON, so
+  a refusal you can read and copy no longer carries a note name or a path. The
+  reason itself still reaches Settings and the startup recovery pane: the
+  diagnostic sanitizer renders the typed envelope instead of discarding it.
+
+- **Direct save errors can no longer become discard-capable conflicts because
+  of a page title or block text.** The save producer carries a closed reason
+  code and conflict epoch through tagged JSON, and the frontend no longer
+  reconstructs either value from error wording.
+
+- **Managed activation now recovers after a process abort before its authority
+  marker is published.** The marker remains the sole commit point; the next
+  activation retires a wholly recognized unmarked generation and disposable
+  SQLite projection, then rebuilds from unchanged Direct Files.
+
+- **Internal guards and Managed diagnostics now fail on the regressions they
+  name.** Source ratchets detect helper-hidden error parsing and grouped
+  filesystem imports, platform coverage is enumerated, projection/conflict
+  counters cover their real drain/rebuild boundaries, generation refusals are
+  scenario-pinned, and skipped checkpoint captures retain a bounded cause
+  without being mislabeled as recovery.
+
+- **Closing or switching graphs no longer leaves a conflicted page's
+  crash-recovery draft up to half a second stale.** The close barrier now
+  lands every pending conflict-capsule refresh before it resolves.
+- **A refused sync join names the affected notes again.** The typed
+  `shared-frontier-mismatch` refusal carries the bounded list of differing
+  relative paths (at most 32, never note content) that the join panel shows
+  and the storage/sync contract promises; the previous typed-error change had
+  dropped it.
 
 - **Managed recovery moves and Windows backup restore close their publication
   crash windows.** Private-root archive moves now synchronize both renamed
