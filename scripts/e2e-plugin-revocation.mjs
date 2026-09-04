@@ -92,8 +92,13 @@ function seedEnabledSettings(indexJson, signature) {
     known_graphs: [{ name: "graph", path: GRAPH }],
     last_graph_path: GRAPH,
     plugin_states: { [manifest.id]: { version: manifest.version, enabled: true } },
-    "plugin-registry-index": indexJson,
-    "plugin-registry-signature": signature,
+    // The signed registry cache lives in ONE envelope under `plugin_registry_cache`
+    // (src-tauri/src/plugins.rs REGISTRY_CACHE_KEY). The split
+    // `plugin-registry-index` / `plugin-registry-signature` pair this journey used
+    // to seed was retired by 4b752120 — the loader now returns `Absent` for it, so
+    // seeding the old pair expressed no revocation at all and let the sentinel
+    // activate. Seed the shape the product actually reads.
+    plugin_registry_cache: { schemaVersion: 1, indexJson, signature },
   }, null, 2)}\n`);
 }
 
@@ -257,12 +262,14 @@ try {
   }
   const envelope = persisted.plugin_registry_cache;
   if (envelope?.schemaVersion !== 1 || envelope.indexJson !== revokedIndexJson || envelope.signature !== revokedSignature) {
-    throw new Error(`legacy revocation pair did not migrate to one exact signed envelope: ${JSON.stringify(envelope)}`);
+    throw new Error(`the exact signed revocation envelope was not retained: ${JSON.stringify(envelope)}`);
   }
+  // Retired keys must stay retired: writing settings must not resurrect the
+  // split pair whose reader 4b752120 deleted.
   if (Object.hasOwn(persisted, "plugin-registry-index") || Object.hasOwn(persisted, "plugin-registry-signature")) {
-    throw new Error("legacy split registry keys survived successful atomic migration");
+    throw new Error("retired split registry keys reappeared in persisted settings");
   }
-  console.log(`PASS: ${manifest.id}@${manifest.version} stayed absent, migrated atomically, and persisted disabled when revoked`);
+  console.log(`PASS: ${manifest.id}@${manifest.version} stayed absent, kept its exact signed envelope, and persisted disabled when revoked`);
 
   // Later cache loss must not resurrect the already revoked package: durable
   // native enablement is an independent restart safety boundary.
