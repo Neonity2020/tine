@@ -423,13 +423,23 @@ await withApp(0, async (browser) => {
   await browser.$(".qb-bar").waitForExist({ timeout: 5_000 });
   await browser.$(".qb-chip").click();
   await browser.$(".qb-menu").waitForExist({ timeout: 5_000 });
-  await browser.execute(() => document.querySelector(".query-advanced-header")?.dispatchEvent(
-    new MouseEvent("pointerdown", { bubbles: true, cancelable: true })
-  ));
   await browser.keys(["Escape"]);
   await browser.$(".qb-menu").waitForExist({ reverse: true, timeout: 5_000 });
   if (!(await browser.$(".query-advanced-modal").isExisting())) {
     throw new Error("QueryBuilder child Escape also closed its Advanced parent");
+  }
+  // Same rung by pointer (GH #472): pressing the modal's own header is an
+  // outside press for the clause menu, so it closes the menu and only the menu.
+  // This step used to precede the Escape above, to reactivate the parent layer;
+  // since every popover now dismisses on an outside press, it IS the dismissal.
+  await browser.$(".qb-chip").click();
+  await browser.$(".qb-menu").waitForExist({ timeout: 5_000 });
+  await browser.execute(() => document.querySelector(".query-advanced-header")?.dispatchEvent(
+    new MouseEvent("pointerdown", { bubbles: true, cancelable: true })
+  ));
+  await browser.$(".qb-menu").waitForExist({ reverse: true, timeout: 5_000 });
+  if (!(await browser.$(".query-advanced-modal").isExisting())) {
+    throw new Error("An outside press on the Advanced header closed the modal, not just its child menu");
   }
   await browser.keys(["Escape"]);
   await browser.$(".query-advanced-modal").waitForExist({ reverse: true, timeout: 5_000 });
