@@ -185,7 +185,15 @@ async function openPage(browser, title) {
   try {
     link = await waitFor(async () => {
       for (const candidate of await browser.$$(".page-ref")) {
-        if ((await candidate.getText()).trim() === title) return candidate;
+        // A `.page-ref` anchor carries OG's `[[ ]]` decoration inside itself
+        // whenever `:ui/show-brackets?` is on, and that key defaults to ON
+        // (src/render/inline.tsx, pinned by src/render/showBrackets.test.tsx).
+        // The contract here is "a link to this page is reachable", not how the
+        // link is decorated, so compare the name with the decoration removed —
+        // the same tolerance every other journey gets from its `*=Name`
+        // fallback selector.
+        const text = (await candidate.getText()).trim();
+        if (text.replace(/^\[\[/, "").replace(/\]\]$/, "").trim() === title) return candidate;
       }
       return undefined;
     }, 30_000, `${title} was absent from the routed journal links`);
@@ -241,12 +249,24 @@ async function assertLiveConflict(browser, local, current, phase) {
 }
 
 async function resolveEverywhere(browser, side) {
+  // The resolve-everywhere buttons carry TWO labels: `.conflict-wide` ("Keep
+  // <side label>") and `.conflict-narrow` ("All mine" / "All theirs"). CSS shows
+  // exactly one, so a visible-text probe is really an assertion about pane
+  // width — which is a non-requirement of this journey, and which the
+  // full-pane-width Concord default legitimately flipped. Identify the action
+  // by the stable narrow label that is always present in the DOM, and click the
+  // real button that owns it.
   const selector = side === "mine" ? "All mine" : "All theirs";
-  const choose = await waitFor(
-    () => visibleButtonContaining(browser, selector),
-    15_000,
-    `${selector} action was absent`,
-  );
+  const choose = await waitFor(async () => {
+    for (const button of await browser.$$(".sync-merge-toolbar-actions button")) {
+      const owns = await button.execute(
+        (node, want) => (node.textContent ?? "").includes(want),
+        selector,
+      );
+      if (owns && (await button.isDisplayed())) return button;
+    }
+    return undefined;
+  }, 15_000, `${selector} action was absent`);
   await choose.click();
   const apply = await waitFor(
     () => visibleButtonContaining(browser, "Apply resolution"),
