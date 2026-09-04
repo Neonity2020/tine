@@ -10,6 +10,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Tab inside a block embed no longer throws the caret out of the embed.**
+  Indenting, outdenting or moving a bullet inside a `{{embed}}` did the right
+  thing to the outline but reopened the editor on the block's other rendering
+  further down the page, so the following keystrokes landed out of sight. These
+  three operations now keep the caret on the surface you were typing on, as
+  splitting and merging already did (GH #477).
+
+- **Query Builder dropdowns close when you click somewhere else.** Its clause
+  menu and add-filter picker stayed open while you clicked away and started
+  editing a different block, even though the sort and summarize popovers beside
+  them closed correctly. Closing on an outside press now has one implementation
+  that every popover in Tine shares, so this cannot differ per menu again; the
+  `+ sort` button also toggles shut when you press it a second time (GH #472).
+
+- **A context submenu stays on screen.** Opened near the right edge of the
+  window — over a wide table, say — the `Show children as →` submenu was drawn
+  past the edge and its items could not be reached. It now mirrors to the left,
+  or overlays its own menu when the window is too narrow for either side
+  (GH #471).
+
+- **A page opened only in the right sidebar can be typed into.** An empty page,
+  or one whose only content is its `key:: value` header, offered nothing to
+  click and no place for the caret unless you first opened it in the main pane
+  (GH #483).
+
+- **Both copy buttons in the references sections sit on the same edge.** The one
+  in Linked References floated in the middle of its row because it and the
+  filter button each claimed the row's free space (GH #475).
+
 - **A `[[link]]` stops looking dead the moment its name becomes an alias.** After
   you added `alias:: page1` to another page, every existing `[[page1]]` kept the
   faded missing-page styling until you restarted Tine — even though clicking it

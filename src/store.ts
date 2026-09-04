@@ -3644,8 +3644,14 @@ export function splitBlock(
   markDirty(pageName);
 }
 
-/** Tab: make the block the last child of its previous sibling. */
-export function indentBlock(id: string, caretOffset: number) {
+/** Tab: make the block the last child of its previous sibling.
+ *
+ * `editingSurface` names the surface the caret must stay on, exactly as the
+ * split/merge operations above take it. Without it the caret leaves a block
+ * embed mid-keystroke: `editing()` in Block.tsx prefers the NON-embed rendering
+ * when no surface is named, so the editor remounts on the source copy of the
+ * same block further down the page (GH #477). */
+export function indentBlock(id: string, caretOffset: number, editingSurface: string | null = null) {
   if (!blockWritable(id)) return;
   const i = indexInSiblings(id);
   if (i <= 0) return;
@@ -3668,12 +3674,13 @@ export function indentBlock(id: string, caretOffset: number) {
       np.collapsed = false;
     })
   );
-  startEditing(id, caretOffset);
+  startEditing(id, caretOffset, null, editingSurface);
   markDirty(pageName);
 }
 
-/** Shift+Tab: move the block out to be the next sibling of its parent. */
-export function outdentBlock(id: string, caretOffset: number) {
+/** Shift+Tab: move the block out to be the next sibling of its parent.
+ *  `editingSurface` as in `indentBlock` (GH #477). */
+export function outdentBlock(id: string, caretOffset: number, editingSurface: string | null = null) {
   const node = doc.byId[id];
   if (!node || !blockWritable(id) || node.parent === null) return;
   pushUndo("outdent", [node.page]);
@@ -3704,7 +3711,7 @@ export function outdentBlock(id: string, caretOffset: number) {
       gArr.splice(gArr.indexOf(parentId) + 1, 0, id);
     })
   );
-  startEditing(id, caretOffset);
+  startEditing(id, caretOffset, null, editingSurface);
   markDirty(pageName);
 }
 

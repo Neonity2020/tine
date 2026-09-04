@@ -10137,6 +10137,33 @@
         "failBefore": "proven"
       },
       "notes": "User harm: opening a context menu over a table's rightmost column drew its `Show children as` submenu off the screen, so the items could not be reached at all. The parent menu had been viewport-aware since the `Delete namespace` fix (placeContextMenu); the submenu was pure CSS at `left: 100%` and knew nothing about the window. Fixed with the same shape: `placeSubmenu` picks a side once per menu -- right by default, mirrored left when the right would overflow, overlaying the menu itself when the viewport is too narrow for the pair -- and the menu carries the answer as `data-submenu-side`. Submenus are now hidden by `visibility` rather than `display` so they can be measured before the choice; being absolutely positioned, they still cost the menu no size and do not disturb the parent's own placement measurement. Measured in a real engine over the built app: before, the submenu ran 1089-1249px in a 1100px viewport; after, 726-886px on the left. The `over` branch is proven by the pure unit tests plus a forced-attribute layout check in the same script -- the narrow layout that selects it does not produce a block context menu in this harness, and it has NOT been observed on a real phone or on the reporter's iPadOS build. Known and not addressed: a submenu can still overflow the BOTTOM edge; only the horizontal axis was reported."
+    },
+    {
+      "id": "UI-EMBED-STRUCTURAL-CARET-477",
+      "title": "Tab, Shift+Tab and Alt+Shift+Up inside a block embed keep the caret in the embed",
+      "family": "block-embed",
+      "sources": {
+        "issues": [
+          477
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.embedStructural.test.tsx::a structural edit inside a block embed keeps the caret there (GH #477)::keeps Tab (indent) in the embed",
+          "src/components/Block.embedStructural.test.tsx::a structural edit inside a block embed keeps the caret there (GH #477)::keeps Shift+Tab (outdent) in the embed",
+          "src/components/Block.embedStructural.test.tsx::a structural edit inside a block embed keeps the caret there (GH #477)::keeps Alt+Shift+Up (move block up) in the embed",
+          "src/frontendTwins.guard.test.ts::frontend twin ownership guards::keeps every store editing operation surface-aware"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User harm: pressing Tab on a bullet inside a block embed indented the bullet correctly but threw the caret out of the embed onto the source copy of the same block elsewhere on the page, so the next keystrokes landed somewhere the user was not looking. Root cause is a shared invariant, not the Tab key: a store operation that reopens the editor must name the surface the caret belongs to, and `indentBlock`/`outdentBlock` did not take one. With no surface named, `editing()` in Block.tsx deliberately prefers the non-`ref:`/`embed:` rendering (the agenda-copy rule), so the editor remounted on the source. `splitBlock`, `mergeWithPrev` and `mergeWithNext` had already been given the parameter; indent, outdent and the Alt+Shift+Up/Down move had been missed. Fixed by giving all three the same `editingSurface` parameter that the split/merge family takes and passing `structuralSurface()` from the command table, and the class is now held at zero by a source scan over src/store.ts (proven to fire by reverting one call). Deliberately NOT changed in this packet: the paste and template-insert sites in Block.tsx also drop the surface, but they focus a NEWLY CREATED sibling, which may legitimately fall outside the embed's subtree -- pinning those to the embed surface could mount no editor at all. That is a separate question about which surface renders a new block, recorded rather than guessed. Evidence layer: jsdom render, driving the literal keydown path over a host page that renders the target block twice (once in the embed, once as an ordinary root) -- with a single rendering there is no wrong surface to land on and the bug is invisible. Not re-run natively; the surfaces here are DOM structure, not WebKitGTK layout."
     }
   ]
 }

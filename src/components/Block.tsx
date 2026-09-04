@@ -2786,7 +2786,7 @@ export function Editor(props: { id: string }): JSX.Element {
     const start = ref.selectionStart;
     commit(ref.value);
     setBlockMoving(true, doc.byId[props.id]?.page);
-    startEditing(props.id, start);
+    startEditing(props.id, start, null, structuralSurface());
     const move = outlineScope && !outlineScope.navOnly
       ? (moveItem(props.id, dir), Promise.resolve())
       : moveBlockFeed(props.id, dir).then(() => undefined);
@@ -2933,14 +2933,14 @@ export function Editor(props: { id: string }): JSX.Element {
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll) { nudgeListItem(ll, +2); return true; }
       if (!outlineScope?.navOnly && outlineScope?.roots.includes(props.id)) return true;
-      commit(ref.value); indentBlock(props.id, ref.selectionStart); return true;
+      commit(ref.value); indentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
     },
     "editor/outdent": (e) => {
       e.preventDefault();
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll && ll.indent.length > 0) { nudgeListItem(ll, -2); return true; }
       if (outlineScope?.forceExpandedRoot === doc.byId[props.id]?.parent) return true;
-      commit(ref.value); outdentBlock(props.id, ref.selectionStart); return true;
+      commit(ref.value); outdentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
     },
   };
   const mobileKeyEvent = { preventDefault() {} } as KeyboardEvent;
