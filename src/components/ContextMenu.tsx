@@ -122,6 +122,26 @@ export function placeContextMenu(
   return { left, top };
 }
 
+/** Which side a submenu opens on, once the parent menu itself has been placed.
+ *
+ *  Submenus used to be pure CSS at `left: 100%`, with no idea where the window
+ *  ended, so a menu opened over the rightmost column of a table pushed its
+ *  submenu off the screen entirely (GH #471). Right stays the default; left is
+ *  the mirror when the right side would overflow; `over` is the last resort for
+ *  a viewport too narrow for the pair, where the submenu overlays its own menu
+ *  instead of leaving the screen. Pure, because jsdom cannot lay out. */
+export function placeSubmenu(
+  menuLeft: number,
+  menuWidth: number,
+  submenuWidth: number,
+  vw: number,
+  margin = 6,
+): "right" | "left" | "over" {
+  if (menuLeft + menuWidth + submenuWidth <= vw - margin) return "right";
+  if (menuLeft - submenuWidth >= margin) return "left";
+  return "over";
+}
+
 export function ContextMenu(): JSX.Element {
   const close = (restoreFocus = true) => {
     const current = contextMenu();
@@ -135,6 +155,7 @@ export function ContextMenu(): JSX.Element {
   };
   let menuEl: HTMLDivElement | undefined;
   const [place, setPlace] = createSignal<{ left: number; top: number } | null>(null);
+  const [submenuSide, setSubmenuSide] = createSignal<"right" | "left" | "over">("right");
 
   // Viewport-aware placement. The menu opens at the click point, but a tall menu
   // opened low (e.g. "Delete namespace" near the sidebar bottom, GH nit) would
@@ -152,7 +173,18 @@ export function ContextMenu(): JSX.Element {
       const el = menuEl;
       if (!el || contextMenu() !== cm) return;
       const r = el.getBoundingClientRect();
-      setPlace(placeContextMenu(x, y, r.width, r.height, window.innerWidth, window.innerHeight));
+      const placed = placeContextMenu(x, y, r.width, r.height, window.innerWidth, window.innerHeight);
+      setPlace(placed);
+      // Submenus are laid out but hidden by `visibility`, so they are measurable
+      // here (GH #471). One side for the whole menu: two sibling submenus opening
+      // opposite ways would be worse than either.
+      const widest = Math.max(
+        0,
+        ...[...el.querySelectorAll<HTMLElement>(".ctx-submenu-menu")].map((sub) =>
+          sub.getBoundingClientRect().width,
+        ),
+      );
+      setSubmenuSide(placeSubmenu(placed.left, r.width, widest, window.innerWidth));
       if (cm.kind === "page") {
         el.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus();
       }
@@ -182,6 +214,7 @@ export function ContextMenu(): JSX.Element {
           <div
             ref={menuEl}
             class="ctx-menu"
+            data-submenu-side={submenuSide()}
             role={m().kind === "page" ? "menu" : undefined}
             aria-label={m().kind === "page" ? "Page actions" : undefined}
             style={{

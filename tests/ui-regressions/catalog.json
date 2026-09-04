@@ -10108,6 +10108,35 @@
         "failBefore": "proven"
       },
       "notes": "User harm: the copy button floated in the middle of the Linked References row while the Unlinked one sat at the right edge, so two near-identical sections read as different controls. Root cause is a flexbox rule, not a value to tune: `.reference-export-toggle` and `.reference-filter-toggle` each claimed `margin-left: auto`, and two auto margins SPLIT the free space between them rather than one absorbing it. Unlinked References has no filter button, so its copy button kept the whole gap and landed at the edge. Fixed by giving the header one owner of that push -- the first trailing button takes the free space, the rest sit on the row gap -- and by rendering copy last in Linked References so it lands on the same edge as the section that has copy alone. Measured in a real engine (headless Chromium over the built app), not modelled: before, the two right edges were 766px and 1030px in a 1100px viewport; after, both are 1030px. jsdom applies no layout, so the render test pins only the DOM order that the CSS rule depends on."
+    },
+    {
+      "id": "UI-CONTEXT-SUBMENU-ONSCREEN-471",
+      "title": "A context submenu stays inside the window instead of opening off the right edge",
+      "family": "context-menu",
+      "sources": {
+        "issues": [
+          471
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/contextMenuPlace.test.tsx::placeSubmenu::opens right when the pair fits",
+          "src/components/contextMenuPlace.test.tsx::placeSubmenu::mirrors to the left rather than leaving the window",
+          "src/components/contextMenuPlace.test.tsx::placeSubmenu::takes the right side when it fits exactly to the safe boundary",
+          "src/components/contextMenuPlace.test.tsx::placeSubmenu::overlays the menu when the viewport is too narrow for either side",
+          "src/components/contextMenuPlace.test.tsx::placeSubmenu::prefers left over overlaying whenever the left side has room",
+          "scripts/shot-submenu-onscreen.mjs"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User harm: opening a context menu over a table's rightmost column drew its `Show children as` submenu off the screen, so the items could not be reached at all. The parent menu had been viewport-aware since the `Delete namespace` fix (placeContextMenu); the submenu was pure CSS at `left: 100%` and knew nothing about the window. Fixed with the same shape: `placeSubmenu` picks a side once per menu -- right by default, mirrored left when the right would overflow, overlaying the menu itself when the viewport is too narrow for the pair -- and the menu carries the answer as `data-submenu-side`. Submenus are now hidden by `visibility` rather than `display` so they can be measured before the choice; being absolutely positioned, they still cost the menu no size and do not disturb the parent's own placement measurement. Measured in a real engine over the built app: before, the submenu ran 1089-1249px in a 1100px viewport; after, 726-886px on the left. The `over` branch is proven by the pure unit tests plus a forced-attribute layout check in the same script -- the narrow layout that selects it does not produce a block context menu in this harness, and it has NOT been observed on a real phone or on the reporter's iPadOS build. Known and not addressed: a submenu can still overflow the BOTTOM edge; only the horizontal axis was reported."
     }
   ]
 }

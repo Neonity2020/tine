@@ -4393,8 +4393,12 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   position: relative;
 }
 
+/* Hidden by `visibility`, not `display`, so ContextMenu can MEASURE the submenu
+   before deciding which side it opens on (GH #471). It is absolutely positioned,
+   so being laid out costs the menu no size and does not disturb the parent's own
+   viewport placement measurement. */
 .ctx-submenu-menu {
-  display: none;
+  visibility: hidden;
   position: absolute;
   left: 100%;
   top: -4px;
@@ -4406,8 +4410,22 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
 }
 
-.ctx-submenu:hover .ctx-submenu-menu {
-  display: block;
+.ctx-submenu:hover > .ctx-submenu-menu {
+  visibility: visible;
+}
+
+/* Side chosen by `placeSubmenu`, once per menu. Mirror to the left when opening
+   right would leave the window; overlay the menu itself when the viewport is too
+   narrow for the pair, which is the reporter's phone case. */
+.ctx-menu[data-submenu-side="left"] .ctx-submenu-menu {
+  left: auto;
+  right: 100%;
+}
+
+.ctx-menu[data-submenu-side="over"] .ctx-submenu-menu {
+  left: 0;
+  right: auto;
+  top: 100%;
 }
 
 .ctx-row {
