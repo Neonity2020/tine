@@ -47,3 +47,4 @@ reddit-backup/
 /*-fail-before.log
 /after-*.txt
 /measurement-*.txt
+/measurement*-*.md

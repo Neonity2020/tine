@@ -6348,6 +6348,29 @@
     "failBefore": "i12-front-door-fail-before.log, flag-fold-fail-before.log and data-home-kind-fail-before.log at 20bb15de"
    },
    "notes": "Four production readers parsed TINE_DEBUG/--debug independently (src-tauri/src/debug.rs, crates/tine-core/src/sync_runtime.rs and twice in crates/tine-core/src/oplog/import.rs), so the host process could not steer core diagnostics and the answer could drift per crate. Separately, the always-on fatal 'nowhere to keep its application data' line carried no error kind: the only diagnosable detail sat on the debug-only channel behind a process::exit the user cannot get past."
+  },
+  {
+    "id": "REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001",
+    "title": "Managed journal-range queries returned nothing when the graph configured a non-default journal page-title format",
+    "family": "managed-direct-query-parity",
+    "sources": {
+      "issues": [],
+      "commits": [],
+      "internal": "Harvest Wave 4 C7b"
+    },
+    "platforms": [
+      "all"
+    ],
+    "layer": "tine-core-query-managed-adapter",
+    "status": "covered",
+    "coverage": {
+      "tests": [
+        "crates/tine-core/src/sync_runtime_tests.rs::c7b_query_driver_parity"
+      ],
+      "scenario": "managed-query.journal-range-predicate-matches-direct",
+      "failBefore": "c7b-managed-journal-ordinal-fail-before.log at 61327be99fbd002f6837b43c027068c24279f10c"
+    },
+    "notes": "Direct Files derives a journal page's ordinal from the graph's configured JournalFormat, the producer that fills PageEntry::date_key. The managed query adapters derived it instead from query.rs journal_ordinal, which called JournalDate::from_title and so hardcoded the DEFAULT title format. On any graph whose :journal/page-title-format differs from the default the managed ordinal was None, so every predicate reading a journal day -- (between START END) and the other journal-day forms -- excluded every journal page and the managed query answered empty while Direct answered normally. ApplicationQueryPage now carries the day from the configured format, so one producer serves both backends. The sparse task-candidate path still reads the default format, but symmetrically for both backends (its ApplicationSparseQueryPage is also built in direct_projection.rs), so it cannot diverge; giving it the configured format is a follow-up."
   }
  ]
 }

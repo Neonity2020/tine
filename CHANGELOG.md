@@ -10,6 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Journal-day queries such as `(between …)` work in Managed Storage on a graph
+  with a custom journal page-title format.** Tine's Managed reader worked out
+  which day a journal page was from the DEFAULT title format rather than the one
+  your graph configures, so on any graph that sets `:journal/page-title-format`
+  every journal page looked like it had no date and every journal-day query came
+  back empty — while the same query over the same files answered normally in
+  Direct Files. Both now read the day from your configured format.
+
 - **Failure messages no longer reach the logs with your notes inside them.**
   Twelve always-on diagnostic lines used to print whatever a failed operation
   said — and a failed save, print, or conflict capture says it about the page it
@@ -65,6 +73,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   dropped it.
 
 ### Changed
+
+- **Managed and Direct reference and query reads now share one evaluator per
+  question, and a Managed navigation request loads its pending overlay at most
+  once.** Backlinks, unlinked references, block referrers, simple and advanced
+  queries and query export each ran through a separate Managed copy of the
+  Direct evaluator; they now run the same code over the same projected page
+  forest, and the Managed reference reads reuse the projection the query path
+  already retains instead of rebuilding one per read. Results, ordering and
+  bounds are unchanged.
 
 - **Sorting a sheet now derives each row's sort key once.** The key was
   previously recomputed inside the comparator, so a 200-row sheet parsed,

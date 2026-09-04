@@ -436,6 +436,10 @@ struct ManagedApplicationQueryInstrumentation {
     projection_cache_misses: usize,
     hydration_cache_hits: usize,
     hydration_cache_misses: usize,
+    /// Pending paths actually LOADED while constructing a navigation overlay.
+    /// One complete pass equals the number of committed-undrained paths; a
+    /// request that rebuilds the overlay per consumer records a multiple of it.
+    navigation_overlay_pending_path_loads: usize,
 }
 
 /// How many distinct simple-query answers one actor retains at a time.
@@ -12454,56 +12458,28 @@ fn bound_application_reference_sources(
     lower_bound_exceeded: bool,
 ) -> SyncApplicationBoundedRefGroups {
     sources.sort_by(|a, b| a.0.cmp(&b.0));
-    // Same accounting rule as Direct Files and as the managed block-referrer
-    // path: `query::ConstructionBudget`. This loop already charged payload +
-    // page name + 256 per admitted row and latched `exceeded`; naming the rule
-    // once is what keeps the three copies from drifting again.
-    let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
-    let mut grouped: Vec<(Option<i64>, RefGroup)> = Vec::new();
-    let mut by_name = HashMap::<String, usize>::new();
-    for (_, date_key, page, matches) in sources {
-        let key = crate::refs::page_key(&page.name);
-        let index = *by_name.entry(key).or_insert_with(|| {
-            let index = grouped.len();
-            grouped.push((
-                date_key,
-                RefGroup {
-                    page: page.name.clone(),
-                    kind: page.kind,
-                    blocks: Vec::new(),
-                    evidence: Vec::new(),
-                },
-            ));
-            index
-        });
-        if let (Some(previous), Some(current)) = (grouped[index].0, date_key) {
-            grouped[index].0 = Some(previous.max(current));
-        } else if grouped[index].0.is_none() {
-            grouped[index].0 = date_key;
-        }
+    // Budget admission, per-page grouping, `total`/`exceeded` and display order
+    // all belong to ONE algorithm shared with Direct Files and with the managed
+    // block-referrer path: `query::BoundedReferenceGroups`. This loop only
+    // declares its pages and offers its rows.
+    let mut accumulator = crate::query::BoundedReferenceGroups::new(max_rows, max_bytes);
+    for (path, date_key, page, matches) in sources {
+        let slot = accumulator.page(&path, &page.name, page.kind, date_key);
         for (block, evidence) in matches {
             let payload = crate::model::block_dto_estimated_bytes(&block)
                 .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence));
-            if budget.admit_estimated(&page.name, payload) {
-                grouped[index].1.blocks.push(block);
-                grouped[index].1.evidence.push(evidence);
-            }
+            accumulator.admit(slot, block, Some(evidence), payload);
         }
     }
-    grouped.retain(|(_, group)| !group.blocks.is_empty());
-    grouped.sort_by(|a, b| {
-        b.0.unwrap_or(i64::MIN)
-            .cmp(&a.0.unwrap_or(i64::MIN))
-            .then_with(|| a.1.page.cmp(&b.1.page))
-    });
-    let mut total = budget.total;
-    let mut exceeded = budget.exceeded;
+    let bounded = accumulator.finish();
+    let mut total = bounded.total;
+    let mut exceeded = bounded.exceeded;
     if lower_bound_exceeded {
         total = total.max(max_rows.saturating_add(1));
         exceeded = true;
     }
     SyncApplicationBoundedRefGroups {
-        groups: grouped.into_iter().map(|(_, group)| group).collect(),
+        groups: bounded.groups,
         total,
         exceeded,
     }
@@ -12590,13 +12566,25 @@ fn application_page_block_reference_counts(
     Ok(counts)
 }
 
-/// The managed path holds raw text rather than a parsed outline, so it builds a
-/// throwaway `DocBlock` to reach the projection -- but the truncation rule
-/// itself is [`crate::doc::crumb_line`], not a third copy of it (DUP-8).
-fn application_crumb_line(raw: &str, is_org: bool) -> String {
-    let mut block = crate::doc::DocBlock::new(raw);
-    block.is_org = is_org;
-    crate::doc::crumb_line(&block)
+/// The journal day a managed page evaluates as, for `(between …)` and the other
+/// journal-day predicates.
+///
+/// ONE producer answers this question for both backends: the graph's configured
+/// [`crate::date::JournalFormat`], which is also what fills `PageEntry::date_key`
+/// on the Direct side. Reading the day out of the page title with the DEFAULT
+/// title format instead is what made managed journal-range queries answer empty
+/// on every graph configuring a custom `:journal/page-title-format`
+/// (REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001). Prefer the entry's own `date_key`
+/// where the caller holds a `PageEntry`; this is for callers that hold only the
+/// loaded `PageDto`.
+fn application_query_page_journal(
+    journal_format: &crate::date::JournalFormat,
+    page: &PageDto,
+) -> Option<i64> {
+    if page.kind != PageKind::Journal {
+        return None;
+    }
+    crate::date::JournalFormat::parse(journal_format, &page.name).map(|date| date.ordinal_key())
 }
 
 fn application_query_page_recency(
@@ -12613,41 +12601,6 @@ fn application_query_page_recency(
         }
         Err(_) => i64::MIN,
     }
-}
-
-fn application_page_block_referrers(
-    page: &PageDto,
-    target: &str,
-    allowed_indices: Option<&HashSet<usize>>,
-) -> Vec<BlockDto> {
-    let flat = flatten_application_blocks(&page.blocks);
-    let is_org = page.format == Format::Org;
-    let crumbs = flat
-        .iter()
-        .map(|block| application_crumb_line(&block.block.raw, is_org))
-        .collect::<Vec<_>>();
-    let mut output = Vec::new();
-    for (index, block) in flat.iter().enumerate() {
-        if allowed_indices.is_some_and(|allowed| !allowed.contains(&index))
-            || !crate::render::block_refs(&block.block.raw, is_org)
-                .block
-                .iter()
-                .any(|uuid| uuid == target)
-        {
-            continue;
-        }
-        let mut dto = shallow_application_block(block.block);
-        let mut ancestors = Vec::new();
-        let mut parent = block.parent;
-        while let Some(index) = parent {
-            ancestors.push(crumbs[index].clone());
-            parent = flat[index].parent;
-        }
-        ancestors.reverse();
-        dto.breadcrumb = ancestors;
-        output.push(dto);
-    }
-    output
 }
 
 fn clone_application_subtree_bounded(
@@ -13459,6 +13412,15 @@ impl RuntimeActor {
             .reset_counters();
     }
 
+    #[cfg(test)]
+    fn note_navigation_overlay_pending_path_load(&self) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.navigation_overlay_pending_path_loads = current
+            .navigation_overlay_pending_path_loads
+            .saturating_add(1);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
     /// The converted block tree for one exact managed page, reused whenever the
     /// page's exact content is unchanged since the last managed query.
     fn application_projection_roots(
@@ -14111,24 +14073,32 @@ impl RuntimeActor {
         if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
             return Ok(SyncApplicationNavigationOutcome::Deferred { state });
         }
+        // ONE pending overlay per navigation request. Building it re-loads every
+        // pending path, and several of the consumers below need it; this local
+        // dies with the request, so it is a request-scoped value, not a cache
+        // (D-10).
+        let mut overlay_memo: Option<ApplicationNavigationOverlay> = None;
         let reply = match request {
             SyncApplicationNavigationRequest::ReferencedPageNames { known_digest } => {
-                let names = self.application_navigation_reference_names_ready()?;
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
+                let names = self.application_navigation_reference_names_ready(overlay)?;
                 SyncApplicationNavigationReply::ReferencedPageNames(
                     ReferencedPageNames::answer_for(&names, known_digest),
                 )
             }
             SyncApplicationNavigationRequest::PageAliases => {
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
                 SyncApplicationNavigationReply::PageAliases(
-                    self.application_navigation_aliases_ready()?
+                    self.application_navigation_aliases_ready(overlay)?
                         .into_iter()
                         .map(|(alias, owner, _)| (alias, owner))
                         .collect(),
                 )
             }
             SyncApplicationNavigationRequest::PageIcons { names } => {
-                let pages = self.application_navigation_pages_ready()?;
-                let aliases = self.application_navigation_aliases_ready()?;
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
+                let pages = self.application_navigation_pages_ready(overlay)?;
+                let aliases = self.application_navigation_aliases_ready(overlay)?;
                 let mut real_names = HashSet::new();
                 let mut icons = HashMap::new();
                 for (page, preamble) in pages {
@@ -14161,13 +14131,14 @@ impl RuntimeActor {
                 SyncApplicationNavigationReply::PageIcons(selected)
             }
             SyncApplicationNavigationRequest::ExistingPageNames { names } => {
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
                 let mut known = self
-                    .application_navigation_pages_ready()?
+                    .application_navigation_pages_ready(overlay)?
                     .into_iter()
                     .map(|(page, _)| crate::refs::page_key(&page.name))
                     .collect::<HashSet<_>>();
                 known.extend(
-                    self.application_navigation_aliases_ready()?
+                    self.application_navigation_aliases_ready(overlay)?
                         .into_iter()
                         .map(|(alias, _, _)| alias),
                 );
@@ -14179,13 +14150,14 @@ impl RuntimeActor {
                 )
             }
             SyncApplicationNavigationRequest::QuickSwitch { query, limit } => {
+                let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
                 let pages = self
-                    .application_navigation_pages_ready()?
+                    .application_navigation_pages_ready(overlay)?
                     .into_iter()
                     .map(|(page, _)| page)
                     .collect();
-                let aliases = self.application_navigation_aliases_ready()?;
-                let referenced = self.application_navigation_reference_names_ready()?;
+                let aliases = self.application_navigation_aliases_ready(overlay)?;
+                let referenced = self.application_navigation_reference_names_ready(overlay)?;
                 SyncApplicationNavigationReply::QuickSwitch(
                     crate::query_plan::legacy_page_search_entries(
                         pages, aliases, referenced, &query, limit,
@@ -14436,7 +14408,7 @@ impl RuntimeActor {
                 .iter()
                 .map(String::as_str)
                 .collect::<HashSet<_>>();
-            let mut pages = self.application_navigation_pages_ready()?;
+            let mut pages = self.application_navigation_pages_ready(&overlay)?;
             pages.sort_by(|left, right| left.0.rel_path.cmp(&right.0.rel_path));
             let mut claimants = HashMap::<String, Vec<(String, PageKind, Format, BlockDto)>>::new();
             for (entry, _) in pages {
@@ -14697,7 +14669,8 @@ impl RuntimeActor {
             let Some((_, page)) = current else {
                 continue;
             };
-            let blocks = application_page_block_referrers(page, target, None);
+            let roots = self.application_projection_roots(path.as_str(), page);
+            let blocks = crate::query::application_page_block_referrers(&roots, target, None);
             if blocks.is_empty() {
                 continue;
             }
@@ -14723,7 +14696,10 @@ impl RuntimeActor {
         for (page_id, block_ids) in candidates {
             let current = self.load_application_reference_page_id_ready(page_id)?;
             let allowed = application_parser_indices_for_block_ids(&current, &block_ids)?;
-            let blocks = application_page_block_referrers(&current.page, target, Some(&allowed));
+            let roots =
+                self.application_projection_roots(current.editor.page.path.as_str(), &current.page);
+            let blocks =
+                crate::query::application_page_block_referrers(&roots, target, Some(&allowed));
             if blocks.is_empty() {
                 continue;
             }
@@ -14759,68 +14735,40 @@ impl RuntimeActor {
         // identical content.
         source_groups.sort_by(|a, b| a.1.cmp(&b.1));
 
-        // ONE accounting rule with Direct Files (`query::ConstructionBudget`,
-        // as used by `collect_bounded_candidates`): payload + page name + 256
-        // charged per ADMITTED row, `exceeded` latched once the budget closes.
-        // This used to be open-coded here with a per-group overhead that was
-        // probed per row but accumulated once per emitted group, so identical
-        // content under an identical `max_bytes` admitted a different number of
-        // rows on the two paths.
-        let mut budget = crate::query::ConstructionBudget::new(max_rows, max_bytes);
-        let mut groups: Vec<(Option<i64>, String, RefGroup)> = Vec::new();
+        // ONE accounting, grouping and ordering rule with Direct Files and with
+        // managed backlinks: `query::BoundedReferenceGroups`. This loop used to
+        // own private copies of all three, and they had drifted — it grouped by
+        // storage path, so two files whose titles fold to one logical page
+        // produced two reference groups where Direct produced one.
+        let mut accumulator = crate::query::BoundedReferenceGroups::new(max_rows, max_bytes);
         for (date_key, path, group) in source_groups {
-            let mut admitted = Vec::new();
+            let slot = accumulator.page(&path, &group.page, group.kind, date_key);
             for block in group.blocks {
-                if budget.closed() {
-                    budget.deny_match();
+                if accumulator.closed() {
+                    accumulator.deny();
                     continue;
                 }
-                if !budget
-                    .admit_estimated(&group.page, crate::model::block_dto_estimated_bytes(&block))
-                {
-                    continue;
-                }
-                admitted.push(block);
-            }
-            if !admitted.is_empty() {
-                groups.push((
-                    date_key,
-                    path,
-                    RefGroup {
-                        page: group.page,
-                        kind: group.kind,
-                        blocks: admitted,
-                        evidence: Vec::new(),
-                    },
-                ));
+                let payload = crate::model::block_dto_estimated_bytes(&block);
+                accumulator.admit(slot, block, None, payload);
             }
         }
-        // OG parity, same rule as Direct `collect_bounded_candidates`: newest
-        // journal day first, non-journal pages last, page name as the
-        // deterministic tie-break (path breaking a name tie).
-        groups.sort_by(|a, b| {
-            b.0.unwrap_or(i64::MIN)
-                .cmp(&a.0.unwrap_or(i64::MIN))
-                .then_with(|| a.2.page.cmp(&b.2.page))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        let groups = groups
-            .into_iter()
-            .map(|(_, _, group)| group)
-            .collect::<Vec<_>>();
+        let bounded = accumulator.finish();
         Ok(SyncApplicationBoundedRefGroups {
-            groups,
-            total: budget.total,
-            exceeded: budget.exceeded,
+            groups: bounded.groups,
+            total: bounded.total,
+            exceeded: bounded.exceeded,
         })
     }
 
+    /// `overlay` is the caller's request-scoped pending overlay (see
+    /// [`Self::navigation_overlay_scoped`]), passed in rather than rebuilt.
     fn application_equivalent_page_names_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
         target: &str,
     ) -> Result<(String, Vec<String>, String), SyncApplicationPageRequestError> {
         let mut real_pages = crate::query::RealPageNames::new();
-        for (page, _) in self.application_navigation_pages_ready()? {
+        for (page, _) in self.application_navigation_pages_ready(overlay)? {
             let key = crate::refs::page_key(&page.name);
             match real_pages.get_mut(&key) {
                 Some((winner_path, winner_name)) if page.path < *winner_path => {
@@ -14834,7 +14782,7 @@ impl RuntimeActor {
             }
         }
         let aliases = self
-            .application_navigation_aliases_ready()?
+            .application_navigation_aliases_ready(overlay)?
             .into_iter()
             .map(|(alias, owner, _)| (alias, owner))
             .collect::<Vec<_>>();
@@ -14851,13 +14799,15 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+        // ONE pending overlay for this request: the equivalent-name fold and
+        // the reference walk below both need it.
+        let overlay = self.application_navigation_overlay_ready()?;
         let (canonical, names_norm, self_page) =
-            self.application_equivalent_page_names_ready(target)?;
+            self.application_equivalent_page_names_ready(&overlay, target)?;
         let excluded = crate::refs::ReferenceSourceExclusions::new(
             &self_page,
             self.graph.config.favorites_page.as_deref(),
         );
-        let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let read = self.application_materialized_read_ready()?;
 
@@ -14944,7 +14894,9 @@ impl RuntimeActor {
             if excluded.excludes_name(&page.name) {
                 continue;
             }
+            let roots = self.application_projection_roots(path.as_str(), &page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &page,
                 &canonical,
                 &names_norm,
@@ -14972,7 +14924,10 @@ impl RuntimeActor {
                 continue;
             }
             let allowed = application_parser_indices_for_block_ids(&current, &candidate.blocks)?;
+            let roots =
+                self.application_projection_roots(current.editor.page.path.as_str(), &current.page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &current.page,
                 &canonical,
                 &names_norm,
@@ -15017,8 +14972,13 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
-        let (canonical, names_norm, self_page) =
-            self.application_equivalent_page_names_ready(target)?;
+        // ONE pending overlay for this request, built lazily: the early return
+        // below reaches neither consumer on a search-index-backed run.
+        let mut overlay_memo: Option<ApplicationNavigationOverlay> = None;
+        let (canonical, names_norm, self_page) = self.application_equivalent_page_names_ready(
+            self.navigation_overlay_scoped(&mut overlay_memo)?,
+            target,
+        )?;
         let excluded = crate::refs::ReferenceSourceExclusions::new(
             &self_page,
             self.graph.config.favorites_page.as_deref(),
@@ -15036,12 +14996,16 @@ impl RuntimeActor {
             // Preserve correctness through exact application pages, never the
             // broad Direct-Files parsed cache. This exceptional path remains
             // explicit so C3 performance receipts can measure it separately.
-            for (entry, _) in self.application_navigation_pages_ready()? {
+            for (entry, _) in self.application_navigation_pages_ready(
+                self.navigation_overlay_scoped(&mut overlay_memo)?,
+            )? {
                 if excluded.excludes_name(&entry.name) {
                     continue;
                 }
                 let page = self.load_application_reference_source_exact_ready(&entry.rel_path)?;
+                let roots = self.application_projection_roots(&entry.rel_path, &page);
                 let matches = crate::query::application_page_reference_matches(
+                    &roots,
                     &page,
                     &canonical,
                     &names_norm,
@@ -15059,7 +15023,7 @@ impl RuntimeActor {
             ));
         }
 
-        let overlay = self.application_navigation_overlay_ready()?;
+        let overlay = self.navigation_overlay_scoped_owned(&mut overlay_memo)?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
@@ -15116,7 +15080,9 @@ impl RuntimeActor {
             if excluded.excludes_name(&page.name) {
                 continue;
             }
+            let roots = self.application_projection_roots(path.as_str(), &page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &page,
                 &canonical,
                 &names_norm,
@@ -15148,7 +15114,9 @@ impl RuntimeActor {
             if excluded.excludes_name(&page.name) {
                 continue;
             }
+            let roots = self.application_projection_roots(path.as_str(), &page);
             let matches = crate::query::application_page_reference_matches(
+                &roots,
                 &page,
                 &canonical,
                 &names_norm,
@@ -15726,6 +15694,7 @@ impl RuntimeActor {
                     &self.graph.journal_format,
                     &page,
                 ),
+                journal: application_query_page_journal(&self.graph.journal_format, &page),
                 roots: self.application_projection_roots(&path, &page),
                 page,
             })
@@ -15748,7 +15717,8 @@ impl RuntimeActor {
     fn application_all_query_pages_ready(
         &self,
     ) -> Result<Vec<crate::query::ApplicationQueryPage>, SyncApplicationPageRequestError> {
-        let entries = self.application_navigation_pages_ready()?;
+        let overlay = self.application_navigation_overlay_ready()?;
+        let entries = self.application_navigation_pages_ready(&overlay)?;
         let mut pages = Vec::with_capacity(entries.len());
         for (entry, _) in entries {
             let current = match self.load_application_exact_ready(&entry.rel_path)? {
@@ -15765,6 +15735,7 @@ impl RuntimeActor {
                     &self.graph.journal_format,
                     &current.page,
                 ),
+                journal: entry.date_key,
                 roots: self.application_projection_roots(&entry.rel_path, &current.page),
                 page: current.page,
             });
@@ -15849,8 +15820,11 @@ impl RuntimeActor {
         cancellation: Option<&ApplicationSearchCancellation>,
     ) -> Result<crate::query_plan::QueryExecution, SyncApplicationPageRequestError> {
         let cancelled = || cancellation.is_some_and(ApplicationSearchCancellation::cancelled);
+        // ONE pending overlay for this request, built lazily: the cancellation
+        // return below skips the alias and referenced-name consumers.
+        let mut overlay_memo: Option<ApplicationNavigationOverlay> = None;
         let entries = self
-            .application_navigation_pages_ready()?
+            .application_navigation_pages_ready(self.navigation_overlay_scoped(&mut overlay_memo)?)?
             .into_iter()
             .map(|(entry, _)| entry)
             .collect::<Vec<_>>();
@@ -15866,8 +15840,9 @@ impl RuntimeActor {
                 explain,
             ));
         }
-        let aliases = self.application_navigation_aliases_ready()?;
-        let referenced = self.application_navigation_reference_names_ready()?;
+        let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
+        let aliases = self.application_navigation_aliases_ready(overlay)?;
+        let referenced = self.application_navigation_reference_names_ready(overlay)?;
         let needs_blocks = plan
             .branches
             .iter()
@@ -15969,7 +15944,9 @@ impl RuntimeActor {
         target: &str,
         targets: &[BacklinkFilterTarget],
     ) -> Result<BacklinkFilterContext, SyncApplicationPageRequestError> {
-        let (_, names_norm, _) = self.application_equivalent_page_names_ready(target)?;
+        // ONE pending overlay for this request: both consumers below need it.
+        let overlay = self.application_navigation_overlay_ready()?;
+        let (_, names_norm, _) = self.application_equivalent_page_names_ready(&overlay, target)?;
         let excluded_refs = names_norm.into_iter().collect::<HashSet<_>>();
         let mut requested = HashMap::<(PageKind, String), HashSet<String>>::new();
         for item in targets {
@@ -15981,7 +15958,7 @@ impl RuntimeActor {
         let requested_unique = requested.values().map(HashSet::len).sum::<usize>();
         let mut context = BacklinkFilterContext::default();
         let mut bytes = 0_usize;
-        let pages = self.application_navigation_pages_ready()?;
+        let pages = self.application_navigation_pages_ready(&overlay)?;
         for (entry, _) in pages {
             let key = (entry.kind, crate::refs::page_key(&entry.name));
             let Some(ids) = requested.get(&key) else {
@@ -16042,10 +16019,14 @@ impl RuntimeActor {
         Ok(context)
     }
 
+    /// `overlay` is the caller's REQUEST-SCOPED pending overlay
+    /// ([`SyncRuntimeActor::application_navigation_overlay_ready`]), passed in
+    /// rather than rebuilt: constructing it re-reads every pending path, and one
+    /// navigation request asks several of these helpers in turn.
     fn application_navigation_pages_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
     ) -> Result<Vec<(PageEntry, Option<String>)>, SyncApplicationPageRequestError> {
-        let overlay = self.application_navigation_overlay_ready()?;
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, PageId)> = None;
@@ -16101,7 +16082,7 @@ impl RuntimeActor {
                         "application_navigation_pages_overlay_inventory_entry",
                     )
                 })?;
-            output.push((page_id, entry, page.pre_block));
+            output.push((*page_id, entry, page.pre_block.clone()));
         }
         output.sort_by(|a, b| a.1.rel_path.cmp(&b.1.rel_path).then_with(|| a.0.cmp(&b.0)));
         Ok(output
@@ -16126,6 +16107,8 @@ impl RuntimeActor {
             .unwrap_or_default();
         let mut overlay = BTreeMap::new();
         for path in paths {
+            #[cfg(test)]
+            self.note_navigation_overlay_pending_path_load();
             let path = ManagedPath::parse(path).map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_navigation_overlay_path_parse",
@@ -16151,10 +16134,42 @@ impl RuntimeActor {
         Ok(overlay)
     }
 
+    /// The pending overlay for ONE request, built at most once.
+    ///
+    /// `memo` is a local of the request being served and dies with it, so this
+    /// is a request-scoped value, never a cache across requests (D-10). It
+    /// exists because [`Self::application_navigation_overlay_ready`] re-loads
+    /// every pending path, and a single navigation request asks several
+    /// consumers that each need the same overlay.
+    fn navigation_overlay_scoped<'a>(
+        &self,
+        memo: &'a mut Option<ApplicationNavigationOverlay>,
+    ) -> Result<&'a ApplicationNavigationOverlay, SyncApplicationPageRequestError> {
+        if memo.is_none() {
+            *memo = Some(self.application_navigation_overlay_ready()?);
+        }
+        Ok(memo.as_ref().expect("overlay built immediately above"))
+    }
+
+    /// The request-scoped overlay, handed to a caller that consumes it.
+    ///
+    /// Same request-scoped value as [`Self::navigation_overlay_scoped`]; use
+    /// this only where the caller is the last consumer in the request, because
+    /// it empties `memo`.
+    fn navigation_overlay_scoped_owned(
+        &self,
+        memo: &mut Option<ApplicationNavigationOverlay>,
+    ) -> Result<ApplicationNavigationOverlay, SyncApplicationPageRequestError> {
+        match memo.take() {
+            Some(overlay) => Ok(overlay),
+            None => self.application_navigation_overlay_ready(),
+        }
+    }
+
     fn application_navigation_aliases_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
     ) -> Result<Vec<(String, String, String)>, SyncApplicationPageRequestError> {
-        let overlay = self.application_navigation_overlay_ready()?;
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, String, PageId)> = None;
@@ -16208,10 +16223,12 @@ impl RuntimeActor {
         Ok(output)
     }
 
+    /// `overlay` is the caller's request-scoped pending overlay; see
+    /// [`SyncRuntimeActor::application_navigation_pages_ready`].
     fn application_navigation_reference_names_ready(
         &self,
+        overlay: &ApplicationNavigationOverlay,
     ) -> Result<Vec<String>, SyncApplicationPageRequestError> {
-        let overlay = self.application_navigation_overlay_ready()?;
         let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, String, String, PageId)> = None;
@@ -16249,7 +16266,7 @@ impl RuntimeActor {
                 break;
             }
         }
-        for current in overlay.into_values().flatten() {
+        for current in overlay.values().flatten() {
             for (raw, normalized) in navigation_page_reference_names(&current.1) {
                 if seen.insert(normalized) {
                     output.push(raw);

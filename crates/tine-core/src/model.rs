@@ -6121,6 +6121,7 @@ impl Graph {
                         &entry.name,
                         &entry.path,
                     ),
+                    journal: entry.date_key,
                 })
             })
             .collect::<Option<Vec<_>>>()?;

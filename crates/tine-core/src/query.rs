@@ -129,7 +129,222 @@ impl ConstructionBudget {
     }
 }
 
-/// Parse a journal-page title (e.g. "Jan 1st, 2022") to a `yyyymmdd` ordinal.
+/// A page already declared to [`BoundedReferenceGroups`]. Opaque so a caller
+/// cannot fabricate a slot for a page it never declared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReferencePageSlot(usize);
+
+struct BoundedReferenceGroup {
+    date_key: Option<i64>,
+    order_key: String,
+    group: RefGroup,
+}
+
+/// The ONE bounded reference-result accumulator (I-12, I-13).
+///
+/// Direct Files' `collect_reference_occurrences_bounded`, managed backlinks and
+/// unlinked references (`bound_application_reference_sources`) and the managed
+/// block-referrer path each used to own a private copy of the same four rules —
+/// [`ConstructionBudget`] admission, grouping duplicate logical page names under
+/// the canonical [`crate::refs::page_key`], carrying `total`/`exceeded`, and the
+/// OG display order — and the three copies had already drifted: the managed
+/// block-referrer path grouped by storage path, so two files whose titles fold
+/// to one logical page produced two reference groups where Direct produced one.
+/// They are call sites now; this type is the algorithm.
+///
+/// Rows are admitted in the caller's declaration order, which every caller makes
+/// source-path order, because the budget truncates and Direct Files charges
+/// page-by-page in path order. Display order is applied only at [`Self::finish`].
+///
+/// `evidence` is parallel to `blocks` within a group. A producer is either
+/// evidence-bearing for every row (backlinks, unlinked references) or for none
+/// (block referrers); mixing the two within one group is not a supported shape.
+pub(crate) struct BoundedReferenceGroups {
+    budget: ConstructionBudget,
+    declarations: Vec<ReferencePageDeclaration>,
+    groups: Vec<BoundedReferenceGroup>,
+    by_key: HashMap<String, usize>,
+}
+
+struct ReferencePageDeclaration {
+    order_key: String,
+    name: String,
+    kind: PageKind,
+    date_key: Option<i64>,
+    group: Option<usize>,
+}
+
+impl BoundedReferenceGroups {
+    pub(crate) fn new(max_rows: usize, max_bytes: usize) -> Self {
+        Self {
+            budget: ConstructionBudget::new(max_rows, max_bytes),
+            declarations: Vec::new(),
+            groups: Vec::new(),
+            by_key: HashMap::new(),
+        }
+    }
+
+    /// Declare the page whose rows follow. Declaring is free: a page that
+    /// retains no row never reaches the result and never contributes its
+    /// journal day or path to a group it shares a canonical key with.
+    pub(crate) fn page(
+        &mut self,
+        order_key: &str,
+        name: &str,
+        kind: PageKind,
+        date_key: Option<i64>,
+    ) -> ReferencePageSlot {
+        self.declarations.push(ReferencePageDeclaration {
+            order_key: order_key.to_owned(),
+            name: name.to_owned(),
+            kind,
+            date_key,
+            group: None,
+        });
+        ReferencePageSlot(self.declarations.len() - 1)
+    }
+
+    pub(crate) fn closed(&self) -> bool {
+        self.budget.closed()
+    }
+
+    /// Count a match the budget will not construct.
+    pub(crate) fn deny(&mut self) {
+        self.budget.deny_match();
+    }
+
+    /// Create or join the group this declaration belongs to, merging duplicate
+    /// logical page names under the canonical [`crate::refs::page_key`].
+    /// `order_key` (the source path in every caller) only breaks a display tie;
+    /// the smallest wins, so order never depends on which duplicate came first.
+    fn group_for(&mut self, slot: ReferencePageSlot) -> usize {
+        if let Some(index) = self.declarations[slot.0].group {
+            return index;
+        }
+        let key = refs::page_key(&self.declarations[slot.0].name);
+        let index = match self.by_key.get(&key).copied() {
+            Some(index) => {
+                let declaration = &self.declarations[slot.0];
+                let existing = &mut self.groups[index];
+                existing.date_key = match (existing.date_key, declaration.date_key) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (current @ Some(_), None) => current,
+                    (None, other) => other,
+                };
+                if declaration.order_key < existing.order_key {
+                    existing.order_key.clone_from(&declaration.order_key);
+                }
+                index
+            }
+            None => {
+                let declaration = &self.declarations[slot.0];
+                let index = self.groups.len();
+                self.groups.push(BoundedReferenceGroup {
+                    date_key: declaration.date_key,
+                    order_key: declaration.order_key.clone(),
+                    group: RefGroup {
+                        page: declaration.name.clone(),
+                        kind: declaration.kind,
+                        blocks: Vec::new(),
+                        evidence: Vec::new(),
+                    },
+                });
+                self.by_key.insert(key, index);
+                index
+            }
+        };
+        self.declarations[slot.0].group = Some(index);
+        index
+    }
+
+    /// Charge one row against the shared budget and, only if it is admitted,
+    /// build and retain it. The row is constructed inside `build` so an
+    /// over-budget match costs an estimate, never a DTO.
+    pub(crate) fn admit_with(
+        &mut self,
+        slot: ReferencePageSlot,
+        payload_bytes: usize,
+        build: impl FnOnce() -> (BlockDto, Option<ReferenceBlockEvidence>),
+    ) -> bool {
+        let index = self.group_for(slot);
+        let Self { budget, groups, .. } = self;
+        let entry = &mut groups[index];
+        if !budget.admit_estimated(&entry.group.page, payload_bytes) {
+            return false;
+        }
+        let (block, evidence) = build();
+        entry.group.blocks.push(block);
+        if let Some(evidence) = evidence {
+            entry.group.evidence.push(evidence);
+        }
+        true
+    }
+
+    /// [`Self::admit_with`] for a caller that already owns the constructed row.
+    pub(crate) fn admit(
+        &mut self,
+        slot: ReferencePageSlot,
+        block: BlockDto,
+        evidence: Option<ReferenceBlockEvidence>,
+        payload_bytes: usize,
+    ) -> bool {
+        self.admit_with(slot, payload_bytes, move || (block, evidence))
+    }
+
+    /// Drop the pages that retained nothing and apply the OG display order:
+    /// newest journal day first, non-journal pages last, page name as the
+    /// deterministic tie-break, source path breaking a name tie.
+    pub(crate) fn finish(self) -> BoundedGroups {
+        let mut groups = self.groups;
+        groups.retain(|entry| !entry.group.blocks.is_empty());
+        groups.sort_by(|a, b| reference_group_display_order(a, b));
+        BoundedGroups {
+            groups: groups.into_iter().map(|entry| entry.group).collect(),
+            total: self.budget.total,
+            exceeded: self.budget.exceeded,
+        }
+    }
+}
+
+/// The ONE display order for reference groups: journal day descending, then
+/// page name, then the group's admission key.
+///
+/// It has exactly one production call site --
+/// [`BoundedReferenceGroups::finish`] -- because every reference surface
+/// (Direct occurrences, managed backlinks, managed unlinked references, managed
+/// block referrers) reaches display order through that one accumulator. A
+/// second caller would mean a second producer of this answer (I-12).
+fn reference_group_display_order(
+    a: &BoundedReferenceGroup,
+    b: &BoundedReferenceGroup,
+) -> std::cmp::Ordering {
+    b.date_key
+        .unwrap_or(i64::MIN)
+        .cmp(&a.date_key.unwrap_or(i64::MIN))
+        .then_with(|| a.group.page.cmp(&b.group.page))
+        .then_with(|| a.order_key.cmp(&b.order_key))
+}
+
+/// The `yyyymmdd` ordinal of a journal title read with the DEFAULT title format
+/// (e.g. "Jan 1st, 2022").
+///
+/// This is NOT the producer of "what day is this journal page". That question
+/// has one config-aware owner, [`crate::date::JournalFormat::parse`], which is
+/// what fills `PageEntry::date_key` for Direct Files and
+/// `ApplicationQueryPage::journal` for the managed adapters. Deriving the day
+/// from the title with the default format instead is what made managed
+/// journal-range queries answer empty on every graph configuring a custom
+/// `:journal/page-title-format` (REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001).
+///
+/// Two callers survive, and neither can make the two backends disagree:
+///
+/// - the sparse task-candidate evaluator, whose `ApplicationSparseQueryPage`
+///   carries no day and is constructed in `direct_projection.rs` as well, so
+///   BOTH backends read the same (equally default-bound) value there;
+/// - [`resolve_date_token`], which reads a `(between …)` BOUND LITERAL the user
+///   typed rather than a page's day, in code shared by both backends.
+///
+/// Giving either the configured format is a follow-up, not a parity defect.
 fn journal_ordinal(title: &str) -> Option<i64> {
     JournalDate::from_title(title).map(|d| d.ordinal_key())
 }
@@ -714,7 +929,16 @@ fn block_reference_evidence(
 /// Exact parser-owned reference matches from one application-gateway page.
 /// SQLite callers may restrict ordinary blocks by flattened parser index, but
 /// the evidence and frontend identities always come from `PageDto`.
+/// Reference matches within ONE page, over that page's projected forest.
+///
+/// `roots` is the page's `DocBlock` forest: Direct hands its cached
+/// `Arc<Document>` roots, managed reads hand the forest retained by
+/// `application_projection_roots`, so neither side converts a `BlockDto` tree
+/// here. The walk itself is [`collect_reference_matches`] -- the same visitor
+/// the Direct occurrence collector uses -- so pre-order block indexing,
+/// ancestor breadcrumbs and result-row shape have ONE owner (I-12).
 pub(crate) fn application_page_reference_matches(
+    roots: &[DocBlock],
     page: &PageDto,
     canonical: &str,
     names_norm: &[String],
@@ -740,62 +964,81 @@ pub(crate) fn application_page_reference_matches(
         }
     }
 
-    fn visit(
-        blocks: &[BlockDto],
-        is_org: bool,
-        canonical: &str,
-        names_norm: &[String],
-        kind: ReferenceKind,
-        allowed_indices: Option<&std::collections::HashSet<usize>>,
-        config: &crate::config::Config,
-        index: &mut usize,
-        ancestors: &mut Vec<String>,
-        output: &mut Vec<(BlockDto, ReferenceBlockEvidence)>,
-    ) {
-        for block in blocks {
-            let current = *index;
-            *index = index.saturating_add(1);
-            let projected = dto_block_to_doc_block(block, is_org);
-            if allowed_indices.is_none_or(|allowed| allowed.contains(&current)) {
-                if let Some(hit) =
-                    block_reference_evidence(&projected, canonical, names_norm, kind, config)
-                {
-                    let mut dto = block_to_shallow_dto(&projected);
-                    dto.breadcrumb = ancestors.clone();
-                    output.push((dto, hit));
-                }
+    // Pre-order position of the block being classified, which is the index
+    // `allowed_indices` is expressed in.
+    let index = std::cell::Cell::new(0_usize);
+    let mut path = Vec::new();
+    let mut found: Vec<()> = Vec::new();
+    collect_reference_matches(
+        roots,
+        &mut path,
+        &mut |block, _| {
+            let current = index.get();
+            index.set(current.saturating_add(1));
+            if allowed_indices.is_some_and(|allowed| !allowed.contains(&current)) {
+                return None;
             }
-            ancestors.push(crate::doc::crumb_line(&projected));
-            visit(
-                &block.children,
-                is_org,
-                canonical,
-                names_norm,
-                kind,
-                allowed_indices,
-                config,
-                index,
-                ancestors,
-                output,
-            );
-            ancestors.pop();
-        }
-    }
-
-    let mut index = 0;
-    visit(
-        &page.blocks,
-        is_org,
-        canonical,
-        names_norm,
-        kind,
-        allowed_indices,
-        config,
-        &mut index,
-        &mut Vec::new(),
-        &mut matches,
+            block_reference_evidence(block, canonical, names_norm, kind, config)
+        },
+        &mut |block, ancestors, hit| {
+            let mut dto = result_dto(block);
+            dto.breadcrumb = ancestors
+                .iter()
+                .map(|ancestor| crate::doc::crumb_line(ancestor))
+                .collect();
+            matches.push((dto, hit));
+            None
+        },
+        &mut found,
     );
     matches
+}
+
+/// Block-level referrers within ONE managed page, over that page's projected
+/// forest and the same [`collect_reference_matches`] visitor.
+///
+/// Replaces the managed twin that flattened the `BlockDto` tree, re-parsed
+/// every block through `render::block_refs`, and built a throwaway `DocBlock`
+/// per block just to produce a breadcrumb. Here the match test reads the
+/// forest's memoized `block_refs` projection and breadcrumbs are computed only
+/// for admitted rows.
+pub(crate) fn application_page_block_referrers(
+    roots: &[DocBlock],
+    target: &str,
+    allowed_indices: Option<&std::collections::HashSet<usize>>,
+) -> Vec<BlockDto> {
+    let index = std::cell::Cell::new(0_usize);
+    let mut output = Vec::new();
+    let mut path = Vec::new();
+    let mut found: Vec<()> = Vec::new();
+    collect_reference_matches(
+        roots,
+        &mut path,
+        &mut |block, _| {
+            let current = index.get();
+            index.set(current.saturating_add(1));
+            if allowed_indices.is_some_and(|allowed| !allowed.contains(&current)) {
+                return None;
+            }
+            block
+                .projection()
+                .block_refs
+                .iter()
+                .any(|uuid| uuid == target)
+                .then_some(())
+        },
+        &mut |block, ancestors, ()| {
+            let mut dto = result_dto(block);
+            dto.breadcrumb = ancestors
+                .iter()
+                .map(|ancestor| crate::doc::crumb_line(ancestor))
+                .collect();
+            output.push(dto);
+            None
+        },
+        &mut found,
+    );
+    output
 }
 
 pub(crate) fn application_page_property_dto(page: &PageDto) -> Option<BlockDto> {
@@ -854,120 +1097,79 @@ fn collect_reference_occurrences_bounded(
 ) -> BoundedGroups {
     let exclude =
         refs::ReferenceSourceExclusions::new(self_page, graph.config.favorites_page.as_deref());
-    let mut budget = ConstructionBudget::new(max_rows, max_bytes);
+    let mut accumulator = BoundedReferenceGroups::new(max_rows, max_bytes);
     let candidate_pages = graph.reference_candidate_pages(names_norm, kind);
-    let groups = {
-        let pages = candidate_pages.pages.as_slice();
-        let mut groups: Vec<(Option<i64>, RefGroup)> = Vec::new();
-        let mut by_name = std::collections::HashMap::<String, usize>::new();
-        let mut sources = pages.iter().collect::<Vec<_>>();
-        sources.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
-        for (entry, doc) in sources {
-            if exclude.excludes_name(&entry.name) {
-                continue;
-            }
-            let mut blocks = Vec::new();
-            let mut evidence = Vec::new();
-            if let Some(mut block) = doc
-                .pre_block
-                .as_deref()
-                .and_then(|pre| page_property_block(entry, pre))
-            {
-                if budget.closed() {
-                    if block_has_reference(&block, names_norm, kind, &graph.config) {
-                        budget.deny_match();
-                    }
-                } else if let Some(hit) =
-                    block_reference_evidence(&block, canonical, names_norm, kind, &graph.config)
-                {
-                    let mut dto = block_to_shallow_dto(&block);
-                    dto.page_property = true;
-                    let estimated = crate::model::block_dto_estimated_bytes(&dto)
-                        .saturating_add(reference_evidence_estimated_bytes(&hit));
-                    if budget.admit_estimated(&entry.name, estimated) {
-                        blocks.push(dto);
-                        evidence.push(hit);
-                    }
+    let pages = candidate_pages.pages.as_slice();
+    let mut sources = pages.iter().collect::<Vec<_>>();
+    sources.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
+    for (entry, doc) in sources {
+        if exclude.excludes_name(&entry.name) {
+            continue;
+        }
+        let slot = accumulator.page(&entry.rel_path, &entry.name, entry.kind, entry.date_key);
+        if let Some(mut block) = doc
+            .pre_block
+            .as_deref()
+            .and_then(|pre| page_property_block(entry, pre))
+        {
+            if accumulator.closed() {
+                if block_has_reference(&block, names_norm, kind, &graph.config) {
+                    accumulator.deny();
                 }
-                block.children.clear();
+            } else if let Some(hit) =
+                block_reference_evidence(&block, canonical, names_norm, kind, &graph.config)
+            {
+                // The page-property DTO is the estimate's own input here, so it
+                // is built before admission on this one row (unchanged).
+                let mut dto = block_to_shallow_dto(&block);
+                dto.page_property = true;
+                let estimated = crate::model::block_dto_estimated_bytes(&dto)
+                    .saturating_add(reference_evidence_estimated_bytes(&hit));
+                accumulator.admit(slot, dto, Some(hit), estimated);
             }
-            let mut path = Vec::new();
-            let mut found: Vec<(BlockDto, ReferenceBlockEvidence)> = Vec::new();
-            let construction_closed = std::cell::Cell::new(budget.closed());
-            collect_reference_matches(
-                &doc.roots,
-                &mut path,
-                &mut |block, _| {
-                    if construction_closed.get() {
-                        block_has_reference(block, names_norm, kind, &graph.config).then_some(None)
-                    } else {
-                        block_reference_evidence(block, canonical, names_norm, kind, &graph.config)
-                            .map(Some)
-                    }
-                },
-                &mut |block, ancestors, hit| {
-                    let Some(hit) = hit else {
-                        budget.deny_match();
-                        construction_closed.set(true);
-                        return None;
-                    };
-                    let estimated = shallow_dto_estimated_bytes(block, ancestors)
-                        .saturating_add(reference_evidence_estimated_bytes(&hit));
-                    if !budget.admit_estimated(&entry.name, estimated) {
-                        construction_closed.set(true);
-                        return None;
-                    }
-                    construction_closed.set(budget.closed());
+            block.children.clear();
+        }
+        let mut path = Vec::new();
+        let mut found: Vec<()> = Vec::new();
+        let construction_closed = std::cell::Cell::new(accumulator.closed());
+        collect_reference_matches(
+            &doc.roots,
+            &mut path,
+            &mut |block, _| {
+                if construction_closed.get() {
+                    block_has_reference(block, names_norm, kind, &graph.config).then_some(None)
+                } else {
+                    block_reference_evidence(block, canonical, names_norm, kind, &graph.config)
+                        .map(Some)
+                }
+            },
+            &mut |block, ancestors, hit| {
+                let Some(hit) = hit else {
+                    accumulator.deny();
+                    construction_closed.set(true);
+                    return None;
+                };
+                let estimated = shallow_dto_estimated_bytes(block, ancestors)
+                    .saturating_add(reference_evidence_estimated_bytes(&hit));
+                let admitted = accumulator.admit_with(slot, estimated, || {
                     let mut dto = result_dto(block);
                     dto.breadcrumb = ancestors
                         .iter()
                         .map(|ancestor| crate::doc::crumb_line(ancestor))
                         .collect();
-                    Some((dto, hit))
-                },
-                &mut found,
-            );
-            for (dto, hit) in found {
-                blocks.push(dto);
-                evidence.push(hit);
-            }
-            if !blocks.is_empty() {
-                let key = refs::normalize(&entry.name);
-                if let Some(&index) = by_name.get(&key) {
-                    let (date_key, group) = &mut groups[index];
-                    *date_key = match (*date_key, entry.date_key) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (current @ Some(_), None) => current,
-                        (None, other) => other,
-                    };
-                    group.blocks.extend(blocks);
-                    group.evidence.extend(evidence);
-                } else {
-                    by_name.insert(key, groups.len());
-                    groups.push((
-                        entry.date_key,
-                        RefGroup {
-                            page: entry.name.clone(),
-                            kind: entry.kind,
-                            blocks,
-                            evidence,
-                        },
-                    ));
+                    (dto, Some(hit))
+                });
+                if !admitted {
+                    construction_closed.set(true);
+                    return None;
                 }
-            }
-        }
-        groups.sort_by(|a, b| {
-            b.0.unwrap_or(i64::MIN)
-                .cmp(&a.0.unwrap_or(i64::MIN))
-                .then_with(|| a.1.page.cmp(&b.1.page))
-        });
-        groups.into_iter().map(|(_, group)| group).collect()
-    };
-    BoundedGroups {
-        groups,
-        total: budget.total,
-        exceeded: budget.exceeded,
+                construction_closed.set(accumulator.closed());
+                None
+            },
+            &mut found,
+        );
     }
+    accumulator.finish()
 }
 
 pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {
@@ -1415,6 +1617,16 @@ pub fn run_query_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
+    run_query_bounded_over(&GraphQueryPages(graph), query_src, max_rows, max_bytes)
+}
+
+/// The ONE simple-query entry: source limits, parse, options, evaluation.
+fn run_query_bounded_over(
+    source: &dyn QueryPageSource,
+    query_src: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> BoundedGroups {
     if !query_source_within_limit(query_src) || !query_nesting_within_limit(query_src) {
         return BoundedGroups {
             groups: Vec::new(),
@@ -1432,7 +1644,133 @@ pub fn run_query_bounded(
     };
     let mut opts = QueryOpts::default();
     pred.collect_opts(&mut opts);
-    run_pred_bounded(graph, &pred, &opts, max_rows, max_bytes)
+    run_pred_bounded_over(source, &pred, &opts, max_rows, max_bytes)
+}
+
+/// One page as the shared query drivers see it, borrowed from whichever backend
+/// produced it.
+///
+/// Deliberately borrowed rather than owned. Direct Files holds an
+/// `Arc<Document>` per page and managed storage holds an `Arc<Vec<DocBlock>>`;
+/// an owned page shape (an `ApplicationQueryPage`, say) would force Direct to
+/// construct and clone a whole `DocBlock` forest per query per page just to
+/// satisfy the shared signature. `roots` is a borrowed slice for exactly that
+/// reason, and `recency` is a callback because Direct Files answers it with a
+/// filesystem `stat` that must not run for a page the query never matched.
+pub(crate) struct QueryPageView<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: PageKind,
+    pub(crate) pre_block: Option<&'a str>,
+    pub(crate) roots: &'a [DocBlock],
+    /// The page's journal ordinal as its own backend already knows it: Direct
+    /// Files from the filename it parsed at inventory time, managed storage
+    /// from the page title.
+    pub(crate) journal: Option<i64>,
+    pub(crate) recency: &'a dyn Fn() -> i64,
+}
+
+/// The ONE page-source abstraction the shared simple/advanced/export query
+/// drivers evaluate over (I-12, D-4). A backend implements this; it does not
+/// re-implement the driver.
+///
+/// `visit` returning [`std::ops::ControlFlow::Break`] stops the walk, which is
+/// what lets export hydration stop as soon as every wanted root is found.
+pub(crate) trait QueryPageSource {
+    fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>);
+
+    /// Lend the backend's complete page set as ONE borrowed slice, for the one
+    /// consumer that must retain block references ACROSS pages: export
+    /// hydration resolves selected roots in query order, not page order, so it
+    /// cannot emit while streaming. Streaming callers use
+    /// [`QueryPageSource::for_each_page`] and allocate nothing extra.
+    fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>]));
+
+    /// Test-only instrumentation hook: one predicate evaluation over this
+    /// source is about to begin. Only Direct Files' whole-graph source counts,
+    /// because the counter exists to prove the candidate planner avoided a full
+    /// graph walk.
+    #[cfg(test)]
+    fn note_predicate_evaluation(&self) {}
+}
+
+/// Direct Files' page source: the cached `Arc<Document>` snapshot.
+pub(crate) struct GraphQueryPages<'a>(pub(crate) &'a Graph);
+
+impl QueryPageSource for GraphQueryPages<'_> {
+    fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>) {
+        self.0.with_pages(|pages| {
+            for (entry, doc) in pages {
+                let recency = || page_recency_secs(entry);
+                let flow = visit(QueryPageView {
+                    name: &entry.name,
+                    kind: entry.kind,
+                    pre_block: doc.pre_block.as_deref(),
+                    roots: &doc.roots,
+                    journal: entry.date_key,
+                    recency: &recency,
+                });
+                if flow.is_break() {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>])) {
+        self.0.with_pages(|pages| {
+            let pages = pages
+                .iter()
+                .map(|(entry, doc)| ExportHydrationPage {
+                    kind: entry.kind,
+                    name: &entry.name,
+                    roots: &doc.roots,
+                })
+                .collect::<Vec<_>>();
+            run(&pages);
+        });
+    }
+
+    #[cfg(test)]
+    fn note_predicate_evaluation(&self) {
+        FULL_GRAPH_QUERY_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+}
+
+/// Managed storage's page source: the already-narrowed candidate set, each page
+/// carrying the `DocBlock` forest the projection cache retained for it.
+pub(crate) struct ApplicationQueryPages<'a>(pub(crate) &'a [ApplicationQueryPage]);
+
+impl QueryPageSource for ApplicationQueryPages<'_> {
+    fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>) {
+        for source in self.0 {
+            let page = &source.page;
+            let recency = || source.recency;
+            let flow = visit(QueryPageView {
+                name: &page.name,
+                kind: page.kind,
+                pre_block: page.pre_block.as_deref(),
+                roots: source.roots.as_slice(),
+                journal: source.journal,
+                recency: &recency,
+            });
+            if flow.is_break() {
+                break;
+            }
+        }
+    }
+
+    fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>])) {
+        let pages = self
+            .0
+            .iter()
+            .map(|source| ExportHydrationPage {
+                kind: source.page.kind,
+                name: source.page.name.as_str(),
+                roots: source.roots.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        run(&pages);
+    }
 }
 
 fn run_pred_bounded(
@@ -1442,8 +1780,21 @@ fn run_pred_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
+    run_pred_bounded_over(&GraphQueryPages(graph), pred, opts, max_rows, max_bytes)
+}
+
+/// The ONE simple-query evaluator. Both storage modes reach it through
+/// [`QueryPageSource`]; neither owns a second copy of the budget, the page loop,
+/// the OG top-level-root filter, the sample cap or the recency axis.
+fn run_pred_bounded_over(
+    source: &dyn QueryPageSource,
+    pred: &Pred,
+    opts: &QueryOpts,
+    max_rows: usize,
+    max_bytes: usize,
+) -> BoundedGroups {
     #[cfg(test)]
-    FULL_GRAPH_QUERY_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    source.note_predicate_evaluation();
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
     // An unsorted `(sample N)` semantically needs only the first N matches in
     // deterministic traversal order. Do not construct or classify the rest as
@@ -1454,61 +1805,59 @@ fn run_pred_bounded(
     // a single time axis: journal pages by the day they represent, other pages by
     // file mtime. Only computed when such a sort is active (else we skip the stat).
     let want_recency = matches!(&opts.sort, Some((f, _)) if is_recency_field(f));
-    let (groups, recency_by_page) = graph.with_pages(|pages| {
-        let mut groups: Vec<RefGroup> = Vec::new();
-        let mut recency: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        for (entry, doc) in pages {
-            let (page_props, page_tags) = page_facets(doc.pre_block.as_deref());
-            let ctx = EvalCtx {
-                journal: entry.date_key,
-                is_journal: entry.kind == PageKind::Journal,
-                page_name: &entry.name,
-                page_props: &page_props,
-                page_tags: &page_tags,
-            };
-            let mut matched: Vec<BlockDto> = Vec::new();
-            let mut path = Vec::new();
-            let mut path_refs = PathRefCounts::new();
-            let track_path_refs = pred.uses_path_refs();
-            collect_og_query_roots(
-                &doc.roots,
-                &mut path,
-                &mut path_refs,
-                track_path_refs,
-                false,
-                &mut |block, _, ancestor_refs| {
-                    pred.eval_with_path_refs(block, ancestor_refs, &ctx)
-                        .then_some(())
-                },
-                &mut |block, _, ()| {
-                    if sample_admission_cap.is_some_and(|cap| budget.rows >= cap) {
-                        return None;
-                    }
-                    if budget.closed() {
-                        budget.deny_match();
-                        return None;
-                    }
-                    if !budget.admit_estimated(&entry.name, shallow_dto_estimated_bytes(block, &[]))
-                    {
-                        return None;
-                    }
-                    Some(result_dto(block))
-                },
-                &mut matched,
-            );
-            if !matched.is_empty() {
-                if want_recency {
-                    recency.insert(entry.name.clone(), page_recency_secs(entry));
+    let mut groups: Vec<RefGroup> = Vec::new();
+    let mut recency_by_page: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    source.for_each_page(&mut |page| {
+        let (page_props, page_tags) = page_facets(page.pre_block);
+        let ctx = EvalCtx {
+            journal: page.journal,
+            is_journal: page.kind == PageKind::Journal,
+            page_name: page.name,
+            page_props: &page_props,
+            page_tags: &page_tags,
+        };
+        let mut matched: Vec<BlockDto> = Vec::new();
+        let mut path = Vec::new();
+        let mut path_refs = PathRefCounts::new();
+        let track_path_refs = pred.uses_path_refs();
+        collect_og_query_roots(
+            page.roots,
+            &mut path,
+            &mut path_refs,
+            track_path_refs,
+            false,
+            &mut |block, _, ancestor_refs| {
+                pred.eval_with_path_refs(block, ancestor_refs, &ctx)
+                    .then_some(())
+            },
+            &mut |block, _, ()| {
+                if sample_admission_cap.is_some_and(|cap| budget.rows >= cap) {
+                    return None;
                 }
-                groups.push(RefGroup {
-                    page: entry.name.clone(),
-                    kind: entry.kind,
-                    blocks: matched,
-                    evidence: Vec::new(),
-                });
+                if budget.closed() {
+                    budget.deny_match();
+                    return None;
+                }
+                if !budget.admit_estimated(page.name, shallow_dto_estimated_bytes(block, &[])) {
+                    return None;
+                }
+                Some(result_dto(block))
+            },
+            &mut matched,
+        );
+        if !matched.is_empty() {
+            if want_recency {
+                recency_by_page.insert(page.name.to_owned(), (page.recency)());
             }
+            groups.push(RefGroup {
+                page: page.name.to_owned(),
+                kind: page.kind,
+                blocks: matched,
+                evidence: Vec::new(),
+            });
         }
-        (groups, recency)
+        std::ops::ControlFlow::Continue(())
     });
 
     finish_query_groups(groups, recency_by_page, opts, budget)
@@ -1634,6 +1983,12 @@ fn finish_query_groups(
 /// `recency` shares Direct Files' axis: journal midnight or projected-file mtime.
 pub(crate) struct ApplicationQueryPage {
     pub(crate) page: PageDto,
+    /// The journal day this page evaluates as, or `None` for an ordinary page.
+    ///
+    /// Supplied by the caller from the graph's configured `JournalFormat` -- the
+    /// same producer that fills `PageEntry::date_key` on the Direct side -- so
+    /// the two backends answer journal-day predicates identically.
+    pub(crate) journal: Option<i64>,
     /// The page's block tree already converted for evaluation. Supplied by the
     /// caller from [`ApplicationProjectionCache`] so an unchanged page keeps its
     /// memoized lsdoc projections across queries, the way Direct Files keeps
@@ -2261,94 +2616,12 @@ pub(crate) fn run_application_query_pages_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
-    if !query_source_within_limit(query_src) || !query_nesting_within_limit(query_src) {
-        return BoundedGroups {
-            groups: Vec::new(),
-            total: 0,
-            exceeded: false,
-        };
-    }
-    let Some(pred) = Pred::parse(query_src, JournalDate::today()) else {
-        return BoundedGroups {
-            groups: Vec::new(),
-            total: 0,
-            exceeded: false,
-        };
-    };
-    let mut opts = QueryOpts::default();
-    pred.collect_opts(&mut opts);
-    run_application_pred_pages_bounded(pages, &pred, &opts, max_rows, max_bytes)
-}
-
-fn run_application_pred_pages_bounded(
-    pages: &[ApplicationQueryPage],
-    pred: &Pred,
-    opts: &QueryOpts,
-    max_rows: usize,
-    max_bytes: usize,
-) -> BoundedGroups {
-    let mut budget = ConstructionBudget::new(max_rows, max_bytes);
-    let sample_admission_cap = opts.sample.filter(|_| opts.sort.is_none());
-    let want_recency = matches!(&opts.sort, Some((field, _)) if is_recency_field(field));
-    let mut groups = Vec::new();
-    let mut recency_by_page = std::collections::HashMap::new();
-
-    for source in pages {
-        let page = &source.page;
-        let (page_props, page_tags) = page_facets(page.pre_block.as_deref());
-        let ctx = EvalCtx {
-            journal: (page.kind == PageKind::Journal)
-                .then(|| journal_ordinal(&page.name))
-                .flatten(),
-            is_journal: page.kind == PageKind::Journal,
-            page_name: &page.name,
-            page_props: &page_props,
-            page_tags: &page_tags,
-        };
-        let roots = source.roots.as_slice();
-        let mut matched = Vec::new();
-        let mut path = Vec::new();
-        let mut path_refs = PathRefCounts::new();
-        let track_path_refs = pred.uses_path_refs();
-        collect_og_query_roots(
-            roots,
-            &mut path,
-            &mut path_refs,
-            track_path_refs,
-            false,
-            &mut |block, _, ancestor_refs| {
-                pred.eval_with_path_refs(block, ancestor_refs, &ctx)
-                    .then_some(())
-            },
-            &mut |block, _, ()| {
-                if sample_admission_cap.is_some_and(|cap| budget.rows >= cap) {
-                    return None;
-                }
-                if budget.closed() {
-                    budget.deny_match();
-                    return None;
-                }
-                if !budget.admit_estimated(&page.name, shallow_dto_estimated_bytes(block, &[])) {
-                    return None;
-                }
-                Some(result_dto(block))
-            },
-            &mut matched,
-        );
-        if !matched.is_empty() {
-            if want_recency {
-                recency_by_page.insert(page.name.clone(), source.recency);
-            }
-            groups.push(RefGroup {
-                page: page.name.clone(),
-                kind: page.kind,
-                blocks: matched,
-                evidence: Vec::new(),
-            });
-        }
-    }
-
-    finish_query_groups(groups, recency_by_page, &opts, budget)
+    run_query_bounded_over(
+        &ApplicationQueryPages(pages),
+        query_src,
+        max_rows,
+        max_bytes,
+    )
 }
 
 /// Storage-independent shallow block supplied by the managed sparse reader.
@@ -2782,6 +3055,42 @@ pub fn run_advanced_query_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> (AdvancedResult, bool, usize) {
+    run_advanced_query_bounded_over(
+        &GraphQueryPages(graph),
+        query_src,
+        current_page,
+        max_rows,
+        max_bytes,
+    )
+}
+
+pub(crate) fn run_application_advanced_query_pages_bounded(
+    pages: &[ApplicationQueryPage],
+    query_src: &str,
+    current_page: Option<&str>,
+    max_rows: usize,
+    max_bytes: usize,
+) -> (AdvancedResult, bool, usize) {
+    run_advanced_query_bounded_over(
+        &ApplicationQueryPages(pages),
+        query_src,
+        current_page,
+        max_rows,
+        max_bytes,
+    )
+}
+
+/// The ONE advanced-query evaluator: source limits, clause lowering, the
+/// `ran`/`ignored` report and delegation to the shared simple-query driver all
+/// live here, so the two storage modes cannot answer an advanced query
+/// differently (I-12, I-19).
+fn run_advanced_query_bounded_over(
+    source: &dyn QueryPageSource,
+    query_src: &str,
+    current_page: Option<&str>,
+    max_rows: usize,
+    max_bytes: usize,
+) -> (AdvancedResult, bool, usize) {
     if !query_source_within_limit(query_src) {
         return (rejected_advanced_query("query-too-large"), false, 0);
     }
@@ -2804,48 +3113,7 @@ pub fn run_advanced_query_bounded(
     };
     let mut opts = QueryOpts::default();
     pred.collect_opts(&mut opts);
-    let bounded = run_pred_bounded(graph, &pred, &opts, max_rows, max_bytes);
-    (
-        AdvancedResult {
-            groups: bounded.groups,
-            ran,
-            ignored,
-            supported: true,
-        },
-        bounded.exceeded,
-        bounded.total,
-    )
-}
-
-pub(crate) fn run_application_advanced_query_pages_bounded(
-    pages: &[ApplicationQueryPage],
-    query_src: &str,
-    current_page: Option<&str>,
-    max_rows: usize,
-    max_bytes: usize,
-) -> (AdvancedResult, bool, usize) {
-    if !query_source_within_limit(query_src) {
-        return (rejected_advanced_query("query-too-large"), false, 0);
-    }
-    if !query_nesting_within_limit(query_src) {
-        return (rejected_advanced_query("query-nesting-too-deep"), false, 0);
-    }
-    let (pred, ran, ignored) = advanced_pred(query_src, current_page, JournalDate::today());
-    let Some(pred) = pred else {
-        return (
-            AdvancedResult {
-                groups: Vec::new(),
-                ran,
-                ignored,
-                supported: false,
-            },
-            false,
-            0,
-        );
-    };
-    let mut opts = QueryOpts::default();
-    pred.collect_opts(&mut opts);
-    let bounded = run_application_pred_pages_bounded(pages, &pred, &opts, max_rows, max_bytes);
+    let bounded = run_pred_bounded_over(source, &pred, &opts, max_rows, max_bytes);
     (
         AdvancedResult {
             groups: bounded.groups,
@@ -4155,7 +4423,10 @@ struct SelectedExportQuery {
     roots: Vec<SelectedExportRoot>,
 }
 
-struct ExportHydrationPage<'a> {
+/// One page as export hydration sees it. Built by each backend's
+/// [`QueryPageSource::with_hydration_pages`]; neither export entry point
+/// constructs it.
+pub(crate) struct ExportHydrationPage<'a> {
     kind: PageKind,
     name: &'a str,
     roots: &'a [DocBlock],
@@ -4163,7 +4434,7 @@ struct ExportHydrationPage<'a> {
 
 fn hydrate_selected_export_queries(
     selected: Vec<SelectedExportQuery>,
-    pages: &[ExportHydrationPage<'_>],
+    source: &dyn QueryPageSource,
     max_nodes: usize,
     max_bytes: usize,
 ) -> Vec<QueryExportResult> {
@@ -4178,44 +4449,59 @@ fn hydrate_selected_export_queries(
     }
 
     let total_wanted = wanted_by_page.values().map(HashSet::len).sum::<usize>();
-    let mut found: HashMap<(PageKind, String, String), &DocBlock> = HashMap::new();
-    for page in pages {
-        if found.len() == total_wanted {
-            break;
-        }
-        let page_key = (page.kind, page.name.to_owned());
-        let Some(wanted) = wanted_by_page.get(&page_key) else {
-            continue;
-        };
-        let mut stack: Vec<&DocBlock> = page.roots.iter().rev().collect();
-        while let Some(block) = stack.pop() {
-            let property_id = block.property("id");
-            let matched = if wanted.contains(block.uuid.as_str()) {
-                Some(block.uuid.as_str())
-            } else {
-                property_id.as_deref().filter(|id| wanted.contains(*id))
+    let mut results = Vec::new();
+    source.with_hydration_pages(&mut |pages| {
+        let mut found: HashMap<(PageKind, String, String), &DocBlock> = HashMap::new();
+        for page in pages {
+            if found.len() == total_wanted {
+                break;
+            }
+            let page_key = (page.kind, page.name.to_owned());
+            let Some(wanted) = wanted_by_page.get(&page_key) else {
+                continue;
             };
-            if let Some(id) = matched {
-                found.insert((page.kind, page.name.to_owned(), id.to_string()), block);
-                if found.len() == total_wanted {
-                    break;
+            let mut stack: Vec<&DocBlock> = page.roots.iter().rev().collect();
+            while let Some(block) = stack.pop() {
+                let property_id = block.property("id");
+                let matched = if wanted.contains(block.uuid.as_str()) {
+                    Some(block.uuid.as_str())
+                } else {
+                    property_id.as_deref().filter(|id| wanted.contains(*id))
+                };
+                if let Some(id) = matched {
+                    found.insert((page.kind, page.name.to_owned(), id.to_string()), block);
+                    if found.len() == total_wanted {
+                        break;
+                    }
+                }
+                for child in block.children.iter().rev() {
+                    stack.push(child);
                 }
             }
-            for child in block.children.iter().rev() {
-                stack.push(child);
-            }
         }
-    }
+        results = emit_selected_export_queries(&selected, &found, max_nodes, max_bytes);
+    });
+    results
+}
 
+/// Emit the bounded DTOs for the already-located roots, in SELECTED-QUERY order
+/// (not page order): the node and byte budget is cumulative across macros, so
+/// the emission order is part of the contract.
+fn emit_selected_export_queries(
+    selected: &[SelectedExportQuery],
+    found: &HashMap<(PageKind, String, String), &DocBlock>,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> Vec<QueryExportResult> {
     let mut remaining_nodes = max_nodes.max(1);
     let mut remaining_bytes = max_bytes.max(1);
     selected
-        .into_iter()
+        .iter()
         .map(|query| {
             let mut groups: Vec<RefGroup> = Vec::new();
             let mut shown = 0usize;
             let mut omitted_nodes = 0usize;
-            for root in query.roots {
+            for root in &query.roots {
                 let Some(block) = found.get(&(root.kind, root.page.clone(), root.id.clone()))
                 else {
                     omitted_nodes = omitted_nodes.saturating_add(1);
@@ -4237,7 +4523,7 @@ fn hydrate_selected_export_queries(
                     group.blocks.push(dto);
                 } else {
                     groups.push(RefGroup {
-                        page: root.page,
+                        page: root.page.clone(),
                         kind: root.kind,
                         blocks: vec![dto],
                         evidence: Vec::new(),
@@ -4245,7 +4531,7 @@ fn hydrate_selected_export_queries(
                 }
             }
             QueryExportResult {
-                key: query.key,
+                key: query.key.clone(),
                 groups,
                 shown,
                 total: query.total,
@@ -4314,48 +4600,14 @@ pub fn export_query_subtrees(
     max_nodes: usize,
     max_bytes: usize,
 ) -> QueryExportBatch {
-    let (query_limit, selected) = select_export_queries(specs, max_queries, max_roots, |spec| {
-        const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
-        const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
-        if spec.advanced {
-            let (result, exceeded, total) = run_advanced_query_bounded(
-                graph,
-                &spec.query,
-                None,
-                QUERY_EXPORT_CONSTRUCTION_ROWS,
-                QUERY_EXPORT_CONSTRUCTION_BYTES,
-            );
-            BoundedGroups {
-                groups: result.groups,
-                total,
-                exceeded,
-            }
-        } else {
-            run_query_bounded(
-                graph,
-                &spec.query,
-                QUERY_EXPORT_CONSTRUCTION_ROWS,
-                QUERY_EXPORT_CONSTRUCTION_BYTES,
-            )
-        }
-    });
-
-    let results = graph.with_pages(|pages| {
-        let pages = pages
-            .iter()
-            .map(|(entry, doc)| ExportHydrationPage {
-                kind: entry.kind,
-                name: &entry.name,
-                roots: &doc.roots,
-            })
-            .collect::<Vec<_>>();
-        hydrate_selected_export_queries(selected, &pages, max_nodes, max_bytes)
-    });
-
-    QueryExportBatch {
-        results,
-        omitted_queries: specs.len().saturating_sub(query_limit),
-    }
+    export_query_subtrees_over(
+        &GraphQueryPages(graph),
+        specs,
+        max_queries,
+        max_roots,
+        max_nodes,
+        max_bytes,
+    )
 }
 
 pub(crate) fn export_application_query_subtrees(
@@ -4366,12 +4618,36 @@ pub(crate) fn export_application_query_subtrees(
     max_nodes: usize,
     max_bytes: usize,
 ) -> QueryExportBatch {
+    export_query_subtrees_over(
+        &ApplicationQueryPages(pages),
+        specs,
+        max_queries,
+        max_roots,
+        max_nodes,
+        max_bytes,
+    )
+}
+
+/// The construction ceiling one exported query macro may reach while SELECTING
+/// its roots, before the caller's own node/byte budget bounds hydration. One
+/// definition: the two storage modes previously carried a private copy each.
+const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
+const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
+
+/// The ONE query-export driver: selection ceiling, simple/advanced dispatch,
+/// root selection under the global root budget, and hydration.
+fn export_query_subtrees_over(
+    source: &dyn QueryPageSource,
+    specs: &[QueryExportSpec],
+    max_queries: usize,
+    max_roots: usize,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> QueryExportBatch {
     let (query_limit, selected) = select_export_queries(specs, max_queries, max_roots, |spec| {
-        const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
-        const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
         if spec.advanced {
-            let (result, exceeded, total) = run_application_advanced_query_pages_bounded(
-                pages,
+            let (result, exceeded, total) = run_advanced_query_bounded_over(
+                source,
                 &spec.query,
                 None,
                 QUERY_EXPORT_CONSTRUCTION_ROWS,
@@ -4383,24 +4659,16 @@ pub(crate) fn export_application_query_subtrees(
                 exceeded,
             }
         } else {
-            run_application_query_pages_bounded(
-                pages,
+            run_query_bounded_over(
+                source,
                 &spec.query,
                 QUERY_EXPORT_CONSTRUCTION_ROWS,
                 QUERY_EXPORT_CONSTRUCTION_BYTES,
             )
         }
     });
-    let hydration_pages = pages
-        .iter()
-        .map(|source| ExportHydrationPage {
-            kind: source.page.kind,
-            name: source.page.name.as_str(),
-            roots: source.roots.as_slice(),
-        })
-        .collect::<Vec<_>>();
     QueryExportBatch {
-        results: hydrate_selected_export_queries(selected, &hydration_pages, max_nodes, max_bytes),
+        results: hydrate_selected_export_queries(selected, source, max_nodes, max_bytes),
         omitted_queries: specs.len().saturating_sub(query_limit),
     }
 }
@@ -7897,10 +8165,15 @@ mod tests {
             guide: false,
         };
         let roots = ApplicationProjectionCache::default().roots(&page.path, &page);
+        let journal = (page.kind == PageKind::Journal)
+            .then(|| crate::date::JournalFormat::default().parse(&page.name))
+            .flatten()
+            .map(|date| date.ordinal_key());
         ApplicationQueryPage {
             page,
             roots,
             recency,
+            journal,
         }
     }
 

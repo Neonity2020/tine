@@ -243,8 +243,8 @@ fn shallow_application_block_measured_exception_is_bounded() {
         .collect::<Vec<_>>();
     assert_eq!(
         shallow_calls.len(),
-        4,
-        "AST-visible calls stay in the three reviewed owners (the fifth is inside the resolve closure): {shallow_calls:#?}"
+        3,
+        "AST-visible calls stay in the reviewed owners (the fourth is inside the resolve closure): {shallow_calls:#?}"
     );
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sync_runtime.rs"),
@@ -252,8 +252,8 @@ fn shallow_application_block_measured_exception_is_bounded() {
     .unwrap();
     assert_eq!(
         source.match_indices("shallow_application_block(").count(),
-        6,
-        "one definition plus exactly five reviewed production calls"
+        5,
+        "one definition plus exactly four reviewed production calls"
     );
 }
 
@@ -407,6 +407,19 @@ fn managed_read_surface_contract_and_changelog_are_pinned() {
             && unreleased.contains("ownership"),
         "the Unreleased/Changed note must name Direct/Managed parity and shared ownership"
     );
+    // W4-C7b extends this ONE changelog pin rather than adding a second
+    // changelog-pinning test (I-12: one producer per question).
+    for required in [
+        "share one evaluator per
+  question",
+        "loads its pending overlay at most
+  once",
+    ] {
+        assert!(
+            changed.contains(required),
+            "the Unreleased/Changed note must state the W4-C7b outcome: {required}"
+        );
+    }
     application_family_is_pinned_by_name();
 }
 
@@ -31358,4 +31371,1300 @@ fn setting_the_debug_flag_gates_a_core_diagnostic_line() {
          so the flag's name and its gate disagree. The setter is plain and idempotent over an \
          AtomicBool; `runtime_debug_diagnostics_enabled()` is the only reader."
     );
+}
+
+// ---------------------------------------------------------------------------
+// W4-C7b — one query driver per question, one bounded-reference loop, one
+// reference visitor, one navigation overlay per request.
+//
+// The structural tests below pin EXCLUSIVE OWNERSHIP of an algorithm plus
+// delegation from every named producer. They deliberately do not count family
+// membership: renaming a twin, or wrapping two retained copies in a common
+// function, lowers a count while shipping the whole defect.
+// ---------------------------------------------------------------------------
+
+fn c7b_repository_source(relative: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative),
+    )
+    .unwrap_or_else(|error| panic!("{relative} is readable: {error}"))
+}
+
+/// The exact production body of `fn <name>` in `relative`, sliced by the
+/// parsed brace span so a marker inside a comment or a string still belongs to
+/// the function that contains it, and a nested `fn` cannot be mistaken for the
+/// outer one.
+fn c7b_fn_body(relative: &str, name: &str) -> String {
+    use syn::visit::{self, Visit};
+
+    struct Finder<'a> {
+        name: &'a str,
+        spans: Vec<(usize, usize)>,
+    }
+    impl<'a> Finder<'a> {
+        fn record(&mut self, ident: &syn::Ident, block: &syn::Block) {
+            if ident == self.name {
+                let span = block.brace_token.span.join();
+                self.spans.push((span.start().line, span.end().line));
+            }
+        }
+    }
+    impl<'ast, 'a> Visit<'ast> for Finder<'a> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            self.record(&item.sig.ident, &item.block);
+            visit::visit_item_fn(self, item);
+        }
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            self.record(&item.sig.ident, &item.block);
+            visit::visit_impl_item_fn(self, item);
+        }
+    }
+
+    let source = c7b_repository_source(relative);
+    let file = syn::parse_file(&source).expect("production source parses");
+    let mut finder = Finder {
+        name,
+        spans: Vec::new(),
+    };
+    finder.visit_file(&file);
+    assert_eq!(
+        finder.spans.len(),
+        1,
+        "{relative} must define exactly one `{name}`; found {}",
+        finder.spans.len()
+    );
+    let (start, end) = finder.spans[0];
+    source
+        .lines()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const C7B_QUERY_RS: &str = "crates/tine-core/src/query.rs";
+const C7B_SYNC_RUNTIME_RS: &str = "crates/tine-core/src/sync_runtime.rs";
+
+#[test]
+fn c7b_query_driver_producers_share_one_page_source() {
+    // (named production producer, the shared driver it must delegate to)
+    let pairs = [
+        ("run_query_bounded", "run_query_bounded_over"),
+        (
+            "run_application_query_pages_bounded",
+            "run_query_bounded_over",
+        ),
+        ("run_pred_bounded", "run_pred_bounded_over"),
+        (
+            "run_advanced_query_bounded",
+            "run_advanced_query_bounded_over",
+        ),
+        (
+            "run_application_advanced_query_pages_bounded",
+            "run_advanced_query_bounded_over",
+        ),
+        ("export_query_subtrees", "export_query_subtrees_over"),
+        (
+            "export_application_query_subtrees",
+            "export_query_subtrees_over",
+        ),
+    ];
+    // The algorithm itself: budget, page loop, OG root filter, export selection
+    // ceiling, and the hydration-page construction.
+    let algorithm = [
+        "ConstructionBudget::new(",
+        "collect_og_query_roots(",
+        "for_each_page(",
+        "with_hydration_pages(",
+        "select_export_queries(",
+        "QUERY_EXPORT_CONSTRUCTION_ROWS",
+        "Pred::parse(",
+    ];
+    // The subset the shared drivers themselves must still contain; the rest
+    // (hydration-page construction) lives in a driver-private helper.
+    let owned_by_drivers = [
+        "ConstructionBudget::new(",
+        "collect_og_query_roots(",
+        "for_each_page(",
+        "select_export_queries(",
+        "QUERY_EXPORT_CONSTRUCTION_ROWS",
+        "Pred::parse(",
+    ];
+
+    for (producer, driver) in pairs {
+        let body = c7b_fn_body(C7B_QUERY_RS, producer);
+        assert!(
+            body.contains(&format!("{driver}(")),
+            "{producer} must delegate to the shared driver {driver}"
+        );
+        for marker in algorithm {
+            assert!(
+                !body.contains(marker),
+                "{producer} still owns `{marker}`; the mode adapters may only build a \
+                 QueryPageSource and call {driver} (I-12, D-4)"
+            );
+        }
+    }
+
+    // Exclusive ownership: inside the driver family, only the shared `*_over`
+    // drivers may contain the algorithm markers at all.
+    let mut family = pairs.iter().map(|(p, _)| *p).collect::<Vec<_>>();
+    family.extend(pairs.iter().map(|(_, d)| *d));
+    family.sort();
+    family.dedup();
+    for marker in owned_by_drivers {
+        let owners = family
+            .iter()
+            .filter(|name| c7b_fn_body(C7B_QUERY_RS, name).contains(marker))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            !owners.is_empty(),
+            "`{marker}` disappeared from the query-driver family; the marker is stale"
+        );
+        assert!(
+            owners.iter().all(|owner| owner.ends_with("_over")),
+            "`{marker}` is owned outside the shared drivers: {owners:?}"
+        );
+    }
+
+    // A driver that merely dispatches on the storage mode is the wrong
+    // implementation this obligation exists to reject: it satisfies the counts
+    // while retaining two copies. The shared drivers therefore may not name
+    // either concrete page source.
+    for (_, driver) in pairs {
+        let body = c7b_fn_body(C7B_QUERY_RS, driver);
+        for mode in ["GraphQueryPages(", "ApplicationQueryPages(", "with_pages("] {
+            assert!(
+                !body.contains(mode),
+                "{driver} must stay generic over QueryPageSource; it names `{mode}`"
+            );
+        }
+    }
+
+    // The retired managed evaluator must be gone from production, not renamed.
+    let files = crate::projection_producer_census::production_rust();
+    for retired in [
+        "run_application_pred_pages_bounded",
+        "application_page_block_referrers_dto",
+    ] {
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.code.contains(&format!("fn {retired}("))),
+            "{retired} must not exist in production"
+        );
+    }
+}
+
+#[test]
+fn c7b_reference_grouping_has_one_algorithm_owner() {
+    // Budget admission, per-page grouping, total/exceeded and display order all
+    // belong to `query::BoundedReferenceGroups`; these three are call sites.
+    for (file, producer) in [
+        (C7B_QUERY_RS, "collect_reference_occurrences_bounded"),
+        (C7B_SYNC_RUNTIME_RS, "bound_application_reference_sources"),
+        (C7B_SYNC_RUNTIME_RS, "application_block_referrers_ready"),
+    ] {
+        let body = c7b_fn_body(file, producer);
+        for required in ["BoundedReferenceGroups::new(", ".page(", ".finish()"] {
+            assert!(
+                body.contains(required),
+                "{producer} must reach grouping through the shared accumulator ({required})"
+            );
+        }
+        assert!(
+            !body.contains("ConstructionBudget"),
+            "{producer} must not own budget admission; BoundedReferenceGroups does"
+        );
+    }
+
+    // Exclusive ownership of the display order. One production call site means
+    // one producer of the answer "in what order are reference groups shown".
+    let files = crate::projection_producer_census::production_rust();
+    assert_eq!(
+        crate::projection_producer_census::call_count(files, "reference_group_display_order"),
+        1,
+        "reference group display order has exactly one production call site \
+         (BoundedReferenceGroups::finish)"
+    );
+    let accumulator = c7b_repository_source(C7B_QUERY_RS);
+    let accumulator = accumulator
+        .split_once("impl BoundedReferenceGroups {")
+        .and_then(|(_, tail)| tail.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("BoundedReferenceGroups has a bounded impl block");
+    assert!(
+        accumulator.contains("reference_group_display_order("),
+        "that call site is inside BoundedReferenceGroups (its finish)"
+    );
+    // And exactly one accumulator type exists.
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| file.code.contains("impl BoundedReferenceGroups"))
+            .count(),
+        1,
+        "BoundedReferenceGroups has one implementation"
+    );
+}
+
+#[test]
+fn c7b_managed_reference_reads_use_shared_docblock_visitors() {
+    // Every Managed reference read obtains the page forest from the retained
+    // projection and delegates the walk; none of them may carry a private
+    // BlockDto visitor, a DTO conversion, or its own reference match loop.
+    for producer in [
+        "application_backlinks_ready",
+        "application_unlinked_references_ready",
+        "application_block_referrers_ready",
+    ] {
+        let body = c7b_fn_body(C7B_SYNC_RUNTIME_RS, producer);
+        assert!(
+            body.contains("application_projection_roots("),
+            "{producer} must take the page forest from the retained projection"
+        );
+        for forbidden in [
+            "dto_block_to_doc_block",
+            "flatten_application_blocks",
+            "application_query_doc_block",
+            "render::block_refs",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{producer} must not rebuild or re-walk a BlockDto tree (`{forbidden}`)"
+            );
+        }
+    }
+
+    // The two shared visitors are exactly that: they walk a DocBlock forest
+    // through the ONE traversal primitive and own no recursion of their own.
+    for visitor in [
+        "application_page_reference_matches",
+        "application_page_block_referrers",
+    ] {
+        let body = c7b_fn_body(C7B_QUERY_RS, visitor);
+        assert!(
+            body.contains("collect_reference_matches("),
+            "{visitor} must walk through the shared reference visitor"
+        );
+        for forbidden in ["fn visit(", "dto_block_to_doc_block", "block.children"] {
+            assert!(
+                !body.contains(forbidden),
+                "{visitor} must not carry its own tree walk (`{forbidden}`)"
+            );
+        }
+    }
+
+    // The managed twin must be gone from sync_runtime.rs, not renamed there.
+    let files = crate::projection_producer_census::production_rust();
+    let sync_runtime = files
+        .iter()
+        .find(|file| file.relative == C7B_SYNC_RUNTIME_RS)
+        .expect("sync_runtime.rs is production source");
+    assert!(
+        !sync_runtime
+            .code
+            .contains("fn application_page_block_referrers("),
+        "the managed block-referrer twin lives in query.rs beside the shared visitor"
+    );
+    assert!(
+        !sync_runtime.code.contains("fn application_crumb_line("),
+        "the managed per-block crumb producer is retired; crumbs come from the forest"
+    );
+}
+
+/// A graph with the shapes the reference and query surfaces actually fork on:
+/// journals and ordinary pages, an alias, a page-property (preamble) reference,
+/// nested blocks with breadcrumbs, Org beside Markdown, and a durable `id::`
+/// with a block reference to it.
+///
+/// It deliberately does NOT contain two files whose titles fold to one logical
+/// page. That shape cannot be used as a parity oracle: Managed activation
+/// ingests at most one document per canonical page key, so a second such file
+/// loads as `Missing` and the two backends differ for a reason that lives in
+/// ingestion, not in any evaluator this fixture exercises. See `RECEIPT.md`
+/// (Forks) for the measurement that established it.
+fn c7b_parity_fixture(label: &str, seed: u128) -> ActivationFixture {
+    let fixture = ActivationFixture::nested_unicode(label, seed);
+    let notes = fixture.graph_root.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(
+        notes.join("Topic.md"),
+        "alias:: Subject\n\n- the topic page's own block\n",
+    )
+    .unwrap();
+    fs::write(
+        notes.join("Ref One.md"),
+        "tags:: Topic\n\n- parent block\n\t- child mentions [[Topic]] here\n\t\t- grandchild plain Topic mention\n- anchor block\n  id:: 11111111-1111-4111-8111-111111111111\n- refers to ((11111111-1111-4111-8111-111111111111))\n",
+    )
+    .unwrap();
+    fs::write(
+        notes.join("Ref Two.org"),
+        "* org block referencing [[Topic]]\n** nested org child mentioning Subject\n",
+    )
+    .unwrap();
+    fs::write(notes.join("Third Ref.md"), "- third file [[Topic]]\n").unwrap();
+    // THREE journals, deliberately: with one, a backend that loses the journal
+    // ordinal entirely still produces the right answer, and the oracle proves
+    // nothing about journal ordering. Their filename order and their date order
+    // disagree, so ordering by name cannot masquerade as ordering by date.
+    for (file, body) in [
+        (
+            "01-09-2026.md",
+            "- journal mentions [[Topic]] and TODO topic work\n",
+        ),
+        ("30-08-2026.md", "- older journal mentions [[Topic]]\n"),
+        ("02-09-2026.md", "- newest journal mentions [[Topic]]\n"),
+    ] {
+        fs::write(fixture.graph_root.join("diary").join(file), body).unwrap();
+    }
+    fixture
+}
+
+/// `BlockDto::id` is a session-local handle whose value differs by mode (see
+/// `docs/contracts/managed-read-surface.md`), so it is normalized out before
+/// comparison. Everything else — raw text, breadcrumbs, facets, evidence
+/// occurrences, group order, `total`, `exceeded` — is compared literally.
+fn c7b_normalize_ids(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["id", "block_id"] {
+                if let Some(slot) = map.get_mut(key) {
+                    *slot = serde_json::Value::Null;
+                }
+            }
+            for (_, nested) in map.iter_mut() {
+                c7b_normalize_ids(nested);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                c7b_normalize_ids(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn c7b_comparable<T: serde::Serialize>(value: T) -> serde_json::Value {
+    let mut json = serde_json::to_value(value).unwrap();
+    c7b_normalize_ids(&mut json);
+    json
+}
+
+fn c7b_navigation(
+    handle: &SyncRuntimeHandle,
+    request: SyncApplicationNavigationRequest,
+) -> SyncApplicationNavigationReply {
+    match handle.application_navigation(request).unwrap() {
+        SyncApplicationNavigationOutcome::Loaded { reply } => reply,
+        other => panic!("managed navigation deferred instead of loading: {other:?}"),
+    }
+}
+
+const C7B_TARGET: &str = "Topic";
+const C7B_ANCHOR: &str = "11111111-1111-4111-8111-111111111111";
+
+fn c7b_activated(fixture: &ActivationFixture) -> SyncRuntimeHandle {
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("the parity fixture activates");
+    drive_initial_feed(&handle);
+    handle
+}
+
+#[test]
+fn c7b_query_driver_parity() {
+    let fixture = c7b_parity_fixture("c7b-query-parity", 0xc7b2);
+    let direct = Graph::open(&fixture.graph_root);
+
+    const ROWS: usize = 64;
+    const BYTES: usize = 1 << 20;
+    // A generous run and a deliberately truncating run: the bounds are where
+    // two evaluators most easily disagree about WHICH rows survive.
+    let bounds = [(ROWS, BYTES), (2, 512)];
+    // The third query reads the page's journal ordinal, which nothing else here
+    // does: journal page NAMES are ISO, so their lexical order already agrees
+    // with their date order, and a backend that supplied no ordinal at all would
+    // still order every other answer correctly.
+    let simple_queries = [
+        "[[Topic]]",
+        "(and [[Topic]] (not (page \"Topic\")))",
+        "(and [[Topic]] (between [[Jan 1st, 2026]] [[Dec 31st, 2026]]))",
+    ];
+    let advanced_query =
+        "{:query [:find (pull ?b [*]) :where [?b :block/refs ?p] [?p :block/name \"topic\"]]}";
+
+    let mut direct_simple = Vec::new();
+    for query in simple_queries {
+        for (rows, bytes) in bounds {
+            let result = direct.run_query_bounded(query, rows, bytes);
+            direct_simple.push(c7b_comparable((
+                &*result.groups,
+                result.total,
+                result.exceeded,
+            )));
+        }
+    }
+    let direct_advanced = bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            let (result, exceeded, total) = crate::query::run_advanced_query_bounded(
+                &direct,
+                advanced_query,
+                None,
+                *rows,
+                *bytes,
+            );
+            c7b_comparable((result, exceeded, total))
+        })
+        .collect::<Vec<_>>();
+    let specs = vec![
+        crate::query::QueryExportSpec {
+            key: "simple".into(),
+            query: "[[Topic]]".into(),
+            advanced: false,
+        },
+        crate::query::QueryExportSpec {
+            key: "advanced".into(),
+            query: advanced_query.into(),
+            advanced: true,
+        },
+    ];
+    let direct_export = c7b_comparable(crate::query::export_query_subtrees(
+        &direct, &specs, 8, 32, 512, BYTES,
+    ));
+
+    // Non-vacuity: a parity oracle over two empty answers proves nothing.
+    let simple_rows = direct
+        .run_query_bounded("[[Topic]]", ROWS, BYTES)
+        .groups
+        .iter()
+        .map(|group| group.blocks.len())
+        .sum::<usize>();
+    assert!(
+        simple_rows >= 4,
+        "the fixture must produce a non-trivial simple-query answer, got {simple_rows}"
+    );
+
+    let handle = c7b_activated(&fixture);
+
+    let mut managed_simple = Vec::new();
+    for query in simple_queries {
+        for (rows, bytes) in bounds {
+            let row = match c7b_navigation(
+                &handle,
+                SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.to_owned(),
+                    max_rows: rows,
+                    max_bytes: bytes,
+                },
+            ) {
+                SyncApplicationNavigationReply::SimpleQuery(result) => {
+                    c7b_comparable((result.groups, result.total, result.exceeded))
+                }
+                other => panic!("unexpected simple-query reply: {other:?}"),
+            };
+            managed_simple.push(row);
+        }
+    }
+    let managed_advanced = bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            match c7b_navigation(
+                &handle,
+                SyncApplicationNavigationRequest::AdvancedQuery {
+                    query: advanced_query.to_owned(),
+                    current_page: None,
+                    max_rows: *rows,
+                    max_bytes: *bytes,
+                },
+            ) {
+                SyncApplicationNavigationReply::AdvancedQuery(result) => {
+                    c7b_comparable((result.result, result.exceeded, result.total))
+                }
+                other => panic!("unexpected advanced-query reply: {other:?}"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let managed_export = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::ExportQuerySubtrees {
+            specs,
+            max_queries: 8,
+            max_roots: 32,
+            max_nodes: 512,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::ExportQuerySubtrees(batch) => c7b_comparable(batch),
+        other => panic!("unexpected export reply: {other:?}"),
+    };
+
+    assert_eq!(managed_simple, direct_simple, "simple-query parity");
+    assert_eq!(managed_advanced, direct_advanced, "advanced-query parity");
+    assert_eq!(managed_export, direct_export, "query-export parity");
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn c7b_bounded_reference_grouping_parity() {
+    let fixture = c7b_parity_fixture("c7b-reference-parity", 0xc7b3);
+    let direct = Graph::open(&fixture.graph_root);
+
+    const BYTES: usize = 1 << 20;
+    // Bounds where BOTH backends answer exactly: the generous one, and a byte
+    // bound, which every backend applies against the same construction budget.
+    let exact_bounds = [(64_usize, BYTES), (64, 400)];
+
+    let direct_reference = exact_bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            let backlinks = direct.backlinks_bounded(C7B_TARGET, *rows, *bytes);
+            let unlinked = direct.unlinked_refs_bounded(C7B_TARGET, *rows, *bytes);
+            let referrers = direct.block_referrers_bounded(C7B_ANCHOR, *rows, *bytes);
+            c7b_comparable((
+                (&*backlinks.groups, backlinks.total, backlinks.exceeded),
+                (&*unlinked.groups, unlinked.total, unlinked.exceeded),
+                (&*referrers.groups, referrers.total, referrers.exceeded),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    // Non-vacuity: the generous bound must retain rows from several pages and
+    // the tight bounds must actually truncate, or the oracle compares three
+    // copies of the same answer.
+    let full = direct.backlinks_bounded(C7B_TARGET, 64, BYTES);
+    assert!(
+        full.groups.len() >= 3 && full.total >= 4,
+        "the fixture must produce a multi-page backlink answer, got {} groups / {} rows",
+        full.groups.len(),
+        full.total
+    );
+    assert!(
+        direct.backlinks_bounded(C7B_TARGET, 2, BYTES).exceeded
+            && direct.backlinks_bounded(C7B_TARGET, 64, 400).exceeded,
+        "both tight bounds must truncate, or the bounded oracle proves nothing"
+    );
+    assert!(
+        direct.block_referrers_bounded(C7B_ANCHOR, 64, BYTES).total >= 1,
+        "the fixture must produce a real block referrer"
+    );
+
+    let handle = c7b_activated(&fixture);
+    let managed_backlinks = |rows: usize, bytes: usize| match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::Backlinks {
+            name: C7B_TARGET.to_owned(),
+            max_rows: rows,
+            max_bytes: bytes,
+        },
+    ) {
+        SyncApplicationNavigationReply::Backlinks(result) => result,
+        other => panic!("unexpected backlinks reply: {other:?}"),
+    };
+    let managed_reference = exact_bounds
+        .iter()
+        .map(|(rows, bytes)| {
+            let groups = |request| match c7b_navigation(&handle, request) {
+                SyncApplicationNavigationReply::UnlinkedReferences(result)
+                | SyncApplicationNavigationReply::BlockReferrers(result) => result,
+                other => panic!("unexpected reference reply: {other:?}"),
+            };
+            let backlinks = managed_backlinks(*rows, *bytes);
+            let unlinked = groups(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: C7B_TARGET.to_owned(),
+                max_rows: *rows,
+                max_bytes: *bytes,
+            });
+            let referrers = groups(SyncApplicationNavigationRequest::BlockReferrers {
+                uuid: C7B_ANCHOR.to_owned(),
+                max_rows: *rows,
+                max_bytes: *bytes,
+            });
+            c7b_comparable((
+                (backlinks.groups, backlinks.total, backlinks.exceeded),
+                (unlinked.groups, unlinked.total, unlinked.exceeded),
+                (referrers.groups, referrers.total, referrers.exceeded),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        managed_reference, direct_reference,
+        "bounded reference grouping parity (retained rows, order, evidence, total, exceeded)"
+    );
+
+    // Row-truncated backlinks are NOT an exact-parity case, and deliberately so.
+    // `bound_application_reference_sources` takes a `lower_bound_exceeded` flag
+    // because the Managed backlink path stops enumerating candidate source pages
+    // once the row bound is already blown, and then reports `total` as a lower
+    // bound. That pre-bound predates this packet and is untouched by it (the
+    // flag and its `total.max(max_rows + 1)` latch are unchanged context in the
+    // diff), so a different retained subset here is a candidate-selection
+    // difference, not a grouping-algorithm difference.
+    //
+    // What the SHARED accumulator does own under truncation is asserted here:
+    // it never admits more than the row bound, it latches `exceeded`, it emits
+    // no empty group, it never invents a row, and it keeps the untruncated
+    // display order. A private grouping copy that admitted an extra row, kept an
+    // emptied group, or re-sorted its groups fails on both backends.
+    let untruncated = c7b_comparable(&*full.groups);
+    let untruncated_groups = untruncated.as_array().unwrap();
+    for (label, truncated) in [
+        (
+            "direct",
+            c7b_comparable(&*direct.backlinks_bounded(C7B_TARGET, 2, BYTES).groups),
+        ),
+        (
+            "managed",
+            c7b_comparable(managed_backlinks(2, BYTES).groups),
+        ),
+    ] {
+        let groups = truncated.as_array().unwrap();
+        let rows: usize = groups
+            .iter()
+            .map(|group| group["blocks"].as_array().unwrap().len())
+            .sum();
+        assert!(
+            rows <= 2 && rows > 0,
+            "{label}: the row bound admits between one and max_rows rows, got {rows}"
+        );
+        assert!(
+            groups
+                .iter()
+                .all(|group| !group["blocks"].as_array().unwrap().is_empty()),
+            "{label}: a group emptied by truncation must not survive: {groups:?}"
+        );
+        // Every retained group is one of the untruncated groups, its rows are a
+        // prefix-free subset of that group's rows, and the groups appear in the
+        // untruncated order.
+        let mut cursor = 0usize;
+        for group in groups {
+            let position = untruncated_groups
+                .iter()
+                .position(|full_group| full_group["page"] == group["page"])
+                .unwrap_or_else(|| {
+                    panic!("{label}: truncation invented a group: {:?}", group["page"])
+                });
+            assert!(
+                position >= cursor,
+                "{label}: truncation re-ordered groups at {:?}",
+                group["page"]
+            );
+            cursor = position;
+            let full_rows = untruncated_groups[position]["blocks"].as_array().unwrap();
+            for block in group["blocks"].as_array().unwrap() {
+                assert!(
+                    full_rows.contains(block),
+                    "{label}: truncation invented a row: {:?}",
+                    block["raw"]
+                );
+            }
+        }
+    }
+    assert!(
+        managed_backlinks(2, BYTES).exceeded
+            && direct.backlinks_bounded(C7B_TARGET, 2, BYTES).exceeded,
+        "both backends latch `exceeded` when the row bound truncates"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn c7b_reference_visitor_parity() {
+    // The per-page visitor's own dimensions: page preamble, nested breadcrumbs,
+    // Org beside Markdown, alias-equivalent names, and plain vs explicit
+    // occurrence evidence.
+    let fixture = c7b_parity_fixture("c7b-visitor-parity", 0xc7b4);
+    let direct = Graph::open(&fixture.graph_root);
+    const ROWS: usize = 64;
+    const BYTES: usize = 1 << 20;
+
+    let direct_backlinks = direct.backlinks_bounded(C7B_TARGET, ROWS, BYTES);
+    let direct_unlinked = direct.unlinked_refs_bounded(C7B_TARGET, ROWS, BYTES);
+
+    // Non-vacuity for the visitor's own dimensions.
+    let all_blocks = direct_backlinks
+        .groups
+        .iter()
+        .flat_map(|group| group.blocks.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        all_blocks.iter().any(|block| block.page_property),
+        "a page-property (preamble) reference must be in the backlink answer"
+    );
+    assert!(
+        all_blocks.iter().any(|block| !block.breadcrumb.is_empty()),
+        "a nested reference must carry a breadcrumb"
+    );
+    assert!(
+        direct_backlinks
+            .groups
+            .iter()
+            .any(|group| group.page.contains("Ref Two")),
+        "the Org page must contribute a reference"
+    );
+    assert!(
+        direct_unlinked.total > 0,
+        "the fixture must produce plain (unlinked) occurrences too"
+    );
+
+    let handle = c7b_activated(&fixture);
+    let managed_backlinks = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::Backlinks {
+            name: C7B_TARGET.to_owned(),
+            max_rows: ROWS,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::Backlinks(result) => result,
+        other => panic!("unexpected backlinks reply: {other:?}"),
+    };
+    let managed_unlinked = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::UnlinkedReferences {
+            name: C7B_TARGET.to_owned(),
+            max_rows: ROWS,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::UnlinkedReferences(result) => result,
+        other => panic!("unexpected unlinked reply: {other:?}"),
+    };
+    let managed_referrers = match c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::BlockReferrers {
+            uuid: C7B_ANCHOR.to_owned(),
+            max_rows: ROWS,
+            max_bytes: BYTES,
+        },
+    ) {
+        SyncApplicationNavigationReply::BlockReferrers(result) => result,
+        other => panic!("unexpected referrers reply: {other:?}"),
+    };
+    let direct_referrers = direct.block_referrers_bounded(C7B_ANCHOR, ROWS, BYTES);
+
+    assert_eq!(
+        c7b_comparable((
+            managed_backlinks.groups,
+            managed_backlinks.total,
+            managed_backlinks.exceeded
+        )),
+        c7b_comparable((
+            &*direct_backlinks.groups,
+            direct_backlinks.total,
+            direct_backlinks.exceeded
+        )),
+        "per-page backlink visitor parity"
+    );
+    assert_eq!(
+        c7b_comparable((
+            managed_unlinked.groups,
+            managed_unlinked.total,
+            managed_unlinked.exceeded
+        )),
+        c7b_comparable((
+            &*direct_unlinked.groups,
+            direct_unlinked.total,
+            direct_unlinked.exceeded
+        )),
+        "per-page unlinked visitor parity"
+    );
+    assert_eq!(
+        c7b_comparable((
+            managed_referrers.groups,
+            managed_referrers.total,
+            managed_referrers.exceeded
+        )),
+        c7b_comparable((
+            &*direct_referrers.groups,
+            direct_referrers.total,
+            direct_referrers.exceeded
+        )),
+        "per-page block-referrer visitor parity"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn c7b_navigation_overlay_pending_paths_load_at_most_once_per_request() {
+    let fixture = c7b_parity_fixture("c7b-overlay-once", 0xc7b5);
+    let overlay_path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .expect("the fixture has pages")
+        .rel_path;
+
+    let activation_handle = c7b_activated(&fixture);
+    assert!(matches!(
+        activation_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(activation_handle);
+
+    let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+    let handle = opened.handle.expect("managed reopen retains its actor");
+
+    // A committed-undrained local suffix: this is the only state in which the
+    // overlay actually loads anything, so it is the only state in which
+    // rebuilding it per consumer costs work.
+    let (mut page, revision) = load_application_exact(&handle, &overlay_path);
+    let edited = format!("{} overlay-edit", page.blocks[0].raw);
+    page.blocks[0].raw = edited.clone();
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    assert!(
+        matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+        "the overlay fixture edit must be accepted: {save:?}"
+    );
+    assert_eq!(
+        handle.status().unwrap().managed_local_pending,
+        1,
+        "the request must run with a real, undrained pending suffix"
+    );
+
+    // QuickSwitch asks pages, aliases AND referenced names: three consumers of
+    // the same overlay in one request.
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    let reply = c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::QuickSwitch {
+            query: "o".into(),
+            limit: 16,
+        },
+    );
+    assert!(
+        matches!(reply, SyncApplicationNavigationReply::QuickSwitch(ref hits) if !hits.is_empty()),
+        "the QuickSwitch request must actually answer: {reply:?}"
+    );
+    let counters = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        counters.navigation_overlay_pending_path_loads, 1,
+        "one navigation request loads its one pending path exactly once, not once \
+         per consumer: {counters:?}"
+    );
+
+    // Drained: nothing pending, so nothing is loaded — the request-scoped value
+    // is lazy, not eager, and is not retained across requests.
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    for _ in 0..2 {
+        match c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::SimpleQuery {
+                query: "[[Topic]]".into(),
+                max_rows: 64,
+                max_bytes: 1 << 20,
+            },
+        ) {
+            SyncApplicationNavigationReply::SimpleQuery(_) => {}
+            other => panic!("unexpected simple-query reply: {other:?}"),
+        }
+    }
+    let drained = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        drained.navigation_overlay_pending_path_loads, 0,
+        "a simple query on a drained actor loads no pending path: {drained:?}"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// W4-C7b obligation 9: measurement harness.
+//
+// Structural counters gate the cuts; timing is advisory (this machine builds
+// other worktrees concurrently). The allocation counters below are defined here
+// because none exist anywhere under `crates/` -- `rg 'allocation_calls|allocated_bytes|GlobalAlloc|global_allocator' crates/`
+// returns nothing outside this block -- so there is no existing primitive to
+// reuse (D-14). They are `#[cfg(test)]` only and never enter a shipped binary.
+// ---------------------------------------------------------------------------
+
+pub(crate) mod c7b_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) static CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    pub(crate) fn snapshot() -> (usize, usize) {
+        (CALLS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
+    }
+}
+
+#[global_allocator]
+static C7B_ALLOCATOR: c7b_alloc::Counting = c7b_alloc::Counting;
+
+/// `pages` ordinary pages plus five journals, every one of them referencing the
+/// measured page, so a reference read and a query read both touch all of them.
+fn c7b_measurement_fixture(label: &str, pages: usize) -> ActivationFixture {
+    let fixture = ActivationFixture::nested_unicode(label, 0xc7b_0000);
+    let notes = fixture.graph_root.join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("Topic.md"), "- the measured page\n").unwrap();
+    for index in 0..pages {
+        let body = (0..12)
+            .map(|block| {
+                format!(
+                    "- block {block} on page {index} mentions [[Topic]] and some ordinary prose\n\t- a nested child with **inline** markup and a [link](https://example.invalid/{block})\n"
+                )
+            })
+            .collect::<String>();
+        fs::write(notes.join(format!("Measured {index:03}.md")), body).unwrap();
+    }
+    for day in 1..=5 {
+        fs::write(
+            fixture.graph_root.join(format!("diary/0{day}-09-2026.md")),
+            "- journal block mentioning [[Topic]]\n",
+        )
+        .unwrap();
+    }
+    fixture
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct C7bSample {
+    allocation_calls: usize,
+    allocated_bytes: usize,
+    projection_cache_hits: usize,
+    projection_cache_misses: usize,
+    result_page_hydrations: usize,
+    micros: u128,
+}
+
+fn c7b_percentile(mut values: Vec<u128>, percentile: f64) -> u128 {
+    values.sort_unstable();
+    if values.is_empty() {
+        return 0;
+    }
+    let index = ((values.len() as f64 - 1.0) * percentile).round() as usize;
+    values[index]
+}
+
+fn c7b_report(label: &str, samples: &[C7bSample]) {
+    let cold = samples[0];
+    let warm = &samples[1..];
+    let micros = warm.iter().map(|sample| sample.micros).collect::<Vec<_>>();
+    let median = c7b_percentile(micros.clone(), 0.5);
+    let p95 = c7b_percentile(micros, 0.95);
+    let warm_first = warm.first().copied().unwrap_or_default();
+    println!(
+        "C7BMEASURE\t{label}\tcold_alloc_calls={}\tcold_alloc_bytes={}\tcold_hits={}\tcold_misses={}\tcold_hydrations={}\tcold_micros={}\twarm_alloc_calls={}\twarm_alloc_bytes={}\twarm_hits={}\twarm_misses={}\twarm_hydrations={}\twarm_median_micros={median}\twarm_p95_micros={p95}\trounds={}",
+        cold.allocation_calls,
+        cold.allocated_bytes,
+        cold.projection_cache_hits,
+        cold.projection_cache_misses,
+        cold.result_page_hydrations,
+        cold.micros,
+        warm_first.allocation_calls,
+        warm_first.allocated_bytes,
+        warm_first.projection_cache_hits,
+        warm_first.projection_cache_misses,
+        warm_first.result_page_hydrations,
+        warm.len(),
+    );
+}
+
+#[test]
+#[ignore = "W4-C7b measurement harness; run explicitly with --ignored"]
+fn c7b_measure_managed_and_direct_reads() {
+    const PAGES: usize = 30;
+    const ROUNDS: usize = 9;
+    const ROWS: usize = 4096;
+    const BYTES: usize = 8 << 20;
+
+    let fixture = c7b_measurement_fixture("c7b-measure", PAGES);
+
+    // Direct Files: the same workload against `Graph`, which holds an
+    // `Arc<Document>` per page and must never build a page forest for a query.
+    let direct = Graph::open(&fixture.graph_root);
+    let mut direct_reference = Vec::new();
+    let mut direct_query = Vec::new();
+    for round in 0..=ROUNDS {
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let groups = direct.backlinks_bounded("Topic", ROWS, BYTES);
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        assert!(groups.total >= PAGES, "the measured workload must be real");
+        direct_reference.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            micros,
+            ..Default::default()
+        });
+
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let result = direct.run_query_bounded("[[Topic]]", ROWS, BYTES);
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        assert!(result.total >= PAGES, "the measured workload must be real");
+        direct_query.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            micros,
+            ..Default::default()
+        });
+        let _ = round;
+    }
+    c7b_report("direct.backlinks", &direct_reference);
+    c7b_report("direct.simple_query", &direct_query);
+
+    let handle = c7b_activated(&fixture);
+    let mut managed_reference = Vec::new();
+    let mut managed_query = Vec::new();
+    for _ in 0..=ROUNDS {
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let reply = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::Backlinks {
+                name: "Topic".to_owned(),
+                max_rows: ROWS,
+                max_bytes: BYTES,
+            },
+        );
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        match reply {
+            SyncApplicationNavigationReply::Backlinks(result) => {
+                assert!(result.total >= PAGES, "the measured workload must be real")
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        managed_reference.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            projection_cache_hits: counters.projection_cache_hits,
+            projection_cache_misses: counters.projection_cache_misses,
+            result_page_hydrations: counters.result_page_hydrations,
+            micros,
+        });
+
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let (calls, bytes) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let reply = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::SimpleQuery {
+                query: "[[Topic]]".to_owned(),
+                max_rows: ROWS,
+                max_bytes: BYTES,
+            },
+        );
+        let micros = started.elapsed().as_micros();
+        let (calls_after, bytes_after) = c7b_alloc::snapshot();
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        match reply {
+            SyncApplicationNavigationReply::SimpleQuery(result) => {
+                assert!(result.total >= PAGES, "the measured workload must be real")
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        managed_query.push(C7bSample {
+            allocation_calls: calls_after - calls,
+            allocated_bytes: bytes_after - bytes,
+            projection_cache_hits: counters.projection_cache_hits,
+            projection_cache_misses: counters.projection_cache_misses,
+            result_page_hydrations: counters.result_page_hydrations,
+            micros,
+        });
+    }
+    c7b_report("managed.backlinks", &managed_reference);
+    c7b_report("managed.simple_query", &managed_query);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Obligation 9's real-graph regression run. Reads a COPY of the anonymized
+/// corpus named by `C7B_CORPUS`; it copies first because managed activation
+/// writes provider state into the graph root. Reports counts and timings only.
+#[test]
+#[ignore = "W4-C7b corpus measurement; run explicitly with C7B_CORPUS=<path> --ignored"]
+fn c7b_measure_anonymized_corpus() {
+    let Ok(corpus) = std::env::var("C7B_CORPUS") else {
+        panic!("set C7B_CORPUS to the corpus path");
+    };
+    let root = std::env::temp_dir().join(format!("tine-c7b-corpus-{}", Uuid::new_v4()));
+    let graph_root = root.join("graph");
+    fs::create_dir_all(&graph_root).unwrap();
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(format!("{corpus}/."))
+        .arg(&graph_root)
+        .status()
+        .unwrap();
+    assert!(status.success(), "corpus copy failed");
+
+    let direct = Graph::open(&graph_root);
+    let pages = direct.list_pages().len();
+    assert!(pages > 500, "the corpus must be the real one, got {pages}");
+    let target = direct
+        .list_pages()
+        .into_iter()
+        .filter(|entry| entry.kind == PageKind::Page)
+        .map(|entry| entry.name)
+        .max_by_key(|name| direct.backlinks_bounded(name, 4096, 8 << 20).total)
+        .expect("the corpus has pages");
+    let referenced = direct.backlinks_bounded(&target, 4096, 8 << 20).total;
+
+    let mut direct_micros = Vec::new();
+    let mut direct_calls = Vec::new();
+    for _ in 0..5 {
+        let (calls, _) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let groups = direct.backlinks_bounded(&target, 4096, 8 << 20);
+        direct_micros.push(started.elapsed().as_micros());
+        let (calls_after, _) = c7b_alloc::snapshot();
+        direct_calls.push(calls_after - calls);
+        assert_eq!(groups.total, referenced);
+    }
+
+    let request = SyncLocalActivationRequest {
+        archive_root: root.join("private/archive"),
+        graph_root: graph_root.clone(),
+        enrollment_root: root.join("private/enrollment"),
+        receipt_root: root.join("private/receipts"),
+        database_path: root.join("private/projection/bootstrap.sqlite"),
+        application_runtime_root: root.join("private/runtime"),
+        capture_root: root.join("private/capture"),
+        preparation_root: root.join("private/preparation"),
+        provider_root: graph_root.join(".tine-sync/v2/shared"),
+        provider_journal_root: root.join("private/provider/device/journal"),
+        identities: {
+            let seed: u128 = 0xc7b_c0d5;
+            SyncLocalActivationIdentities {
+                workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+                lineage_digest: LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+                catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 2)),
+                device_id: DeviceId::from_uuid(Uuid::from_u128(seed + 3)),
+                preparation_id: Uuid::from_u128(seed + 4),
+                session_id: SessionId::from_uuid(Uuid::from_u128(seed + 5)),
+            }
+        },
+    };
+    let activation_started = std::time::Instant::now();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(request);
+    let activation_micros = activation_started.elapsed().as_micros();
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("the corpus activates");
+    drive_initial_feed(&handle);
+
+    let mut managed_micros = Vec::new();
+    let mut managed_calls = Vec::new();
+    let mut last = (0usize, 0usize, 0usize);
+    for _ in 0..5 {
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let (calls, _) = c7b_alloc::snapshot();
+        let started = std::time::Instant::now();
+        let reply = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::Backlinks {
+                name: target.clone(),
+                max_rows: 4096,
+                max_bytes: 8 << 20,
+            },
+        );
+        managed_micros.push(started.elapsed().as_micros());
+        let (calls_after, _) = c7b_alloc::snapshot();
+        managed_calls.push(calls_after - calls);
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        last = (
+            counters.projection_cache_hits,
+            counters.projection_cache_misses,
+            counters.result_page_hydrations,
+        );
+        match reply {
+            SyncApplicationNavigationReply::Backlinks(result) => {
+                assert_eq!(
+                    result.total, referenced,
+                    "managed and direct agree on the corpus"
+                )
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+    println!(
+        "C7BCORPUS\tpages={pages}\treferencing_rows={referenced}\tactivation_micros={activation_micros}\tdirect_cold_micros={}\tdirect_warm_median_micros={}\tdirect_warm_alloc_calls={}\tmanaged_cold_micros={}\tmanaged_warm_median_micros={}\tmanaged_warm_alloc_calls={}\twarm_hits={}\twarm_misses={}\twarm_hydrations={}",
+        direct_micros[0],
+        c7b_percentile(direct_micros[1..].to_vec(), 0.5),
+        direct_calls[1],
+        managed_micros[0],
+        c7b_percentile(managed_micros[1..].to_vec(), 0.5),
+        managed_calls[1],
+        last.0,
+        last.1,
+        last.2,
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    let _ = fs::remove_dir_all(&root);
 }

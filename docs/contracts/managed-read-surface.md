@@ -11,9 +11,10 @@ adapter call edges.
 
 | symbol | file | class | canonical owner | justification/evidence |
 | --- | --- | --- | --- | --- |
+| application_page_block_referrers | `crates/tine-core/src/query.rs` | adapter | collect_reference_matches | Walks the page's projected forest through the shared reference visitor; owns no traversal of its own. |
 | application_page_property_dto | `crates/tine-core/src/query.rs` | necessary | — | Projects one Managed page-property DTO input. |
 | application_page_property_pairs | `crates/tine-core/src/query.rs` | necessary | — | Normalizes Managed wire property pairs. |
-| application_page_reference_matches | `crates/tine-core/src/query.rs` | necessary | — | Matches references over Managed page DTO input. |
+| application_page_reference_matches | `crates/tine-core/src/query.rs` | adapter | collect_reference_matches | Matches references over a page's projected forest through the shared reference visitor. |
 | application_page_templates | `crates/tine-core/src/query.rs` | adapter | visit_template_blocks | Walks Managed DTO shape and delegates each result to the canonical template leaf. |
 | application_query_doc_block | `crates/tine-core/src/query.rs` | necessary | — | Rehydrates a complete Managed DTO subtree. |
 | application_sparse_query_doc_block | `crates/tine-core/src/query.rs` | necessary | — | Rehydrates a sparse materialized-query row through `DocBlock::new`. |
@@ -25,7 +26,6 @@ adapter call edges.
 | application_block_children_by_identity | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Locates children in a Managed editor DTO tree. |
 | application_block_reference_counts_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Merges Managed reference-count index and overlay. |
 | application_block_referrers_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Merges Managed referrer index and hydrated pages. |
-| application_crumb_line | `crates/tine-core/src/sync_runtime.rs` | adapter | crumb_line | Supplies format to the shared crumb renderer. |
 | application_editor_blocks | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Sole Managed save-request block DTO constructor. |
 | application_editor_blocks_existing | `crates/tine-core/src/sync_runtime.rs` | adapter | application_editor_blocks | Existing-save exposed-key policy delegates to the shared builder. |
 | application_editor_blocks_new | `crates/tine-core/src/sync_runtime.rs` | adapter | application_editor_blocks | New-save generated-key policy delegates to the shared builder. |
@@ -55,7 +55,6 @@ adapter call edges.
 | application_navigation_reference_names_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed reference-name index plus overlay. |
 | application_orphan_assets_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed asset-reference index boundary. |
 | application_page_block_reference_counts | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Counts references in a hydrated Managed page. |
-| application_page_block_referrers | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Builds Managed referrer breadcrumbs from DTO trees. |
 | application_page_identity_map | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Maps Managed editor identities for stable saves. |
 | application_page_inventory | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Builds inventory from one hydrated Managed page. |
 | application_page_inventory | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Builds inventory from one Managed projected page. |
@@ -67,6 +66,7 @@ adapter call edges.
 | application_preview_block_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed bounded-subtree preview boundary. |
 | application_projection_roots | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Owns the cached complete DocBlock view for a Managed page. |
 | application_property_facets_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed property-facet index plus overlay. |
+| application_query_page_journal | `crates/tine-core/src/sync_runtime.rs` | adapter | parse | Calls `crate::date::JournalFormat::parse` (the census records a call by its last path segment) to read the page's journal day from the graph's CONFIGURED format — the same producer that fills Direct's `PageEntry::date_key`. Never `JournalDate::from_title`, which hardcodes the default format. |
 | application_query_page_recency | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Computes recency from Managed path and graph config. |
 | application_query_plan_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed query-plan/index preparation boundary. |
 | application_request | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed application request boundary. |
@@ -89,6 +89,7 @@ adapter call edges.
 | --- | --- | --- | --- |
 | application_backlink_filter_entry | `crates/tine-core/src/query.rs` | backlink_filter_entry | C7a-1 |
 | template_dto_from_application | `crates/tine-core/src/query.rs` | template_dto | C7a-3 |
+| application_crumb_line | `crates/tine-core/src/sync_runtime.rs` | crumb_line | W4-C7b-1 |
 
 ## UUID ownership policy
 
@@ -112,8 +113,9 @@ the UUID before that identity enters the database.
 
 ## Measured exception
 
-`shallow_application_block` remains at exactly five syntactically pinned
-Managed result boundaries. The DTO already contains parser-derived facets;
+`shallow_application_block` remains at exactly four syntactically pinned
+Managed result boundaries (W4-C7b retired the fifth with the managed
+block-referrer twin). The DTO already contains parser-derived facets;
 routing through `dto_block_to_doc_block` plus `block_to_shallow_dto` creates one
 temporary `DocBlock` per result and reparses raw text. See
 `managed_shallow_application_block_manual_probe` and
@@ -141,3 +143,28 @@ block identity across modes must read the `id` entry of `properties`. The
 real-graph gate `managed_c7a_real_graph_copy_manual_gate` normalizes this field
 out of its parity oracle for exactly this reason; if a future packet needs the
 two modes to agree on it, that is a deliberate identity change, not a bug fix.
+
+## W4-C7b measured collapse
+
+One evaluator per question, measured before and after on the same machine. The
+gate is the structural column — how many production functions own the algorithm.
+Timing is advisory: this machine builds other worktrees concurrently.
+
+Runtime counters come from `c7b_measure_managed_and_direct_reads` (30 indexed
+pages + 5 journals, one cold pass and nine warm passes) and
+`c7b_measure_anonymized_corpus` (1,045-page real graph, one cold pass and four
+warm). `allocation_calls` / `allocated_bytes` are a `#[cfg(test)]` counting
+global allocator defined in `sync_runtime_tests.rs::c7b_alloc`; no allocation
+counter existed anywhere under `crates/` to reuse.
+
+| function | file | question | classification | shared producer | callers | before structural counters | after structural counters | timing (advisory) | exception rationale / evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `run_query_bounded` / `run_application_query_pages_bounded` | `crates/tine-core/src/query.rs` | which blocks satisfy a simple query, bounded | cut | `run_query_bounded_over` over `QueryPageSource` | 2 | 2 algorithm owners | 1 algorithm owner | managed warm simple query unchanged at the memo (859 alloc calls, 269 µs median) | `c7b_query_driver_producers_share_one_page_source` |
+| `run_pred_bounded` / `run_application_pred_pages_bounded` | `crates/tine-core/src/query.rs` | which blocks satisfy a parsed predicate, bounded | cut (the managed twin deleted outright) | `run_pred_bounded_over` | 2 → 1 | 2 algorithm owners | 1 algorithm owner | n/a (shared with the driver above) | `c7b_query_driver_producers_share_one_page_source` |
+| `run_advanced_query_bounded` / `run_application_advanced_query_pages_bounded` | `crates/tine-core/src/query.rs` | which blocks satisfy an advanced query, bounded | cut | `run_advanced_query_bounded_over` | 2 | 2 algorithm owners | 1 algorithm owner | not separately timed; same driver | `c7b_query_driver_parity` |
+| `export_query_subtrees` / `export_application_query_subtrees` | `crates/tine-core/src/query.rs` | which subtrees a query exports, bounded | cut | `export_query_subtrees_over` | 2 | 2 algorithm owners, 2 budget constants | 1 algorithm owner, 1 budget constant | not separately timed | `c7b_query_driver_parity` |
+| `collect_reference_occurrences_bounded`, `bound_application_reference_sources`, the managed block-referrer loop | `crates/tine-core/src/query.rs`, `crates/tine-core/src/sync_runtime.rs` | how reference rows are grouped, admitted and ordered | cut | `BoundedReferenceGroups` + `reference_group_display_order` | 3 | 3 algorithm owners, 3 display-order copies | 1 algorithm owner, 1 display-order producer | see the reference row below | `c7b_reference_grouping_has_one_algorithm_owner`, `c7b_bounded_reference_grouping_parity` |
+| `application_page_reference_matches`, `application_page_block_referrers` | `crates/tine-core/src/query.rs` | which blocks of one page reference a target | cut | `collect_reference_matches` over cached `DocBlock` roots | 7 managed call sites | 0 of 7 reference reads used the retained projection; the block-referrer twin parsed every block twice | 7 of 7 use `application_projection_roots`; one `crumb_line` producer | 30 pages warm: 119,882 → 87,417 alloc calls, 15.15 → 11.48 MB, 82.5 → 63.2 ms median. Corpus warm: 461,493 → 367,446 alloc calls, 291.2 → 238.5 ms median, cache hits 0 → 168, misses 0 | `c7b_managed_reference_reads_use_shared_docblock_visitors`, `measurement-before.txt`, `measurement-after.txt`, `measurement-corpus-*.txt` |
+| `application_navigation_overlay_ready` consumers | `crates/tine-core/src/sync_runtime.rs` | what the pending local suffix contains, for this request | cut | one request-scoped `navigation_overlay_scoped` memo | 6 `*_ready` consumers | QuickSwitch: 3 pending-path load passes per request | 1 | not separately timed; the counter is the gate | `c7b_navigation_overlay_pending_paths_load_at_most_once_per_request` |
+| `journal_ordinal` | `crates/tine-core/src/query.rs` | which day a journal page evaluates as | cut for the query adapters; **measured exception for the sparse path** | `JournalFormat::parse` via `ApplicationQueryPage::journal` | 2 → 1 | 2 producers, disagreeing on any custom `:journal/page-title-format` | 1 config-aware producer for both backends | none | The remaining `journal_ordinal` caller is the sparse task-candidate evaluator, whose `ApplicationSparseQueryPage` is also constructed in `direct_projection.rs`; BOTH backends read the same default-bound value there, so it cannot diverge. Collapsing it needs a file outside this packet's write set. `REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001` |
+| Direct Files, all questions | `crates/tine-core/src/model.rs` | — | unchanged by construction | `GraphQueryPages` yields borrowed `(&meta, &[DocBlock], …)` | — | backlinks warm 6 alloc calls / 65 B / 1 µs; corpus warm 6 alloc calls / 2 µs | identical: 6 alloc calls / 65 B / 1 µs; corpus 6 / 2 µs | no change | Direct constructs no page forest and clones no root vector for a query, before or after; `ApplicationProjectionCache` has zero Direct call sites |
