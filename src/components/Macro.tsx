@@ -167,6 +167,31 @@ function splitQuery(arg: string): ParsedQuery {
   };
 }
 
+/** Remove the block a query is written in from that query's own results.
+ *
+ *  `{{query "xyz"}}` contains `xyz`, so the block matches its own query and the
+ *  backend says so honestly. Rendering that match renders the page the query
+ *  lives on, which renders the query, which lists the page again — the
+ *  recursion in GH #469. OG removes exactly the host block for the same reason
+ *  and states it where it does it (`frontend/components/query/result.cljs` at
+ *  `6e7afa8e`: "exclude the current one, otherwise it'll loop forever"). Only
+ *  the block itself goes; its children are ordinary results.
+ *
+ *  Returns the input unchanged when nothing matches, so a query whose results
+ *  never contain its host keeps referential equality for downstream memos. */
+export function withoutHostBlock(groups: RefGroup[], hostBlockId: string | undefined): RefGroup[] {
+  if (!hostBlockId) return groups;
+  const hosts = (group: RefGroup) => group.blocks.some((block) => block.id === hostBlockId);
+  if (!groups.some(hosts)) return groups;
+  return groups
+    .map((group) =>
+      hosts(group)
+        ? { ...group, blocks: group.blocks.filter((block) => block.id !== hostBlockId) }
+        : group,
+    )
+    .filter((group) => group.blocks.length > 0);
+}
+
 // A {{query ...}} block: runs the query and renders matching blocks as a list
 // or a sortable table. When `blockId` is given (the block is a standalone query
 // block, not an inline-in-text macro) an interactive builder bar is shown and
@@ -357,9 +382,8 @@ export function QueryMacro(props: {
   // expanding it (key flips to include dataRev) refreshes it.
   const queryRequestKey = () =>
     `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() || currentPageInput() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
-  const [groups] = createResource(
-    queryRequestKey,
-    async (requestKey) => {
+  const fetchGroups = async (requestKey: string): Promise<RefGroup[]> => {
+    {
       const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
       const searchSource = friendlySearch();
       if (searchSource !== null) {
@@ -376,9 +400,17 @@ export function QueryMacro(props: {
           ),
         );
         if (queryRequestKey() !== requestKey) return [];
-        setSearchExecution(execution);
+        // The Search presentation renders these hits directly rather than the
+        // RefGroups below, so the host block has to come out here too — the same
+        // exclusion `withoutHostBlock` makes, at the other place membership is
+        // decided (GH #469). Diagnostics and the explanation are untouched: the
+        // hit was really found, it is just not shown to itself.
+        const hits = props.blockId
+          ? execution.hits.filter((hit) => !(hit.entity === "block" && hit.block.id === props.blockId))
+          : execution.hits;
+        setSearchExecution(hits.length === execution.hits.length ? execution : { ...execution, hits });
         const grouped = new Map<string, RefGroup>();
-        for (const hit of execution.hits) {
+        for (const hit of hits) {
           if (hit.entity !== "block") continue;
           const key = `${hit.kind}\0${hit.page}\0${hit.path ?? ""}`;
           const group = grouped.get(key) ?? { page: hit.page, kind: hit.kind, path: hit.path, blocks: [] };
@@ -406,6 +438,18 @@ export function QueryMacro(props: {
       setAdvInfo(null);
       return sharedQueryResult(scope, `simple\0${requestKey}`, () => backend().runQuery(executableForm()));
     }
+  };
+  // A query must not return the block it is written in. `{{query "xyz"}}`
+  // contains `xyz`, so the backend answers honestly and the block matches its
+  // own query — then the result renders the page it lives on, which renders the
+  // query, which lists the page again. OG removes exactly the host block for
+  // this reason and says so where it does it (frontend/components/query/result.cljs
+  // at 6e7afa8e: "exclude the current one, otherwise it'll loop forever"). Its
+  // children are NOT removed; only the block itself. Applied once here, after
+  // every fetch path, rather than in each of the three (GH #469).
+  const [groups] = createResource(
+    queryRequestKey,
+    async (requestKey) => withoutHostBlock(await fetchGroups(requestKey), props.blockId),
   );
   const groupsError = () => {
     const error = groups.error;

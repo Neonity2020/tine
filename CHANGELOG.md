@@ -18,6 +18,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A query no longer returns the block it is written in.** `{{query "xyz"}}`
+  matched its own text, so the results listed the page the query lives on —
+  which renders the query again, which lists the page again. Matching Logseq,
+  the query's own block is left out of its results; blocks under it are not
+  (GH #469).
+
 - **Tab inside a block embed no longer throws the caret out of the embed.**
   Indenting, outdenting or moving a bullet inside a `{{embed}}` did the right
   thing to the outline but reopened the editor on the block's other rendering

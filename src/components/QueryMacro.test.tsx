@@ -8,7 +8,7 @@ import { backend } from "../backend";
 import { blockProperty, doc, resetStore, setDoc, undo, type FeedPage, type Node as StoreNode } from "../store";
 import { route } from "../router";
 import { clearSimpleForm, getSimpleForm, stashSimpleForm } from "../editor/queryBuilder";
-import type { QueryExecution, RefGroup } from "../types";
+import type { QueryExecution, QueryHit, RefGroup } from "../types";
 import { bumpDataRev } from "../ui";
 
 beforeAll(async () => {
@@ -517,6 +517,89 @@ describe("QueryMacro sheet integration", () => {
     expect(getSimpleForm("query")).toBeUndefined();
     expect(root.querySelector(".qb-bar")).not.toBeNull();
 
+    dispose();
+  });
+});
+
+// GH #469. `{{query "xyz"}}` matched its own block, because the block's own text
+// contains `xyz` — so the query listed the page it lives on, which renders the
+// query again, which lists the page again. OG removes exactly the host block
+// from every result set for this reason, and says so at
+// frontend/components/query/result.cljs (6e7afa8e): "exclude the current one,
+// otherwise it'll loop forever".
+describe("a query never returns its own block (GH #469)", () => {
+  function loadSelfMatching(queryRaw: string) {
+    setDoc({
+      byId: {
+        query: node("query", queryRaw, null),
+        todo: node("todo", "TODO From query\nowner:: Martin", null),
+      },
+      pages: [page(["query", "todo"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+  }
+
+  it("drops the host block from a simple DSL query's results", async () => {
+    loadSelfMatching('{{query "From query"}}\ntine.view:: list');
+    // The backend answers honestly: the host block's own text matches too.
+    vi.spyOn(backend(), "runQuery").mockResolvedValue(queryGroups(["query", "todo"]));
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    await settleQuery();
+
+    const listed = [...root.querySelectorAll(".query-group [data-block-id]")]
+      .map((el) => el.getAttribute("data-block-id"));
+    expect(listed).toContain("todo");
+    expect(listed).not.toContain("query");
+    // The count the user reads must agree with what is shown.
+    expect(root.querySelector(".query-count")?.textContent).toBe("1");
+    dispose();
+  });
+
+  it("drops the host block from an advanced query's results", async () => {
+    loadSelfMatching('{{query {:query [:find (pull ?b [*]) :where [?b :block/content "x"]]}}}\ntine.view:: list');
+    vi.spyOn(backend(), "runAdvancedQuery").mockResolvedValue({
+      groups: queryGroups(["query", "todo"]),
+      ran: ["content"],
+      ignored: [],
+      supported: true,
+    });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    await settleQuery();
+
+    const listed = [...root.querySelectorAll(".query-group [data-block-id]")]
+      .map((el) => el.getAttribute("data-block-id"));
+    expect(listed).toContain("todo");
+    expect(listed).not.toContain("query");
+    dispose();
+  });
+
+  it("drops the host block from a full-text search query's hits", async () => {
+    loadSelfMatching('{{query (search "From query")}}\ntine.view:: search');
+    const hit = (id: string, raw: string): QueryHit => ({
+      entity: "block" as const,
+      page: "Sheet",
+      kind: "page" as const,
+      block: { id, raw, collapsed: false, children: [], breadcrumb: [], properties: [] },
+      display_text: raw,
+      evidence: [{ clause_id: 1, field: "visible_content" as const, mode: "contains" as const, spans: [{ start: 0, end: 4 }] }],
+    });
+    const execution: QueryExecution = {
+      hits: [hit("query", '{{query (search "From query")}}'), hit("todo", "TODO From query")],
+      diagnostics: [],
+      explanation: { branches: [] },
+      cancelled: false,
+    };
+    vi.spyOn(backend(), "runGraphSearch").mockResolvedValue(execution);
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    await settleQuery();
+
+    const hits = [...root.querySelectorAll(".query-search-hit")].map((el) => el.textContent ?? "");
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain("TODO From query");
     dispose();
   });
 });

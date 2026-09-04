@@ -10190,6 +10190,32 @@
         "failBefore": "proven"
       },
       "notes": "User outcome (blocking core operation): the top of a page was unreachable. The only route to 'a block above this one' was Enter at offset 0, which splits the block; a code block owns its own Enter key (it inserts a line of code and never splits), so with a code block first on the page there was no keyboard route AND no earlier block to insert after. The reporter could edit the code block and add blocks after it, but could not put anything above it at all. Fixed by adding the missing capability rather than by changing what Enter means inside a code editor: `insertOutlineBefore` in the store (the existing `insertOutlineAfter` was refactored so both sides share one implementation and cannot drift) and an 'Insert block above' item in the block context menu, offered on every writable block because the same dead end exists for the first child of any subtree. The read-only branch of `blockActions` deliberately does not carry it. Guide: crates/tine-core/src/templates/capture-plan-day.md documents both routes, pinned by an onboarding assertion. NOT done, and left to Martin as a product question: whether Shift+Enter inside a code editor should also mean 'new block' (today it is a second way to say newline, so the binding is free, and it would match the documented inverse pair) — that changes what a key means inside a code block and is not decision-free."
+    },
+    {
+      "id": "UI-QUERY-EXCLUDES-ITS-OWN-BLOCK-469",
+      "title": "A query never returns the block it is written in",
+      "family": "query",
+      "sources": {
+        "issues": [
+          469
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.test.tsx::a query never returns its own block (GH #469)::drops the host block from a simple DSL query's results",
+          "src/components/QueryMacro.test.tsx::a query never returns its own block (GH #469)::drops the host block from an advanced query's results",
+          "src/components/QueryMacro.test.tsx::a query never returns its own block (GH #469)::drops the host block from a full-text search query's hits"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome (blocking core operation): `{{query \"xyz\"}}` listed the page it was written on, and that rendering contained the query again, so the results nested into themselves -- the reporter's screenshot is the same page repeating down the pane. The backend is not wrong: the host block's own text really does contain the search term. The missing rule is at the presentation boundary, which is the only layer that knows which block hosts the query. OG parity provenance: logseq/og at 6e7afa8e, frontend/components/query/result.cljs get-query-result computes `remove-blocks (if current-block-uuid [current-block-uuid] nil)` with the comment 'exclude the current one, otherwise it'll loop forever', and frontend/db/query_react.cljs custom-query-result-transform removes exactly those uuids -- the host block only, NOT its children, which remain ordinary results. Tine now does the same in one place per membership decision: `withoutHostBlock` over the RefGroups (all three fetch paths funnel through it) and the equivalent filter over `execution.hits`, because the Search presentation renders those hits directly rather than the groups. Diagnostics and the query explanation keep the unfiltered execution: the hit was really found, it is simply not shown to itself. Breadth: every query-execution call site was inventoried -- the tag-page query (Page.tsx), the virtual query workspace and the quick switcher have no host block at all, so QueryMacro is the whole class. Evidence layer: jsdom render over the real Block/QueryMacro path with the backend mocked to answer honestly; the fail-before run reproduces the recursion literally (the list rendered 'query' nine times)."
     }
   ]
 }
