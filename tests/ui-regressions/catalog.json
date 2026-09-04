@@ -10270,6 +10270,29 @@
         "failBefore": "proven"
       },
       "notes": "User outcome (flexible presentation behavior, but the setting itself is the requirement): the reporter set `:ref/linked-references-collapsed-threshold 0` in config.edn and Tine ignored it. Tine already implemented OG's RULE correctly -- collapse when the TOTAL backlink count reaches the threshold, which is `default-collapsed? (>= total threshold)` in logseq/og components/reference.cljs at 6e7afa8e -- but wired the threshold to a hard-coded 100 and never read the key. Now plumbed config.edn -> Config -> GraphMeta -> LinkedReferences, with OG's own fallback of 100 when the key is absent or not an integer (state.cljs get-linked-references-collapsed-threshold). Zero is deliberately a real value meaning `always collapsed` -- the request in the Logseq discussion thread the key came from -- so the frontend uses `?? 100`, never a falsy test; a test pins the 0 case for exactly that reason. Scope: Linked References only. OG gives Unlinked References `:default-collapsed? true` unconditionally with no threshold, and Tine matches that already, so the key is deliberately NOT applied there. The section's own expand/collapse override (GH #272) still wins over the computed default, so this changes the default and not the control. Also note the parser: int_value reads ASCII digits, so a negative threshold falls back to 100 where OG would collapse always -- a value no sane config carries, recorded rather than special-cased."
+    },
+    {
+      "id": "UI-PDF-READER-OVERFLOW-TOOLS-UNREACHABLE-INTERNAL",
+      "title": "Fit width, Fit height, Area highlight, Notes and Outline stay reachable in a narrow PDF reader pane",
+      "family": "pdf-reader",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "2026-09-04 E2E flake census; surfaced by the quarantined pdf-logseq and pdf-routes journeys"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-pdf-overflow-reachability.mjs"
+        ],
+        "scenario": "pdf-reader.overflow-tool-reachability",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: in a PDF reader pane 520px wide or narrower - a split pane, a companion pane, a phone - five reader tools could not be reached by any pointer. Classification: blocking core operation; the controls were absent from the interface entirely, not merely awkward. Root cause is a CSS cascade-order bug, not a container-query bug: `@container pdfviewer (max-width: 520px)` set `.pdf-settings-overflow { display: grid }`, but the plain `.pdf-settings-overflow { display: none }` default was written LATER in app.css at equal specificity (0,1,0), so the default won at every width. Below 520px the toolbar copies were correctly hidden by the same query and the More-settings copies were hidden too, leaving nowhere to click. Fix: move the container-query block after the base declarations; nothing else changed. This is the answer to two quarantines that had recorded it as a contradictory harness visibility probe - pdf-logseq could not reach Outline, pdf-routes could not reach Notes, and both concluded the two probes disagreed about pane width. They did not disagree: the inline probe was right that the toolbar copy was hidden, and the overflow probe's 0x0 rect was a child of a display:none parent, whose computed `display: inline-block` said nothing about the parent because a bare <button> computes that anyway. Evidence at the browser layer because container queries and hit-testing are CSS layout, which jsdom does not apply; the guard walks nine widths across the 520px boundary and asserts each tool is hit-testable in one place or the other. Necessity gate: 25 unreachable tool/width combinations before the fix (5 tools x 5 widths at or below 520px), 0 after."
     }
   ]
 }

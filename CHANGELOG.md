@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **The PDF reader's Fit width, Fit height, Area highlight, Notes and Outline
+  are reachable again in a narrow reader pane.** Below 520px — a split pane, a
+  companion pane, a phone — the toolbar correctly moved those five tools into
+  the More-settings menu, but a CSS ordering mistake left the menu copies hidden
+  as well, so there was nowhere left to click them. They now appear in the menu
+  exactly when the toolbar is too narrow to show them inline.
+
 - **The whole left-sidebar row opens its page again, and the right sidebar's
   spare width is now the drag handle it was meant to be.** v0.6.981 narrowed the
   wrong pane: it made only the page title clickable in the left sidebar, which

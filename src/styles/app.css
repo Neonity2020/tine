@@ -9903,18 +9903,6 @@ html.drag-selection-suppressed * {
   background: color-mix(in srgb, var(--link-color) 13%, transparent);
 }
 
-/* The reader follows the topbar's container-query overflow pattern: the
-   lower-priority tools remain available from the existing More menu while the
-   pager, Find, zoom +/- and Close stay in the toolbar. */
-@container pdfviewer (max-width: 520px) {
-  .pdf-toolbar .pdf-overflow-action {
-    display: none;
-  }
-  .pdf-settings-overflow {
-    display: grid;
-  }
-}
-
 .pdf-settings-menu,
 .pdf-outline-panel {
   position: absolute;
@@ -9958,6 +9946,28 @@ html.drag-selection-suppressed * {
 .pdf-settings-overflow button[aria-pressed="true"] {
   border-color: var(--link-color);
   background: color-mix(in srgb, var(--link-color) 13%, transparent);
+}
+
+/* The reader follows the topbar's container-query overflow pattern: the
+   lower-priority tools remain available from the existing More menu while the
+   pager, Find, zoom +/- and Close stay in the toolbar.
+
+   This block MUST stay after `.pdf-settings-overflow`'s own declarations. It
+   used to sit before them, and `display: grid` here lost the cascade to the
+   plain `display: none` default below at equal specificity — so the overflow
+   copies of Fit width, Fit height, Area highlight, Notes and Outline were
+   `display: none` at EVERY width while the inline copies were hidden below
+   520px. Those five controls were unreachable by pointer in any narrow reader
+   pane, which is what the quarantined pdf-logseq (Outline) and pdf-routes
+   (Notes) journeys were reporting. Guarded by
+   scripts/check-pdf-overflow-reachability.mjs. */
+@container pdfviewer (max-width: 520px) {
+  .pdf-toolbar .pdf-overflow-action {
+    display: none;
+  }
+  .pdf-settings-overflow {
+    display: grid;
+  }
 }
 
 .pdf-settings-heading,
