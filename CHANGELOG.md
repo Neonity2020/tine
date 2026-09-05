@@ -30,6 +30,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A page with an unresolved save conflict can be opened on disk again.**
+  "Open with default app" and "Show in folder" both refused while a conflict was
+  pending, which left a page whose conflict view would not load with no way to
+  read it at all. Both now open the file as it stands on disk and say so; your
+  unsaved changes stay in Tine until you resolve the conflict (GH #490).
+
 - **Clicking inside a code block now puts the cursor where you clicked.** In a
   code block of any size, clicking anywhere in it opened an editor that looked
   blank: the cursor jumped to the very end of the block, and the editor was

@@ -10384,6 +10384,28 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: clicking anywhere in a rendered code block opened an editor whose visible area was blank -- the caret sat at the very end of the block, hundreds of lines below the click, and the no-wrap textarea was scrolled to the far right of the longest line, so none of the clicked code was on screen. Classification: blocking core operation; editing a code block by clicking into it is how the block is edited at all. Two independent defects share the one symptom. First, a code card renders as highlight.js markup carrying none of the lsdoc span data the general rendered-face mapper reads, so the mapper always declined and the caret fell back to end-of-block; `codeCardOffsetFromRange` maps a caret range inside `pre.code-block > code` by rendered text position instead, and the card branch is taken BEFORE the past-the-end rule, because a click to the right of a SHORT line inside a tall card means that line's end, not the block's. Offsets leave in the block's own visible-raw coordinates like every other numeric caret target, and `focusNow` maps them through the fence wrapper as it already did. Second, a `wrap=off` textarea mounts with its whole value assigned, which parks the browser selection at the end; focusing reveals that end and the later setSelectionRange does not scroll back, so even a correct caret opened the box scrolled right -- `revealCaretColumn` measures the caret column in one mirror pass and reveals it, and runs only for an editor that can scroll horizontally at all. Evidence at the browser layer because both halves are hit-testing and scroll geometry, which jsdom does not apply. Necessity gate: against pre-fix source the same probe reports the caret at 18798 of 18798 and scrollLeft 4481 of a 5153px content box; after, offset 2 and scrollLeft 5."
+    },
+    {
+      "id": "UI-CONFLICTED-PAGE-FILE-ACTIONS-490",
+      "title": "A page with an unresolved save conflict can still be opened or revealed on disk",
+      "family": "external-change-conflict-resolution",
+      "sources": {
+        "issues": [490],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ContextMenu.test.tsx::page file actions on a conflicted page (GH #490)"
+        ],
+        "scenario": "conflict.file-actions-not-refused",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a page whose conflict view would not finish loading could not be inspected at all -- Open with default app and Show in folder both refused with `Resolve the save conflict ... before opening its file`, so the one remaining way to read the text was closed too. Classification: blocking core operation; the refusal removed the recovery path from a page that was already unusable. The refusal named no in-scope threat: opening or revealing a file changes nothing on disk, and the conflicted draft is not written either way, so it defended nothing and cost the user the file. It is replaced by the recovery behaviour the storage rules prefer -- the conflicted page skips the flush (an unsavable draft is exactly what the conflict IS, so flushing could only fail again) and the file is opened as it stands, with an info toast saying the unsaved changes stay in Tine until the conflict is resolved. This addresses the SECOND half of GH #490 only; the reporter also saw the conflict panel itself hang on `Reading both versions...`, which is a separate defect and is not claimed fixed here. Evidence at the render layer driving the real page-actions menu with the page marked conflicted. Necessity gate: both assertions fail against pre-fix ContextMenu.tsx with openPageFile never called."
     }
   ]
 }
