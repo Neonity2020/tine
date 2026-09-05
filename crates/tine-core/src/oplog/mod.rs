@@ -200,15 +200,16 @@ pub use sqlite::{
 };
 pub use sqlite_materialization::{
     MaterializationChange, MaterializationError, MaterializedBlockInput, MaterializedBlockRow,
-    MaterializedEntityId, MaterializedPageInput, MaterializedPageRow, MaterializedProperty,
-    MaterializedPropertyRow, MaterializedReference, MaterializedReferenceKind,
-    MaterializedReferrerRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTask,
-    MaterializedTaskRow, SqliteMaterializedRead, MAX_MATERIALIZATION_CHANGE_BLOCKS,
-    MAX_MATERIALIZATION_CHANGE_BYTES, MAX_MATERIALIZATION_CHANGE_FACET_VALUES,
-    MAX_MATERIALIZATION_CHANGE_PAGES, MAX_MATERIALIZATION_FACET_BYTES,
-    MAX_MATERIALIZATION_FACET_VALUES, MAX_MATERIALIZATION_FIELD_BYTES,
-    MAX_MATERIALIZATION_PREAMBLE_BYTES, MAX_MATERIALIZATION_QUERY_BYTES,
-    MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
+    MaterializedEntityId, MaterializedPageInput, MaterializedPageRow, MaterializedPlanning,
+    MaterializedProperty, MaterializedPropertyRow, MaterializedReference,
+    MaterializedReferenceKind, MaterializedReferrerRow, MaterializedSearchHit, MaterializedTagRow,
+    MaterializedTask, MaterializedTaskRow, SqliteMaterializedRead,
+    MAX_MATERIALIZATION_CHANGE_BLOCKS, MAX_MATERIALIZATION_CHANGE_BYTES,
+    MAX_MATERIALIZATION_CHANGE_FACET_VALUES, MAX_MATERIALIZATION_CHANGE_PAGES,
+    MAX_MATERIALIZATION_FACET_BYTES, MAX_MATERIALIZATION_FACET_VALUES,
+    MAX_MATERIALIZATION_FIELD_BYTES, MAX_MATERIALIZATION_PREAMBLE_BYTES,
+    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    MAX_MATERIALIZATION_READ_BYTES,
 };
 pub use wire::SHARED_PROVIDER_TREE_NAMESPACES;
 
@@ -253,7 +254,13 @@ mod external_surface_tests {
         let digest = Sha256::digest(public_uses.join("\n").as_bytes());
         assert_eq!(
             format!("{digest:x}"),
-            "b6d132b2ba20e79948f703faacb02dc67713dc47d88ea8b1fc7d3d6bbdad889e",
+            // Re-pinned 2026-09-05 (query engine P1-a2): `MaterializedPlanning`
+            // joins the materialization re-export list. It is the block's
+            // `[#A]`/`SCHEDULED:`/`DEADLINE:` facet, carried independently of
+            // `MaterializedTask` (§3.2 M2). Derived by re-running this
+            // function's own extraction over `HEAD` and the working tree: one
+            // name added, none removed, still 20 declarations.
+            "22323e60fe472f16d8f78a7e617feba02c823b9fa2455307e1869e47be6c01df",
             "the exact public oplog re-export surface changed"
         );
 

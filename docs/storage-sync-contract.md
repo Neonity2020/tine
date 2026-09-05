@@ -418,6 +418,56 @@ these from the SAME closure and the SAME atomizer over the SAME per-block input
 copy that merely agrees by inspection: a graph has one behaviour, whichever
 storage mode holds it.
 
+**Planning is not a task.** `block_planning` carries a block's `[#A]`,
+`SCHEDULED:` and `DEADLINE:` facets for every block that has any of them,
+written from the projection's three fields alone and never conditioned on the
+task marker. `tasks` cannot answer these questions: a row is written there only
+when a marker exists, so a markerless `SCHEDULED:` block is absent from it while
+the tree walk still evaluates its date. The `scheduled_day`/`deadline_day`
+columns hold the `yyyymmdd` ordinal and are NULL when the timestamp text is not
+a calendar day, so a malformed date keeps its presence and loses only its day.
+
+**The query columns are the exact visible text.** `blocks.query_visible` is the
+block's visible text byte for byte and `blocks.query_visible_folded` is that
+text canonically folded; every content predicate reads them. The neighbouring
+`searchable_text` and its FTS stay whitespace-collapsed for the existing search
+consumers and are not a substitute: a phrase query has to be able to tell `a  b`
+from `a b`. Both columns are populated at WRITE time by both producers, never by
+parsing or hydrating rows during a query.
+
+**A tag key is a page key.** `tags.tag_key` is `refs::page_key(tag)` — the same
+key page identity uses — because `#x` is OG's `[[x]]`; `tags_lookup_idx` leads
+with it. `pages.journal_day` is the journal page's `yyyymmdd`, derived from the
+page's own file stem under the graph's `:file/name-format` and journal formats,
+and NULL for every other page.
+
+**The projection has a statement seam; nothing else does.**
+`PhysicalProjectionQueryReader` runs caller-supplied SQL against the graph
+projection with bound parameters, plus `EXPLAIN QUERY PLAN` for the same
+statement. Raw SQL crosses that boundary; **authority does not.** It is allowed
+here, and only here, because the projection is a disposable cache derived from
+the oplog: a malformed statement fails a read and can never corrupt truth. The
+oplog, the frontier and the Markdown/Org tree keep their curated typed
+boundaries and must never gain such a seam.
+
+The restriction is the **engine's**, not a validator's. The reader owns a
+connection opened `SQLITE_OPEN_READ_ONLY` and no constructor accepts an existing
+writable handle, so it cannot be reached from one; SQLite itself refuses every
+write through it, which
+`the_query_seam_can_read_the_projection_and_cannot_write_it` proves by
+attempting `DELETE`, `INSERT`, `UPDATE`, `DROP` and `CREATE` rather than
+assuming. There is deliberately **no** SQL-text parser or "single SELECT only"
+check: it would be a runtime refusal with no in-scope failure to name — the
+shape this contract's refusal table exists to keep out — and it could reject a
+legitimate statement. Values travel as bound parameters in the signature, so an
+interpolated statement is not expressible, and `explain_query_plan` binds the
+same parameters as the query it explains, because with `sqlite_stat4` present an
+unbound explain can report a plan for a statement the caller never runs.
+
+**This seam adds no refusal.** The in-scope failures it can meet — a missing,
+stale or corrupt projection — are answered by rebuild, and contention by
+`busy_timeout`.
+
 **One parse config, or a rebuild.** Six graph-config facts decide those derived
 rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,
 `:block-hidden-properties`, `:journal/page-title-format`,

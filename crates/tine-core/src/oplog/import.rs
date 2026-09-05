@@ -937,6 +937,7 @@ fn capture_activation_page_records(
                 order: imported_order(tree.nodes[index].sibling_position),
                 content: std::mem::take(&mut tree.nodes[index].raw),
                 searchable_text: facets.searchable_text,
+                query_visible: facets.query_visible,
                 heading_level: facets.heading_level,
                 collapsed: facets.collapsed,
                 logseq_uuid: None,
@@ -945,6 +946,7 @@ fn capture_activation_page_records(
                 properties: facets.properties,
                 tags: facets.tags,
                 task: facets.task,
+                planning: facets.planning,
                 path_ref_names: facets.path_ref_names,
             });
             activation_block_sources.push(ActivationBlockSourceV1 {
@@ -953,15 +955,15 @@ fn capture_activation_page_records(
             });
         }
         let is_org = super::reference_catalog::reference_source_is_org(entry.path());
-        let (preamble_search, _, _, properties, tags, _, _) = tree
+        let preamble_facets = tree
             .preamble
             .as_deref()
             .map(|preamble| super::sqlite::document_facets(preamble, is_org))
             .unwrap_or_default();
         let mut searchable = page_name.clone();
-        if !preamble_search.is_empty() {
+        if !preamble_facets.searchable_text.is_empty() {
             searchable.push(' ');
-            searchable.push_str(&preamble_search);
+            searchable.push_str(&preamble_facets.searchable_text);
         }
         let record = ActivationPageRecordV1::new(
             source_leaf,
@@ -977,8 +979,8 @@ fn capture_activation_page_records(
                 preamble: tree.preamble,
                 searchable_text: searchable,
                 references: Vec::new(),
-                properties,
-                tags,
+                properties: preamble_facets.properties,
+                tags: preamble_facets.tags,
                 blocks: terminal_blocks,
             },
             activation_block_sources,
@@ -1814,6 +1816,7 @@ fn materialize_lazy_genesis_page(
             order: stored.order.clone(),
             content: stored.content.clone(),
             searchable_text: facets.searchable_text,
+            query_visible: facets.query_visible,
             heading_level: facets.heading_level,
             collapsed: facets.collapsed,
             logseq_uuid,
@@ -1823,11 +1826,12 @@ fn materialize_lazy_genesis_page(
             properties: facets.properties,
             tags: facets.tags,
             task: facets.task,
+            planning: facets.planning,
             path_ref_names: facets.path_ref_names,
         });
     }
     let is_org = super::reference_catalog::reference_source_is_org(&page.path);
-    let (preamble_search, _, _, properties, tags, _, _) = page
+    let preamble_facets = page
         .preamble
         .as_deref()
         .map(|preamble| super::sqlite::document_facets(preamble, is_org))
@@ -1835,9 +1839,9 @@ fn materialize_lazy_genesis_page(
     let logical_name = LogicalPageName::parse(page.name.clone())
         .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
     let mut searchable = page.name.clone();
-    if !preamble_search.is_empty() {
+    if !preamble_facets.searchable_text.is_empty() {
         searchable.push(' ');
-        searchable.push_str(&preamble_search);
+        searchable.push_str(&preamble_facets.searchable_text);
     }
     Ok(super::MaterializedPageInput {
         page_id: page.page_id,
@@ -1849,8 +1853,8 @@ fn materialize_lazy_genesis_page(
         preamble: page.preamble,
         searchable_text: searchable,
         references: Vec::new(),
-        properties,
-        tags,
+        properties: preamble_facets.properties,
+        tags: preamble_facets.tags,
         blocks,
     })
 }
@@ -4985,21 +4989,10 @@ struct ParsedNode {
     projection_facets: ParsedBlockProjectionFacets,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ParsedBlockProjectionFacets {
-    searchable_text: String,
-    heading_level: Option<u8>,
-    collapsed: bool,
-    properties: Vec<super::MaterializedProperty>,
-    tags: Vec<String>,
-    task: Option<super::MaterializedTask>,
-    /// The block's own normalized page references, captured by the same parse
-    /// as every other facet (§5.8 G1) and moved with exactly the neighbours
-    /// `properties` moves with.
-    #[serde(default)]
-    path_ref_names: Vec<String>,
-}
+/// The activation capture stores exactly the facets one parse yields, so this
+/// is [`super::sqlite::BlockFacets`] itself rather than a twin that has to be
+/// kept in step with it by hand (D-14).
+use super::sqlite::BlockFacets as ParsedBlockProjectionFacets;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -5017,7 +5010,7 @@ struct ParsedExternalTree {
     effective: PageEntry,
 }
 
-const CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION: u32 = 1;
+const CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION: u32 = 2;
 const MAX_CAPTURED_ACTIVATION_PAGE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Parser-owned, process-local handoff from the exact source capture to the
@@ -5500,8 +5493,7 @@ fn flatten_document(
                 (crate::doc::property_key_norm(&key) == "id").then_some(value)
             })
             .collect();
-        let (searchable_text, heading_level, collapsed, properties, tags, task, path_ref_names) =
-            super::sqlite::document_facets_from_parsed_block(block);
+        let projection_facets = super::sqlite::document_facets_from_parsed_block(block);
         let index = nodes.len();
         let span = spans.get(index).copied().ok_or_else(|| {
             authority_block(
@@ -5518,15 +5510,7 @@ fn flatten_document(
             span,
             raw: block.raw.clone(),
             raw_ids,
-            projection_facets: ParsedBlockProjectionFacets {
-                searchable_text,
-                heading_level,
-                collapsed,
-                properties,
-                tags,
-                task,
-                path_ref_names,
-            },
+            projection_facets,
         });
         instrumentation.parsed_nodes = instrumentation.parsed_nodes.saturating_add(1);
         instrumentation.max_depth = instrumentation.max_depth.max(depth);

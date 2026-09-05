@@ -52,7 +52,7 @@ const REFERENCE_CATALOG_POSTING_OVERHEAD_BYTES: usize = 96;
 const REFERENCE_CATALOG_ALIAS_OVERHEAD_BYTES: usize = 80;
 // Parser-derived query facts are disposable rows bound only by the accepted
 // frontier stamp. They are never a second authenticated authority.
-const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 7;
+const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 8;
 
 pub(crate) type ApplyChangeInstrumentation = storage::ApplyChangeInstrumentation;
 
@@ -266,6 +266,21 @@ pub struct MaterializedTask {
     pub deadline: Option<String>,
 }
 
+/// `[#A]` / `SCHEDULED:` / `DEADLINE:`, carried INDEPENDENTLY of
+/// [`MaterializedTask`] (SPEC §3.2 M2).
+///
+/// It is a separate field and not three more `MaterializedTask` fields because
+/// `task` is filled only under a marker, while the walk evaluates all three on
+/// markerless blocks too -- so folding them into `task` is exactly the shape
+/// that made `walk == SQL` unreachable for these attributes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializedPlanning {
+    pub priority: Option<String>,
+    pub scheduled: Option<String>,
+    pub deadline: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializedBlockInput {
@@ -275,6 +290,13 @@ pub struct MaterializedBlockInput {
     pub order: String,
     pub content: String,
     pub searchable_text: String,
+    /// The block's exact visible text, from which the shared producer derives
+    /// both `blocks.query_visible` and `blocks.query_visible_folded`.
+    ///
+    /// `searchable_text` cannot serve: it is whitespace-collapsed for today's
+    /// search consumers, and a content predicate has to be able to tell `a  b`
+    /// from `a b` (§5.10).
+    pub query_visible: String,
     pub heading_level: Option<u8>,
     pub collapsed: bool,
     pub logseq_uuid: Option<LogseqUuid>,
@@ -283,6 +305,7 @@ pub struct MaterializedBlockInput {
     pub properties: Vec<MaterializedProperty>,
     pub tags: Vec<String>,
     pub task: Option<MaterializedTask>,
+    pub planning: Option<MaterializedPlanning>,
     /// The block's OWN normalized page references — `BlockProjection.refs_norm`,
     /// the walk's exact source (§5.8 G1) — from which the shared closure
     /// function derives `block_path_refs`.
@@ -1151,6 +1174,11 @@ fn validate_page(
             &block.searchable_text,
             MAX_MATERIALIZATION_FIELD_BYTES,
         )?;
+        input_budget.add_field(
+            "block query visible bytes",
+            &block.query_visible,
+            MAX_MATERIALIZATION_FIELD_BYTES,
+        )?;
         for name in &block.path_ref_names {
             input_budget.add_field(
                 "path ref names bytes",
@@ -1209,6 +1237,30 @@ fn validate_page(
             if task.marker.is_empty() {
                 return Err(MaterializationError::InvalidInput(format!(
                     "block {} has an empty task marker",
+                    block.block_id
+                )));
+            }
+        }
+        if let Some(planning) = &block.planning {
+            for value in [
+                planning.priority.as_deref(),
+                planning.scheduled.as_deref(),
+                planning.deadline.as_deref(),
+            ] {
+                if let Some(value) = value {
+                    input_budget.add_field(
+                        "planning priority/scheduled/deadline bytes",
+                        value,
+                        MAX_MATERIALIZATION_FIELD_BYTES,
+                    )?;
+                }
+            }
+            if planning.priority.is_none()
+                && planning.scheduled.is_none()
+                && planning.deadline.is_none()
+            {
+                return Err(MaterializationError::InvalidInput(format!(
+                    "block {} carries an empty planning facet",
                     block.block_id
                 )));
             }
@@ -1488,15 +1540,19 @@ pub(crate) fn lower_pages_with_derived_rows(
     pages: &[MaterializedPageInput],
     parse_config: &ParseConfig,
 ) -> Result<Vec<storage::PhysicalPage>, MaterializationError> {
+    // Built once for the whole batch: `JournalFormat::new` compiles five
+    // patterns, which is per-graph work rather than per-page work.
+    let journal_days = crate::query::derived::JournalDays::new(parse_config);
     pages
         .iter()
-        .map(|page| lower_page(page, parse_config))
+        .map(|page| lower_page(page, parse_config, &journal_days))
         .collect()
 }
 
 fn lower_page(
     page: &MaterializedPageInput,
     parse_config: &ParseConfig,
+    journal_days: &crate::query::derived::JournalDays,
 ) -> Result<storage::PhysicalPage, MaterializationError> {
     let normalized_searchable_text = normalized_searchable_text(&page.searchable_text)?;
     // The page's format comes from its own path, case-insensitively
@@ -1532,12 +1588,13 @@ fn lower_page(
         name_key: page.name_key.clone(),
         path: page.path.as_str().to_owned(),
         text_kind: text_kind_to_sql(page.kind),
+        journal_day: journal_days.day(page.path.as_str(), page.kind == ManagedTextKind::Journal),
         preamble: page.preamble.clone(),
         searchable_text: page.searchable_text.clone(),
         normalized_searchable_text,
         references: page.references.iter().map(lower_reference).collect(),
         properties: page.properties.iter().map(lower_property).collect(),
-        tags: page.tags.clone(),
+        tags: crate::query::derived::tag_rows(&page.tags),
         property_atoms: page_property_atoms,
         blocks: page
             .blocks
@@ -1561,6 +1618,11 @@ fn lower_block(
     parse_config: &ParseConfig,
 ) -> Result<storage::PhysicalBlock, MaterializationError> {
     let normalized_searchable_text = normalized_searchable_text(&block.searchable_text)?;
+    // Managed Storage carries only the visible text across its input capture,
+    // so the fold is derived here -- by the same `canonical_fold` Direct Files
+    // already applied when it filled `BlockProjection::visible_lower`.
+    let (query_visible, query_visible_folded) =
+        crate::query::derived::query_visible_columns(&block.query_visible, None);
     let property_atoms = crate::query::derived::property_atom_rows(
         &block
             .properties
@@ -1578,18 +1640,27 @@ fn lower_block(
         content: block.content.clone(),
         searchable_text: block.searchable_text.clone(),
         normalized_searchable_text,
+        query_visible,
+        query_visible_folded,
         heading_level: block.heading_level,
         collapsed: block.collapsed,
         logseq_uuid: block.logseq_uuid.map(|id| id.as_uuid().into_bytes()),
         logseq_identity_origin: block.logseq_identity_origin.map(identity_origin_to_sql),
         references: block.references.iter().map(lower_reference).collect(),
         properties: block.properties.iter().map(lower_property).collect(),
-        tags: block.tags.clone(),
+        tags: crate::query::derived::tag_rows(&block.tags),
         task: block.task.as_ref().map(|task| storage::PhysicalTask {
             marker: task.marker.clone(),
             priority: task.priority.clone(),
             scheduled: task.scheduled.clone(),
             deadline: task.deadline.clone(),
+        }),
+        planning: block.planning.as_ref().and_then(|planning| {
+            crate::query::derived::planning_row(
+                planning.priority.as_deref(),
+                planning.scheduled.as_deref(),
+                planning.deadline.as_deref(),
+            )
         }),
         path_refs,
         property_atoms,
@@ -3431,6 +3502,7 @@ mod tests {
             order: order.into(),
             content: block_id.to_string(),
             searchable_text: block_id.to_string(),
+            query_visible: block_id.to_string(),
             heading_level: None,
             collapsed: false,
             logseq_uuid: None,
@@ -3439,6 +3511,7 @@ mod tests {
             properties: Vec::new(),
             tags: Vec::new(),
             task: None,
+            planning: None,
             path_ref_names: Vec::new(),
         }
     }
@@ -3515,6 +3588,7 @@ mod tests {
             order: "a".into(),
             content: "baseline block".into(),
             searchable_text: "baseline block".into(),
+            query_visible: "baseline block".into(),
             heading_level: None,
             collapsed: false,
             logseq_uuid: Some(logseq_uuid),
@@ -3523,6 +3597,7 @@ mod tests {
             properties: Vec::new(),
             tags: Vec::new(),
             task: None,
+            planning: None,
             path_ref_names: Vec::new(),
         });
 
@@ -3624,6 +3699,7 @@ mod tests {
                     order: format!("{index:02}"),
                     content: format!("block {index}"),
                     searchable_text: format!("block {index}"),
+                    query_visible: format!("block {index}"),
                     heading_level: None,
                     collapsed: false,
                     logseq_uuid: None,
@@ -3632,6 +3708,7 @@ mod tests {
                     properties: Vec::new(),
                     tags: Vec::new(),
                     task: None,
+                    planning: None,
                     path_ref_names: Vec::new(),
                 }
             })
@@ -3757,7 +3834,7 @@ mod tests {
 
     #[test]
     fn materialization_input_schema_refuses_prior_and_future_before_sqlite_write() {
-        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 7);
+        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 8);
         let current = MaterializationChange::new(
             batch_id(500_000),
             vec![page_input(page_id(500_001), "current".into())],
@@ -4001,6 +4078,15 @@ mod tests {
         "- outer [[Alpha]]\n",
         "\t- inner #beta\n",
         "\t\t- leaf\n",
+        // The three shapes `tasks` cannot represent, plus the one it can, so a
+        // guard over them compares a populated table against a populated table.
+        "- ship it\n",
+        "  SCHEDULED: <2026-06-28 Sun>\n",
+        "  DEADLINE: <2026-07-01 Wed>\n",
+        "- [#A] ship it\n",
+        "- TODO marked\n",
+        "  SCHEDULED: <2026-06-29 Mon>\n",
+        "  DEADLINE: <2026-07-02 Thu>\n",
     );
 
     const PARITY_PATH: &str = "pages/parity-page.md";
@@ -4093,31 +4179,25 @@ mod tests {
                 let id = BlockId::from_uuid(
                     Uuid::parse_str(&block.uuid).expect("assigned runtime block identity"),
                 );
-                let (
-                    searchable_text,
-                    heading_level,
-                    collapsed,
-                    properties,
-                    tags,
-                    task,
-                    path_ref_names,
-                ) = super::super::sqlite::document_facets_from_parsed_block(block);
+                let facets = super::super::sqlite::document_facets_from_parsed_block(block);
                 out.push(MaterializedBlockInput {
                     block_id: id,
                     home_document_id: document_id(1),
                     parent,
                     order: format!("{:08x}", out.len()),
                     content: block.raw.clone(),
-                    searchable_text,
-                    heading_level,
-                    collapsed,
+                    searchable_text: facets.searchable_text,
+                    query_visible: facets.query_visible,
+                    heading_level: facets.heading_level,
+                    collapsed: facets.collapsed,
                     logseq_uuid: None,
                     logseq_identity_origin: None,
                     references: Vec::new(),
-                    properties,
-                    tags,
-                    task,
-                    path_ref_names,
+                    properties: facets.properties,
+                    tags: facets.tags,
+                    task: facets.task,
+                    planning: facets.planning,
+                    path_ref_names: facets.path_ref_names,
                 });
                 walk(&block.children, Some(id), out);
             }
@@ -4156,7 +4236,7 @@ mod tests {
             crate::query::walk_closure_names_for_test(PARITY_NAME, &parity_document().roots);
 
         // Stated first: three empty lists would agree and prove nothing.
-        assert_eq!(direct.len(), 5, "the fixture page has five blocks");
+        assert_eq!(direct.len(), 8, "the fixture page has eight blocks");
         assert!(
             direct.iter().any(|(_, refs)| refs.len() > 1),
             "at least one block must inherit a ref from an ancestor"
@@ -4200,7 +4280,339 @@ mod tests {
                         "parity page".to_owned()
                     ]
                 ),
+                // The three planning blocks reference nothing, so each carries
+                // only its own page -- recorded, not required.
+                (
+                    "ship it\nSCHEDULED: <2026-06-28 Sun>\nDEADLINE: <2026-07-01 Wed>".to_owned(),
+                    vec!["parity page".to_owned()]
+                ),
+                ("[#A] ship it".to_owned(), vec!["parity page".to_owned()]),
+                (
+                    "TODO marked\nSCHEDULED: <2026-06-29 Mon>\nDEADLINE: <2026-07-02 Thu>"
+                        .to_owned(),
+                    vec!["parity page".to_owned()]
+                ),
             ]
+        );
+    }
+
+    /// One page's planning rows as a producer emits them.
+    type PlanningRows = Vec<(String, Option<PlanningRow>)>;
+    type PlanningRow = (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+    );
+
+    fn planning_rows(page: &storage::PhysicalPage) -> PlanningRows {
+        page.blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.content.clone(),
+                    block.planning.as_ref().map(|planning| {
+                        (
+                            planning.priority.clone(),
+                            planning.scheduled.clone(),
+                            planning.scheduled_day,
+                            planning.deadline.clone(),
+                            planning.deadline_day,
+                        )
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    fn direct_files_page(
+        name: &str,
+        rel_path: &str,
+        kind: crate::model::PageKind,
+    ) -> storage::PhysicalPage {
+        let entry = crate::model::PageEntry {
+            name: name.to_owned(),
+            kind,
+            date_key: None,
+            rel_path: rel_path.to_owned(),
+            path: std::path::PathBuf::from(rel_path),
+        };
+        crate::direct_projection::physical_page_for_test(
+            &entry,
+            &parse_page(rel_path, PARITY_FIXTURE),
+            &ParseConfig::default(),
+        )
+        .expect("the page lowers through Direct Files")
+    }
+
+    fn managed_page(page: &MaterializedPageInput, config: &ParseConfig) -> storage::PhysicalPage {
+        lower_pages_with_derived_rows(std::slice::from_ref(page), config)
+            .expect("the page lowers through Managed Storage")
+            .into_iter()
+            .next()
+            .expect("one lowered page")
+    }
+
+    /// Guard 2b (§5.8, §3.2 M2, I-19). `block_planning` is the same list on
+    /// both backends and under the tree walk -- and it is populated for the
+    /// three blocks `tasks` cannot hold at all.
+    ///
+    /// The walk's answer is `BlockProjection`'s three fields, which are
+    /// independent of `marker` by construction; the fixture pins what they hold
+    /// for each form rather than legislating it.
+    #[test]
+    fn direct_files_managed_storage_and_the_walk_agree_on_block_planning() {
+        let direct = planning_rows(&direct_files_page(
+            PARITY_NAME,
+            PARITY_PATH,
+            crate::model::PageKind::Page,
+        ));
+        let managed = planning_rows(&managed_page(&parity_page_input(), &ParseConfig::default()));
+
+        let mut walked: PlanningRows = Vec::new();
+        fn walk(blocks: &[crate::doc::DocBlock], out: &mut PlanningRows) {
+            for block in blocks {
+                let projection = block.projection();
+                let row = (projection.priority.is_some()
+                    || projection.scheduled.is_some()
+                    || projection.deadline.is_some())
+                .then(|| {
+                    (
+                        projection.priority.clone(),
+                        projection.scheduled.clone(),
+                        projection
+                            .scheduled
+                            .as_deref()
+                            .and_then(crate::query::eval::planning_day),
+                        projection.deadline.clone(),
+                        projection
+                            .deadline
+                            .as_deref()
+                            .and_then(crate::query::eval::planning_day),
+                    )
+                });
+                out.push((block.raw.clone(), row));
+                walk(&block.children, out);
+            }
+        }
+        walk(&parity_document().roots, &mut walked);
+
+        // Stated first: three all-`None` lists would agree and prove nothing.
+        let with_rows = direct.iter().filter(|(_, row)| row.is_some()).count();
+        assert_eq!(with_rows, 3, "the fixture has three planning blocks");
+
+        assert_eq!(direct, managed, "Direct Files and Managed Storage disagree");
+        assert_eq!(direct, walked, "the producers and the walk disagree");
+
+        // The shared truth, recorded. Two of the three rows belong to blocks
+        // with NO marker, so `tasks` holds neither -- which is the whole reason
+        // this table exists.
+        let markerless = direct
+            .iter()
+            .filter(|(content, row)| row.is_some() && !content.contains("TODO"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markerless,
+            vec![
+                (
+                    "ship it\nSCHEDULED: <2026-06-28 Sun>\nDEADLINE: <2026-07-01 Wed>".to_owned(),
+                    Some((
+                        None,
+                        Some("2026-06-28 Sun".to_owned()),
+                        Some(20_260_628),
+                        Some("2026-07-01 Wed".to_owned()),
+                        Some(20_260_701),
+                    )),
+                ),
+                (
+                    "[#A] ship it".to_owned(),
+                    Some((Some("A".to_owned()), None, None, None, None)),
+                ),
+            ]
+        );
+        let marked = direct
+            .iter()
+            .filter(|(content, _)| content.starts_with("TODO"))
+            .collect::<Vec<_>>();
+        assert_eq!(marked.len(), 1, "the fixture has one marked task");
+        assert!(
+            marked[0].1.is_some(),
+            "a marked task gets a planning row too, not only a tasks row"
+        );
+    }
+
+    /// Guard 2c (§5.8, §5.10, I-19). The two query-text columns are the block's
+    /// EXACT visible text and its canonical fold on both backends -- not the
+    /// whitespace-collapsed `searchable_text` beside them.
+    #[test]
+    fn direct_files_and_managed_storage_agree_on_the_query_visible_columns() {
+        let direct = direct_files_page(PARITY_NAME, PARITY_PATH, crate::model::PageKind::Page);
+        let managed = managed_page(&parity_page_input(), &ParseConfig::default());
+        let columns = |page: &storage::PhysicalPage| {
+            page.blocks
+                .iter()
+                .map(|block| {
+                    (
+                        block.query_visible.clone(),
+                        block.query_visible_folded.clone(),
+                        block.searchable_text.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let direct_columns = columns(&direct);
+        assert_eq!(
+            direct_columns,
+            columns(&managed),
+            "the two producers disagree on the query-visible columns"
+        );
+
+        // The columns are the projection's own visible text, folded once.
+        let mut expected: Vec<(String, String)> = Vec::new();
+        fn walk(blocks: &[crate::doc::DocBlock], out: &mut Vec<(String, String)>) {
+            for block in blocks {
+                let visible = block.projection().visible.clone();
+                let folded = crate::search_query::canonical_fold(&visible);
+                out.push((visible, folded));
+                walk(&block.children, out);
+            }
+        }
+        walk(&parity_document().roots, &mut expected);
+        assert_eq!(
+            direct_columns
+                .iter()
+                .map(|(visible, folded, _)| (visible.clone(), folded.clone()))
+                .collect::<Vec<_>>(),
+            expected,
+            "the columns are exactly `visible` and `canonical_fold(visible)`"
+        );
+
+        // And they are NOT `searchable_text`: the multi-line planning block
+        // keeps its newlines here and loses them there. Stated as a difference
+        // the fixture actually contains, so the two columns cannot quietly
+        // become the same value.
+        assert!(
+            direct_columns
+                .iter()
+                .any(|(visible, _, searchable)| visible != searchable),
+            "the fixture must contain a block whose visible text is not its collapsed text"
+        );
+    }
+
+    /// Guard 2d (§3.2 K18). `tags.tag_key` is the page key of the tag, on both
+    /// backends -- so `tag('X')` and `[[X]]` cannot disagree about one word.
+    #[test]
+    fn direct_files_and_managed_storage_agree_on_tag_keys() {
+        let mut input = parity_page_input();
+        input.tags = vec!["Release".to_owned(), "Docs".to_owned()];
+        let managed = managed_page(&input, &ParseConfig::default());
+        let mut direct = direct_files_page(PARITY_NAME, PARITY_PATH, crate::model::PageKind::Page);
+        direct.tags = crate::query::derived::tag_rows(&["Release".to_owned(), "Docs".to_owned()]);
+
+        let keys = |page: &storage::PhysicalPage| {
+            page.tags
+                .iter()
+                .map(|tag| (tag.tag.clone(), tag.tag_key.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&direct), keys(&managed));
+        assert_eq!(
+            keys(&direct),
+            vec![
+                ("Release".to_owned(), "release".to_owned()),
+                ("Docs".to_owned(), "docs".to_owned()),
+            ],
+            "the key is `refs::page_key(tag)`, the page-identity key"
+        );
+        // Block-level inline tags carry the same key rule.
+        let inline = direct
+            .blocks
+            .iter()
+            .flat_map(|block| block.tags.iter())
+            .map(|tag| (tag.tag.clone(), tag.tag_key.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            inline
+                .iter()
+                .any(|(tag, key)| tag == "beta" && key == "beta"),
+            "the inline #beta tag carries its key too: {inline:?}"
+        );
+    }
+
+    /// Guard 2e (§5.8, §3.2). `pages.journal_day` is the journal page's
+    /// `yyyymmdd` on both backends, under the graph's OWN
+    /// `:journal/file-name-format` -- and it is NULL for an ordinary page.
+    ///
+    /// The custom format is the point: a day derived under the default format
+    /// would be silently wrong for exactly the graphs that configured one, and
+    /// the format reaches the producer only because it is a `ParseConfig` field
+    /// (§5.8 C3).
+    #[test]
+    fn both_backends_read_the_journal_day_under_the_graphs_own_file_name_format() {
+        let config = crate::config::Config::parse(
+            "{:journal/file-name-format \"dd_MM_yyyy\" :journal/page-title-format \"dd_MM_yyyy\"}",
+        )
+        .parse_config();
+        let rel_path = "journals/28_06_2026.md";
+        let name = "28_06_2026";
+
+        let direct_journal = {
+            let entry = crate::model::PageEntry {
+                name: name.to_owned(),
+                kind: crate::model::PageKind::Journal,
+                date_key: None,
+                rel_path: rel_path.to_owned(),
+                path: std::path::PathBuf::from(rel_path),
+            };
+            crate::direct_projection::physical_page_for_test(
+                &entry,
+                &parse_page(rel_path, PARITY_FIXTURE),
+                &config,
+            )
+            .expect("the journal lowers through Direct Files")
+            .journal_day
+        };
+
+        let mut managed_input =
+            page_input_for(name, rel_path, &parse_page(rel_path, PARITY_FIXTURE));
+        managed_input.kind = ManagedTextKind::Journal;
+        managed_input.path = ManagedPath::parse(rel_path.to_owned()).unwrap();
+        let managed_journal = managed_page(&managed_input, &config).journal_day;
+
+        assert_eq!(direct_journal, Some(20_260_628));
+        assert_eq!(direct_journal, managed_journal, "the backends disagree");
+
+        // The same file under the DEFAULT format is not a journal day at all,
+        // so the config really is what decided the answer.
+        let entry = crate::model::PageEntry {
+            name: name.to_owned(),
+            kind: crate::model::PageKind::Journal,
+            date_key: None,
+            rel_path: rel_path.to_owned(),
+            path: std::path::PathBuf::from(rel_path),
+        };
+        assert_eq!(
+            crate::direct_projection::physical_page_for_test(
+                &entry,
+                &parse_page(rel_path, PARITY_FIXTURE),
+                &ParseConfig::default(),
+            )
+            .unwrap()
+            .journal_day,
+            None,
+            "the default format must not parse this stem, or the guard is vacuous"
+        );
+
+        // An ordinary page never carries a day, whatever its name looks like.
+        assert_eq!(
+            direct_files_page(PARITY_NAME, PARITY_PATH, crate::model::PageKind::Page).journal_day,
+            None
+        );
+        assert_eq!(
+            managed_page(&parity_page_input(), &config).journal_day,
+            None
         );
     }
 
@@ -4227,7 +4639,11 @@ mod tests {
         let mut blocks = 0usize;
         let mut rows = 0usize;
         let mut atoms = 0usize;
+        let mut planning = 0usize;
+        let mut journal_days = 0usize;
         let mut disagreements = 0usize;
+        let config = ParseConfig::default();
+        let days = crate::query::derived::JournalDays::new(&config);
         for (index, entry) in graph.list_pages().into_iter().enumerate() {
             let Ok(text) = std::fs::read_to_string(&entry.path) else {
                 continue;
@@ -4236,8 +4652,13 @@ mod tests {
             let Ok(managed_path) = ManagedPath::parse(entry.rel_path.clone()) else {
                 continue;
             };
-            let _ = managed_path;
-            let input = page_input_for(&entry.name, &entry.rel_path, &document);
+            let mut input = page_input_for(&entry.name, &entry.rel_path, &document);
+            input.path = managed_path;
+            input.kind = if entry.kind == crate::model::PageKind::Journal {
+                ManagedTextKind::Journal
+            } else {
+                ManagedTextKind::Page
+            };
             let direct = direct_files_path_refs_for(&entry.name, &entry.rel_path, &document);
             let managed = managed_storage_path_refs_for(&input);
             let walked = crate::query::walk_closure_names_for_test(&entry.name, &document.roots);
@@ -4251,6 +4672,57 @@ mod tests {
                     walked.len()
                 );
             }
+            // The four §5.8 objects this packet adds, on the same corpus page.
+            let direct_page = {
+                let page_entry = crate::model::PageEntry {
+                    name: entry.name.clone(),
+                    kind: entry.kind,
+                    date_key: None,
+                    rel_path: entry.rel_path.clone(),
+                    path: entry.path.clone(),
+                };
+                crate::direct_projection::physical_page_for_test(&page_entry, &document, &config)
+                    .expect("the corpus page lowers through Direct Files")
+            };
+            let managed_page = managed_page(&input, &config);
+            if planning_rows(&direct_page) != planning_rows(&managed_page)
+                || direct_page.journal_day != managed_page.journal_day
+                || direct_page
+                    .blocks
+                    .iter()
+                    .map(|block| (&block.query_visible, &block.query_visible_folded))
+                    .ne(managed_page
+                        .blocks
+                        .iter()
+                        .map(|block| (&block.query_visible, &block.query_visible_folded)))
+                || direct_page
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.tags.iter().map(|tag| &tag.tag_key))
+                    .ne(managed_page
+                        .blocks
+                        .iter()
+                        .flat_map(|block| block.tags.iter().map(|tag| &tag.tag_key)))
+            {
+                disagreements += 1;
+                eprintln!("§5.8 projection-object disagreement at corpus page index {index}");
+            }
+            // The journal day the producer derives must be the day the page
+            // entry already carries: two rules for one question is the defect.
+            let derived_day = days.day(
+                &entry.rel_path,
+                entry.kind == crate::model::PageKind::Journal,
+            );
+            if derived_day != entry.date_key {
+                disagreements += 1;
+                eprintln!("journal-day disagreement at corpus page index {index}");
+            }
+            journal_days += usize::from(derived_day.is_some());
+            planning += direct_page
+                .blocks
+                .iter()
+                .filter(|block| block.planning.is_some())
+                .count();
             pages += 1;
             blocks += direct.len();
             rows += direct.iter().map(|(_, refs)| refs.len()).sum::<usize>();
@@ -4272,7 +4744,9 @@ mod tests {
         }
         eprintln!(
             "derived_rows_agree_across_backends_over_a_real_corpus pages={pages} blocks={blocks} \
-             block_path_refs_rows={rows} property_atoms_rows={atoms} disagreements={disagreements}"
+             block_path_refs_rows={rows} property_atoms_rows={atoms} \
+             block_planning_rows={planning} journal_day_pages={journal_days} \
+             disagreements={disagreements}"
         );
         assert!(pages > 0, "the corpus directory holds no readable pages");
         assert_eq!(disagreements, 0, "the backends disagree on a real graph");
@@ -4351,16 +4825,38 @@ mod tests {
                     &config,
                 )
                 .len();
+                // This packet's own producers, on the same inputs.
+                produced_rows += usize::from(
+                    crate::query::derived::planning_row(
+                        block.planning.as_ref().and_then(|p| p.priority.as_deref()),
+                        block.planning.as_ref().and_then(|p| p.scheduled.as_deref()),
+                        block.planning.as_ref().and_then(|p| p.deadline.as_deref()),
+                    )
+                    .is_some(),
+                );
+                produced_rows += crate::query::derived::tag_rows(&block.tags).len();
+                produced_rows += usize::from(
+                    !crate::query::derived::query_visible_columns(&block.query_visible, None)
+                        .1
+                        .is_empty(),
+                );
             }
         }
         let producer_elapsed = producer_start.elapsed();
 
         const GROUP: usize = 32;
+        // "Before" is the pre-P1-a/P1-a2 row content: the same lowered pages
+        // through the same insert path, carrying none of the rows the two
+        // packets added and paying none of their index maintenance.
         let strip = |page: &mut storage::PhysicalPage| {
             page.property_atoms.clear();
+            page.journal_day = None;
             for block in &mut page.blocks {
                 block.path_refs.clear();
                 block.property_atoms.clear();
+                block.planning = None;
+                block.query_visible = String::new();
+                block.query_visible_folded = String::new();
             }
         };
 
@@ -4477,6 +4973,20 @@ mod tests {
             // F11: the config travels inside the work item, so the sentence
             // above is structurally true and not merely currently true.
             "travels **inside** each\nqueued Direct Files work item",
+            // P1-a2: each of the four §5.8 objects states the question it
+            // answers and why the neighbouring column cannot answer it.
+            "`block_planning`",
+            "never conditioned on the\ntask marker",
+            "`blocks.query_visible`",
+            "`blocks.query_visible_folded`",
+            "`tags.tag_key` is `refs::page_key(tag)`",
+            "`pages.journal_day`",
+            // D-15: the seam's justification is the projection's disposability
+            // and the enforcement is the engine's. If either sentence goes, the
+            // reason the boundary may be widened here — and only here — is gone.
+            "Raw SQL crosses that boundary; **authority does not.**",
+            "The restriction is the **engine's**, not a validator's.",
+            "This seam adds no refusal.",
         ] {
             assert!(
                 contract.contains(phrase),
@@ -4486,7 +4996,7 @@ mod tests {
 
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection, ContentDigest::of(b"empty")).unwrap();
-        for table in ["block_path_refs", "property_atoms"] {
+        for table in ["block_path_refs", "property_atoms", "block_planning"] {
             let found: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -4506,6 +5016,28 @@ mod tests {
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .expect("the stamp carries the column the contract names");
+        // Every column the prose above names, read back off the real schema:
+        // a sentence about a column that does not exist is not a contract.
+        for (table, column) in [
+            ("blocks", "query_visible"),
+            ("blocks", "query_visible_folded"),
+            ("tags", "tag_key"),
+            ("pages", "journal_day"),
+            ("block_planning", "scheduled_day"),
+            ("block_planning", "deadline_day"),
+        ] {
+            let found: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                found, 1,
+                "the contract names a missing column: {table}.{column}"
+            );
+        }
 
         // Six config facts, six digest movements. A key named in the prose but
         // absent from `ParseConfig` would leave the rebuild rule describing
@@ -4535,7 +5067,18 @@ mod tests {
     /// behaviour" a fact rather than an intention.
     #[test]
     fn genesis_and_delta_stores_hold_byte_identical_derived_rows() {
-        const DERIVED: [&str; 2] = ["block_path_refs", "property_atoms"];
+        // `pages` and `blocks` are here for their new query columns:
+        // `journal_day`, `query_visible` and `query_visible_folded` are written
+        // by the two lowering entry points exactly as the derived tables are,
+        // so they belong to the same proof.
+        const DERIVED: [&str; 6] = [
+            "pages",
+            "blocks",
+            "tags",
+            "block_planning",
+            "block_path_refs",
+            "property_atoms",
+        ];
         let empty_frontier = ContentDigest::of(b"empty");
         let page = parity_page_input();
 
@@ -4588,7 +5131,11 @@ mod tests {
 
         // Two empty tables have equal digests, so state that the fixture
         // actually populated both before comparing them.
-        assert_eq!(genesis_digests.len(), 2, "both derived tables are digested");
+        assert_eq!(
+            genesis_digests.len(),
+            DERIVED.len(),
+            "every derived table is digested"
+        );
         assert_ne!(
             genesis_digests, empty_digests,
             "the fixture must populate the derived tables it compares"

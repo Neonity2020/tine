@@ -1409,6 +1409,7 @@ fn physical_page(
     for block in &mut blocks {
         block.path_refs = path_refs.remove(&block.block_id).unwrap_or_default();
     }
+    let journal_days = crate::query::derived::JournalDays::new(parse_config);
     let page_property_atoms = crate::query::derived::property_atom_rows(
         &properties
             .iter()
@@ -1425,12 +1426,13 @@ fn physical_page(
             name_key: crate::refs::page_key(&entry.name),
             path: entry.rel_path.clone(),
             text_kind: page_kind_to_sql(entry.kind),
+            journal_day: journal_days.day(&entry.rel_path, entry.kind == PageKind::Journal),
             preamble: document.pre_block.clone(),
             normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
             searchable_text,
             references: Vec::new(),
             properties,
-            tags,
+            tags: crate::query::derived::tag_rows(&tags),
             property_atoms: page_property_atoms,
             blocks,
         },
@@ -1499,6 +1501,12 @@ fn lower_blocks(
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        // The query columns are the EXACT visible text and its fold, never the
+        // whitespace-collapsed `searchable_text` beside them (§5.10).
+        let (query_visible, query_visible_folded) = crate::query::derived::query_visible_columns(
+            &projection.visible,
+            Some(&projection.visible_lower),
+        );
         let properties = projection
             .properties
             .iter()
@@ -1526,19 +1534,28 @@ fn lower_blocks(
             content: block.raw.clone(),
             normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
             searchable_text,
+            query_visible,
+            query_visible_folded,
             heading_level: projection.heading_level,
             collapsed: block.collapsed(),
             logseq_uuid,
             logseq_identity_origin: logseq_uuid.map(|_| 0),
             references: Vec::new(),
             properties,
-            tags: projection.tags.clone(),
+            tags: crate::query::derived::tag_rows(&projection.tags),
             task: projection.marker.as_ref().map(|marker| PhysicalTask {
                 marker: marker.to_ascii_uppercase(),
                 priority: projection.priority.clone(),
                 scheduled: projection.scheduled.clone(),
                 deadline: projection.deadline.clone(),
             }),
+            // Written from the three projection fields alone, so a markerless
+            // block gets a row exactly as a marked one does (§3.2 M2).
+            planning: crate::query::derived::planning_row(
+                projection.priority.as_deref(),
+                projection.scheduled.as_deref(),
+                projection.deadline.as_deref(),
+            ),
             // Filled once per page, after the whole flat block list exists.
             path_refs: Vec::new(),
             property_atoms,

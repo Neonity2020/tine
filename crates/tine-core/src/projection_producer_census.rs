@@ -1655,7 +1655,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.13.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.14.0\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -1719,9 +1719,32 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // is deliberately absent from this surface — the inventory records calls
     // (`tine_storage::X(`) and `use` declarations, and a bare type position is
     // neither. Checked, because it looked like a second contributor.
+    // Re-pinned 2026-09-05 (query engine P1-a2): the four remaining §5.8
+    // projection objects change exactly ONE entry in this surface —
+    // `query/derived.rs`'s single `use` declaration widens from
+    // `PhysicalPropertyAtom` to `{PhysicalPlanning, PhysicalPropertyAtom,
+    // PhysicalTag}`, because the shared producer now also emits the
+    // `block_planning` row and the `tags` rows. Derived, not assumed: the
+    // import and direct-call inventories were recomputed over the HEAD and
+    // working versions of every production file this packet touches
+    // (`direct_projection.rs`, `oplog/import.rs`, `oplog/sqlite.rs`,
+    // `oplog/sqlite_materialization.rs`, `oplog/mod.rs`, `query/derived.rs`)
+    // and that one line is the only difference — zero new calls, zero new
+    // `use` sites, and the write-crossing table above is byte-identical. Both
+    // added names are row shapes the physical layer already owns, so the
+    // producer names them rather than growing parallel core types (D-14).
+    // The certified dependency moves v0.13.0 -> v0.14.0 in the same commit: the
+    // projection schema goes 23 -> 24 for those four objects, and `PhysicalPage`
+    // and `PhysicalBlock` change shape (`tags` becomes `Vec<PhysicalTag>`,
+    // `PhysicalBlock` gains `planning`), which under cargo's 0.x rules is a
+    // minor bump. v0.14.0 also adds `PhysicalProjectionQueryReader`, the
+    // read-only statement seam (D-15) — it is deliberately absent from THIS
+    // surface because no tine-core file calls it yet; the lowering that will is
+    // P1-b's, and this census is an inventory of actual call sites, not of what
+    // the dependency offers.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1e18633c28afc56f810e2ce5a059cc9b7e6f002f68e6429a8d2ba5e036dc6e23",
+        "067d57c3b8d94e3573f835b8a51bb741a6b505f082e86d23768ff1a5cd38d86d",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

@@ -1290,18 +1290,36 @@ fn authenticate_event_for_engine(
     Ok(())
 }
 
-pub(super) fn document_facets(
-    content: &str,
-    is_org: bool,
-) -> (
-    String,
-    Option<u8>,
-    bool,
-    Vec<super::MaterializedProperty>,
-    Vec<String>,
-    Option<super::MaterializedTask>,
-    Vec<String>,
-) {
+/// Every SQLite/search facet ONE parse of a block yields.
+///
+/// A named record rather than a widening tuple, and the same record the
+/// activation capture stores (`import::ParsedBlockProjectionFacets` is this
+/// type): a facet added for the query engine has one place to be added, and a
+/// caller cannot silently bind two of nine positions the wrong way round.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BlockFacets {
+    pub(super) searchable_text: String,
+    /// The block's exact visible text -- `BlockProjection::visible`. The query
+    /// columns are built from this, never from `searchable_text`, whose
+    /// whitespace this function collapses for the existing search consumers
+    /// (§5.10).
+    pub(super) query_visible: String,
+    pub(super) heading_level: Option<u8>,
+    pub(super) collapsed: bool,
+    pub(super) properties: Vec<super::MaterializedProperty>,
+    pub(super) tags: Vec<String>,
+    pub(super) task: Option<super::MaterializedTask>,
+    /// `[#A]` / `SCHEDULED:` / `DEADLINE:`, filled independently of `task`:
+    /// the walk evaluates them on markerless blocks and `tasks` cannot hold
+    /// them (§3.2 M2).
+    pub(super) planning: Option<super::MaterializedPlanning>,
+    /// The block's own normalized page references, captured by the same parse
+    /// as every other facet (§5.8 G1).
+    pub(super) path_ref_names: Vec<String>,
+}
+
+pub(super) fn document_facets(content: &str, is_org: bool) -> BlockFacets {
     // `DocBlock` removes only parser-recognized properties from visible text.
     // Every other facet needs a property/header/tag/priority marker or an
     // uppercase task/planning token. If none can occur, preserve the same
@@ -1311,15 +1329,11 @@ pub(super) fn document_facets(
         .iter()
         .any(|byte| matches!(byte, b':' | b'#' | b'[' | b'*') || byte.is_ascii_uppercase());
     if !may_have_facets {
-        return (
-            content.split_whitespace().collect::<Vec<_>>().join(" "),
-            None,
-            false,
-            Vec::new(),
-            Vec::new(),
-            None,
-            Vec::new(),
-        );
+        return BlockFacets {
+            searchable_text: content.split_whitespace().collect::<Vec<_>>().join(" "),
+            query_visible: content.to_owned(),
+            ..BlockFacets::default()
+        };
     }
     let mut block = crate::doc::DocBlock::new(content);
     block.is_org = is_org;
@@ -1331,19 +1345,10 @@ pub(super) fn document_facets(
 /// process-only result so terminal SQLite lowering does not parse the same raw
 /// block a second time. Ordinary edits and archive replay continue to enter
 /// through [`document_facets`].
-pub(super) fn document_facets_from_parsed_block(
-    block: &crate::doc::DocBlock,
-) -> (
-    String,
-    Option<u8>,
-    bool,
-    Vec<super::MaterializedProperty>,
-    Vec<String>,
-    Option<super::MaterializedTask>,
-    Vec<String>,
-) {
-    let searchable_text = block
-        .visible_text()
+pub(super) fn document_facets_from_parsed_block(block: &crate::doc::DocBlock) -> BlockFacets {
+    let projection = block.projection();
+    let searchable_text = projection
+        .visible
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -1361,64 +1366,69 @@ pub(super) fn document_facets_from_parsed_block(
         scheduled: block.scheduled().map(str::to_owned),
         deadline: block.deadline().map(str::to_owned),
     });
+    // Filled under `block.marker()` nowhere: a `[#A]`- or `SCHEDULED:`-only
+    // block is exactly the row `tasks` cannot hold (§3.2 M2).
+    let planning = (projection.priority.is_some()
+        || projection.scheduled.is_some()
+        || projection.deadline.is_some())
+    .then(|| super::MaterializedPlanning {
+        priority: projection.priority.clone(),
+        scheduled: projection.scheduled.clone(),
+        deadline: projection.deadline.clone(),
+    });
     // One parse yields every facet, including the block's own normalized page
     // references — the closure's per-block input on BOTH backends (§5.8 G1).
-    let path_ref_names = block.projection().refs_norm.clone();
-    (
+    BlockFacets {
         searchable_text,
+        query_visible: projection.visible.clone(),
         heading_level,
         collapsed,
         properties,
         tags,
         task,
-        path_ref_names,
-    )
+        planning,
+        path_ref_names: projection.refs_norm.clone(),
+    }
 }
 
 fn materialized_page_input(page: super::MaterializedPage) -> super::MaterializedPageInput {
     let is_org = super::reference_catalog::reference_source_is_org(&page.path);
-    let (preamble_search, _, _, properties, tags, _, _) = page
+    let preamble_facets = page
         .preamble
         .as_deref()
         .map(|preamble| document_facets(preamble, is_org))
         .unwrap_or_default();
     let mut page_search = Vec::with_capacity(2);
     page_search.push(page.name.as_str().to_owned());
-    if !preamble_search.is_empty() {
-        page_search.push(preamble_search);
+    if !preamble_facets.searchable_text.is_empty() {
+        page_search.push(preamble_facets.searchable_text);
     }
-    let blocks =
-        page.blocks
-            .into_iter()
-            .map(|block| {
-                let (
-                    searchable_text,
-                    heading_level,
-                    collapsed,
-                    properties,
-                    tags,
-                    task,
-                    path_ref_names,
-                ) = document_facets(&block.content, is_org);
-                super::MaterializedBlockInput {
-                    block_id: block.block_id,
-                    home_document_id: block.home_document_id,
-                    parent: block.parent,
-                    order: block.order,
-                    content: block.content,
-                    searchable_text,
-                    heading_level,
-                    collapsed,
-                    logseq_uuid: block.logseq_uuid,
-                    logseq_identity_origin: block.logseq_identity_origin,
-                    references: Vec::new(),
-                    properties,
-                    tags,
-                    task,
-                    path_ref_names,
-                }
-            })
-            .collect::<Vec<_>>();
+    let blocks = page
+        .blocks
+        .into_iter()
+        .map(|block| {
+            let facets = document_facets(&block.content, is_org);
+            super::MaterializedBlockInput {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+                parent: block.parent,
+                order: block.order,
+                content: block.content,
+                searchable_text: facets.searchable_text,
+                query_visible: facets.query_visible,
+                heading_level: facets.heading_level,
+                collapsed: facets.collapsed,
+                logseq_uuid: block.logseq_uuid,
+                logseq_identity_origin: block.logseq_identity_origin,
+                references: Vec::new(),
+                properties: facets.properties,
+                tags: facets.tags,
+                task: facets.task,
+                planning: facets.planning,
+                path_ref_names: facets.path_ref_names,
+            }
+        })
+        .collect::<Vec<_>>();
     super::MaterializedPageInput {
         page_id: page.page_id,
         home_document_id: page.home_document_id,
@@ -1429,8 +1439,8 @@ fn materialized_page_input(page: super::MaterializedPage) -> super::Materialized
         preamble: page.preamble,
         searchable_text: page_search.join(" "),
         references: Vec::new(),
-        properties,
-        tags,
+        properties: preamble_facets.properties,
+        tags: preamble_facets.tags,
         blocks,
     }
 }
@@ -9705,6 +9715,7 @@ mod tests {
                     order: "a".into(),
                     content: content.into(),
                     searchable_text: format!("{content} needle"),
+                    query_visible: format!("{content} needle"),
                     heading_level: Some(2),
                     collapsed: true,
                     logseq_uuid: None,
@@ -9726,6 +9737,11 @@ mod tests {
                     tags: vec!["block-tag".into()],
                     task: Some(MaterializedTask {
                         marker: "TODO".into(),
+                        priority: Some("A".into()),
+                        scheduled: Some("2026-07-25 Sat".into()),
+                        deadline: Some("2026-07-26 Sun".into()),
+                    }),
+                    planning: Some(crate::oplog::MaterializedPlanning {
                         priority: Some("A".into()),
                         scheduled: Some("2026-07-25 Sat".into()),
                         deadline: Some("2026-07-26 Sun".into()),
@@ -11843,6 +11859,7 @@ mod tests {
                 order: "a".into(),
                 content: "stable referrer".into(),
                 searchable_text: "stable referrer".into(),
+                query_visible: "stable referrer".into(),
                 heading_level: None,
                 collapsed: false,
                 logseq_uuid: None,
@@ -11860,6 +11877,7 @@ mod tests {
                 properties: Vec::new(),
                 tags: Vec::new(),
                 task: None,
+                planning: None,
                 path_ref_names: Vec::new(),
             }],
         });
@@ -12612,6 +12630,7 @@ mod tests {
                 order: "a".into(),
                 content: content.into(),
                 searchable_text: content.into(),
+                query_visible: content.into(),
                 heading_level: None,
                 collapsed: false,
                 logseq_uuid: None,
@@ -12620,6 +12639,7 @@ mod tests {
                 properties: Vec::new(),
                 tags: Vec::new(),
                 task: None,
+                planning: None,
                 path_ref_names: Vec::new(),
             }
         }
