@@ -30,6 +30,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **On Android, dark mode no longer blanks the notification bar.** Since 0.6.981
+  the strip behind the status bar has been painted by the app window rather than
+  the page, and it followed the phone's light/dark setting while the clock and
+  icons followed Tine's own — so running Tine in dark mode on a phone still in
+  light mode put white icons on a white strip. One setting now decides both
+  (GH #467).
+
 - **A page with an unresolved save conflict can be opened on disk again.**
   "Open with default app" and "Show in folder" both refused while a conflict was
   pending, which left a page whose conflict view would not load with no way to
