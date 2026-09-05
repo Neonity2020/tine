@@ -6,9 +6,13 @@
 //! `simplify-query` (`:505-516`), `build-query` (`:377-445`) and its
 //! `build-*` helpers, `parse-property-value` (`:242-252`),
 //! `build-all-page-tags` (`:322-325`), and the `blocks?` anchor rule
-//! (`:388-393`). The serializer transcribes the frontend's own `toDsl`
-//! (`src/editor/queryBuilder.ts:482`) with its `quoteStr`/`needsQuote`
-//! escaping (`:409-424`) and single-child `and` simplification.
+//! (`:388-393`). The serializer lives in [`super::print`]; its escaping and
+//! single-child `and` simplification were transcribed from the frontend's own
+//! `toDsl` in `src/editor/queryBuilder.ts` while that printer still existed (up
+//! to commit `52cb16fe`). It was deleted when the builder moved to the IR, so
+//! this module's [`read_string`] is now the only other definition of those
+//! bytes, and `print::tests::og_expressible_queries_round_trip_through_the_og_printer`
+//! is what holds the two together (I-12: one implementation prints a query).
 //!
 //! **The unknown head no longer truncates.** OG's `build-query` returns `nil`
 //! for an unrecognised head and the old Tine parser propagated that as "the

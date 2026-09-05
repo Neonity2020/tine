@@ -8,6 +8,7 @@ import type { JSX } from "solid-js";
 import type { Block, Inline } from "./ast";
 import { backend } from "../backend";
 import { clearAssetBlobCache } from "../assetCache";
+import { blockRunResult } from "../queryReadingsTestkit";
 
 // A few render paths reach back into the wasm parser (e.g. a properties block
 // renders each value via InlineText → parseBlock). Node supports WebAssembly +
@@ -700,12 +701,16 @@ describe("user macro helpers", () => {
   });
 
   it("still dispatches a query nested in a configured macro", async () => {
-    vi.spyOn(backend(), "runQuery").mockResolvedValue([]);
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([]));
     setGraphMeta({ root: "/test", macros: { outer: "{{query (task TODO)}}" } } as never);
     const root = document.createElement("div");
     const dispose = render(() => <AstBody raw="{{outer}}" />, root);
     try {
-      await vi.waitFor(() => expect(backend().runQuery).toHaveBeenCalledWith("(task TODO)"));
+      await vi.waitFor(() =>
+        expect(vi.mocked(backend().queryRun).mock.calls[0]?.[0].source).toMatchObject({
+          original: "(task TODO)",
+        }),
+      );
     } finally {
       dispose();
     }

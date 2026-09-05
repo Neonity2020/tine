@@ -8977,6 +8977,103 @@ img.emoji {
   margin-bottom: 2px;
 }
 
+/* The query text pane (TQL in a block, the OG DSL in the workspace). The rows
+   stay on screen while the text is invalid, greyed, because they are the last
+   reading that actually ran — blanking them would report a typo as an empty
+   graph. */
+.query-text-pane-details {
+  flex-basis: 100%;
+  margin-top: 4px;
+  font-size: 12px;
+}
+.query-text-pane-details > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  user-select: none;
+}
+.query-text-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.query-text-pane-input {
+  width: 100%;
+  font-family: var(--font-mono, monospace);
+  resize: vertical;
+}
+.query-text-pane-input.query-text-pane-invalid {
+  border-color: var(--danger-color, #c0392b);
+}
+.query-text-pane-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.query-text-pane-error {
+  color: var(--danger-color, #c0392b);
+  font-size: 12px;
+}
+.query-text-pane-pending {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.qb-bar-stale .qb-chip,
+.qb-bar-stale .qb-conn,
+.qb-bar-stale .qb-sort {
+  opacity: 0.55;
+}
+.query-stale .query-group,
+.query-stale .query-search-results,
+.query-stale .query-page-rows,
+.query-stale .query-summary,
+.query-stale .sheet-grid {
+  opacity: 0.5;
+}
+
+/* Page-anchored results: the query answers with PAGES, not blocks (§7.1, K16),
+   so they are listed as page links rather than forced into a block group. */
+.query-page-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0 6px;
+}
+.query-page-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}
+
+/* "Why is this empty?" (Q14, N19): asked only once a run has come back empty. */
+.query-why-empty {
+  border: none;
+  background: none;
+  padding: 0;
+  margin-left: 6px;
+  color: var(--link-color);
+  font-size: 12px;
+  cursor: pointer;
+}
+.query-why-empty-panel {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.query-why-empty-notice,
+.query-why-empty-pending {
+  color: var(--text-muted);
+}
+.query-why-empty-table {
+  font-size: 12px;
+}
+
+/* The run's own diagnostics, distinct from a failed command. */
+.query-diagnostics {
+  color: var(--danger-color, #c0392b);
+}
+
 /* Result summary panel (aggregation / group-by), shown above the result list. */
 .query-summary {
   font-size: 13px;

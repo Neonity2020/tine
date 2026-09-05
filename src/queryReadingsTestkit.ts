@@ -15,7 +15,16 @@
 // never declared, and it throws rather than guessing.
 import { vi } from "vitest";
 import { backend } from "./backend";
-import type { ParsedQuery, Query, Source, ViewSettings } from "./editor/queryIr";
+import type {
+  Filter,
+  ParsedQuery,
+  Query,
+  QueryReport,
+  QueryResult,
+  Source,
+  ViewSettings,
+} from "./editor/queryIr";
+import type { RefGroup } from "./types";
 
 /** One declared reading: the form, the opaque options map, and which source
  *  variant the engine recognised. */
@@ -30,6 +39,12 @@ export interface QueryReading {
   /** The view settings the engine lifted out of the text and the block's
    *  `tine.*` properties. */
   view?: ViewSettings;
+  /** The filter the engine read, for the few tests that are about what the
+   *  query MEANS rather than how the argument was split. Omitted, the reading is
+   *  `raw` — the IR's honest spelling for text retained but not interpreted. A
+   *  test that needs a real filter states it here; it does not ask a mock with
+   *  no parser to derive one. */
+  filter?: Filter;
 }
 
 function readingToIr(reading: QueryReading): ParsedQuery {
@@ -50,7 +65,7 @@ function readingToIr(reading: QueryReading): ParsedQuery {
   // about the READING, never about what the filter means.
   const query: Query = {
     anchor: "block",
-    filter: { kind: "raw", text: original, diagnostic_kind: "not_applicable" },
+    filter: reading.filter ?? { kind: "raw", text: original, diagnostic_kind: "not_applicable" },
     diagnostics: [],
     source,
   };
@@ -72,4 +87,22 @@ export function backendReadsQueries(readings: Record<string, QueryReading>): voi
     }
     return readingToIr(reading);
   });
+}
+
+/** What `query_run` answers for a block-anchored query (§7.1).
+ *
+ *  Execution goes through the ONE evaluator now — `run_query` and
+ *  `run_advanced_query` cannot read TQL and are off the render path — so every
+ *  query test states its result in this shape rather than as a bare group list.
+ *  `report` is the advanced ran/ignored answer, which rides on the result
+ *  instead of on a second command (M5). */
+export function blockRunResult(groups: RefGroup[], report?: Partial<QueryReport>): QueryResult {
+  return {
+    anchor: "block",
+    groups,
+    diagnostics: [],
+    report: { ran: [], ignored: [], supported: true, ...report },
+    total: groups.reduce((sum, group) => sum + group.blocks.length, 0),
+    exceeded: false,
+  };
 }

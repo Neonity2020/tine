@@ -39,6 +39,8 @@ icon:: 🔗
   - **Search / List / Table / Board** are presentations of one result membership: switching the view never changes which blocks matched. **Filters / Advanced** narrows by friendly fields and date ranges; **Edit as visual query** opens the chip-by-chip builder; **Explain query** shows what Tine understood. Choosing blocks and choosing a presentation are separate steps — see [[Workflows/Structure repeated information]] for that split in action.
   - Naming a search tab — typing into "Name this search to save it as a page" and pressing **Save page** — creates one ordinary page whose only block is a `{{query}}` (plus a `tine.view::` line unless you chose the plain List view). From then on it behaves like any page: linkable, searchable, always fresh. A page that already exists with the chosen name is never overwritten — you pick another name.
   - A `{{query [[Page]]}}` block uses Logseq's path-refs rule: a block matches when it mentions the page, when a bullet it lives under does, or when it sits on that page — so the page's own outline always appears. The backlinks-only answer to the same question is the page's **Linked References** panel.
+  - A query that asks about pages rather than blocks — `(page-property …)`, `(page-tags …)`, `(namespace …)` — lists the pages themselves.
+  - When a query finds nothing, **why empty?** under the result asks which condition emptied it: for each condition, how many blocks it matches on its own and how many the query would match without it. That is usually enough to see which one to loosen.
 - ## Related
   - [[Workflows/Find and revisit]] — the task-first path over these pieces.
   - [[Features/Tips & shortcuts]] — the wider shortcut map: tabs, sidebars, focus mode.

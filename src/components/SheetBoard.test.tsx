@@ -13,6 +13,7 @@ import type { RefGroup } from "../types";
 import { backend } from "../backend";
 import { installKeybindings } from "../keybindings";
 import { clearTransientLayersForTest, registerTransientLayer } from "../transientLayers";
+import { blockRunResult } from "../queryReadingsTestkit";
 
 beforeAll(async () => {
   await initParser();
@@ -1220,7 +1221,7 @@ describe("SheetBoard", () => {
       feed: ["Sheet"],
       loaded: true,
     });
-    vi.spyOn(backend(), "runQuery").mockResolvedValue(queryGroups(["todo"]));
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(queryGroups(["todo"])));
 
     const { root, dispose } = mount(() => <Block id="query" />);
     await tick();
@@ -1250,7 +1251,7 @@ describe("SheetBoard", () => {
       feed: ["Sheet"],
       loaded: true,
     });
-    vi.spyOn(backend(), "runQuery").mockResolvedValue(queryGroups(["todo"]));
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(queryGroups(["todo"])));
 
     const { root, dispose } = mount(() => <Block id="query" />);
     await tick();
@@ -1276,7 +1277,7 @@ describe("SheetBoard", () => {
       feed: ["Sheet"],
       loaded: true,
     });
-    vi.spyOn(backend(), "runQuery").mockResolvedValue(queryGroups(["todo"]));
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(queryGroups(["todo"])));
 
     const { root, dispose } = mount(() => <Block id="query" />);
     await tick();

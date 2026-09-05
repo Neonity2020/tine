@@ -3,7 +3,7 @@
 //! SPEC §3.1 fixes the encoding, not just the shapes: internally tagged
 //! (`"kind"`), `snake_case` variant names, `snake_case` fields, and `Span`
 //! offsets in UTF-16 code units. The TypeScript mirror in
-//! `src/editor/queryBuilder.ts` is written against exactly these bytes, so a
+//! `src/editor/queryIr.ts` is written against exactly these bytes, so a
 //! rename that Rust happily compiles is a silent break of the frontend — which
 //! is why the bytes are checked in rather than re-derived.
 //!
@@ -41,13 +41,13 @@ where
         panic!(
             "{}: {error}. Re-run with TINE_UPDATE_QUERY_IR_FIXTURES=1 only if the \
              wire format changed on purpose, and move the TypeScript mirror in \
-             src/editor/queryBuilder.ts in the same commit.",
+             src/editor/queryIr.ts in the same commit.",
             path.display()
         )
     });
     assert_eq!(
         encoded, expected,
-        "the wire format of {name} changed; src/editor/queryBuilder.ts reads these bytes"
+        "the wire format of {name} changed; src/editor/queryIr.ts reads these bytes"
     );
     let decoded: T = serde_json::from_str(&expected).expect("deserialize the fixture");
     assert_eq!(

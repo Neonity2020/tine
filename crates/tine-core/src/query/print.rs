@@ -6,10 +6,17 @@
 //! `NotApplicable` diagnostic everywhere else rather than emitting a query that
 //! means something different (I-12: one canonical answer).
 //!
-//! The OG serialization is transcribed (D-9) from the frontend's own `toDsl`
-//! in `src/editor/queryBuilder.ts`, including its `quoteStr`/`needsQuote`
-//! escaping, its `dateBound` bare-vs-`[[…]]` rule, and its single-child `and`
-//! simplification (which matches OG `simplify-query`).
+//! The OG serialization was transcribed (D-9) from the frontend's own `toDsl`
+//! in `src/editor/queryBuilder.ts` — its `quoteStr`/`needsQuote` escaping, its
+//! `dateBound` bare-vs-`[[…]]` rule, and its single-child `and` simplification
+//! (which matches OG `simplify-query`). **That printer no longer exists**: it
+//! was deleted (last present at commit `52cb16fe`) when the builder moved to the
+//! IR, precisely so that this module is the only place a query is printed
+//! (I-12). The rules it transcribed are now defined HERE, and pinned against the
+//! reader by [`super::og`] round-tripping every og-expressible query
+//! (`tests::og_expressible_queries_round_trip_through_the_og_printer`,
+//! `tests::a_quoted_value_survives_the_og_escaping`) rather than by agreement
+//! with a second implementation.
 //!
 //! **Deviation from §4.3, recorded (D-14 would otherwise apply):** the TQL
 //! printer emits text directly instead of `Display`-ing a rebuilt `sqlparser`
@@ -778,8 +785,9 @@ fn og_between(field: &str, value: &Value) -> Option<String> {
     ))
 }
 
-/// `queryBuilder.ts` `dateBound`: a bound that resolves on its own is bare, a
-/// journal page title is wrapped in `[[ ]]`.
+/// A bound that resolves on its own is bare; a journal page title is wrapped in
+/// `[[ ]]`. Read back by `og`'s `between` parser, which is what defines the
+/// distinction now that the frontend's `dateBound` is gone.
 fn date_bound(value: &Value) -> Option<String> {
     let Value::Date { literal } = value else {
         return None;
@@ -816,13 +824,14 @@ fn is_bare_date_token(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit())
 }
 
-/// `queryBuilder.ts` `quoteStr`: a DSL double-quoted string with `\` and `"`
-/// escaped, so a value containing a quote round-trips.
+/// A DSL double-quoted string with `\` and `"` escaped, so a value containing a
+/// quote round-trips through `og::read_string`.
 fn quote_str(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// `queryBuilder.ts` `needsQuote`: quote when the value cannot be a bare word.
+/// Quote when the value cannot be a bare word — the complement of what
+/// `og::read_string` accepts unquoted.
 fn needs_quote(text: &str) -> bool {
     text.is_empty()
         || text

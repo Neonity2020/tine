@@ -15,6 +15,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   graph written in Logseq that used it showed nothing. It now selects the same
   pages Logseq selects.
 
+- **A query that finds nothing can say which condition emptied it.** Under an
+  empty result there is now a **why empty?** disclosure: for each condition it
+  shows how many blocks that condition matches on its own, and how many the
+  query would match without it. A query with several conditions used to say only
+  "No results", which is the one moment you most need to know which one to
+  loosen. Nothing extra is asked of the engine until you open it.
+
 - **Ctrl+Y also redoes, on Windows and Linux.** Ctrl+Z undid and Ctrl+Y did
   nothing, because Logseq binds redo to Ctrl/Cmd+Shift+Z and leaves Ctrl+Y
   unbound — so the key most editors on those platforms use for redo reached no
@@ -63,6 +70,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   cancelled each other out in a way the query never asked for. A disabled row
   now removes exactly itself.
 
+- **A `<% current page %>` query no longer runs twice when you navigate.**
+  Moving to another page re-ran such a query immediately against the page you
+  had just left, then ran it again once the substituted text caught up — so one
+  navigation cost two whole-graph passes and could briefly show the previous
+  page's answer. It now runs once, for the page you are actually on.
+
 - **A broken or unusual condition survives editing another row.** A commented
   out condition with an unfinished quote used to be replaced with `false` — the
   text you wrote was gone after one save, and the unfinished quote could swallow
@@ -72,6 +85,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   left alone when you edit a neighbour.
 
 ### Changed
+
+- **A query about pages now answers with pages.** `{{query (page-property …)}}`,
+  `(page-tags …)` and `(namespace …)` ask a question about pages, but Tine
+  answered them by listing every block on each matching page — so one matching
+  page could fill the result with its whole outline. They now list the pages
+  themselves. A query about blocks is unaffected.
+
+- **The query block's `⚙ advanced` / `← Simple` switch is gone.** It converted
+  between the chip builder and a datalog query, in both directions, and neither
+  direction was safe: going out dropped any sort, grouping or summary the query
+  carried, and coming back could only read the exact shape it had itself
+  written, so an advanced query written by hand came back wrong or not at all.
+  An advanced query now stays advanced — editable as text, with its own note
+  saying which parts Tine ran and which it ignored — and is no longer offered a
+  chip builder that would rewrite it.
 
 - **`{{query (property …)}}` now matches the way you read the page, not the way
   the bytes happen to be written.** A property value matches whatever its
