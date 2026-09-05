@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **The Concord base ledger now reclaims entries whose stored text has been
+  removed from underneath it.** Its prune already dropped unreferenced blobs and
+  unreadable records; an index or conflict pin naming a blob that an antivirus
+  quarantine, a disk cleaner or a partial restore had deleted was kept forever
+  as dead metadata. Conflict diffs were never affected — a missing blob has
+  always degraded to the ordinary two-column diff — and the ledger still never
+  warns about one.
+
 ### Fixed
 
 - **Clicking a link to the PDF you are already reading keeps your place.**
