@@ -10428,6 +10428,28 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: with Tine in dark mode the Android notification bar went blank -- no clock, no icons -- while light mode was fine. Classification: blocking stateful UX; the OS status bar became unreadable for as long as the app was open. Introduced in 0.6.981, which began padding the Activity content root with the system-bar and display-cutout insets so the WebView sits inside them. That moved the strip behind the status bar from the PAGE to the WINDOW, and the window background resolves through values/ versus values-night -- the ANDROID night setting -- while SystemBarAppearance sets the bar ICON appearance from TINE's own persisted theme. When the two disagreed, which is ordinary for a user who runs Tine dark on a phone still in light mode, the white light-mode icons landed on the white light-mode strip. Fix: SystemBarAppearance paints the window background from the same `dark` flag that chooses the icon appearance, reading two colours that deliberately have no values-night variant so the resolver cannot put the device setting back in charge. Evidence: the instrumented Android test asserts the PAIR -- strip colour and icon appearance together, plus the white-on-white cross-check -- because either half alone was already correct before the fix; the source guard pins the one-authority rule and the absence of a night override. Not yet observed on a real device or emulator run, so confidence stays moderate until the Android UI runtime job has run this test."
+    },
+    {
+      "id": "UI-CONFLICT-DIFF-FAILURE-STUCK-PANEL-490",
+      "title": "A conflict whose diff cannot be read says so, instead of freezing the panel and blanking the page",
+      "family": "external-change-conflict-resolution",
+      "sources": {
+        "issues": [490],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ConflictResolution.test.tsx::a conflict diff that fails (GH #490)"
+        ],
+        "scenario": "conflict.diff-failure-is-a-message",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a page showed the conflict banner, its panel stayed on `Reading both versions...` forever, and the page body stayed blank -- the page could not be used at all. Classification: blocking core operation. One mechanism produces both symptoms, and all three of its steps are verified in this worktree's own solid-js build rather than inferred: reading an errored Solid resource THROWS (`read()`, solid.js:318-322); `grep -rn 'ErrorBoundary|catchError' src/` excluding tests returns zero hits, so Tine registers no boundary anywhere; and `runUpdates`' catch (solid.js:819-823) sets `Effects = null` before rehandling. So when the diff resource rejected, `<Show when={diff()}>` threw inside the batch the resource's own completion started, and the discarded Effects queue contained BOTH the effect that swaps this panel's fallback text off `Reading both versions...` AND the page body's `<For each={rootsToRender()}>`. The `Couldn't read this conflict.` branch was dead code for every rejection. Fix: all six reads of the resource go through `diffValue()`, which consults `diff.error` first and never calls the throwing accessor -- including the two `createMemo`s that would otherwise have thrown on recompute -- and the fallback now names the backend's reason instead of a bare apology. NOT fixed here: which rejection the reporter hit. The likely trigger is a restored Direct capsule with no `disk_rev` replaying a session-scoped observation epoch that died with the previous process (`src-tauri/src/commands.rs:4243-4258`, refused at `crates/tine-core/src/model.rs:12864-12869`); the analysis, and why the obvious frontend guard for it is wrong for Managed, are in `tine-agents/specs/notes/2026-09-05-gh490-conflict-hang.md`. Necessity gate: both assertions fail against pre-fix ConflictResolution.tsx, the panel still reading `Reading both versions...` after the rejection."
     }
   ]
 }

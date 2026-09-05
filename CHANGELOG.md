@@ -37,6 +37,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   light mode put white icons on a white strip. One setting now decides both
   (GH #467).
 
+- **A conflict Tine cannot read no longer freezes the page.** When the
+  comparison failed, the panel stayed on "Reading both versions…" forever and
+  the page body went blank, so the page could not be used at all. The failure is
+  now shown, with the reason, and the rest of the page keeps working (GH #490).
+
 - **A page with an unresolved save conflict can be opened on disk again.**
   "Open with default app" and "Show in folder" both refused while a conflict was
   pending, which left a page whose conflict view would not load with no way to
