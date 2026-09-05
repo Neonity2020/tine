@@ -164,7 +164,7 @@ const suites = {
     ["media", "scripts/e2e-media.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["pdf-routes", "scripts/e2e-pdf-routes.mjs", {}],
-    ["pdf-scroll-resources", "scripts/e2e-pdf-scroll-resources.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
+    ["pdf-scroll-resources", "scripts/e2e-pdf-scroll-resources.mjs"],
     ["pdf-ownership", "scripts/e2e-pdf-ownership.mjs", {}],
     ["plugin-revocation", "scripts/e2e-plugin-revocation.mjs", {}],
     ["plugin-graph-ownership", "scripts/e2e-plugin-graph-ownership.mjs", {}],
