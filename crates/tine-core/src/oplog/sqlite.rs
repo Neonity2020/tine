@@ -20,6 +20,7 @@
 //! file replaced out of band inside the replicated archive would otherwise let
 //! the old holder and a new opener both believe they own the workspace.
 
+use crate::config::ParseConfig;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
@@ -1035,6 +1036,11 @@ pub struct RebuildSource<'a> {
     runtime_authority: EngineAuthority,
     exact_frontier_root: AcceptedFrontierRoot,
     accepted_batch_count: u64,
+    /// The runtime's config snapshot, under which every derived row in this
+    /// build is produced and against which an existing database's stamp is
+    /// compared (§5.8 M21/H5). Defaults so that the only callers which must
+    /// supply one are the runtime's.
+    parse_config: ParseConfig,
 }
 
 enum RebuildLoader {
@@ -1103,7 +1109,23 @@ impl<'a> RebuildSource<'a> {
             runtime_authority: engine.runtime_authority().clone(),
             exact_frontier_root,
             accepted_batch_count,
+            parse_config: ParseConfig::default(),
         })
+    }
+
+    /// Bind the runtime's graph-config snapshot to this build (§5.8 M21).
+    ///
+    /// Every production open route sets it; the default is the default config,
+    /// which is what a graph with no `config.edn` overrides parses under
+    /// anyway, so a caller that never edits config observes no behaviour change.
+    #[must_use]
+    pub fn with_parse_config(mut self, parse_config: ParseConfig) -> Self {
+        self.parse_config = parse_config;
+        self
+    }
+
+    pub(crate) fn parse_config(&self) -> &ParseConfig {
+        &self.parse_config
     }
 
     fn load_event(
@@ -1278,6 +1300,7 @@ pub(super) fn document_facets(
     Vec<super::MaterializedProperty>,
     Vec<String>,
     Option<super::MaterializedTask>,
+    Vec<String>,
 ) {
     // `DocBlock` removes only parser-recognized properties from visible text.
     // Every other facet needs a property/header/tag/priority marker or an
@@ -1295,6 +1318,7 @@ pub(super) fn document_facets(
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
         );
     }
     let mut block = crate::doc::DocBlock::new(content);
@@ -1316,6 +1340,7 @@ pub(super) fn document_facets_from_parsed_block(
     Vec<super::MaterializedProperty>,
     Vec<String>,
     Option<super::MaterializedTask>,
+    Vec<String>,
 ) {
     let searchable_text = block
         .visible_text()
@@ -1336,6 +1361,9 @@ pub(super) fn document_facets_from_parsed_block(
         scheduled: block.scheduled().map(str::to_owned),
         deadline: block.deadline().map(str::to_owned),
     });
+    // One parse yields every facet, including the block's own normalized page
+    // references — the closure's per-block input on BOTH backends (§5.8 G1).
+    let path_ref_names = block.projection().refs_norm.clone();
     (
         searchable_text,
         heading_level,
@@ -1343,12 +1371,13 @@ pub(super) fn document_facets_from_parsed_block(
         properties,
         tags,
         task,
+        path_ref_names,
     )
 }
 
 fn materialized_page_input(page: super::MaterializedPage) -> super::MaterializedPageInput {
     let is_org = super::reference_catalog::reference_source_is_org(&page.path);
-    let (preamble_search, _, _, properties, tags, _) = page
+    let (preamble_search, _, _, properties, tags, _, _) = page
         .preamble
         .as_deref()
         .map(|preamble| document_facets(preamble, is_org))
@@ -1358,30 +1387,38 @@ fn materialized_page_input(page: super::MaterializedPage) -> super::Materialized
     if !preamble_search.is_empty() {
         page_search.push(preamble_search);
     }
-    let blocks = page
-        .blocks
-        .into_iter()
-        .map(|block| {
-            let (searchable_text, heading_level, collapsed, properties, tags, task) =
-                document_facets(&block.content, is_org);
-            super::MaterializedBlockInput {
-                block_id: block.block_id,
-                home_document_id: block.home_document_id,
-                parent: block.parent,
-                order: block.order,
-                content: block.content,
-                searchable_text,
-                heading_level,
-                collapsed,
-                logseq_uuid: block.logseq_uuid,
-                logseq_identity_origin: block.logseq_identity_origin,
-                references: Vec::new(),
-                properties,
-                tags,
-                task,
-            }
-        })
-        .collect::<Vec<_>>();
+    let blocks =
+        page.blocks
+            .into_iter()
+            .map(|block| {
+                let (
+                    searchable_text,
+                    heading_level,
+                    collapsed,
+                    properties,
+                    tags,
+                    task,
+                    path_ref_names,
+                ) = document_facets(&block.content, is_org);
+                super::MaterializedBlockInput {
+                    block_id: block.block_id,
+                    home_document_id: block.home_document_id,
+                    parent: block.parent,
+                    order: block.order,
+                    content: block.content,
+                    searchable_text,
+                    heading_level,
+                    collapsed,
+                    logseq_uuid: block.logseq_uuid,
+                    logseq_identity_origin: block.logseq_identity_origin,
+                    references: Vec::new(),
+                    properties,
+                    tags,
+                    task,
+                    path_ref_names,
+                }
+            })
+            .collect::<Vec<_>>();
     super::MaterializedPageInput {
         page_id: page.page_id,
         home_document_id: page.home_document_id,
@@ -1930,6 +1967,10 @@ pub(crate) struct CleanGenesisProjectionBuilder {
     pending: super::sqlite_materialization::TerminalMaterializationChunk,
     observed_pages: usize,
     expected_pages: usize,
+    /// The graph config the derived rows are built under, stamped into the
+    /// database so a later config edit rebuilds rather than reads stale atoms
+    /// (§5.8 H6/H5).
+    parse_config: ParseConfig,
     instrumentation: CleanGenesisProjectionInstrumentation,
 }
 
@@ -1959,10 +2000,11 @@ impl CleanGenesisProjectionBuilder {
         target: &Path,
         claim: ProjectionClaim,
         expected_pages: usize,
+        parse_config: ParseConfig,
     ) -> Result<Self, ProjectionError> {
         let files = SqliteFileSet::prepare_candidate(target)?;
         let mut physical = PhysicalSqliteDatabase::open_writable(files.database_path())?;
-        initialize_schema(&physical, claim)?;
+        initialize_schema(&physical, claim, &parse_config)?;
         physical.begin_candidate_build()?;
         physical.begin_terminal_bootstrap_construction()?;
         Ok(Self {
@@ -1973,6 +2015,7 @@ impl CleanGenesisProjectionBuilder {
             pending: super::sqlite_materialization::TerminalMaterializationChunk::default(),
             observed_pages: 0,
             expected_pages,
+            parse_config,
             instrumentation: CleanGenesisProjectionInstrumentation::default(),
         })
     }
@@ -2011,7 +2054,8 @@ impl CleanGenesisProjectionBuilder {
         }
         let chunk = std::mem::take(&mut self.pending);
         let lowering_started = std::time::Instant::now();
-        let physical_chunk = super::sqlite_materialization::lower_terminal_chunk(chunk)?;
+        let physical_chunk =
+            super::sqlite_materialization::lower_terminal_chunk(chunk, &self.parse_config)?;
         self.instrumentation.chunk_lowering_micros = self
             .instrumentation
             .chunk_lowering_micros
@@ -2147,6 +2191,7 @@ pub(crate) fn open_clean_genesis_projection(
     path: &Path,
     claim: ProjectionClaim,
     expected_root: &AcceptedFrontierRoot,
+    parse_config: &ParseConfig,
 ) -> Result<CleanGenesisPhysicalProjection, ProjectionError> {
     super::hot_engine::validate_accepted_frontier_root(expected_root)
         .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
@@ -2172,6 +2217,13 @@ pub(crate) fn open_clean_genesis_projection(
     if materialized.acceptance_sequence() != 0 {
         return Err(ProjectionError::FrontierRegression);
     }
+    // The rows on disk were derived under the config this stamp names. A
+    // different config asks a different question of the same Markdown, so the
+    // rows are stale, not damaged: the caller's existing `Err` arm rebuilds
+    // without preserving forensics (§5.8 H5/G6, D-1 rebuild-never-migrate).
+    if physical.stamped_parse_config_hash()? != parse_config.digest() {
+        return Err(ProjectionError::ParseConfigMismatch);
+    }
     drop(physical);
     PhysicalSqliteDatabase::open_writable(path).map_err(Into::into)
 }
@@ -2192,7 +2244,12 @@ pub(crate) fn build_clean_genesis_sqlite_for_test(
     policy: &super::ReferenceCatalogPolicyV1,
     pages: &ActivationPageRecordStore,
 ) -> Result<PhysicalSqliteDatabase, ProjectionError> {
-    let mut builder = CleanGenesisProjectionBuilder::new(path, claim, pages.page_count())?;
+    let mut builder = CleanGenesisProjectionBuilder::new(
+        path,
+        claim,
+        pages.page_count(),
+        ParseConfig::default(),
+    )?;
     for page_id in pages.path_order() {
         let page = pages
             .sqlite_page(*page_id)
@@ -2611,6 +2668,13 @@ impl CleanProjectionRebuildInstrumentation {
 pub enum ProjectionRecovery {
     OpenedExisting,
     RebuiltMissing {
+        applied_batches: usize,
+    },
+    /// Rebuilt because the graph's parse config moved out from under the
+    /// derived rows (§5.8 H6). Reported apart from `RebuiltMissing` because
+    /// nothing was missing and apart from `RebuiltPreservingEvidence` because
+    /// nothing was wrong: this is the expected cost of a `config.edn` edit.
+    RebuiltStaleConfig {
         applied_batches: usize,
     },
     RebuiltPreservingEvidence {
@@ -3349,6 +3413,10 @@ pub struct SqliteFrontier {
     required_frontier_root: AcceptedFrontierRoot,
     required_frontier_digest: ContentDigest,
     checkpoint_each_apply: bool,
+    /// The graph config every derived row applied through this handle is built
+    /// under (§5.8 M21). It is the config the database's own stamp records, so
+    /// a per-event apply can never mix atoms from two configs.
+    parse_config: ParseConfig,
     _lease: Arc<HeldApplierLocks>,
 }
 
@@ -3587,6 +3655,7 @@ impl SqliteFrontier {
         engine: &ShardedHotEngine,
         candidate: CleanGenesisPhysicalProjection,
         slot: SqliteApplierSlot<'lease>,
+        parse_config: ParseConfig,
     ) -> Result<LeasedOpenProjection<'lease>, ProjectionError> {
         if claim != ProjectionClaim::current(engine.workspace_id(), engine.lineage_digest())
             || store.workspace_id() != engine.workspace_id()
@@ -3635,6 +3704,7 @@ impl SqliteFrontier {
                     required_frontier_root: expected_root.clone(),
                     required_frontier_digest: expected_digest,
                     checkpoint_each_apply: true,
+                    parse_config: parse_config,
                     _lease: locks,
                 },
                 recovery: ProjectionRecovery::OpenedExisting,
@@ -3726,6 +3796,7 @@ impl SqliteFrontier {
                         &source.exact_frontier_root,
                     )?,
                     checkpoint_each_apply: true,
+                    parse_config: source.parse_config.clone(),
                     _lease: lease,
                 },
                 recovery: ProjectionRecovery::OpenedExisting,
@@ -3785,6 +3856,45 @@ impl SqliteFrontier {
                         rebuild,
                     });
                 }
+                Ok(ExistingProjection::ParseConfigChanged) => {
+                    // Blank slate (D-1): the prior rows are discarded and
+                    // rebuilt from the oplog, never migrated. No forensics —
+                    // preserving a copy of a healthy projection whose only
+                    // fault is a stale config would fill the runtime directory
+                    // with evidence of the user changing a setting.
+                    let reason =
+                        "SQLite projection was derived under a different graph parse config"
+                            .to_owned();
+                    let stage = Instant::now();
+                    let (database, rebuild) =
+                        Self::build_candidate_and_publish(&path, claim, lease, &source)?;
+                    record_projection_rebuild("rebuilt-config", &reason, stage.elapsed(), &rebuild);
+                    record_projection_open_test_observation(
+                        claim.workspace_id,
+                        "rebuilt-config",
+                        &reason,
+                        rebuild,
+                    );
+                    mark_rebuild_complete(&pending_forensics)?;
+                    return Ok(OpenProjection {
+                        database,
+                        recovery: if pending_forensics.directories.is_empty() {
+                            ProjectionRecovery::RebuiltStaleConfig {
+                                applied_batches: rebuild.accepted_events_applied,
+                            }
+                        } else {
+                            // A forensic preservation interrupted by an earlier
+                            // open is still owed its report, whatever prompted
+                            // today's rebuild.
+                            ProjectionRecovery::RebuiltPreservingEvidence {
+                                reason,
+                                evidence: pending_forensics.evidence,
+                                applied_batches: rebuild.accepted_events_applied,
+                            }
+                        },
+                        rebuild,
+                    });
+                }
                 Ok(ExistingProjection::Current) => {
                     if !pending_forensics.directories.is_empty() {
                         mark_rebuild_complete(&pending_forensics)?;
@@ -3806,6 +3916,7 @@ impl SqliteFrontier {
                                     &source.exact_frontier_root,
                                 )?,
                                 checkpoint_each_apply: true,
+                                parse_config: source.parse_config.clone(),
                                 _lease: lease,
                             },
                             recovery: ProjectionRecovery::RebuiltPreservingEvidence {
@@ -3836,6 +3947,7 @@ impl SqliteFrontier {
                                 &source.exact_frontier_root,
                             )?,
                             checkpoint_each_apply: true,
+                            parse_config: source.parse_config.clone(),
                             _lease: lease,
                         },
                         recovery: {
@@ -3943,6 +4055,7 @@ impl SqliteFrontier {
             claim,
             lease,
             source.runtime_authority.clone(),
+            source.parse_config.clone(),
         )
         .map_err(|error| {
             ProjectionError::Rebuild(format!(
@@ -4006,6 +4119,7 @@ impl SqliteFrontier {
                     &source.exact_frontier_root,
                 )?,
                 checkpoint_each_apply: true,
+                parse_config: source.parse_config.clone(),
                 _lease: lease,
             },
             rebuild,
@@ -4017,9 +4131,10 @@ impl SqliteFrontier {
         claim: ProjectionClaim,
         lease: Arc<HeldApplierLocks>,
         runtime_authority: EngineAuthority,
+        parse_config: ParseConfig,
     ) -> Result<Self, ProjectionError> {
         let physical = PhysicalSqliteDatabase::open_writable(path)?;
-        initialize_schema(&physical, claim)?;
+        initialize_schema(&physical, claim, &parse_config)?;
         let root = read_frontier_root(&physical)?;
         write_projection_checkpoint(path, claim, &root)?;
         Ok(Self {
@@ -4032,6 +4147,7 @@ impl SqliteFrontier {
                 &AcceptedFrontierRoot::empty(),
             )?,
             checkpoint_each_apply: false,
+            parse_config: parse_config,
             _lease: lease,
         })
     }
@@ -4683,6 +4799,7 @@ impl SqliteFrontier {
                 &stored.semantic_effect,
                 Some(stored.causal_dot()?),
                 &context,
+                &self.parse_config,
             )?;
             self.physical.apply_materialization_for_test(
                 &physical,
@@ -5238,7 +5355,8 @@ impl SqliteFrontier {
         instrumentation.bulk_pages_materialized += page_ids.len();
         instrumentation.peak_bulk_pages = instrumentation.peak_bulk_pages.max(page_ids.len());
         instrumentation.exact_document_loads = materializer.exact_document_loads();
-        let physical = super::sqlite_materialization::lower_terminal_chunk(chunk)?;
+        let physical =
+            super::sqlite_materialization::lower_terminal_chunk(chunk, &self.parse_config)?;
         bootstrap.terminal_reference_micros = bootstrap
             .terminal_reference_micros
             .saturating_add(reference_micros);
@@ -5477,6 +5595,7 @@ impl SqliteFrontier {
                 event.semantic_effect(),
                 Some(event.causal_dot()),
                 event.effect_validation_context(),
+                &self.parse_config,
             )?),
             None => None,
         };
@@ -5675,6 +5794,13 @@ enum ExistingProjection {
     /// genuine divergence so the receipt says which one happened, because they
     /// have different causes and only one of them is a corruption signal.
     Behind { applied_through: u64 },
+    /// Authentic, but its derived rows were lowered under a different graph
+    /// parse config (§5.8 H6). Every `pages`/`property_atoms`/`block_path_refs`
+    /// row could differ, and reconciliation compares only source revisions, so
+    /// nothing short of a rebuild restores agreement. A benign, expected
+    /// outcome of the user editing `config.edn` — never a corruption signal,
+    /// so it preserves no forensic evidence.
+    ParseConfigChanged,
 }
 
 fn validate_existing(
@@ -5780,6 +5906,18 @@ fn validate_existing(
         )
         .map_err(|error| error.to_string())?;
     update_projection_open_breakdown(|b| b.materialization_stamp = stage.elapsed());
+    // Decided last, after the database has proved itself authentic and
+    // internally consistent: a projection that fails those checks is still a
+    // corruption signal and must keep its evidence, whatever its parse config
+    // says. Only an otherwise-healthy database whose six parse-relevant config
+    // facts moved takes the quiet rebuild.
+    if physical
+        .stamped_parse_config_hash()
+        .map_err(|error| ProjectionError::from(error).to_string())?
+        != source.parse_config.digest()
+    {
+        return Ok(ExistingProjection::ParseConfigChanged);
+    }
     if found_frontier == source.exact_frontier_root && found_count == expected_count {
         return Ok(ExistingProjection::Current);
     }
@@ -5970,12 +6108,20 @@ fn write_projection_checkpoint(
     files.publish_checkpoint(&bytes).map_err(Into::into)
 }
 
+/// The single stamp writer (§5.8 H5): every route that creates a projection
+/// database goes through here, so the parse-config digest a database records is
+/// always the one its rows were built under.
 fn initialize_schema(
     physical: &PhysicalSqliteDatabase,
     claim: ProjectionClaim,
+    parse_config: &ParseConfig,
 ) -> Result<(), ProjectionError> {
     let frontier = canonical_frontier_root_bytes(&AcceptedFrontierRoot::empty())?;
-    physical.initialize_schema(lower_physical_claim(claim), &frontier)?;
+    physical.initialize_schema(
+        lower_physical_claim(claim),
+        &frontier,
+        parse_config.digest(),
+    )?;
     return Ok(());
 }
 
@@ -7429,6 +7575,7 @@ mod applier_lease {
             store: &ObjectStore,
             engine: &ShardedHotEngine,
             candidate: CleanGenesisPhysicalProjection,
+            parse_config: ParseConfig,
         ) -> Result<Self, (WorkspaceRuntimeLease, ProjectionError)> {
             Self::open_under(lease, |slot| {
                 let opened = SqliteFrontier::adopt_clean_genesis_with_applier_slot(
@@ -7439,6 +7586,7 @@ mod applier_lease {
                     engine,
                     candidate,
                     slot,
+                    parse_config.clone(),
                 )?;
                 Ok((opened, ()))
             })
@@ -8192,6 +8340,10 @@ pub enum ProjectionError {
     SchemaMismatch(String),
     Corrupt(String),
     InvalidFrontier(String),
+    /// The projection's rows were derived under a different graph parse config
+    /// (§5.8 H6). A recognized, benign outcome — not corruption: the caller
+    /// rebuilds from the untouched source tree.
+    ParseConfigMismatch,
     InvalidAcceptedEvent(String),
     MissingDependency(BatchId),
     FrontierUnappliedBatch(BatchId),
@@ -8280,6 +8432,10 @@ impl fmt::Display for ProjectionError {
             }
             Self::Materialization(error) => write!(f, "SQLite materialization failed: {error}"),
             Self::Rebuild(error) => write!(f, "SQLite rebuild failed: {error}"),
+            Self::ParseConfigMismatch => write!(
+                f,
+                "SQLite projection was derived under a different graph parse config"
+            ),
             Self::InjectedFailure => write!(f, "injected SQLite transaction failure"),
         }
     }
@@ -9574,6 +9730,7 @@ mod tests {
                         scheduled: Some("2026-07-25 Sat".into()),
                         deadline: Some("2026-07-26 Sun".into()),
                     }),
+                    path_ref_names: Vec::new(),
                 }],
             }],
             Vec::new(),
@@ -9687,6 +9844,7 @@ mod tests {
                 &database,
                 ids.catalog,
                 ReferenceCatalogPolicyV1::default(),
+                &ParseConfig::default(),
             )
             .unwrap()
             .expect("clean identity fixture reopens");
@@ -9705,6 +9863,7 @@ mod tests {
                 &store,
                 &engine,
                 projection,
+                ParseConfig::default(),
             )
             .map_err(|(_, error)| error)
             .unwrap();
@@ -10598,6 +10757,130 @@ mod tests {
                 .kind,
             ManagedTextKind::Journal
         );
+    }
+
+    /// Guard 4 (§5.8 H5/H6, D-1). An otherwise-healthy projection whose
+    /// derived rows were lowered under a different graph parse config is
+    /// REBUILT on the next open -- never migrated, never opened as-is -- and
+    /// because a `config.edn` edit is an ordinary user action rather than
+    /// corruption, the rebuild preserves no forensic evidence.
+    #[test]
+    fn a_parse_config_change_rebuilds_the_projection_without_preserving_evidence() {
+        let ids = TestIds::new(1_780);
+        let dir = TestDir::new("parse-config-rebuild");
+        let (mut database, mut engine, store) = open_empty(&dir, ids);
+        let path = "pages/config-rebuild.md";
+        let transaction = OperationTransaction::new(vec![
+            SemanticOperation::CreatePage {
+                page_id: ids.page,
+                home_document_id: ids.document,
+                name: crate::oplog::LogicalPageName::parse("Config Rebuild").unwrap(),
+                path: ManagedPath::parse(path).unwrap(),
+                kind: ManagedTextKind::Page,
+            },
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: ids.block,
+                    home_document_id: ids.document,
+                },
+                page_id: ids.page,
+                parent: None,
+                order: "a".into(),
+                content: "owner:: Ada".into(),
+            },
+        ])
+        .unwrap();
+        let prepared = engine
+            .prepare_fixture_transaction(author(1_781), &transaction)
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &prepared);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
+                .unwrap();
+        let change = rich_materialization(
+            &event,
+            ids,
+            path,
+            ManagedTextKind::Page,
+            "Config Rebuild",
+            "owner:: Ada",
+        );
+        assert_eq!(
+            database
+                .apply_materialized_accepted(&event, &change)
+                .unwrap(),
+            ApplyDisposition::Applied
+        );
+        let database_path = database.path().to_path_buf();
+        let default_config = ParseConfig::default();
+        assert_eq!(
+            database.physical.stamped_parse_config_hash().unwrap(),
+            default_config.digest()
+        );
+        drop(database);
+
+        // The same config reopens the same database: the guard below is about
+        // the config changing, not about every reopen rebuilding.
+        let unchanged = open_test_projection(
+            &database_path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unchanged.recovery, ProjectionRecovery::OpenedExisting);
+        drop(unchanged);
+
+        let mut edited = ParseConfig::default();
+        edited.separated_by_commas.push("authors".to_owned());
+        assert_ne!(edited.digest(), default_config.digest());
+        let rebuilt = open_test_projection(
+            &database_path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store)
+                .unwrap()
+                .with_parse_config(edited.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                rebuilt.recovery,
+                ProjectionRecovery::RebuiltStaleConfig { applied_batches: 1 }
+            ),
+            "a parse-config change must rebuild: {:?}",
+            rebuilt.recovery
+        );
+        // Rebuilt, not migrated (D-1): the new stamp is the edited config's.
+        assert_eq!(
+            rebuilt
+                .database
+                .physical
+                .stamped_parse_config_hash()
+                .unwrap(),
+            edited.digest()
+        );
+        assert_eq!(rebuilt.database.applied_batch_count().unwrap(), 1);
+        drop(rebuilt);
+
+        // A benign outcome preserves nothing: a graph whose owner edits
+        // `config.edn` a few times must not accumulate copies of a healthy
+        // projection in the runtime directory.
+        let forensic = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".forensic-"))
+            .count();
+        assert_eq!(forensic, 0, "a parse-config rebuild preserved evidence");
+
+        // And the rebuilt database is steady under the config that built it.
+        let steady = open_test_projection(
+            &database_path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store)
+                .unwrap()
+                .with_parse_config(edited),
+        )
+        .unwrap();
+        assert_eq!(steady.recovery, ProjectionRecovery::OpenedExisting);
     }
 
     #[test]
@@ -11577,6 +11860,7 @@ mod tests {
                 properties: Vec::new(),
                 tags: Vec::new(),
                 task: None,
+                path_ref_names: Vec::new(),
             }],
         });
         let root_change =
@@ -12336,6 +12620,7 @@ mod tests {
                 properties: Vec::new(),
                 tags: Vec::new(),
                 task: None,
+                path_ref_names: Vec::new(),
             }
         }
 

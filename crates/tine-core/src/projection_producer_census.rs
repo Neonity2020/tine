@@ -1655,7 +1655,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.12.2\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.13.0\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -1701,9 +1701,27 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // validator rejecting an unknown Direct Files text kind. No new write
     // crossing: the write-boundary table above is byte-identical, and every one
     // of the four is a read.
+    // Re-pinned 2026-09-05 (query engine P1-a): the two derived tables' single
+    // producer, `query/derived.rs`, adds exactly ONE token to this surface —
+    // its `use tine_storage::sqlite::PhysicalPropertyAtom;`. Derived, not
+    // assumed: the surface was dumped and every entry for each production file
+    // this packet touched (`config.rs`, `direct_projection.rs`, `model.rs`,
+    // `oplog/import.rs`, `oplog/sqlite.rs`, `oplog/sqlite_materialization.rs`,
+    // `query.rs`, `query/eval.rs`, `query/registry.rs`, `sync_runtime.rs`) was
+    // read back; only the new file contributes. The atom struct is a row shape
+    // the physical layer already owns, so the producer names it rather than
+    // introducing a parallel core type (D-14), and it crosses no write
+    // boundary: the write-crossing table above is byte-identical.
+    // The certified dependency moves v0.12.2 -> v0.13.0 in the same commit: the
+    // schema goes 22 -> 23 and five physical types drop their `Eq` derive
+    // (`atom_num` is an optional `f64`), which is a minor bump, not a patch.
+    // `direct_projection.rs`'s new `tine_storage::ContentDigest` type annotation
+    // is deliberately absent from this surface — the inventory records calls
+    // (`tine_storage::X(`) and `use` declarations, and a bare type position is
+    // neither. Checked, because it looked like a second contributor.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "e0045f18c99f6a3988caa1c430452fb6a0f463f731436288a178219991f98d91",
+        "1e18633c28afc56f810e2ce5a059cc9b7e6f002f68e6429a8d2ba5e036dc6e23",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

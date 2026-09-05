@@ -1755,6 +1755,26 @@ impl Default for ParseConfig {
     }
 }
 
+impl ParseConfig {
+    /// The parse-relevant config of the graph rooted at `root`.
+    ///
+    /// Managed-storage open routes need the parse-config digest before any
+    /// `Graph` exists (the projection is opened to *serve* the graph), so this
+    /// reads `logseq/config.edn` directly. It is not a second reader: the path
+    /// comes from the same resolver `Graph::open` uses and the text goes
+    /// through the same `Config::parse`, so a graph and its projection can
+    /// never disagree about which six facts were in force. An unreadable or
+    /// absent file yields the defaults, exactly as opening the graph would.
+    pub fn for_graph_root(root: &std::path::Path) -> ParseConfig {
+        let path = crate::model::reconciliation_scan_config_path_at_open(root);
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|text| Config::parse(&text).parse_config())
+            .unwrap_or_default()
+    }
+}
+
 impl Config {
     /// The parse-relevant slice of this config (SPEC §5.8).
     pub fn parse_config(&self) -> ParseConfig {

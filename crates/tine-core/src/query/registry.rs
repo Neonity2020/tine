@@ -301,8 +301,7 @@ pub fn build_registry(
 
     // Per key, fold every owner's flattened atom list into the aggregate.
     let mut keys: BTreeMap<String, KeyAccumulator> = BTreeMap::new();
-    for ((normalized, owner_type, _owner_id), mut group) in groups {
-        group.rows.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((normalized, owner_type, _owner_id), group) in groups {
         let atoms = flatten_owner_atoms(&group, &normalized, config);
         let accumulator = keys.entry(normalized).or_default();
         accumulator.observe_owner(owner_type, &atoms, config);
@@ -332,16 +331,23 @@ pub fn build_registry(
 /// concatenate, de-duplicate by [`atom_key`] with first occurrence winning, and
 /// renumber `0..n` — so the atom list of a key is ONE union no matter how many
 /// source rows spelled it (`k::` twice, `K::` and `k::`).
-fn flatten_owner_atoms(group: &OwnerGroup, normalized: &str, config: &ParseConfig) -> Vec<Atom> {
-    let key = if group.source_name.is_empty() {
-        normalized
-    } else {
-        group.source_name.as_str()
-    };
+///
+/// This is the ONE flattening rule. The registry reaches it through
+/// [`flatten_owner_atoms`]; both physical projection producers reach it through
+/// [`owner_property_atoms`]. `rows` is `(source ordinal, value)` in any order —
+/// the sort by ordinal is part of the rule (E3), not the caller's business.
+pub fn flatten_property_atoms(
+    key: &str,
+    rows: &[(u32, &str)],
+    format: AtomFormat,
+    config: &ParseConfig,
+) -> Vec<Atom> {
+    let mut ordered: Vec<(u32, &str)> = rows.to_vec();
+    ordered.sort_by_key(|(ordinal, _)| *ordinal);
     let mut out: Vec<Atom> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for (_, value) in &group.rows {
-        for atom in crate::query::atom::property_atoms(key, value, group.format, config) {
+    for (_, value) in ordered {
+        for atom in crate::query::atom::property_atoms(key, value, format, config) {
             if seen.insert(atom.key.clone()) {
                 let ordinal = out.len() as u32;
                 out.push(Atom { ordinal, ..atom });
@@ -349,6 +355,53 @@ fn flatten_owner_atoms(group: &OwnerGroup, normalized: &str, config: &ParseConfi
         }
     }
     out
+}
+
+/// Every atom of ONE owner, keyed by normalized property name, from the owner's
+/// property lines in source order — the shape both physical producers write
+/// `property_atoms` from (§5.8, D-4/M6: one computation, two writers).
+///
+/// `properties` is `(raw key, value)` in the order the physical `properties`
+/// rows are numbered, which is exactly the `ordinal` those rows carry. Several
+/// lines may share one normalized key (`k::` twice; `K::` and `k::`); the
+/// flattening rule makes them one atom list.
+pub fn owner_property_atoms(
+    properties: &[(String, String)],
+    format: AtomFormat,
+    config: &ParseConfig,
+) -> Vec<(String, Vec<Atom>)> {
+    let mut groups: BTreeMap<String, (String, Vec<(u32, &str)>)> = BTreeMap::new();
+    for (at, (name, value)) in properties.iter().enumerate() {
+        let normalized = property_key_norm(name);
+        if normalized.is_empty() {
+            continue;
+        }
+        let entry = groups
+            .entry(normalized)
+            .or_insert_with(|| (name.clone(), Vec::new()));
+        entry.1.push((at as u32, value.as_str()));
+    }
+    groups
+        .into_iter()
+        .map(|(normalized, (source_name, rows))| {
+            let atoms = flatten_property_atoms(&source_name, &rows, format, config);
+            (normalized, atoms)
+        })
+        .collect()
+}
+
+fn flatten_owner_atoms(group: &OwnerGroup, normalized: &str, config: &ParseConfig) -> Vec<Atom> {
+    let key = if group.source_name.is_empty() {
+        normalized
+    } else {
+        group.source_name.as_str()
+    };
+    let rows: Vec<(u32, &str)> = group
+        .rows
+        .iter()
+        .map(|(ordinal, value)| (*ordinal, value.as_str()))
+        .collect();
+    flatten_property_atoms(key, &rows, group.format, config)
 }
 
 #[derive(Default)]

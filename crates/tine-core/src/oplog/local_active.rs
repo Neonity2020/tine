@@ -1107,6 +1107,7 @@ mod bounded_admission {
                 &database,
                 catalog_document_id,
                 ReferenceCatalogPolicyV1::default(),
+                &crate::config::ParseConfig::default(),
             )
             .unwrap()
             .expect("the published clean activation marker reopens");
@@ -1126,6 +1127,7 @@ mod bounded_admission {
                 &store,
                 &engine,
                 projection,
+                crate::config::ParseConfig::default(),
             )
             .map_err(|(_, error)| error)
             .unwrap();

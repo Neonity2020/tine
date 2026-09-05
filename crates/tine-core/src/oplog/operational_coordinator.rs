@@ -1733,6 +1733,7 @@ mod tests {
                 &database_path,
                 catalog,
                 super::super::ReferenceCatalogPolicyV1::default(),
+                &crate::config::ParseConfig::default(),
             )
             .unwrap()
             .expect("published clean coordinator activation reopens");
@@ -1751,6 +1752,7 @@ mod tests {
                 &archive,
                 &engine,
                 projection,
+                crate::config::ParseConfig::default(),
             )
             .map_err(|(_, error)| error)
             .unwrap();
@@ -1946,6 +1948,7 @@ mod tests {
                 &database_path,
                 catalog,
                 super::super::ReferenceCatalogPolicyV1::default(),
+                &crate::config::ParseConfig::default(),
             )
             .unwrap()
             .expect("published clean coordinator activation reopens after restart");
@@ -1975,6 +1978,7 @@ mod tests {
                     &archive,
                     &engine,
                     baseline_projection,
+                    crate::config::ParseConfig::default(),
                 )
                 .map_err(|(_, error)| error)
                 .unwrap()

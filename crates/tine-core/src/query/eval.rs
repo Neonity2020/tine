@@ -133,7 +133,7 @@ fn collect_compiled(filter: &Filter, out: &mut CompiledLeaves) {
     });
 }
 
-type PathRefCounts = HashMap<String, usize>;
+use crate::query::path_refs::PathRefCounts;
 
 /// Whether this query reads `:block/path-refs`, i.e. whether the walk has to
 /// maintain the ancestor-ref counters at all.
@@ -305,24 +305,18 @@ fn eval_refs(
     ancestor_refs: &PathRefCounts,
     ctx: &EvalCtx,
 ) -> bool {
+    let page_key = refs::normalize(ctx.page_name);
+    let own = &block.projection().refs_norm;
     if let Some(name) = single_ref_name(pred) {
         let normalized = refs::normalize(&name);
-        let hit = block.projection().refs_contains_norm(&normalized)
-            || ancestor_refs.contains_key(&normalized)
-            || refs::normalize(ctx.page_name) == normalized;
+        let hit =
+            crate::query::path_refs::closure_contains(&page_key, own, ancestor_refs, &normalized);
         return match quant {
             Quant::Any | Quant::Every => hit,
             Quant::None => !hit,
         };
     }
-    let names = block
-        .projection()
-        .refs_norm
-        .iter()
-        .cloned()
-        .chain(ancestor_refs.keys().cloned())
-        .chain(std::iter::once(refs::normalize(ctx.page_name)))
-        .collect::<Vec<_>>();
+    let names = crate::query::path_refs::closure_names(&page_key, own, ancestor_refs);
     quantify(quant, names.iter(), |name| eval_name_element(pred, name))
 }
 

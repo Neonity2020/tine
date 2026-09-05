@@ -5512,7 +5512,7 @@ pub fn is_config_file_path(root: &Path, path: &Path) -> bool {
         .eq_ignore_ascii_case(CONFIG_RELATIVE_PATH)
 }
 
-fn reconciliation_scan_config_path_at_open(root: &Path) -> PathBuf {
+pub(crate) fn reconciliation_scan_config_path_at_open(root: &Path) -> PathBuf {
     let exact = root.join("logseq").join("config.edn");
     let matching = |directory: &Path, expected: &str| -> Option<PathBuf> {
         let mut found = None;
@@ -6059,6 +6059,7 @@ impl Graph {
                 self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
                 snapshot,
                 revisions,
+                Arc::new(self.config.parse_config()),
             );
         }
         Ok(())
@@ -6116,7 +6117,12 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         {
-            projection.enqueue_full(generation, pages, revisions);
+            projection.enqueue_full(
+                generation,
+                pages,
+                revisions,
+                Arc::new(self.config.parse_config()),
+            );
         }
     }
 
@@ -6134,7 +6140,13 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         {
-            projection.enqueue_replace(generation, entry, document, revision);
+            projection.enqueue_replace(
+                generation,
+                entry,
+                document,
+                revision,
+                Arc::new(self.config.parse_config()),
+            );
         }
     }
 
@@ -6146,7 +6158,7 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         {
-            projection.enqueue_delete(generation, entry);
+            projection.enqueue_delete(generation, entry, Arc::new(self.config.parse_config()));
         }
     }
 

@@ -7051,6 +7051,7 @@ fn activate_clean_runtime_resources_retaining_archive(
         &store,
         &engine,
         projection,
+        graph.config.parse_config(),
     )
     .map_err(|(_, error)| CleanOpenError::from(error))?;
     engine
@@ -7265,6 +7266,11 @@ fn open_clean_runtime_resources_with_progress(
     let identities = request.clean_identities.as_ref().ok_or_else(|| {
         "clean managed runtime open has no persisted local identity record".to_owned()
     })?;
+    // The six parse-relevant config facts the projection's derived rows were
+    // built under (§5.8 H5). Read here, once, from the graph the projection
+    // serves: every open route below either stamps this digest into a fresh
+    // database or refuses a database stamped with a different one.
+    let parse_config = crate::config::ParseConfig::for_graph_root(&request.graph_root);
     if request
         .enrollment_root
         .join(crate::oplog::lazy_genesis::LAZY_GENESIS_ACTIVATION_MARKER_FILE)
@@ -7456,6 +7462,7 @@ fn open_clean_runtime_resources_with_progress(
             ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
             &baseline,
             ReferenceCatalogPolicyV1::default(),
+            &parse_config,
         )
         .map_err(CleanOpenError::from)?;
         LeasedWorkspaceProjection::adopt_clean_genesis(
@@ -7466,13 +7473,16 @@ fn open_clean_runtime_resources_with_progress(
             &store,
             &engine,
             baseline_projection,
+            parse_config.clone(),
         )
         .map_err(|(_, error)| CleanOpenError::from(error))?
     } else {
         let application_runtime =
             ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
                 .map_err(CleanOpenError::from)?;
-        let source = RebuildSource::new(&engine, &store).map_err(CleanOpenError::from)?;
+        let source = RebuildSource::new(&engine, &store)
+            .map_err(CleanOpenError::from)?
+            .with_parse_config(parse_config.clone());
         LeasedWorkspaceProjection::open_under(lease, |slot| {
             let opened = crate::oplog::SqliteFrontier::open_or_rebuild_with_applier_slot(
                 &request.database_path,

@@ -28,6 +28,7 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::config::ParseConfig;
 use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -944,6 +945,7 @@ fn capture_activation_page_records(
                 properties: facets.properties,
                 tags: facets.tags,
                 task: facets.task,
+                path_ref_names: facets.path_ref_names,
             });
             activation_block_sources.push(ActivationBlockSourceV1 {
                 span: tree.nodes[index].span,
@@ -951,7 +953,7 @@ fn capture_activation_page_records(
             });
         }
         let is_org = super::reference_catalog::reference_source_is_org(entry.path());
-        let (preamble_search, _, _, properties, tags, _) = tree
+        let (preamble_search, _, _, properties, tags, _, _) = tree
             .preamble
             .as_deref()
             .map(|preamble| super::sqlite::document_facets(preamble, is_org))
@@ -1231,6 +1233,7 @@ fn build_clean_activation_candidates(
     working: &Path,
     database_path: &Path,
     policy: &ReferenceCatalogPolicyV1,
+    parse_config: &ParseConfig,
 ) -> Result<
     (
         CleanActivationCandidates,
@@ -1254,6 +1257,7 @@ fn build_clean_activation_candidates(
         database_path,
         super::ProjectionClaim::current(workspace_id, lineage_digest),
         pages.page_count(),
+        parse_config.clone(),
     )?;
 
     for page_id in pages.path_order() {
@@ -1422,6 +1426,7 @@ pub(crate) fn prepare_clean_activation(
     let activation_record_micros = elapsed_micros(started);
 
     let started = Instant::now();
+    let parse_config = graph.config.parse_config();
     let (candidates, candidate) = build_clean_activation_candidates(
         &pages,
         workspace_id,
@@ -1431,6 +1436,7 @@ pub(crate) fn prepare_clean_activation(
         &working,
         database_path,
         policy,
+        &parse_config,
     )?;
     let candidate_fanout_micros = elapsed_micros(started);
     let instrumentation = CleanActivationInstrumentation {
@@ -1674,6 +1680,7 @@ pub(crate) fn open_clean_activation(
     database_path: &Path,
     catalog_document_id: DocumentId,
     policy: ReferenceCatalogPolicyV1,
+    parse_config: &ParseConfig,
 ) -> Result<Option<OpenedCleanActivation>, BootstrapStreamingImportError> {
     let Some(opened) = open_clean_activation_authority(
         enrollment_root,
@@ -1690,6 +1697,7 @@ pub(crate) fn open_clean_activation(
         super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
         &baseline,
         policy,
+        parse_config,
     )?;
     Ok(Some(OpenedCleanActivation {
         engine,
@@ -1703,9 +1711,15 @@ pub(crate) fn open_or_rebuild_clean_genesis_projection(
     claim: super::ProjectionClaim,
     baseline: &LazyGenesisCandidate,
     policy: ReferenceCatalogPolicyV1,
+    parse_config: &ParseConfig,
 ) -> Result<super::sqlite::CleanGenesisPhysicalProjection, BootstrapStreamingImportError> {
     let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
-    match super::sqlite::open_clean_genesis_projection(database_path, claim, &accepted_frontier) {
+    match super::sqlite::open_clean_genesis_projection(
+        database_path,
+        claim,
+        &accepted_frontier,
+        parse_config,
+    ) {
         Ok(projection) => {
             if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
                 eprintln!("[tine] clean genesis projection recovery: opened-existing");
@@ -1722,12 +1736,25 @@ pub(crate) fn open_or_rebuild_clean_genesis_projection(
             if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
                 eprintln!("[tine] clean genesis projection recovery: rebuilt");
             }
+            // A parse-config change is named apart from every other reason to
+            // rebuild: it is the expected cost of a `config.edn` edit, not a
+            // sign that anything about this projection was wrong (§5.8 H6).
+            let recovery = if matches!(error, super::sqlite::ProjectionError::ParseConfigMismatch) {
+                "rebuilt-config"
+            } else {
+                "rebuilt-missing"
+            };
             let reason = error.to_string();
-            let projection =
-                rebuild_clean_genesis_projection(database_path, claim, baseline, policy)?;
+            let projection = rebuild_clean_genesis_projection(
+                database_path,
+                claim,
+                baseline,
+                policy,
+                parse_config,
+            )?;
             super::sqlite::record_projection_open_test_observation(
                 claim.workspace_id(),
-                "rebuilt-missing",
+                recovery,
                 &reason,
                 super::sqlite::RebuildInstrumentation::default(),
             );
@@ -1796,10 +1823,11 @@ fn materialize_lazy_genesis_page(
             properties: facets.properties,
             tags: facets.tags,
             task: facets.task,
+            path_ref_names: facets.path_ref_names,
         });
     }
     let is_org = super::reference_catalog::reference_source_is_org(&page.path);
-    let (preamble_search, _, _, properties, tags, _) = page
+    let (preamble_search, _, _, properties, tags, _, _) = page
         .preamble
         .as_deref()
         .map(|preamble| super::sqlite::document_facets(preamble, is_org))
@@ -1832,6 +1860,7 @@ fn rebuild_clean_genesis_projection(
     claim: super::ProjectionClaim,
     baseline: &LazyGenesisCandidate,
     policy: ReferenceCatalogPolicyV1,
+    parse_config: &ParseConfig,
 ) -> Result<super::sqlite::CleanGenesisPhysicalProjection, BootstrapStreamingImportError> {
     super::sqlite::remove_disposable_projection(database_path)?;
     let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
@@ -1839,6 +1868,7 @@ fn rebuild_clean_genesis_projection(
         database_path,
         claim,
         baseline.page_count(),
+        parse_config.clone(),
     )?;
     for page_id in baseline.page_ids() {
         let page = baseline.page(page_id)?.ok_or_else(|| {
@@ -4964,6 +4994,11 @@ struct ParsedBlockProjectionFacets {
     properties: Vec<super::MaterializedProperty>,
     tags: Vec<String>,
     task: Option<super::MaterializedTask>,
+    /// The block's own normalized page references, captured by the same parse
+    /// as every other facet (§5.8 G1) and moved with exactly the neighbours
+    /// `properties` moves with.
+    #[serde(default)]
+    path_ref_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -5465,7 +5500,7 @@ fn flatten_document(
                 (crate::doc::property_key_norm(&key) == "id").then_some(value)
             })
             .collect();
-        let (searchable_text, heading_level, collapsed, properties, tags, task) =
+        let (searchable_text, heading_level, collapsed, properties, tags, task, path_ref_names) =
             super::sqlite::document_facets_from_parsed_block(block);
         let index = nodes.len();
         let span = spans.get(index).copied().ok_or_else(|| {
@@ -5490,6 +5525,7 @@ fn flatten_document(
                 properties,
                 tags,
                 task,
+                path_ref_names,
             },
         });
         instrumentation.parsed_nodes = instrumentation.parsed_nodes.saturating_add(1);
@@ -6437,6 +6473,7 @@ mod tests {
                 &database,
                 catalog,
                 ReferenceCatalogPolicyV1::default(),
+                &ParseConfig::default(),
             )
             .unwrap()
             .expect("published clean snapshot activation reopens");
@@ -6455,6 +6492,7 @@ mod tests {
                 &store,
                 &engine,
                 projection,
+                ParseConfig::default(),
             )
             .map_err(|(_, error)| error)
             .unwrap();
@@ -6561,6 +6599,7 @@ mod tests {
                 &database,
                 catalog,
                 ReferenceCatalogPolicyV1::default(),
+                &ParseConfig::default(),
             )
             .unwrap()
             .expect("published clean snapshot activation reopens after config change");
@@ -6591,6 +6630,7 @@ mod tests {
                     &store,
                     &engine,
                     baseline_projection,
+                    ParseConfig::default(),
                 )
                 .map_err(|(_, error)| error)
                 .unwrap()
@@ -6688,6 +6728,61 @@ mod tests {
             }
         }
         source.into_bytes()
+    }
+
+    /// Guard 4, clean-genesis half (§5.8 H5/H6). The other managed open route
+    /// -- the sequence-zero baseline a fresh activation publishes -- refuses a
+    /// database stamped with a different parse config and rebuilds it, named
+    /// apart from every other reason to rebuild.
+    #[test]
+    fn a_parse_config_change_rebuilds_the_clean_genesis_projection() {
+        let fixture = CleanSnapshotFixture::new("parse-config", &["pages/a.md"]);
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+        let baseline_directory = fixture
+            ._root
+            .path()
+            .join("clean-archive")
+            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY);
+        let enrollment = fixture._root.path().join("clean-enrollment");
+        let database = fixture.database.clone();
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
+        let CleanSnapshotFixture {
+            _root,
+            graph,
+            runtime,
+            ..
+        } = fixture;
+        drop(runtime);
+        drop(graph);
+
+        let reopen = |parse_config: &ParseConfig| {
+            let opened = open_clean_activation(
+                &enrollment,
+                &baseline_directory,
+                &database,
+                catalog,
+                ReferenceCatalogPolicyV1::default(),
+                parse_config,
+            )
+            .unwrap()
+            .expect("the published activation reopens");
+            drop(opened);
+            crate::oplog::sqlite::take_projection_open_test_observation(workspace)
+        };
+
+        // Same config: the baseline on disk is the one this graph asked for.
+        assert_eq!(reopen(&ParseConfig::default()).recovery, "opened-existing");
+
+        let mut edited = ParseConfig::default();
+        edited.separated_by_commas.push("authors".to_owned());
+        let observation = reopen(&edited);
+        assert_eq!(
+            observation.recovery, "rebuilt-config",
+            "a parse-config change must rebuild the clean genesis projection: {observation:?}"
+        );
+
+        // Rebuilt under the edited config, so the next open is steady again.
+        assert_eq!(reopen(&edited).recovery, "opened-existing");
     }
 
     #[test]

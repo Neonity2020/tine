@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::config::ParseConfig;
 #[cfg(test)]
 use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
@@ -51,7 +52,7 @@ const REFERENCE_CATALOG_POSTING_OVERHEAD_BYTES: usize = 96;
 const REFERENCE_CATALOG_ALIAS_OVERHEAD_BYTES: usize = 80;
 // Parser-derived query facts are disposable rows bound only by the accepted
 // frontier stamp. They are never a second authenticated authority.
-const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 6;
+const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 7;
 
 pub(crate) type ApplyChangeInstrumentation = storage::ApplyChangeInstrumentation;
 
@@ -282,6 +283,15 @@ pub struct MaterializedBlockInput {
     pub properties: Vec<MaterializedProperty>,
     pub tags: Vec<String>,
     pub task: Option<MaterializedTask>,
+    /// The block's OWN normalized page references — `BlockProjection.refs_norm`,
+    /// the walk's exact source (§5.8 G1) — from which the shared closure
+    /// function derives `block_path_refs`.
+    ///
+    /// It is a separate field because `references` holds only a resolved entity
+    /// id and a kind and cannot carry names, and because the reference postings
+    /// encode different things per backend, so no kind filter over them could
+    /// be parity-safe (E2).
+    pub path_ref_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1141,6 +1151,13 @@ fn validate_page(
             &block.searchable_text,
             MAX_MATERIALIZATION_FIELD_BYTES,
         )?;
+        for name in &block.path_ref_names {
+            input_budget.add_field(
+                "path ref names bytes",
+                name,
+                MAX_MATERIALIZATION_FIELD_BYTES,
+            )?;
+        }
         if block.order.is_empty() {
             return Err(MaterializationError::InvalidInput(format!(
                 "block {} has an empty order key",
@@ -1330,8 +1347,15 @@ pub(crate) fn initialize_schema(
     connection: &Connection,
     empty_frontier_digest: ContentDigest,
 ) -> Result<(), MaterializationError> {
-    storage::initialize_materialization_schema_for_test(connection, empty_frontier_digest)
-        .map_err(Into::into)
+    // Unit fixtures at this level exercise lowering, not the config-change
+    // rebuild route, so they stamp the default parse config. The routes that
+    // must notice a config change compare the stamp themselves (§5.8 H5).
+    storage::initialize_materialization_schema_for_test(
+        connection,
+        empty_frontier_digest,
+        ParseConfig::default().digest(),
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1348,6 +1372,7 @@ pub(crate) fn apply_change(
         semantic_effect,
         None,
         &EffectValidationContext::linear(),
+        &ParseConfig::default(),
     )?;
     storage::apply_materialization_change_for_test(
         transaction,
@@ -1364,6 +1389,7 @@ pub(crate) fn lower_validated_change(
     semantic_effect: &[u8],
     causal_dot: Option<BatchCausalDot>,
     context: &EffectValidationContext,
+    parse_config: &ParseConfig,
 ) -> Result<storage::PhysicalMaterializationChange, MaterializationError> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
@@ -1410,11 +1436,7 @@ pub(crate) fn lower_validated_change(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let replacements = change
-        .replacements
-        .iter()
-        .map(lower_page)
-        .collect::<Result<Vec<_>, _>>()?;
+    let replacements = lower_pages_with_derived_rows(&change.replacements, parse_config)?;
     Ok(storage::PhysicalMaterializationChange {
         batch_id: change.batch_id.as_uuid().into_bytes(),
         replacements,
@@ -1455,8 +1477,54 @@ pub(crate) fn lower_validated_change(
     })
 }
 
-fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, MaterializationError> {
+/// Lower every replacement page AND its derived rows through the ONE tine-core
+/// computation (SPEC §5.8 J2).
+///
+/// Managed Storage has two lowering entry points — per-event
+/// [`lower_validated_change`] and the terminal builder's
+/// [`lower_terminal_chunk`] — and they must not each grow their own copy of the
+/// closure and the atomizer, so both come through here.
+pub(crate) fn lower_pages_with_derived_rows(
+    pages: &[MaterializedPageInput],
+    parse_config: &ParseConfig,
+) -> Result<Vec<storage::PhysicalPage>, MaterializationError> {
+    pages
+        .iter()
+        .map(|page| lower_page(page, parse_config))
+        .collect()
+}
+
+fn lower_page(
+    page: &MaterializedPageInput,
+    parse_config: &ParseConfig,
+) -> Result<storage::PhysicalPage, MaterializationError> {
     let normalized_searchable_text = normalized_searchable_text(&page.searchable_text)?;
+    // The page's format comes from its own path, case-insensitively
+    // (`Format::from_path`), never from `reference_source_is_org`, whose
+    // `ends_with(".org")` would type an `Outline.ORG` page Markdown here while
+    // Direct Files types it Org (§5.8 E4).
+    let format = crate::query::atom::AtomFormat::from(crate::model::Format::from_path(
+        std::path::Path::new(page.path.as_str()),
+    ));
+    let page_property_atoms = crate::query::derived::property_atom_rows(
+        &page
+            .properties
+            .iter()
+            .map(|property| (property.name.clone(), property.value.clone()))
+            .collect::<Vec<_>>(),
+        format,
+        parse_config,
+    );
+    let flat = page
+        .blocks
+        .iter()
+        .map(|block| crate::query::path_refs::PathRefBlock {
+            id: block.block_id,
+            parent: block.parent,
+            refs: block.path_ref_names.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let mut path_refs = crate::query::derived::path_ref_rows(&page.name, &flat);
     Ok(storage::PhysicalPage {
         page_id: page.page_id.as_uuid().into_bytes(),
         home_document_id: page.home_document_id.as_uuid().into_bytes(),
@@ -1470,18 +1538,38 @@ fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, Mat
         references: page.references.iter().map(lower_reference).collect(),
         properties: page.properties.iter().map(lower_property).collect(),
         tags: page.tags.clone(),
+        property_atoms: page_property_atoms,
         blocks: page
             .blocks
             .iter()
-            .map(lower_block)
+            .map(|block| {
+                lower_block(
+                    block,
+                    path_refs.remove(&block.block_id).unwrap_or_default(),
+                    format,
+                    parse_config,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
 fn lower_block(
     block: &MaterializedBlockInput,
+    path_refs: Vec<String>,
+    format: crate::query::atom::AtomFormat,
+    parse_config: &ParseConfig,
 ) -> Result<storage::PhysicalBlock, MaterializationError> {
     let normalized_searchable_text = normalized_searchable_text(&block.searchable_text)?;
+    let property_atoms = crate::query::derived::property_atom_rows(
+        &block
+            .properties
+            .iter()
+            .map(|property| (property.name.clone(), property.value.clone()))
+            .collect::<Vec<_>>(),
+        format,
+        parse_config,
+    );
     Ok(storage::PhysicalBlock {
         block_id: block.block_id.as_uuid().into_bytes(),
         home_document_id: block.home_document_id.as_uuid().into_bytes(),
@@ -1503,6 +1591,8 @@ fn lower_block(
             scheduled: task.scheduled.clone(),
             deadline: task.deadline.clone(),
         }),
+        path_refs,
+        property_atoms,
     })
 }
 
@@ -1615,6 +1705,7 @@ pub(crate) struct TerminalMaterializationChunk {
 /// is no per-event semantic effect to validate against here.
 pub(crate) fn lower_terminal_chunk(
     mut chunk: TerminalMaterializationChunk,
+    parse_config: &ParseConfig,
 ) -> Result<storage::PhysicalTerminalMaterializationChunk, MaterializationError> {
     for page in &mut chunk.pages {
         canonicalize_page_blocks(page);
@@ -1733,11 +1824,7 @@ pub(crate) fn lower_terminal_chunk(
         ));
     }
     Ok(storage::PhysicalTerminalMaterializationChunk {
-        pages: chunk
-            .pages
-            .iter()
-            .map(lower_page)
-            .collect::<Result<Vec<_>, _>>()?,
+        pages: lower_pages_with_derived_rows(&chunk.pages, parse_config)?,
         postings: lower_reference_postings(&chunk.postings)?,
         aliases: lower_alias_declarations(&chunk.aliases)?,
         block_home_claims: chunk
@@ -3352,6 +3439,7 @@ mod tests {
             properties: Vec::new(),
             tags: Vec::new(),
             task: None,
+            path_ref_names: Vec::new(),
         }
     }
 
@@ -3382,11 +3470,14 @@ mod tests {
         );
         assert_eq!(change.replacements()[0].blocks[0].parent, Some(root));
 
-        let physical = lower_terminal_chunk(TerminalMaterializationChunk {
-            pages: vec![page],
-            postings: Vec::new(),
-            aliases: Vec::new(),
-        })
+        let physical = lower_terminal_chunk(
+            TerminalMaterializationChunk {
+                pages: vec![page],
+                postings: Vec::new(),
+                aliases: Vec::new(),
+            },
+            &ParseConfig::default(),
+        )
         .expect("terminal bootstrap accepts the same nested traversal order");
         assert_eq!(
             physical.pages[0]
@@ -3432,13 +3523,17 @@ mod tests {
             properties: Vec::new(),
             tags: Vec::new(),
             task: None,
+            path_ref_names: Vec::new(),
         });
 
-        let physical = lower_terminal_chunk(TerminalMaterializationChunk {
-            pages: vec![page.clone()],
-            postings: Vec::new(),
-            aliases: Vec::new(),
-        })
+        let physical = lower_terminal_chunk(
+            TerminalMaterializationChunk {
+                pages: vec![page.clone()],
+                postings: Vec::new(),
+                aliases: Vec::new(),
+            },
+            &ParseConfig::default(),
+        )
         .unwrap();
 
         let name_key = LogicalPageName::parse(&page.name).unwrap().key_digest();
@@ -3537,6 +3632,7 @@ mod tests {
                     properties: Vec::new(),
                     tags: Vec::new(),
                     task: None,
+                    path_ref_names: Vec::new(),
                 }
             })
             .collect();
@@ -3661,7 +3757,7 @@ mod tests {
 
     #[test]
     fn materialization_input_schema_refuses_prior_and_future_before_sqlite_write() {
-        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 6);
+        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 7);
         let current = MaterializationChange::new(
             batch_id(500_000),
             vec![page_input(page_id(500_001), "current".into())],
@@ -3886,5 +3982,690 @@ mod tests {
             Err(MaterializationError::Corrupt(message))
                 if message.contains("malformed managed path row")
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.8 acceptance: the two derived tables, produced once and agreed on by
+    // both backends and the tree walk.
+    // -----------------------------------------------------------------------
+
+    /// One page carrying every property form the closure and the atomizer have
+    /// to survive together: a property-key-only block, an `alias::`, a `tags::`
+    /// value, an inline `#tag` and a `[[link]]`.
+    const PARITY_FIXTURE: &str = concat!(
+        "alias:: Second Name\n",
+        "tags:: Release, Docs\n",
+        "\n",
+        "- status:: open\n",
+        "- tags:: Release, Docs\n",
+        "- outer [[Alpha]]\n",
+        "\t- inner #beta\n",
+        "\t\t- leaf\n",
+    );
+
+    const PARITY_PATH: &str = "pages/parity-page.md";
+    const PARITY_NAME: &str = "Parity Page";
+
+    fn parity_document() -> crate::doc::Document {
+        parse_page(PARITY_PATH, PARITY_FIXTURE)
+    }
+
+    /// One page's text, parsed exactly as both backends parse it: the format
+    /// comes from the path (`Format::from_path`, E4), and the blocks carry the
+    /// runtime identities the producers key on.
+    fn parse_page(rel_path: &str, text: &str) -> crate::doc::Document {
+        let mut document = match crate::model::Format::from_path(std::path::Path::new(rel_path)) {
+            crate::model::Format::Md => crate::doc::parse(text),
+            crate::model::Format::Org => crate::org::parse_org(text),
+        };
+        crate::model::assign_doc_runtime_ids(&mut document.roots, rel_path);
+        document
+    }
+
+    /// Direct Files' answer: content -> `block_path_refs` names.
+    fn direct_files_path_refs() -> Vec<(String, Vec<String>)> {
+        direct_files_path_refs_for(PARITY_NAME, PARITY_PATH, &parity_document())
+    }
+
+    fn direct_files_path_refs_for(
+        name: &str,
+        rel_path: &str,
+        document: &crate::doc::Document,
+    ) -> Vec<(String, Vec<String>)> {
+        let entry = crate::model::PageEntry {
+            name: name.to_owned(),
+            kind: crate::model::PageKind::Page,
+            date_key: None,
+            rel_path: rel_path.to_owned(),
+            path: std::path::PathBuf::from(rel_path),
+        };
+        let page = crate::direct_projection::physical_page_for_test(
+            &entry,
+            document,
+            &ParseConfig::default(),
+        )
+        .expect("the page lowers through Direct Files");
+        page.blocks
+            .into_iter()
+            .map(|block| (block.content, block.path_refs))
+            .collect()
+    }
+
+    /// Managed Storage's answer, entered through the same capture the accepted
+    /// event path uses so the guard compares producers, not transcriptions.
+    fn managed_storage_path_refs() -> Vec<(String, Vec<String>)> {
+        managed_storage_path_refs_for(&parity_page_input())
+    }
+
+    fn managed_storage_path_refs_for(page: &MaterializedPageInput) -> Vec<(String, Vec<String>)> {
+        let lowered =
+            lower_pages_with_derived_rows(std::slice::from_ref(page), &ParseConfig::default())
+                .expect("the page lowers through Managed Storage");
+        lowered
+            .into_iter()
+            .next()
+            .expect("one lowered page")
+            .blocks
+            .into_iter()
+            .map(|block| (block.content, block.path_refs))
+            .collect()
+    }
+
+    /// The fixture as Managed Storage receives it: one page whose blocks carry
+    /// the facets `document_facets_from_parsed_block` captures, including the
+    /// `refs_norm` the closure runs over.
+    fn parity_page_input() -> MaterializedPageInput {
+        page_input_for(PARITY_NAME, PARITY_PATH, &parity_document())
+    }
+
+    fn page_input_for(
+        name: &str,
+        rel_path: &str,
+        document: &crate::doc::Document,
+    ) -> MaterializedPageInput {
+        let mut flat: Vec<MaterializedBlockInput> = Vec::new();
+        fn walk(
+            blocks: &[crate::doc::DocBlock],
+            parent: Option<BlockId>,
+            out: &mut Vec<MaterializedBlockInput>,
+        ) {
+            for block in blocks {
+                let id = BlockId::from_uuid(
+                    Uuid::parse_str(&block.uuid).expect("assigned runtime block identity"),
+                );
+                let (
+                    searchable_text,
+                    heading_level,
+                    collapsed,
+                    properties,
+                    tags,
+                    task,
+                    path_ref_names,
+                ) = super::super::sqlite::document_facets_from_parsed_block(block);
+                out.push(MaterializedBlockInput {
+                    block_id: id,
+                    home_document_id: document_id(1),
+                    parent,
+                    order: format!("{:08x}", out.len()),
+                    content: block.raw.clone(),
+                    searchable_text,
+                    heading_level,
+                    collapsed,
+                    logseq_uuid: None,
+                    logseq_identity_origin: None,
+                    references: Vec::new(),
+                    properties,
+                    tags,
+                    task,
+                    path_ref_names,
+                });
+                walk(&block.children, Some(id), out);
+            }
+        }
+        walk(&document.roots, None, &mut flat);
+        MaterializedPageInput {
+            page_id: page_id(1),
+            home_document_id: document_id(1),
+            name: name.to_owned(),
+            name_key: super::super::LogicalPageName::parse(name)
+                .expect("the page name is a logical page name")
+                .canonical_key()
+                .as_str()
+                .to_owned(),
+            path: ManagedPath::parse(rel_path).unwrap(),
+            kind: ManagedTextKind::Page,
+            preamble: document.pre_block.clone(),
+            searchable_text: name.to_owned(),
+            references: Vec::new(),
+            properties: Vec::new(),
+            tags: Vec::new(),
+            blocks: flat,
+        }
+    }
+
+    /// Guard 2 (§5.8 G1, I-19). One graph, two backends, one behaviour: the
+    /// rows Direct Files writes, the rows Managed Storage writes and the
+    /// closure the tree walk materializes are the same list for the same page.
+    /// The fixture pins whatever `refs_norm` holds for each form; it does not
+    /// legislate it.
+    #[test]
+    fn direct_files_managed_storage_and_the_walk_agree_on_block_path_refs() {
+        let direct = direct_files_path_refs();
+        let managed = managed_storage_path_refs();
+        let walked =
+            crate::query::walk_closure_names_for_test(PARITY_NAME, &parity_document().roots);
+
+        // Stated first: three empty lists would agree and prove nothing.
+        assert_eq!(direct.len(), 5, "the fixture page has five blocks");
+        assert!(
+            direct.iter().any(|(_, refs)| refs.len() > 1),
+            "at least one block must inherit a ref from an ancestor"
+        );
+
+        assert_eq!(direct, managed, "Direct Files and Managed Storage disagree");
+        assert_eq!(direct, walked, "the producers and the walk disagree");
+
+        // The shared truth, recorded. This is what `refs_norm` holds for each
+        // form today, not a rule this guard imposes: `[[Alpha]]` and `#beta`
+        // are the only two forms that produce a ref, every block carries its
+        // own page, and descendants inherit their ancestors' refs. Note that a
+        // block-level `tags::` value contributes NO ref here -- all three
+        // producers agree on that, so it is a recorded property of the parser,
+        // not a backend disagreement.
+        assert_eq!(
+            direct,
+            vec![
+                ("status:: open".to_owned(), vec!["parity page".to_owned()]),
+                (
+                    "tags:: Release, Docs".to_owned(),
+                    vec!["parity page".to_owned()]
+                ),
+                (
+                    "outer [[Alpha]]".to_owned(),
+                    vec!["alpha".to_owned(), "parity page".to_owned()]
+                ),
+                (
+                    "inner #beta".to_owned(),
+                    vec![
+                        "alpha".to_owned(),
+                        "beta".to_owned(),
+                        "parity page".to_owned()
+                    ]
+                ),
+                (
+                    "leaf".to_owned(),
+                    vec![
+                        "alpha".to_owned(),
+                        "beta".to_owned(),
+                        "parity page".to_owned()
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// Guard 5 (AGENTS §4 tier 2). The three-way agreement above, re-run over
+    /// every page of a real graph.
+    ///
+    /// Opt-in because this repository ships no corpus of that scale or shape:
+    /// `TINE_DERIVED_PARITY_GRAPH=~/research/logseq-anonymized`. Only aggregate
+    /// counts are printed; no corpus content is ever emitted, and on a
+    /// disagreement the failure names the page's INDEX, not its text.
+    ///
+    /// A disagreement here is a corpus defect in the synthetic fixture above:
+    /// the fix is to extract the minimal shape into the permanent fast corpus,
+    /// not to weaken this gate.
+    #[test]
+    #[ignore = "acceptance gate over a real corpus: set TINE_DERIVED_PARITY_GRAPH"]
+    fn derived_rows_agree_across_backends_over_a_real_corpus() {
+        let Some(root) = std::env::var_os("TINE_DERIVED_PARITY_GRAPH") else {
+            eprintln!("skipped: set TINE_DERIVED_PARITY_GRAPH to a corpus directory");
+            return;
+        };
+        let graph = crate::model::Graph::open(std::path::PathBuf::from(&root));
+        let mut pages = 0usize;
+        let mut blocks = 0usize;
+        let mut rows = 0usize;
+        let mut atoms = 0usize;
+        let mut disagreements = 0usize;
+        for (index, entry) in graph.list_pages().into_iter().enumerate() {
+            let Ok(text) = std::fs::read_to_string(&entry.path) else {
+                continue;
+            };
+            let document = parse_page(&entry.rel_path, &text);
+            let Ok(managed_path) = ManagedPath::parse(entry.rel_path.clone()) else {
+                continue;
+            };
+            let _ = managed_path;
+            let input = page_input_for(&entry.name, &entry.rel_path, &document);
+            let direct = direct_files_path_refs_for(&entry.name, &entry.rel_path, &document);
+            let managed = managed_storage_path_refs_for(&input);
+            let walked = crate::query::walk_closure_names_for_test(&entry.name, &document.roots);
+            if direct != managed || direct != walked {
+                disagreements += 1;
+                eprintln!(
+                    "derived-row parity disagreement at corpus page index {index} \
+                     (direct={} managed={} walk={} block rows)",
+                    direct.len(),
+                    managed.len(),
+                    walked.len()
+                );
+            }
+            pages += 1;
+            blocks += direct.len();
+            rows += direct.iter().map(|(_, refs)| refs.len()).sum::<usize>();
+            atoms += lower_pages_with_derived_rows(
+                std::slice::from_ref(&input),
+                &ParseConfig::default(),
+            )
+            .expect("the corpus page lowers")
+            .into_iter()
+            .map(|page| {
+                page.property_atoms.len()
+                    + page
+                        .blocks
+                        .iter()
+                        .map(|block| block.property_atoms.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+        }
+        eprintln!(
+            "derived_rows_agree_across_backends_over_a_real_corpus pages={pages} blocks={blocks} \
+             block_path_refs_rows={rows} property_atoms_rows={atoms} disagreements={disagreements}"
+        );
+        assert!(pages > 0, "the corpus directory holds no readable pages");
+        assert_eq!(disagreements, 0, "the backends disagree on a real graph");
+    }
+
+    /// I-15 cost report. Two new tables and six new indexes are new expensive
+    /// primitives; this measures what they cost on a real graph rather than
+    /// asserting they are cheap.
+    ///
+    /// "Before" is not a guess: both stores are built from the SAME lowered
+    /// pages through the SAME insert path, and the before-store simply carries
+    /// no `block_path_refs` or `property_atoms` rows -- which is exactly the
+    /// pre-P1-a row content, index maintenance included.
+    ///
+    /// Opt-in: `TINE_DERIVED_COST_GRAPH=~/research/logseq-anonymized`. Prints
+    /// aggregates only; no corpus content is emitted.
+    #[test]
+    #[ignore = "I-15 cost report over a real corpus: set TINE_DERIVED_COST_GRAPH"]
+    fn derived_row_build_cost_over_a_real_corpus() {
+        use std::time::Instant;
+
+        let Some(root) = std::env::var_os("TINE_DERIVED_COST_GRAPH") else {
+            eprintln!("skipped: set TINE_DERIVED_COST_GRAPH to a corpus directory");
+            return;
+        };
+        let config = ParseConfig::default();
+        let graph = crate::model::Graph::open(std::path::PathBuf::from(&root));
+        let mut inputs = Vec::new();
+        let mut skipped = 0usize;
+        for entry in graph.list_pages() {
+            let Ok(text) = std::fs::read_to_string(&entry.path) else {
+                skipped += 1;
+                continue;
+            };
+            if super::super::LogicalPageName::parse(&entry.name).is_err()
+                || ManagedPath::parse(entry.rel_path.clone()).is_err()
+            {
+                skipped += 1;
+                continue;
+            }
+            let document = parse_page(&entry.rel_path, &text);
+            let mut input = page_input_for(&entry.name, &entry.rel_path, &document);
+            input.page_id = page_id(inputs.len() as u128 + 1);
+            inputs.push(input);
+        }
+        assert!(
+            !inputs.is_empty(),
+            "the corpus directory holds no usable pages"
+        );
+
+        // The producers' own CPU, measured on the same inputs the builds use.
+        let producer_start = Instant::now();
+        let mut produced_rows = 0usize;
+        for input in &inputs {
+            let flat = input
+                .blocks
+                .iter()
+                .map(|block| crate::query::path_refs::PathRefBlock {
+                    id: block.block_id,
+                    parent: block.parent,
+                    refs: block.path_ref_names.as_slice(),
+                })
+                .collect::<Vec<_>>();
+            produced_rows += crate::query::derived::path_ref_rows(&input.name, &flat)
+                .values()
+                .map(Vec::len)
+                .sum::<usize>();
+            for block in &input.blocks {
+                produced_rows += crate::query::derived::property_atom_rows(
+                    &block
+                        .properties
+                        .iter()
+                        .map(|property| (property.name.clone(), property.value.clone()))
+                        .collect::<Vec<_>>(),
+                    crate::query::atom::AtomFormat::Markdown,
+                    &config,
+                )
+                .len();
+            }
+        }
+        let producer_elapsed = producer_start.elapsed();
+
+        const GROUP: usize = 32;
+        let strip = |page: &mut storage::PhysicalPage| {
+            page.property_atoms.clear();
+            for block in &mut page.blocks {
+                block.path_refs.clear();
+                block.property_atoms.clear();
+            }
+        };
+
+        // ---- genesis ----
+        let mut genesis_after = Vec::new();
+        for group in inputs.chunks(GROUP) {
+            genesis_after.push(
+                lower_terminal_chunk(
+                    TerminalMaterializationChunk {
+                        pages: group.to_vec(),
+                        postings: Vec::new(),
+                        aliases: Vec::new(),
+                    },
+                    &config,
+                )
+                .expect("the corpus lowers as a terminal chunk"),
+            );
+        }
+        let mut genesis_before = genesis_after.clone();
+        for chunk in &mut genesis_before {
+            for page in &mut chunk.pages {
+                strip(page);
+            }
+        }
+        let seed = |chunks: &[storage::PhysicalTerminalMaterializationChunk]| {
+            let mut connection = Connection::open_in_memory().unwrap();
+            initialize_schema(&connection, ContentDigest::of(b"empty")).unwrap();
+            let start = Instant::now();
+            for chunk in chunks {
+                let transaction = connection.transaction().unwrap();
+                storage::seed_terminal_chunk_for_test(&transaction, chunk).unwrap();
+                transaction.commit().unwrap();
+            }
+            start.elapsed()
+        };
+        let genesis_before_elapsed = seed(&genesis_before);
+        let genesis_after_elapsed = seed(&genesis_after);
+
+        // ---- delta ----
+        let mut delta_after = Vec::new();
+        for (index, group) in inputs.chunks(GROUP).enumerate() {
+            let change =
+                MaterializationChange::new(batch_id(index as u128 + 1), group.to_vec(), Vec::new())
+                    .unwrap();
+            let effect = semantic_effect_for_replacements(change.replacements());
+            let physical = lower_validated_change(
+                &change,
+                &effect,
+                None,
+                &EffectValidationContext::linear(),
+                &config,
+            )
+            .expect("the corpus lowers as a validated change");
+            delta_after.push((physical, change.digest().unwrap()));
+        }
+        let mut delta_before = delta_after.clone();
+        for (change, _) in &mut delta_before {
+            for page in &mut change.replacements {
+                strip(page);
+            }
+        }
+        let apply = |changes: &[(storage::PhysicalMaterializationChange, ContentDigest)]| {
+            let mut connection = Connection::open_in_memory().unwrap();
+            initialize_schema(&connection, ContentDigest::of(b"empty")).unwrap();
+            let start = Instant::now();
+            for (index, (change, digest)) in changes.iter().enumerate() {
+                let sequence = index as u64 + 1;
+                let transaction = connection.transaction().unwrap();
+                storage::apply_materialization_change_for_test(
+                    &transaction,
+                    change,
+                    sequence,
+                    *digest,
+                    ContentDigest::of(&sequence.to_be_bytes()),
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            }
+            start.elapsed()
+        };
+        let delta_before_elapsed = apply(&delta_before);
+        let delta_after_elapsed = apply(&delta_after);
+
+        eprintln!(
+            "derived_row_build_cost_over_a_real_corpus pages={} skipped={skipped} \
+             derived_rows={produced_rows} producer_cpu_ms={:.1} \
+             genesis_before_ms={:.1} genesis_after_ms={:.1} \
+             delta_before_ms={:.1} delta_after_ms={:.1}",
+            inputs.len(),
+            producer_elapsed.as_secs_f64() * 1000.0,
+            genesis_before_elapsed.as_secs_f64() * 1000.0,
+            genesis_after_elapsed.as_secs_f64() * 1000.0,
+            delta_before_elapsed.as_secs_f64() * 1000.0,
+            delta_after_elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+
+    /// Contract-first (AGENTS §5). The storage contract's derived-row rules and
+    /// the code that implements them move together, and the load-bearing names
+    /// in the prose are the ones the code actually uses: the tables exist under
+    /// those names, and every config key the contract names really does move
+    /// the digest the stamp records.
+    #[test]
+    fn the_storage_contract_names_the_derived_tables_and_the_parse_config_stamp() {
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        for phrase in [
+            "`block_path_refs`",
+            "`property_atoms`",
+            "`materialization_stamp.parse_config_hash`",
+            "de-duplicated by `atom_key`",
+            "renumbered `0..n`",
+            "`projection_source_revision`",
+            "never migrated in place, and no\nforensic evidence is preserved",
+        ] {
+            assert!(
+                contract.contains(phrase),
+                "the storage contract no longer says: {phrase}"
+            );
+        }
+
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, ContentDigest::of(b"empty")).unwrap();
+        for table in ["block_path_refs", "property_atoms"] {
+            let found: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                found, 1,
+                "the contract names a table the schema lacks: {table}"
+            );
+        }
+        connection
+            .query_row(
+                "SELECT parse_config_hash FROM materialization_stamp WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .expect("the stamp carries the column the contract names");
+
+        // Six config facts, six digest movements. A key named in the prose but
+        // absent from `ParseConfig` would leave the rebuild rule describing
+        // something that cannot happen.
+        let baseline = ParseConfig::default().digest();
+        for edn in [
+            "{:property/separated-by-commas #{:authors}}",
+            "{:ignored-page-references-keywords #{:url}}",
+            "{:block-hidden-properties #{:internal}}",
+            "{:journal/page-title-format \"yyyy-MM-dd\"}",
+            "{:journal/file-name-format \"yyyy_MM_dd\"}",
+            "{:file/name-format :triple-lowbar}",
+        ] {
+            assert_ne!(
+                crate::config::Config::parse(edn).parse_config().digest(),
+                baseline,
+                "this config edit does not move the parse-config digest: {edn}"
+            );
+        }
+    }
+
+    /// Guard 1 (§5.8, I-19). A genesis-built store and a delta-built store of
+    /// the same page hold byte-identical `block_path_refs` and
+    /// `property_atoms`. The two routes reach SQLite through different lowering
+    /// entry points -- `lower_terminal_chunk` and `lower_validated_change` --
+    /// so agreeing here is what makes "one graph, two build paths, one
+    /// behaviour" a fact rather than an intention.
+    #[test]
+    fn genesis_and_delta_stores_hold_byte_identical_derived_rows() {
+        const DERIVED: [&str; 2] = ["block_path_refs", "property_atoms"];
+        let empty_frontier = ContentDigest::of(b"empty");
+        let page = parity_page_input();
+
+        let mut delta = Connection::open_in_memory().unwrap();
+        initialize_schema(&delta, empty_frontier).unwrap();
+        let change =
+            MaterializationChange::new(batch_id(1), vec![page.clone()], Vec::new()).unwrap();
+        let input_digest = change.digest().unwrap();
+        let semantic_effect = semantic_effect_for_replacements(change.replacements());
+        let transaction = delta.transaction().unwrap();
+        apply_change(
+            &transaction,
+            &change,
+            &semantic_effect,
+            1,
+            input_digest,
+            ContentDigest::of(b"after"),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let mut genesis = Connection::open_in_memory().unwrap();
+        initialize_schema(&genesis, empty_frontier).unwrap();
+        let chunk = lower_terminal_chunk(
+            TerminalMaterializationChunk {
+                pages: vec![page],
+                postings: Vec::new(),
+                aliases: Vec::new(),
+            },
+            &ParseConfig::default(),
+        )
+        .unwrap();
+        let transaction = genesis.transaction().unwrap();
+        storage::seed_terminal_chunk_for_test(&transaction, &chunk).unwrap();
+        transaction.commit().unwrap();
+
+        let empty = Connection::open_in_memory().unwrap();
+        initialize_schema(&empty, empty_frontier).unwrap();
+
+        let derived_digests = |connection: &Connection| {
+            storage::materialization_row_digests_by_table_for_test(connection)
+                .unwrap()
+                .into_iter()
+                .filter(|(table, _)| DERIVED.contains(table))
+                .collect::<Vec<_>>()
+        };
+        let genesis_digests = derived_digests(&genesis);
+        let delta_digests = derived_digests(&delta);
+        let empty_digests = derived_digests(&empty);
+
+        // Two empty tables have equal digests, so state that the fixture
+        // actually populated both before comparing them.
+        assert_eq!(genesis_digests.len(), 2, "both derived tables are digested");
+        assert_ne!(
+            genesis_digests, empty_digests,
+            "the fixture must populate the derived tables it compares"
+        );
+        for ((table, genesis), (_, empty)) in genesis_digests.iter().zip(empty_digests.iter()) {
+            assert_ne!(genesis, empty, "{table} is empty in the genesis store");
+        }
+
+        assert_eq!(
+            genesis_digests, delta_digests,
+            "the genesis and delta stores disagree on the derived rows"
+        );
+    }
+
+    /// Guard 3 (§5.8 flattening). Per source row in source-ordinal order,
+    /// concatenated, de-duplicated by `atom_key` (first wins), renumbered
+    /// `0..n` -- asserted on the rows the producer actually emits.
+    #[test]
+    fn property_atom_rows_flatten_concatenate_dedupe_and_renumber() {
+        let properties = vec![
+            ("k".to_owned(), "a".to_owned()),
+            ("k".to_owned(), "a".to_owned()),
+            ("K".to_owned(), "b".to_owned()),
+            ("k".to_owned(), "a, c".to_owned()),
+        ];
+        let rows = crate::query::derived::property_atom_rows(
+            &properties,
+            crate::query::atom::AtomFormat::Markdown,
+            &ParseConfig::default(),
+        );
+        let atoms = rows
+            .iter()
+            .filter(|row| row.normalized_name == "k")
+            .map(|row| (row.ordinal, row.atom.clone(), row.atom_key.clone()))
+            .collect::<Vec<_>>();
+        // Four source rows in source-ordinal order yield `a`, `a`, `b`, then
+        // `a` and `c`. Concatenated that is [a, a, b, a, c]; de-duplicated by
+        // `atom_key` with first-wins it is [a, b, c]; renumbered it is 0..2.
+        // The atomizer's own comma handling is what turns the fourth row into
+        // two atoms -- the fixture pins that, it does not legislate it.
+        assert_eq!(
+            atoms,
+            vec![
+                (0, "a".to_owned(), "a".to_owned()),
+                (1, "b".to_owned(), "b".to_owned()),
+                (2, "c".to_owned(), "c".to_owned()),
+            ],
+            "atoms must concatenate in source order, drop repeats and renumber from zero"
+        );
+        // Renumbering is `0..n` over the surviving atoms, not the source rows:
+        // a gap would leave the primary key's ordinal meaning "which source row"
+        // instead of "which atom".
+        assert!(
+            rows.iter()
+                .filter(|row| row.normalized_name == "k")
+                .enumerate()
+                .all(|(index, row)| u32::try_from(index) == Ok(row.ordinal)),
+            "surviving atoms are renumbered contiguously"
+        );
+    }
+
+    /// The de-duplication key is `atom_key`, not the atom text: two source rows
+    /// that differ only in case are one atom, and the FIRST spelling is the one
+    /// that survives.
+    #[test]
+    fn property_atom_dedupe_is_by_atom_key_and_keeps_the_first_spelling() {
+        let properties = vec![
+            ("k".to_owned(), "Alpha".to_owned()),
+            ("k".to_owned(), "alpha".to_owned()),
+        ];
+        let rows = crate::query::derived::property_atom_rows(
+            &properties,
+            crate::query::atom::AtomFormat::Markdown,
+            &ParseConfig::default(),
+        );
+        let atoms = rows
+            .iter()
+            .filter(|row| row.normalized_name == "k")
+            .map(|row| (row.ordinal, row.atom.clone(), row.atom_key.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(atoms, vec![(0, "Alpha".to_owned(), "alpha".to_owned())]);
     }
 }

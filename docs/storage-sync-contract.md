@@ -404,9 +404,33 @@ recognized provider temporary files mean “delivery may still be settling.”
 Direct Files stores one app-private
 `direct-files-projections/<canonical-graph-path-digest>.sqlite` database outside
 the graph. It contains only the same parser-derived physical page, block, task,
-property, tag, and search facts accepted by managed storage's disposable
-projection; it contains no binding, oplog frontier, sync role, or authority
-stamp. Markdown/Org remains the sole Direct Files authority.
+property, tag, path-ref, property-atom, and search facts accepted by managed
+storage's disposable projection; it contains no binding, oplog frontier, sync
+role, or authority stamp. Markdown/Org remains the sole Direct Files authority.
+
+**Path refs and property atoms are one producer, not two.** `block_path_refs`
+holds each block's reference closure — its own normalized refs, every
+ancestor's, and the page's own normalized name — and `property_atoms` holds each
+property element already flattened, de-duplicated by `atom_key` (first spelling
+wins) and renumbered `0..n`. Both backends and the in-memory tree walk obtain
+these from the SAME closure and the SAME atomizer over the SAME per-block input
+(`refs_norm`, the parser's own normalized refs). No backend may grow its own
+copy that merely agrees by inspection: a graph has one behaviour, whichever
+storage mode holds it.
+
+**One parse config, or a rebuild.** Six graph-config facts decide those derived
+rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,
+`:block-hidden-properties`, `:journal/page-title-format`,
+`:journal/file-name-format` and `:file/name-format`. Their digest is stamped
+into the projection's
+`materialization_stamp.parse_config_hash` when the database is created, and
+every open route compares it. A mismatch is a benign, expected outcome of the
+user editing `config.edn`, not corruption: the projection is discarded and
+rebuilt from the untouched Markdown/Org tree, never migrated in place, and no
+forensic evidence is preserved. Direct Files reaches the same end differently —
+reconciliation compares only source revisions, so the same digest is folded into
+each page's `projection_source_revision`, and a config edit therefore re-lowers
+every page even though no file byte changed.
 
 Direct editor replacement briefly retains the old live inode as
 `.<target>.<pid>.<sequence>.editor-recovery` and the proposed bytes as the

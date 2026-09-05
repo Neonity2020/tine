@@ -236,6 +236,7 @@ impl AuthorityFixture {
             &database_path,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            &crate::config::ParseConfig::default(),
         )
         .unwrap()
         .expect("clean import authority fixture reopens");
@@ -254,6 +255,7 @@ impl AuthorityFixture {
             &writer,
             &clean_engine,
             projection,
+            crate::config::ParseConfig::default(),
         )
         .map_err(|(_, error)| error)
         .unwrap();

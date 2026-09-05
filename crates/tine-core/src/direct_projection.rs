@@ -1,3 +1,4 @@
+use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::oplog::query_lowering::drain_after;
@@ -70,6 +71,12 @@ enum PageDelta {
 struct PendingProjection {
     full: Option<(u64, PageSnapshot, PageRevisions)>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
+    /// The graph config the queued work must be lowered under (§5.8 M21). It is
+    /// stamped into every page's `projection_source_revision`, so a config edit
+    /// re-lowers every page on the next snapshot instead of leaving rows that
+    /// answer a question the config no longer asks (J7, D-1: rebuild, never
+    /// migrate).
+    parse_config: Option<Arc<ParseConfig>>,
     latest_generation: u64,
     stop: bool,
 }
@@ -137,12 +144,14 @@ impl DirectProjection {
         generation: u64,
         pages: PageSnapshot,
         revisions: PageRevisions,
+        parse_config: Arc<ParseConfig>,
     ) {
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
         pending.full = Some((generation, pages, revisions));
         pending.deltas.clear();
+        pending.parse_config = Some(parse_config);
         pending.latest_generation = generation;
         self.shared.changed.notify_one();
     }
@@ -153,21 +162,32 @@ impl DirectProjection {
         entry: PageEntry,
         document: Arc<Document>,
         revision: String,
+        parse_config: Arc<ParseConfig>,
     ) {
-        self.enqueue_delta(generation, PageDelta::Replace(entry, document, revision));
+        self.enqueue_delta(
+            generation,
+            PageDelta::Replace(entry, document, revision),
+            parse_config,
+        );
     }
 
-    pub(crate) fn enqueue_delete(&self, generation: u64, entry: PageEntry) {
-        self.enqueue_delta(generation, PageDelta::Delete(entry));
+    pub(crate) fn enqueue_delete(
+        &self,
+        generation: u64,
+        entry: PageEntry,
+        parse_config: Arc<ParseConfig>,
+    ) {
+        self.enqueue_delta(generation, PageDelta::Delete(entry), parse_config);
     }
 
-    fn enqueue_delta(&self, generation: u64, delta: PageDelta) {
+    fn enqueue_delta(&self, generation: u64, delta: PageDelta, parse_config: Arc<ParseConfig>) {
         self.shared.ready.store(false, Ordering::Release);
         let key = match &delta {
             PageDelta::Replace(entry, _, _) | PageDelta::Delete(entry) => entry.rel_path.clone(),
         };
         let mut pending = self.shared.pending.lock().unwrap();
         pending.deltas.insert(key, (generation, delta));
+        pending.parse_config = Some(parse_config);
         pending.latest_generation = pending.latest_generation.max(generation);
         self.shared.changed.notify_one();
     }
@@ -1050,7 +1070,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     let _lease = lease;
     let mut requires_full_rebuild = false;
     loop {
-        let (full, deltas, latest_generation) = {
+        let (full, deltas, parse_config, latest_generation) = {
             let mut pending = shared.pending.lock().unwrap();
             while pending.full.is_none() && pending.deltas.is_empty() && !pending.stop {
                 pending = shared.changed.wait(pending).unwrap();
@@ -1064,6 +1084,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             (
                 pending.full.take(),
                 std::mem::take(&mut pending.deltas),
+                pending
+                    .parse_config
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(ParseConfig::default())),
                 pending.latest_generation,
             )
         };
@@ -1073,7 +1097,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let applied = if requires_full_rebuild && !had_full {
             Err("a prior projection failure requires a complete parser snapshot".into())
         } else {
-            apply_pending(&mut database, full, deltas)
+            apply_pending(&mut database, full, deltas, &parse_config)
         };
         if let Err(error) = applied {
             requires_full_rebuild = true;
@@ -1130,21 +1154,24 @@ fn apply_pending(
     database: &mut PhysicalGraphProjectionDatabase,
     full: Option<(u64, PageSnapshot, PageRevisions)>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
+    parse_config: &ParseConfig,
 ) -> Result<(), String> {
+    let config_digest = parse_config.digest();
     if let Some((_, pages, revisions)) = full {
         let sources = pages
             .iter()
             .map(|(entry, _)| {
                 Ok(PhysicalGraphProjectionSourceRevision {
                     page_id: page_id(&entry.rel_path),
-                    revision: projection_source_revision(revisions.get(&entry.path).ok_or_else(
-                        || {
+                    revision: projection_source_revision(
+                        revisions.get(&entry.path).ok_or_else(|| {
                             format!(
                                 "parsed page has no exact source revision: {}",
                                 entry.rel_path
                             )
-                        },
-                    )?),
+                        })?,
+                        config_digest,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1159,7 +1186,7 @@ fn apply_pending(
         let lowered = pages
             .iter()
             .filter(|(entry, _)| replacements_needed.contains(&page_id(&entry.rel_path)))
-            .map(|(entry, document)| physical_page(entry, document))
+            .map(|(entry, document)| physical_page(entry, document, parse_config))
             .collect::<Result<Vec<_>, _>>()?;
         let mut replacements = Vec::with_capacity(lowered.len());
         let mut reference_postings = Vec::new();
@@ -1196,9 +1223,10 @@ fn apply_pending(
                 PageDelta::Replace(entry, document, revision) => {
                     replacement_sources.push(PhysicalGraphProjectionSourceRevision {
                         page_id: page_id(&entry.rel_path),
-                        revision: projection_source_revision(&revision),
+                        revision: projection_source_revision(&revision, config_digest),
                     });
-                    let (page, mut postings, mut page_aliases) = physical_page(&entry, &document)?;
+                    let (page, mut postings, mut page_aliases) =
+                        physical_page(&entry, &document, parse_config)?;
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
@@ -1221,13 +1249,41 @@ fn apply_pending(
     Ok(())
 }
 
-fn projection_source_revision(content_revision: &str) -> String {
-    format!("direct-facts-v{DIRECT_PROJECTION_FACTS_VERSION}:{content_revision}")
+/// The revision Direct Files compares to decide whether a page's rows are still
+/// current. Folding the parse-config digest in is what makes a config edit a
+/// full re-lowering (§5.8 J7): reconciliation compares only source revisions,
+/// so without it an unchanged file would keep rows built under the old config.
+fn projection_source_revision(
+    content_revision: &str,
+    parse_config_digest: tine_storage::ContentDigest,
+) -> String {
+    let digest = parse_config_digest
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("direct-facts-v{DIRECT_PROJECTION_FACTS_VERSION}:{digest}:{content_revision}")
+}
+
+/// The Direct Files producer, reachable from the cross-backend parity guard.
+///
+/// Named as a seam rather than widened: the guard has to compare the rows this
+/// exact function emits against the Managed Storage producer's and the walk's,
+/// and a reimplementation in the test would prove only that the test agrees
+/// with itself (§5.8 G1, I-19).
+#[cfg(test)]
+pub(crate) fn physical_page_for_test(
+    entry: &PageEntry,
+    document: &Document,
+    parse_config: &ParseConfig,
+) -> Result<PhysicalPage, String> {
+    physical_page(entry, document, parse_config).map(|(page, _, _)| page)
 }
 
 fn physical_page(
     entry: &PageEntry,
     document: &Document,
+    parse_config: &ParseConfig,
 ) -> Result<
     (
         PhysicalPage,
@@ -1239,7 +1295,12 @@ fn physical_page(
     #[cfg(test)]
     PHYSICAL_PAGE_LOWERINGS.fetch_add(1, Ordering::Relaxed);
     let id = page_id(&entry.rel_path);
-    let is_org = Format::from_path(Path::new(&entry.rel_path)) == Format::Org;
+    let format = Format::from_path(Path::new(&entry.rel_path));
+    let is_org = format == Format::Org;
+    // `Format::from_path` and never `reference_source_is_org`: the latter is a
+    // case-sensitive `ends_with(".org")` and would type an `Outline.ORG` page
+    // Markdown here while Direct Files types it Org (§5.8 E4).
+    let atom_format = crate::query::atom::AtomFormat::from(format);
     let (preamble_search, properties, tags) = document
         .pre_block
         .as_deref()
@@ -1277,6 +1338,7 @@ fn physical_page(
             crate::doc::property_reference_page_names(preamble).into_iter(),
         )?;
     }
+    let mut block_refs_norm: Vec<Vec<String>> = Vec::new();
     lower_blocks(
         &document.roots,
         id,
@@ -1284,7 +1346,33 @@ fn physical_page(
         &mut Vec::new(),
         &mut blocks,
         &mut reference_postings,
+        &mut block_refs_norm,
+        parse_config,
+        atom_format,
     )?;
+    // The two derived tables come from the ONE tine-core computation (§5.8):
+    // this side only hands it the block's own `refs_norm` and its parent.
+    let flat = blocks
+        .iter()
+        .zip(block_refs_norm.iter())
+        .map(|(block, refs)| crate::query::path_refs::PathRefBlock {
+            id: block.block_id,
+            parent: block.parent,
+            refs: refs.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let mut path_refs = crate::query::derived::path_ref_rows(&entry.name, &flat);
+    for block in &mut blocks {
+        block.path_refs = path_refs.remove(&block.block_id).unwrap_or_default();
+    }
+    let page_property_atoms = crate::query::derived::property_atom_rows(
+        &properties
+            .iter()
+            .map(|property| (property.name.clone(), property.value.clone()))
+            .collect::<Vec<_>>(),
+        atom_format,
+        parse_config,
+    );
     Ok((
         PhysicalPage {
             page_id: id,
@@ -1299,6 +1387,7 @@ fn physical_page(
             references: Vec::new(),
             properties,
             tags,
+            property_atoms: page_property_atoms,
             blocks,
         },
         reference_postings,
@@ -1306,6 +1395,7 @@ fn physical_page(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_blocks(
     source: &[DocBlock],
     page_id: [u8; 16],
@@ -1313,6 +1403,9 @@ fn lower_blocks(
     structural_path: &mut Vec<u32>,
     out: &mut Vec<PhysicalBlock>,
     reference_postings: &mut Vec<PhysicalReferencePosting>,
+    refs_norm: &mut Vec<Vec<String>>,
+    parse_config: &ParseConfig,
+    atom_format: crate::query::atom::AtomFormat,
 ) -> Result<(), String> {
     for (position, block) in source.iter().enumerate() {
         let position = u32::try_from(position)
@@ -1371,6 +1464,12 @@ fn lower_blocks(
                 value: value.clone(),
             })
             .collect();
+        let property_atoms = crate::query::derived::property_atom_rows(
+            &projection.properties,
+            atom_format,
+            parse_config,
+        );
+        refs_norm.push(projection.refs_norm.clone());
         let logseq_uuid = block
             .property("id")
             .and_then(|value| Uuid::parse_str(value.trim()).ok())
@@ -1396,6 +1495,9 @@ fn lower_blocks(
                 scheduled: projection.scheduled.clone(),
                 deadline: projection.deadline.clone(),
             }),
+            // Filled once per page, after the whole flat block list exists.
+            path_refs: Vec::new(),
+            property_atoms,
         });
         lower_blocks(
             &block.children,
@@ -1404,6 +1506,9 @@ fn lower_blocks(
             structural_path,
             out,
             reference_postings,
+            refs_norm,
+            parse_config,
+            atom_format,
         )?;
         structural_path.pop();
     }
@@ -2692,9 +2797,34 @@ mod tests {
     #[test]
     fn extractor_version_participates_in_disposable_source_revision() {
         let source = "sha256:unchanged-source";
-        let projected = projection_source_revision(source);
-        assert_eq!(projected, "direct-facts-v2:sha256:unchanged-source");
+        let digest = ParseConfig::default().digest();
+        let projected = projection_source_revision(source, digest);
+        let hex = digest
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            projected,
+            format!("direct-facts-v2:{hex}:sha256:unchanged-source")
+        );
         assert_ne!(projected, source);
+    }
+
+    /// Guard 4, Direct Files half (§5.8 J7). Reconciliation compares only
+    /// source revisions, so a config edit that changes no file byte must still
+    /// change the revision it compares -- otherwise every unchanged page keeps
+    /// rows derived under the old config forever.
+    #[test]
+    fn a_parse_config_change_moves_every_source_revision() {
+        let source = "sha256:unchanged-source";
+        let mut edited = ParseConfig::default();
+        edited.separated_by_commas.push("authors".to_owned());
+        assert_ne!(ParseConfig::default().digest(), edited.digest());
+        assert_ne!(
+            projection_source_revision(source, ParseConfig::default().digest()),
+            projection_source_revision(source, edited.digest()),
+        );
     }
 
     #[test]

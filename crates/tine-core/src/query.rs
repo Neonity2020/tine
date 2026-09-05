@@ -6,10 +6,12 @@
 pub mod atom;
 #[cfg(test)]
 mod conformance;
+pub mod derived;
 pub(crate) mod eval;
 pub mod ir;
 pub mod macro_text;
 pub(crate) mod og;
+pub mod path_refs;
 pub mod print;
 pub mod registry;
 pub(crate) mod tql;
@@ -373,47 +375,67 @@ fn walk<'a>(blocks: &'a [DocBlock], f: &mut impl FnMut(&'a DocBlock)) {
     }
 }
 
-type PathRefCounts = std::collections::HashMap<String, usize>;
+use crate::query::path_refs::PathRefCounts;
 
-fn push_path_refs(block: &DocBlock, refs: &mut PathRefCounts) {
-    for reference in &block.projection().refs_norm {
-        *refs.entry(reference.clone()).or_default() += 1;
-    }
+/// `children` and `refs` for the document tree, as
+/// [`crate::query::path_refs::dfs_path_refs`] wants them. The refs are
+/// `BlockProjection.refs_norm` -- the same per-block input the projection
+/// producers feed the closure (§5.8 G1), so the walk and the two backends
+/// cannot drift.
+fn doc_children(block: &DocBlock) -> &[DocBlock] {
+    &block.children
 }
 
-fn pop_path_refs(block: &DocBlock, refs: &mut PathRefCounts) {
-    for reference in &block.projection().refs_norm {
-        let remove = if let Some(count) = refs.get_mut(reference) {
-            *count -= 1;
-            *count == 0
-        } else {
-            false
-        };
-        if remove {
-            refs.remove(reference);
-        }
-    }
+fn doc_refs(block: &DocBlock) -> &[String] {
+    &block.projection().refs_norm
 }
 
 /// Walk all blocks while maintaining the normalized union of ancestor refs.
 /// This mirrors OG's materialized `:block/path-refs` without adding a second
 /// persistent index or turning deep outlines into an O(nodes * depth) scan.
+///
+/// The traversal and the multiset are
+/// [`crate::query::path_refs::dfs_path_refs`]'s, the same ones
+/// `path_refs_closure` runs to produce `block_path_refs` rows (§5.8).
 fn walk_path_refs<'a>(
     blocks: &'a [DocBlock],
     refs: &mut PathRefCounts,
     track_refs: bool,
     f: &mut impl FnMut(&'a DocBlock, &PathRefCounts),
 ) {
-    for block in blocks {
-        f(block, refs);
-        if track_refs {
-            push_path_refs(block, refs);
-        }
-        walk_path_refs(&block.children, refs, track_refs, f);
-        if track_refs {
-            pop_path_refs(block, refs);
-        }
-    }
+    crate::query::path_refs::dfs_path_refs(blocks, &doc_children, &doc_refs, refs, track_refs, f);
+}
+
+/// The walk's own `block_path_refs` answer for one page, keyed by block
+/// content, in walk order.
+///
+/// Test-only, and deliberately built from the same `walk_path_refs` +
+/// `closure_names` pair `eval_refs` uses, so the cross-backend parity guard
+/// compares the walk's behaviour rather than a copy of it (§5.8 G1, I-19).
+#[cfg(test)]
+pub(crate) fn walk_closure_names_for_test(
+    page_name: &str,
+    blocks: &[DocBlock],
+) -> Vec<(String, Vec<String>)> {
+    let page_key = refs::normalize(page_name);
+    let mut counts = PathRefCounts::new();
+    let mut out = Vec::new();
+    walk_path_refs(
+        blocks,
+        &mut counts,
+        true,
+        &mut |block: &DocBlock, ancestors: &PathRefCounts| {
+            out.push((
+                block.raw.clone(),
+                crate::query::path_refs::closure_names(
+                    &page_key,
+                    &block.projection().refs_norm,
+                    ancestors,
+                ),
+            ));
+        },
+    );
+    out
 }
 
 /// Collect matches in document order while evaluating every candidate exactly
@@ -455,6 +477,13 @@ fn collect_matching_path<'a, M, T>(
     }
 }
 
+/// The OG result-presentation walk, over the one path-refs traversal.
+///
+/// `path` and the matched-ancestor flag are the visitor's own stacks, pushed in
+/// pre-order and popped in post-order, so this keeps the previous shape exactly:
+/// a block is classified against the path and the ancestor refs that do NOT yet
+/// include its own, and is dropped from the output when its immediate parent
+/// matched (`tree/filter-top-level-blocks`).
 fn collect_og_query_roots<'a, M, T>(
     blocks: &'a [DocBlock],
     path: &mut Vec<&'a DocBlock>,
@@ -465,35 +494,57 @@ fn collect_og_query_roots<'a, M, T>(
     materialize: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock], M) -> Option<T>,
     out: &mut Vec<T>,
 ) {
-    for block in blocks {
-        let classification = classify(block, path, path_refs);
-        let matched = classification.is_some();
-        if !parent_matched {
-            if let Some(classification) = classification {
-                if let Some(item) = materialize(block, path, classification) {
-                    out.push(item);
+    struct OgRoots<'a, 'v, M, T, C, Z> {
+        path: &'v mut Vec<&'a DocBlock>,
+        matched: Vec<bool>,
+        classify: &'v mut C,
+        materialize: &'v mut Z,
+        out: &'v mut Vec<T>,
+        marker: std::marker::PhantomData<M>,
+    }
+
+    impl<'a, M, T, C, Z> crate::query::path_refs::PathRefVisitor<'a, DocBlock>
+        for OgRoots<'a, '_, M, T, C, Z>
+    where
+        C: FnMut(&'a DocBlock, &[&'a DocBlock], &PathRefCounts) -> Option<M>,
+        Z: FnMut(&'a DocBlock, &[&'a DocBlock], M) -> Option<T>,
+    {
+        fn enter(&mut self, block: &'a DocBlock, ancestor_refs: &PathRefCounts) {
+            let classification = (self.classify)(block, self.path, ancestor_refs);
+            let matched = classification.is_some();
+            if !self.matched.last().copied().unwrap_or(false) {
+                if let Some(classification) = classification {
+                    if let Some(item) = (self.materialize)(block, self.path, classification) {
+                        self.out.push(item);
+                    }
                 }
             }
+            self.path.push(block);
+            self.matched.push(matched);
         }
-        path.push(block);
-        if track_path_refs {
-            push_path_refs(block, path_refs);
+
+        fn leave(&mut self, _block: &'a DocBlock) {
+            self.matched.pop();
+            self.path.pop();
         }
-        collect_og_query_roots(
-            &block.children,
-            path,
-            path_refs,
-            track_path_refs,
-            matched,
-            classify,
-            materialize,
-            out,
-        );
-        if track_path_refs {
-            pop_path_refs(block, path_refs);
-        }
-        path.pop();
     }
+
+    let mut visitor = OgRoots {
+        path,
+        matched: vec![parent_matched],
+        classify,
+        materialize,
+        out,
+        marker: std::marker::PhantomData,
+    };
+    crate::query::path_refs::dfs_path_refs(
+        blocks,
+        &doc_children,
+        &doc_refs,
+        path_refs,
+        track_path_refs,
+        &mut visitor,
+    );
 }
 
 fn collect_reference_matches<'a, M, T>(
