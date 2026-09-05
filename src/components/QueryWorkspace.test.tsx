@@ -15,7 +15,7 @@ import {
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
 import { pageInventoryRev } from "../ui";
-import { SaveConflictError } from "../backend";
+import { backend, SaveConflictError } from "../backend";
 
 afterEach(() => {
   clearTransientLayersForTest();
@@ -268,6 +268,9 @@ describe("QueryWorkspace", () => {
       source: "(and (task TODO))",
       presentation: "list",
     };
+    // The pane shows what the PRINTER returned (I-12); the dev-preview backend
+    // has no printer, so this test says what Rust would answer.
+    vi.spyOn(backend(), "printQuery").mockResolvedValue(route.source);
     const lower = vi.fn(() => true);
     const unregisterLower = registerTransientLayer({ id: "query-workspace-lower", dismiss: lower });
     const root = document.createElement("div");
@@ -280,6 +283,9 @@ describe("QueryWorkspace", () => {
       const dialog = root.querySelector<HTMLElement>(".query-advanced-modal")!;
       expect(dialog).not.toBeNull();
 
+      // The bar is over the IR now, so it appears once the ENGINE has read the
+      // route's text — there is no frontend parser left to do it synchronously.
+      await waitFor(() => expect(root.querySelector(".qb-chip")).not.toBeNull());
       root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
       expect(root.querySelector(".qb-menu")).not.toBeNull();
 
@@ -296,7 +302,9 @@ describe("QueryWorkspace", () => {
         .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
       expect(root.querySelector(".qb-menu")).toBeNull();
       expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
-      expect(root.querySelector<HTMLTextAreaElement>(".query-dsl-editor textarea")?.value).toBe(route.source);
+      await waitFor(() =>
+        expect(root.querySelector<HTMLTextAreaElement>(".query-text-pane-input")?.value).toBe(route.source),
+      );
       expect(lower).not.toHaveBeenCalled();
 
       expect(dismissTopTransient("back")).toBe(true);

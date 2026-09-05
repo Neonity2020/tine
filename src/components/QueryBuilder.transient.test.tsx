@@ -9,14 +9,32 @@ import {
   dismissTopTransient,
   registerTransientLayer,
 } from "../transientLayers";
-import { QueryBuilder } from "./QueryBuilder";
+import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
+import { priorityFilter, taskFilter } from "../editor/queryBuilder";
+import type { Filter } from "../editor/queryIr";
 
-function mountBuilder(dsl = "(and (task TODO))") {
+// The builder edits the IR now, so the harness hands it a `Filter` rather than a
+// DSL string: there is no frontend parser left to turn text into a tree, and the
+// popover behaviour under test never depended on the text form.
+function session(filter: Filter): BuilderSession {
+  return { query: { anchor: "block", filter, source: { kind: "builder" } }, view: {} };
+}
+
+function nested(depth: number, leaf: Filter): Filter {
+  let filter = leaf;
+  for (let level = 0; level < depth; level += 1) filter = { kind: "and", items: [filter] };
+  return filter;
+}
+
+function mountBuilder(filter: Filter = taskFilter(["TODO"])) {
   const host = document.createElement("div");
   document.body.append(host);
-  const [source, setSource] = createSignal(dsl);
-  const dispose = render(() => <QueryBuilder dsl={source} onChange={setSource} />, host);
-  return { host, source, dispose };
+  const [current, setCurrent] = createSignal<BuilderSession>(session(filter));
+  const dispose = render(
+    () => <QueryBuilder session={current} onChange={setCurrent} />,
+    host
+  );
+  return { host, source: () => JSON.stringify(current()), dispose };
 }
 
 afterEach(() => {
@@ -28,6 +46,9 @@ afterEach(() => {
 
 beforeEach(() => {
   vi.spyOn(backend(), "queryFacets").mockResolvedValue([]);
+  // The text pane's contents are PRINTED BY RUST (I-12); these tests are about
+  // the popovers above it, so the printer is stubbed rather than exercised.
+  vi.spyOn(backend(), "printQuery").mockResolvedValue("(and (task TODO))");
 });
 
 describe("QueryBuilder transient ownership (post-GH #161)", () => {
@@ -57,8 +78,7 @@ describe("QueryBuilder transient ownership (post-GH #161)", () => {
 
   it("renders a bounded sentinel instead of recursing through a hostile query tree", () => {
     const depth = 65;
-    const dsl = `${"(and ".repeat(depth)}[[Leaf]]${")".repeat(depth)}`;
-    const { host, dispose } = mountBuilder(dsl);
+    const { host, dispose } = mountBuilder(nested(depth, taskFilter(["TODO"])));
     try {
       expect(host.querySelector(".qb-depth-limit")?.textContent).toContain("64");
       expect(host.querySelectorAll(".qb-group").length).toBeLessThanOrEqual(64);
@@ -67,7 +87,7 @@ describe("QueryBuilder transient ownership (post-GH #161)", () => {
     }
   });
 
-  it("gives every popover family one Escape or Back rung above a lower owner without changing the DSL", () => {
+  it("gives every popover family one Escape or Back rung above a lower owner without changing the query", () => {
     const { host, source, dispose } = mountBuilder();
     const original = source();
     const cases: Array<{ open: () => HTMLButtonElement; visible: string; reason: "escape" | "back" }> = [
@@ -114,8 +134,8 @@ describe("QueryBuilder transient ownership (post-GH #161)", () => {
     // here is that two builders on one page own separate popover state, and that
     // a press inside one is an OUTSIDE press for the other (GH #472) — so they
     // cannot both stay open, and the one pressed survives.
-    const first = mountBuilder("(and (task TODO))");
-    const second = mountBuilder("(and (priority A))");
+    const first = mountBuilder(taskFilter(["TODO"]));
+    const second = mountBuilder(priorityFilter(["A"]));
     try {
       first.host.querySelector<HTMLButtonElement>(".qb-chip")!.click();
       second.host.querySelector<HTMLButtonElement>(".qb-chip")!.click();
@@ -187,11 +207,11 @@ describe("GH #472: every Query Builder popover closes on an outside press", () =
 
   // Both event types, because touch and pen deliver only the first and some
   // synthesized/compatibility paths only the second.
-  it("closes each popover on an outside mousedown without changing the DSL", () => {
+  it("closes each popover on an outside mousedown without changing the query", () => {
     expectAllClosedBy("mousedown");
   });
 
-  it("closes each popover on an outside pointerdown without changing the DSL", () => {
+  it("closes each popover on an outside pointerdown without changing the query", () => {
     expectAllClosedBy("pointerdown");
   });
 
@@ -259,7 +279,7 @@ describe("QueryBuilder facet sharing (Harvest W4-P1 item 3)", () => {
       autocomplete ? [["autocomplete-only", ["a"]]] : payloads[current]
     );
 
-    const builders = Array.from({ length: 5 }, () => mountBuilder("(and (task TODO))"));
+    const builders = Array.from({ length: 5 }, () => mountBuilder(taskFilter(["TODO"])));
     try {
       await Promise.resolve();
       await Promise.resolve();

@@ -12,35 +12,60 @@ import {
 } from "solid-js";
 import { backend } from "../backend";
 import {
-  parseQuery,
-  toDsl,
-  clauseToAdvanced,
-  stashSimpleForm,
-  clauseLabel,
   addChild,
+  betweenFilter,
+  builderLeafKind,
+  builderRoot,
+  contentFilter,
+  currentAgg,
+  currentGroup,
+  currentSort,
+  filterChildren,
+  filterLabel,
+  journalFilter,
+  namespaceFilter,
+  onPageFilter,
+  pagePropertyFilter,
+  pageRefFilter,
+  pageTagsFilter,
+  planningFilter,
+  priorityFilter,
+  propertyFilter,
   removeAt,
   replaceAt,
-  wrapAt,
-  unwrapAt,
+  searchFilter,
   setOp,
-  MARKERS,
-  PRIORITIES,
+  sortLabel,
+  taskFilter,
+  unwrapAt,
+  withAgg,
+  withGroup,
+  withSort,
+  wrapAt,
   BETWEEN_FIELDS,
+  MARKERS,
   MAX_QUERY_BUILDER_DEPTH,
+  PRIORITIES,
   SORT_PRESETS,
-  type Clause,
+  type AggState,
   type BetweenField,
+  type BuilderLeafKind,
   type SortPreset,
 } from "../editor/queryBuilder";
+import type { AggFn, Filter, Query, QueryPrintDialect, ViewSettings } from "../editor/queryIr";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
 import { sharedQueryResult } from "../queryResultCache";
-import { dataRev, graphEpoch, graphMeta, pushToast, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
+import { dataRev, graphEpoch, graphMeta, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
 import { dismissOnOutsidePointer, registerTransientLayer, type TransientLayer } from "../transientLayers";
 
-// Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
-// The DSL text is the single source of truth — we parse it to a tree, apply an
-// immutable edit, and write the new DSL back through `onChange` (which rewrites
-// the owning block). Results then re-run reactively.
+// Interactive query builder: an OG-style chip bar over the query **IR**.
+//
+// It used to be a chip bar over a DSL STRING — parse the text, edit the private
+// `Clause` tree, print the text back. Both ends of that round trip were a second
+// implementation of a language Rust already owns, and they disagreed with it
+// (I-12). Now the bar edits `Filter` and `ViewSettings` directly and the only
+// text in this component is what `query_print` produced and what the user typed
+// into the pane, which `query_parse` reads back.
 //
 // `stop` keeps clicks inside the bar from bubbling to the block's onClick, which
 // would drop the block into raw-text edit mode and replace the builder.
@@ -50,7 +75,16 @@ type QueryFacets = [string, string[]][];
 type QueryFacetsAccessor = Accessor<QueryFacets | undefined>;
 const locKey = (l: number[]) => l.join(".");
 
-type ClauseKind = Clause["kind"];
+/** The pair an edit session holds (§4.3.1). `query` carries the anchor, the
+ *  filter, the diagnostics and the authored source — including the opaque
+ *  options map, which only Rust ever splits or appends. */
+export interface BuilderSession {
+  query: Query;
+  view: ViewSettings;
+}
+
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
 // Every popover in the bar — clause menu, add-filter picker, sort, summarize —
 // registers here, so all four answer Escape/Back AND "the user pressed somewhere
@@ -71,56 +105,22 @@ function registerVisiblePopover(open: () => boolean, layer: TransientLayer) {
   });
 }
 
-// Sort is query-GLOBAL (not a filter chip), so it's handled separately from the
-// clause tree: a single root-level `sortBy` child. These helpers read/replace it.
-function rootChildren(root: Clause): Clause[] {
-  return root.kind === "op" && root.op === "and" ? root.children : [root];
-}
-function currentSort(root: Clause): { field: string; dir: "asc" | "desc" } | null {
-  const s = rootChildren(root).find((c) => c.kind === "sortBy");
-  return s && s.kind === "sortBy" ? { field: s.field, dir: s.dir } : null;
-}
-function withSort(root: Clause, sort: { field: string; dir: "asc" | "desc" } | null): Clause {
-  // Explicit Clause[] — else TS narrows the filtered array to exclude sortBy
-  // (inferred type predicate) and rejects the push below.
-  const kids: Clause[] = rootChildren(root).filter((c) => c.kind !== "sortBy");
-  if (sort && sort.field.trim()) {
-    kids.push({ kind: "sortBy", field: sort.field.trim(), dir: sort.dir });
-  }
-  // Re-wrap as a root `and`; toDsl simplifies a single child back to bare form.
-  return { kind: "op", op: "and", children: kids };
-}
-
-// Aggregation + grouping are result-level directives (like sort), held as
-// root-level `aggregate`/`groupBy` children and edited via the "+ summarize"
-// control below — not as filter chips. These helpers read/replace them.
-type AggState = { agg: "count" | "sum" | "avg"; field: string | null };
-function currentAgg(root: Clause): AggState | null {
-  const a = rootChildren(root).find((c) => c.kind === "aggregate");
-  return a && a.kind === "aggregate" ? { agg: a.agg, field: a.field } : null;
-}
-function currentGroup(root: Clause): string | null {
-  const g = rootChildren(root).find((c) => c.kind === "groupBy");
-  return g && g.kind === "groupBy" ? g.field : null;
-}
-function withAgg(root: Clause, agg: AggState | null): Clause {
-  const kids: Clause[] = rootChildren(root).filter((c) => c.kind !== "aggregate");
-  if (agg) kids.push({ kind: "aggregate", agg: agg.agg, field: agg.field });
-  return { kind: "op", op: "and", children: kids };
-}
-function withGroup(root: Clause, field: string | null): Clause {
-  const kids: Clause[] = rootChildren(root).filter((c) => c.kind !== "groupBy");
-  if (field && field.trim()) kids.push({ kind: "groupBy", field: field.trim() });
-  return { kind: "op", op: "and", children: kids };
-}
-
 // A small "+ sort" / "sort: field ↑" control in the bar (NOT a filter chip).
 // The popover leads with one-click presets (the common cases — no typing, no
 // syntax to get wrong) and keeps a free-text row for sorting by any other
 // property. `SORT_PRESETS` is the single source of truth (see queryBuilder.ts).
-function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; parentTransientId?: string }): JSX.Element {
+//
+// **It edits `ViewSettings`, not the filter (§7.6, Q15).** Sort used to live in
+// the clause tree as a fake `sortBy` child, which is why wrapping it in an OR
+// silently disabled it and why the chip menu had to special-case it. Presentation
+// is now a separate value and the printers re-emit it.
+function SortControl(props: {
+  view: () => ViewSettings;
+  apply: (view: ViewSettings) => void;
+  parentTransientId?: string;
+}): JSX.Element {
   const [open, setOpen] = createSignal(false);
-  const cur = () => currentSort(props.tree());
+  const cur = () => currentSort(props.view());
   // The free-text escape hatch: sort by an arbitrary property name.
   const [field, setField] = createSignal("");
   const [dir, setDir] = createSignal<"asc" | "desc">("asc");
@@ -149,31 +149,30 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
     setOpen(true);
   };
   const applyPreset = (p: SortPreset) => {
-    props.apply(withSort(props.tree(), { field: p.field, dir: p.dir }));
+    props.apply(withSort(props.view(), { field: p.field, dir: p.dir }));
     setOpen(false);
   };
   const applyCustom = () => {
     if (!field().trim()) return;
-    props.apply(withSort(props.tree(), { field: field().trim(), dir: dir() }));
+    props.apply(withSort(props.view(), { field: field().trim(), dir: dir() }));
     setOpen(false);
   };
   const clearSort = () => {
-    props.apply(withSort(props.tree(), null));
+    props.apply(withSort(props.view(), null));
     setOpen(false);
   };
   return (
     <span class="qb-add-wrap">
       {/* A stable "+ sort" affordance — it does NOT morph into the current sort
-          value (the active sort shows as its own chip in the bar). It just gains
-          an `active` highlight and opens the popover to change/clear. */}
+          value. It just gains an `active` highlight and opens the popover. */}
       <button
         ref={triggerEl}
         class="qb-sort"
         classList={{ active: !!cur() }}
-        title={cur() ? `Sorted by ${clauseLabel({ kind: "sortBy", field: cur()!.field, dir: cur()!.dir })}. Click to change.` : "Sort results"}
+        title={cur() ? `Sorted by ${sortLabel(cur()!.field, cur()!.dir)}. Click to change.` : "Sort results"}
         onClick={(e) => { stop(e); open() ? setOpen(false) : openPopover(); }}
       >
-        + sort
+        {cur() ? `sort: ${sortLabel(cur()!.field, cur()!.dir)}` : "+ sort"}
       </button>
       <Show when={open()}>
         <div ref={pickerEl} class="qb-picker qb-sort-picker" onClick={stop}>
@@ -222,16 +221,21 @@ function SortControl(props: { tree: () => Clause; apply: (c: Clause) => void; pa
 // property) and grouping (by page or a property). Modeled on SortControl — a
 // single pill + popover, dismiss-on-outside-click. Aggregate + group are
 // independent (you can group by page AND count per group). The numbers are
-// computed in the frontend from the returned block list (Macro.tsx); this just
-// edits the DSL directive that rides along.
-function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => void; facets: QueryFacetsAccessor; parentTransientId?: string }): JSX.Element {
+// computed in the frontend from the returned block list (Macro.tsx); this edits
+// the VIEW SETTINGS the printers re-emit (§7.6).
+function SummarizeControl(props: {
+  view: () => ViewSettings;
+  apply: (view: ViewSettings) => void;
+  facets: QueryFacetsAccessor;
+  parentTransientId?: string;
+}): JSX.Element {
   const [open, setOpen] = createSignal(false);
   // Two-step property choice: null = show the top-level buttons; "sum"/"avg" =
   // pick a property to aggregate; "group" = pick a property to group by.
   const [pick, setPick] = createSignal<"sum" | "avg" | "group" | null>(null);
   const keys = () => (props.facets() ?? []).map(([k]) => k);
-  const agg = () => currentAgg(props.tree());
-  const group = () => currentGroup(props.tree());
+  const agg = () => currentAgg(props.view());
+  const group = () => currentGroup(props.view());
   const active = () => !!agg() || !!group();
   let triggerEl: HTMLButtonElement | undefined;
   let pickerEl: HTMLDivElement | undefined;
@@ -248,15 +252,15 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
     setOpen(true);
   };
   // Each pick applies and closes the popover (like SortControl's presets). To set
-  // BOTH an aggregate and a grouping, reopen — the two are independent, so the DSL
-  // keeps whichever the other pick already set.
+  // BOTH an aggregate and a grouping, reopen — the two are independent, so the
+  // view keeps whichever the other pick already set.
   const setAgg = (a: AggState | null) => {
-    props.apply(withAgg(props.tree(), a));
+    props.apply(withAgg(props.view(), a));
     setPick(null);
     setOpen(false);
   };
   const setGroup = (f: string | null) => {
-    props.apply(withGroup(props.tree(), f));
+    props.apply(withGroup(props.view(), f));
     setPick(null);
     setOpen(false);
   };
@@ -303,12 +307,12 @@ function SummarizeControl(props: { tree: () => Clause; apply: (c: Clause) => voi
             <div class="qb-picker-title">{pick() === "group" ? "Group by property" : `${pick() === "sum" ? "Sum" : "Average"} of property`}</div>
             <For each={keys()}>
               {(k) => (
-                <button class="qb-menu-item" onClick={() => (pick() === "group" ? setGroup(k) : setAgg({ agg: pick() as "sum" | "avg", field: k }))}>
+                <button class="qb-menu-item" onClick={() => (pick() === "group" ? setGroup(k) : setAgg({ agg: pick() as AggFn, field: k }))}>
                   {k}
                 </button>
               )}
             </For>
-            <PropNameInput onCommit={(k) => (pick() === "group" ? setGroup(k) : setAgg({ agg: pick() as "sum" | "avg", field: k }))} />
+            <PropNameInput onCommit={(k) => (pick() === "group" ? setGroup(k) : setAgg({ agg: pick() as AggFn, field: k }))} />
           </Show>
         </div>
       </Show>
@@ -331,27 +335,246 @@ function PropNameInput(props: { onCommit: (key: string) => void }): JSX.Element 
   );
 }
 
-// "Switch to advanced" converts the CURRENT builder tree to its single-line
-// Datalog equivalent (clauseToAdvanced) — it must never discard the query and
-// never write a multi-line macro: lsdoc `{{query …}}` macros don't span lines,
-// so the old multi-line skeleton made the block stop parsing as a query at all
-// and silently destroyed the user's simple query (Jul 8 data-mutation bug).
-// The clause cheat-sheet lives in the pill's tooltip instead of the file.
-const ADVANCED_CHEATSHEET =
-  'Convert this query to an advanced (Datalog) [:find …] form. Supported clauses: ' +
-  '(task ?b "TODO" "DOING"), (priority ?b "A"), (page-ref ?b "Page"), (property ?b :key "v"), ' +
-  '(page-property ?b :key), (page-tags ?b "tag"), (scheduled ?b), (deadline ?b), (journal ?b), ' +
-  '(page ?b "Name"), (namespace ?b "Parent"), (between ?b "2026-01-01" "2026-12-31"), ' +
-  'combined with (and …) (or …) (not …). Unsupported clauses are flagged, never guessed. ' +
-  'Keep it on ONE line and avoid #{…} sets — a query macro cannot span lines or contain braces.';
+// ---------------------------------------------------------------------------
+// The text pane (§4.3.1, §7.1)
+// ---------------------------------------------------------------------------
+
+/** How long the pane waits after the last keystroke before asking the engine.
+ *  §7.1's ~150 ms: long enough that ordinary typing is one parse, short enough
+ *  that the rows follow the text rather than trailing it. */
+const PANE_DEBOUNCE_MS = 150;
+
+/** The query text pane.
+ *
+ *  **One implementation, two dialects.** A query block edits TQL and the query
+ *  workspace edits the OG DSL, because that is the text each of them persists —
+ *  but "debounce, parse, keep the last good reading, drop a stale response" is
+ *  the same question in both, so it is answered once (I-12). The dialect is an
+ *  input, not a second pane.
+ *
+ *  The contract it implements, from §4.3.1:
+ *
+ *  - A failed parse **keeps the draft and the last-good session**, shows the
+ *    parser's OWN message, and disables save. It never blanks the pane and never
+ *    writes to disk. The bar above renders greyed while this holds, so the rows
+ *    on screen are visibly "what still ran", not "what you just typed".
+ *  - **I-20:** a monotonically increasing edit revision discards stale parse
+ *    responses. A slow answer for text the user has since retyped is DROPPED,
+ *    not rendered — the failure mode it prevents is a late success overwriting a
+ *    later edit's error, which reads as "my typo was accepted".
+ *  - Saving waits for a successful parse of the CURRENT revision, so the pending
+ *    state disables save too. There is no spinner that outlives a response:
+ *    every settled revision clears it, including a dropped one.
+ *  - The pane is not an options editor. */
+function QueryTextPane(props: {
+  session: () => BuilderSession | undefined;
+  dialect: Extract<QueryPrintDialect, "og" | "tql">;
+  /** A successful parse of the current revision: the new filter/anchor, ready to
+   *  be shown. Carry-forward of the view and the opaque options is the caller's
+   *  (`QueryBuilder`'s), because it owns the session. */
+  onParsed: (query: Query) => void;
+  /** Commit the last-good parse. Enabled only when the current revision parsed. */
+  onCommit: (query: Query) => void;
+  onStale: (stale: boolean) => void;
+  alwaysOpen?: boolean;
+}): JSX.Element {
+  const [draft, setDraft] = createSignal<string | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [pending, setPending] = createSignal(false);
+  const [good, setGood] = createSignal<Query | null>(null);
+  // The edit revision. `settled` is the newest revision whose response we
+  // accepted; a response for anything older is dropped unrendered (I-20).
+  let revision = 0;
+  let settled = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(timer));
+
+  // The pane is collapsed until the user asks for it, and a closed pane prints
+  // nothing: the text it would show is an IPC round trip per query block on the
+  // page, spent on bytes nobody is looking at.
+  const [open, setOpen] = createSignal(!!props.alwaysOpen);
+
+  // The session's own text is PRINTED BY RUST. The pane never renders a query it
+  // spelled itself — that was the twin this packet removed.
+  const [printed] = createResource(
+    () => (open() ? props.session() : undefined),
+    async (session) => {
+      try {
+        return { text: await backend().printQuery(session.query, session.view, props.dialect), refusal: null };
+      } catch (error) {
+        return { text: null, refusal: errorMessage(error) };
+      }
+    },
+  );
+
+  // A session arriving from outside the pane (a chip edit, a save landing, a
+  // different block) invalidates every outstanding response and the draft with
+  // it (§4.3.1: "switching host block or closing the session invalidates
+  // outstanding responses").
+  createEffect(() => {
+    props.session();
+    revision += 1;
+    settled = revision;
+    clearTimeout(timer);
+    setDraft(null);
+    setError(null);
+    setPending(false);
+    setGood(null);
+    props.onStale(false);
+  });
+
+  const text = () => draft() ?? printed.latest?.text ?? "";
+  const refusal = () => (draft() === null ? printed.latest?.refusal ?? null : null);
+
+  const run = async (source: string, mine: number) => {
+    try {
+      const parsed = await backend().parseQuery(source, props.dialect);
+      // I-20: the user has typed since; this answer is about text that no longer
+      // exists. Dropping it is the whole point — rendering it would replace a
+      // newer reading with an older one.
+      if (mine <= settled) return;
+      settled = mine;
+      setPending(false);
+      // A diagnostic inside an `off` subtree carries `disabled` and does not
+      // invalidate (§3.5) — a parse with only disabled diagnostics is successful
+      // and saveable.
+      const blocking = (parsed.query.diagnostics ?? []).filter((d) => !d.disabled);
+      if (blocking.length) {
+        setError(blocking.map((d) => d.message).join(" · "));
+        props.onStale(true);
+        return;
+      }
+      setError(null);
+      setGood(parsed.query);
+      props.onStale(false);
+      props.onParsed(parsed.query);
+    } catch (error) {
+      if (mine <= settled) return;
+      settled = mine;
+      setPending(false);
+      setError(errorMessage(error));
+      props.onStale(true);
+    }
+  };
+
+  const onInput = (next: string) => {
+    setDraft(next);
+    revision += 1;
+    const mine = revision;
+    clearTimeout(timer);
+    // The pane is not an options editor (§4.3.1). TQL has no braces and the OG
+    // DSL's form never ends in one, so a trailing `}` is an options map that was
+    // pasted here — which is a different control, not a parse error. This makes
+    // no claim about WHERE the map starts; splitting one is Rust's job and only
+    // Rust's.
+    if (next.trim().endsWith("}")) {
+      settled = mine;
+      setPending(false);
+      setError("The options map (title, collapsed) is edited with the title and Display controls, not here.");
+      props.onStale(true);
+      return;
+    }
+    setPending(true);
+    timer = setTimeout(() => void run(next, mine), PANE_DEBOUNCE_MS);
+  };
+
+  const savable = () => draft() !== null && !pending() && !error() && good() !== null;
+
+  const body = () => (
+    <div class="query-text-pane">
+      <textarea
+        class="qb-input query-text-pane-input"
+        classList={{ "query-text-pane-invalid": !!error() }}
+        rows={3}
+        spellcheck={false}
+        aria-label={props.dialect === "tql" ? "Query text (TQL)" : "Query expression"}
+        aria-invalid={error() ? "true" : undefined}
+        value={text()}
+        disabled={!!refusal()}
+        onInput={(event) => onInput(event.currentTarget.value)}
+      />
+      <div class="query-text-pane-status">
+        <Show when={refusal()}>
+          {(message) => <span class="query-text-pane-error" role="alert">{message()}</span>}
+        </Show>
+        <Show when={error()}>
+          {/* The parser's OWN message, never a catch-all (I-9). The rows above
+              stay on screen and greyed; they are the last reading that ran. */}
+          {(message) => <span class="query-text-pane-error" role="alert">{message()}</span>}
+        </Show>
+        <Show when={pending() && !error()}>
+          <span class="query-text-pane-pending">Checking…</span>
+        </Show>
+        <button
+          type="button"
+          class="qb-commit query-text-pane-save"
+          disabled={!savable()}
+          onClick={() => { const q = good(); if (q) props.onCommit(q); }}
+        >
+          Save query text
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <Show when={!props.alwaysOpen} fallback={body()}>
+      <details
+        class="query-text-pane-details"
+        onClick={stop}
+        onToggle={(event) => setOpen(event.currentTarget.open)}
+      >
+        <summary>{props.dialect === "tql" ? "Query text" : "Raw query DSL"}</summary>
+        <Show when={open()}>{body()}</Show>
+      </details>
+    </Show>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The bar
+// ---------------------------------------------------------------------------
 
 export function QueryBuilder(props: {
-  dsl: () => string;
-  onChange: (dsl: string) => void;
+  /** The persisted reading of the query. `undefined` while the engine has not
+   *  answered yet — the bar renders nothing rather than an empty query it would
+   *  then be able to save over the author's text. */
+  session: () => BuilderSession | undefined;
+  /** Persist an edit. Chip edits call this immediately (each one is a complete,
+   *  valid IR); the pane calls it only when the user saves a parse. */
+  onChange: (next: BuilderSession) => void;
+  /** The text pane's language: `tql` for a query block, `og` for the workspace,
+   *  which materializes OG text. */
+  paneDialect?: Extract<QueryPrintDialect, "og" | "tql">;
+  paneAlwaysOpen?: boolean;
+  /** The pane's text no longer parses, so the rows on screen are the LAST
+   *  reading that ran. The host greys them; the bar cannot, because the rows are
+   *  not its children. */
+  onStale?: (stale: boolean) => void;
   blockId?: string;
   parentTransientId?: string;
 }): JSX.Element {
-  const tree = createMemo(() => parseQuery(props.dsl()));
+  // The pane's last-good parse, not yet saved. `null` = the bar shows the
+  // persisted reading. This is what makes "the rows follow the text you typed"
+  // and "nothing reaches disk until you save it" both true (§4.3.1).
+  const [paneQuery, setPaneQuery] = createSignal<Query | null>(null);
+  const [stale, setStale] = createSignal(false);
+  createEffect(() => {
+    props.session();
+    setPaneQuery(null);
+  });
+
+  const session = createMemo<BuilderSession | undefined>(() => {
+    const persisted = props.session();
+    if (!persisted) return undefined;
+    const pane = paneQuery();
+    return pane ? { query: pane, view: persisted.view } : persisted;
+  });
+  // The bar always edits an `and`/`or` root, so "+ add filter" has somewhere to
+  // add. A single-child `and` prints back as the bare child (`og_form`).
+  const root = createMemo(() => builderRoot(session()?.query.filter ?? { kind: "and", items: [] }));
+  const view = () => session()?.view ?? {};
+
   // N builders on one page asked the SAME whole-graph facets question N times
   // per (graphEpoch, dataRev). The scope is per-builder by decision (P0), so the
   // fix is not a shared scope but a shared REQUEST: `sharedQueryResult` collapses
@@ -375,50 +598,68 @@ export function QueryBuilder(props: {
   if (autoOpen) setQueryBuilderAutoOpen(null);
   const [adding, setAdding] = createSignal<string | null>(autoOpen ? "add:" : null);
 
-  const apply = (next: Clause) => {
-    props.onChange(toDsl(next));
+  /** A chip edit: a new filter over the CURRENT reading, saved immediately. */
+  const apply = (next: Filter) => {
+    const current = session();
+    if (!current) return;
+    props.onChange({ query: { ...current.query, filter: next }, view: current.view });
     setOpenMenu(null);
     setAdding(null);
   };
+  const applyView = (next: ViewSettings) => {
+    const current = session();
+    if (!current) return;
+    props.onChange({ query: current.query, view: next });
+  };
+  /** §4.3.1 carry-forward: a pane parse replaces only the filter, the anchor and
+   *  the diagnostics. The session's view and its OPAQUE options survive — an
+   *  absent map in pane text never means "delete the title". */
+  const carryForward = (parsed: Query): Query => {
+    const current = props.session();
+    const options = current && current.query.source.kind !== "builder"
+      ? current.query.source.og_options ?? ""
+      : "";
+    return {
+      anchor: parsed.anchor,
+      filter: parsed.filter,
+      diagnostics: parsed.diagnostics,
+      source: parsed.source.kind === "builder"
+        ? parsed.source
+        : { ...parsed.source, og_options: options },
+    };
+  };
 
   return (
-    <div class="qb-bar" onClick={stop}>
-      <Node clause={tree()} loc={[]} isRoot tree={tree} apply={apply} facets={facets}
-        openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding}
-        parentTransientId={props.parentTransientId} />
-      <SortControl tree={tree} apply={apply} parentTransientId={props.parentTransientId} />
-      <SummarizeControl tree={tree} apply={apply} facets={facets} parentTransientId={props.parentTransientId} />
-      <button
-        class="qb-sort qb-advanced"
-        title={ADVANCED_CHEATSHEET}
-        onClick={(e) => {
-          stop(e);
-          const conv = clauseToAdvanced(tree());
-          if (!conv.ok) {
-            pushToast(`Can't auto-convert to Datalog: ${conv.unsupported.join(", ")} has no advanced equivalent — write the [:find …] form by hand`);
-            return;
-          }
-          if (props.blockId) stashSimpleForm(props.blockId, props.dsl());
-          props.onChange(conv.dsl);
-          pushToast(
-            conv.dropped.length
-              ? `Converted to an advanced Datalog query (dropped: ${conv.dropped.join(", ")}) — undo restores the simple form`
-              : "Converted to an advanced Datalog query — undo restores the simple form"
-          );
-        }}
-      >
-        ⚙ advanced
-      </button>
-    </div>
+    <Show when={session()}>
+      <div class="qb-bar" classList={{ "qb-bar-stale": stale() }} onClick={stop}>
+        <Node clause={root()} loc={[]} isRoot tree={root} apply={apply} facets={facets}
+          openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding}
+          parentTransientId={props.parentTransientId} />
+        <SortControl view={view} apply={applyView} parentTransientId={props.parentTransientId} />
+        <SummarizeControl view={view} apply={applyView} facets={facets} parentTransientId={props.parentTransientId} />
+        <QueryTextPane
+          session={props.session}
+          dialect={props.paneDialect ?? "tql"}
+          onParsed={(parsed) => setPaneQuery(carryForward(parsed))}
+          onCommit={(parsed) => {
+            const current = props.session();
+            if (!current) return;
+            props.onChange({ query: carryForward(parsed), view: current.view });
+          }}
+          onStale={(value) => { setStale(value); props.onStale?.(value); }}
+          alwaysOpen={props.paneAlwaysOpen}
+        />
+      </div>
+    </Show>
   );
 }
 
 interface NodeCtx {
   loc: number[];
   isRoot?: boolean;
-  clause: Clause;
-  tree: () => Clause;
-  apply: (next: Clause) => void;
+  clause: Filter;
+  tree: () => Filter;
+  apply: (next: Filter) => void;
   facets: QueryFacetsAccessor;
   openMenu: () => string | null;
   setOpenMenu: (k: string | null) => void;
@@ -431,35 +672,39 @@ function Node(props: NodeCtx): JSX.Element {
   if (props.loc.length >= MAX_QUERY_BUILDER_DEPTH) {
     return <span class="qb-depth-limit">Query nesting truncated at {MAX_QUERY_BUILDER_DEPTH} levels</span>;
   }
-  const isOp = () => props.clause.kind === "op";
-  const op = () => props.clause as Clause & { kind: "op" };
+  // `off` renders as a greyed wrapper around its subtree: the row is present and
+  // round-trips, it just does not run (§3.5, Q12). The UI that toggles it is P6's.
+  const kind = () => props.clause.kind;
+  const children = () => filterChildren(props.clause) ?? [];
 
   return (
-    <Show when={isOp()} fallback={<Chip {...props} />}>
-      <Show when={op().op === "not"} fallback={<OpGroup {...props} />}>
-        <span class="qb-op-not">
-          <span class="qb-bracket">NOT(</span>
-          <For each={op().children}>
+    <Show when={kind() === "and" || kind() === "or" || kind() === "not" || kind() === "off"} fallback={<Chip {...props} />}>
+      <Show when={kind() === "and" || kind() === "or"} fallback={
+        <span class="qb-op-not" classList={{ "qb-off": kind() === "off" }}>
+          <span class="qb-bracket">{kind() === "off" ? "OFF(" : "NOT("}</span>
+          <For each={children()}>
             {(child, i) => (
               <Node {...props} clause={child} loc={[...props.loc, i()]} isRoot={false} />
             )}
           </For>
-          <AddButton {...props} />
           <ChipMenu {...props} />
           <span class="qb-bracket">)</span>
         </span>
+      }>
+        <OpGroup {...props} />
       </Show>
     </Show>
   );
 }
 
-// An and/or operator node: optional bracket + a clickable operator pill that
-// flips and<->or, its children, and a trailing "+".
+// An and/or node: optional bracket + a clickable operator pill that flips
+// and<->or, its children, and a trailing "+".
 function OpGroup(props: NodeCtx): JSX.Element {
-  const op = () => props.clause as Clause & { kind: "op" };
+  const children = () => filterChildren(props.clause) ?? [];
+  const op = () => (props.clause.kind === "or" ? "or" : "and");
   const showBracket = () => !props.isRoot;
-  const showOpPill = () => op().children.length > 1 || !props.isRoot;
-  const flip = () => props.apply(setOp(props.tree(), props.loc, op().op === "and" ? "or" : "and"));
+  const showOpPill = () => children().length > 1 || !props.isRoot;
+  const flip = () => props.apply(setOp(props.tree(), props.loc, op() === "and" ? "or" : "and"));
 
   return (
     <span class="qb-group" classList={{ "qb-root": props.isRoot }}>
@@ -475,15 +720,15 @@ function OpGroup(props: NodeCtx): JSX.Element {
             flip();
           }}
         >
-          {op().op.toUpperCase()}
+          {op().toUpperCase()}
         </button>
       </Show>
-      <For each={op().children}>
+      <For each={children()}>
         {(child, i) => (
           <Node {...props} clause={child} loc={[...props.loc, i()]} isRoot={false} />
         )}
       </For>
-      <AddButton {...props} prominent={props.isRoot && op().children.length === 0} />
+      <AddButton {...props} prominent={props.isRoot && children().length === 0} />
       <Show when={!props.isRoot}>
         <ChipMenu {...props} />
         <span class="qb-bracket">)</span>
@@ -492,7 +737,7 @@ function OpGroup(props: NodeCtx): JSX.Element {
   );
 }
 
-// A leaf filter chip. Click opens an action menu (delete / wrap).
+// A leaf chip. Click opens an action menu (delete / wrap).
 function Chip(props: NodeCtx): JSX.Element {
   const key = () => `chip:${locKey(props.loc)}`;
   let triggerEl: HTMLButtonElement | undefined;
@@ -508,31 +753,22 @@ function Chip(props: NodeCtx): JSX.Element {
           props.setOpenMenu(props.openMenu() === key() ? null : key());
         }}
       >
-        {clauseLabel(props.clause)}
+        {filterLabel(props.clause)}
       </button>
       <ChipMenu {...props} trigger={() => triggerEl ?? null} />
     </span>
   );
 }
 
-// Per-clause action popover (delete, wrap in AND/OR/NOT, and for op nodes:
+// Per-clause action popover (delete, wrap in AND/OR/NOT, and for boolean nodes:
 // unwrap). Shown for both leaf chips and operator nodes.
 function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.Element {
-  const isOpKey = () => props.clause.kind === "op";
+  const isOpKey = () => filterChildren(props.clause) !== null;
   const key = () => `${isOpKey() ? "op" : "chip"}:${locKey(props.loc)}`;
   const open = () => props.openMenu() === key();
-  const act = (f: () => Clause) => () => props.apply(f());
-  // The root op has no enclosing position to delete/wrap from.
+  const act = (f: () => Filter) => () => props.apply(f());
+  // The root has no enclosing position to delete/wrap from.
   const atRoot = () => props.loc.length === 0;
-
-  // Result-level directives (sort / aggregate / group-by) aren't filters: they're
-  // edited via the "+ sort" / "+ summarize" controls, so their chip menu offers
-  // only Delete (no Edit, no wrap-in-AND/OR/NOT — wrapping one would nest it out
-  // of the root and silently disable it).
-  const isSort = () =>
-    props.clause.kind === "sortBy" ||
-    props.clause.kind === "aggregate" ||
-    props.clause.kind === "groupBy";
 
   const [editing, setEditing] = createSignal(false);
   let menuEl: HTMLDivElement | undefined;
@@ -544,14 +780,15 @@ function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.
     trigger: props.trigger,
     dismiss: () => { props.setOpenMenu(null); return true; },
   });
-  // Nullary clauses (scheduled/deadline/journal), result-level directives, and
-  // raw/op have nothing to edit here.
-  const canEdit = () =>
-    !isOpKey() &&
-    !["raw", "scheduled", "deadline", "journal", "sortBy", "aggregate", "groupBy"].includes(
-      props.clause.kind,
-    );
-  const editKind = () => (props.clause.kind === "raw" ? "page" : (props.clause.kind as ClauseKind));
+  // "Edit…" is offered exactly for the shapes a picker can re-collect. A leaf the
+  // pickers do not model still renders and still deletes — it just has no value
+  // editor, which is honest rather than a form that would rewrite it into
+  // something else.
+  const editKind = () => (isOpKey() ? null : builderLeafKind(props.clause));
+  const canEdit = () => {
+    const kind = editKind();
+    return kind != null && kind !== "scheduled" && kind !== "deadline" && kind !== "journal";
+  };
 
   return (
     <Show when={open()}>
@@ -563,11 +800,9 @@ function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.
             </Show>
             <Show when={!atRoot()}>
               <button class="qb-menu-item" onClick={act(() => removeAt(props.tree(), props.loc))}>Delete</button>
-              <Show when={!isSort()}>
-                <button class="qb-menu-item" onClick={act(() => wrapAt(props.tree(), props.loc, "and"))}>Wrap in AND</button>
-                <button class="qb-menu-item" onClick={act(() => wrapAt(props.tree(), props.loc, "or"))}>Wrap in OR</button>
-                <button class="qb-menu-item" onClick={act(() => wrapAt(props.tree(), props.loc, "not"))}>Wrap in NOT</button>
-              </Show>
+              <button class="qb-menu-item" onClick={act(() => wrapAt(props.tree(), props.loc, "and"))}>Wrap in AND</button>
+              <button class="qb-menu-item" onClick={act(() => wrapAt(props.tree(), props.loc, "or"))}>Wrap in OR</button>
+              <button class="qb-menu-item" onClick={act(() => wrapAt(props.tree(), props.loc, "not"))}>Wrap in NOT</button>
             </Show>
             <Show when={isOpKey() && !atRoot()}>
               <button class="qb-menu-item" onClick={act(() => unwrapAt(props.tree(), props.loc))}>Unwrap</button>
@@ -575,14 +810,14 @@ function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.
           </>
         }>
           <div class="qb-picker-title">Edit value</div>
-          <ValuePicker facets={props.facets} kind={editKind()} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
+          <ValuePicker facets={props.facets} kind={editKind()!} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
         </Show>
       </div>
     </Show>
   );
 }
 
-// "+" button that opens the add-filter picker, scoped to the op at `loc`. When
+// "+" button that opens the add-filter picker, scoped to the node at `loc`. When
 // `prominent` (an empty query), render an inviting "➕ Add filter" call-to-action
 // instead of a bare "+", so leaving the bullet reveals an obvious next step.
 function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
@@ -625,10 +860,10 @@ function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
 }
 
 // ---------------------------------------------------------------------------
-// Add-filter picker: choose a clause type, then collect its value(s).
+// Add-filter picker: choose a filter type, then collect its value(s).
 // ---------------------------------------------------------------------------
 
-const FILTER_TYPES: { kind: ClauseKind; label: string }[] = [
+const FILTER_TYPES: { kind: BuilderLeafKind; label: string }[] = [
   { kind: "page", label: "Page / tag reference" },
   { kind: "task", label: "Task marker" },
   { kind: "priority", label: "Priority" },
@@ -646,19 +881,20 @@ const FILTER_TYPES: { kind: ClauseKind; label: string }[] = [
 
 function AddPicker(props: {
   facets: QueryFacetsAccessor;
-  onCommit: (c: Clause) => void;
+  onCommit: (c: Filter) => void;
   onSetOp: (op: "and" | "or") => void;
   rootRef?: (element: HTMLDivElement) => void;
 }): JSX.Element {
-  const [step, setStep] = createSignal<ClauseKind | "type">("type");
+  const [step, setStep] = createSignal<BuilderLeafKind | "type">("type");
   // When armed, the next filter is added negated (wrapped in NOT).
   const [negate, setNegate] = createSignal(false);
 
-  const pick = (kind: ClauseKind) => {
-    if (kind === "scheduled" || kind === "deadline" || kind === "journal") return commit({ kind });
+  const pick = (kind: BuilderLeafKind) => {
+    if (kind === "scheduled" || kind === "deadline") return commit(planningFilter(kind));
+    if (kind === "journal") return commit(journalFilter());
     setStep(kind);
   };
-  const commit = (c: Clause) => props.onCommit(negate() ? { kind: "op", op: "not", children: [c] } : c);
+  const commit = (c: Filter) => props.onCommit(negate() ? { kind: "not", inner: c } : c);
 
   return (
     <div ref={props.rootRef} class="qb-picker" onClick={stop}>
@@ -681,49 +917,50 @@ function AddPicker(props: {
         </For>
       </Show>
       <Show when={step() !== "type"}>
-        <ValuePicker facets={props.facets} kind={step() as ClauseKind} onCommit={commit} />
+        <ValuePicker facets={props.facets} kind={step() as BuilderLeafKind} onCommit={commit} />
       </Show>
     </div>
   );
 }
 
-// Renders the value collector for a given clause kind. Shared by the add-filter
-// picker and the in-place "Edit value" flow.
-function ValuePicker(props: { facets: QueryFacetsAccessor; kind: ClauseKind; onCommit: (c: Clause) => void }): JSX.Element {
+// Renders the value collector for a given filter kind, and commits the IR leaf
+// `og.rs` builds for the same intent. Shared by the add-filter picker and the
+// in-place "Edit value" flow.
+function ValuePicker(props: { facets: QueryFacetsAccessor; kind: BuilderLeafKind; onCommit: (c: Filter) => void }): JSX.Element {
   return (
     <>
       <Show when={props.kind === "page"}>
-        <PageInput placeholder="Page or tag name" onCommit={(name) => props.onCommit({ kind: "page", name })} />
+        <PageInput placeholder="Page or tag name" onCommit={(name) => props.onCommit(pageRefFilter(name))} />
       </Show>
       <Show when={props.kind === "task"}>
-        <MultiPick options={MARKERS} onCommit={(markers) => props.onCommit({ kind: "task", markers })} />
+        <MultiPick options={MARKERS} onCommit={(markers) => props.onCommit(taskFilter(markers))} />
       </Show>
       <Show when={props.kind === "priority"}>
-        <MultiPick options={PRIORITIES} onCommit={(levels) => props.onCommit({ kind: "priority", levels })} />
+        <MultiPick options={PRIORITIES} onCommit={(levels) => props.onCommit(priorityFilter(levels))} />
       </Show>
       <Show when={props.kind === "property"}>
-        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit({ kind: "property", key, value })} />
+        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit(propertyFilter(key, value))} />
       </Show>
       <Show when={props.kind === "between"}>
-        <BetweenPick onCommit={(field, start, end) => props.onCommit({ kind: "between", field, start, end })} />
+        <BetweenPick onCommit={(field, start, end) => props.onCommit(betweenFilter(field, start, end))} />
       </Show>
       <Show when={props.kind === "onPage"}>
-        <PageInput placeholder="Page name" onCommit={(name) => props.onCommit({ kind: "onPage", name })} />
+        <PageInput placeholder="Page name" onCommit={(name) => props.onCommit(onPageFilter(name))} />
       </Show>
       <Show when={props.kind === "namespace"}>
-        <PageInput placeholder="Namespace (parent page)" onCommit={(ns) => props.onCommit({ kind: "namespace", ns })} />
+        <PageInput placeholder="Namespace (parent page)" onCommit={(ns) => props.onCommit(namespaceFilter(ns))} />
       </Show>
       <Show when={props.kind === "pageProperty"}>
-        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit({ kind: "pageProperty", key, value })} />
+        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit(pagePropertyFilter(key, value))} />
       </Show>
       <Show when={props.kind === "content"}>
-        <TextInput placeholder="Text to search for" onCommit={(text) => props.onCommit({ kind: "content", text })} />
+        <TextInput placeholder="Text to search for" onCommit={(text) => props.onCommit(contentFilter(text))} />
       </Show>
       <Show when={props.kind === "search"}>
-        <TextInput placeholder="Search words and operators" onCommit={(source) => props.onCommit({ kind: "search", source })} />
+        <TextInput placeholder="Search words and operators" onCommit={(source) => props.onCommit(searchFilter(source))} />
       </Show>
       <Show when={props.kind === "pageTags"}>
-        <TextInput placeholder="Tag (one)" onCommit={(t) => props.onCommit({ kind: "pageTags", tags: [t] })} />
+        <TextInput placeholder="Tag (one)" onCommit={(t) => props.onCommit(pageTagsFilter([t]))} />
       </Show>
     </>
   );
@@ -941,7 +1178,7 @@ function DateBoundInput(props: {
           if (e.key === "Enter") props.onEnter();
         }}
       />
-      <span class="qb-bound-preview">{preview() ? `→ ${preview()}` : " "}</span>
+      <span class="qb-bound-preview">{preview() ? `→ ${preview()}` : " "}</span>
     </div>
   );
 }

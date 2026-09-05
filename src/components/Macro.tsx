@@ -8,23 +8,23 @@ import { resolveBlockBatched } from "../resolveBatch";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
-import { QueryBuilder } from "./QueryBuilder";
+import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
 import { SearchResultRow } from "./SearchResultRow";
-import {
-  advancedToClause,
-  clearSimpleForm,
-  getSimpleForm,
-  toDsl,
-} from "../editor/queryBuilder";
 import { foldAggregate, groupRows, type AggDirective } from "../editor/queryAggregate";
 import { quoteEdnString, unquoteEdnString } from "../editor/edn";
 import { queryMacroExtents, QUERY_MACRO_NAMES } from "../editor/queryMacro";
 import {
+  macroPrintDialect,
   macroTextDialect,
   sourceOptions,
   sourceOriginal,
   sourcePrintDialect,
+  type Diagnostic,
+  type EmptyExplanation,
+  type PageRow,
+  type ParsedQuery,
   type Query,
+  type QueryReport,
   type Source,
   type ViewSettings,
 } from "../editor/queryIr";
@@ -152,6 +152,20 @@ interface Row {
   props: Record<string, string>;
 }
 
+/** The message a rejected command carried. A `QueryPrintRefusedError` already
+ *  carries the printer's OWN located message (I-9), so there is nothing to add
+ *  here and nothing to replace it with. */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The advanced ran/ignored note, read off the run's report (M5) instead of a
+ *  second command's return shape. `ran`/`ignored` are optional on the wire; an
+ *  OG or TQL source reports neither. */
+function reportInfo(report: QueryReport): { ran: string[]; ignored: string[]; supported: boolean } {
+  return { ran: report.ran ?? [], ignored: report.ignored ?? [], supported: report.supported };
+}
+
 /** Remove the block a query is written in from that query's own results.
  *
  *  `{{query "xyz"}}` contains `xyz`, so the block matches its own query and the
@@ -277,12 +291,33 @@ export function QueryMacro(props: {
     const r = focusedRouter().route();
     return r.kind === "page" ? r.name : undefined;
   };
-  const executableForm = createMemo(() => {
-    const f = form();
-    if (!currentPageMarker()) return f;
+  // The dyvar is substituted in the TEXT and read by the one engine, exactly as
+  // the authored text is: the execution gets its own parse of the substituted
+  // argument rather than a frontend rewrite of an already-parsed IR. `null` means
+  // "no substitution applies", and then the authoring parse IS the execution's.
+  const executionArg = createMemo<string | null>(() => {
+    if (!currentPageMarker()) return null;
     const pageName = focusedQueryPage();
-    if (!pageName) return f; // no focused page: leave verbatim, like templates
-    return f.replace(/<%\s*current page\s*%>/gi, `[[${pageName}]]`);
+    if (!pageName) return null; // no focused page: leave verbatim, like templates
+    return arg().replace(/<%\s*current page\s*%>/gi, `[[${pageName}]]`);
+  });
+  const [executionParsed] = createResource(
+    () => {
+      const argument = executionArg();
+      return argument === null
+        ? undefined
+        : { argument, name: macroName(), properties: blockDirectives() };
+    },
+    (request) =>
+      backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+  );
+  /** The reading the EXECUTION runs. Every authoring and display derivation keeps
+   *  the literal dyvar and therefore keeps using `parsed`. */
+  const runnable = (): ParsedQuery | undefined =>
+    executionArg() === null ? parsed.latest : executionParsed.latest;
+  const executableForm = createMemo(() => {
+    const source = runnable()?.query.source;
+    return (source ? sourceOriginal(source) : null) ?? "";
   });
   // The query LANGUAGE decision rides the same substituted form the execution
   // uses (never authoring rewrites): presentation and execution can't disagree
@@ -341,12 +376,89 @@ export function QueryMacro(props: {
       ?? extents[0];
     setRaw(props.blockId, raw.slice(0, target.start) + newMacro + raw.slice(target.end));
   };
-  const applyDsl = (dsl: string) => {
-    const options = opts() ? ` ${opts()}` : "";
-    // Re-emit under the name the block already carries (§7.9). Promoting a
-    // `{{query}}` to `{{tine-query}}` is the SAVE path's decision, made from
-    // `query_og_expressible` — never a side effect of editing a chip.
-    rewriteMacro(`{{${macroName()} ${dsl}${options}}}`);
+  // **The save path (§4.3 Q3, A5; B5).**
+  //
+  // The frontend no longer prints a query — it hands the engine an IR and a
+  // dialect, and writes back the bytes the engine returned (I-12). Three things
+  // are decided here, and only here:
+  //
+  //  1. **The macro name.** `query_og_expressible` first, so P0 never asks the
+  //     OG printer a question it is going to refuse: an expressible edit keeps
+  //     the block's CURRENT name (a `{{tine-query}}` block is never silently
+  //     converted back to `{{query}}`), a non-expressible edit of a `{{query}}`
+  //     block is written as `{{tine-query <tql_macro>}}`.
+  //  2. **`NotApplicable` is answered, not surfaced.** This is the ONE caller
+  //     entitled to see it (`QueryPrintRefusedError.isNotApplicable`): if the OG
+  //     printer refuses after all, the answer is to switch dialect, not to show
+  //     the user an error about a query Tine can perfectly well store.
+  //  3. **Any OTHER refusal is shown and NOT written** (I-4, I-9, W4): a
+  //     macro-safety refusal carries the printer's own located message, and the
+  //     block's bytes are left exactly as they were.
+  //
+  // On a crossing (`{{query}}` → `{{tine-query}}`) the view directives the OG
+  // text carried have no home in TQL, so they are written to the block's `tine.*`
+  // properties in the SAME undo unit (§4.3 Y2) — otherwise the crossed block
+  // would re-parse without its sort, sample, grouping or aggregate.
+  const applyEdit = async (next: BuilderSession) => {
+    if (!props.blockId) return;
+    const current = macroName();
+    let expressible = false;
+    try {
+      expressible = await backend().queryOgExpressible(next.query, next.view);
+    } catch (error) {
+      setPrintError(errorText(error));
+      return;
+    }
+    const crossing = !expressible && current.toLowerCase() !== "tine-query";
+    let name = expressible ? current : QUERY_MACRO_NAMES[1];
+    let dialect = macroPrintDialect(name);
+    let argument: string;
+    try {
+      argument = await backend().printQuery(next.query, next.view, dialect);
+    } catch (error) {
+      if (error instanceof QueryPrintRefusedError && error.isNotApplicable && dialect === "og") {
+        // `og_expressible` said yes and the printer said no. The entitled answer
+        // is the other dialect, not a refusal shown to the user.
+        name = QUERY_MACRO_NAMES[1];
+        dialect = macroPrintDialect(name);
+        try {
+          argument = await backend().printQuery(next.query, next.view, dialect);
+        } catch (second) {
+          setPrintError(errorText(second));
+          return;
+        }
+      } else {
+        setPrintError(errorText(error));
+        return;
+      }
+    }
+    setPrintError(null);
+    const node = doc.byId[props.blockId];
+    const write = () => {
+      rewriteMacro(`{{${name} ${argument}}}`);
+      if (name.toLowerCase() === "tine-query") writeViewProperties(next.view);
+    };
+    if (crossing && node) withUndoUnit(`query:cross:${props.blockId}`, [node.page], write);
+    else write();
+  };
+  /** §4.3 Y2: TQL text carries no view directives, so a crossed block keeps them
+   *  in its own `tine.*` properties — the §7.6 grammar the engine already reads
+   *  back in `query_parse`'s precedence merge (§4.1). */
+  const writeViewProperties = (view: ViewSettings) => {
+    const blockId = props.blockId;
+    if (!blockId) return;
+    const sort = (view.sort ?? [])
+      .map(([field, dir]) => `${field} ${dir}`)
+      .join("; ");
+    setBlockProperty(blockId, "tine.sort", sort || null);
+    setBlockProperty(blockId, "tine.sample", view.sample == null ? null : String(view.sample));
+    setBlockProperty(blockId, "tine.group-by", view.group_by || null);
+    const aggregates = (view.aggregates ?? [])
+      // `["", "count"]` is the whole-result count; the §7.6 grammar spells it as
+      // a bare `count` segment with no `=` (X3).
+      .map(([field, fn]) => (field ? `${field}=${fn}` : fn))
+      .join(";");
+    setBlockProperty(blockId, "tine.col-aggregates", aggregates || null);
   };
   // Edit the query's display title (:title "…" in the options map). Only offered
   // for a user-authored standalone query (blockId set, no app-supplied title).
@@ -389,16 +501,17 @@ export function QueryMacro(props: {
       // I-4 / T7: a refused print is NEVER swallowed. Nothing is written, and the
       // reason is shown next to the edit that provoked it. A catch-all that
       // turned this into a silent no-op is how an unsaved rename looks saved.
-      setPrintError(
-        error instanceof QueryPrintRefusedError
-          ? error.message
-          : error instanceof Error
-            ? error.message
-            : String(error),
-      );
+      setPrintError(errorText(error));
     }
   };
   const [printError, setPrintError] = createSignal<string | null>(null);
+  /** What the builder edits: the AUTHORING reading, never the execution's
+   *  dyvar-substituted one — editing a chip must not bake the page you happen to
+   *  be looking at into the saved query. */
+  const builderSession = (): BuilderSession | undefined => {
+    const reading = parsed.latest;
+    return reading ? { query: reading.query, view: reading.view } : undefined;
+  };
 
   // Whether this is an advanced (datalog) query is the ENGINE's reading of the
   // text, not a regex over it (§7.1): a `:find` inside a string literal is text.
@@ -406,52 +519,24 @@ export function QueryMacro(props: {
   const currentPageInput = createMemo(() =>
     isAdvanced() && declaresCurrentPageInput(form())
   );
-  const simpleBackDsl = createMemo<string | null>(() => {
-    const blockId = props.blockId;
-    if (!blockId || !isAdvanced()) return null;
-    const stashed = getSimpleForm(blockId);
-    if (stashed !== undefined) return stashed;
-    const c = advancedToClause(form());
-    return c ? toDsl(c) : null;
-  });
-  const simpleBackTitle = () =>
-    simpleBackDsl() !== null
-      ? "Back to the visual query builder"
-      : "This advanced query can't be converted back to the visual builder automatically — edit it as raw text, or rebuild it visually.";
-  const backToSimple = (e: MouseEvent) => {
-    e.stopPropagation();
-    const blockId = props.blockId;
-    if (!blockId) return;
-    const stashed = getSimpleForm(blockId);
-    if (stashed !== undefined) {
-      applyDsl(stashed);
-      clearSimpleForm(blockId);
-      return;
-    }
-    const c = advancedToClause(form());
-    if (c) applyDsl(toDsl(c));
-  };
-  const simpleBackButton = () => (
-    <span
-      class="query-simple-toggle-wrap"
-      title={simpleBackTitle()}
-      onClick={(e) => e.stopPropagation()}
-    >
-      <button
-        type="button"
-        class="qb-sort query-simple-toggle"
-        title={simpleBackTitle()}
-        disabled={simpleBackDsl() === null}
-        onClick={backToSimple}
-      >
-        ← Simple
-      </button>
-    </span>
-  );
+  // The `⚙ advanced` / `← Simple` pair is gone with the frontend's datalog
+  // converters (§9 P0-ts: "datalog conversion deleted"). Both directions were a
+  // second query translator living in `queryBuilder.ts` — the one that dropped
+  // sort/aggregate/group-by on the way out and could only read back the exact
+  // shape it had written. Converting an authored advanced query into a filter is
+  // explicitly out of scope (§4.3.1, Q13); an advanced block stays editable as
+  // raw text by clicking it, with the ran/ignored note above saying what took.
   const currentPage = () => props.currentPage ?? (props.blockId ? doc.byId[props.blockId]?.page : undefined);
   const [advInfo, setAdvInfo] = createSignal<{ ran: string[]; ignored: string[]; supported: boolean } | null>(
     null
   );
+  // `@page`-anchored rows (K16): a page result needs no document load, so it is
+  // NOT a degenerate `RefGroup` with one empty block — it is the page itself.
+  const [pageRows, setPageRows] = createSignal<PageRow[] | null>(null);
+  // The engine's own diagnostics for the run. An INVALID query returns zero rows
+  // plus these (§3.5), which is why they are rendered next to the empty state
+  // rather than swallowed into it.
+  const [diagnostics, setDiagnostics] = createSignal<Diagnostic[]>([]);
   const [searchExecution, setSearchExecution] = createSignal<QueryExecution | null>(null);
   const collapseKey = () => JSON.stringify([
     graphMeta()?.root ?? "",
@@ -489,15 +574,32 @@ export function QueryMacro(props: {
   // `undefined` keeps `createResource` from fetching at all, rather than running
   // a query nobody authored.
   const queryRequestKey = (): string | undefined => {
-    if (!parsed.latest) return undefined;
-    return `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() || currentPageInput() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
+    const reading = runnable();
+    if (!reading) return undefined;
+    // The IR, not the text, is what runs — so it is what identifies the run. Two
+    // blocks whose text differs only in whitespace share a request; two blocks
+    // whose text is identical but whose `tine.*` properties differ do not.
+    const identity = JSON.stringify([reading.query, reading.view]);
+    // Only a query that binds `?current-page` needs the focused page in its key:
+    // for those the text is identical on both pages and only the execution
+    // context differs. A `<% current page %>` query must NOT key off it — the
+    // substitution lives in the TEXT, so its reading changes a beat later, and a
+    // key that moved first would run the OLD query under the NEW page: one extra
+    // execution of a state the user was never in.
+    const binding = currentPageInput() ? `\0cp:${executionPage() ?? ""}` : "";
+    return `${graphEpoch()}\0${collapsed() ? `collapsed ${identity}` : `${identity} ${dataRev()}`}${binding}`;
   };
+  /** The page an execution binds `?current-page` to (§4.4). `:inputs
+   *  [:current-page]` is a focused-pane binding; an advanced form without it
+   *  retains the owner page for `:query-page` compatibility. */
+  const executionPage = () => (currentPageInput() ? focusedQueryPage() : currentPage());
   const fetchGroups = async (requestKey: string): Promise<RefGroup[]> => {
     {
       const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
       const searchSource = friendlySearch();
       if (searchSource !== null) {
         setAdvInfo(null);
+        setPageRows(null);
         const execution = await sharedQueryResult(
           scope,
           `friendly-search\0${requestKey}`,
@@ -530,23 +632,32 @@ export function QueryMacro(props: {
         return [...grouped.values()];
       }
       setSearchExecution(null);
-      // Advanced (datalog) queries take a separate path that maps the supported
-      // clause subset onto the engine and reports what ran vs was ignored.
-      if (isAdvanced()) {
-        // `:inputs [:current-page]` is a focused-pane binding. Advanced forms
-        // without it retain the owner page for :query-page compatibility.
-        const page = currentPageInput() ? focusedQueryPage() : currentPage();
-        const r = await sharedQueryResult(
-          scope,
-          `advanced\0${page ?? ""}\0${requestKey}`,
-          () => backend().runAdvancedQuery(executableForm(), page),
-        );
-        if (queryRequestKey() !== requestKey) return [];
-        setAdvInfo({ ran: r.ran, ignored: r.ignored, supported: r.supported });
-        return r.groups;
+      // **One evaluator (§7.1, B1).** `run_query` re-parsed the OG text and
+      // `run_advanced_query` re-parsed the datalog; both are now the same
+      // `query_run` over an IR the engine already read, which is also the only
+      // reason a `{{tine-query …}}` block can return rows at all — the legacy
+      // entry points cannot read TQL. Which grammar the text was is settled by
+      // then, and the advanced ran/ignored report rides on the result rather than
+      // on a separate command.
+      const reading = runnable();
+      if (!reading) return [];
+      const page = executionPage();
+      const result = await sharedQueryResult(
+        scope,
+        `ir\0${page ?? ""}\0${requestKey}`,
+        () => backend().queryRun(reading.query, reading.view, page ? { current_page: page } : undefined),
+      );
+      // I-20: the user has edited since this run started; its answer is about a
+      // query that is no longer on screen.
+      if (queryRequestKey() !== requestKey) return [];
+      setAdvInfo(isAdvanced() ? reportInfo(result.report) : null);
+      setDiagnostics(result.diagnostics ?? []);
+      if (result.anchor === "page") {
+        setPageRows(result.pages);
+        return [];
       }
-      setAdvInfo(null);
-      return sharedQueryResult(scope, `simple\0${requestKey}`, () => backend().runQuery(executableForm()));
+      setPageRows(null);
+      return result.groups;
     }
   };
   // A query must not return the block it is written in. `{{query "xyz"}}`
@@ -588,7 +699,42 @@ export function QueryMacro(props: {
   });
   const total = () => currentView() === "search"
     ? searchPresentationHits().length
-    : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
+    : (pageRows()?.length ?? groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0);
+  // **Why empty? (Q14, N19; B1).** `query_explain_empty` was decoded and never
+  // rendered, so a query that matched nothing said only "No results" — which is
+  // the one moment a user most needs to know WHICH conjunct emptied it. Asked
+  // only when the run actually came back empty, so an ordinary query costs one
+  // command as before.
+  const [explainOpen, setExplainOpen] = createSignal(false);
+  const [explained] = createResource(
+    () => {
+      const reading = runnable();
+      if (!explainOpen() || !reading || total() > 0) return undefined;
+      return { reading, key: queryRequestKey() ?? "" };
+    },
+    ({ reading }) => {
+      const page = executionPage();
+      return backend().queryExplainEmpty(
+        reading.query,
+        reading.view,
+        page ? { current_page: page } : undefined,
+      );
+    },
+  );
+  /** The engine's answer, or the honest reason there is none: an unbound or
+   *  unsupported query has no counts to report, and an empty row list without
+   *  its diagnostics would read as "every conjunct matches nothing" instead of
+   *  "this query never ran" (I-9). */
+  const explainRows = (): EmptyExplanation[] => explained()?.rows ?? [];
+  const explainNotice = (): string | null => {
+    const answer = explained();
+    if (!answer) return null;
+    const blocking = (answer.diagnostics ?? []).filter((d) => !d.disabled);
+    if (blocking.length) return blocking.map((d) => d.message).join(" · ");
+    if (!answer.report.supported) return "This query has no clauses Tine can run, so nothing was evaluated.";
+    if (!answer.rows.length) return "Nothing in this graph matches this query.";
+    return null;
+  };
   // A `(sort-by …)` query is sorted GLOBALLY by the engine and returned as one
   // block per group in that order — so the list view must render flat (a single
   // ordered sequence with a per-row page breadcrumb), not grouped by page, or the
@@ -696,17 +842,22 @@ export function QueryMacro(props: {
   // Hide the whole block when asked and there's nothing to show (advanced
   // queries still render their "unsupported" notice).
   const hidden = () => props.hideWhenEmpty && !isAdvanced() && total() === 0;
+  // The query text pane holds text that does not parse: the rows below are the
+  // last reading that RAN, so they are greyed rather than blanked (§4.3.1).
+  const [paneStale, setPaneStale] = createSignal(false);
   const unsupportedAdvanced = () => isAdvanced() && advInfo() && (
     !advInfo()!.supported || (props.strictAdvanced === true && advInfo()!.ignored.length > 0)
   );
 
   return (
     <Show when={!hidden()}>
-      <div class="query-block" classList={{ "query-sheet-block": sheetFace() }}>
+      <div
+        class="query-block"
+        classList={{ "query-sheet-block": sheetFace(), "query-stale": paneStale() }}
+      >
         <Switch>
           <Match when={unsupportedAdvanced()}>
             <div class="query-unsupported" role={props.unsupportedLabel ? "alert" : undefined}>
-              <Show when={props.blockId}>{simpleBackButton()}</Show>
               <Show
                 when={props.unsupportedLabel}
                 fallback={<>Advanced (datalog) query: no supported clauses. <code>{`{{${props.body}}}`}</code></>}
@@ -718,7 +869,6 @@ export function QueryMacro(props: {
           <Match when={true}>
             <Show when={isAdvanced() && advInfo()?.supported}>
               <div class="query-adv-note">
-                <Show when={props.blockId}>{simpleBackButton()}</Show>
                 Partial datalog — ran: {advInfo()!.ran.join(", ") || "—"}
                 <Show when={advInfo()!.ignored.length > 0}>
                   {` · ignored: ${advInfo()!.ignored.join(", ")}`}
@@ -804,12 +954,18 @@ export function QueryMacro(props: {
                 </div>
               </Show>
             </div>
-            {/* The visual builder only models the simple DSL. For an advanced
-                (datalog) query, hide the chip bar (its clauses aren't builder-
-                representable) — the block is editable as raw text by clicking it, and
-                the ran/ignored note above shows which clauses took. */}
-            <Show when={props.blockId && !isAdvanced()}>
-              <QueryBuilder dsl={form} onChange={applyDsl} blockId={props.blockId} />
+            {/* The builder edits a FILTER. An authored advanced (datalog) query
+                keeps its own editing path — converting one into a filter is out
+                of scope (§4.3.1, Q13) — so the chip bar stays hidden for it and
+                the ran/ignored note above says which clauses took. */}
+            <Show when={props.blockId && !isAdvanced() && builderSession()}>
+              <QueryBuilder
+                session={builderSession}
+                onChange={(next) => void applyEdit(next)}
+                paneDialect="tql"
+                blockId={props.blockId}
+                onStale={setPaneStale}
+              />
             </Show>
             <Show when={printError()}>
               {(message) => (
@@ -824,6 +980,14 @@ export function QueryMacro(props: {
                   {message().lead} {message().message}
                 </div>
               )}
+            </Show>
+            {/* The run's OWN diagnostics. A query with an enabled diagnostic is
+                invalid and returns zero rows plus these (§3.5) — showing only
+                "No results" would report a broken query as an empty graph. */}
+            <Show when={diagnostics().some((d) => !d.disabled)}>
+              <div class="query-unsupported query-diagnostics" role="alert">
+                {diagnostics().filter((d) => !d.disabled).map((d) => d.message).join(" · ")}
+              </div>
             </Show>
             <Show when={!collapsed()}>
               <Show
@@ -952,9 +1116,92 @@ export function QueryMacro(props: {
                         </table>
                       )}
                     </Show>
+                    {/* `@page`-anchored results are pages, not blocks (K16): they
+                        carry `{name, kind, journal_day?}` and need no document
+                        load, so they render as page links rather than as empty
+                        block groups. */}
+                    <Show when={pageRows()}>
+                      {(rows) => (
+                        <div class="query-page-rows" role="list" aria-label="Matching pages" onClick={stop}>
+                          <For each={rows()}>
+                            {(row) => (
+                              <button
+                                type="button"
+                                class="query-page-row"
+                                role="listitem"
+                                onMouseDown={internalLinkMouseDown}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const target = { name: row.name, pageKind: row.kind };
+                                  const dest = internalLinkDest(e);
+                                  if (dest === "sidebar") openPageInSidebar(target);
+                                  else if (dest === "background") openPageTargetInNewTab(target);
+                                  else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
+                                  else openPageTarget(target);
+                                }}
+                                onAuxClick={(e) => internalLinkAuxClick(e, () =>
+                                  openPageTargetInNewTab({ name: row.name, pageKind: row.kind })
+                                )}
+                              >
+                                <span class="switcher-kind">{row.kind}</span>
+                                <span>{row.name}</span>
+                              </button>
+                            )}
+                          </For>
+                        </div>
+                      )}
+                    </Show>
                     <Show
                       when={groups() && groups()!.length > 0}
-                      fallback={<div class="query-empty">No results</div>}
+                      fallback={
+                        <Show when={!pageRows()?.length}>
+                          <div class="query-empty">
+                            No results{" "}
+                            {/* §7.5: zero results is the one moment a user most
+                                needs to know WHICH conjunct emptied the query,
+                                and the engine can already say. */}
+                            <button
+                              type="button"
+                              class="query-why-empty"
+                              onClick={(e) => { e.stopPropagation(); setExplainOpen(!explainOpen()); }}
+                            >
+                              {explainOpen() ? "hide" : "why empty?"}
+                            </button>
+                            <Show when={explainOpen()}>
+                              <div class="query-why-empty-panel" onClick={stop}>
+                                <Show when={explained.loading}>
+                                  <span class="query-why-empty-pending">Checking…</span>
+                                </Show>
+                                <Show when={explainNotice()}>
+                                  {(notice) => <div class="query-why-empty-notice">{notice()}</div>}
+                                </Show>
+                                <Show when={explainRows().length > 0}>
+                                  <table class="md-table query-why-empty-table">
+                                    <thead>
+                                      <tr>
+                                        <th>Condition</th>
+                                        <th>Alone</th>
+                                        <th>Without it</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      <For each={explainRows()}>
+                                        {(row) => (
+                                          <tr classList={{ "query-why-empty-culprit": row.alone === 0 }}>
+                                            <td><code>{row.conjunct}</code></td>
+                                            <td>{row.alone}</td>
+                                            <td>{row.without ?? "—"}</td>
+                                          </tr>
+                                        )}
+                                      </For>
+                                    </tbody>
+                                  </table>
+                                </Show>
+                              </div>
+                            </Show>
+                          </div>
+                        </Show>
+                      }
                     >
                       <Show
                         when={legacyTable()}

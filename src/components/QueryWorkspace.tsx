@@ -30,7 +30,7 @@ import type {
   RefGroup,
   SavePageResult,
 } from "../types";
-import { QueryBuilder } from "./QueryBuilder";
+import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
 import { SearchResultRow, buildSearchExcerpt } from "./SearchResultRow";
 import { registerTransientLayer } from "../transientLayers";
 import { bumpPageInventoryRev } from "../ui";
@@ -399,6 +399,28 @@ function AdvancedModal(props: {
   let dialog!: HTMLDivElement;
   let firstField: HTMLElement | undefined;
 
+  // **The workspace's draft is OG DSL text, and the engine is what reads and
+  // writes it** (§7.1, I-12). The builder edits the IR; this pair is the one
+  // boundary between that IR and the text the workspace materializes
+  // (`savedQueryRaw` writes `{{query <dsl>}}`). The frontend does not parse or
+  // print here — it asks.
+  const [builderSession] = createResource(dsl, async (text): Promise<BuilderSession> => {
+    const parsed = await backend().parseQuery(text, "og");
+    return { query: parsed.query, view: parsed.view };
+  });
+  const applyBuilderEdit = async (next: BuilderSession) => {
+    try {
+      setDsl(await backend().printQuery(next.query, next.view, "og"));
+      setError(null);
+    } catch (failure) {
+      // A workspace materializes an OG `{{query …}}` block, so an edit the OG
+      // syntax cannot say has nowhere to go here. The printer's own message says
+      // which part (I-9); the draft is left exactly as it was rather than saved
+      // as something else.
+      setError(failure instanceof Error ? failure.message : String(failure));
+    }
+  };
+
   createEffect(() => {
     const unregister = registerTransientLayer({
       id: props.layerId,
@@ -494,22 +516,12 @@ function AdvancedModal(props: {
         <Show when={draftKind() === "search"} fallback={
           <div class="query-dsl-editor">
             <QueryBuilder
-              dsl={dsl}
-              onChange={(next) => { setDsl(next); setError(null); }}
+              session={() => builderSession.latest}
+              onChange={(next) => void applyBuilderEdit(next)}
+              paneDialect="og"
+              paneAlwaysOpen
               parentTransientId={props.layerId}
             />
-            <details>
-              <summary>Raw query DSL</summary>
-              <label>
-                Query expression
-                <textarea
-                  rows={6}
-                  value={dsl()}
-                  onInput={(event) => { setDsl(event.currentTarget.value); setError(null); }}
-                  spellcheck={false}
-                />
-              </label>
-            </details>
             <p class="query-advanced-note">Switching back to friendly fields is offered only when it can be lossless.</p>
           </div>
         }>

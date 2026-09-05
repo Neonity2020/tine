@@ -19,6 +19,7 @@ import { backend, QueryPrintRefusedError } from "../backend";
 import { doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import type { RefGroup } from "../types";
 import { backendReadsQueries } from "../queryReadingsTestkit";
+import { blockRunResult } from "../queryReadingsTestkit";
 
 beforeAll(async () => {
   await initParser();
@@ -69,7 +70,7 @@ function load(raw: string): void {
     feed: ["Sheet"],
     loaded: true,
   });
-  vi.spyOn(backend(), "runQuery").mockResolvedValue(groups());
+  vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
 }
 
 // The argument that survives only if the RAW source is read: a literal comma

@@ -1,389 +1,470 @@
+// The builder's model, over the IR.
+//
+// The old file in this place tested a parser and a printer that no longer exist
+// here: `parseQuery`/`toDsl` round trips, `clauseToAdvanced` conversions, DSL
+// quoting. Those were the frontend's second query language, and the tests were
+// its specification — keeping them would have been keeping the twin (I-12, D-14).
+// What is testable here now is what the builder actually owns: the IR SHAPE each
+// picker emits, the phrase each node reads as, and the tree edits.
+
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
-  parseQuery,
-  toDsl,
-  clauseToAdvanced,
-  clauseLabel,
   addChild,
+  betweenFilter,
+  builderLeafKind,
+  builderRoot,
+  contentFilter,
+  currentAgg,
+  currentGroup,
+  currentSort,
+  escapeLike,
+  filterLabel,
+  journalFilter,
+  namespaceFilter,
+  onPageFilter,
+  pagePropertyFilter,
+  pageRefFilter,
+  pageTagsFilter,
+  planningFilter,
+  plainLikeSubstring,
+  priorityFilter,
+  propertyFilter,
   removeAt,
   replaceAt,
-  wrapAt,
-  unwrapAt,
+  searchFilter,
   setOp,
-  type Clause,
+  sortLabel,
+  taskFilter,
+  unwrapAt,
+  withAgg,
+  withGroup,
+  withSort,
+  wrapAt,
 } from "./queryBuilder";
+import { forEachFilter, type Filter, type ViewSettings } from "./queryIr";
 
-// Round-trip helper: DSL -> tree -> DSL should be stable for supported forms.
-const roundtrip = (dsl: string) => toDsl(parseQuery(dsl));
+const A = pageRefFilter("A");
+const B = pageRefFilter("B");
+const C = pageRefFilter("C");
 
-describe("parse + serialize round-trip", () => {
-  it("turns a query past the visual-builder depth cap into a bounded raw fallback", () => {
-    const depth = 65;
-    const dsl = `${"(and ".repeat(depth)}[[Leaf]]${")".repeat(depth)}`;
-    let clause = parseQuery(dsl);
-    let traversed = 0;
-    let foundRaw = false;
-    while (clause.kind === "op" && clause.children.length === 1) {
-      traversed++;
-      clause = clause.children[0];
-    }
-    foundRaw = clause.kind === "raw";
-    expect(foundRaw).toBe(true);
-    expect(traversed).toBeLessThanOrEqual(65);
+// **The shapes are the contract with `crates/tine-core/src/query/og.rs`.**
+// A chip added here and the same filter typed as OG text must be the SAME IR, or
+// the round trip (add → print → re-parse) silently rewrites the user's query. So
+// these assert the exact JSON, each naming the `og.rs` construction it mirrors.
+describe("leaf constructors mirror the OG parser's IR", () => {
+  it("`[[x]]` / `#x` is `refs any (name = x)` (Filter::page_ref, Q2)", () => {
+    expect(pageRefFilter("Foo")).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel",
+        rel: "refs",
+        quant: "any",
+        pred: { kind: "leaf", leaf: { kind: "attr", attr: "name", op: "eq", value: { kind: "text", text: "Foo" } } },
+      },
+    });
   });
 
-  it("page / tag refs", () => {
-    expect(roundtrip("[[Foo]]")).toBe("[[Foo]]");
-    expect(roundtrip("#bar")).toBe("[[bar]]"); // tag normalizes to page-ref (same predicate)
-    expect(roundtrip("#café")).toBe("[[café]]");
-    expect(roundtrip("#你好")).toBe("[[你好]]");
+  it("`(task …)` is `task in [...]`, and an empty pick is OG's open-task set", () => {
+    expect(taskFilter(["TODO", "DOING"])).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "attr",
+        attr: "task",
+        op: "in",
+        value: { kind: "list", items: [{ kind: "text", text: "TODO" }, { kind: "text", text: "DOING" }] },
+      },
+    });
+    // og.rs: "OG drops `(task)` with no markers; Tine's shipped behaviour reads
+    // it as any open task and the corpus depends on it."
+    const empty = taskFilter([]);
+    expect(empty.kind === "leaf" && empty.leaf.kind === "attr" && empty.leaf.value).toEqual({
+      kind: "list",
+      items: ["TODO", "DOING", "NOW", "LATER"].map((text) => ({ kind: "text", text })),
+    });
   });
 
-  it("boolean operators", () => {
-    expect(roundtrip("(and [[A]] [[B]])")).toBe("(and [[A]] [[B]])");
-    expect(roundtrip("(or [[A]] [[B]])")).toBe("(or [[A]] [[B]])");
-    expect(roundtrip("(not [[A]])")).toBe("(not [[A]])");
+  it("`(priority …)` defaults to A/B/C, matching og.rs", () => {
+    const empty = priorityFilter([]);
+    expect(empty.kind === "leaf" && empty.leaf.kind === "attr" && empty.leaf.value).toEqual({
+      kind: "list",
+      items: ["A", "B", "C"].map((text) => ({ kind: "text", text })),
+    });
   });
 
-  it("nested operators", () => {
-    expect(roundtrip("(and [[A]] (or [[B]] [[C]]))")).toBe("(and [[A]] (or [[B]] [[C]]))");
+  it("`(property k v)` is `props any (key = k AND value = v)` (og.rs::property_leaf)", () => {
+    expect(propertyFilter("type", "book")).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel",
+        rel: "props",
+        quant: "any",
+        pred: {
+          kind: "and",
+          items: [
+            { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "type" } } },
+            { kind: "leaf", leaf: { kind: "attr", attr: "value", op: "eq", value: { kind: "text", text: "book" } } },
+          ],
+        },
+      },
+    });
+    // `(property k)` with no value is the bare key test, not `value = ""`.
+    expect(propertyFilter("public", null)).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel",
+        rel: "props",
+        quant: "any",
+        pred: { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "public" } } },
+      },
+    });
   });
 
-  it("task / priority / property / dates", () => {
-    expect(roundtrip("(task TODO DOING)")).toBe("(task TODO DOING)");
-    expect(roundtrip("(priority A B)")).toBe("(priority A B)");
-    expect(roundtrip("(property type book)")).toBe("(property type book)");
-    expect(roundtrip("(property public)")).toBe("(property public)");
-    expect(roundtrip("(scheduled)")).toBe("(scheduled)");
-    expect(roundtrip("(deadline)")).toBe("(deadline)");
-    expect(roundtrip("(between [[Jan 1st, 2021]] [[Jan 1st, 2100]])")).toBe(
-      "(between [[Jan 1st, 2021]] [[Jan 1st, 2100]])"
+  it("page-row filters are read THROUGH the page relation (og.rs::through_page)", () => {
+    const throughPage = (inner: unknown) => ({
+      kind: "leaf",
+      leaf: { kind: "rel", rel: "page", quant: "any", pred: inner },
+    });
+    expect(onPageFilter("Alpha")).toEqual(
+      throughPage({ kind: "leaf", leaf: { kind: "attr", attr: "name", op: "eq", value: { kind: "text", text: "Alpha" } } }),
     );
+    // OG `(namespace x)` is recursive membership: the name starts with `x/`.
+    expect(namespaceFilter("Projects")).toEqual(
+      throughPage({ kind: "leaf", leaf: { kind: "attr", attr: "name", op: "starts_with", value: { kind: "text", text: "Projects/" } } }),
+    );
+    expect(journalFilter()).toEqual(
+      throughPage({ kind: "leaf", leaf: { kind: "attr", attr: "journal", op: "eq", value: { kind: "bool", bool: true } } }),
+    );
+    expect(pagePropertyFilter("fach", null)).toEqual(throughPage(propertyFilter("fach", null)));
   });
 
-  it("property keys drop a leading colon / underscore and keep ref values", () => {
-    // Mirrors query.rs: `:fach` → `fach`, `_`→`-`, and a [[page]] / #tag VALUE is
-    // captured (was dropped, leaking a stray page-ref) — the reported bug's builder side.
-    const prop = (dsl: string) => {
-      const root = parseQuery(dsl);
-      // parseQuery wraps a single clause in an `and` root.
-      const c = root.kind === "op" ? root.children[0] : root;
-      return c;
+  it("`(page-tags …)` is the page's `tags` property with a set test", () => {
+    expect(pageTagsFilter(["research"])).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel",
+        rel: "page",
+        quant: "any",
+        pred: {
+          kind: "leaf",
+          leaf: {
+            kind: "rel",
+            rel: "props",
+            quant: "any",
+            pred: {
+              kind: "and",
+              items: [
+                { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "tags" } } },
+                { kind: "leaf", leaf: { kind: "attr", attr: "value", op: "in", value: { kind: "list", items: [{ kind: "text", text: "research" }] } } },
+              ],
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it("`(scheduled)` / `(deadline)` are presence leaves, never a date", () => {
+    expect(planningFilter("scheduled")).toEqual({
+      kind: "leaf",
+      leaf: { kind: "attr", attr: "scheduled", op: "is_set", value: { kind: "none" } },
+    });
+  });
+
+  // og.rs::bounded — two bounds, one bound, no bounds are three DIFFERENT leaves.
+  // The IR keeps the literal unresolved, so a cached query never pins a day.
+  it("`(between …)` degrades exactly as og.rs::bounded does", () => {
+    expect(betweenFilter("scheduled", "-7d", "+7d")).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "attr",
+        attr: "scheduled",
+        op: "between",
+        value: { kind: "list", items: [{ kind: "date", literal: "-7d" }, { kind: "date", literal: "+7d" }] },
+      },
+    });
+    expect(betweenFilter("deadline", "today", "")).toEqual({
+      kind: "leaf",
+      leaf: { kind: "attr", attr: "deadline", op: "ge", value: { kind: "date", literal: "today" } },
+    });
+    expect(betweenFilter("deadline", "", "+14d")).toEqual({
+      kind: "leaf",
+      leaf: { kind: "attr", attr: "deadline", op: "le", value: { kind: "date", literal: "+14d" } },
+    });
+    expect(betweenFilter("deadline", "", "")).toEqual({
+      kind: "leaf",
+      leaf: { kind: "attr", attr: "deadline", op: "is_set", value: { kind: "none" } },
+    });
+  });
+
+  it("`(between any …)` expands to the faithful three-way or", () => {
+    const any = betweenFilter("any", "-7d", "+7d");
+    expect(any.kind).toBe("or");
+    expect(any.kind === "or" && any.items).toEqual([
+      betweenFilter("journal", "-7d", "+7d"),
+      betweenFilter("scheduled", "-7d", "+7d"),
+      betweenFilter("deadline", "-7d", "+7d"),
+    ]);
+    // The journal form goes through the page; the planning forms do not.
+    expect(betweenFilter("journal", "-7d", "+7d")).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel",
+        rel: "page",
+        quant: "any",
+        pred: {
+          kind: "leaf",
+          leaf: {
+            kind: "attr",
+            attr: "day",
+            op: "between",
+            value: { kind: "list", items: [{ kind: "date", literal: "-7d" }, { kind: "date", literal: "+7d" }] },
+          },
+        },
+      },
+    });
+  });
+});
+
+// `og::escape_like` and its inverse `og::plain_like_substring`. The builder emits
+// the pattern synchronously as the chip commits, so these two are transcribed
+// rather than shared — and an unescaped `%` would make `50%` match everything
+// after the `50`.
+describe("LIKE escaping (transcribed from og::escape_like)", () => {
+  it("treats the user's `%`, `_` and `\\` as data", () => {
+    expect(escapeLike("50% _ok_ a\\b")).toBe("50\\% \\_ok\\_ a\\\\b");
+  });
+
+  it("a content chip carries the `%…%` substring pattern", () => {
+    expect(contentFilter("100% done")).toEqual({
+      kind: "leaf",
+      leaf: { kind: "attr", attr: "content", op: "like", value: { kind: "text", text: "%100\\% done%" } },
+    });
+  });
+
+  it("round-trips through the printer's inverse", () => {
+    for (const text of ["plain", "100% done", "a_b", "back\\slash", "%%%"]) {
+      expect(plainLikeSubstring(`%${escapeLike(text)}%`)).toBe(text);
+    }
+  });
+
+  it("refuses a pattern that is not a plain substring, so the label never lies", () => {
+    // An unescaped wildcard in the middle is a real pattern, not a literal.
+    expect(plainLikeSubstring("%a%b%")).toBeNull();
+    expect(plainLikeSubstring("no percent signs")).toBeNull();
+  });
+});
+
+describe("builderLeafKind", () => {
+  it("recognises every shape a picker can emit", () => {
+    expect(builderLeafKind(pageRefFilter("A"))).toBe("page");
+    expect(builderLeafKind(taskFilter(["TODO"]))).toBe("task");
+    expect(builderLeafKind(priorityFilter(["A"]))).toBe("priority");
+    expect(builderLeafKind(propertyFilter("k", "v"))).toBe("property");
+    expect(builderLeafKind(propertyFilter("k", null))).toBe("property");
+    expect(builderLeafKind(pagePropertyFilter("k", "v"))).toBe("pageProperty");
+    expect(builderLeafKind(pageTagsFilter(["t"]))).toBe("pageTags");
+    expect(builderLeafKind(planningFilter("scheduled"))).toBe("scheduled");
+    expect(builderLeafKind(planningFilter("deadline"))).toBe("deadline");
+    expect(builderLeafKind(journalFilter())).toBe("journal");
+    expect(builderLeafKind(onPageFilter("P"))).toBe("onPage");
+    expect(builderLeafKind(namespaceFilter("N"))).toBe("namespace");
+    expect(builderLeafKind(contentFilter("x"))).toBe("content");
+    expect(builderLeafKind(searchFilter("a or b"))).toBe("search");
+    expect(builderLeafKind(betweenFilter("scheduled", "-7d", "+7d"))).toBe("between");
+    expect(builderLeafKind(betweenFilter("journal", "-7d", "+7d"))).toBe("between");
+  });
+
+  it("returns null — not a wrong guess — for a shape no picker can re-collect", () => {
+    // A typed comparison, a quantifier the pickers do not offer, and a boolean
+    // node are all things the builder RENDERS but must not offer to "edit" with a
+    // form that would rewrite them into something else.
+    const typed: Filter = {
+      kind: "leaf",
+      leaf: { kind: "attr", attr: "content", op: "gt", value: { kind: "number", number: 3 } },
     };
-    expect(prop("(property :type book)")).toEqual({ kind: "property", key: "type", value: "book" });
-    expect(prop("(property my_key v)")).toEqual({ kind: "property", key: "my-key", value: "v" });
-    expect(prop("(property :fach [[Foo Bar]])")).toEqual({
-      kind: "property",
-      key: "fach",
-      value: "Foo Bar",
+    expect(builderLeafKind(typed)).toBeNull();
+    const everyChild: Filter = {
+      kind: "leaf",
+      leaf: { kind: "rel", rel: "children", quant: "every", pred: taskFilter(["TODO"]) },
+    };
+    expect(builderLeafKind(everyChild)).toBeNull();
+    expect(builderLeafKind({ kind: "and", items: [] })).toBeNull();
+  });
+});
+
+// §7.5's anti-Jira property: "every query the parser accepts renders in the
+// builder, invalid ones included". The golden wire fixture is the widest IR the
+// two sides agree on, so labelling every node of it is the strongest cheap
+// statement of totality available here.
+describe("filterLabel is total over the IR", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      join(fileURLToPath(new URL("../..", import.meta.url)), "crates/tine-core/tests/fixtures/query-ir/filter.json"),
+      "utf8",
+    ),
+  ) as Filter;
+
+  it("phrases every node of the golden filter fixture without throwing", () => {
+    let nodes = 0;
+    forEachFilter(fixture, (node) => {
+      nodes += 1;
+      const label = filterLabel(node);
+      expect(typeof label).toBe("string");
+      expect(label.length).toBeGreaterThan(0);
     });
-    expect(prop("(property :type #assignment)")).toEqual({
-      kind: "property",
-      key: "type",
-      value: "assignment",
-    });
-    expect(prop("(page-property :fach [[Foo]])")).toEqual({
-      kind: "pageProperty",
-      key: "fach",
-      value: "Foo",
-    });
+    expect(nodes).toBeGreaterThan(20);
   });
 
-  it("new OG-parity filters round-trip", () => {
-    expect(roundtrip("(page Project/Alpha)")).toBe("(page Project/Alpha)");
-    expect(roundtrip("(namespace Project)")).toBe("(namespace Project)");
-    expect(roundtrip("(page-property type book)")).toBe("(page-property type book)");
-    expect(roundtrip("(page-property public)")).toBe("(page-property public)");
-    expect(roundtrip("(page-tags research active)")).toBe("(page-tags research active)");
-    expect(roundtrip('"full text"')).toBe('"full text"');
-    // Relative/keyword/ISO bounds stay bare; journal titles keep their [[ ]].
-    expect(roundtrip("(between -7d +7d)")).toBe("(between -7d +7d)");
-    expect(roundtrip("(between today tomorrow)")).toBe("(between today tomorrow)");
-    expect(roundtrip("(between 2026-01-01 2026-12-31)")).toBe("(between 2026-01-01 2026-12-31)");
+  it("keeps an unparsed span's own text as its phrase (§4.3.2 R4)", () => {
+    expect(filterLabel({ kind: "raw", text: "(frobnicate x)", diagnostic_kind: "unknown_head" }))
+      .toBe("(frobnicate x)");
   });
 
-  it("retains OG bare content terms in the visual tree", () => {
-    expect(parseQuery("(and (task DONE) changelog)")).toEqual({
-      kind: "op",
-      op: "and",
-      children: [
-        { kind: "task", markers: ["DONE"] },
-        { kind: "content", text: "changelog" },
-      ],
-    });
-    expect(roundtrip("(and (task DONE) changelog)")).toBe('(and (task DONE) "changelog")');
+  it("marks a disabled subtree rather than hiding it (§3.5, Q12)", () => {
+    expect(filterLabel({ kind: "off", inner: pageRefFilter("A") })).toBe("A (off)");
   });
 
-  it("between field selector and journal predicate round-trip", () => {
-    expect(roundtrip("(journal)")).toBe("(journal)");
-    expect(roundtrip("(between -30d today)")).toBe("(between -30d today)");
-    expect(roundtrip("(between journal -30d today)")).toBe("(between -30d today)");
-    expect(roundtrip("(between scheduled -7d +7d)")).toBe("(between scheduled -7d +7d)");
-    expect(roundtrip("(between deadline today +14d)")).toBe("(between deadline today +14d)");
-    expect(roundtrip("(between any -7d +7d)")).toBe("(between any -7d +7d)");
-    // The motivating query.
-    expect(roundtrip("(and (task TODO) (between journal -30d today))")).toBe(
-      "(and (task TODO) (between -30d today))"
+  it("reads the friendly shapes friendlily", () => {
+    expect(filterLabel(pageRefFilter("Foo"))).toBe("Foo");
+    expect(filterLabel(taskFilter(["NOW", "LATER"]))).toBe("task: NOW | LATER");
+    expect(filterLabel(propertyFilter("type", "book"))).toBe("type: book");
+    expect(filterLabel(propertyFilter("public", null))).toBe("public: any");
+    expect(filterLabel(pagePropertyFilter("fach", "x"))).toBe("page fach: x");
+    expect(filterLabel(pageTagsFilter(["a", "b"]))).toBe("page tags: a | b");
+    expect(filterLabel(onPageFilter("Alpha"))).toBe("page: Alpha");
+    expect(filterLabel(namespaceFilter("Projects"))).toBe("namespace: Projects");
+    expect(filterLabel(journalFilter())).toBe("on journal page");
+    expect(filterLabel(contentFilter("100% done"))).toBe('text: "100% done"');
+    expect(filterLabel(betweenFilter("journal", "-30d", "today"))).toBe("between: -30d ~ today");
+    expect(filterLabel(betweenFilter("scheduled", "-7d", "+7d"))).toBe("scheduled between: -7d ~ +7d");
+  });
+});
+
+describe("builderRoot", () => {
+  it("adopts a bare leaf so `+ add filter` has somewhere to add", () => {
+    expect(builderRoot(A)).toEqual({ kind: "and", items: [A] });
+  });
+  it("keeps an `or` root as an `or`, so adding a filter does not change the query", () => {
+    expect(builderRoot({ kind: "or", items: [A, B] })).toEqual({ kind: "or", items: [A, B] });
+  });
+  it("reads `true` as the empty query", () => {
+    expect(builderRoot({ kind: "true" })).toEqual({ kind: "and", items: [] });
+  });
+});
+
+describe("tree edits", () => {
+  const root = (items: Filter[]): Filter => ({ kind: "and", items });
+
+  it("addChild appends to the addressed boolean node", () => {
+    expect(addChild(root([A]), [], B)).toEqual(root([A, B]));
+    expect(addChild(root([{ kind: "or", items: [A] }]), [0], B)).toEqual(root([{ kind: "or", items: [A, B] }]));
+  });
+
+  it("addChild refuses a `not`, which holds exactly one child", () => {
+    const tree = root([{ kind: "not", inner: A }]);
+    expect(addChild(tree, [0], B)).toBe(tree);
+  });
+
+  it("removeAt deletes, and prunes the empty node it leaves behind", () => {
+    expect(removeAt(root([A, B]), [1])).toEqual(root([A]));
+    expect(removeAt(root([A]), [0])).toEqual(root([]));
+    // The `or` becomes childless and goes with it, rather than staying as a
+    // vacuous `(or)` that would match everything.
+    expect(removeAt(root([A, { kind: "or", items: [B] }]), [1, 0])).toEqual(root([A]));
+  });
+
+  it("replaceAt swaps one node", () => {
+    expect(replaceAt(root([A, B]), [1], taskFilter(["TODO"]))).toEqual(root([A, taskFilter(["TODO"])]));
+  });
+
+  it("wrapAt wraps in a new boolean node, `not` included", () => {
+    expect(wrapAt(root([A, B]), [1], "or")).toEqual(root([A, { kind: "or", items: [B] }]));
+    expect(wrapAt(root([A]), [0], "not")).toEqual(root([{ kind: "not", inner: A }]));
+  });
+
+  it("unwrapAt promotes children, through `not` and `off` too", () => {
+    expect(unwrapAt(root([A, { kind: "or", items: [B, C] }]), [1])).toEqual(root([A, B, C]));
+    expect(unwrapAt(root([{ kind: "not", inner: A }]), [0])).toEqual(root([A]));
+    expect(unwrapAt(root([{ kind: "off", inner: A }]), [0])).toEqual(root([A]));
+  });
+
+  it("setOp flips the root and any inner node", () => {
+    expect(setOp(root([A, B]), [], "or")).toEqual({ kind: "or", items: [A, B] });
+    expect(setOp(root([{ kind: "and", items: [A, B] }]), [0], "or")).toEqual(
+      root([{ kind: "or", items: [A, B] }]),
     );
   });
 
-  it("quotes property values with spaces", () => {
-    const t = parseQuery('(property title "War and Peace")');
-    expect(toDsl(t)).toBe('(property title "War and Peace")');
+  it("a path that no longer addresses anything is a no-op, not a corruption", () => {
+    // A popover can outlive the tree it was opened over; an edit at a stale `loc`
+    // must leave the query alone rather than delete a neighbour.
+    const tree = root([A]);
+    expect(removeAt(tree, [7])).toBe(tree);
+    expect(replaceAt(tree, [1, 2], B)).toBe(tree);
+    expect(wrapAt(tree, [], "or")).toBe(tree);
+    expect(unwrapAt(tree, [0])).toBe(tree); // a leaf has no children to promote
+    expect(setOp(tree, [0], "or")).toBe(tree);
   });
 
-  it("escapes quotes/parens/backslashes in string values so they round-trip", () => {
-    // Full-text content with an embedded quote — was serialized to `"foo "bar""`
-    // and silently truncated to `foo `; now escaped + unescaped symmetrically.
-    const content: Clause = { kind: "op", op: "and", children: [{ kind: "content", text: 'foo "bar"' }] };
-    expect(toDsl(content)).toBe('"foo \\"bar\\""');
-    expect(parseQuery(toDsl(content))).toEqual(content);
-
-    // Property value with whitespace AND a quote.
-    const prop: Clause = { kind: "op", op: "and", children: [{ kind: "property", key: "title", value: 'a "b" c' }] };
-    expect(parseQuery(toDsl(prop))).toEqual(prop);
-
-    // A `)` in a value must force quoting so it can't close the form early.
-    const paren: Clause = { kind: "op", op: "and", children: [{ kind: "property", key: "note", value: "see (x)" }] };
-    expect(toDsl(paren)).toBe('(property note "see (x)")');
-    expect(parseQuery(toDsl(paren))).toEqual(paren);
-
-    // A literal backslash round-trips (escaped on write, unescaped on read).
-    const bs: Clause = { kind: "op", op: "and", children: [{ kind: "content", text: "a\\b" }] };
-    expect(parseQuery(toDsl(bs))).toEqual(bs);
-
-    // Generated value forcing quoting AND containing a backslash (Windows path).
-    const winpath: Clause = { kind: "op", op: "and", children: [{ kind: "property", key: "path", value: "C:\\program files" }] };
-    expect(parseQuery(toDsl(winpath))).toEqual(winpath);
-
-    // Only `\"` and `\\` are escapes: a HAND-AUTHORED single backslash before a
-    // normal char is kept literally, so `"C:\tmp"` doesn't become `C:tmp`.
-    expect(parseQuery('"a\\q b"')).toEqual({
-      kind: "op",
-      op: "and",
-      children: [{ kind: "content", text: "a\\q b" }],
-    });
-  });
-
-  it("round-trips a lossless friendly-search frontend", () => {
-    const dsl = '(search "alpha or \\"beta gamma\\" not draft")';
-    expect(roundtrip(dsl)).toBe(dsl);
-    expect(parseQuery(dsl)).toEqual({
-      kind: "op",
-      op: "and",
-      children: [{ kind: "search", source: 'alpha or "beta gamma" not draft' }],
-    });
-  });
-
-  it("empty query is empty string", () => {
-    expect(roundtrip("")).toBe("");
-    expect(toDsl(parseQuery(""))).toBe("");
-  });
-
-  it("unknown form is preserved verbatim", () => {
-    // (sample 5) isn't in Tine's runnable grammar — keep it rather than drop it.
-    expect(roundtrip("(sample 5)")).toBe("(sample 5)");
-  });
-
-  it("preserves a NESTED unknown form and the clauses after it", () => {
-    // The raw fallback must capture a BALANCED extent — a lazy stop at the first
-    // ")" split `(custom (nested x))` at the inner ")", dropping [[B]] and writing
-    // an unbalanced fragment back to the {{query}} block.
-    const dsl = "(and [[A]] (custom (nested x)) [[B]])";
-    expect(roundtrip(dsl)).toBe(dsl);
-    expect(parseQuery(dsl)).toEqual({
-      kind: "op",
-      op: "and",
-      children: [
-        { kind: "page", name: "A" },
-        { kind: "raw", text: "(custom (nested x))" },
-        { kind: "page", name: "B" },
-      ],
-    });
+  it("edits do not mutate the input tree", () => {
+    const tree = root([A, { kind: "or", items: [B] }]);
+    const before = structuredClone(tree);
+    removeAt(tree, [1, 0]);
+    addChild(tree, [1], C);
+    wrapAt(tree, [0], "not");
+    expect(tree).toEqual(before);
   });
 });
 
-describe("tree shape", () => {
-  it("bare clause is wrapped in an and-root", () => {
-    const t = parseQuery("[[Foo]]");
-    expect(t).toEqual({ kind: "op", op: "and", children: [{ kind: "page", name: "Foo" }] });
+// Presentation is a separate value (§3.1, Q15). It used to ride in the clause
+// tree as fake filter children, which is why wrapping a sort in an OR silently
+// disabled it.
+describe("view settings edits", () => {
+  it("sort holds at most the one key OG can express", () => {
+    const view = withSort({}, { field: "priority", dir: "desc" });
+    expect(view.sort).toEqual([["priority", "desc"]]);
+    expect(currentSort(view)).toEqual({ field: "priority", dir: "desc" });
+    expect(currentSort(withSort(view, null))).toBeNull();
+    expect(withSort(view, null).sort).toBeUndefined();
   });
 
-  it("single-child and simplifies on serialize", () => {
-    const root: Clause = { kind: "op", op: "and", children: [{ kind: "page", name: "X" }] };
-    expect(toDsl(root)).toBe("[[X]]");
-  });
-});
-
-describe("mutations", () => {
-  it("addChild appends to the addressed op", () => {
-    let t = parseQuery("[[A]]"); // and-root with one child
-    t = addChild(t, [], { kind: "page", name: "B" });
-    expect(toDsl(t)).toBe("(and [[A]] [[B]])");
+  it("a blank field clears rather than writing an empty sort key", () => {
+    expect(withSort({}, { field: "   ", dir: "asc" }).sort).toBeUndefined();
   });
 
-  it("removeAt deletes and re-simplifies", () => {
-    let t = parseQuery("(and [[A]] [[B]])");
-    t = removeAt(t, [1]);
-    expect(toDsl(t)).toBe("[[A]]"); // back to single child -> simplified
+  it("`count` is the whole-result count, spelled with the empty field (X3)", () => {
+    const view = withAgg({}, { agg: "count", field: null });
+    expect(view.aggregates).toEqual([["", "count"]]);
+    expect(currentAgg(view)).toEqual({ agg: "count", field: null });
   });
 
-  it("removing the last child yields an empty query", () => {
-    let t = parseQuery("[[A]]");
-    t = removeAt(t, [0]);
-    expect(toDsl(t)).toBe("");
+  it("sum/avg keep their field", () => {
+    const view = withAgg({}, { agg: "sum", field: "hours" });
+    expect(view.aggregates).toEqual([["hours", "sum"]]);
+    expect(currentAgg(view)).toEqual({ agg: "sum", field: "hours" });
+    expect(currentAgg(withAgg(view, null))).toBeNull();
   });
 
-  it("replaceAt swaps a clause", () => {
-    let t = parseQuery("(and [[A]] [[B]])");
-    t = replaceAt(t, [1], { kind: "task", markers: ["TODO"] });
-    expect(toDsl(t)).toBe("(and [[A]] (task TODO))");
+  it("group-by is independent of the aggregate", () => {
+    let view: ViewSettings = withAgg({}, { agg: "count", field: null });
+    view = withGroup(view, "page");
+    expect(currentGroup(view)).toBe("page");
+    expect(currentAgg(view)).toEqual({ agg: "count", field: null });
+    expect(currentGroup(withGroup(view, null))).toBeNull();
   });
 
-  it("wrapAt wraps a clause in a new operator", () => {
-    let t = parseQuery("(and [[A]] [[B]])");
-    t = wrapAt(t, [1], "or");
-    expect(toDsl(t)).toBe("(and [[A]] (or [[B]]))");
-    t = addChild(t, [1], { kind: "page", name: "C" });
-    expect(toDsl(t)).toBe("(and [[A]] (or [[B]] [[C]]))");
+  it("a view edit does not mutate the view it was given", () => {
+    const view: ViewSettings = { sort: [["page", "asc"]] };
+    withSort(view, { field: "priority", dir: "desc" });
+    withGroup(view, "status");
+    expect(view).toEqual({ sort: [["page", "asc"]] });
   });
 
-  it("unwrapAt promotes children and prunes empties", () => {
-    let t = parseQuery("(and [[A]] (or [[B]] [[C]]))");
-    t = unwrapAt(t, [1]);
-    expect(toDsl(t)).toBe("(and [[A]] [[B]] [[C]])");
-  });
-
-  it("setOp flips and<->or on the root", () => {
-    let t = parseQuery("(and [[A]] [[B]])");
-    t = setOp(t, [], "or");
-    expect(toDsl(t)).toBe("(or [[A]] [[B]])");
-  });
-});
-
-describe("labels", () => {
-  it("renders human-readable chips", () => {
-    expect(clauseLabel({ kind: "page", name: "Foo" })).toBe("Foo");
-    expect(clauseLabel({ kind: "task", markers: ["NOW", "LATER"] })).toBe("task: NOW | LATER");
-    expect(clauseLabel({ kind: "property", key: "type", value: "book" })).toBe("type: book");
-    expect(clauseLabel({ kind: "property", key: "public", value: null })).toBe("public: any");
-    expect(clauseLabel({ kind: "between", field: "any", start: "-7d", end: "+7d" })).toBe(
-      "any between: -7d ~ +7d"
-    );
-    expect(clauseLabel({ kind: "between", field: "journal", start: "-30d", end: "today" })).toBe(
-      "between: -30d ~ today"
-    );
-  });
-});
-
-describe("sort-by clause", () => {
-  it("parses and round-trips", () => {
-    expect(roundtrip("(sort-by priority desc)")).toBe("(sort-by priority desc)");
-    expect(roundtrip("(sort-by page)")).toBe("(sort-by page asc)"); // default asc
-    expect(roundtrip("(and (task TODO) (sort-by priority desc))")).toBe(
-      "(and (task TODO) (sort-by priority desc))"
-    );
-  });
-  it("has a readable label", () => {
-    expect(clauseLabel({ kind: "sortBy", field: "priority", dir: "desc" })).toBe("sort: priority ↓");
-  });
-});
-
-describe("aggregate + group-by directives", () => {
-  it("parse and round-trip", () => {
-    expect(roundtrip("(aggregate count)")).toBe("(aggregate count)");
-    expect(roundtrip("(aggregate sum hours)")).toBe("(aggregate sum hours)");
-    expect(roundtrip("(aggregate avg score)")).toBe("(aggregate avg score)");
-    expect(roundtrip("(group-by page)")).toBe("(group-by page)");
-    expect(roundtrip("(group-by status)")).toBe("(group-by status)");
-    // Alongside filters + a group-by, all round-trip together.
-    expect(roundtrip("(and (task TODO) (group-by page) (aggregate count))")).toBe(
-      "(and (task TODO) (group-by page) (aggregate count))"
-    );
-    // `average` normalizes to `avg`.
-    expect(roundtrip("(aggregate average score)")).toBe("(aggregate avg score)");
-  });
-  it("has readable labels", () => {
-    expect(clauseLabel({ kind: "aggregate", agg: "count", field: null })).toBe("count");
-    expect(clauseLabel({ kind: "aggregate", agg: "sum", field: "hours" })).toBe("sum of hours");
-    expect(clauseLabel({ kind: "groupBy", field: "status" })).toBe("group by status");
-  });
-});
-
-// The "⚙ advanced" pill conversion. Jul 8 regression: the old multi-line
-// skeleton did not parse as a {{query}} macro (lsdoc macros are single-line)
-// and silently REPLACED the user's simple query.
-describe("clauseToAdvanced", () => {
-  const conv = (dsl: string) => clauseToAdvanced(parseQuery(dsl));
-
-  it("refuses to guess an advanced equivalent for friendly search", () => {
-    expect(conv('(search "alpha beta")')).toEqual({
-      ok: false,
-      unsupported: ['friendly search "alpha beta"'],
-    });
-  });
-
-  it("converts a task query 1:1 and stays on one line", () => {
-    const r = conv("(task TODO DOING)");
-    expect(r).toEqual({
-      ok: true,
-      dsl: '[:find (pull ?b [*]) :where (task ?b "TODO" "DOING")]',
-      dropped: [],
-    });
-  });
-
-  it("NEVER emits a newline or a brace (macros cannot span lines; #{…} sets kill macro parsing)", () => {
-    for (const dsl of [
-      "(task TODO DOING)",
-      '(and (task TODO) [[Some Page]] (property status "open") (scheduled))',
-      '(or (priority A) (not (journal)))',
-      "",
-    ]) {
-      const r = conv(dsl);
-      expect(r.ok).toBe(true);
-      if (r.ok) {
-        expect(r.dsl).not.toContain("\n");
-        expect(r.dsl).not.toContain("{");
-        expect(r.dsl).not.toContain("}");
-      }
-    }
-  });
-
-  it("flattens a top-level and into sibling :where groups", () => {
-    const r = conv('(and (task TODO) [[Roadmap]] (namespace "Projects"))');
-    expect(r).toMatchObject({
-      ok: true,
-      dsl: '[:find (pull ?b [*]) :where (task ?b "TODO") (page-ref ?b "Roadmap") (namespace ?b "Projects")]',
-    });
-  });
-
-  it('expands between "any" into the faithful (or …) of the three fields', () => {
-    const r = conv('(between any "2026-01-01" "2026-12-31")');
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.dsl).toContain('(or (between :journal ?b "2026-01-01" "2026-12-31")');
-      expect(r.dsl).toContain('(between :scheduled ?b');
-      expect(r.dsl).toContain('(between :deadline ?b');
-    }
-  });
-
-  it("drops result-shaping with a report instead of failing", () => {
-    const r = conv("(and (task TODO) (sort-by priority) (group-by page))");
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.dsl).toBe('[:find (pull ?b [*]) :where (task ?b "TODO")]');
-      expect(r.dropped).toEqual(["sort by priority", "group by page"]);
-    }
-  });
-
-  it("REFUSES (rather than loses) a clause with no advanced equivalent", () => {
-    const r = conv('"free text"');
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.unsupported[0]).toContain("full-text");
-  });
-
-  it("an empty query seeds the default task clause", () => {
-    const r = conv("");
-    expect(r).toMatchObject({ ok: true, dsl: '[:find (pull ?b [*]) :where (task ?b "TODO" "DOING")]' });
+  it("sortLabel prefers a preset's words", () => {
+    expect(sortLabel("modified", "desc")).toBe("newest first");
+    expect(sortLabel("rating", "desc")).toBe("rating ↓");
   });
 });

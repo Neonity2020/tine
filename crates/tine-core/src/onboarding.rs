@@ -1048,6 +1048,12 @@ mod tests {
         // nothing else in the app tells the reader which link forms are live.
         assert!(page.markdown.contains("A `file:` link"));
         assert!(page.markdown.contains("alias:: Kitchen sink (features)"));
+        // The empty result is the one moment a user most needs to know WHICH
+        // condition emptied it, and nothing else in the app says the disclosure
+        // is there. Same for page-anchored results: `(page-property …)` used to
+        // answer with blocks, so a reader who learned that needs telling.
+        assert!(page.markdown.contains("**why empty?**"));
+        assert!(page.markdown.contains("lists the pages themselves"));
         assert!(page.markdown.contains("Save page"));
         assert!(page.markdown.contains("tine.view::"));
         assert!(page.markdown.contains("[[Workflows/Find and revisit]]"));

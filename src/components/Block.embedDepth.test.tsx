@@ -6,6 +6,7 @@ import { loadSingle, resetStore } from "../store";
 import type { BlockDto, PageDto, RefGroup } from "../types";
 import { Block } from "./Block";
 import { LinkDepthContext } from "./linkDepth";
+import { blockRunResult } from "../queryReadingsTestkit";
 
 let liveGroupBudget = Number.POSITIVE_INFINITY;
 let observedLiveGroups = 0;
@@ -213,11 +214,11 @@ describe("shared embed/ref render depth (GH #206)", () => {
     const sourcePage = page("Recursive Query", [queryBlock, mirror]);
     loadSingle(sourcePage);
     mockBlockEmbeds(sourcePage, [queryBlock]);
-    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([{
       page: sourcePage.name,
       kind: sourcePage.kind,
       blocks: [{ ...mirror }],
-    }]);
+    }]));
     liveGroupBudget = 8;
 
     const { root, dispose } = mountBlock(queryId, 4);
@@ -240,11 +241,11 @@ describe("shared embed/ref render depth (GH #206)", () => {
     };
     const sourcePage = page("Self Query", [queryBlock]);
     loadSingle(sourcePage);
-    vi.spyOn(backend(), "runQuery").mockResolvedValue([{
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([{
       page: sourcePage.name,
       kind: sourcePage.kind,
       blocks: [{ ...queryBlock }],
-    }]);
+    }]));
     liveGroupBudget = 8;
 
     const { root, dispose } = mountBlock(queryId, 4);
