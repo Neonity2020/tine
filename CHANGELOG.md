@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Ctrl+Y also redoes, on Windows and Linux.** Ctrl+Z undid and Ctrl+Y did
+  nothing, because Logseq binds redo to Ctrl/Cmd+Shift+Z and leaves Ctrl+Y
+  unbound — so the key most editors on those platforms use for redo reached no
+  command at all. Ctrl+Shift+Z is still the binding the shortcuts list shows and
+  remaps; Ctrl+Y rides along as a second default, keeps one Redo row, and is
+  dropped if you bind Redo to something of your own. Not on macOS, where Ctrl+Y
+  is the system's yank inside every text field (GH #491).
+
 ### Changed
 
 - **The Concord base ledger now reclaims entries whose stored text has been

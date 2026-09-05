@@ -10338,6 +10338,29 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: in a PDF reader pane 520px wide or narrower - a split pane, a companion pane, a phone - five reader tools could not be reached by any pointer. Classification: blocking core operation; the controls were absent from the interface entirely, not merely awkward. Root cause is a CSS cascade-order bug, not a container-query bug: `@container pdfviewer (max-width: 520px)` set `.pdf-settings-overflow { display: grid }`, but the plain `.pdf-settings-overflow { display: none }` default was written LATER in app.css at equal specificity (0,1,0), so the default won at every width. Below 520px the toolbar copies were correctly hidden by the same query and the More-settings copies were hidden too, leaving nowhere to click. Fix: move the container-query block after the base declarations; nothing else changed. This is the answer to two quarantines that had recorded it as a contradictory harness visibility probe - pdf-logseq could not reach Outline, pdf-routes could not reach Notes, and both concluded the two probes disagreed about pane width. They did not disagree: the inline probe was right that the toolbar copy was hidden, and the overflow probe's 0x0 rect was a child of a display:none parent, whose computed `display: inline-block` said nothing about the parent because a bare <button> computes that anyway. Evidence at the browser layer because container queries and hit-testing are CSS layout, which jsdom does not apply; the guard walks nine widths across the 520px boundary and asserts each tool is hit-testable in one place or the other. Necessity gate: 25 unreachable tool/width combinations before the fix (5 tools x 5 widths at or below 520px), 0 after."
+    },
+    {
+      "id": "UI-REDO-CTRL-Y-UNBOUND-491",
+      "title": "Ctrl+Y redoes on Windows and Linux, beside the primary Ctrl+Shift+Z",
+      "family": "keyboard-shortcuts",
+      "sources": {
+        "issues": [491],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/keybindings.test.ts::secondary default chords (aliases)"
+        ],
+        "scenario": "keybindings.redo-alias-ctrl-y",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: Ctrl+Z undid an edit and Ctrl+Y did nothing, so the redo key most Windows editors use reached no command at all. Classification: blocking stateful UX -- an ordinary editing gesture with no effect, not a presentation detail. Logseq binds redo to mod+shift+z and leaves Ctrl+Y unbound, so this is a deliberate divergence from OG, approved by Martin on 2026-09-05; the exact chord is the accepted requirement on Windows and Linux, and mod+shift+z remains the binding Settings shows and remaps. Implemented as a CommandDef `alias`, a second default chord that runs the same command: it keeps one Redo row in the shortcuts list and the palette, loses every collision with a primary binding because aliases are dispatched last, and is dropped entirely once the user binds Redo themselves, since an alias they can neither see in the recorder nor reset must not outlive their choice. Not registered on macOS, where Ctrl+Y is the system Emacs-style yank inside every text field and redo is Cmd+Shift+Z. Evidence at the unit layer driving the real store through the dispatcher -- undo an edit, press the chord, assert the text came back -- because `run: redo` captures its function reference when COMMANDS is built, so a module spy would assert about nothing."
     }
   ]
 }
