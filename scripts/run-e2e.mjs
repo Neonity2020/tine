@@ -222,10 +222,12 @@ const suites = {
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
     // GH #240 was proved on Linux and re-reported on Windows 0.6.98, which is
-    // exactly the gap an advisory Windows suite exists to close: the journey
-    // itself is platform-neutral (it reaches its page through a rendered link,
-    // not the Quick Switcher), so the only reason it was Linux-only was that
-    // nobody added it here.
+    // exactly the gap an advisory Windows suite exists to close: the journey's
+    // *assertions* are platform-neutral (it reaches its page through a rendered
+    // link, not the Quick Switcher). Its session startup was not: listing it
+    // here on 2026-09-05 was not sufficient, and run 33959023127 died in
+    // EdgeDriver launch mode. It now starts the app in WebView2 attach mode
+    // like every other entry, which src/e2eWindowsSuiteSession.test.ts pins.
     ["selection-actions", "scripts/e2e-selection-actions.mjs", {}],
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
     ["windows-direct-large-open", "scripts/e2e-windows-direct-large-open.mjs", {}],
