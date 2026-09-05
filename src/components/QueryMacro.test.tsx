@@ -10,6 +10,8 @@ import { route } from "../router";
 import { clearSimpleForm, getSimpleForm, stashSimpleForm } from "../editor/queryBuilder";
 import type { QueryExecution, QueryHit, RefGroup } from "../types";
 import { bumpDataRev } from "../ui";
+import { queryMacroExtent } from "../editor/queryMacro";
+import { backendReadsQueries } from "../queryReadingsTestkit";
 
 beforeAll(async () => {
   await initParser();
@@ -132,6 +134,10 @@ function loadAdvancedQueryDoc(queryRaw: string) {
     supported: true,
   });
   vi.spyOn(backend(), "runQuery").mockResolvedValue(queryGroups(["todo"]));
+  // Whether a `{{query …}}` holds datalog is the ENGINE's reading, not a regex
+  // over the text (§7.1) — so the test says the engine read datalog.
+  const argument = queryMacroExtent(queryRaw)?.argument ?? "";
+  backendReadsQueries({ [argument]: { form: argument, kind: "advanced" } });
 }
 
 describe("QueryMacro sheet integration", () => {
@@ -455,6 +461,7 @@ describe("QueryMacro sheet integration", () => {
 
   it("persists an explicit expanded override over source collapsed true", async () => {
     loadQueryDoc("{{query (todo TODO) {:collapsed? true}}}");
+    backendReadsQueries({ "(todo TODO) {:collapsed? true}": { form: "(todo TODO)", opts: "{:collapsed? true}" } });
     vi.spyOn(backend(), "runQuery").mockResolvedValue(queryGroups(["todo"]));
     const first = mount(() => <Block id="query" />);
     await settleQuery();
@@ -473,6 +480,7 @@ describe("QueryMacro sheet integration", () => {
 
   it("keeps legacy :table-view? rendering read-only when no tine.view is set", async () => {
     loadQueryDoc("{{query (todo TODO) {:table-view? true}}}");
+    backendReadsQueries({ "(todo TODO) {:table-view? true}": { form: "(todo TODO)", opts: "{:table-view? true}" } });
 
     const { root, dispose } = mount(() => (
       <>
@@ -494,6 +502,15 @@ describe("QueryMacro sheet integration", () => {
     const simpleDsl = "(and (task TODO) (sort-by priority desc))";
     stashSimpleForm("query", simpleDsl);
     loadAdvancedQueryDoc('{{query [:find (pull ?b [*]) :where (task ?b "TODO")]}}');
+    // Restoring the stashed simple form REWRITES the macro, so the engine is
+    // asked to read the restored text too — declare both readings.
+    backendReadsQueries({
+      '[:find (pull ?b [*]) :where (task ?b "TODO")]': {
+        form: '[:find (pull ?b [*]) :where (task ?b "TODO")]',
+        kind: "advanced",
+      },
+      [simpleDsl]: { form: simpleDsl },
+    });
 
     const { root, dispose } = mount(() => (
       <>
@@ -559,6 +576,14 @@ describe("a query never returns its own block (GH #469)", () => {
 
   it("drops the host block from an advanced query's results", async () => {
     loadSelfMatching('{{query {:query [:find (pull ?b [*]) :where [?b :block/content "x"]]}}}\ntine.view:: list');
+    // A form that is ITSELF one map stays whole: `split_trailing_map` only splits
+    // a map that FOLLOWS a nonempty form (§4.3.1).
+    backendReadsQueries({
+      '{:query [:find (pull ?b [*]) :where [?b :block/content "x"]]}': {
+        form: '{:query [:find (pull ?b [*]) :where [?b :block/content "x"]]}',
+        kind: "advanced",
+      },
+    });
     vi.spyOn(backend(), "runAdvancedQuery").mockResolvedValue({
       groups: queryGroups(["query", "todo"]),
       ran: ["content"],

@@ -256,6 +256,17 @@
               "kind": "leaf",
               "leaf": {
                 "kind": "attr",
+                "attr": "value",
+                "op": "is_blank",
+                "value": {
+                  "kind": "none"
+                }
+              }
+            },
+            {
+              "kind": "leaf",
+              "leaf": {
+                "kind": "attr",
                 "attr": "atom_count",
                 "op": "lt",
                 "value": {

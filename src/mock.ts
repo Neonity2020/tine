@@ -5,12 +5,53 @@
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, GraphVerificationReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
 import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
+import { sourceOptions, sourceOriginal } from "./editor/queryIr";
+import type {
+  ExplainEmptyResult,
+  ParsedQuery,
+  Query,
+  QueryPrintDialect,
+  QueryResult,
+  QueryTextDialect,
+  RegistrySnapshot,
+  Source,
+  ViewKind,
+  ViewSettings,
+} from "./editor/queryIr";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { leadingMarker } from "./markers";
 import { fuzzyScore } from "./editor/autocomplete";
 import { canonicalFold, matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
 import { parseJournalWith } from "./journal";
+
+/** The dev preview's stand-in for `query_print`'s refusal (§7.1, I-9): the same
+ *  JSON envelope the native command rejects with, so `classifyNativeCallError`
+ *  decodes it into the same `QueryPrintRefusedError` a real refusal produces and
+ *  callers cannot accidentally handle the two differently. */
+function mockPrintRefusal(reasonCode: "not_applicable" | "syntax", message: string): Error {
+  return new Error(JSON.stringify({
+    kind: "query-print-refused",
+    reason_code: reasonCode,
+    detail: { kind: reasonCode, message, suggestions: [], disabled: false },
+  }));
+}
+
+/** The `tine.*` view properties a host block carries, as `ViewSettings` (§4.1).
+ *  The real command merges these OVER the directives lifted from the query text;
+ *  the mock has no directives to merge with, so the properties are the whole
+ *  answer. */
+function mockViewFromProperties(properties: [string, string][]): ViewSettings {
+  const view: ViewSettings = {};
+  for (const [key, value] of properties) {
+    if (key === "tine.view" && ["search", "list", "table", "board"].includes(value)) {
+      view.view = value as ViewKind;
+    }
+    if (key === "tine.group-by" && value) view.group_by = value;
+  }
+  return view;
+}
+
 
 /** Mock feed membership must use a Logseq journal-title parser, never the
  * host's permissive/non-portable Date string parser. Keep the same explicit
@@ -1274,6 +1315,119 @@ export function mockBackend(): Backend {
         return { groups, ran: ["task"], ignored: [], supported: true };
       }
       return { groups: [], ran: [], ignored: [], supported: false };
+    },
+    // ---- The six query commands (SPEC §7.1, N23) ------------------------
+    //
+    // **These are deliberately NOT a second query engine** (D-14, I-12). The real
+    // parser, printer and walk live in `crates/tine-core/src/query/`; the browser
+    // dev-preview cannot call them, so these mocks answer the SHAPE of each
+    // command — enough for the screenshot harness and for a caller to be
+    // type-checked against the real contract — and say so when they cannot answer
+    // the substance. Growing them into a working OG/TQL parser here would
+    // reintroduce exactly the frontend twin this packet deleted.
+    async parseQuery(
+      text: string,
+      dialect: QueryTextDialect,
+      blockProperties?: [string, string][],
+    ): Promise<ParsedQuery> {
+      // **The mock does not split the options map, deliberately.** Splitting a
+      // macro argument is the ONE thing this packet moved into Rust (§7.1, X4);
+      // a copy here — even a "just for the dev preview" copy — is the second
+      // answer to "where does the options map start" that I-12 forbids, and it
+      // would disagree with Rust on exactly the input that matters. So the whole
+      // argument is retained verbatim as `original` with no options. That keeps
+      // the property the byte contract actually needs: a `preserveForm` print
+      // re-emits these exact bytes, so a title edit through the dev preview
+      // still cannot corrupt the author's query — it simply cannot separate the
+      // title out to edit it, which is the honest capability of a backend with
+      // no parser.
+      const original = text;
+      const ogOptions = "";
+      const kind: Source["kind"] =
+        dialect === "macro_tql" || dialect === "tql"
+          ? "tql"
+          : dialect === "advanced"
+            ? "advanced"
+            : "og";
+      const query: Query = {
+        anchor: "block",
+        // A mock cannot know the filter, and inventing one would make callers
+        // "work" against an answer the real engine would never give. `raw` is the
+        // IR's own honest spelling for retained-but-not-understood text (§4.3.2),
+        // and it carries the payload losslessly so a print can still re-emit it.
+        filter: { kind: "raw", text: original, diagnostic_kind: "not_applicable" },
+        diagnostics: [{
+          kind: "not_applicable",
+          message: "The browser dev preview does not run the query engine.",
+          suggestions: [],
+          disabled: false,
+        }],
+        source: kind === "advanced"
+          ? { kind: "advanced", original, og_options: ogOptions }
+          : kind === "tql"
+            ? { kind: "tql", original, og_options: ogOptions }
+            : { kind: "og", original, og_options: ogOptions },
+      };
+      return { query, view: mockViewFromProperties(blockProperties ?? []) };
+    },
+    async printQuery(
+      query: Query,
+      _view: ViewSettings,
+      dialect: QueryPrintDialect,
+      preserveForm = false,
+    ): Promise<string> {
+      // Source-preserving printing is byte transport, not lowering, so the mock
+      // gets it exactly right (§4.3.1): the original form plus the options map,
+      // once.
+      const original = sourceOriginal(query.source);
+      if (preserveForm) {
+        if (original === null) {
+          throw mockPrintRefusal("not_applicable", "A builder query has no source form to preserve.");
+        }
+        const options = sourceOptions(query.source);
+        return options ? `${original} ${options}` : original;
+      }
+      // Re-lowering an IR to text IS the printer, and the printer is in Rust.
+      // Refuse in the command's own envelope rather than returning a plausible
+      // string the caller would then SAVE over the author's query.
+      if (dialect === "og") {
+        throw mockPrintRefusal(
+          "not_applicable",
+          "The browser dev preview cannot print the OG DSL from an IR.",
+        );
+      }
+      throw mockPrintRefusal(
+        "syntax",
+        "The browser dev preview cannot print a query from an IR.",
+      );
+    },
+    async queryOgExpressible(): Promise<boolean> {
+      // The mock's parse never produces an OG-expressible IR (its filter is a
+      // `raw` capsule), so this is not a guess — it is the true answer for the
+      // values this backend hands out.
+      return false;
+    },
+    async queryRegistry(): Promise<RegistrySnapshot> {
+      return { rows: [], generation: 0 };
+    },
+    async queryRun(query: Query): Promise<QueryResult> {
+      // An invalid query returns zero rows plus its diagnostics (§3.5) — which is
+      // precisely the mock's situation, so this arm is the contract, not a stub.
+      return {
+        anchor: "block",
+        groups: [],
+        diagnostics: query.diagnostics ?? [],
+        report: { ran: [], ignored: [], supported: false },
+        total: 0,
+        exceeded: false,
+      };
+    },
+    async queryExplainEmpty(query: Query): Promise<ExplainEmptyResult> {
+      return {
+        rows: [],
+        diagnostics: query.diagnostics ?? [],
+        report: { ran: [], ignored: [], supported: false },
+      };
     },
     async runQuery(query: string): Promise<RefGroup[]> {
       // Simplified mock evaluator: task/todo filter or page-ref filter.

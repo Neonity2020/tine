@@ -118,6 +118,12 @@ fn every_filter_variant() -> Filter {
             Filter::and(vec![
                 Filter::attr(Attr::Key, CmpOp::Eq, Value::text("size")),
                 Filter::attr(Attr::Value, CmpOp::Gt, Value::Number { number: 3.0 }),
+                // `IsBlank` — a property atom that IS set but empty. Added by
+                // P0-ts: the TypeScript mirror's coverage test
+                // (`src/editor/queryIr.test.ts`) is only as strong as this
+                // corpus, and it found that the one function called
+                // `every_filter_variant` was missing an operator.
+                Filter::attr(Attr::Value, CmpOp::IsBlank, Value::None),
                 Filter::attr(Attr::AtomCount, CmpOp::Lt, Value::Number { number: 5.0 }),
             ]),
         ),
@@ -142,6 +148,64 @@ fn every_filter_variant() -> Filter {
 #[test]
 fn the_filter_wire_format_covers_every_variant() {
     golden("filter", &every_filter_variant());
+}
+
+/// The corpus must EARN its name. `every_filter_variant` is what pins both the
+/// wire bytes and the TypeScript mirror's completeness, so an operator it never
+/// spells is an operator neither side is checked on — which is how `IsBlank` sat
+/// unpinned until P0-ts's mirror test noticed. Enumerating here rather than
+/// trusting the name means the next added operator fails this test on the spot.
+#[test]
+fn the_corpus_spells_every_comparison_operator() {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+    every_filter_variant().for_each_leaf(&mut |leaf| {
+        if let Leaf::Attr { op, .. } = leaf {
+            seen.insert(match op {
+                CmpOp::Eq => "eq",
+                CmpOp::NotEq => "not_eq",
+                CmpOp::Lt => "lt",
+                CmpOp::Le => "le",
+                CmpOp::Gt => "gt",
+                CmpOp::Ge => "ge",
+                CmpOp::Between => "between",
+                CmpOp::In => "in",
+                CmpOp::NotIn => "not_in",
+                CmpOp::Like => "like",
+                CmpOp::StartsWith => "starts_with",
+                CmpOp::Match => "match",
+                CmpOp::Regex => "regex",
+                CmpOp::IsSet => "is_set",
+                CmpOp::IsNotSet => "is_not_set",
+                CmpOp::IsBlank => "is_blank",
+            });
+        }
+    });
+    let expected: BTreeSet<&'static str> = [
+        "eq",
+        "not_eq",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "between",
+        "in",
+        "not_in",
+        "like",
+        "starts_with",
+        "match",
+        "regex",
+        "is_set",
+        "is_not_set",
+        "is_blank",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        seen, expected,
+        "every_filter_variant() does not spell every CmpOp; add the missing one \
+         so both the wire fixture and the TypeScript mirror are pinned on it"
+    );
 }
 
 #[test]
@@ -377,11 +441,26 @@ fn the_bounds_wire_format_is_stable() {
 
 /// The mirror is only a mirror if the Rust side says where it is. A reader who
 /// changes `Query` must be told, at the definition, that TypeScript reads it.
+///
+/// The named path is checked against the FILE SYSTEM as well as the prose.
+/// Naming a mirror that is not there is the failure this guard exists to catch,
+/// and prose alone cannot catch it: P0-ts found this pin still pointing at
+/// `queryBuilder.ts` — which by then held the DSL parser, not the mirror — after
+/// the mirror moved to its own module.
 #[test]
 fn the_ir_names_its_typescript_mirror() {
+    const MIRROR: &str = "src/editor/queryIr.ts";
     let source = include_str!("../src/query/ir.rs");
     assert!(
-        source.contains("src/editor/queryBuilder.ts"),
-        "the IR must name its TypeScript mirror at the type it mirrors (I-11)"
+        source.contains(MIRROR),
+        "the IR must name its TypeScript mirror ({MIRROR}) at the type it mirrors (I-11)"
+    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(MIRROR);
+    assert!(
+        path.exists(),
+        "the IR names a TypeScript mirror that is not there: {}",
+        path.display()
     );
 }

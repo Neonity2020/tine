@@ -2,6 +2,7 @@
 // trigger at the caret, and apply a chosen completion. No DOM — unit-testable.
 
 import { TEMPLATE_VARS } from "./templateVars";
+import { QUERY_MACRO_SCAFFOLD, QUERY_MACRO_SCAFFOLD_CARET } from "./queryMacroName";
 import { isBareTagPrefix, tagRef } from "../tags";
 import { propertyKeyNorm } from "../render/block";
 
@@ -502,7 +503,7 @@ const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     caret: `#+BEGIN_${t}\n`.length,
   })),
   { label: "Divider", insert: "---" },
-  { label: "Query", insert: "{{query }}", caret: 8 },
+  { label: "Query", insert: QUERY_MACRO_SCAFFOLD, caret: QUERY_MACRO_SCAFFOLD_CARET },
   { label: "Query (visual builder)", action: "query-builder" },
   { label: "Embed", insert: "{{embed }}", caret: 8 },
   // OG's slash entry is named "Embed Youtube timestamp" (og-1.0.0

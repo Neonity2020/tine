@@ -13,6 +13,7 @@ import { NamespaceCrumb } from "./Namespace";
 import { LinkedReferences } from "./LinkedReferences";
 import { QueryMacro } from "./Macro";
 import type { RefGroup } from "../types";
+import { backendReadsQueries } from "../queryReadingsTestkit";
 
 // GH #283 (approved contract): ONE modified-click decision across internal
 // page/block link surfaces:
@@ -248,6 +249,9 @@ describe("modified-click contract on internal links (GH #283)", () => {
       kind: "page",
       blocks: [{ id: "query-hit", raw: "TODO row", collapsed: false, children: [] }],
     }]);
+    backendReadsQueries({
+      "(task TODO) {:table-view? true}": { form: "(task TODO)", opts: "{:table-view? true}" },
+    });
     const m = mount(() => <QueryMacro body={'query (task TODO) {:table-view? true}'} />);
     try {
       const cell = await vi.waitFor(() => {
@@ -413,6 +417,9 @@ describe("Alt+click opens the link in the other pane (GH #438)", () => {
       kind: "page",
       blocks: [{ id: "query-hit", raw: "TODO row", collapsed: false, children: [] }],
     }]);
+    backendReadsQueries({
+      "(task TODO) {:table-view? true}": { form: "(task TODO)", opts: "{:table-view? true}" },
+    });
     const m = mount(() => <QueryMacro body={'query (task TODO) {:table-view? true}'} />);
     try {
       const cell = await vi.waitFor(() => {

@@ -6551,6 +6551,33 @@
     "failBefore": "tine-agents/evidence/qe/p0-rust/wave-d/d2-fail-before.log (base f8149fbc)"
    },
    "notes": "`content match` promises the graph search box's semantics: substring terms (so `foobar` answers `foo`, `oob` and `oo`), quoted phrases with their internal whitespace, OR arms, negated terms and an exclusion-only query. A standard word-token FTS index gets the first three wrong, so the walk and a token-index route would answer the same query differently and the user would watch results appear and disappear by route rather than by content. The leaf now carries the payload parsed ONCE by the search box's own search_query::Matcher, reached through Filter::match_sources and CompiledLeaves::match_program, so any future engine inherits that parse instead of re-deriving it; an empty or invalid-regex Match is a false leaf, including under `not`; and Match is legal only on `content`. The named fixture list -- foobar/foo/oob/oo, phrases with leading, repeated and tab or newline whitespace, whitespace-only terms, OR arms mixing short and long, negatives, exclusion-only, invalid regex, Unicode, escaped quotes -- plus every example the search help text displays is the corpus the future SQL route must reproduce row for row."
+  },
+  {
+   "id": "REG-P0-QUERY-MACRO-RAW-SOURCE-001",
+   "title": "A query macro was read from the document parser's comma-split arguments instead of the raw source",
+   "family": "query-engine",
+   "sources": {
+    "issues": [],
+    "commits": [],
+    "internal": "2026-09 query-engine campaign, packet P0-ts; SPEC 4.3.1 and 7.1; invariants I-4, I-12, D-14"
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "frontend-render-and-publish-boundary",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/components/QueryMacroSource.test.tsx",
+     "src/editor/queryMacro.test.ts",
+     "crates/tine-core/tests/query_macro_extents.rs",
+     "crates/tine-core/src/publish.rs::tests::publish_reads_a_query_macro_from_the_raw_source_not_the_split_args",
+     "crates/tine-core/src/publish.rs::tests::publish_renders_both_query_macro_names_and_never_leaks_the_source"
+    ],
+    "scenario": "query-engine.macro-argument-comes-from-the-raw-source",
+    "failBefore": "t5-span-fail-before.log (renderer span anchoring), t5-publish-fail-before.log (publishing), t3-splitter-fail-before.log (the deleted options-map splitter disagreeing with Rust on 8 of 20 shared corpus cases)"
+   },
+   "notes": "mldoc/lsdoc splits a macro's arguments on commas and stops before the first `}`, so name+args cannot rebuild a query carrying a trailing options map or a literal comma inside a string. Rendering and publishing both consumed that reconstruction: an inline {{query (task TODO) {:title \"T\"}}} lost the map's closing brace, so the title was dropped and publishing emitted a stray } as visible text beside results computed from a truncated query. Both sides now recover the exact source slice with the shared raw-extent reader, pinned on both sides by one corpus (crates/tine-core/tests/fixtures/query-macro/extents.json). The renderer's join is the subtle half: lsdoc reports UTF-8 byte offsets into the re-bulleted parse input (\"- \" + raw.trimStart()), so anchoring by the span as if it indexed raw never matched and always fell back to the lossy reconstruction; queryMacroExtentAtSpan does the same span[0] - 2 + leadBytes mapping render/facets.ts already used, and anchors exactly so a span measured against some other string finds nothing rather than the wrong macro."
   }
  ]
 }

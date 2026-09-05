@@ -1,13 +1,14 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta, type ExportRequest } from "../ui";
-import { exportNodesFor, formatForPage } from "../store";
+import { doc, exportNodesFor, formatForPage } from "../store";
 import { backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
 import { resolveBlockBatched, resolvedBlockRefSync } from "../resolveBatch";
 import { expandTemplate } from "../render/inline";
 import { visibleBody } from "../render/block";
 import { parseBlock } from "../render/parse";
-import { splitTrailingMap } from "../editor/edn";
+import { isQueryMacroName, queryMacroExtentAtSpan } from "../editor/queryMacro";
+import { macroTextDialect, sourceOriginal } from "../editor/queryIr";
 import {
   exportOutline,
   DEFAULT_EXPORT_OPTIONS,
@@ -82,7 +83,6 @@ const TEXT_TOGGLES: ExportToggle[] = [
 ];
 
 const EMBED_EXPORT_NODE_LIMIT = 2_000;
-const ADVANCED_RE = /\[\s*:find|:where|:find/;
 
 const BUILT_IN_MACRO_NAMES = new Set([
   "query",
@@ -107,7 +107,10 @@ function isBuiltInMacro(name: string): boolean {
 
 interface WarmTargets {
   refs: Set<string>;
-  macros: Map<string, { name: string; args: string[] }>;
+  /** `raw` is the macro's exact source argument when the collector could anchor
+   *  it by offset (§4.3.1); absent when it could not, and the caller then falls
+   *  back to the lossy `args` reconstruction. */
+  macros: Map<string, { name: string; args: string[]; raw?: string }>;
 }
 
 type WarmedMacro =
@@ -189,21 +192,35 @@ function literalBuiltInMacroText(name: string, args: string[]): string | null {
   return null;
 }
 
-function collectInlineTargets(inlines: Inline[], targets: WarmTargets): void {
+function collectInlineTargets(inlines: Inline[], targets: WarmTargets, sourceRaw?: string): void {
   for (const s of inlines) {
     switch (s.k) {
       case "emphasis":
       case "subscript":
       case "superscript":
       case "tag":
-        collectInlineTargets(s.children, targets);
+        collectInlineTargets(s.children, targets, sourceRaw);
         break;
       case "link":
         if (s.url.type === "block_ref") targets.refs.add(s.url.v);
-        if (s.label) collectInlineTargets(s.label, targets);
+        if (s.label) collectInlineTargets(s.label, targets, sourceRaw);
         break;
       case "macro": {
-        targets.macros.set(macroKey(s.name, s.args), { name: s.name, args: s.args });
+        // §4.3.1: "Export collection must retain the SOURCE/offset alongside the
+        // parsed node rather than only `name,args`." `args` came through mldoc's
+        // comma split and stops before the first `}`, so a query with an options
+        // map or a literal comma cannot be rebuilt from it. `raw` is the exact
+        // slice, anchored by the macro's own source offset; it is undefined only
+        // when the node had no span or no extent covers it, and the caller then
+        // falls back to the reconstruction.
+        const extent = sourceRaw !== undefined
+          ? queryMacroExtentAtSpan(sourceRaw, s.span)
+          : null;
+        targets.macros.set(macroKey(s.name, s.args), {
+          name: s.name,
+          args: s.args,
+          raw: extent?.argument,
+        });
         if (s.name.toLowerCase() === "embed") {
           const uuid = blockRefTarget(macroArg(s.args));
           if (uuid) targets.refs.add(uuid);
@@ -214,39 +231,41 @@ function collectInlineTargets(inlines: Inline[], targets: WarmTargets): void {
   }
 }
 
-function collectListItemTargets(item: ListItem, targets: WarmTargets): void {
-  if (item.name) collectInlineTargets(item.name, targets);
-  item.content.forEach((b) => collectBlockTargets(b, targets));
-  item.items.forEach((child) => collectListItemTargets(child, targets));
+function collectListItemTargets(item: ListItem, targets: WarmTargets, sourceRaw?: string): void {
+  if (item.name) collectInlineTargets(item.name, targets, sourceRaw);
+  item.content.forEach((b) => collectBlockTargets(b, targets, sourceRaw));
+  item.items.forEach((child) => collectListItemTargets(child, targets, sourceRaw));
 }
 
-function collectBlockTargets(block: Block, targets: WarmTargets): void {
+// `sourceRaw` is the block source these AST nodes were parsed from, carried down
+// so a query macro can be resolved back to its exact raw slice (§4.3.1).
+function collectBlockTargets(block: Block, targets: WarmTargets, sourceRaw?: string): void {
   switch (block.kind) {
     case "paragraph":
     case "heading":
     case "bullet":
-      collectInlineTargets(block.inline, targets);
+      collectInlineTargets(block.inline, targets, sourceRaw);
       break;
     case "quote":
     case "custom":
-      block.children.forEach((b) => collectBlockTargets(b, targets));
+      block.children.forEach((b) => collectBlockTargets(b, targets, sourceRaw));
       break;
     case "list":
-      block.items.forEach((item) => collectListItemTargets(item, targets));
+      block.items.forEach((item) => collectListItemTargets(item, targets, sourceRaw));
       break;
     case "table":
-      if (block.header) block.header.forEach((c) => collectInlineTargets(c, targets));
-      block.rows.forEach((r) => r.forEach((c) => collectInlineTargets(c, targets)));
+      if (block.header) block.header.forEach((c) => collectInlineTargets(c, targets, sourceRaw));
+      block.rows.forEach((r) => r.forEach((c) => collectInlineTargets(c, targets, sourceRaw)));
       break;
     case "footnote_def":
-      collectInlineTargets(block.inline, targets);
+      collectInlineTargets(block.inline, targets, sourceRaw);
       break;
   }
 }
 
 function collectRawTargets(raw: string, format: Format, targets: WarmTargets): void {
   try {
-    parseBlock(raw, format === "org").forEach((b) => collectBlockTargets(b, targets));
+    parseBlock(raw, format === "org").forEach((b) => collectBlockTargets(b, targets, raw));
   } catch {
     /* keep export usable if a malformed block misses pre-warm */
   }
@@ -296,17 +315,40 @@ async function warmMacro(
 }
 
 async function warmQueryMacros(
-  macros: { name: string; args: string[] }[],
+  macros: { name: string; args: string[]; raw?: string }[],
   warmed: Map<string, WarmedMacro>,
+  currentPage: string | undefined,
 ): Promise<void> {
   if (!macros.length) return;
-  const specs: QueryExportSpec[] = macros.map((macro) => {
-    const { form } = splitTrailingMap(macroArg(macro.args));
-    return {
+  // §7.1, I-12: Export no longer splits the options map and no longer decides
+  // OG-vs-advanced with its own regex. It asks `query_parse` with the macro's
+  // OWN name, which splits once in Rust and picks the grammar with the one Rust
+  // discriminator — so a `:find` inside a string literal is text here and in the
+  // renderer, instead of being datalog in whichever of the two looked first.
+  const parsed = await Promise.all(macros.map(async (macro) => {
+    const argument = macro.raw ?? macroArg(macro.args);
+    try {
+      const { query } = await backend().parseQuery(argument, macroTextDialect(macro.name));
+      return { macro, source: query.source };
+    } catch {
+      // A parse that rejects must not silently export as an OG query: fall back
+      // to the literal macro text, which is what an unresolvable macro already
+      // does everywhere else in this file.
+      return { macro, source: null };
+    }
+  }));
+  const specs: QueryExportSpec[] = parsed.flatMap(({ macro, source }) => {
+    if (source === null || source.kind === "builder") return [];
+    return [{
       key: macroKey(macro.name, macro.args),
-      query: form,
-      advanced: ADVANCED_RE.test(form),
-    };
+      query: sourceOriginal(source) ?? "",
+      advanced: source.kind === "advanced",
+      // T8 / §4.4: an exported advanced query must bind `?current-page` to the
+      // SAME page the rendered one did. Absent is the honest "no binding", never
+      // a guess — but a page-scoped export is not absent, and leaving it so
+      // resolved `:current-page` to None, which is a wrong answer.
+      current_page: currentPage,
+    }];
   });
   try {
     const batch = await backend().exportQuerySubtrees(specs);
@@ -340,22 +382,29 @@ async function warmQueryMacros(
   }
 }
 
-export async function warmExportResolutions(nodes: ExportNode[], warmed: Map<string, WarmedMacro>): Promise<void> {
+export async function warmExportResolutions(
+  nodes: ExportNode[],
+  warmed: Map<string, WarmedMacro>,
+  currentPage?: string,
+): Promise<void> {
   const targets: WarmTargets = { refs: new Set(), macros: new Map() };
   const pages: PageReadCache = new Map();
   collectNodeTargets(nodes, targets);
   await Promise.all([...targets.refs].map((uuid) => resolveBlockBatched(uuid).catch(() => null)));
   const macros = [...targets.macros.values()];
+  // §7.9: BOTH macro names are queries. Filtering on the literal `"query"` is
+  // exactly how a `{{tine-query …}}` block came to export as literal text.
   await warmQueryMacros(
-    macros.filter((macro) => macro.name.toLowerCase() === "query"),
+    macros.filter((macro) => isQueryMacroName(macro.name)),
     warmed,
+    currentPage,
   );
   // Page embeds are intentionally whole-page exports, but run them after the
   // globally bounded query batch so their PageDto cache cannot overlap query
   // source-page hydration (which no longer uses getPage at all).
   await Promise.all(
     macros
-      .filter((macro) => macro.name.toLowerCase() !== "query")
+      .filter((macro) => !isQueryMacroName(macro.name))
       .map((macro) => warmMacro(macro, warmed, pages)),
   );
 }
@@ -392,6 +441,19 @@ function Modal(props: { request: ExportRequest }): JSX.Element {
   // the preview recomputes from it as options change. Rendered mode applies the
   // typographic glyphs exactly when the app displays them (not persisted).
   const nodes = "ids" in props.request ? exportNodesFor(props.request.ids) : props.request.nodes;
+  // T8 / §4.4: the export knows the page it is exporting FROM, so an advanced
+  // query's `?current-page` resolves to the same page it would have rendered
+  // against. A selection spanning several pages has no single answer, so it
+  // supplies none — an unbound input is a stated limitation, a WRONG page is a
+  // wrong answer. A prebuilt node forest (the reference batch export) likewise
+  // has no owning page.
+  const currentPage = (): string | undefined => {
+    if (!("ids" in props.request)) return undefined;
+    const pages = new Set(
+      props.request.ids.map((id) => doc.byId[id]?.page).filter((p): p is string => !!p),
+    );
+    return pages.size === 1 ? [...pages][0] : undefined;
+  };
   // Name the preserved syntax after the selection's actual format: a Markdown
   // forest offers "Markdown", an Org forest "Org", a mix "Markdown/Org" — so
   // the preserve choice says what it preserves (GH #352).
@@ -444,7 +506,7 @@ function Modal(props: { request: ExportRequest }): JSX.Element {
 
   onMount(() => {
     setWarming(true);
-    void warmExportResolutions(nodes, warmedMacros).finally(() => {
+    void warmExportResolutions(nodes, warmedMacros, currentPage()).finally(() => {
       if (disposed) return;
       setWarmRev(warmRev() + 1);
       setWarming(false);

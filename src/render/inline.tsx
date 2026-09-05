@@ -26,6 +26,7 @@ import { coarseSpanAttrs, literalSpanAttrs, plainSpanAttrs, typographicPlainSpan
 import { createLongPress } from "./longPress";
 import { typographyMode } from "../ui";
 import { visibleBody } from "./block";
+import { isQueryMacroName, queryMacroExtentAtSpan, QUERY_MACRO_NAMES } from "../editor/queryMacro";
 import { AstBody } from "./body";
 import { backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
@@ -57,9 +58,29 @@ import { ExternalLink, reportLinkOpenFailure } from "../components/ExternalLink"
 
 // Shared `{{macro}}` dispatch, keyed off a reconstructed body string for built-ins.
 // User macros get parser-supplied args from the AST path so quoted commas survive.
-function renderMacroBody(raw: string, blockId?: string, userArgs?: string[]): JSX.Element {
+//
+// **The query arm does not use `raw` (§4.3.1, §7.9).** `macroBody` rebuilds a
+// body with `args.join(", ")`, and mldoc's macro parser both splits on commas
+// and stops before the first `}` — so for `{{query (task TODO) {:title "T"}}}`
+// the AST argument is `(task TODO) {:title "T"` with the closing brace missing,
+// and `content = 'a,b'` comes back as `content = 'a, b'`. A query is therefore
+// dispatched with its RAW SOURCE SLICE, recovered from the owning block by the
+// macro's own source offset. `rawArgument` is that slice; when the caller has no
+// span or no block (macro expansion, decorator unit tests) the arm falls back to
+// the reconstructed body, which is what every non-query macro still uses.
+function renderMacroBody(
+  raw: string,
+  blockId?: string,
+  userArgs?: string[],
+  rawMacro?: { name: string; argument: string },
+): JSX.Element {
   const body = raw.trimStart();
-  if (/^query\b/i.test(body)) return <QueryMacro body={body} blockId={blockId} />;
+  if (rawMacro) {
+    return <QueryMacro body={`${rawMacro.name} ${rawMacro.argument}`} macroName={rawMacro.name} blockId={blockId} />;
+  }
+  if (QUERY_MACRO_NAMES.some((name) => new RegExp(`^${name}\\b`, "i").test(body))) {
+    return <QueryMacro body={body} blockId={blockId} />;
+  }
   if (/^embed\b/i.test(body)) return <EmbedMacro body={body} blockId={blockId} />;
   if (/^youtube-timestamp\b/i.test(body)) return <YoutubeTimestamp body={body} />;
   if (/^(video|youtube|vimeo|bilibili)\b/i.test(body)) return <VideoMacro body={body} />;
@@ -159,7 +180,7 @@ function renderInline(s: Inline, blockId?: string, spanMode = true, macroExpansi
     case "tag":
       return <PageRef name={astText(s.children)} blockId={blockId} tag spanAttrs={spanMode ? coarseSpanAttrs(s.span) : undefined} />;
     case "macro":
-      return renderMacroBody(macroBody(s), blockId, s.args);
+      return renderMacroBody(macroBody(s), blockId, s.args, rawQueryMacro(s, blockId));
     case "latex":
       return <MathView tex={s.body} display={s.mode === "Displayed"} spanAttrs={spanMode ? coarseSpanAttrs(s.span) : undefined} />;
     case "timestamp":
@@ -243,6 +264,27 @@ function urlDest(url: Url): string {
 
 function macroBody(s: MacroInline): string {
   return s.args.length ? `${s.name} ${s.args.join(", ")}` : s.name;
+}
+
+/** The RAW source slice of a query macro node, by source offset (§4.3.1).
+ *
+ *  Returns null for a non-query macro, and for a query macro the renderer cannot
+ *  anchor: no span (the AST did not carry one), no owning block, or no extent
+ *  covering the offset. The caller then falls back to the reconstructed body —
+ *  lossy for options maps and literal commas, but never worse than before this
+ *  packet, and it is the only path an expanded user macro can take (its text is
+ *  not a slice of any block's raw source). */
+function rawQueryMacro(s: MacroInline, blockId?: string): { name: string; argument: string } | undefined {
+  if (!isQueryMacroName(s.name)) return undefined;
+  if (!blockId || s.span === undefined) return undefined;
+  const raw = doc.byId[blockId]?.raw;
+  if (raw === undefined) return undefined;
+  // Anchor exactly, or not at all — `queryMacroExtentAtSpan` owns both the
+  // span→index mapping and the exactness requirement, so a span measured against
+  // some OTHER string finds nothing and this falls back rather than rendering one
+  // query's results under another query's text.
+  const extent = queryMacroExtentAtSpan(raw, s.span);
+  return extent ? { name: extent.name, argument: extent.argument } : undefined;
 }
 
 const PEEK_OPEN_MS = 350;

@@ -35,6 +35,12 @@ export interface QueryExportSpec {
   key: string;
   query: string;
   advanced: boolean;
+  /** The page this macro is written on — the §4.4 execution context, so an
+   *  exported advanced query binds `?current-page` to the SAME page the rendered
+   *  one did. Optional because an export with no owning page (a multi-page
+   *  selection, a reference batch) genuinely has no binding to offer; absent is
+   *  the honest "unbound", never a guess. */
+  current_page?: string;
 }
 
 /** Native hierarchy projection for one query macro. */

@@ -27,6 +27,7 @@ import { RightSidebar } from "./RightSidebar";
 import { PageView } from "./Page";
 import type { PageEntry, QueryExecution } from "../types";
 import { LONG_PRESS_DELAY } from "../render/longPress";
+import { backendReadsQueries } from "../queryReadingsTestkit";
 
 // GH #207: the internal-link gesture contract (linkGesture.ts, GH #283) is ONE
 // decision — plain click opens, Shift+click → right sidebar, Ctrl/Cmd+click or
@@ -500,6 +501,10 @@ describe("query search-presentation rows follow the gesture contract (GH #207)",
       kind: "page",
       blocks: [{ id: "q1", raw: "TODO row", collapsed: false, children: [] }],
     }]);
+    backendReadsQueries({
+      "(task TODO) {:table-view? true}": { form: "(task TODO)", opts: "{:table-view? true}" },
+      "(task DONE)": { form: "(task DONE)" },
+    });
     loadQueryDoc("{{query (task TODO) {:table-view? true}}}");
     const table = mount(() => <Block id="query" />);
     try {

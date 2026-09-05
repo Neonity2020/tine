@@ -12,6 +12,7 @@ import {
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
+import { QUERY_MACRO_NAMES } from "../editor/queryMacroName";
 import {
   friendlySearchToDsl,
   friendlySearchToSavedDsl,
@@ -80,7 +81,12 @@ export interface QueryWorkspaceProps {
 function savedQueryRaw(input: Pick<MaterializeQueryInput, "source" | "sourceKind" | "presentation">): string {
   const source = input.source.trim();
   const dsl = input.sourceKind === "search" ? friendlySearchToSavedDsl(source) : source;
-  const query = `{{query ${dsl}}}`;
+  // §7.9: the macro name comes from the shared list. The workspace always
+  // materializes OG DSL text (`friendlySearchToSavedDsl` and the builder both
+  // produce it), so it writes the legacy spelling — but it writes it by NAME,
+  // not by spelling it inline, so promoting a workspace to TQL later is one
+  // change here rather than a grep across the app.
+  const query = `{{${QUERY_MACRO_NAMES[0]} ${dsl}}}`;
   return input.presentation === "list" ? query : `${query}\ntine.view:: ${input.presentation}`;
 }
 

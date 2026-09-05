@@ -3,6 +3,21 @@
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
 import { notifyGraphRebound } from "./modeHooks";
+import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
+import type {
+  Diagnostic,
+  DiagnosticKind,
+  ExecutionContext,
+  ExplainEmptyResult,
+  ParsedQuery,
+  Query,
+  QueryPrintDialect,
+  QueryTextDialect,
+  QueryResult,
+  RegistrySnapshot,
+  Span,
+  ViewSettings,
+} from "./editor/queryIr";
 import type {
   ActivationExpectedRevision,
   ActivationIntent,
@@ -211,10 +226,14 @@ export type BackendErrorKind =
   | "sparse-shutdown-refused"
   | "asset-too-large"
   | "operation-cancelled"
-  | "managed-actor-refusal";
+  | "managed-actor-refusal"
+  | "query-print-refused";
 
 const BACKEND_ERROR_MESSAGES: Record<
-  Exclude<BackendErrorKind, "save-conflict" | "direct-save-failure" | "managed-actor-refusal">,
+  Exclude<
+    BackendErrorKind,
+    "save-conflict" | "direct-save-failure" | "managed-actor-refusal" | "query-print-refused"
+  >,
   string
 > = {
   "sync-data-unavailable": "This graph does not yet contain sync data from another device.",
@@ -299,6 +318,39 @@ export class AssetTooLargeError extends BackendError {
   constructor() {
     super("asset-too-large", BACKEND_ERROR_MESSAGES["asset-too-large"]);
     this.name = "AssetTooLargeError";
+  }
+}
+
+/** `query_print` refused to print this IR in the requested dialect (§7.1, A4).
+ *
+ *  `NotApplicable` means the OG printer cannot express the query — the OG DSL is
+ *  a partial language, so this is an ordinary, expected answer, not a fault.
+ *  **Exactly one caller is entitled to see it: the save path**, which responds by
+ *  switching to the `{{tine-query}}` dialect. Any other caller reaching here
+ *  asked the OG printer without first calling `queryOgExpressible`, and that is a
+ *  bug in that caller — which is why this rejects instead of returning `""`. A
+ *  catch-all that turned a refusal into a silent no-op is how an unsaved edit
+ *  comes to look saved.
+ *
+ *  `diagnostic` is the structured `Diagnostic` the printer produced, carried in
+ *  the envelope's `detail` so callers read `kind`/`message`/`suggestions` as
+ *  objects rather than parsing prose (I-9). */
+export class QueryPrintRefusedError extends BackendError {
+  constructor(
+    readonly reasonCode: string,
+    readonly diagnostic: Diagnostic | null,
+  ) {
+    super(
+      "query-print-refused",
+      diagnostic?.message ?? `The query could not be printed (reason code: ${reasonCode}).`,
+    );
+    this.name = "QueryPrintRefusedError";
+  }
+
+  /** Whether this refusal is the expected "OG cannot say this" answer, as
+   *  opposed to a malformed-input refusal the caller must surface. */
+  get isNotApplicable(): boolean {
+    return this.reasonCode === "not_applicable";
   }
 }
 
@@ -404,6 +456,38 @@ function readSharedFrontierMismatchDetail(raw: unknown): SharedFrontierMismatchD
   return { localPages, sharedPages, localOnly, sharedOnly, changed, paths, omitted };
 }
 
+/** Read the structured `Diagnostic` a `query-print-refused` envelope carries.
+ *
+ *  Validated field by field: a malformed payload degrades to a detail-less
+ *  refusal (the caller still learns the print was REFUSED, which is the part that
+ *  must never be lost) rather than being trusted into the UI.
+ *  `DIAGNOSTIC_KINDS` is the mirror's own list, so a kind Rust adds and the
+ *  mirror has not learned reads as malformed instead of flowing through
+ *  mistyped. */
+function readPrintDiagnostic(detail: unknown): Diagnostic | null {
+  if (!detail || typeof detail !== "object") return null;
+  const value = detail as Record<string, unknown>;
+  if (typeof value.message !== "string") return null;
+  if (typeof value.kind !== "string") return null;
+  if (!(DIAGNOSTIC_KINDS as readonly string[]).includes(value.kind)) return null;
+  const suggestions = Array.isArray(value.suggestions)
+    && value.suggestions.every((s) => typeof s === "string")
+    ? (value.suggestions as string[])
+    : [];
+  const span = value.span && typeof value.span === "object"
+    && typeof (value.span as Record<string, unknown>).start === "number"
+    && typeof (value.span as Record<string, unknown>).end === "number"
+    ? (value.span as unknown as Span)
+    : undefined;
+  return {
+    kind: value.kind as DiagnosticKind,
+    message: value.message,
+    suggestions,
+    disabled: value.disabled === true,
+    span,
+  };
+}
+
 function classifyTaggedBackendError(error: unknown): BackendError | null {
   const message = typeof error === "string"
     ? error
@@ -457,6 +541,10 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
     case "managed-actor-refusal":
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         ? new ManagedActorRefusalError(payload.reason_code)
+        : null;
+    case "query-print-refused":
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        ? new QueryPrintRefusedError(payload.reason_code, readPrintDiagnostic(payload.detail))
         : null;
     default:
       return null;
@@ -651,6 +739,64 @@ export interface Backend {
    *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
    *  the page doesn't exist. */
   pagePrintHtml(name: string, opts: PrintOpts): Promise<string>;
+  // ---- The six query commands (SPEC §7.1, N23) --------------------------
+  //
+  // ONE engine, in Rust. `parseQuery` and `printQuery` are the only producers
+  // and consumers of query TEXT in the app: the frontend holds the IR and the
+  // view, never a DSL string it parsed itself.
+
+  /** Text → `{query, view}` (§7.1).
+   *
+   *  `macroQuery` / `macroTql` take the COMPLETE raw macro argument, WITHOUT the
+   *  outer `{{`/`}}`, and are the only inputs that split a trailing options map —
+   *  once, in Rust. `macroQuery` also picks OG vs advanced with the one Rust
+   *  discriminator, so a `:find` inside a string literal is text on both sides.
+   *  `og` / `tql` / `advanced` are explicit form inputs.
+   *
+   *  `blockProperties` are the host block's `tine.*` properties, which take
+   *  precedence over directives lifted from the query text (§4.1). Passing them
+   *  is `Macro.tsx`'s job and is merged here and nowhere else. */
+  parseQuery(
+    text: string,
+    dialect: QueryTextDialect,
+    blockProperties?: [string, string][],
+  ): Promise<ParsedQuery>;
+  /** IR → text (§4.3, §7.1).
+   *
+   *  Rejects with {@link QueryPrintRefusedError} when `dialect` is `og` and the IR
+   *  is not OG-expressible; the save path is the ONE caller entitled to see that
+   *  and answers by switching dialect. Everyone else must call
+   *  {@link Backend.queryOgExpressible} first.
+   *
+   *  `preserveForm` re-emits `source.original` plus the changed options map once,
+   *  WITHOUT re-lowering the IR (§4.3.1) — the source-preserving title edit. It
+   *  requires a source-backed query and its matching macro dialect; a builder
+   *  query is refused. Title editing is not a filter conversion. */
+  printQuery(
+    query: Query,
+    view: ViewSettings,
+    dialect: QueryPrintDialect,
+    preserveForm?: boolean,
+  ): Promise<string>;
+  /** Whether the OG DSL can say this query, so the save path can choose the
+   *  macro name (Q3) without provoking a rejection. */
+  queryOgExpressible(query: Query, view: ViewSettings): Promise<boolean>;
+  /** The observed property registry (§6.1), with the generation that invalidates
+   *  a cached parse's suggestions. */
+  queryRegistry(): Promise<RegistrySnapshot>;
+  /** Run an already-parsed IR through the one walk. `context.current_page` binds
+   *  `?current-page`; an absent one leaves it UNBOUND rather than guessing (§4.4). */
+  queryRun(query: Query, view: ViewSettings, context?: ExecutionContext): Promise<QueryResult>;
+  /** Why the query returned nothing (Q14, N19): for a root `and`, one row per
+   *  top-level conjunct with the count matching it alone and the count matching
+   *  all the others without it. Carries the diagnostics and the support report,
+   *  because "never bound" and "nothing matched" are different answers. */
+  queryExplainEmpty(
+    query: Query,
+    view: ViewSettings,
+    context?: ExecutionContext,
+  ): Promise<ExplainEmptyResult>;
+
   runQuery(query: string): Promise<RefGroup[]>;
   /** Resolve all Copy / Export query macros under one cumulative native budget. */
   exportQuerySubtrees(specs: QueryExportSpec[]): Promise<QueryExportBatch>;
@@ -1560,6 +1706,29 @@ class TauriBackend implements Backend {
   }
   pagePrintHtml(name: string, opts: PrintOpts) {
     return this.call<string>("page_print_html", { name, opts });
+  }
+  parseQuery(text: string, dialect: QueryTextDialect, blockProperties?: [string, string][]) {
+    return this.call<ParsedQuery>("query_parse", { text, dialect, blockProperties });
+  }
+  printQuery(
+    query: Query,
+    view: ViewSettings,
+    dialect: QueryPrintDialect,
+    preserveForm = false,
+  ) {
+    return this.call<string>("query_print", { query, view, dialect, preserveForm });
+  }
+  queryOgExpressible(query: Query, view: ViewSettings) {
+    return this.call<boolean>("query_og_expressible", { query, view });
+  }
+  queryRegistry() {
+    return this.call<RegistrySnapshot>("query_registry");
+  }
+  queryRun(query: Query, view: ViewSettings, context?: ExecutionContext) {
+    return this.call<QueryResult>("query_run", { query, view, context });
+  }
+  queryExplainEmpty(query: Query, view: ViewSettings, context?: ExecutionContext) {
+    return this.call<ExplainEmptyResult>("query_explain_empty", { query, view, context });
   }
   runQuery(query: string) {
     return this.call<RefGroup[]>("run_query", { query });

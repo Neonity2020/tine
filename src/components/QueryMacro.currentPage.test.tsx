@@ -9,6 +9,8 @@ import { doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "
 import { openPage, route } from "../router";
 import { resetPaneLayoutToSingle } from "../panes";
 import type { QueryExecution, RefGroup } from "../types";
+import { queryMacroExtent } from "../editor/queryMacro";
+import { backendReadsQueries } from "../queryReadingsTestkit";
 
 // GH #301 (approved): a query whose text explicitly carries `<% current page %>`
 // binds that marker to the FOCUSED pane's route page and re-runs when that page
@@ -47,7 +49,13 @@ function node(id: string, raw: string, parent: string | null, children: string[]
   return { id, raw, collapsed: false, parent, page: "Sheet", children };
 }
 
-function loadQueryDoc(queryRaw: string) {
+function loadQueryDoc(queryRaw: string, kind?: "advanced") {
+  // Whether a `{{query …}}` holds datalog is the ENGINE's reading of the text,
+  // not a regex over it (§7.1), so a test that wants the advanced path says so.
+  if (kind) {
+    const argument = queryMacroExtent(queryRaw)?.argument ?? "";
+    backendReadsQueries({ [argument]: { form: argument, kind } });
+  }
   setDoc({
     byId: {
       query: node("query", queryRaw, null),
@@ -143,7 +151,7 @@ describe("query `<% current page %>` dispatch to the focused pane (GH #301)", ()
   });
 
   it("advanced queries substitute at execution too, while its owner-page param stays the query block's page (the :query-page binding)", async () => {
-    loadQueryDoc("{{query [:find (pull ?b [*]) :in $ ?cp :where [?b :block/refs ?cp]] :inputs [<% current page %>]}}");
+    loadQueryDoc("{{query [:find (pull ?b [*]) :in $ ?cp :where [?b :block/refs ?cp]] :inputs [<% current page %>]}}", "advanced");
     const runAdvancedQuery = vi.spyOn(backend(), "runAdvancedQuery").mockImplementation(async (q: string, pageParam?: string) => ({
       groups: groupsFor(`advanced ${q} @ ${pageParam}`),
       ran: [],
@@ -166,7 +174,7 @@ describe("query `<% current page %>` dispatch to the focused pane (GH #301)", ()
   });
 
   it("binds an advanced :inputs [:current-page] query to the focused pane and reruns only for a new focused page", async () => {
-    loadQueryDoc("{{query [:find (pull ?b [*]) :in $ ?current-page :where [?p :block/name ?current-page] [?b :block/refs ?p]] :inputs [:current-page]}}");
+    loadQueryDoc("{{query [:find (pull ?b [*]) :in $ ?current-page :where [?p :block/name ?current-page] [?b :block/refs ?p]] :inputs [:current-page]}}", "advanced");
     const runAdvancedQuery = vi.spyOn(backend(), "runAdvancedQuery").mockResolvedValue({
       groups: groupsFor("todo"),
       ran: ["current-page-ref"],
@@ -197,7 +205,7 @@ describe("query `<% current page %>` dispatch to the focused pane (GH #301)", ()
   });
 
   it("keeps an advanced query without the live keyword owner-bound and navigation-independent", async () => {
-    loadQueryDoc('{{query {:query [:find (pull ?b [*]) :where (task ?b "TODO")] :inputs ["example :current-page"]}}}');
+    loadQueryDoc('{{query {:query [:find (pull ?b [*]) :where (task ?b "TODO")] :inputs ["example :current-page"]}}}', "advanced");
     const runAdvancedQuery = vi.spyOn(backend(), "runAdvancedQuery").mockResolvedValue({
       groups: groupsFor("todo"),
       ran: ["task"],

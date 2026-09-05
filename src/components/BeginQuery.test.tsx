@@ -9,6 +9,7 @@ import { Block } from "./Block";
 import { inspectBeginQuery } from "./BeginQuery";
 import { LiveRefGroup } from "./LiveRefGroup";
 import { RefBlocks } from "./RefBlocks";
+import { backendReadsQueries } from "../queryReadingsTestkit";
 
 const BEGIN_QUERY = `#+BEGIN_QUERY
 {:title "Class pages"
@@ -57,7 +58,24 @@ function dto(id: string, raw: string): BlockDto {
   return { id, raw, collapsed: false, children: [] };
 }
 
+// BeginQuery hands QueryMacro a macro body it composes itself. Which grammar
+// that payload is written in, and where the `{:table-view? true}` presentation
+// map begins, are the ENGINE's readings now, not a frontend regex (§7.1) — so a
+// test that depends on either has to declare it.
+function declareBeginQueryReading(source: string): void {
+  const match = inspectBeginQuery(source, "md");
+  if (match?.kind !== "supported") throw new Error("fixture is not a supported BEGIN_QUERY");
+  backendReadsQueries({
+    [`${match.query} {:table-view? true}`]: {
+      form: match.query,
+      opts: "{:table-view? true}",
+      kind: "advanced",
+    },
+  });
+}
+
 function seedQuery(): BlockDto {
+  declareBeginQueryReading(BEGIN_QUERY);
   setDoc({
     byId: {
       query: node("query", BEGIN_QUERY),
@@ -161,6 +179,7 @@ describe("terminated whole-block BEGIN_QUERY", () => {
       .replace("Class pages", "Partial pages")
       .replace(":class)", ":partial-class)");
     const query = dto("partial-query", partialSource);
+    declareBeginQueryReading(partialSource);
     vi.spyOn(backend(), "runAdvancedQuery").mockResolvedValue({
       groups: [{ page: "Source", kind: "page", blocks: [dto("result", "A matching class page")] }],
       ran: ["page-property"],

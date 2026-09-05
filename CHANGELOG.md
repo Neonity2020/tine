@@ -25,6 +25,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A query written in the middle of a line now shows its title.** A
+  `{{query …}}` with a title or other display options — anything in the trailing
+  `{…}` — was read back from a truncated copy of your text whenever it sat
+  inside a sentence rather than alone on its own line: the closing brace was
+  missing, so the title was ignored and a stray `}` appeared after the results.
+  A query with a comma inside a quoted condition was cut at the comma the same
+  way. Tine now reads the query out of the file exactly as you wrote it, so what
+  it shows is what is there.
+
+- **A published page no longer prints a stray `}` after a query.** Publishing
+  read query macros from the same truncated copy, so a query carrying a title
+  emitted its options' closing brace as visible text next to the results, and
+  the results themselves were computed from a query missing its last character.
+
+- **Renaming a query can no longer rewrite the query.** Editing a query's title
+  used to re-assemble the whole macro from Tine's own reading of it. Now the
+  title is the only thing that changes: your conditions go back to the file
+  exactly as you typed them, even for a query Tine only partly understands. If
+  the new title would produce something Tine could not read back, nothing is
+  written at all and the query says why.
+
 - **A saved query can no longer be written as text Tine will not read back.**
   A query whose conditions produced a comma next to a `[[page]]`, or that
   started with a page reference and carried a title or a sort order, was written

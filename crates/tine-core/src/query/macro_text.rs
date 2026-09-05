@@ -29,15 +29,20 @@
 //! Every one of these is a LEXICAL question about bytes in a document. None of
 //! them parses the query language; the grammar lives in `og.rs` and `tql.rs`.
 
-use crate::query::ir::{Diagnostic, DiagnosticKind, Span};
+use crate::query::ir::{Diagnostic, DiagnosticKind, Span, QUERY_MACRO_NAMES};
 
-/// The macro names a query can be spelled with.
+/// Whether `name` is one of [`QUERY_MACRO_NAMES`], case-insensitively and as a
+/// WHOLE name (§7.9).
 ///
-/// **Deliberately private to this wave.** SPEC §7.9 (Y1) makes the public
-/// `QUERY_MACRO_NAMES` in `query/ir.rs`, together with its doc-code consistency
-/// test against the TypeScript twin, a P0-ts edit. P0-ts can promote this
-/// constant without renaming a single reader.
-const QUERY_MACRO_NAMES: [&str; 2] = ["tine-query", "query"];
+/// The ONE recognizer for "is this macro a query", so a neighbour cannot answer
+/// it with its own `name == "query"` and thereby publish `{{tine-query …}}` as
+/// literal text (Y1). Callers hold a name the document parser already tokenized;
+/// callers holding raw bytes want [`query_macro_extent`] instead.
+pub fn is_query_macro_name(name: &str) -> bool {
+    QUERY_MACRO_NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
 
 /// Which grammar's literals protect a delimiter while scanning FORM text.
 ///
@@ -293,22 +298,29 @@ fn query_macro_extent_from(raw: &str, from: usize) -> Option<MacroExtent> {
 
 /// Read one macro whose `{{` is at `start`, if its name is a query macro name.
 ///
-/// **Widened from the TypeScript, recorded:** `edn.ts` matches `/\{\{query\b/i`,
-/// which knows only one name and would also accept `{{query-foo}}` (`-` is a
-/// word boundary in JavaScript). Here the name is read as a token and compared
-/// against [`QUERY_MACRO_NAMES`] whole, longest first, so `{{tine-query …}}` is
-/// recognised and `{{query-foo …}}` is not.
+/// **Widened from the TypeScript, recorded:** the pre-P0-ts `edn.ts` matched
+/// `/\{\{query\b/i`, which knew only one name and would also accept
+/// `{{query-foo}}` (`-` is a word boundary in JavaScript). Here the name is read
+/// as a token and compared against [`QUERY_MACRO_NAMES`] whole, so
+/// `{{tine-query …}}` is recognised and `{{query-foo …}}` is not.
+///
+/// The LONGEST matching candidate wins, not the first, so the shared constant's
+/// array order carries no meaning (§7.9): P0-ts reordered it to the spec's
+/// `["query", "tine-query"]` and this scan is unchanged by that.
 fn macro_at(raw: &str, start: usize) -> Option<MacroExtent> {
     let after_braces = start + 2;
     let rest = raw.get(after_braces..)?;
-    let name = QUERY_MACRO_NAMES.iter().find(|candidate| {
-        rest.len() >= candidate.len()
-            && rest[..candidate.len()].eq_ignore_ascii_case(candidate)
-            && matches!(
-                rest.as_bytes().get(candidate.len()),
-                None | Some(b' ') | Some(b'\t') | Some(b'}')
-            )
-    })?;
+    let name = QUERY_MACRO_NAMES
+        .iter()
+        .filter(|candidate| {
+            rest.len() >= candidate.len()
+                && rest[..candidate.len()].eq_ignore_ascii_case(candidate)
+                && matches!(
+                    rest.as_bytes().get(candidate.len()),
+                    None | Some(b' ') | Some(b'\t') | Some(b'}')
+                )
+        })
+        .max_by_key(|candidate| candidate.len())?;
     let argument_start = after_braces + name.len();
     let family = FormFamily::for_macro_name(name);
     // Depth 2 is what the two opening braces already contributed, so form text

@@ -4,6 +4,7 @@
 
 use crate::doc::{self, DocBlock};
 use crate::model::{BlockDto, Graph, PageKind, RefGroup};
+use crate::query::macro_text::is_query_macro_name;
 use crate::refs::block_id;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -592,6 +593,35 @@ fn take_to_close(html: &str, i: &mut usize, tag: &str) -> String {
 /// raw `<` in its output opens a tag — a `<`-delimited scan is exact and can't be fooled by
 /// content. (`depth` bounds macro-expansion recursion; see `expand_macro`.)
 fn decorate(html: &str, ctx: &Ctx, depth: u8) -> String {
+    decorate_source(html, None, ctx, depth)
+}
+
+/// [`decorate`] with the ORIGINAL block source `html` was rendered from, when
+/// the caller has it (§4.3.1).
+///
+/// **Why a query macro cannot use lsdoc's `data-args`.** The macro parser splits
+/// arguments on commas and stops before the first `}`, so for
+/// `{{query (task TODO) {:title "T"}}}` the AST argument is `(task TODO)
+/// {:title "T"` — the options map's closing brace is MISSING — and
+/// `content = 'a,b'` comes back as two arguments that rejoin as `'a, b'`. Both
+/// are silent corruptions of the author's bytes, and `args.join(", ")` is the
+/// reconstruction §4.3.1 forbids. So a query macro's argument is taken from the
+/// raw source instead: the k-th query macro ELEMENT in this body is the k-th
+/// query macro EXTENT in its source, because lsdoc emits elements in source
+/// order and [`query_macro_extents`] scans in source order.
+///
+/// `raw = None` (macro expansion, decorator unit tests) keeps the old
+/// reconstructed argument: it is lossy, but there is no raw slice to prefer.
+fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> String {
+    let raw_query_arguments: Vec<String> = raw
+        .map(|raw| {
+            crate::query::macro_text::query_macro_extents(raw)
+                .into_iter()
+                .map(|extent| extent.argument)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut query_macros_seen = 0usize;
     let refs = ctx.refs;
     let b = html.as_bytes();
     let mut out = String::with_capacity(html.len() + 64);
@@ -698,6 +728,14 @@ fn decorate(html: &str, ctx: &Ctx, depth: u8) -> String {
                 .map(unescape)
                 .unwrap_or_default();
             let args = macro_args(tag_attr(inner, "data-args"));
+            if is_query_macro_name(&mname) {
+                let raw_argument = raw_query_arguments.get(query_macros_seen).cloned();
+                query_macros_seen += 1;
+                if let Some(argument) = raw_argument {
+                    out.push_str(&expand_query_macro(&mname, argument.trim(), ctx, depth));
+                    continue;
+                }
+            }
             out.push_str(&expand_macro(&mname, &args, ctx, depth));
             continue;
         }
@@ -2716,11 +2754,20 @@ fn render_children_sheet(
 fn render_query_sheet(
     graph: &Graph,
     cfg: &SheetConfig,
+    macro_name: &str,
     query: &str,
     ctx: &Ctx,
     emit: &SheetEmit,
     out: &mut String,
 ) {
+    // §7.9: a sheet whose row source is `{{tine-query …}}` is a sheet. The TQL
+    // path has its own executor, so route the whole rendering through it rather
+    // than handing TQL text to the OG string parser, which would read it as one
+    // unknown head and publish an empty board.
+    if macro_name.eq_ignore_ascii_case("tine-query") {
+        out.push_str(&render_tql_query(graph, query, ctx, 0));
+        return;
+    }
     let outcome = match run_static_query_groups(graph, query, ctx) {
         Ok(outcome) => outcome,
         Err(html) => {
@@ -2761,6 +2808,9 @@ fn render_query_sheet(
 /// The whole-block `{{query …}}` detection used for query-backed sheets: the
 /// rendered body being exactly one macro element means the block IS the query
 /// (its `tine.view` chooses the sheet presentation for the results).
+/// The macro NAME when the rendered body is exactly one query macro element,
+/// else `None`. The argument is not read here — §4.3.1 takes it from the raw
+/// source, because `data-args` has already lost the options brace by this point.
 fn whole_query_macro(rendered: &str) -> Option<String> {
     let t = rendered.trim();
     let inner = t.strip_prefix("<span ")?;
@@ -2770,15 +2820,28 @@ fn whole_query_macro(rendered: &str) -> Option<String> {
         None?;
     }
     let name = tag_attr(tag_inner, "data-macro").map(unescape)?;
-    if name != "query" {
+    // §7.9: both spellings are queries. A `{{tine-query …}}` block carrying
+    // `tine.view:: board` is as much a sheet row source as a `{{query …}}` one.
+    if !is_query_macro_name(&name) {
         None?;
     }
     if inner[close + 1..].trim() != "</span>" {
         None?;
     }
-    macro_args(tag_attr(tag_inner, "data-args"))
-        .into_iter()
-        .next()
+    Some(name)
+}
+
+/// Expand one query macro from its RAW argument (§4.3.1). Same bounds as
+/// [`expand_macro`]; separate only because the argument arrives verbatim from the
+/// block source rather than from lsdoc's comma-split `data-args`.
+fn expand_query_macro(name: &str, argument: &str, ctx: &Ctx, depth: u8) -> String {
+    let Some(graph) = ctx.graph else {
+        return String::new();
+    };
+    if depth >= 4 {
+        return format!("<span class=\"macro-raw\">{{{{{} …}}}}</span>", esc(name));
+    }
+    render_query_named(graph, name, argument, ctx, depth + 1)
 }
 
 /// Expand one `{{macro …}}`. Bounded by `depth` (a page can embed a block that embeds
@@ -2791,8 +2854,13 @@ fn expand_macro(name: &str, args: &[String], ctx: &Ctx, depth: u8) -> String {
         return format!("<span class=\"macro-raw\">{{{{{} …}}}}</span>", esc(name));
     }
     let arg0 = args.first().map(|s| s.as_str()).unwrap_or("").trim();
+    // §7.9: `{{tine-query …}}` renders through the same executor as `{{query …}}`.
+    // A macro name this tree writes but cannot export would publish the author's
+    // query as literal text (Y1) — which is exactly what this arm used to do.
+    if is_query_macro_name(name) {
+        return render_query_named(graph, name, arg0, ctx, depth + 1);
+    }
     match name {
-        "query" => render_query(graph, arg0, ctx, depth + 1),
         "embed" => render_embed(graph, arg0, ctx, depth + 1),
         "video" => render_video(arg0),
         "namespace" => render_namespace(graph, arg0, ctx),
@@ -2808,6 +2876,99 @@ fn expand_macro(name: &str, args: &[String], ctx: &Ctx, depth: u8) -> String {
 /// Run a `{{query …}}` against the graph and render its results as a bordered block.
 fn render_query(graph: &Graph, src: &str, ctx: &Ctx, depth: u8) -> String {
     render_query_with_title(graph, src, None, ctx, depth)
+}
+
+/// Render whichever query macro name the author wrote (§7.9, Y1).
+///
+/// `{{query …}}` keeps the legacy OG/advanced string path, unchanged. A
+/// `{{tine-query …}}` argument is TQL, which that path cannot read at all, so it
+/// goes through the shared parser and the one IR walk — the same engine the app
+/// runs. Publishing a macro name this tree can write but not export is the
+/// failure Y1 names, and it is why this arm exists.
+fn render_query_named(graph: &Graph, name: &str, argument: &str, ctx: &Ctx, depth: u8) -> String {
+    if !name.eq_ignore_ascii_case("tine-query") {
+        return render_query(graph, argument, ctx, depth);
+    }
+    render_tql_query(graph, argument, ctx, depth)
+}
+
+/// The `{{tine-query …}}` static-export path: parse the COMPLETE raw argument
+/// with the one Rust splitter, run the IR, then hand the groups to the same
+/// renderer, public-page filter and title chrome the OG path uses.
+fn render_tql_query(graph: &Graph, argument: &str, ctx: &Ctx, depth: u8) -> String {
+    if !crate::query::query_source_within_limit(argument) {
+        return format!(
+            "<div class=\"query query-too-large\">Query source exceeds the {} KiB publication limit.</div>",
+            crate::query::QUERY_SOURCE_MAX_BYTES / 1024
+        );
+    }
+    // A static export has no property registry to suggest against; an empty one
+    // costs only `UnknownIdent` SUGGESTIONS, never a different parse (§6.4).
+    let registry =
+        crate::query::registry::Registry::from_snapshot(&crate::query::ir::RegistrySnapshot {
+            rows: Vec::new(),
+            generation: 0,
+        });
+    let (query, view) = crate::query::parse_query_input(
+        argument,
+        crate::query::QueryInput::MacroTql,
+        crate::date::JournalDate::today(),
+        &registry,
+    );
+    // An enabled diagnostic means the query is not understood; it returns no
+    // rows by contract (§3.5), so say that rather than publishing an empty list
+    // that reads as "nothing matched".
+    if query.is_invalid() {
+        return "<div class=\"query query-unsupported\" role=\"alert\">Unsupported query.</div>"
+            .to_string();
+    }
+    const STATIC_QUERY_MAX_ROWS: usize = 20_000;
+    const STATIC_QUERY_MAX_BYTES: usize = 32 * 1024 * 1024;
+    #[cfg(test)]
+    publish_test_counts::bump_query_run(graph);
+    let result = crate::query::run_query_result_ir(
+        graph,
+        &query,
+        &view,
+        crate::query::ir::Bounds {
+            max_rows: STATIC_QUERY_MAX_ROWS,
+            max_bytes: STATIC_QUERY_MAX_BYTES,
+        },
+        // A published page is not "the current page" of the author's session;
+        // `?current-page` simply has no binding here (§4.4), exactly as the
+        // print export already behaves.
+        &crate::query::ir::ExecutionContext::none(),
+    );
+    if result.exceeded {
+        return format!(
+            "<div class=\"query query-too-large\">Query has {} matches; narrow it before publishing.</div>",
+            result.total
+        );
+    }
+    let groups = match result.rows {
+        crate::query::ir::QueryRows::Block { groups } => groups,
+        // A `@page`-anchored query answers page rows, which the static export's
+        // block-result renderer has no shape for. P1 owns that surface; until
+        // then say so instead of rendering a silently empty result.
+        crate::query::ir::QueryRows::Page { .. } => {
+            return "<div class=\"query query-unsupported\" role=\"alert\">Page-anchored queries are not published yet.</div>".to_string()
+        }
+    };
+    let pre_filter_total: usize = groups.iter().map(|group| group.blocks.len()).sum();
+    let groups: Vec<RefGroup> = groups
+        .into_iter()
+        .filter(|group| publish_page_allowed(ctx, &group.page))
+        .collect();
+    render_query_outcome(
+        graph,
+        StaticQueryOutcome {
+            groups,
+            pre_filter_total,
+        },
+        None,
+        ctx,
+        depth,
+    )
 }
 
 /// The ONE static-export query executor, shared by the `{{query …}}` macro
@@ -2927,6 +3088,19 @@ fn render_query_with_title(
         Ok(outcome) => outcome,
         Err(html) => return html,
     };
+    render_query_outcome(graph, outcome, title, ctx, depth)
+}
+
+/// The shared result chrome: count, rows, and the non-public omission notice.
+/// Both macro names reach it, so a TQL export and an OG export are the same
+/// document (§7.9).
+fn render_query_outcome(
+    graph: &Graph,
+    outcome: StaticQueryOutcome,
+    title: Option<&str>,
+    ctx: &Ctx,
+    depth: u8,
+) -> String {
     let groups = outcome.groups;
     let total: usize = groups.iter().map(|g| g.blocks.len()).sum();
     let omitted = outcome.pre_filter_total.saturating_sub(total);
@@ -3261,9 +3435,17 @@ fn render_block_ordered(
     } else {
         Some(lsdoc::render_html(&blocks, &md_opts()))
     };
+    // §4.3.1: the sheet's row source is the RAW macro too. `whole_query_macro`
+    // only decides WHETHER the body is a single query macro (and under which
+    // name); the argument itself comes from the block source, so a sheet whose
+    // query carries an options map or a literal comma is not silently rewritten.
     let sheet_query_src = sheet.as_ref().and_then(|cfg| {
-        whole_query_macro(rendered_body.as_deref().unwrap_or(""))
-            .filter(|_| cfg.view == SheetView::Board || cfg.view == SheetView::Table)
+        if cfg.view != SheetView::Board && cfg.view != SheetView::Table {
+            return None;
+        }
+        let name = whole_query_macro(rendered_body.as_deref().unwrap_or(""))?;
+        let extent = crate::query::macro_text::query_macro_extent(&b.raw)?;
+        Some((name, extent.argument))
     });
 
     // Header facets (task checkbox + marker, priority) → the decorated body (lsdoc's
@@ -3300,8 +3482,12 @@ fn render_block_ordered(
         Some(BeginQueryInspection::Unsupported) => out.push_str(
             "<div class=\"query-unsupported begin-query-unsupported\" role=\"alert\">Unsupported BEGIN_QUERY.</div>",
         ),
-        None => match (&sheet, sheet_query_src.as_deref(), ctx.graph) {
-            (Some(cfg), Some(query), Some(graph)) => {
+        None => match (
+            &sheet,
+            sheet_query_src.as_ref().map(|(name, argument)| (name.as_str(), argument.as_str())),
+            ctx.graph,
+        ) {
+            (Some(cfg), Some((name, query)), Some(graph)) => {
                 let emit = SheetEmit {
                     ctx,
                     slug,
@@ -3309,9 +3495,16 @@ fn render_block_ordered(
                     opts,
                     anchors: false,
                 };
-                render_query_sheet(graph, cfg, query, ctx, &emit, out);
+                render_query_sheet(graph, cfg, name, query, ctx, &emit, out);
             }
-            _ => out.push_str(&decorate(rendered_body.as_deref().unwrap_or(""), ctx, 0)),
+            // §4.3.1: the block's own raw source is the query transport, so a
+            // `{:title "T"}` map and a literal comma survive publication.
+            _ => out.push_str(&decorate_source(
+                rendered_body.as_deref().unwrap_or(""),
+                Some(&b.raw),
+                ctx,
+                0,
+            )),
         },
     }
     out.push_str("</div>");
@@ -5572,6 +5765,122 @@ mod tests {
             !folded.contains("hidden child text"),
             "folded hides collapsed children"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **Y1: a packet may not write a macro name its own tree cannot export.**
+    ///
+    /// P0-ts's printer writes `{{tine-query …}}` whenever a filter is not
+    /// OG-expressible (Q3). Before this packet, `expand_macro` matched the
+    /// literal `"query"` and every other name fell through to the muted
+    /// `macro-raw` literal — so a saved TQL query published as its own source
+    /// text. That is the exact failure §7.9 names, and this is its test.
+    #[test]
+    fn publish_renders_both_query_macro_names_and_never_leaks_the_source() {
+        let dir = std::env::temp_dir().join(format!("tine-publish-tql-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:publishing/all-pages-public? true}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO tql-visible-result [[Alpha]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- {{tine-query @block and [[Alpha]]}}\n- {{query (task TODO)}}\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        let (outdir, _) = publish_graph(&graph).unwrap();
+        let dashboard =
+            fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
+
+        // Both macros became query blocks…
+        assert_eq!(
+            dashboard.matches("class=\"query\"").count(),
+            2,
+            "both macro names render as query blocks: {dashboard}"
+        );
+        // …neither leaked its authored source as literal text…
+        assert!(
+            !dashboard.contains("{{tine-query") && !dashboard.contains("{{query"),
+            "a query macro published as literal text: {dashboard}"
+        );
+        assert!(
+            !dashboard.contains("macro-raw"),
+            "a query macro fell through to the unknown-macro literal: {dashboard}"
+        );
+        // …and the TQL one actually RAN, rather than rendering an empty result
+        // that would look identical to a working query with no matches.
+        assert!(
+            dashboard.contains("tql-visible-result"),
+            "the TQL query returned its row: {dashboard}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// §4.3.1: the query transport is the RAW SOURCE SLICE, not lsdoc's
+    /// comma-split `data-args`.
+    ///
+    /// mldoc's macro parser splits arguments on commas and stops before the
+    /// first `}`, so `{{query (task TODO) {:title "T"}}}` reaches the exporter as
+    /// the argument `(task TODO) {:title "T"` — the options brace MISSING — and a
+    /// literal comma comes back with a space inserted. Both are silent
+    /// corruptions of the author's bytes. This asserts the publisher reads the
+    /// block source instead.
+    #[test]
+    fn publish_reads_a_query_macro_from_the_raw_source_not_the_split_args() {
+        let dir = std::env::temp_dir().join(format!("tine-publish-rawarg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:publishing/all-pages-public? true}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO raw-arg-visible-result\n",
+        )
+        .unwrap();
+        // A trailing options map: the AST argument loses its closing brace, so a
+        // publisher trusting `data-args` hands the parser an unbalanced form.
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- {{query (task TODO) {:title \"Open, work\"}}}\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        let (outdir, _) = publish_graph(&graph).unwrap();
+        let dashboard =
+            fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
+
+        assert!(
+            dashboard.contains("class=\"query\""),
+            "the query rendered: {dashboard}"
+        );
+        assert!(
+            dashboard.contains("raw-arg-visible-result"),
+            "the query with an options map still RAN: {dashboard}"
+        );
+        // The stray `}` §4.3.1 measures on mldoc must not reach the document.
+        assert!(
+            !dashboard.contains("}}}") && !dashboard.contains("{{query"),
+            "the options brace leaked into the published page: {dashboard}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

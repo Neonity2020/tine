@@ -1,5 +1,5 @@
-import { For, Show, Switch, Match, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
-import { backend } from "../backend";
+import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
+import { backend, QueryPrintRefusedError } from "../backend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
 import { openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
@@ -14,12 +14,20 @@ import {
   advancedToClause,
   clearSimpleForm,
   getSimpleForm,
-  parseQuery,
   toDsl,
-  type Clause,
 } from "../editor/queryBuilder";
-import { foldAggregate, groupRows } from "../editor/queryAggregate";
-import { quoteEdnString, unquoteEdnString, splitTrailingMap, queryMacroExtents } from "../editor/edn";
+import { foldAggregate, groupRows, type AggDirective } from "../editor/queryAggregate";
+import { quoteEdnString, unquoteEdnString } from "../editor/edn";
+import { queryMacroExtents, QUERY_MACRO_NAMES } from "../editor/queryMacro";
+import {
+  macroTextDialect,
+  sourceOptions,
+  sourceOriginal,
+  sourcePrintDialect,
+  type Query,
+  type Source,
+  type ViewSettings,
+} from "../editor/queryIr";
 import { visibleBody } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { sheetConfig } from "../sheet/config";
@@ -34,8 +42,6 @@ import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
 import { blockDtoExternalId } from "../blockIdentity";
 import { ExternalLink } from "./ExternalLink";
-
-const ADVANCED_RE = /\[\s*:find|:where|:find/;
 
 // Recognize the typed Logseq input without treating an example in a string or
 // `;;` comment as live. Only a direct token in the :inputs vector makes query
@@ -146,27 +152,6 @@ interface Row {
   props: Record<string, string>;
 }
 
-interface ParsedQuery {
-  form: string; // the query form, without the options map
-  opts: string; // the raw trailing `{…}` options map, or ""
-  title?: string;
-  collapsed?: boolean;
-  tableView?: boolean;
-}
-// Split a trailing front-matter options map off the query DSL and read the
-// display options OG supports (:title / :collapsed? / :table-view?).
-function splitQuery(arg: string): ParsedQuery {
-  const { form, opts } = splitTrailingMap(arg);
-  const tm = /:title\s+"((?:[^"\\]|\\.)*)"/.exec(opts);
-  return {
-    form,
-    opts,
-    title: tm ? unquoteEdnString(tm[1]) : undefined,
-    collapsed: /:collapsed\?\s+true/.test(opts),
-    tableView: /:table-view\?\s+true/.test(opts),
-  };
-}
-
 /** Remove the block a query is written in from that query's own results.
  *
  *  `{{query "xyz"}}` contains `xyz`, so the block matches its own query and the
@@ -198,6 +183,11 @@ export function withoutHostBlock(groups: RefGroup[], hostBlockId: string | undef
 // edits rewrite the {{query ...}} macro in that block's raw text.
 export function QueryMacro(props: {
   body: string;
+  /** The macro name this query was AUTHORED under (§7.9). Supplied by the render
+   *  dispatch, which recovered it from the raw source alongside the argument.
+   *  Absent for callers that build a body string themselves; the name is then
+   *  read back off `body`, and failing that defaults to the legacy spelling. */
+  macroName?: string;
   blockId?: string;
   title?: string;
   /** Read-only query surfaces can supply page context without a blockId, which
@@ -217,12 +207,67 @@ export function QueryMacro(props: {
   const linkDepth = useContext(LinkDepthContext);
   if (linkDepth > MAX_DEPTH_OF_LINKS) return <LinkDepthWarning />;
 
-  const arg = () => props.body.replace(/^query\s*/i, "").trim();
-  // Split a trailing front-matter options map ({:title … :collapsed? … :table-view? …})
-  // off the query form, so builder/engine see only the form and the options drive
-  // display defaults.
-  const parsed = createMemo(() => splitQuery(arg()));
-  const form = () => parsed().form;
+  // §7.9: strip whichever query macro name this block was authored under, not a
+  // hard-coded `query`. A `{{tine-query …}}` body whose name was not stripped
+  // would be handed to the parser as `tine-query @block and …`, which is not a
+  // query in any grammar.
+  const macroName = (): string => {
+    if (props.macroName) return props.macroName;
+    const authored = QUERY_MACRO_NAMES.find((name) =>
+      new RegExp(`^${name}(\\s|$)`, "i").test(props.body.trim()),
+    );
+    return authored ?? QUERY_MACRO_NAMES[0];
+  };
+  const arg = () =>
+    props.body.trim().replace(new RegExp(`^${macroName()}\\s*`, "i"), "").trim();
+  // The host block's `tine.*` properties, which §4.1 gives precedence over the
+  // directives lifted from the query text. Merging the two is the engine's job,
+  // so they are handed to it rather than reconciled here.
+  const blockDirectives = createMemo<[string, string][]>(() => {
+    const id = props.blockId;
+    const node = id ? doc.byId[id] : undefined;
+    if (!id || !node) return [];
+    return facetsOf(node.raw, formatForBlock(id)).properties.filter(([key]) =>
+      key.startsWith("tine."),
+    );
+  });
+  // **The macro argument is read by the ONE engine (§7.1, X4).** Where the
+  // trailing options map begins, and whether a `{{query …}}` holds the OG DSL or
+  // advanced datalog, are query-language questions that Rust already answers in
+  // `query_parse`. This component used to answer both a second time — with
+  // `splitTrailingMap` and an `ADVANCED_RE` regex — and the two answers differed
+  // on exactly the inputs that matter (a literal `}` inside a string, a `:find`
+  // inside a string). Both twins are gone (I-12, D-14).
+  const parseRequest = createMemo(() => ({
+    argument: arg(),
+    name: macroName(),
+    properties: blockDirectives(),
+  }));
+  const [parsed] = createResource(parseRequest, (request) =>
+    backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+  );
+  // `latest` rather than `parsed()`: a re-parse after an edit keeps the previous
+  // reading visible instead of blanking the query for a frame.
+  const source = (): Source | undefined => parsed.latest?.query.source;
+  const view = (): ViewSettings => parsed.latest?.view ?? {};
+  const form = (): string => {
+    const s = source();
+    return (s ? sourceOriginal(s) : null) ?? "";
+  };
+  const opts = (): string => {
+    const s = source();
+    return s ? sourceOptions(s) : "";
+  };
+  // `:title` / `:collapsed?` / `:table-view?` are read out of the OPAQUE options
+  // map, which the engine carries verbatim and deliberately does not interpret
+  // (§4.3, Y2). There is no Rust answer being duplicated here — reading three
+  // display keys out of the author's own map is this component's own question.
+  const titleOption = (): string | undefined => {
+    const m = /:title\s+"((?:[^"\\]|\\.)*)"/.exec(opts());
+    return m ? unquoteEdnString(m[1]) : undefined;
+  };
+  const collapsedOption = () => /:collapsed\?\s+true/.test(opts());
+  const tableViewOption = () => /:table-view\?\s+true/.test(opts());
   // GH #301: `<% current page %>` inside a query binds to the FOCUSED pane's
   // route page and re-runs on navigation. Substitution is execution-only —
   // authoring text and every editing/display derivation keep the literal dyvar
@@ -253,7 +298,7 @@ export function QueryMacro(props: {
     return view === "search" || view === "table" || view === "board" ? view : "list";
   };
   const sheetFace = () => currentView() === "table" || currentView() === "board";
-  const legacyTable = () => currentView() === "list" && parsed().tableView === true;
+  const legacyTable = () => currentView() === "list" && tableViewOption();
   const setQueryView = (next: QueryView) => {
     const blockId = props.blockId;
     if (!blockId) return;
@@ -284,34 +329,80 @@ export function QueryMacro(props: {
     const raw = doc.byId[props.blockId]?.raw ?? "";
     const extents = queryMacroExtents(raw);
     if (!extents.length) return;
+    // Target by the extent's own recovered name+argument rather than by a
+    // whitespace-normalized slice of the source: that is the same pair the
+    // renderer handed this component as `body`, so the match is exact even when
+    // two macros differ only inside a string literal.
     const norm = (s: string) => s.replace(/\s+/g, " ").trim();
     const mine = norm(props.body);
-    const target = extents.find((e) => norm(raw.slice(e.start + 2, e.end - 2)) === mine) ?? extents[0];
+    const target =
+      extents.find((e) => norm(`${e.name} ${e.argument}`) === mine)
+      ?? extents.find((e) => norm(raw.slice(e.start + 2, e.end - 2)) === mine)
+      ?? extents[0];
     setRaw(props.blockId, raw.slice(0, target.start) + newMacro + raw.slice(target.end));
   };
   const applyDsl = (dsl: string) => {
-    const opts = parsed().opts ? ` ${parsed().opts}` : "";
-    rewriteMacro(`{{query ${dsl}${opts}}}`);
+    const options = opts() ? ` ${opts()}` : "";
+    // Re-emit under the name the block already carries (§7.9). Promoting a
+    // `{{query}}` to `{{tine-query}}` is the SAVE path's decision, made from
+    // `query_og_expressible` — never a side effect of editing a chip.
+    rewriteMacro(`{{${macroName()} ${dsl}${options}}}`);
   };
   // Edit the query's display title (:title "…" in the options map). Only offered
   // for a user-authored standalone query (blockId set, no app-supplied title).
   const [editingTitle, setEditingTitle] = createSignal(false);
-  const titleText = () => props.title ?? parsed().title ?? "Query";
+  const titleText = () => props.title ?? titleOption() ?? "Query";
   const titleEditable = () => !!props.blockId && props.title === undefined;
-  const setTitle = (t: string) => {
+  // **A title edit is not a filter conversion (§4.3.1).** The new options map is
+  // handed back to the printer with `preserveForm`, which re-emits
+  // `source.original` verbatim and never re-lowers the IR — so renaming a query
+  // the engine only partly understands cannot rewrite the author's filter, and a
+  // query that OG could not express is still renameable. The dialect comes off
+  // the SOURCE, not the macro name: a `{{query …}}` holding datalog prints as
+  // `advanced_macro`.
+  const setTitle = async (t: string) => {
     if (!props.blockId) return;
-    const inner = parsed().opts.replace(/^\{|\}$/g, "").trim();
+    const reading = parsed.latest;
+    if (!reading) return;
+    const inner = opts().replace(/^\{|\}$/g, "").trim();
     // Drop any existing :title (escape-aware), keep the other options.
     const rest = inner.replace(/:title\s+"(?:[^"\\]|\\.)*"\s*/, "").trim();
     // Strip chars that would break the {{…}} macro / {…} options map; escape the
-    // rest so quotes/backslashes round-trip faithfully through splitQuery.
+    // rest so quotes/backslashes round-trip faithfully through a re-parse.
     const title = t.trim().replace(/[\r\n{}]/g, "");
     const parts = [title ? `:title "${quoteEdnString(title)}"` : "", rest].filter(Boolean);
-    const opts = parts.length ? ` {${parts.join(" ")}}` : "";
-    rewriteMacro(`{{query ${form()}${opts}}}`);
+    const nextOptions = parts.length ? `{${parts.join(" ")}}` : "";
+    const nextQuery: Query = {
+      ...reading.query,
+      source: { ...reading.query.source, og_options: nextOptions } as Source,
+    };
+    try {
+      const argument = await backend().printQuery(
+        nextQuery,
+        reading.view,
+        sourcePrintDialect(reading.query.source),
+        true,
+      );
+      setPrintError(null);
+      rewriteMacro(`{{${macroName()} ${argument}}}`);
+    } catch (error) {
+      // I-4 / T7: a refused print is NEVER swallowed. Nothing is written, and the
+      // reason is shown next to the edit that provoked it. A catch-all that
+      // turned this into a silent no-op is how an unsaved rename looks saved.
+      setPrintError(
+        error instanceof QueryPrintRefusedError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error),
+      );
+    }
   };
+  const [printError, setPrintError] = createSignal<string | null>(null);
 
-  const isAdvanced = () => ADVANCED_RE.test(arg());
+  // Whether this is an advanced (datalog) query is the ENGINE's reading of the
+  // text, not a regex over it (§7.1): a `:find` inside a string literal is text.
+  const isAdvanced = () => source()?.kind === "advanced";
   const currentPageInput = createMemo(() =>
     isAdvanced() && declaresCurrentPageInput(form())
   );
@@ -368,7 +459,19 @@ export function QueryMacro(props: {
     arg(),
   ]);
   const storedCollapse = loadCollapsed(collapseKey());
-  const [collapsed, setCollapsed] = createSignal(storedCollapse ?? parsed().collapsed ?? false);
+  const [collapsed, setCollapsed] = createSignal(storedCollapse ?? false);
+  // `{:collapsed? true}` is an authored DEFAULT, not a reader's choice, so it
+  // only applies when this reader has no stored preference for this query. It
+  // can only be honoured once the engine has separated the options map from the
+  // form, which is why it is seeded when the parse lands rather than at setup.
+  if (storedCollapse === undefined || storedCollapse === null) {
+    let seeded = false;
+    createEffect(() => {
+      if (seeded || !parsed.latest) return;
+      seeded = true;
+      if (collapsedOption()) setCollapsed(true);
+    });
+  }
   const toggleCollapsed = () => {
     const v = !collapsed();
     setCollapsed(v);
@@ -380,8 +483,15 @@ export function QueryMacro(props: {
   // A COLLAPSED query keys off the form only (no dataRev), so it fetches once for
   // its count and doesn't re-run a whole-graph scan on every save while hidden;
   // expanding it (key flips to include dataRev) refreshes it.
-  const queryRequestKey = () =>
-    `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() || currentPageInput() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
+  // Nothing runs before the engine has read the text: the form the executor is
+  // given is `source.original`, and until the parse lands there is no form —
+  // only the raw argument, which still carries the options map. Returning
+  // `undefined` keeps `createResource` from fetching at all, rather than running
+  // a query nobody authored.
+  const queryRequestKey = (): string | undefined => {
+    if (!parsed.latest) return undefined;
+    return `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}${currentPageMarker() || currentPageInput() ? `\0cp:${focusedQueryPage() ?? ""}` : ""}`;
+  };
   const fetchGroups = async (requestKey: string): Promise<RefGroup[]> => {
     {
       const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
@@ -483,7 +593,11 @@ export function QueryMacro(props: {
   // block per group in that order — so the list view must render flat (a single
   // ordered sequence with a per-row page breadcrumb), not grouped by page, or the
   // global order would be lost to page headers.
-  const globalSort = createMemo(() => /\(\s*sort-by\b/i.test(form()));
+  // The engine sorts GLOBALLY when the view carries a sort, returning one block
+  // per group in that order — so the list view must render flat (one ordered
+  // sequence with a per-row breadcrumb) or the global order is lost to page
+  // headers. Which is read off the parsed view, not re-detected in the text.
+  const globalSort = createMemo(() => (view().sort ?? []).length > 0);
   const queryGroupKey = (group: RefGroup, flat: boolean) =>
     flat
       ? `${group.kind}\0${group.page}\0${group.path ?? ""}\0${group.blocks.map((block) => block.id).join("\0")}`
@@ -515,19 +629,19 @@ export function QueryMacro(props: {
     return Array.from(keys);
   });
 
-  // Result summarization (1a): the `(aggregate …)` / `(group-by …)` directives ride
-  // in the DSL and are parse-but-ignored by the engine (it returns the full set), so
-  // the math is computed HERE from the returned rows. Only the simple DSL carries
-  // them (datalog aggregation is OG's :result-transform, which we list as ignored).
-  const directives = createMemo<{ agg: Extract<Clause, { kind: "aggregate" }> | null; group: string | null }>(() => {
+  // Result summarization (1a): `aggregate` / `group-by` are VIEW settings, lifted
+  // out of the query text (or the block's `tine.*` properties) by the engine and
+  // returned alongside the IR. The engine returns the full block set and ignores
+  // them, so the math is computed HERE from the returned rows. Only the simple
+  // DSL carries them (datalog aggregation is OG's :result-transform, which we
+  // list as ignored).
+  const directives = createMemo<{ agg: AggDirective | null; group: string | null }>(() => {
     if (isAdvanced()) return { agg: null, group: null };
-    const root = parseQuery(form());
-    const kids = root.kind === "op" && root.op === "and" ? root.children : [root];
-    const agg = kids.find((c) => c.kind === "aggregate");
-    const group = kids.find((c) => c.kind === "groupBy");
+    const settings = view();
+    const [field, fn] = settings.aggregates?.[0] ?? [];
     return {
-      agg: agg?.kind === "aggregate" ? agg : null,
-      group: group?.kind === "groupBy" ? group.field : null,
+      agg: fn ? { agg: fn, field: field ?? null } : null,
+      group: settings.group_by ?? null,
     };
   });
   const aggLabel = () => {
@@ -581,7 +695,7 @@ export function QueryMacro(props: {
 
   // Hide the whole block when asked and there's nothing to show (advanced
   // queries still render their "unsupported" notice).
-  const hidden = () => props.hideWhenEmpty && !ADVANCED_RE.test(arg()) && total() === 0;
+  const hidden = () => props.hideWhenEmpty && !isAdvanced() && total() === 0;
   const unsupportedAdvanced = () => isAdvanced() && advInfo() && (
     !advInfo()!.supported || (props.strictAdvanced === true && advInfo()!.ignored.length > 0)
   );
@@ -649,13 +763,13 @@ export function QueryMacro(props: {
                     <input
                       class="query-title-input"
                       autofocus
-                      value={parsed().title ?? ""}
+                      value={titleOption() ?? ""}
                       placeholder="Query title"
                       onClick={(e) => e.stopPropagation()}
                       onKeyDown={(e) => {
                         e.stopPropagation();
                         if (e.key === "Enter") {
-                          setTitle(e.currentTarget.value);
+                          void setTitle(e.currentTarget.value);
                           setEditingTitle(false);
                         } else if (e.key === "Escape") {
                           canceled = true;
@@ -663,7 +777,7 @@ export function QueryMacro(props: {
                         }
                       }}
                       onBlur={(e) => {
-                        if (!canceled) setTitle(e.currentTarget.value);
+                        if (!canceled) void setTitle(e.currentTarget.value);
                         setEditingTitle(false);
                       }}
                     />
@@ -696,6 +810,13 @@ export function QueryMacro(props: {
                 the ran/ignored note above shows which clauses took. */}
             <Show when={props.blockId && !isAdvanced()}>
               <QueryBuilder dsl={form} onChange={applyDsl} blockId={props.blockId} />
+            </Show>
+            <Show when={printError()}>
+              {(message) => (
+                <div class="query-unsupported query-print-refused" role="alert">
+                  The query wasn't changed: {message()}
+                </div>
+              )}
             </Show>
             <Show when={groupsError()}>
               {(message) => (
