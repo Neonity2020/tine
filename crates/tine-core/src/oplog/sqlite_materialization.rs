@@ -4474,6 +4474,9 @@ mod tests {
             "renumbered `0..n`",
             "`projection_source_revision`",
             "never migrated in place, and no\nforensic evidence is preserved",
+            // F11: the config travels inside the work item, so the sentence
+            // above is structurally true and not merely currently true.
+            "travels **inside** each\nqueued Direct Files work item",
         ] {
             assert!(
                 contract.contains(phrase),

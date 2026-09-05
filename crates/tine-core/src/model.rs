@@ -6158,7 +6158,8 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         {
-            projection.enqueue_delete(generation, entry, Arc::new(self.config.parse_config()));
+            // A delete lowers nothing, so it carries no parse config (F11).
+            projection.enqueue_delete(generation, entry);
         }
     }
 

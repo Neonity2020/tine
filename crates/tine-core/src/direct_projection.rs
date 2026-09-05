@@ -61,22 +61,59 @@ fn hex16(id: [u8; 16]) -> String {
     out
 }
 
+/// One queued page change. **The graph config travels INSIDE the work item**
+/// (§5.8 M21, F11): every arm that lowers a page carries the exact
+/// [`ParseConfig`] it must be lowered under, so the worker cannot reach a state
+/// where queued work exists and the config that describes it does not.
+///
+/// The config used to sit beside the queue, and the worker read it as
+/// `parse_config.clone().unwrap_or_else(|| Arc::new(ParseConfig::default()))`.
+/// That fallback was unreachable — the stop check runs first and every enqueue
+/// path set the config in the same critical section that inserted the work —
+/// but if it had ever fired it would have lowered queued pages under the
+/// DEFAULT config and stamped the result as current: silently wrong rows,
+/// which is exactly what the stamp exists to prevent, reached from inside. A
+/// `debug_assert` would have hidden the release-mode behaviour behind a passing
+/// debug run, so the absence is removed by SHAPE — it can no longer be spelled.
+///
+/// `Delete` deliberately carries no config: it lowers nothing and stamps no
+/// source revision, so a config on that arm would be a value with no reader.
 #[derive(Clone)]
 enum PageDelta {
-    Replace(PageEntry, Arc<Document>, String),
-    Delete(PageEntry),
+    Replace {
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+        parse_config: Arc<ParseConfig>,
+    },
+    Delete {
+        entry: PageEntry,
+    },
+}
+
+impl PageDelta {
+    fn entry(&self) -> &PageEntry {
+        match self {
+            PageDelta::Replace { entry, .. } | PageDelta::Delete { entry } => entry,
+        }
+    }
+}
+
+/// A queued whole-graph snapshot and the config it must be lowered under. The
+/// config is stamped into every page's `projection_source_revision`, so a
+/// config edit re-lowers every page on the next snapshot instead of leaving
+/// rows that answer a question the config no longer asks (J7, D-1: rebuild,
+/// never migrate).
+struct PendingFull {
+    pages: PageSnapshot,
+    revisions: PageRevisions,
+    parse_config: Arc<ParseConfig>,
 }
 
 #[derive(Default)]
 struct PendingProjection {
-    full: Option<(u64, PageSnapshot, PageRevisions)>,
+    full: Option<PendingFull>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
-    /// The graph config the queued work must be lowered under (§5.8 M21). It is
-    /// stamped into every page's `projection_source_revision`, so a config edit
-    /// re-lowers every page on the next snapshot instead of leaving rows that
-    /// answer a question the config no longer asks (J7, D-1: rebuild, never
-    /// migrate).
-    parse_config: Option<Arc<ParseConfig>>,
     latest_generation: u64,
     stop: bool,
 }
@@ -149,9 +186,12 @@ impl DirectProjection {
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
-        pending.full = Some((generation, pages, revisions));
+        pending.full = Some(PendingFull {
+            pages,
+            revisions,
+            parse_config,
+        });
         pending.deltas.clear();
-        pending.parse_config = Some(parse_config);
         pending.latest_generation = generation;
         self.shared.changed.notify_one();
     }
@@ -166,28 +206,24 @@ impl DirectProjection {
     ) {
         self.enqueue_delta(
             generation,
-            PageDelta::Replace(entry, document, revision),
-            parse_config,
+            PageDelta::Replace {
+                entry,
+                document,
+                revision,
+                parse_config,
+            },
         );
     }
 
-    pub(crate) fn enqueue_delete(
-        &self,
-        generation: u64,
-        entry: PageEntry,
-        parse_config: Arc<ParseConfig>,
-    ) {
-        self.enqueue_delta(generation, PageDelta::Delete(entry), parse_config);
+    pub(crate) fn enqueue_delete(&self, generation: u64, entry: PageEntry) {
+        self.enqueue_delta(generation, PageDelta::Delete { entry });
     }
 
-    fn enqueue_delta(&self, generation: u64, delta: PageDelta, parse_config: Arc<ParseConfig>) {
+    fn enqueue_delta(&self, generation: u64, delta: PageDelta) {
         self.shared.ready.store(false, Ordering::Release);
-        let key = match &delta {
-            PageDelta::Replace(entry, _, _) | PageDelta::Delete(entry) => entry.rel_path.clone(),
-        };
+        let key = delta.entry().rel_path.clone();
         let mut pending = self.shared.pending.lock().unwrap();
         pending.deltas.insert(key, (generation, delta));
-        pending.parse_config = Some(parse_config);
         pending.latest_generation = pending.latest_generation.max(generation);
         self.shared.changed.notify_one();
     }
@@ -1070,7 +1106,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     let _lease = lease;
     let mut requires_full_rebuild = false;
     loop {
-        let (full, deltas, parse_config, latest_generation) = {
+        let (full, deltas, latest_generation) = {
             let mut pending = shared.pending.lock().unwrap();
             while pending.full.is_none() && pending.deltas.is_empty() && !pending.stop {
                 pending = shared.changed.wait(pending).unwrap();
@@ -1084,10 +1120,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             (
                 pending.full.take(),
                 std::mem::take(&mut pending.deltas),
-                pending
-                    .parse_config
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(ParseConfig::default())),
                 pending.latest_generation,
             )
         };
@@ -1097,7 +1129,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let applied = if requires_full_rebuild && !had_full {
             Err("a prior projection failure requires a complete parser snapshot".into())
         } else {
-            apply_pending(&mut database, full, deltas, &parse_config)
+            apply_pending(&mut database, full, deltas)
         };
         if let Err(error) = applied {
             requires_full_rebuild = true;
@@ -1152,12 +1184,17 @@ fn open_projection_database(
 
 fn apply_pending(
     database: &mut PhysicalGraphProjectionDatabase,
-    full: Option<(u64, PageSnapshot, PageRevisions)>,
+    full: Option<PendingFull>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
-    parse_config: &ParseConfig,
 ) -> Result<(), String> {
-    let config_digest = parse_config.digest();
-    if let Some((_, pages, revisions)) = full {
+    if let Some(PendingFull {
+        pages,
+        revisions,
+        parse_config,
+    }) = full
+    {
+        let parse_config = parse_config.as_ref();
+        let config_digest = parse_config.digest();
         let sources = pages
             .iter()
             .map(|(entry, _)| {
@@ -1220,18 +1257,25 @@ fn apply_pending(
         let mut deletions = Vec::new();
         for (_, (_, delta)) in deltas {
             match delta {
-                PageDelta::Replace(entry, document, revision) => {
+                // Each replacement lowers under the config it was queued with,
+                // never under a later page's or a default (F11).
+                PageDelta::Replace {
+                    entry,
+                    document,
+                    revision,
+                    parse_config,
+                } => {
                     replacement_sources.push(PhysicalGraphProjectionSourceRevision {
                         page_id: page_id(&entry.rel_path),
-                        revision: projection_source_revision(&revision, config_digest),
+                        revision: projection_source_revision(&revision, parse_config.digest()),
                     });
                     let (page, mut postings, mut page_aliases) =
-                        physical_page(&entry, &document, parse_config)?;
+                        physical_page(&entry, &document, &parse_config)?;
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
                 }
-                PageDelta::Delete(entry) => deletions.push(page_id(&entry.rel_path)),
+                PageDelta::Delete { entry } => deletions.push(page_id(&entry.rel_path)),
             }
         }
         database
@@ -2825,6 +2869,90 @@ mod tests {
             projection_source_revision(source, ParseConfig::default().digest()),
             projection_source_revision(source, edited.digest()),
         );
+    }
+
+    /// **F11.** The parse config travels inside each queued work item, so two
+    /// replacements coalesced into one worker turn are each lowered and stamped
+    /// under the config they were queued with -- never under whichever config
+    /// the last enqueue happened to leave beside the queue, and never under a
+    /// default that absence could stand in for.
+    ///
+    /// The stamp is what reconciliation compares, so a page carrying another
+    /// page's config digest is a page whose rows answer a question the config
+    /// no longer asks and which no later reopen will notice (J7, D-1).
+    #[test]
+    fn each_queued_page_lowers_under_the_config_it_was_queued_with() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("per-item-parse-config");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut database = open_projection_database(&root.join("projection.sqlite")).unwrap();
+
+        let default_config = Arc::new(ParseConfig::default());
+        let edited_config = Arc::new({
+            let mut edited = ParseConfig::default();
+            edited.separated_by_commas.push("authors".to_owned());
+            edited
+        });
+        assert_ne!(default_config.digest(), edited_config.digest());
+
+        let queued = |rel_path: &str, parse_config: &Arc<ParseConfig>| {
+            (
+                rel_path.to_owned(),
+                (
+                    1_u64,
+                    PageDelta::Replace {
+                        entry: PageEntry {
+                            name: rel_path.trim_end_matches(".md").to_owned(),
+                            kind: PageKind::Page,
+                            date_key: None,
+                            rel_path: rel_path.to_owned(),
+                            path: root.join(rel_path),
+                        },
+                        document: Arc::new({
+                            let mut document = crate::doc::parse("- authors:: ada, grace\n");
+                            crate::model::assign_doc_runtime_ids(&mut document.roots, rel_path);
+                            document
+                        }),
+                        revision: format!("sha256:{rel_path}"),
+                        parse_config: Arc::clone(parse_config),
+                    },
+                ),
+            )
+        };
+        let deltas = BTreeMap::from([
+            queued("alpha.md", &default_config),
+            queued("beta.md", &edited_config),
+        ]);
+        apply_pending(&mut database, None, deltas).unwrap();
+
+        let stamped = |alpha: &Arc<ParseConfig>, beta: &Arc<ParseConfig>| {
+            database
+                .source_delta(&[
+                    PhysicalGraphProjectionSourceRevision {
+                        page_id: page_id("alpha.md"),
+                        revision: projection_source_revision("sha256:alpha.md", alpha.digest()),
+                    },
+                    PhysicalGraphProjectionSourceRevision {
+                        page_id: page_id("beta.md"),
+                        revision: projection_source_revision("sha256:beta.md", beta.digest()),
+                    },
+                ])
+                .unwrap()
+                .replacements
+        };
+        assert!(
+            stamped(&default_config, &edited_config).is_empty(),
+            "each page must carry the digest of the config it was queued with"
+        );
+        // Not vacuous: the two stamps really are distinct, so the assertion
+        // above could have failed.
+        assert_eq!(
+            stamped(&edited_config, &default_config).len(),
+            2,
+            "swapping the two configs must make both pages stale"
+        );
+        drop(database);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -430,7 +430,11 @@ rebuilt from the untouched Markdown/Org tree, never migrated in place, and no
 forensic evidence is preserved. Direct Files reaches the same end differently —
 reconciliation compares only source revisions, so the same digest is folded into
 each page's `projection_source_revision`, and a config edit therefore re-lowers
-every page even though no file byte changed.
+every page even though no file byte changed. That config travels **inside** each
+queued Direct Files work item rather than beside the queue, so a page can only
+ever be lowered and stamped under the config it was queued with: there is no
+state in which queued work exists and the config describing it does not, and
+therefore no way to stamp default-lowered rows as current.
 
 Direct editor replacement briefly retains the old live inode as
 `.<target>.<pid>.<sequence>.editor-recovery` and the proposed bytes as the
