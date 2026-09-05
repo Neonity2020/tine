@@ -520,7 +520,10 @@ mod tests {
         ledger.record_now("pages/B.md", "- b\n").unwrap();
 
         // Remove every blob, exactly as an external cleaner would.
-        for entry in std::fs::read_dir(ledger.dir().join("blobs")).unwrap().flatten() {
+        for entry in std::fs::read_dir(ledger.dir().join("blobs"))
+            .unwrap()
+            .flatten()
+        {
             std::fs::remove_file(entry.path()).unwrap();
         }
         assert_eq!(ledger.base("pages/A.md"), None, "lookup already degrades");

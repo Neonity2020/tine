@@ -1397,7 +1397,9 @@ mod tests {
         // the second one, and says that remapping Redo replaces both -- the
         // alias is a default, not a hidden extra binding.
         assert!(tips.markdown.contains("redo is Ctrl/Cmd+Shift+Z"));
-        assert!(tips.markdown.contains("On Windows and Linux **Ctrl+Y** also redoes"));
+        assert!(tips
+            .markdown
+            .contains("On Windows and Linux **Ctrl+Y** also redoes"));
         assert!(tips.markdown.contains("remapping Redo replaces both"));
         assert!(tips.markdown.contains("custom maximum"));
     }
