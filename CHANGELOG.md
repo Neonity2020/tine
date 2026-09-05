@@ -30,6 +30,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Clicking inside a code block now puts the cursor where you clicked.** In a
+  code block of any size, clicking anywhere in it opened an editor that looked
+  blank: the cursor jumped to the very end of the block, and the editor was
+  scrolled to the far right of its longest line, so none of the code you clicked
+  was on screen. Both halves are fixed — a click maps to the character under it,
+  and the editor opens showing that character (GH #489).
+
 - **Clicking a link to the PDF you are already reading keeps your place.**
   Opening a PDF link with no page or highlight attached — a plain `![](…​.pdf)`
   asset link to the document already open in that pane — jumped the reader back
