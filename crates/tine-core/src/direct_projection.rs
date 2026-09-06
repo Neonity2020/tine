@@ -2118,7 +2118,10 @@ fn page_kind_to_sql(kind: PageKind) -> i64 {
     }
 }
 
-fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
+/// `pages.text_kind` back to the parser's `PageKind`. A value outside the two
+/// the producer writes is projection damage, not a third kind, so every reader
+/// treats `None` as a failed read (D-3).
+pub(crate) fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
     match kind {
         0 => Some(PageKind::Page),
         1 => Some(PageKind::Journal),

@@ -93,9 +93,12 @@ use tine_storage::sqlite::{MaterializationError, PhysicalQueryValue};
 // The acceptance gates. `#[path]` keeps the file beside this one so the shared
 // production-source scanner sees a `*_tests.rs` sibling include and blanks it
 // from every census (print sites, termination sites, the tine-storage surface).
+// `pub(crate)` so R3's `results_tests.rs` reuses THIS harness — the same
+// production-built corpus, the same lowering entry — instead of growing a
+// second graph/projection fixture beside it (D-14).
 #[cfg(test)]
 #[path = "sql_gates_tests.rs"]
-mod sql_gates_tests;
+pub(crate) mod sql_gates_tests;
 
 use crate::date::JournalDate;
 use crate::doc::property_key_norm;
@@ -357,6 +360,22 @@ pub(crate) struct LoweringInputs<'a> {
     pub(crate) result_set_rule: ResultSetRule,
 }
 
+/// §5.3's block answer row and the relation it reads, as ONE named pair.
+///
+/// They are constants rather than inline literals because
+/// [`descriptor_statement`] wraps exactly this relation, and a wrapper that
+/// re-spelled it would be a second compiler the moment either side moved
+/// (D-14, I-12). The `_IDS` twins are the SAME relation with the routing join
+/// to `pages` removed: the descriptor read re-joins `pages` itself, LEFT, so a
+/// selected block whose page row is missing FAILS the read instead of being
+/// dropped by an inner join (D-3).
+const BLOCK_ANCHOR_SELECT: &str = "SELECT b.block_id, b.page_id, p.path";
+const BLOCK_ANCHOR_FROM: &str = "FROM blocks b JOIN pages p ON p.page_id = b.page_id";
+const BLOCK_ANCHOR_IDS: &str = "SELECT b.block_id, b.page_id FROM blocks b";
+const MATCH_SET_SELECT: &str = "SELECT m.block_id, m.page_id, p.path";
+const MATCH_SET_FROM: &str = "FROM m JOIN pages p ON p.page_id = m.page_id";
+const MATCH_SET_IDS: &str = "SELECT m.block_id, m.page_id FROM m";
+
 /// Lower one resolved query (SPEC §5.1–§5.7).
 ///
 /// The filter is the EVALUABLE one: `Off` subtrees are removed bottom-up first,
@@ -389,8 +408,8 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         // loads anyway.
         Anchor::Block => (
             Row::Block(BlockScope::anchored("b")),
-            "SELECT b.block_id, b.page_id, p.path",
-            "FROM blocks b JOIN pages p ON p.page_id = b.page_id",
+            BLOCK_ANCHOR_SELECT,
+            BLOCK_ANCHOR_FROM,
         ),
         Anchor::Page => (
             Row::Page("p"),
@@ -479,11 +498,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         // the correlated probe today: a block and its parent are always on the
         // same page, so masking inside `m` would be unobservable either way, and
         // staying outside keeps the masked statement the same predicate.
-        (Row::Block(_), Some(_)) => (
-            "SELECT m.block_id, m.page_id, p.path",
-            "FROM m JOIN pages p ON p.page_id = m.page_id",
-            "m.page_id".to_string(),
-        ),
+        (Row::Block(_), Some(_)) => (MATCH_SET_SELECT, MATCH_SET_FROM, "m.page_id".to_string()),
         (Row::Page(alias), _) => (select, from, format!("{alias}.page_id")),
     };
     // §5.9: the overlay-masked page ids are removed inside the statement, so the
@@ -546,6 +561,102 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
             bindings: compiler.regexes,
         },
     }
+}
+
+/// The DESCRIPTOR statement for one lowered block-anchored query (R3 §"Descriptor
+/// read"): the same selected block ids, plus the ordering and result metadata
+/// the shared constructor charges its budget with, and NO payload.
+///
+/// **A wrapper, not a second compiler.** `statement` is [`lower_query`]'s output
+/// verbatim; its selected-id relation becomes one more CTE (`r`) beside the
+/// `WITH` list the statement already carries, and the parameters are returned
+/// unchanged because the wrapper binds nothing. Re-lowering here — or teaching
+/// the compiler a second "projection mode" — would be exactly the walk/SQL fork
+/// this campaign exists to prevent (I-12, D-14).
+///
+/// **Every join is LEFT on purpose (D-3).** A missing `query_block_results`,
+/// `blocks` or `pages` row, a `query_page_order` row Direct Files requires, or
+/// a `text_kind` outside [`crate::direct_projection::page_kind_from_sql`] must
+/// FAIL the read. An inner join would answer the same question with fewer rows,
+/// which is the one thing a damaged disposable cache may never do.
+///
+/// **Ordering** is the order the walk CHARGES its budget in: Direct Files by
+/// `query_page_order.position` (the projection's copy of the inventory order
+/// `GraphQueryPages::for_each_page` enumerates), Managed Storage by `pages.path`
+/// under SQLite's default BINARY collation, which is `String::cmp` on the UTF-8
+/// bytes. Within a page it is always `query_block_results.preorder`.
+///
+/// `Anchor::Page` statements have no block descriptor and are rejected here:
+/// their rows are consumed exactly as they are today.
+pub(crate) fn descriptor_statement(
+    statement: &SqlQuery,
+    order: crate::query::results::BackendOrder,
+) -> Result<SqlQuery, MaterializationError> {
+    let block_anchor = format!("{BLOCK_ANCHOR_SELECT} {BLOCK_ANCHOR_FROM}");
+    let match_set = format!("{MATCH_SET_SELECT} {MATCH_SET_FROM}");
+    let (answer, answered, ids) = if let Some(at) = find_once(&statement.sql, &block_anchor)? {
+        (at, block_anchor.as_str(), BLOCK_ANCHOR_IDS)
+    } else if let Some(at) = find_once(&statement.sql, &match_set)? {
+        (at, match_set.as_str(), MATCH_SET_IDS)
+    } else {
+        return Err(MaterializationError::InvalidQuery(
+            "only a block-anchored lowered statement has a block descriptor read".into(),
+        ));
+    };
+    // Everything before the answer row is the statement's own `WITH` list
+    // (`qe_children`, `m`, or both); everything from it on — including the
+    // `LIMIT` a cutoff appended, which bounds the SELECTED set and therefore
+    // belongs inside `r` — becomes the new CTE's body.
+    let (leading_ctes, body) = statement.sql.split_at(answer);
+    let body = body.replacen(answered, ids, 1);
+    let with = match leading_ctes.trim_end() {
+        "" => "WITH".to_string(),
+        ctes => format!("{ctes},"),
+    };
+    let base = match order {
+        crate::query::results::BackendOrder::Direct => "o.position",
+        crate::query::results::BackendOrder::Managed => "p.path",
+    };
+    Ok(SqlQuery {
+        sql: format!(
+            "{with} r(block_id, page_id) AS ({body}) \
+             SELECT r.block_id, r.page_id, p.name, p.text_kind, p.journal_day, p.path, \
+             q.page_id, q.preorder, q.result_id, q.estimated_bytes, q.tag_count, \
+             q.property_count, b.order_key, o.position \
+             FROM r \
+             LEFT JOIN query_block_results q ON q.block_id = r.block_id \
+             LEFT JOIN blocks b ON b.block_id = r.block_id \
+             LEFT JOIN pages p ON p.page_id = r.page_id \
+             LEFT JOIN query_page_order o ON o.page_id = r.page_id \
+             ORDER BY {base}, q.preorder"
+        ),
+        params: statement.params.clone(),
+        // The wrapper adds ordering and metadata to an already-classified
+        // statement; it neither creates nor removes a bound, and it lowers no
+        // content leaf of its own.
+        positively_bounded: statement.positively_bounded,
+        matches_nothing: statement.matches_nothing,
+        content_plans: statement.content_plans.clone(),
+        regexes: statement.regexes.clone(),
+    })
+}
+
+/// The offset of `needle` in `haystack`, requiring it to occur exactly once.
+///
+/// A second occurrence would mean the answer row's spelling had become
+/// ambiguous inside its own statement, and splicing at the first one would
+/// silently wrap the wrong relation.
+fn find_once(haystack: &str, needle: &str) -> Result<Option<usize>, MaterializationError> {
+    let mut found = haystack.match_indices(needle);
+    let Some((at, _)) = found.next() else {
+        return Ok(None);
+    };
+    if found.next().is_some() {
+        return Err(MaterializationError::InvalidQuery(
+            "the lowered statement spells its answer row more than once".into(),
+        ));
+    }
+    Ok(Some(at))
 }
 
 /// Which row a filter is being compiled against, and under which alias.

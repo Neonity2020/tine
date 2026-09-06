@@ -25,6 +25,12 @@ pub mod registry;
 // so once, here, rather than through forty individual suppressions.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod sql;
+// R3's shared database-result constructor. Like `sql`, it is what §5.9's
+// dispatch will call rather than something a release build reaches yet: R3b
+// wires Direct Files' production switch to it and R4 wires Managed Storage, so
+// outside `cfg(test)` the module says "not called yet" once, here.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod results;
 pub(crate) mod tql;
 pub mod view;
 
@@ -4994,10 +5000,19 @@ fn is_recency_field(field: &str) -> bool {
 /// edited); any other page by its file's last-modified time. `i64::MIN` when a
 /// non-journal page can't be stat'd (so it sorts oldest).
 pub(crate) fn page_recency_secs(entry: &PageEntry) -> i64 {
-    if let Some(dk) = entry.date_key {
+    page_recency_secs_for(entry.date_key, &entry.path)
+}
+
+/// [`page_recency_secs`] by the two inputs it actually reads, so a caller that
+/// holds a page's journal ordinal and its absolute path — R3's database result
+/// read, which never sees a `PageEntry` — asks the SAME producer rather than
+/// spelling the axis a second time (I-12, D-14). `pages.journal_day` is
+/// `PageEntry::date_key` by construction (`derived::JournalDays::day`).
+pub(crate) fn page_recency_secs_for(date_key: Option<i64>, absolute: &std::path::Path) -> i64 {
+    if let Some(dk) = date_key {
         return JournalDate::from_ordinal(dk).to_days() * 86_400;
     }
-    std::fs::metadata(&entry.path)
+    std::fs::metadata(absolute)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
