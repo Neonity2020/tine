@@ -14282,7 +14282,7 @@ mod tests {
         let connection = inspect_connection(&recovered.database);
         let mut statement = connection
             .prepare(
-                "SELECT content FROM blocks
+                "SELECT content FROM blocks LEFT JOIN block_text USING (block_id)
                  WHERE page_id = ?1
                  ORDER BY order_key",
             )

@@ -427,13 +427,21 @@ the tree walk still evaluates its date. The `scheduled_day`/`deadline_day`
 columns hold the `yyyymmdd` ordinal and are NULL when the timestamp text is not
 a calendar day, so a malformed date keeps its presence and loses only its day.
 
-**The query columns are the exact visible text.** `blocks.query_visible` is the
+**The query columns are the exact visible text.** `block_text.query_visible` is the
 block's visible text byte for byte and `blocks.query_visible_folded` is that
-text canonically folded; every content predicate reads them. The neighbouring
+text canonically folded. Content predicates read the folded query text. The
 `searchable_text` and its FTS stay whitespace-collapsed for the existing search
 consumers and are not a substitute: a phrase query has to be able to tell `a  b`
 from `a b`. Both columns are populated at WRITE time by both producers, never by
 parsing or hydrating rows during a query.
+
+**Query rows stay narrow (schema 25).** `pages` holds identity and routing;
+`page_text` owns preamble and search text. `blocks` holds structure, metadata
+and folded query text; `block_text` owns source content, original query-visible
+text and search text. Keyed payloads are written in the same transaction as
+owners and removed on replacement, deletion and reset. Existing typed payload
+reads retain their fields; missing payload is an error, not an omitted entity.
+Projection-only filtering does not load these payload tables.
 
 **A tag key is a page key.** `tags.tag_key` is `refs::page_key(tag)` — the same
 key page identity uses — because `#x` is OG's `[[x]]`; `tags_lookup_idx` leads
@@ -622,7 +630,10 @@ resource limit, or a projection whose page set has drifted from the parsed
 cache. The projection is a disposable cache, so the answer is recovery. The
 fallback is counted, the tree walk answers the user's query, and the same
 full-snapshot enqueue the open path uses is scheduled from the already-parsed
-page cache — no reparse, no disk read, no user action, and no refusal reaches
+page cache, with a sticky request to reopen and reset the disposable projection.
+The worker drops cached readers before reopening and clears source revision
+stamps so unchanged pages are lowered again. The foreground needs no reparse,
+source-file read, or user action, and no refusal reaches
 the user. Clearing readiness alone would not do: it leaves the projection
 unusable until the user happens to save a page. Every route out of a query
 passes through the one place that owns both obligations, so a later route cannot

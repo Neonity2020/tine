@@ -1,6 +1,29 @@
 {
  "schemaVersion": 1,
  "entries": [
+{
+ "id": "REG-QE-P1D-PERSISTENT-CACHE-RECOVERY",
+ "title": "Failed Direct query repairs persistent projection damage without a source edit",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Query campaign P1-d manager review"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection.rs::tests::a_damaged_query_table_is_rebuilt_without_a_source_edit"
+  ],
+  "scenario": "query-engine.persistent-cache-recovery",
+  "failBefore": "P1d-recovery-fail-before.log at c682a7cf: second query remains on fallback after ready"
+ },
+ "notes": "A full snapshot must clear stale source-revision stamps after failed reads."
+},
   {
    "id": "REG-W3-E-TYPED-ERROR-BOUNDARY-001",
    "title": "Backend refusal handling branches on typed fixed-shape envelopes instead of prose",

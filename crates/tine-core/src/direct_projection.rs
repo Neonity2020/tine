@@ -114,6 +114,7 @@ struct PendingFull {
 #[derive(Default)]
 struct PendingProjection {
     full: Option<PendingFull>,
+    rebuild: bool,
     deltas: BTreeMap<String, (u64, PageDelta)>,
     latest_generation: u64,
     stop: bool,
@@ -226,6 +227,13 @@ impl DirectProjection {
             .name("tine-direct-projection".into())
             .spawn(move || projection_worker(worker))?;
         Ok(Self { shared })
+    }
+
+    /// Keep the repair request until a complete parser snapshot is available.
+    pub(crate) fn request_rebuild(&self) {
+        let mut pending = self.shared.pending.lock().unwrap();
+        pending.rebuild = true;
+        self.shared.ready.store(false, Ordering::Release);
     }
 
     pub(crate) fn enqueue_full(
@@ -1271,7 +1279,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         }
     };
     let mut database = match open_projection_database(&shared.path) {
-        Ok(database) => database,
+        Ok(database) => Some(database),
         Err(error) => {
             report_projection_failure("disabled: its database could not be opened", &error);
             shared.worker_available.store(false, Ordering::Release);
@@ -1285,7 +1293,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     let _lease = lease;
     let mut requires_full_rebuild = false;
     loop {
-        let (full, deltas, latest_generation) = {
+        let (full, deltas, latest_generation, rebuild) = {
             let mut pending = shared.pending.lock().unwrap();
             while pending.full.is_none() && pending.deltas.is_empty() && !pending.stop {
                 pending = shared.changed.wait(pending).unwrap();
@@ -1296,10 +1304,12 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 return;
             }
             shared.worker_busy.store(true, Ordering::Release);
+            let rebuild = pending.full.is_some() && std::mem::take(&mut pending.rebuild);
             (
                 pending.full.take(),
                 std::mem::take(&mut pending.deltas),
                 pending.latest_generation,
+                rebuild,
             )
         };
         let had_full = full.is_some();
@@ -1308,7 +1318,25 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let applied = if requires_full_rebuild && !had_full {
             Err("a prior projection failure requires a complete parser snapshot".into())
         } else {
-            apply_pending(&mut database, full, deltas)
+            (|| {
+                if rebuild || requires_full_rebuild || database.is_none() {
+                    // Drop every connection before the disposable file can be
+                    // replaced; a reader must not retain an old file handle.
+                    let mut reader = shared.reader.lock().unwrap();
+                    let mut seam = shared.statement_seam.lock().unwrap();
+                    reader.take();
+                    seam.take();
+                    shared.fts_ever_ready.store(false, Ordering::Release);
+                    database.take();
+                    let mut reopened = open_projection_database(&shared.path)
+                        .map_err(|error| error.to_string())?;
+                    // Even repaired DDL leaves unchanged source stamps behind.
+                    // Reset them so the full snapshot lowers every source page.
+                    reopened.reset().map_err(|error| error.to_string())?;
+                    database = Some(reopened);
+                }
+                apply_pending(database.as_mut().unwrap(), full, deltas)
+            })()
         };
         if let Err(error) = applied {
             requires_full_rebuild = true;
@@ -1325,7 +1353,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         shared.worker_failed.store(false, Ordering::Release);
         let pending = shared.pending.lock().unwrap();
         shared.worker_busy.store(false, Ordering::Release);
-        if pending.full.is_none()
+        if !pending.rebuild
+            && pending.full.is_none()
             && pending.deltas.is_empty()
             && pending.latest_generation == latest_generation
         {
@@ -2111,6 +2140,41 @@ mod tests {
             "stale PageRef and facet reads must record parser fallbacks"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_damaged_query_table_is_rebuilt_without_a_source_edit() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("damaged-query-table");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/source.md"), "- TODO links [[Target]]\n").unwrap();
+        let path = root.join("private/projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(path.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        // Persistently unavailable projection data, unlike a one-shot seam
+        // error on a healthy file. Recovery must actually rebuild the cache.
+        let damaged = rusqlite::Connection::open(&path).unwrap();
+        damaged.execute("DROP TABLE block_path_refs", []).unwrap();
+        drop(damaged);
+        let query = "(page-ref Target)";
+        let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
+        let answer = graph.run_query_bounded(query, 100, 1_000_000);
+        assert_eq!(signature(&answer.groups), signature(&oracle.groups));
+        wait_ready(&graph);
+        let statements_before = graph.direct_projection_statement_reads_test();
+        // A different memo key must reach the repaired SQL table.
+        let next = "(and (page-ref Target) (task TODO))";
+        let oracle = crate::query::run_query_bounded(&graph, next, 100, 1_000_000);
+        let answer = graph.run_query_bounded(next, 100, 1_000_000);
+        assert_eq!(signature(&answer.groups), signature(&oracle.groups));
+        assert_eq!(
+            graph.direct_projection_statement_reads_test(),
+            statements_before + 1
+        );
+        drop(graph);
         let _ = std::fs::remove_dir_all(root);
     }
 

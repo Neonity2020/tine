@@ -291,7 +291,7 @@ pub struct MaterializedBlockInput {
     pub content: String,
     pub searchable_text: String,
     /// The block's exact visible text, from which the shared producer derives
-    /// both `blocks.query_visible` and `blocks.query_visible_folded`.
+    /// both `block_text.query_visible` and `blocks.query_visible_folded`.
     ///
     /// `searchable_text` cannot serve: it is whitespace-collapsed for today's
     /// search consumers, and a content predicate has to be able to tell `a  b`
@@ -3821,8 +3821,8 @@ mod tests {
             .execute(
                 "INSERT INTO pages (
                      page_id, home_document_id, name, name_key, path, text_kind,
-                     preamble, searchable_text
-                 ) VALUES (?1, ?2, ?3, 'key', 'test/schema.md', 0, NULL, '')",
+                     journal_day
+                 ) VALUES (?1, ?2, ?3, 'key', 'test/schema.md', 0, NULL)",
                 params![
                     page_id(300_000).as_uuid().as_bytes().as_slice(),
                     document_id(300_001).as_uuid().as_bytes().as_slice(),
@@ -4993,7 +4993,7 @@ mod tests {
             // answers and why the neighbouring column cannot answer it.
             "`block_planning`",
             "never conditioned on the\ntask marker",
-            "`blocks.query_visible`",
+            "`block_text.query_visible`",
             "`blocks.query_visible_folded`",
             "`tags.tag_key` is `refs::page_key(tag)`",
             "`pages.journal_day`",
@@ -5035,7 +5035,7 @@ mod tests {
         // Every column the prose above names, read back off the real schema:
         // a sentence about a column that does not exist is not a contract.
         for (table, column) in [
-            ("blocks", "query_visible"),
+            ("block_text", "query_visible"),
             ("blocks", "query_visible_folded"),
             ("tags", "tag_key"),
             ("pages", "journal_day"),

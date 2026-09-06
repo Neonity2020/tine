@@ -6643,9 +6643,13 @@ impl Graph {
     ///
     /// `mark_stale` alone only clears `ready`, which would leave the projection
     /// unusable until the user happened to save a page. This is the same
-    /// full-snapshot enqueue the open path makes, from the same already-parsed
+    /// full-snapshot enqueue the open path makes, with a forced cache reset,
+    /// from the same already-parsed
     /// cache — no reparse, no disk read, no user action.
     fn direct_projection_recover_after_failed_read(&self) {
+        if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+            projection.request_rebuild();
+        }
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) else {
             // Nothing is warm to rebuild FROM; clearing `ready` is all that is
