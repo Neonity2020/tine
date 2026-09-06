@@ -8,17 +8,18 @@ use crate::query::{
     ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
     PropertyFacetAccumulator, SimpleQueryCandidatePlan,
 };
+use crate::query_jobs::{Admission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
     PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
-    PhysicalProjectionQueryReader, PhysicalProperty, PhysicalQueryValue, PhysicalReferencePosting,
-    PhysicalReferenceTarget, PhysicalTask,
+    PhysicalProjectionQueryReader, PhysicalProjectionQuerySnapshot, PhysicalProperty,
+    PhysicalQueryValue, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -170,6 +171,22 @@ struct ProjectionShared {
     /// reach a writable one (D-15's enforcement is the handle, not a validator).
     /// It answers §5.9's dispatched query and nothing else.
     statement_seam: Mutex<Option<PhysicalProjectionQueryReader>>,
+    /// R3: the ONE admission/cancellation owner for database-owned query jobs
+    /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
+    /// drains every job before it replaces or resets the file, and `Drop`
+    /// drains before the worker is stopped.
+    query_jobs: QueryJobOwner,
+    /// R3 identity policy (WARM-IDENTITY-ORDER-CONTRACT.md §"Chosen strategy"
+    /// 2–3): the pages whose rows THIS process lowered. Their stored
+    /// `query_block_results.result_id` is the live runtime id the parsed
+    /// document carried when the row was written. Every other page's rows
+    /// survived from an earlier session, and a fresh parse of an unchanged
+    /// page assigns STRUCTURAL runtime ids, so their public id is derived from
+    /// `(path, order_key)` through `model::doc_runtime_id_for_order` instead.
+    /// Copy-on-write: the worker swaps a new `Arc` after each successful
+    /// apply, and a job clones the `Arc` at snapshot acquisition — never a
+    /// live lookup during output.
+    session_pages: Mutex<Arc<HashSet<[u8; 16]>>>,
     /// The generation at which §5.10's FTS-building signal was last observed
     /// READY. Readiness is monotonic within one projection file — the index
     /// owner finishes the build and never un-finishes it, and a rebuild
@@ -205,6 +222,63 @@ struct ProjectionShared {
     fuzzy_candidate_reads: AtomicU64,
 }
 
+impl ProjectionShared {
+    /// R3 identity policy bookkeeping, run by the worker after every
+    /// successful apply: the pages just lowered carry this process's live ids;
+    /// the pages just deleted carry nothing.
+    fn record_session_pages(&self, applied: &AppliedPages) {
+        if applied.lowered.is_empty() && applied.deleted.is_empty() {
+            return;
+        }
+        let mut current = self.session_pages.lock().unwrap();
+        let mut next: HashSet<[u8; 16]> = (**current).clone();
+        next.extend(applied.lowered.iter().copied());
+        for page in &applied.deleted {
+            next.remove(page);
+        }
+        *current = Arc::new(next);
+    }
+}
+
+/// One admitted, snapshot-owning Direct query job (R3). Everything the result
+/// read needs is captured here, at acquisition, under the ready-generation
+/// validation: the pinned read transaction, the compiled-regex program already
+/// installed on its connection, and the identity policy input. Dropping the
+/// job releases the transaction and the capacity slot.
+pub(crate) struct DirectQueryJob<'a> {
+    slot: crate::query_jobs::JobSlot<'a>,
+    pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
+    /// The pages whose rows this process lowered (see
+    /// `ProjectionShared::session_pages`), as of the snapshot.
+    pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+}
+
+impl DirectQueryJob<'_> {
+    /// True once a drain (rebuild, reset, close) has cancelled this job. The
+    /// snapshot's own sticky flag fails its next statement too; this is the
+    /// cheap check between payload batches.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.slot.is_cancelled()
+    }
+}
+
+/// What one attempt to open a query job produced (R3; the §5.9 states plus
+/// the two the job owner adds).
+pub(crate) enum QueryJobOpen<'a> {
+    Job(DirectQueryJob<'a>),
+    /// Not ready at this generation, the generation moved while the snapshot
+    /// was being pinned, or no slot freed within the wait. Nothing is wrong;
+    /// the walk answers and the fallback is counted.
+    NotReady,
+    /// The snapshot could not be opened or the regex program could not be
+    /// installed: a failed read, owed recovery.
+    Failed,
+    /// A drain or close cancelled the job before it ran. The walk answers; no
+    /// recovery is owed and no fallback is counted against a projection that
+    /// is being replaced on purpose.
+    Cancelled,
+}
+
 /// What one attempt to answer through the D-15 statement seam produced
 /// (SPEC §5.9). See [`DirectProjection::run_statement`].
 pub(crate) enum StatementRead {
@@ -233,6 +307,8 @@ impl DirectProjection {
             ready_generation: AtomicU64::new(0),
             reader: Mutex::new(None),
             statement_seam: Mutex::new(None),
+            query_jobs: QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY),
+            session_pages: Mutex::new(Arc::new(HashSet::new())),
             fts_ready_at: AtomicU64::new(0),
             fts_ever_ready: AtomicBool::new(false),
             worker_available: AtomicBool::new(true),
@@ -798,6 +874,89 @@ impl DirectProjection {
         read
     }
 
+    /// R3: open a database-owned query job at the current cache generation.
+    ///
+    /// Order matters and is the plan's (§2B): capacity FIRST, so a waiting job
+    /// pins no WAL pages; then the owned snapshot, validated by
+    /// `ready_at(generation)` before and after SQLite establishes the read
+    /// transaction (`open_direct`); then the job registers its interrupt
+    /// handle with the owner, which is what lets a rebuild reach a statement
+    /// mid-flight; then the statement's compiled-regex program goes on this
+    /// job's own connection (a fresh connection per job, so there is no
+    /// previous execution's table to replace); finally the identity input is
+    /// captured and the generation re-checked, so the captured set describes
+    /// the rows the snapshot sees.
+    pub(crate) fn open_query_job(
+        &self,
+        cache_generation: u64,
+        regexes: &QueryRegexProgram,
+    ) -> QueryJobOpen<'_> {
+        if !self.ready_at(cache_generation) {
+            return QueryJobOpen::NotReady;
+        }
+        #[cfg(test)]
+        if self
+            .shared
+            .inject_read_failure
+            .swap(false, Ordering::AcqRel)
+        {
+            return QueryJobOpen::Failed;
+        }
+        let slot = match self.shared.query_jobs.acquire() {
+            Admission::Slot(slot) => slot,
+            Admission::Cancelled => return QueryJobOpen::Cancelled,
+            Admission::Busy => return QueryJobOpen::NotReady,
+        };
+        let validate = || {
+            if self.ready_at(cache_generation) {
+                Ok(())
+            } else {
+                Err(tine_storage::sqlite::MaterializationError::Incomplete(
+                    "projection generation moved during snapshot acquisition".into(),
+                ))
+            }
+        };
+        let mut snapshot =
+            match PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, validate) {
+                Ok(snapshot) => snapshot,
+                // The validator is the only `Incomplete` this call can produce and
+                // it means the generation moved: not a defect. Anything else is
+                // an unopenable or unreadable file.
+                Err(_) if !self.ready_at(cache_generation) => return QueryJobOpen::NotReady,
+                Err(_) => return QueryJobOpen::Failed,
+            };
+        if !slot.register(snapshot.cancellation()) {
+            return QueryJobOpen::Cancelled;
+        }
+        if snapshot
+            .set_query_regex_predicate(regexes.predicate())
+            .is_err()
+        {
+            return QueryJobOpen::Failed;
+        }
+        let session_pages = Arc::clone(&self.shared.session_pages.lock().unwrap());
+        if !self.ready_at(cache_generation) {
+            return QueryJobOpen::NotReady;
+        }
+        #[cfg(test)]
+        self.shared.statement_reads.fetch_add(1, Ordering::Relaxed);
+        QueryJobOpen::Job(DirectQueryJob {
+            slot,
+            snapshot,
+            session_pages,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_pages_test(&self) -> Arc<HashSet<[u8; 16]>> {
+        Arc::clone(&self.shared.session_pages.lock().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_query_jobs_test(&self) -> usize {
+        self.shared.query_jobs.active()
+    }
+
     /// One read through the D-15 seam. [`DirectProjection::run_statement`] is
     /// this plus §5.9's dispatched-statement census and §4.3.2's regex
     /// registration; [`DirectProjection::fts_ready`] is this without either,
@@ -1274,6 +1433,10 @@ fn block_at_order<'a>(roots: &'a [DocBlock], order: &str) -> Option<&'a DocBlock
 
 impl Drop for DirectProjection {
     fn drop(&mut self) {
+        // R3: the graph is closing. Refuse new jobs, interrupt the active ones
+        // and wait for their slots before the worker is told to stop, so no
+        // snapshot outlives the projection that admitted it.
+        self.shared.query_jobs.close();
         let mut pending = self.shared.pending.lock().unwrap();
         pending.stop = true;
         self.shared.changed.notify_one();
@@ -1368,11 +1531,17 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let had_full = full.is_some();
         #[cfg(test)]
         run_before_apply_pending_hook();
-        let applied = if requires_full_rebuild && !had_full {
+        let applied: Result<AppliedPages, String> = if requires_full_rebuild && !had_full {
             Err("a prior projection failure requires a complete parser snapshot".into())
         } else {
             (|| {
                 if rebuild || requires_full_rebuild || writer_slot.is_none() {
+                    // R3: interrupt and drain every query job first, so no
+                    // owned snapshot retains a handle to the file about to be
+                    // reset or removed, and the rebuild never waits on a read
+                    // nobody will finish. In-scope scenario: a torn projection
+                    // rebuilt under a live reader (D-3).
+                    shared.query_jobs.cancel_all_and_drain();
                     // Drop every connection before the disposable file can be
                     // replaced; a reader must not retain an old file handle.
                     let mut reader = shared.reader.lock().unwrap();
@@ -1391,15 +1560,19 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 apply_pending(writer_slot.as_mut().unwrap(), full, deltas)
             })()
         };
-        if let Err(error) = applied {
-            requires_full_rebuild = true;
-            shared.ready.store(false, Ordering::Release);
-            shared.worker_failed.store(true, Ordering::Release);
-            shared.worker_busy.store(false, Ordering::Release);
-            shared.changed.notify_all();
-            report_projection_failure("is stale; using parser fallback", &error);
-            continue;
-        }
+        let applied = match applied {
+            Ok(applied) => applied,
+            Err(error) => {
+                requires_full_rebuild = true;
+                shared.ready.store(false, Ordering::Release);
+                shared.worker_failed.store(true, Ordering::Release);
+                shared.worker_busy.store(false, Ordering::Release);
+                shared.changed.notify_all();
+                report_projection_failure("is stale; using parser fallback", &error);
+                continue;
+            }
+        };
+        shared.record_session_pages(&applied);
         if had_full {
             requires_full_rebuild = false;
         }
@@ -1443,11 +1616,23 @@ fn open_projection_database(
     Ok(database)
 }
 
+/// Which pages one worker turn actually WROTE (R3 identity policy): the pages
+/// whose rows now carry this process's live runtime ids, and the pages whose
+/// rows are gone. A full snapshot on a warm reopen reuses every unchanged
+/// page's rows, so "a full snapshot was applied" is not "every page was
+/// lowered" — only the source delta's replacements were.
+#[derive(Default)]
+struct AppliedPages {
+    lowered: Vec<[u8; 16]>,
+    deleted: Vec<[u8; 16]>,
+}
+
 fn apply_pending(
     database: &mut PhysicalGraphProjectionDatabase,
     full: Option<PendingFull>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<(), String> {
+) -> Result<AppliedPages, String> {
+    let mut applied = AppliedPages::default();
     if let Some(PendingFull {
         pages,
         revisions,
@@ -1507,6 +1692,10 @@ fn apply_pending(
             .into_iter()
             .filter(|source| replacements_needed.contains(&source.page_id))
             .collect::<Vec<_>>();
+        applied.lowered.extend(replacements_needed.iter().copied());
+        applied
+            .deleted
+            .extend(source_delta.deletions.iter().copied());
         database
             .apply_with_source_revisions_aliases_and_page_order(
                 &PhysicalGraphProjectionChange {
@@ -1544,11 +1733,16 @@ fn apply_pending(
                     let (mut page, mut postings, mut page_aliases) =
                         physical_page(&entry, &document, &parse_config)?;
                     page.query_page_order = Some(query_page_order);
+                    applied.lowered.push(page.page_id);
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
                 }
-                PageDelta::Delete { entry } => deletions.push(page_id(&entry.rel_path)),
+                PageDelta::Delete { entry } => {
+                    let id = page_id(&entry.rel_path);
+                    applied.deleted.push(id);
+                    deletions.push(id);
+                }
             }
         }
         database
@@ -1563,7 +1757,7 @@ fn apply_pending(
             )
             .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    Ok(applied)
 }
 
 /// The revision Direct Files compares to decide whether a page's rows are still
@@ -2244,6 +2438,176 @@ mod tests {
         );
         drop(graph);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// R3 (§2B, D-3): a rebuild under a LIVE query job. The worker must
+    /// interrupt and drain every owned snapshot before it resets the
+    /// disposable file, and a job admitted before the drain can neither run
+    /// its statement nor outlive it. In-scope scenario: a torn projection
+    /// rebuilt while a query is reading it. Also pins the admission answers a
+    /// dispatch maps: a stale generation is `NotReady` and an unopenable file
+    /// is `Failed`, and neither consumes a slot.
+    #[test]
+    fn a_rebuild_drains_a_live_query_job_before_touching_the_file() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("rebuild-drains-job");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/source.md"), "- TODO links [[Target]]\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let generation = graph.cache_generation();
+        let regexes = crate::query::sql::QueryRegexProgram::default();
+
+        assert!(matches!(
+            projection.open_query_job(generation + 1, &regexes),
+            QueryJobOpen::NotReady
+        ));
+        assert_eq!(projection.active_query_jobs_test(), 0);
+        projection.inject_next_statement_failure();
+        assert!(matches!(
+            projection.open_query_job(generation, &regexes),
+            QueryJobOpen::Failed
+        ));
+        assert_eq!(projection.active_query_jobs_test(), 0);
+
+        let QueryJobOpen::Job(mut job) = projection.open_query_job(generation, &regexes) else {
+            panic!("a ready projection admits a job at its generation");
+        };
+        assert_eq!(projection.active_query_jobs_test(), 1);
+        assert!(!job.is_cancelled());
+        assert!(
+            job.session_pages.contains(&page_id("pages/source.md")),
+            "a page lowered by this process carries this process's ids"
+        );
+        let mut rows = 0usize;
+        job.snapshot
+            .visit_projection_query("SELECT block_id FROM blocks", &[], |_| {
+                rows += 1;
+                Ok(std::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "the owned snapshot reads the projection");
+
+        // The production rebuild path, taken while the job is held.
+        graph.direct_projection_recover_after_failed_read_test();
+        let started = Instant::now();
+        while !job.is_cancelled() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the rebuild must cancel the live job"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The worker waits for the drain: the slot is still held, the
+        // projection is not ready, and nothing has been able to reset the file
+        // under the pinned read transaction.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(projection.active_query_jobs_test(), 1);
+        assert!(!graph.direct_projection_ready_test());
+        let interrupted = job.snapshot.visit_projection_query(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000) \
+             SELECT count(*) FROM c",
+            &[],
+            |_| Ok(std::ops::ControlFlow::Continue(())),
+        );
+        assert!(
+            interrupted.is_err(),
+            "a cancelled snapshot cannot run a statement"
+        );
+        assert!(matches!(
+            projection.open_query_job(generation, &regexes),
+            QueryJobOpen::NotReady
+        ));
+
+        drop(job);
+        wait_ready(&graph);
+        assert_eq!(projection.active_query_jobs_test(), 0);
+        let generation = graph.cache_generation();
+        assert!(matches!(
+            projection.open_query_job(generation, &regexes),
+            QueryJobOpen::Job(_)
+        ));
+        drop(projection);
+        drop(graph);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// R3 identity policy: the projection names exactly the pages THIS process
+    /// lowered — a full snapshot's replacements, each live delta's page, minus
+    /// deletions — and a warm reopen that reuses the file (R1) starts from the
+    /// empty set, because those rows' stored ids came from an earlier session
+    /// and must be answered structurally.
+    #[test]
+    fn session_pages_name_exactly_the_pages_this_process_lowered() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("session-pages");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
+        std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
+        let database = scratch("session-pages-db").join("projection.sqlite");
+        let ids = |graph: &Graph, names: &[&str]| -> HashSet<[u8; 16]> {
+            graph
+                .list_pages()
+                .into_iter()
+                .filter(|entry| names.contains(&entry.name.as_str()))
+                .map(|entry| page_id(&entry.rel_path))
+                .collect()
+        };
+
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+            let projection = graph.direct_projection_test().unwrap();
+            assert_eq!(
+                *projection.session_pages_test(),
+                ids(&graph, &["one", "two"])
+            );
+
+            let two = ids(&graph, &["two"]);
+            graph.delete_page("two", PageKind::Page).unwrap();
+            wait_ready(&graph);
+            let after_delete = projection.session_pages_test();
+            assert_eq!(*after_delete, ids(&graph, &["one"]));
+            assert!(after_delete.is_disjoint(&two));
+
+            let entry = graph
+                .list_pages()
+                .into_iter()
+                .find(|entry| entry.name == "one")
+                .unwrap();
+            let mut page = graph.load_page(&entry).unwrap();
+            let baseline = page.rev.clone();
+            page.blocks[0].raw = "DONE one".into();
+            graph.save_page(&page, baseline.as_deref()).unwrap();
+            wait_ready(&graph);
+            assert_eq!(*projection.session_pages_test(), ids(&graph, &["one"]));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        std::fs::write(root.join("pages/two.md"), "- DONE two again\n").unwrap();
+        reset_lowerings();
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+            assert_eq!(lowerings(), 1, "only the externally written page relowers");
+            let projection = graph.direct_projection_test().unwrap();
+            assert_eq!(
+                *projection.session_pages_test(),
+                ids(&graph, &["two"]),
+                "a reused row keeps an earlier session's id; only the relowered page is this session's"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 
     /// **SPEC §5.9's failed-read shape.** A read that was ATTEMPTED and did not

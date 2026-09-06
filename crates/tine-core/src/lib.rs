@@ -38,6 +38,7 @@ pub(crate) mod projection_producer_census;
 mod property_line;
 pub mod publish;
 pub mod query;
+mod query_jobs;
 pub mod query_plan;
 mod reference_evidence;
 pub mod refs;

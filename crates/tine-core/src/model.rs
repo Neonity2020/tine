@@ -6897,6 +6897,26 @@ impl Graph {
         self.direct_projection_mark_stale();
     }
 
+    /// R3: the attached projection itself, so a test can open a query job on
+    /// the same `Arc` the dispatch clones out of this mutex.
+    #[cfg(test)]
+    pub(crate) fn direct_projection_test(
+        &self,
+    ) -> Option<Arc<crate::direct_projection::DirectProjection>> {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    /// R3: the production rebuild path a failed read takes — request the
+    /// rebuild, then enqueue the warm parser snapshot it needs.
+    #[cfg(test)]
+    pub(crate) fn direct_projection_recover_after_failed_read_test(&self) {
+        self.direct_projection_recover_after_failed_read();
+    }
+
     #[cfg(test)]
     pub(crate) fn direct_projection_indexed_reads_test(&self) -> u64 {
         self.direct_projection
