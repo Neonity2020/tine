@@ -1867,9 +1867,38 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     //     not widen what this crate can do to a projection.
     // Manager review reconciled these entries against the certified R1 base;
     // the additions neither expose a write operation nor widen the seam.
+    // Re-pinned 2026-09-06 (query engine R3, Direct results from the
+    // database). Derived, not assumed: the surface was dumped at the certified
+    // R2 base `b768eff4` (325 entries) and at the working head (339 entries)
+    // and the two multisets diffed. No `storage-receiver:` entry is added or
+    // removed. Removed (4): `model.rs` loses its `PhysicalQueryValue` import
+    // and its one `::Blob(` and one `::Text(` constructor — the hydration path
+    // that bound them is deleted, not moved — and `direct_projection.rs`'s
+    // import line is replaced by the one below. Added (18):
+    //   `query/results.rs`  1 import line + `PhysicalQueryValue::Blob(` 4,
+    //                       `::Integer(` 3, `::Real(` 1, `::Text(` 3 — the
+    //                       descriptor read and payload batches bind their
+    //                       parameters (I-22); every value is BOUND.
+    //   `query/sql.rs`      `MaterializationError::InvalidQuery(` 1 -> 3: the
+    //                       descriptor statement refuses an order it cannot
+    //                       express instead of matching nothing.
+    //   `query_jobs.rs`     1 import, `PhysicalProjectionQueryCancellation` —
+    //                       the handle a drain cancels; it cannot write.
+    //   `direct_projection.rs`  its `use` line widens by
+    //                       `PhysicalProjectionQuerySnapshot`; ONE
+    //                       `PhysicalProjectionQuerySnapshot::open_direct(` —
+    //                       the job's own read snapshot, pinned at the
+    //                       generation the walk answers for; and ONE
+    //                       `MaterializationError::Incomplete(` constructor,
+    //                       the value the open's validation closure returns
+    //                       when the generation moved while the snapshot was
+    //                       being acquired (the open fails and the job is
+    //                       `NotReady`). All three are read-side.
+    // `PhysicalProjectionQuerySnapshot` is not in `write_capable_types`; the
+    // write-crossing table above is byte-identical.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "44fe73b81b209c4bbc4ba27809b24e50ecc1cd4d27095396753f6f1f7ec64412",
+        "320ac8cacf4aa86394bd4100ba088f6b1e3a8a22960656cadfcee1eb94947ade",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

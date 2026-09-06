@@ -66,8 +66,13 @@ pub fn test_only_include(path: &Path) -> bool {
     let stem = file.trim_end_matches(".rs");
     let escaped_file = regex::escape(file);
     let escaped_stem = regex::escape(stem);
+    // A visibility on the declaration (`pub(crate) mod gates_tests;`, so a
+    // sibling test module can reuse the harness) does not make the include any
+    // less test-only: the `#[cfg(test)]` above it is what decides. Without
+    // this the R3 `pub(crate) mod sql_gates_tests;` counted 25 gate `eprintln!`
+    // sites as production print sites.
     let include = Regex::new(&format!(
-        r#"(?m)^#\[cfg\(test\)\]\s*\n(?:#\[path\s*=\s*"{escaped_file}"\]\s*\nmod\s+\w+;|mod\s+{escaped_stem};)"#
+        r#"(?m)^#\[cfg\(test\)\]\s*\n(?:#\[path\s*=\s*"{escaped_file}"\]\s*\n(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+;|(?:pub(?:\([^)]*\))?\s+)?mod\s+{escaped_stem};)"#
     ))
     .unwrap();
     fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {

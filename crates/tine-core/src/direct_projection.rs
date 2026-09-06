@@ -2,7 +2,6 @@ use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::oplog::query_lowering::drain_after;
-use crate::query::sql::QueryRegexProgram;
 use crate::query::{
     run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
     ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
@@ -246,19 +245,21 @@ impl ProjectionShared {
 /// installed on its connection, and the identity policy input. Dropping the
 /// job releases the transaction and the capacity slot.
 pub(crate) struct DirectQueryJob<'a> {
-    slot: crate::query_jobs::JobSlot<'a>,
+    /// Held for its `Drop`: releasing the slot is the job's only exit.
+    _slot: crate::query_jobs::JobSlot<'a>,
     pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
     /// The pages whose rows this process lowered (see
     /// `ProjectionShared::session_pages`), as of the snapshot.
     pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
 }
 
+#[cfg(test)]
 impl DirectQueryJob<'_> {
     /// True once a drain (rebuild, reset, close) has cancelled this job. The
-    /// snapshot's own sticky flag fails its next statement too; this is the
-    /// cheap check between payload batches.
+    /// production read checks the snapshot's own sticky flag between batches;
+    /// this is the slot's view, for the drain tests.
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.slot.is_cancelled()
+        self._slot.is_cancelled()
     }
 }
 
@@ -832,48 +833,6 @@ impl DirectProjection {
         Some((rows, pages))
     }
 
-    /// §5.9's dispatched read: run ONE lowered statement through the D-15 seam
-    /// at the current cache generation, and say which of the three §5.9 states
-    /// the attempt landed in.
-    ///
-    /// The three are not interchangeable and the caller acts differently on
-    /// each, which is why they are not collapsed into `Option` the way every
-    /// other reader here collapses them:
-    ///
-    /// * [`StatementRead::NotReady`] — open reconciliation, a full rebuild, or
-    ///   the milliseconds after a save while the delta applies. Nothing is
-    ///   wrong; the walk answers and the worker is already on its way.
-    /// * [`StatementRead::Failed`] — the read was ATTEMPTED and did not answer
-    ///   (a SQL error, a resource limit, an unopenable file). The projection is
-    ///   disposable derived state (D-3), so the answer is recovery, not refusal:
-    ///   the caller notes the fallback and schedules a full snapshot.
-    /// * [`StatementRead::Rows`] — the answer.
-    pub(crate) fn run_statement(
-        &self,
-        cache_generation: u64,
-        sql: &str,
-        parameters: &[PhysicalQueryValue],
-        regexes: &QueryRegexProgram,
-    ) -> StatementRead {
-        // The injection lives here and not in `seam_read`, so it fails the
-        // DISPATCHED statement and not whichever readiness probe happened to
-        // reach the seam first.
-        #[cfg(test)]
-        if self
-            .shared
-            .inject_read_failure
-            .swap(false, Ordering::AcqRel)
-        {
-            return StatementRead::Failed;
-        }
-        let read = self.seam_read(cache_generation, sql, parameters, Some(regexes));
-        #[cfg(test)]
-        if matches!(read, StatementRead::Rows(_)) {
-            self.shared.statement_reads.fetch_add(1, Ordering::Relaxed);
-        }
-        read
-    }
-
     /// R3: open a database-owned query job at the current cache generation.
     ///
     /// Order matters and is the plan's (§2B): capacity FIRST, so a waiting job
@@ -881,16 +840,12 @@ impl DirectProjection {
     /// `ready_at(generation)` before and after SQLite establishes the read
     /// transaction (`open_direct`); then the job registers its interrupt
     /// handle with the owner, which is what lets a rebuild reach a statement
-    /// mid-flight; then the statement's compiled-regex program goes on this
-    /// job's own connection (a fresh connection per job, so there is no
-    /// previous execution's table to replace); finally the identity input is
-    /// captured and the generation re-checked, so the captured set describes
-    /// the rows the snapshot sees.
-    pub(crate) fn open_query_job(
-        &self,
-        cache_generation: u64,
-        regexes: &QueryRegexProgram,
-    ) -> QueryJobOpen<'_> {
+    /// mid-flight; finally the identity input is captured and the generation
+    /// re-checked, so the captured set describes the rows the snapshot sees.
+    /// The statement's compiled-regex program is installed by
+    /// `query::results::read_results` on the job's own connection — the ONE
+    /// install site — so a job carries no regex state of its own.
+    pub(crate) fn open_query_job(&self, cache_generation: u64) -> QueryJobOpen<'_> {
         if !self.ready_at(cache_generation) {
             return QueryJobOpen::NotReady;
         }
@@ -916,7 +871,7 @@ impl DirectProjection {
                 ))
             }
         };
-        let mut snapshot =
+        let snapshot =
             match PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, validate) {
                 Ok(snapshot) => snapshot,
                 // The validator is the only `Incomplete` this call can produce and
@@ -928,12 +883,6 @@ impl DirectProjection {
         if !slot.register(snapshot.cancellation()) {
             return QueryJobOpen::Cancelled;
         }
-        if snapshot
-            .set_query_regex_predicate(regexes.predicate())
-            .is_err()
-        {
-            return QueryJobOpen::Failed;
-        }
         let session_pages = Arc::clone(&self.shared.session_pages.lock().unwrap());
         if !self.ready_at(cache_generation) {
             return QueryJobOpen::NotReady;
@@ -941,7 +890,7 @@ impl DirectProjection {
         #[cfg(test)]
         self.shared.statement_reads.fetch_add(1, Ordering::Relaxed);
         QueryJobOpen::Job(DirectQueryJob {
-            slot,
+            _slot: slot,
             snapshot,
             session_pages,
         })
@@ -962,17 +911,15 @@ impl DirectProjection {
     /// registration; [`DirectProjection::fts_ready`] is this without either,
     /// because a readiness probe is not an answer and binds no pattern.
     ///
-    /// `regexes` is `Some` for exactly the dispatched statements, and it is
-    /// installed INSIDE the seam lock together with the read it belongs to:
-    /// this connection is pooled and reused, so a statement's compiled-regex
-    /// table has to REPLACE the previous statement's rather than be added to
-    /// it, and no other execution may run between the two.
+    /// R3: dispatched statements no longer run here — they run on a job's own
+    /// owned snapshot (`open_query_job`), which is also where the statement's
+    /// compiled-regex program is installed. The pooled seam serves the
+    /// readiness probe and the reference readers only.
     fn seam_read(
         &self,
         cache_generation: u64,
         sql: &str,
         parameters: &[PhysicalQueryValue],
-        regexes: Option<&QueryRegexProgram>,
     ) -> StatementRead {
         if !self.ready_at(cache_generation) {
             return StatementRead::NotReady;
@@ -986,15 +933,6 @@ impl DirectProjection {
         let Some(seam) = seam.as_ref() else {
             return StatementRead::Failed;
         };
-        // Unconditional for a dispatched statement, including the empty table:
-        // installing nothing would leave the PREVIOUS execution's IDs bound on
-        // a reused connection, and a stale ID that answered would be a wrong
-        // result rather than a failed read.
-        if let Some(regexes) = regexes {
-            if seam.set_query_regex_predicate(regexes.predicate()).is_err() {
-                return StatementRead::Failed;
-            }
-        }
         let Ok(rows) = seam.run_projection_query(sql, parameters) else {
             return StatementRead::Failed;
         };
@@ -1039,7 +977,6 @@ impl DirectProjection {
                 cache_generation,
                 "SELECT phase FROM search_fts_build WHERE singleton = 1",
                 &[],
-                None,
             ),
             StatementRead::Rows(rows)
                 if matches!(
@@ -2225,8 +2162,12 @@ mod tests {
                 (oracle.total, oracle.exceeded)
             );
         }
-        assert!(graph.direct_projection_indexed_reads_test() >= 4);
-        let indexed_reads = graph.direct_projection_indexed_reads_test();
+        // R3: every user query above was answered by the dispatched statement.
+        // Three distinct pre-view shapes: `sort-by` is a view directive, so the
+        // fourth query shares the first one's pre-view memo entry.
+        assert_eq!(graph.direct_projection_fallback_reads_test(), 0);
+        assert!(graph.direct_projection_statement_reads_test() >= 3);
+        let statement_reads = graph.direct_projection_statement_reads_test();
         let repeated = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
         assert_eq!(
             signature(&repeated.groups),
@@ -2235,8 +2176,8 @@ mod tests {
             )
         );
         assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_reads,
+            graph.direct_projection_statement_reads_test(),
+            statement_reads,
             "the generation-keyed presentation memo must avoid repeated SQL/parser work"
         );
 
@@ -2291,6 +2232,7 @@ mod tests {
         wait_ready(&graph);
 
         let indexed_before = graph.direct_projection_indexed_reads_test();
+        let statements_before = graph.direct_projection_statement_reads_test();
         for query in [
             "(page-ref Target)",
             "(and (page-ref Target) \"points\")",
@@ -2312,9 +2254,15 @@ mod tests {
             graph.autocomplete_property_facets_bounded(100, 1_000_000),
             crate::query::autocomplete_property_facets_bounded(&graph, 100, 1_000_000)
         );
+        // R3: a user query is answered by the dispatched statement from its own
+        // read snapshot — it no longer passes through the indexed page reads.
         assert!(
-            graph.direct_projection_indexed_reads_test() >= indexed_before + 5,
-            "PageRef and both property-facet entry points must use the generation-bound SQLite read"
+            graph.direct_projection_statement_reads_test() >= statements_before + 3,
+            "PageRef queries must be answered by the dispatched statement"
+        );
+        assert!(
+            graph.direct_projection_indexed_reads_test() >= indexed_before + 2,
+            "both property-facet entry points must use the generation-bound SQLite read"
         );
 
         // **SPEC §5.9's ready shape.** When the projection is ready and the
@@ -2464,21 +2412,20 @@ mod tests {
         wait_ready(&graph);
         let projection = graph.direct_projection_test().unwrap();
         let generation = graph.cache_generation();
-        let regexes = crate::query::sql::QueryRegexProgram::default();
 
         assert!(matches!(
-            projection.open_query_job(generation + 1, &regexes),
+            projection.open_query_job(generation + 1),
             QueryJobOpen::NotReady
         ));
         assert_eq!(projection.active_query_jobs_test(), 0);
         projection.inject_next_statement_failure();
         assert!(matches!(
-            projection.open_query_job(generation, &regexes),
+            projection.open_query_job(generation),
             QueryJobOpen::Failed
         ));
         assert_eq!(projection.active_query_jobs_test(), 0);
 
-        let QueryJobOpen::Job(mut job) = projection.open_query_job(generation, &regexes) else {
+        let QueryJobOpen::Job(mut job) = projection.open_query_job(generation) else {
             panic!("a ready projection admits a job at its generation");
         };
         assert_eq!(projection.active_query_jobs_test(), 1);
@@ -2523,7 +2470,7 @@ mod tests {
             "a cancelled snapshot cannot run a statement"
         );
         assert!(matches!(
-            projection.open_query_job(generation, &regexes),
+            projection.open_query_job(generation),
             QueryJobOpen::NotReady
         ));
 
@@ -2532,7 +2479,7 @@ mod tests {
         assert_eq!(projection.active_query_jobs_test(), 0);
         let generation = graph.cache_generation();
         assert!(matches!(
-            projection.open_query_job(generation, &regexes),
+            projection.open_query_job(generation),
             QueryJobOpen::Job(_)
         ));
         drop(projection);
@@ -2782,20 +2729,13 @@ mod tests {
             0,
             "the feed must not enter the whole-graph evaluator"
         );
-        // I-13/I-15: exactly the RESULT's pages were hydrated. `Gamma` matches
-        // nothing and must not be loaded.
-        let hydrated = graph
-            .direct_projection_hydrated_pages_test()
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            hydrated.len(),
-            dispatched.groups.len(),
-            "pages loaded must equal result pages: {hydrated:?}"
-        );
+        // R3 (I-13, I-15): the answer is constructed from the projection alone.
+        // NO parsed document is loaded for a dispatched query — not the result
+        // pages, and not `Gamma`, which matches nothing.
+        let hydrated = graph.direct_projection_hydrated_pages_test();
         assert!(
-            !hydrated.iter().any(|path| path.ends_with("Gamma.md")),
-            "a page the result does not name must not be hydrated: {hydrated:?}"
+            hydrated.is_empty(),
+            "a dispatched query loads no page document: {hydrated:?}"
         );
 
         // The routed named-page path: the same query scoped to one page, whose
@@ -2820,10 +2760,9 @@ mod tests {
             "Alpha contributes the outer match, its grandchild and its sibling, \
              in document order"
         );
-        assert_eq!(
-            graph.direct_projection_hydrated_pages_test().len(),
-            1,
-            "a one-page result hydrates exactly one page"
+        assert!(
+            graph.direct_projection_hydrated_pages_test().is_empty(),
+            "a routed one-page result loads no page document either"
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -3955,8 +3894,8 @@ mod tests {
             "There is no cost test and no selectivity hatch in front of\nthat decision.",
             "answered by the tree walk over the same query IR, with nothing scheduled",
             // The reads (I-13, I-15).
-            "One statement, plus one `Document` load per\npage the RESULT names",
-            "Pages loaded equals result pages",
+            "a dispatched query loads NO `Document` and reads NO source text",
+            "pages loaded by a dispatched query equals zero",
             "the statement therefore carries no `ORDER BY`, and the\ndispatched result equals the walk's result including order",
             "remembered once per generation, never once per query",
             // The failed-read obligation, with its in-scope scenario named.

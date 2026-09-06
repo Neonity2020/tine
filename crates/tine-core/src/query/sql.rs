@@ -400,12 +400,11 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
     let (row, select, from) = match query.anchor {
         // §5.3's block row is `(block_id, page_id, path)` and nothing else.
         // `block_id` is the answer, `page_id` is the routing identity Managed
-        // Storage's overlay route will address a page by, and `path` is the key
-        // Direct hydration loads a `Document` under TODAY
-        // (`direct_projection_pages_for_paths_ordered`). `pages.name` and
-        // `pages.text_kind` were decoration: no consumer of these rows ever
-        // decoded either, and the hydration reads both from the page entry it
-        // loads anyway.
+        // Storage's overlay route will address a page by, and `path` is the
+        // Direct order key the descriptor read (`query/results.rs`) joins
+        // `query_page_order` on. `pages.name` and `pages.text_kind` were
+        // decoration: no consumer of these rows ever decoded either, and the
+        // descriptor read takes both from the page row of the ANSWER only.
         Anchor::Block => (
             Row::Block(BlockScope::anchored("b")),
             BLOCK_ANCHOR_SELECT,

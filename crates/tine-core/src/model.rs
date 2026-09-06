@@ -4045,18 +4045,10 @@ enum DispatchedQuery {
     NotReady,
     /// A read was attempted and did not answer. Counted, and recovered.
     FailedRead,
-}
-
-/// The order [`Graph::direct_projection_pages_for_paths_ordered`] returns loaded
-/// pages in.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PageLoadOrder {
-    /// The order the caller listed the paths in.
-    AsRequested,
-    /// The graph's own page enumeration order — the order the walk visits pages
-    /// in, and therefore the order a dispatched query has to charge its
-    /// construction budget in (§5.9).
-    GraphSnapshot,
+    /// The projection cancelled the job — a rebuild drained it, or the graph
+    /// closed. Nothing is wrong with the projection: the walk answers, nothing
+    /// is counted as a fallback and no recovery is scheduled (R3 §2B).
+    Cancelled,
 }
 
 /// Which half of the C6 cache identity an entry needs.
@@ -6448,6 +6440,7 @@ impl Graph {
                 self.direct_projection_recover_after_failed_read();
                 walk(self)
             }
+            DispatchedQuery::Cancelled => walk(self),
         }
     }
 
@@ -6515,147 +6508,50 @@ impl Graph {
         if statement.matches_nothing {
             return DispatchedQuery::Answered(crate::query::PreViewGroups::default());
         }
-        // §4.3.2: the statement's compiled-regex table is installed on the
-        // connection that runs it, and REPLACES whatever the previous statement
-        // left there — the pooled seam is reused across executions, and an ID is
-        // meaningful only for the statement that assigned it.
-        let rows = match projection.run_statement(
-            generation,
-            &statement.sql,
-            &statement.params,
-            &statement.regexes,
-        ) {
-            crate::direct_projection::StatementRead::Rows(rows) => rows,
-            crate::direct_projection::StatementRead::NotReady => return DispatchedQuery::NotReady,
-            crate::direct_projection::StatementRead::Failed => return DispatchedQuery::FailedRead,
+        // R3: the answer is constructed from ONE owned read snapshot of the
+        // projection and nothing else — no page document, no parsed cache
+        // (§2B). The job owns capacity, the snapshot pinned at this generation,
+        // and the identity capture; `read_results` owns the descriptor read,
+        // the budget and the payload batches, and installs the statement's
+        // compiled-regex program on the job's own connection.
+        let mut job = match projection.open_query_job(generation) {
+            crate::direct_projection::QueryJobOpen::Job(job) => job,
+            crate::direct_projection::QueryJobOpen::NotReady => return DispatchedQuery::NotReady,
+            crate::direct_projection::QueryJobOpen::Failed => return DispatchedQuery::FailedRead,
+            crate::direct_projection::QueryJobOpen::Cancelled => return DispatchedQuery::Cancelled,
         };
-        self.hydrate_direct_statement_rows(generation, rows, max_rows, max_bytes, profile)
-    }
-
-    /// §5.3's block hydration (M8). The statement answered `(block_id, page_id,
-    /// path)` rows; group them by page, load exactly those pages' already-parsed
-    /// documents, and collect the named blocks. The page's name and kind come
-    /// from the entry this hydration loads, never from a column the candidate
-    /// stage carried along for them.
-    ///
-    /// **Cost is O(result pages), never a candidate superset**, and the guard
-    /// below says so in a way that can fail: a hydration that loaded more pages
-    /// than the result named would be the whole-graph walk this campaign exists
-    /// to delete, wearing a different hat (I-13, I-15).
-    fn hydrate_direct_statement_rows(
-        &self,
-        generation: u64,
-        rows: Vec<Vec<tine_storage::sqlite::PhysicalQueryValue>>,
-        max_rows: usize,
-        max_bytes: usize,
-        profile: crate::query::ConstructionProfile,
-    ) -> DispatchedQuery {
-        // Named in full rather than aliased: the tine-storage boundary census
-        // records `<ImportedName>::Variant(` call sites, and an `as` rename
-        // hides them from that inventory.
-        use tine_storage::sqlite::PhysicalQueryValue;
-        // Group by the page's relative path — the key
-        // `direct_projection_pages_for_paths` loads by, which is why §5.3 puts
-        // `pages.path` in the select list.
-        let mut by_path: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
-        for row in rows {
-            // §5.3's row contract, pinned here rather than assumed: exactly
-            // three columns, the block identity first and the routing path
-            // last. The arity is checked because a row that still carried the
-            // retired `(name, text_kind)` decoration would otherwise decode a
-            // page NAME as a path and hydrate the wrong pages.
-            if row.len() != 3 {
-                return DispatchedQuery::FailedRead;
-            }
-            let (Some(PhysicalQueryValue::Blob(block_id)), Some(PhysicalQueryValue::Text(path))) =
-                (row.first(), row.get(2))
-            else {
-                // The row shape is the lowering's own select list. A row that
-                // does not have it means the statement and this reader disagree
-                // about the projection, which is a failed read and not an empty
-                // answer.
-                return DispatchedQuery::FailedRead;
-            };
-            let Ok(uuid) = Uuid::from_slice(block_id) else {
-                return DispatchedQuery::FailedRead;
-            };
-            by_path
-                .entry(PathBuf::from(path))
-                .or_default()
-                .insert(uuid.to_string());
-        }
-        if by_path.is_empty() {
-            return DispatchedQuery::Answered(crate::query::PreViewGroups::default());
-        }
-        let result_pages = by_path.len();
-        let paths: Vec<PathBuf> = by_path.keys().cloned().collect();
-        let Some(pages) = self.direct_projection_pages_for_paths_ordered(
-            generation,
-            paths,
-            PageLoadOrder::GraphSnapshot,
-        ) else {
-            // `pages_for_paths` collapses two very different things into `None`.
-            // A generation that moved under the read is not a defect — the
-            // snapshot straddled a rebuild, the walk answers, and the worker is
-            // already producing the next one. A page the hydration cannot load
-            // at an UNCHANGED generation is the other kind: the projection names
-            // a page the parsed cache does not have, so the projection is wrong
-            // and §5.9 says to recover it.
-            return if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
+        // The identity policy, captured with the snapshot: a page THIS process
+        // lowered answers with its stored live id; a row reused from an earlier
+        // session answers with the structural id the fresh parse assigns it.
+        let identity = crate::query::results::ResultIdentity::DirectStructural {
+            session_pages: Arc::clone(&job.session_pages),
+            all_session: false,
+        };
+        // The recency axis is the WALK'S producer, by the two inputs the
+        // projection stores; it runs only for a page the answer admitted.
+        let recency = |journal_day: Option<i64>, path: &str| {
+            crate::query::page_recency_secs_for(journal_day, &self.root.join(path))
+        };
+        let inputs = crate::query::results::ResultReadInputs {
+            statement: &statement,
+            order: crate::query::results::BackendOrder::Direct,
+            identity: &identity,
+            max_rows,
+            max_bytes,
+            profile,
+            recency: &recency,
+        };
+        match crate::query::results::read_results(&mut job.snapshot, &inputs) {
+            Ok(pre) => DispatchedQuery::Answered(pre),
+            Err(crate::query::results::ResultReadError::Cancelled) => DispatchedQuery::Cancelled,
+            // A seam refusal or a projection that contradicts itself: the read
+            // was attempted and did not answer, so it is counted and recovered
+            // (D-3, §5.9/M9). The message names columns, never values.
+            Err(crate::query::results::ResultReadError::Sql(_))
+            | Err(crate::query::results::ResultReadError::Corrupt(_)) => {
                 DispatchedQuery::FailedRead
-            } else {
-                DispatchedQuery::NotReady
-            };
-        };
-        // **The guard (I-13, I-15).** Pages loaded must equal the pages the
-        // RESULT named. This is the assertion that keeps the hydration honest:
-        // it is the difference between "load the answer's pages" and "load a
-        // candidate superset and filter in Rust", and the second one is what the
-        // dispatched path replaces.
-        if pages.len() != result_pages {
-            return DispatchedQuery::FailedRead;
+            }
         }
-        #[cfg(test)]
-        DIRECT_HYDRATED_PAGES.with(|recorded| {
-            *recorded.borrow_mut() = pages
-                .iter()
-                .map(|(entry, _)| PathBuf::from(&entry.rel_path))
-                .collect();
-        });
-        let empty = std::collections::HashSet::new();
-        // The recency axis is the WALK'S producer, called on the WALK'S input —
-        // `GraphQueryPages::for_each_page` computes exactly this per matched
-        // page. A second spelling here (the `JournalFormat::page_recency_secs`
-        // the candidate path uses, say) would be a second answer to a question
-        // that already has one, and it would show up as a `(sort-by modified …)`
-        // that reorders when the projection happens to be ready (I-12).
-        let recency: Vec<Box<dyn Fn() -> i64 + '_>> = pages
-            .iter()
-            .map(|(entry, _)| {
-                Box::new(move || crate::query::page_recency_secs(entry)) as Box<dyn Fn() -> i64>
-            })
-            .collect();
-        let result_pages: Vec<crate::query::SqlResultPage<'_>> = pages
-            .iter()
-            .zip(&recency)
-            .map(|((entry, document), recency)| crate::query::SqlResultPage {
-                name: &entry.name,
-                kind: entry.kind,
-                roots: &document.roots,
-                matched: by_path.get(Path::new(&entry.rel_path)).unwrap_or(&empty),
-                recency: recency.as_ref(),
-            })
-            .collect();
-        let pre =
-            crate::query::hydrate_sql_result_pages(&result_pages, max_rows, max_bytes, profile);
-        // The generation is re-checked after the hydration for the same reason
-        // every other projection reader re-checks it: a snapshot that straddles
-        // a rebuild is not a snapshot.
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-            return DispatchedQuery::NotReady;
-        }
-        DispatchedQuery::Answered(pre)
     }
 
     /// §5.9/M9: schedule the recovery a FAILED projection read owes.
@@ -6735,33 +6631,14 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
     }
 
+    /// Load exactly the named pages from the parsed cache, in the order asked
+    /// (source-path order, which is what the reference accumulators charge
+    /// their budget in). A dispatched query never comes here (R3): its answer is
+    /// read from the projection alone, which the test census records.
     fn direct_projection_pages_for_paths(
         &self,
         generation: u64,
         paths: impl IntoIterator<Item = PathBuf>,
-    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        self.direct_projection_pages_for_paths_ordered(
-            generation,
-            paths,
-            PageLoadOrder::AsRequested,
-        )
-    }
-
-    /// [`Graph::direct_projection_pages_for_paths`], with a say in the ORDER the
-    /// loaded pages come back in.
-    ///
-    /// Every pre-existing caller wants the order it asked in (source-path order,
-    /// which is what the reference accumulators charge their budget in).
-    /// §5.9's dispatched query wants [`PageLoadOrder::GraphSnapshot`] instead:
-    /// the walk visits pages in the graph's own page enumeration order and
-    /// charges its construction budget in that order, so a dispatched result
-    /// that hydrated in a different order could admit a DIFFERENT set of rows
-    /// once the budget truncates. Same rows in, same rows out.
-    fn direct_projection_pages_for_paths_ordered(
-        &self,
-        generation: u64,
-        paths: impl IntoIterator<Item = PathBuf>,
-        order: PageLoadOrder,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
         let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
@@ -6777,12 +6654,16 @@ impl Graph {
             if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
                 return None;
             }
-            pages.push((slot, page.clone()));
+            pages.push(page.clone());
         }
-        if order == PageLoadOrder::GraphSnapshot {
-            pages.sort_by_key(|(slot, _)| *slot);
-        }
-        let pages = pages.into_iter().map(|(_, page)| page).collect();
+        #[cfg(test)]
+        DIRECT_HYDRATED_PAGES.with(|recorded| {
+            recorded.borrow_mut().extend(
+                pages
+                    .iter()
+                    .map(|(entry, _)| PathBuf::from(&entry.rel_path)),
+            );
+        });
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
     }
 
@@ -6979,7 +6860,9 @@ impl Graph {
         *self.advanced_cache.write().unwrap() = None;
     }
 
-    /// §5.3: exactly the pages the last dispatched query hydrated.
+    /// Every page document the projection-side readers loaded from the parsed
+    /// cache since the last reset. R3's claim is that a dispatched query
+    /// contributes NOTHING here.
     #[cfg(test)]
     pub(crate) fn direct_projection_hydrated_pages_test(&self) -> Vec<std::path::PathBuf> {
         DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow().clone())

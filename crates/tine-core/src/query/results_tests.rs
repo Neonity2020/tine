@@ -642,8 +642,9 @@ fn a_huge_page_with_one_match_costs_one_descriptor_row_and_one_payload_row() {
     let corpus = Corpus::open(root, true);
     let source = "(content-regex \"haystack\")";
 
-    // TODAY: the answer is produced by hydrating the page's parsed DOCUMENT.
-    // The counter is the existing one §5.3's dispatch already records.
+    // The PRODUCTION path (R3b): the dispatched query answers from the
+    // projection alone. The census below records every parsed document the
+    // projection-side readers load; a dispatched query contributes none.
     corpus.graph.reset_direct_projection_candidate_probe_test();
     corpus.graph.clear_query_memos_test();
     let today = corpus
@@ -659,10 +660,9 @@ fn a_huge_page_with_one_match_costs_one_descriptor_row_and_one_payload_row() {
         "the fixture has exactly one match"
     );
     let hydrated = corpus.graph.direct_projection_hydrated_pages_test();
-    assert_eq!(
-        hydrated,
-        vec![PathBuf::from("pages/huge.md")],
-        "today's dispatched path loads the huge page's document"
+    assert!(
+        hydrated.is_empty(),
+        "the dispatched path loads no page document: {hydrated:?}"
     );
 
     // R3: the same answer from the snapshot alone.

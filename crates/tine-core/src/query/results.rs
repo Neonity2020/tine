@@ -17,8 +17,8 @@
 //!   `query_page_order.position`, Managed Storage by `pages.path` BINARY — then
 //!   `query_block_results.preorder` within a page. DISPLAY order
 //!   (`base_order_groups`, `sort-by`, `sample`) is NOT applied here: this
-//!   returns the same PRE-VIEW shape [`crate::query::hydrate_sql_result_pages`]
-//!   returns, and [`crate::query::apply_view`] finishes it exactly as before.
+//!   returns the same PRE-VIEW shape the retired document hydration returned,
+//!   and [`crate::query::apply_view`] finishes it exactly as before.
 //! * The BUDGET is [`ConstructionBudget`] itself, walked with the same four
 //!   rules `collect_sql_matched_blocks` uses, in the same order. `total` and
 //!   `exceeded` are the budget's, not a second policy.
@@ -48,8 +48,8 @@ use tine_storage::sqlite::{
 
 use crate::direct_projection::page_kind_from_sql;
 use crate::model::{
-    block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, BlockDto,
-    PageKind, RefGroup, ShallowBlockFacets,
+    block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, PageKind,
+    RefGroup, ShallowBlockFacets,
 };
 use crate::query::sql::{descriptor_statement, SqlQuery};
 use crate::query::{ConstructionBudget, ConstructionProfile, PreViewGroups};
@@ -163,7 +163,7 @@ pub(crate) fn read_results(
     let mut pages = PageGroups::default();
     let mut budget = ConstructionBudget::new(inputs.max_rows, inputs.max_bytes);
     let admitted = read_descriptors(snapshot, inputs, &mut pages, &mut budget)?;
-    read_payload(snapshot, inputs, &mut pages, &admitted)?;
+    read_payload(snapshot, &mut pages, &admitted)?;
     Ok(pages.finish(inputs, budget))
 }
 
@@ -498,7 +498,6 @@ fn resolve_identity(
 /// whose row count is the product of two independent facets).
 fn read_payload(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
-    inputs: &ResultReadInputs<'_>,
     pages: &mut PageGroups,
     admitted: &[Descriptor],
 ) -> Result<(), ResultReadError> {
@@ -665,6 +664,8 @@ fn read_owner_strings<T>(
         .replace("{ids}", &placeholders(ids.len()));
     #[cfg(test)]
     note(|census| census.payload_statements += 1);
+    #[cfg(not(test))]
+    let _ = list;
     let rows = snapshot
         .run_projection_query(&sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;

@@ -697,18 +697,21 @@ it does not duplicate text or construct output payload. The durable schema is
 unchanged. Regex program IDs distinguish the effective patterns of both
 syntaxes, and missing required visible text fails the read.
 
-**What one dispatched query reads.** One statement, plus one `Document` load per
-page the RESULT names — never a candidate superset and never a page the answer
-does not contain. Pages loaded equals result pages, and a hydration that loaded
-more refuses that read rather than serving a result it cannot account for.
-`@page`-shaped results load no document at all.
+**What one dispatched query reads.** One descriptor statement over the
+projection, plus the payload batches for the ids the answer ADMITS — never a
+candidate superset, never a page the answer does not contain, and never a page
+document: a dispatched query loads NO `Document` and reads NO source text, so
+pages loaded by a dispatched query equals zero. The page's name, kind and
+journal day come from the projection's own page row, and a projection that
+cannot account for a selected descriptor fails that read rather than serving
+a result it cannot account for.
 
 **A block statement answers `(block_id, page_id, path)` and nothing else, and
 its match set reads `blocks` alone.** The block identity is the answer, the page
 id is the stable routing identity a managed overlay addresses a page by, and the
-path is the key the Direct Files hydration loads a `Document` under; the page's
-name and kind come from the page entry that load returns, never from a column
-carried alongside every candidate row. The materialized production spelling joins `pages` for result routing
+path is the Direct Files order key the descriptor read joins on; the page's
+name and kind come from the descriptor read's page row for the ANSWER, never
+from a column carried alongside every candidate row. The materialized production spelling joins `pages` for result routing
 only on the ANSWER — after matching and after the
 result-set rule has dropped a match whose immediate parent also matched — because
 a page predicate carries its own `pages` subquery keyed by `page_id` and
