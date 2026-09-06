@@ -289,14 +289,18 @@ fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static s
         (DIRECT, "property_owner_rows", "property_facet_rows_after") => {
             ("other-question", "Direct registry snapshot property rows")
         }
+        // R5c (`e61e03d5`) moved the two registry reads out of
+        // `application_property_registry_ready` into the shared builder both
+        // registry sources call (`build_application_property_registry`); the
+        // reads themselves, and the one-snapshot rule above, are unchanged.
         (
             "crates/tine-core/src/sync_runtime.rs",
-            "application_property_registry_ready",
+            "build_application_property_registry",
             "property_facet_rows_after",
         ) => ("other-question", "managed registry snapshot property rows"),
         (
             "crates/tine-core/src/sync_runtime.rs",
-            "application_property_registry_ready",
+            "build_application_property_registry",
             "navigation_pages_after",
         ) => ("other-question", "managed registry snapshot page map"),
         _ => panic!("unclassified SQL read-family call: {file}::{symbol} {family}"),
@@ -434,13 +438,13 @@ fn expected_census() -> BTreeSet<CensusRecord> {
         (
             "property_facet_rows_after",
             "crates/tine-core/src/sync_runtime.rs",
-            "application_property_registry_ready",
+            "build_application_property_registry",
             "managed registry snapshot property rows",
         ),
         (
             "navigation_pages_after",
             "crates/tine-core/src/sync_runtime.rs",
-            "application_property_registry_ready",
+            "build_application_property_registry",
             "managed registry snapshot page map",
         ),
         (

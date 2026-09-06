@@ -18,7 +18,6 @@ adapter call edges.
 | application_page_reference_matches | `crates/tine-core/src/query.rs` | adapter | collect_reference_matches | Matches references over a page's projected forest through the shared reference visitor. |
 | application_page_templates | `crates/tine-core/src/query.rs` | adapter | visit_template_blocks | Walks Managed DTO shape and delegates each result to the canonical template leaf. |
 | application_query_doc_block | `crates/tine-core/src/query.rs` | necessary | — | Rehydrates a complete Managed DTO subtree. |
-| application_sparse_query_doc_block | `crates/tine-core/src/query.rs` | necessary | — | Rehydrates a sparse materialized-query row through `DocBlock::new`. |
 | application_advanced_query_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed advanced-query transaction boundary. |
 | application_all_query_pages_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed all-pages query index boundary. |
 | application_backlink_filter_context_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | backlink_filter_entry | Hydrates cached roots and delegates entries to the shared DocBlock producer. |
@@ -101,6 +100,7 @@ adapter call edges.
 | template_dto_from_application | `crates/tine-core/src/query.rs` | template_dto | C7a-3 |
 | application_crumb_line | `crates/tine-core/src/sync_runtime.rs` | crumb_line | W4-C7b-1 |
 | application_sparse_task_query_ready | `crates/tine-core/src/sync_runtime.rs` | execute_managed_query | R4a |
+| application_sparse_query_doc_block | `crates/tine-core/src/query.rs` | query::results::read_results | R4a-F3 |
 
 ## UUID ownership policy
 

@@ -149,7 +149,7 @@ fn the_query_hatch_marker_records_the_walk_as_the_correctness_oracle() {
         "no external oracle exists",
         "DIFFERENTIAL AGAINST THE WALK",
         "outlives the lowering by at least one",
-        "sparse_task_query_runner_matches_existing_page_evaluator",
+        "the_database_result_equals_the_walk_on_every_shape_and_bound",
         "PVTI_lAHOAAbLVc4BhPsyzg5VyLk",
     ] {
         assert!(
@@ -161,9 +161,10 @@ fn the_query_hatch_marker_records_the_walk_as_the_correctness_oracle() {
         );
     }
     // The named oracle must actually exist, or the marker points at nothing.
-    let query = std::fs::read_to_string(root.join("crates/tine-core/src/query.rs")).unwrap();
+    let query =
+        std::fs::read_to_string(root.join("crates/tine-core/src/query/results_tests.rs")).unwrap();
     assert!(
-        query.contains("fn sparse_task_query_runner_matches_existing_page_evaluator("),
+        query.contains("fn the_database_result_equals_the_walk_on_every_shape_and_bound("),
         "the marker's cited differential oracle test no longer exists; \
          relocate it by symbol and update the note"
     );

@@ -643,9 +643,10 @@ impl DirectProjection {
         // is closed). The walk answers every query from the parsed documents in
         // ~1 ms over the 1,045-file anonymized graph, so the acceptance gate for
         // a real lowering is DIFFERENTIAL AGAINST THE WALK — the shape
-        // `crate::query::tests::sparse_task_query_runner_matches_existing_page_evaluator`
-        // already uses. The walk therefore outlives the lowering by at least one
-        // release as a test-only oracle; it is NOT deletable the moment SQL
+        // `crate::query::results_tests::the_database_result_equals_the_walk_on_every_shape_and_bound`
+        // (and its `_over_a_real_corpus` acceptance twin) already uses. The walk
+        // therefore outlives the lowering by at least one release as a
+        // test-only oracle; it is NOT deletable the moment SQL
         // works. Retire the hatch first, keep the walk, and retire the walk only
         // after a release of differential agreement.
         if lowered.page_ids.len() > Self::candidate_cutoff(graph_page_count) {
