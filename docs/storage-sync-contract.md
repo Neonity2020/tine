@@ -493,6 +493,31 @@ unbound explain can report a plan for a statement the caller never runs.
 stale or corrupt projection — are answered by rebuild, and contention by
 `busy_timeout`.
 
+**A query job owns its snapshot; the projection owns the jobs (R3).** A
+database-answered query runs on `PhysicalProjectionQuerySnapshot::open_direct`,
+one read transaction pinned for the job's whole descriptor-and-payload read so
+every row it returns describes one projection state. The projection admits at
+most `DEFAULT_QUERY_JOB_CAPACITY` jobs at once and **capacity is acquired before
+the snapshot**, so a waiting job pins no WAL pages; the snapshot is validated
+against the exact parser-cache generation before and after SQLite establishes
+the transaction, and a job whose generation moved is `NotReady`, never a stale
+answer. Every admitted job registers its interrupt handle with the owner, and
+**the worker drains every job before a rebuild touches the file**: it cancels
+each registered statement, cancels waiters and late registrations, and blocks
+until no slot is held, so no owned snapshot can retain a handle to a file about
+to be reset or replaced (in-scope: a torn projection rebuilt under a live
+reader). Closing the projection refuses every later admission. Cancellation is
+an answer by the walk, not a failed read: it schedules no recovery.
+
+**Result identity follows who lowered the row.** `query_block_results.result_id`
+is the runtime id the lowering process assigned. The projection tracks
+`session_pages` — exactly the pages THIS process lowered: a full snapshot's
+replacements and each live delta's page, minus deletions — and captures that
+set with the snapshot. A row on a session page answers with its stored id; a
+row reused from an earlier session (a warm reopen lowers none of them) answers
+with the structural runtime id the shared helper reproduces from page path and
+structural order, which is the id the fresh parse assigned it.
+
 **One parse config, or a rebuild.** Six graph-config facts decide those derived
 rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,
 `:block-hidden-properties`, `:journal/page-title-format`,

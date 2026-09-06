@@ -3923,6 +3923,11 @@ mod tests {
             contract.contains("memo of already-shaped frontend result DTOs remains Tine-native")
         );
         assert!(contract.contains("grants no\n   authority"));
+        // R3: the owned-snapshot job contract this file implements.
+        assert!(contract.contains("capacity is acquired before\nthe snapshot"));
+        assert!(contract.contains("the worker drains every job before a rebuild touches the file"));
+        assert!(contract.contains("Cancellation is\nan answer by the walk, not a failed read"));
+        assert!(contract.contains("Result identity follows who lowered the row"));
 
         // The routing rule is asserted inside its own section, not anywhere in
         // the document: a whole-document `contains` passes with the sentence
