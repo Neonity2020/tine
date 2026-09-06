@@ -30,6 +30,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Two pages whose names differ only by punctuation or case no longer wedge a
+  Managed Storage graph.** Creating a page and then, before the background
+  save-settling caught up, creating a second page whose name folds to the same
+  key (`Alpha` and `/Alpha`, or `Foo` and `foo` at a different file path)
+  reported both saves as successful — and then left the graph unopenable, with
+  every later open refusing. The second save is now refused up front, while
+  nothing has been written, the same way it already is once the first save has
+  settled.
+
 - **Managed Storage keeps cleaning up sync conflict copies for the life of the
   graph.** When a file-sync service delivered a conflict copy of a shared
   provider file, Tine cleaned it up and kept one small record of what it had

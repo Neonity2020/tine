@@ -1368,6 +1368,91 @@ collapse of the named-stage inventory. This closes the gap that left the
 Android post-activation save reporting `debug_detail="none"` with no stage — a
 refusal that could have come from any of 131 unnamed sites.
 
+#### Acceptance-only refusals for drain-published local batches
+
+The managed-local drain publishes a batch's immutable manifest at stage
+`ArchivePublication` and only then offers it to the hot engine at stage
+`EngineAcceptance` (`oplog/local_journal_drain.rs`). Replay treats a
+manifest-committed clean operation that does not validate as accepted as
+archive corruption, not as an alternative status
+(`hot_engine::replay_clean_committed_batch_ids`: "manifest-committed clean
+operation ... did not validate as accepted"). A refusal an honestly drafted
+LOCAL batch can meet **only** at acceptance therefore converts a Save the app
+reported successful into a store that refuses to open on every later open. That
+is the shape A4 removed for the four run-local capacity caps; this census
+enumerates the rest of the class.
+
+Scope: every refusal reachable from
+`ShardedHotEngine::accept_clean_prepared_below_managed_local_overlay` for a
+batch whose origin is `BatchOrigin::LocalMutation` — its own preconditions,
+`stage_ready_internal`/`drain_staged`, everything `validate_and_apply` calls,
+the quarantine dispositions, and the `accepted_exactly_once` fall-through.
+
+Classes:
+
+- **U** — unreachable for an honestly drafted, drain-published local batch,
+  because a draft-time check that is at least as strict runs BEFORE the journal
+  append, or because the value is fixed by construction. The draft path is
+  `trusted_local_commit::commit_compound` →
+  `ShardedHotEngine::prepare_managed_local_record` →
+  `validate_managed_local_candidate`, preceded by
+  `prepare_transaction_core`, which runs the same page-name and portable-path
+  producers the acceptance path runs.
+- **S** — reachable only through an in-scope scenario from the table above, and
+  the current outcome is already correct: the drain maps it to `recovery`, the
+  store stays openable, and the record is retried.
+- **R** — reachable for an honest local batch. Fixed; class size is zero.
+
+No row needs a new `MS-REF-*` identifier. The R row no longer reaches any
+public boundary (it is now refused at Save, before the journal append). Every S
+row reaches the public open/activation boundary only as an already-classified
+durable refusal — `MS-REF-DISK-CORRUPT` for a damaged immutable object or
+run-local index, `MS-REF-CRASH-TRUNCATED` for a torn record, and
+`MS-REF-STALE-GENERATION` for an honest concurrent advance — so §3.1 above is
+already complete for this class.
+
+| Refusal stem | Class | Draft-time check (U), in-scope scenario (S), or fix (R) |
+| --- | --- | --- |
+| `clean foreground acceptance requires an index-free baseline runtime` | U | The drain calls this entry point only on the managed-local clean runtime, and `validate_managed_local_overlay_candidate` refuses a non-`LocalMutation` origin before the journal append ("only trusted local-mutation batches enter the managed-local prefix"). |
+| `clean runtime has no operation archive` | U | The drain resolved and duplicated the archive capability at its `Authenticate` stage, before publishing anything. |
+| `is not manifest-committed` | U | The drain published the manifest and re-proved it with `exact_archive_batch` in the same call, immediately before this stage. |
+| `differs from its retained manifest` | U | Byte equality against the manifest the drain itself just wrote. |
+| `did not validate as one accepted operation` | S | Fall-through for `Quarantined`/`IncompleteStaged`; the underlying dispositions are the quarantine rows below. |
+| `EngineError::WorkspaceMismatch` | U | Same comparison in `validate_managed_local_candidate` before the append. |
+| `EngineError::LineageMismatch` | U | Same comparison in `validate_managed_local_candidate` before the append. |
+| `EngineError::BatchCollision` | U | The batch id is minted per draft; a collision needs a second batch with the same id and a different fingerprint. |
+| `EngineError::SelfDependency` | U | The frontier is the pre-batch frontier the draft built, and `validate_managed_local_overlay_candidate` re-proves `actual_pre == manifest.dependency_frontier()` before the append. |
+| `EngineError::RejectedDependency` | U | Every dependency of a local batch is an accepted batch or an earlier record of the same journal-durable prefix. |
+| `EngineError::DuplicateDocumentUpdate` | U | `updates` is a map built by the foreground; the draft validates the same object set. |
+| `EngineError::MissingDocument` | U | A non-empty page effect puts the catalog in `updates` by construction; `affected_projection_pages` equality is proven at draft. |
+| `EngineError::CrdtUpdateBaseMismatch` | U | `validate_update_base` runs at draft and maps this exact error to `ManagedLocalRecordError::StaleBase` before the append. |
+| `EngineError::BlockAlreadyExists` | U | The draft checks accepted claims **and** `local_overlay.block_claims`, so it already sees claims introduced by journal-durable records. |
+| `EngineError::MalformedDocument` | U | Document-shape checks over documents the draft built and already validated with `validate_shard` / `validate_immutable_shard_identity`. |
+| `EngineError::ProjectionManifest` | U | `validate_managed_local_projection_candidate` re-renders every intent deterministically and compares target bytes and annotations before the append. |
+| `EngineError::ProjectionClaimEvidenceMismatch` | U | The claim evidence is recomputed from the same accepted catalog the intent was drafted against; at `EngineAcceptance` for record N the SQLite claim source reflects exactly records 1..N-1. |
+| `EngineError::InvalidCrdt` | S | `MS-REF-CRASH-TRUNCATED` / `MS-REF-DISK-CORRUPT`: a torn or damaged update payload. Drain maps it to `recovery`. |
+| `EngineError::Archive` | S | `MS-REF-DISK-CORRUPT`: archive read/encode failure. Drain maps it to `recovery`; the store stays openable. |
+| `EngineError::ProjectionWork` | S | `MS-REF-DISK-CORRUPT`: raised by `refresh_clean_projection_head_for_batch` AFTER the batch is accepted, so the drain maps it to `recovery` and retries; acceptance itself already stands. |
+| `history_failure` | S | `MS-REF-DISK-CORRUPT`: an earlier publication failure in the same run already made the workspace terminal. |
+| `canonical page-name key is occupied at the declared dependency frontier` | **R → fixed** | Was the one acceptance-only refusal reachable from ordinary editing: the run-local page-name index was blind to journal-durable-but-unaccepted records, so two pages whose exact names differ but whose canonical keys are equal ("Alpha" and "/Alpha") both passed the draft and the second was refused at acceptance after its manifest was published. Fixed by layering `CommittedLocalOverlay::page_names` under the accepted index in the single producer (`prepare_page_name_updates`), exactly as `portable_path_records_many` already layers the overlay for portable paths. The refusal is now raised at draft time, before the journal append. Guarded by `w5_census_a_canonical_page_name_collision_is_settled_before_the_journal_append`. |
+| `two PageIds acquire one canonical page-name key in the same batch` | U | Same producer, same effect, at draft. |
+| `page-name transition observations are incomplete or non-unique` | U | Same producer, same effect, at draft. |
+| `page-name transition disagrees with the authenticated dependency catalog` | U | `exact_before` is derived from the effect itself in both calls. |
+| `conflicts at the declared dependency frontier` | U | Portable paths: `portable_path_records_many` layers `local_overlay.portable_paths` over `ephemeral_portable_paths`, so the draft already sees paths acquired by journal-durable records. This is the shape the page-name fix above copied. |
+| `PageNamePointBatchTooLarge` | U | `MAX_PAGE_NAME_POINT_BATCH` is charged against the same delta count at draft and at acceptance, so it can only ever refuse at Save. |
+| `MalformedPageNameIndex` | S | `MS-REF-DISK-CORRUPT`: the run-local index or its checkpoint is damaged. It is disposable derived state and is rebuilt from the accepted tail on the next open. |
+| `MissingExactLogicalPageNameBlob` | S | `MS-REF-DISK-CORRUPT`: as above. |
+| `portable_path_blocked` | S | `MS-REF-SYNC-CONFLICT`: a non-ancestor concurrent acquisition of the same portable path. Quarantine retains the batch as validated-unpublished evidence rather than losing it. |
+| `page_name_blocked` | S | `MS-REF-SYNC-CONFLICT`: a non-ancestor concurrent acquisition of the same canonical page-name key. Same quarantine treatment. |
+| `identity.blocked` | S | `MS-REF-SYNC-CONFLICT`: an immutable block-home claim conflict delivered by a peer. |
+| `is_blocked()` | S | The workspace already carries terminal conflict evidence from one of the rows above; batches offered afterwards are deliberately retained, not discarded. |
+| `allow_publication` | U | `drain_staged` always passes `true`; only `drain_blocked_evidence` passes `false`, and it runs only when the workspace is already blocked. |
+
+The census is pinned by
+`hot_engine::validation_tests::w5_census_pins_every_acceptance_refusal_to_a_class`:
+a new refusal in this path with no row here, or a row whose stem no longer
+exists in production, fails that test.
+
 ### 3.1a The private receipt-store claim, and when it is checked
 
 `receipts/projection-receipts.claim` identifies the one implemented private

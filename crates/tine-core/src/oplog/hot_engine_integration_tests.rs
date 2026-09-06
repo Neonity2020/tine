@@ -7235,3 +7235,272 @@ fn clean_checkpoint_capture_eligibility_has_one_producer() {
          the single eligibility predicate rather than re-deriving it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W5-census — acceptance-only refusals for drain-published local batches.
+//
+// The managed-local drain publishes a batch's immutable manifest BEFORE the
+// hot engine accepts it (`local_journal_drain.rs`, stage `ArchivePublication`
+// then `EngineAcceptance`). Replay treats a manifest-committed clean operation
+// that does not validate as accepted as archive corruption
+// (`hot_engine.rs::replay_clean_committed_batch_ids`). So any refusal that a
+// drain-published LOCAL batch can only meet at acceptance turns a Save the app
+// reported successful into a store that refuses to open on every later open —
+// the A4 shape (I-10, I-8). A4-fix removed one proven instance (four run-local
+// capacity caps); the census in the "Acceptance-only refusals for
+// drain-published local batches" subsection of docs/storage-sync-contract.md
+// enumerates the rest, and these tests guard the one R row it found.
+//
+// Exemplars: specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md and the
+// `a4_*` guards above.
+// ---------------------------------------------------------------------------
+
+mod w5_census {
+    use crate::model::{BlockDto, Format, PageDto, PageKind};
+    use crate::oplog::{
+        DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
+    };
+    use crate::sync_runtime::{
+        SyncApplicationGraphMutationRequest, SyncApplicationPageSaveRequest,
+        SyncApplicationPageSaveTarget, SyncLocalActivationIdentities, SyncLocalActivationRequest,
+        SyncLocalActivationStatus, SyncPageKind, SyncRuntimeHandle, SyncRuntimeOpenRequest,
+        SyncRuntimeOpenStatus, SyncStorageProfile,
+    };
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    /// What every row of the census must hold for. Quoted in each failure so a
+    /// future reintroduction reads the rule, not just a diff.
+    const RULE: &str = "a Save the app reported successful must never leave a store that refuses \
+to open. The managed-local drain publishes the manifest before the engine accepts the batch, so a \
+refusal reachable only at acceptance for a drain-published local batch is permanent data loss \
+across reopen (I-10) and names no in-scope scenario the draft could not have named first (I-8). \
+Refuse at draft time (before the journal append) or accept. See the \"Acceptance-only refusals for \
+drain-published local batches\" subsection of docs/storage-sync-contract.md, \
+specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md, and the `a4_*` guards.";
+
+    struct Fixture {
+        root: PathBuf,
+        request: SyncLocalActivationRequest,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture(label: &str, seed: u128) -> Fixture {
+        let root = std::env::temp_dir().join(format!("tine-w5-census-{label}-{}", Uuid::new_v4()));
+        let graph_root = root.join("graph");
+        std::fs::create_dir_all(graph_root.join("logseq")).unwrap();
+        std::fs::write(
+            graph_root.join("logseq/config.edn"),
+            br#"{:pages-directory "pages"
+                :journals-directory "journals"
+                :file/name-format :triple-lowbar
+                :journal/file-name-format "yyyy_MM_dd"
+                :journal/page-title-format "yyyy-MM-dd"}"#,
+        )
+        .unwrap();
+        std::fs::write(graph_root.join("Root.md"), b"- seed\n").unwrap();
+        let private = root.join("private");
+        let request = SyncLocalActivationRequest {
+            archive_root: private.join("archive"),
+            graph_root: graph_root.clone(),
+            enrollment_root: private.join("enrollment"),
+            receipt_root: private.join("receipts"),
+            database_path: private.join("projection/bootstrap.sqlite"),
+            application_runtime_root: private.join("runtime"),
+            capture_root: private.join("capture"),
+            preparation_root: private.join("preparation"),
+            provider_root: graph_root.join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
+            identities: SyncLocalActivationIdentities {
+                workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+                lineage_digest: LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+                catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 2)),
+                device_id: DeviceId::from_uuid(Uuid::from_u128(seed + 3)),
+                preparation_id: Uuid::from_u128(seed + 4),
+                session_id: SessionId::from_uuid(Uuid::from_u128(seed + 5)),
+            },
+        };
+        Fixture { root, request }
+    }
+
+    fn activate(fixture: &Fixture) -> SyncRuntimeHandle {
+        let mut activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        for _ in 0..64 {
+            if activated.status == SyncLocalActivationStatus::Active {
+                break;
+            }
+            activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        }
+        assert_eq!(
+            activated.status,
+            SyncLocalActivationStatus::Active,
+            "the W5-census fixture must activate"
+        );
+        let handle = activated
+            .handle
+            .expect("an active activation carries a handle");
+        for _ in 0..256 {
+            if !handle.status().unwrap().watcher.pending {
+                break;
+            }
+            let _ = handle.tick();
+        }
+        handle
+    }
+
+    fn page(name: &str, body: &str) -> PageDto {
+        PageDto {
+            activation: None,
+            name: name.into(),
+            kind: PageKind::Page,
+            title: name.into(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                id: format!("temporary-w5-{body}"),
+                raw: body.into(),
+                ..BlockDto::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        }
+    }
+
+    /// Was this save reported to the user as durable?
+    fn save_new(handle: &SyncRuntimeHandle, name: &str, body: &str) -> bool {
+        matches!(
+            handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: name.to_owned(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: page(name, body),
+            }),
+            Ok(crate::sync_runtime::SyncApplicationPageSaveOutcome::Saved { .. })
+        )
+    }
+
+    /// Run drain turns until the managed-local journal has no pending record.
+    fn settle(handle: &SyncRuntimeHandle) -> bool {
+        for _ in 0..4096 {
+            let status = handle.status().unwrap();
+            if status.managed_local_pending == 0 && !status.watcher.pending {
+                return true;
+            }
+            if handle.tick().is_err() {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn reopen(fixture: &Fixture) -> SyncRuntimeOpenStatus {
+        SyncRuntimeHandle::open(SyncRuntimeOpenRequest {
+            profile: SyncStorageProfile::ExperimentalLocal,
+            clean_identities: Some(fixture.request.identities.clone()),
+            graph_root: fixture.request.graph_root.clone(),
+            enrollment_root: fixture.request.enrollment_root.clone(),
+            archive_root: fixture.request.archive_root.clone(),
+            receipt_root: fixture.request.receipt_root.clone(),
+            database_path: fixture.request.database_path.clone(),
+            application_runtime_root: fixture.request.application_runtime_root.clone(),
+            provider_root: fixture.request.provider_root.clone(),
+            provider_journal_root: fixture.request.provider_journal_root.clone(),
+        })
+        .status
+    }
+
+    /// Assert the drain settled and the store still reopens.
+    fn assert_settles_and_reopens(fixture: &Fixture, handle: SyncRuntimeHandle, journey: &str) {
+        let settled = settle(&handle);
+        let status = handle.status().unwrap();
+        assert!(
+            settled && status.managed_local_pending == 0,
+            "{journey}: the managed-local drain never settled \
+             (pending={}, stage={:?}, detail={:?}). {RULE}",
+            status.managed_local_pending,
+            status.managed_local_stage,
+            status.detail,
+        );
+        assert!(
+            status.detail.is_none(),
+            "{journey}: the drain reported a derivative failure: {:?}. {RULE}",
+            status.detail,
+        );
+        drop(handle);
+        let reopened = reopen(fixture);
+        assert!(
+            matches!(reopened, SyncRuntimeOpenStatus::Active),
+            "{journey}: reopen is {reopened:?}, not Active. {RULE}",
+        );
+    }
+
+    /// The one R row of the census: two pages whose exact names differ but
+    /// whose CANONICAL page-name keys are equal ("Alpha" and "/Alpha" both
+    /// fold to `alpha`) and whose derived paths differ, saved back to back
+    /// with no drain turn in between.
+    ///
+    /// Before the fix the second Save was reported `Saved` — the run-local
+    /// page-name index was blind to the first record, which is journal-durable
+    /// but not yet accepted — and the drain then met
+    /// "canonical page-name key is occupied at the declared dependency
+    /// frontier" at `EngineAcceptance`, after publishing the manifest. Every
+    /// later open replayed that manifest and refused: `OpenRefused`.
+    #[test]
+    fn w5_census_a_canonical_page_name_collision_is_settled_before_the_journal_append() {
+        let fixture = fixture("page-name-collision", 0x5c0000);
+        let handle = activate(&fixture);
+
+        let first = save_new(&handle, "Alpha", "first");
+        assert!(first, "the first page must save");
+        // No drain turn here: the first record is journal-durable and not yet
+        // accepted while the second is drafted.
+        let second = save_new(&handle, "/Alpha", "second");
+        assert_settles_and_reopens(
+            &fixture,
+            handle,
+            "save \"Alpha\", then save \"/Alpha\" before the drain runs",
+        );
+        let _ = second;
+    }
+
+    /// Breadth guard for the rest of the class: one undrained burst of
+    /// ordinary local page work — several creates plus a rename — must either
+    /// be refused at Save or be accepted, and must never leave a store that
+    /// refuses to open.
+    #[test]
+    fn w5_census_an_undrained_local_burst_leaves_a_store_that_reopens_active() {
+        let fixture = fixture("undrained-burst", 0x5c2000);
+        let handle = activate(&fixture);
+
+        for index in 0..4 {
+            assert!(
+                save_new(&handle, &format!("Burst {index}"), &format!("body {index}")),
+                "burst create {index} must save"
+            );
+        }
+        let renamed =
+            handle.mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                old: "Burst 1".into(),
+                new: "Burst One".into(),
+                expected_path: None,
+            });
+        assert!(
+            renamed.is_ok(),
+            "an undrained rename must not error: {renamed:?}"
+        );
+        assert_settles_and_reopens(
+            &fixture,
+            handle,
+            "four creates and a rename with no drain turn in between",
+        );
+    }
+}

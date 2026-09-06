@@ -6408,6 +6408,25 @@
     "failBefore": "proven"
    },
    "notes": "`{inbox,outbox}/removed/` was capped at MAX_PROVIDER_RESIDUE_ENTRIES (512) and nothing ever retired an entry, so the cap was a bound on the LIFETIME of a shared, sync-replicated tree. The write that reached it first is the conflict-copy CLEANUP: remove_identical_generated_conflict writes one removed/retired-<operation id> diagnostic per sync-service conflict copy it cleans up, and Syncthing/Dropbox delivery produces those indefinitely on a busy multi-device graph, so past 512 cleanups the user kept every further conflict copy permanently with no way out from inside the app. removed/ is now bounded by live journal state the way the journal's own completed/ store is (docs/storage-sync-contract.md 2.10c-ii): before adding a diagnostic past PROVIDER_RESIDUE_COMPACTION_TRIGGER (128) the directory is swept, and an entry is retired when no journal record -- pending or completed -- still names its operation. The card blamed retire_frontier_head, which is #[cfg(test)] and cannot drive production growth; the mechanism was right and the exemplar was wrong. Second finding fixed in the same function: the capacity check walked the whole directory and per entry called open_provider_file_nofollow plus validate_provider_regular_file, up to 511 opens and 511 stats to answer 'is there room for one more' on a path the user waits on. Counting is now count-only and the no-follow regular-file check runs once per sweep instead. Fail-before: residue-cap-fail-before.log at b889fc08 with compaction disabled in reserve_provider_diagnostic_capacity -- 'cleanup 512 must never fail on residue capacity: provider rescan exceeded explicit bound'."
+  },
+  {
+   "id": "REG-HARVEST-W5-CENSUS-001",
+   "title": "A Save the app reported successful left a store that refused to open on every later open",
+   "family": "managed-storage-local-drain-acceptance",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W5-census, queue card PVTI_lAHOAAbLVc4BhPsyzg48Dg8, raised by wave-3 packet A4; invariants I-8, I-10, I-11"},
+   "platforms": ["all"],
+   "layer": "tine-core-managed-local-drain",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::w5_census::w5_census_a_canonical_page_name_collision_is_settled_before_the_journal_append",
+     "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::w5_census::w5_census_an_undrained_local_burst_leaves_a_store_that_reopens_active",
+     "crates/tine-core/src/oplog/hot_engine.rs::validation_tests::w5_census_pins_every_acceptance_refusal_to_a_class"
+    ],
+    "scenario": "managed-storage.no-acceptance-only-refusal-for-a-drain-published-local-batch",
+    "failBefore": "necessity-census-1.txt at 37c9b22d (the fix backed out of prepare_page_name_updates)"
+   },
+   "notes": "The managed-local drain publishes a batch's manifest at stage ArchivePublication and only then offers it to the engine at EngineAcceptance, and replay treats a manifest-committed clean operation that does not validate as accepted as archive corruption. The run-local page-name ownership index was the one identity index the CommittedLocalOverlay did not carry -- portable paths and block claims were both layered over the accepted index, page names were not -- so a foreground draft evaluated page names against accepted history alone. Saving a page named \"Alpha\" and then, before the drain ran, a page named \"/Alpha\" (different exact name and different derived path, same canonical page-name key `alpha`) reported BOTH saves as Saved; the drain then met \"canonical page-name key is occupied at the declared dependency frontier\" after publishing the second manifest, the journal wedged at managed_local_pending=1, and every later open returned OpenRefused/clean_open.engine. Fixed by layering CommittedLocalOverlay::page_names under the accepted index inside the single producer (prepare_page_name_updates), exactly as portable_path_records_many already layers the overlay for portable paths, so the refusal is now raised at draft time before the journal append. The full class enumeration is the census table in the \"Acceptance-only refusals for drain-published local batches\" subsection of docs/storage-sync-contract.md; every other refusal on that path is U (a draft-time check is at least as strict) or S (an in-scope scenario the drain already recovers from)."
   }
  ]
 }

@@ -1375,7 +1375,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("stage_object_bytes", 1),
         ("stage_manifest_bytes", 1),
         ("stage", 6),
-        ("commit", 6),
+        // 7 since W5-census: the run-local page-name overlay commits its own
+        // in-memory point transition (`local_overlay.page_names.commit`)
+        // alongside `ephemeral_page_names.commit`. Name-shared with the
+        // durable choke helper; no new durable write path.
+        ("commit", 7),
         ("publish_immutable", 6),
         ("install_staged_artifact", 1),
         ("replace_head", 0),
