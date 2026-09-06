@@ -435,18 +435,22 @@ consumers and are not a substitute: a phrase query has to be able to tell `a  b`
 from `a b`. Both columns are populated at WRITE time by both producers, never by
 parsing or hydrating rows during a query.
 
-**Query rows stay narrow (schema 26, R1 candidate).** `query_block_results`
+**Query rows stay narrow (schema 26).** `query_block_results`
 stores public result identity, tree preorder, construction estimate and tag/
 property counts without duplicating raw payload. `block_own_refs` stores own
 normalized reference names; `query_page_order` stores Direct session positions.
 All are rebuildable facts in the page transaction with explicit FK-off cleanup.
-Warm startup reuses compatible, healthy projected facts for unchanged source
-revisions. Direct session identity and inventory-order metadata must support
-this without full page replacement; that producer integration is still pending
-in this R1 candidate, so metadata-backed result consumption is not yet enabled.
-Managed supplies existing public identity and uses path order. Authority capture
-input formats are unchanged. Streaming cold initialization and result consumption
-are subsequent packets, not claims made by this metadata-producing checkpoint.
+Direct full reconciliation reuses projected facts for unchanged source revisions
+and reconciles only the inventory-order table. Identical order performs no order
+writes. Live page deltas capture retained/append/remove positions before queue
+coalescing. The shared runtime-ID helper reproduces fresh-session IDs from page
+path and structural order; live identity mappings and metadata-backed result
+consumption are subsequent packets. Managed supplies existing public identity
+and uses path order. Authority capture input formats are unchanged. Removing
+global parsing from warm startup, streaming cold initialization, and result
+consumption remain subsequent work; DB reuse alone does not claim fast end-to-end
+startup. Direct source-revision table shape includes the schema26 marker so
+older projection readers reject the newer disposable cache and rebuild it.
 
 `pages` holds identity and routing;
 `page_text` owns preamble and search text. `blocks` holds structure, metadata
