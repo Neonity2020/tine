@@ -12,13 +12,24 @@
 //! the statement runs; `QueryJobOwner` bounds how many run at once and drains
 //! them before the actor removes, replaces, reopens or resets the file.
 //!
-//! An actor holding a pending suffix keeps today's masked walk: the suffix is
-//! evidence the accepted frontier does not cover, and "pending may temporarily
-//! walk" is the plan's stated route for it.
+//! **R5a: an actor holding a pending local suffix is answered here too.** A
+//! captured pending query — by R5b's turn rule, one whose relations all stay
+//! inside a page and which reads no property atom — is answered OFF the actor
+//! from TWO owned snapshots: the pending overlay at the flushed state the
+//! capture required (or a later one), and the accepted projection validated
+//! against the captured stamp with every pending page MASKED out of its
+//! statement. The two descriptor streams are merged in the walk's base order
+//! under ONE construction budget
+//! ([`crate::query::results::read_results_merged`]), so the answer is exactly
+//! what the actor walk would have produced over the same pending state — same
+//! rows, same order, same `total` and `exceeded`, same public ids — and it
+//! still loads no page document and parses nothing. The walk stays as the
+//! recovery path (`Busy`, `Cancelled`, a third `Stale`) and as the oracle.
 //!
-//! Ownership (R4 dossier): this file's types, the shared memo, the census and
-//! the capture/reply/drain wiring in `sync_runtime.rs` are the manager's (R4b);
-//! the body of [`execute_managed_query`] and its tests are the R4a lane's.
+//! Ownership (R4/R5 dossiers): this file's types, the shared memo, the census
+//! and the capture/reply/drain wiring in `sync_runtime.rs` are the manager's
+//! (R4b/R5b); the body of [`execute_managed_query`] and its tests are the
+//! R4a/R5a lanes'.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -37,7 +48,8 @@ use crate::oplog::ContentDigest;
 use crate::query::ir::{Query, ViewSettings};
 use crate::query::registry::Registry;
 use crate::query::results::{
-    read_results, BackendOrder, RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs,
+    read_results, read_results_merged, BackendOrder, RecencyPage, ResultIdentity, ResultReadError,
+    ResultReadInputs, ResultReadShared, ResultSource,
 };
 use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
 use crate::query::{ConstructionProfile, PreViewGroups};
@@ -147,6 +159,11 @@ pub(crate) enum ManagedQueryOutcome {
 pub(crate) struct ManagedQueryCensus {
     /// Executions that opened a snapshot and ran the descriptor statement.
     pub(crate) statement_reads: AtomicUsize,
+    /// The subset of `statement_reads` that were PENDING reads: two snapshots,
+    /// the overlay merged with the masked accepted projection (R5a). Noted
+    /// BESIDE `statement_reads`, never instead of it, so the existing census
+    /// assertions keep meaning "one database read".
+    pub(crate) pending_reads: AtomicUsize,
     /// Queries the walk answered because the executor reported `Busy`, or
     /// `Stale` more times than the handle re-captures.
     pub(crate) fallback_reads: AtomicUsize,
@@ -161,6 +178,7 @@ pub(crate) struct ManagedQueryCensus {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedQueryCensusSnapshot {
     pub(crate) statement_reads: usize,
+    pub(crate) pending_reads: usize,
     pub(crate) fallback_reads: usize,
     pub(crate) failed_reads: usize,
     pub(crate) stale_recaptures: usize,
@@ -169,6 +187,10 @@ pub(crate) struct ManagedQueryCensusSnapshot {
 impl ManagedQueryCensus {
     pub(crate) fn note_statement_read(&self) {
         self.statement_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_pending_read(&self) {
+        self.pending_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_fallback_read(&self) {
@@ -187,6 +209,7 @@ impl ManagedQueryCensus {
     pub(crate) fn snapshot(&self) -> ManagedQueryCensusSnapshot {
         ManagedQueryCensusSnapshot {
             statement_reads: self.statement_reads.load(Ordering::Relaxed),
+            pending_reads: self.pending_reads.load(Ordering::Relaxed),
             fallback_reads: self.fallback_reads.load(Ordering::Relaxed),
             failed_reads: self.failed_reads.load(Ordering::Relaxed),
             stale_recaptures: self.stale_recaptures.load(Ordering::Relaxed),
@@ -196,6 +219,7 @@ impl ManagedQueryCensus {
     #[cfg(test)]
     pub(crate) fn reset(&self) {
         self.statement_reads.store(0, Ordering::Relaxed);
+        self.pending_reads.store(0, Ordering::Relaxed);
         self.fallback_reads.store(0, Ordering::Relaxed);
         self.failed_reads.store(0, Ordering::Relaxed);
         self.stale_recaptures.store(0, Ordering::Relaxed);
@@ -252,12 +276,11 @@ fn execute_on_slot(
 ) -> ManagedQueryOutcome {
     #[cfg(test)]
     run_before_managed_open_hook();
-    // R5b ships the pending route as a stub: the capture is taken, the slot is
-    // held and released, and the walk answers (counted as a fallback), so the
-    // whole turn → capture → walk wiring runs end to end before R5a fills in
-    // the two-source read.
-    if capture.overlay.is_some() {
-        return ManagedQueryOutcome::Busy;
+    // R5a: a capture taken while the actor held a pending local suffix is
+    // answered from TWO snapshots. It stays BELOW the hook, so every barrier
+    // gate still runs before the first snapshot of either file.
+    if let Some(pending) = capture.overlay.as_ref() {
+        return execute_pending_on_slot(capture, pending, slot, census);
     }
     // The stamp is validated INSIDE the read transaction that will serve every
     // later statement, so an accepted batch cannot land between the check and
@@ -353,6 +376,233 @@ fn execute_on_slot(
     };
     drop(snapshot);
     outcome
+}
+
+/// How long a PENDING execution waits for the overlay worker to carry the
+/// revision its capture requires.
+///
+/// Deliberately NOT the owner's slot wait. `execute_on_slot` runs with the slot
+/// already held, so blocking on the overlay's condvar for the full
+/// [`crate::query_jobs::QUERY_JOB_WAIT`] would let two pending queries occupy
+/// the whole capacity for 30 s and starve every other query on the graph —
+/// exactly the queueing the slot exists to prevent (`query_jobs.rs`: "a job
+/// that is waiting for a slot holds its request intent and nothing else", plan
+/// §2B). A flush is ONE in-process worker turn; a wait that long has already
+/// told us the worker is not going to answer in time, and the walk will.
+pub(crate) const OVERLAY_FLUSH_WAIT: Duration =
+    Duration::from_millis(crate::query_jobs::QUERY_JOB_WAIT.as_millis() as u64 / 10);
+
+/// The PENDING read: the overlay at the flushed state the capture required (or
+/// a later one), plus the accepted projection with every pending page masked
+/// out of its statement, merged under one budget (R5a).
+///
+/// The order of the two opens is the coherence proof; see the comment at the
+/// accepted open. Nothing here holds the actor, `operation`, the overlay's
+/// state mutex beyond `open_snapshot`, or any graph mutex; nothing spawns a
+/// thread; nothing writes to either file.
+fn execute_pending_on_slot(
+    capture: &ManagedQueryCapture,
+    pending: &PendingOverlayCapture,
+    slot: &JobSlot<'_>,
+    census: &ManagedQueryCensus,
+) -> ManagedQueryOutcome {
+    use crate::managed_overlay::OverlayOpen;
+
+    // R5b's turn rule captures a pending query only when it has NO property
+    // leaf, so `capture.registry` is the empty registry and the two sources
+    // cannot be lowered under different effective types. R5c lifts the
+    // exclusion by patching the registry off the actor; until then this is the
+    // invariant that makes ONE registry correct for both files.
+    debug_assert!(
+        !capture.props,
+        "R5b's turn rule never captures a pending query with a property leaf"
+    );
+
+    // (1) The OVERLAY first, at exactly one published state. `Unavailable` —
+    // not flushed within the budget, incomplete content, or a worker that
+    // failed — is `Busy`: the walk answers and a fallback is counted.
+    // Availability over refusal (`managed_overlay.rs` module doc) is R5b's
+    // shipped disposition and supersedes the R5 design note's `Failed`; a cache
+    // that could not be built costs a walk, and only a damaged ROW inside a
+    // successfully opened, validated snapshot is `Failed` (D-3).
+    let (mut overlay, state) = match pending
+        .overlay
+        .open_snapshot(pending.required_revision, OVERLAY_FLUSH_WAIT)
+    {
+        OverlayOpen::Snapshot { snapshot, state } => (snapshot, state),
+        OverlayOpen::Unavailable => return ManagedQueryOutcome::Busy,
+        OverlayOpen::Stale => return ManagedQueryOutcome::Stale,
+        OverlayOpen::Closed => return ManagedQueryOutcome::Cancelled,
+    };
+    if !slot.register(overlay.cancellation()) {
+        return ManagedQueryOutcome::Cancelled;
+    }
+    // (2) The ACCEPTED file second, validated against the capture's stamp
+    // inside its own read transaction.
+    //
+    // **The order IS the coherence proof.** A path leaves the pending set only
+    // when its batch is ACCEPTED (`retire_latest_projection_frame` is the only
+    // caller of `PendingOverlay::remove`, and it runs after the batch applied),
+    // and an accepted batch advances the acceptance sequence this open
+    // validates. So: the overlay snapshot is pinned at `(instance, flushed)`
+    // BEFORE this open; if this open succeeds, no batch was accepted in
+    // between, hence no path left the pending set since the capture, hence
+    // `state.pending_paths ⊇` the set at capture time. Every EXTRA path is a
+    // pending page that appeared after the capture — masked out of the accepted
+    // statement below and present in the overlay. No page is read twice and no
+    // page is missing; the answer is "as of overlay acquisition" (plan §2B).
+    let mut accepted = match PhysicalProjectionQuerySnapshot::open_managed(
+        &capture.path,
+        capture.stamp.acceptance_sequence,
+        capture.stamp.frontier_digest,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(MaterializationError::Stale { .. }) => return ManagedQueryOutcome::Stale,
+        Err(_) => return ManagedQueryOutcome::Failed("managed projection snapshot"),
+    };
+    if !slot.register(accepted.cancellation()) {
+        return ManagedQueryOutcome::Cancelled;
+    }
+    // (3) The mask: the accepted page id of every pending path.
+    let mask = match overlay_mask_ids(&mut accepted, &state) {
+        Ok(mask) => mask,
+        Err(outcome) => return outcome,
+    };
+    // (4) Readiness PER SOURCE. The overlay's `fts_ready` is 1 by schema
+    // seeding, but it is probed with the same statement and the same mapping
+    // anyway: a file that says otherwise is damaged, not "still building".
+    let accepted_fts = match probe_fts_ready(&mut accepted) {
+        Ok(ready) => ready,
+        Err(outcome) => return outcome,
+    };
+    let overlay_fts = match probe_fts_ready(&mut overlay) {
+        Ok(ready) => ready,
+        Err(outcome) => return outcome,
+    };
+    // (5) ONE IR, ONE compiled-leaf parse, lowered twice — the sources differ
+    // only in the masked pages and their own readiness.
+    let query = crate::query::block_anchored_query(&capture.query);
+    let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+    let lower = |masked_pages: &[[u8; 16]], fts_ready: bool| {
+        lower_query(
+            &query,
+            &LoweringInputs {
+                today: capture.today,
+                registry: &capture.registry,
+                masked_pages,
+                // NOT `max_rows`: `total` is the number of matches SEEN, and a
+                // buffered source may not be truncated at all.
+                cutoff: None,
+                compiled: &compiled,
+                fts_ready,
+                result_set_rule: RESULT_SET_RULE,
+            },
+        )
+    };
+    let overlay_statement = lower(&[], overlay_fts);
+    let accepted_statement = lower(&mask, accepted_fts);
+    // A filter that folded to false has its answer already (§3.5, I-15); a
+    // source whose statement matches nothing contributes nothing, and if both
+    // do the answer is empty without a statement being run.
+    if overlay_statement.matches_nothing && accepted_statement.matches_nothing {
+        return ManagedQueryOutcome::Answered(PreViewGroups::default());
+    }
+    let recency = |page: RecencyPage<'_>| {
+        capture.journal_format.page_recency_secs(
+            page.kind == PageKind::Journal,
+            page.name,
+            &capture.graph_root.join(page.path),
+        )
+    };
+    // (6) The overlay FIRST: that is the walk's own concatenation order
+    // (`sources` is `[overlay pages…, accepted candidate pages…]` before its
+    // stable sort by path), and the merged constructor buffers every source but
+    // the last, so the small pending file is the buffered one.
+    let mut sources = Vec::with_capacity(2);
+    if !overlay_statement.matches_nothing {
+        sources.push(ResultSource {
+            snapshot: &mut overlay,
+            statement: &overlay_statement,
+        });
+    }
+    if !accepted_statement.matches_nothing {
+        sources.push(ResultSource {
+            snapshot: &mut accepted,
+            statement: &accepted_statement,
+        });
+    }
+    let outcome = match read_results_merged(
+        &mut sources,
+        &ResultReadShared {
+            order: BackendOrder::Managed,
+            // The overlay's rows come from the accept path's own per-page
+            // lowering, so its `result_id`s are the real Managed ones.
+            identity: &ResultIdentity::Stored,
+            max_rows: capture.max_rows,
+            max_bytes: capture.max_bytes,
+            profile: capture.profile,
+            recency: &recency,
+        },
+    ) {
+        Ok(pre) => {
+            census.note_statement_read();
+            census.note_pending_read();
+            ManagedQueryOutcome::Answered(pre)
+        }
+        Err(ResultReadError::Cancelled) => ManagedQueryOutcome::Cancelled,
+        Err(ResultReadError::Sql(_)) => ManagedQueryOutcome::Failed("managed projection statement"),
+        // A row that decodes wrong inside a successfully opened, validated
+        // snapshot is the projection contradicting itself — on EITHER file.
+        // Never a silently smaller answer (D-3).
+        Err(ResultReadError::Corrupt(_)) => {
+            ManagedQueryOutcome::Failed("managed projection result rows")
+        }
+    };
+    // (8) Both transactions end before the slot releases its capacity.
+    drop(sources);
+    drop(overlay);
+    drop(accepted);
+    outcome
+}
+
+/// The accepted page id of every path the overlay holds pending, so the
+/// accepted statement can exclude them.
+///
+/// Byte-for-byte the walk's own mask read
+/// (`application_simple_query_pages_ready`): no row is a page the accepted file
+/// has never seen, one row is masked, and more than one is a refusal — the walk
+/// refuses the same shape, and answering would either duplicate or drop a page
+/// (D-3).
+fn overlay_mask_ids(
+    accepted: &mut PhysicalProjectionQuerySnapshot,
+    state: &crate::managed_overlay::OverlayState,
+) -> Result<Vec<[u8; 16]>, ManagedQueryOutcome> {
+    let mut mask = Vec::with_capacity(state.pending_paths.len());
+    for path in &state.pending_paths {
+        let rows = match accepted.run_projection_query(
+            "SELECT page_id FROM pages WHERE path = ?1 LIMIT 2",
+            &[PhysicalQueryValue::Text(path.clone())],
+        ) {
+            Ok(rows) => rows,
+            Err(_) if accepted.cancellation().is_cancelled() => {
+                return Err(ManagedQueryOutcome::Cancelled)
+            }
+            Err(_) => return Err(ManagedQueryOutcome::Failed("managed projection pages")),
+        };
+        if rows.len() > 1 {
+            return Err(ManagedQueryOutcome::Failed("overlay path ambiguous"));
+        }
+        let Some(row) = rows.first() else {
+            continue;
+        };
+        match row.first() {
+            Some(PhysicalQueryValue::Blob(bytes)) if bytes.len() == 16 => {
+                mask.push(bytes.as_slice().try_into().expect("a checked 16-byte id"));
+            }
+            _ => return Err(ManagedQueryOutcome::Failed("managed projection pages")),
+        }
+    }
+    Ok(mask)
 }
 
 /// A barrier between the slot admission and the snapshot open (test-only), so
@@ -777,6 +1027,45 @@ mod tests {
             assert!(section.contains(sentence), "contract lost: {sentence}");
         }
         assert_eq!(MAX_STALE_RECAPTURES, 2, "the contract says twice");
+    }
+
+    /// R5a's pin: the two-source pending read's own paragraph. The open ORDER
+    /// is the coherence proof and the mask is what keeps the sources disjoint,
+    /// so both must stay written down where the storage contract is read.
+    #[test]
+    fn storage_contract_names_the_two_source_pending_read() {
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        let section = contract
+            .split("**A captured pending query is answered off the actor from BOTH databases.**")
+            .nth(1)
+            .and_then(|tail| tail.split("## 2. Enrollment").next())
+            .expect("the pending-read paragraph precedes section 2");
+        for sentence in [
+            "opens the overlay first, at the flushed revision the capture
+required or later",
+            "only then opens the accepted file and validates the
+capture's stamp inside that read transaction",
+            "that open ORDER is the whole
+coherence proof",
+            "lowers ONE
+compiled query twice",
+            "every page of the overlay's pending set masked out",
+            "the two sources are disjoint by construction",
+            "merged in the walk's own
+base order",
+            "under ONE construction budget",
+            "**The answer is the walk's answer**",
+            "no page document is
+loaded and nothing is parsed",
+            "opens `Unavailable`
+and the query walks as a counted fallback",
+            "Only a damaged ROW inside a snapshot that opened and validated is
+`Failed`",
+            "reachable from both sources —
+is `Failed` too rather than answered twice",
+        ] {
+            assert!(section.contains(sentence), "contract lost: {sentence}");
+        }
     }
 
     /// The same pin for the executor's own paragraph: what one accepted-route

@@ -27857,9 +27857,8 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
 
     // While the save is still an undrained local suffix the stamp carries the
     // pending overlay's revision (R5b), so the earlier memo entry cannot be
-    // reused: the query is captured, the executor (a stub until R5a) reports
-    // `Busy`, and the actor walk answers over the overlay -- "pending may
-    // temporarily walk".
+    // reused: the query is captured and R5a's executor answers it OFF the
+    // actor from the overlay and the masked accepted projection.
     assert_eq!(handle.status().unwrap().managed_local_pending, 1);
     let (pending, counters, census) = run("query while the save is pending");
     assert_eq!(
@@ -27868,12 +27867,12 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
     );
     assert_eq!(
         census,
-        (0, 1, 0, 0),
-        "a pending page-local query is captured and the stub walks: {census:?}"
+        (1, 0, 0, 0),
+        "R5a: a pending page-local query is one off-actor two-source read, not a walk: {census:?}"
     );
-    assert!(
-        counters.result_page_hydrations > 0,
-        "the pending answer is the actor walk: {counters:?}"
+    assert_eq!(
+        counters.result_page_hydrations, 0,
+        "R5a: the off-actor pending read loads no page document at all: {counters:?}"
     );
     assert_managed_simple_query_matches_direct(
         "query while the save is pending",
@@ -33055,11 +33054,11 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
     );
 
     // Captured: the injected outcome IS consumed. Busy → the walk answers and
-    // the fallback is counted; no statement read happened (the stub).
+    // the fallback is counted.
     let oracle = r4b_oracle(&fixture);
     r4b_inject(&handle, vec![Outcome::Busy]);
     let result = r4b_query(&handle).unwrap();
-    assert_managed_simple_query_matches_direct("pending stub walk", result, oracle);
+    assert_managed_simple_query_matches_direct("pending walk after Busy", result, oracle);
     assert_eq!(r4b_census(&handle), (0, 1, 0, 0), "captured, Busy, walked");
     assert_eq!(
         handle
@@ -33071,6 +33070,22 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
             .len(),
         0,
         "a pending page-local query reaches the executor"
+    );
+
+    // R5a: with nothing injected, the executor answers the pending query from
+    // the overlay and the masked accepted file — one statement read, and it is
+    // a PENDING one.
+    r4b_inject(&handle, vec![]);
+    let read = r4b_query(&handle).unwrap();
+    assert_managed_simple_query_matches_direct(
+        "pending two-source read",
+        read,
+        r4b_oracle(&fixture),
+    );
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 1, 0, 0, 0),
+        "the pending route reads two sources off the actor"
     );
 
     // A query is a read: it never advances the overlay (no push, no re-lower).
@@ -33091,7 +33106,7 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
         .unwrap()
         .push_back(Outcome::Failed("must not be consumed"));
     let _ = r4b_query(&handle).unwrap();
-    assert_eq!(r4b_census(&handle), (0, 1, 0, 0), "memo hit");
+    assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0), "memo hit");
     assert_eq!(
         handle
             .inner
@@ -33126,9 +33141,9 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
     );
     let _ = r4b_query(&handle).unwrap();
     assert_eq!(
-        r4b_census(&handle),
-        (1, 1, 0, 0),
-        "accepted route after the drain"
+        r5a_census(&handle),
+        (2, 1, 0, 0, 0),
+        "accepted route after the drain: a second statement read, still one pending read"
     );
 
     assert!(matches!(
@@ -33953,6 +33968,1265 @@ fn r4a_an_exhausted_job_owner_is_busy_and_the_walk_answers() {
         "a freed slot puts the next query back on the database route"
     );
     r4a_assert_same("read after the slots freed", &read, &oracle);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// R5a: the PENDING route. A query captured while the actor holds an undrained
+// local suffix is answered OFF the actor from TWO snapshots — the pending
+// overlay and the accepted projection with every pending page masked — merged
+// under one budget. Every gate below drives the PUBLIC navigation surface and
+// compares against the actor WALK over the same pending state (I-19).
+// ---------------------------------------------------------------------------
+
+/// The pending-route counters as `(statement_reads, pending_reads,
+/// fallback_reads, failed_reads, stale_recaptures)`.
+///
+/// `pending_reads` is the subset of `statement_reads` that read TWO sources, so
+/// a gate can tell the pending route from the accepted one without reaching
+/// into the executor.
+fn r5a_census(handle: &SyncRuntimeHandle) -> (usize, usize, usize, usize, usize) {
+    let census = handle.managed_query_census();
+    (
+        census.statement_reads,
+        census.pending_reads,
+        census.fallback_reads,
+        census.failed_reads,
+        census.stale_recaptures,
+    )
+}
+
+/// The ONE oracle for a PENDING state: the actor's own masked WALK over the
+/// same pending state, on a cleared memo.
+///
+/// `r4b_oracle` reads the graph FILES. It is valid for the ordinary pending
+/// `Existing` save — the Managed save writes the file in the same turn — and it
+/// is NOT valid for a pending deletion, a pending new page, a move, or any
+/// shape whose file write has not landed, so every gate below uses this one.
+/// `r4a_oracle` dispatches to `application_simple_query_pages_ready`, which is
+/// exactly the function the handle's `Busy`/`Cancelled` fallback walks through,
+/// and it moves no `managed_query` counter;
+/// `r5a_a_pending_page_local_query_is_answered_off_the_actor` proves the two
+/// spellings of "the walk" agree by ALSO forcing the handle's own fallback.
+fn r5a_walk(
+    handle: &SyncRuntimeHandle,
+    query: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> SyncApplicationBoundedRefGroups {
+    r4a_oracle(handle, query, max_rows, max_bytes)
+}
+
+/// Append one root block to the page at `path` and save it, leaving the batch
+/// UNDRAINED: the actor holds a pending local suffix from here on.
+fn r5a_pending_append(handle: &SyncRuntimeHandle, path: &str, text: &str) {
+    let (mut page, revision) = load_application_exact(handle, path);
+    page.blocks.push(application_move_test_root(text, 0));
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    assert!(
+        matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+        "the pending append was not saved: {save:?}"
+    );
+}
+
+/// Replace the page at `path` with exactly `blocks`, leaving it pending.
+fn r5a_pending_replace(handle: &SyncRuntimeHandle, path: &str, blocks: Vec<BlockDto>) {
+    let (mut page, revision) = load_application_exact(handle, path);
+    page.blocks = blocks;
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    assert!(
+        matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+        "the pending replacement was not saved: {save:?}"
+    );
+}
+
+/// Author a page that was NEVER accepted, leaving it pending. Returns its path.
+fn r5a_pending_new_page(handle: &SyncRuntimeHandle, name: &str, blocks: Vec<BlockDto>) -> String {
+    match handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: name.into(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(name, SyncPageKind::Page, None, blocks),
+        })
+        .unwrap()
+    {
+        SyncApplicationPageSaveOutcome::Saved { page, .. } => page.path,
+        other => panic!("the new pending page was not saved: {other:?}"),
+    }
+}
+
+/// The overlay's published state once every pushed update has flushed.
+fn r5a_overlay(handle: &SyncRuntimeHandle) -> (PathBuf, crate::managed_overlay::OverlayState) {
+    handle
+        .pending_overlay_state()
+        .unwrap()
+        .expect("a clean Managed runtime installs its pending overlay")
+}
+
+const R5A_ROWS: usize = R4B_ROWS;
+const R5A_BYTES: usize = R4B_BYTES;
+
+/// The shapes every pending scenario is compared under. All four are page-local
+/// and property-free — R5b's turn rule — so all four reach the executor.
+/// `(sort-by modified …)` measures the per-page recency axis, `(sample …)` is
+/// the one directive that STOPS admission (and therefore truncates `total`),
+/// and the content shape reads `block_text` on both sources.
+const R5A_SHAPES: &[&str] = &[
+    "(task TODO)",
+    "(task TODO) (sort-by modified desc)",
+    "(task TODO) (sort-by modified asc)",
+    "(content-regex \"r5a\")",
+    "(task DONE)",
+    "(task TODO) (sample 3)",
+];
+
+/// Every shape at every bound, against the walk over the same pending state.
+///
+/// The byte bounds are derived from each shape's own unbounded answer, so one
+/// of them closes the construction between two rows of a single page — and
+/// because the pending pages are interleaved with accepted ones in the merged
+/// base order, the cut lands inside an overlay page for some shapes and inside
+/// an accepted page for others.
+fn r5a_parity_over(handle: &SyncRuntimeHandle, label: &str) -> (usize, Vec<String>) {
+    let mut differences = Vec::new();
+    let mut rows = 0usize;
+    for (index, source) in R5A_SHAPES.iter().enumerate() {
+        let unbounded = r5a_walk(handle, source, R5A_ROWS, R5A_BYTES);
+        rows += unbounded
+            .groups
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum::<usize>();
+        let mut bounds: Vec<(usize, usize)> = vec![
+            (R5A_ROWS, R5A_BYTES),
+            (1, R5A_BYTES),
+            (2, R5A_BYTES),
+            (R5A_ROWS, 1),
+        ];
+        let mut cumulative = 0usize;
+        for group in &unbounded.groups {
+            for block in &group.blocks {
+                cumulative = cumulative
+                    .saturating_add(crate::model::block_dto_estimated_bytes(block))
+                    .saturating_add(group.page.len())
+                    .saturating_add(256);
+                bounds.push((R5A_ROWS, cumulative.clamp(1, R5A_BYTES)));
+                bounds.push((R5A_ROWS, cumulative.saturating_sub(1).clamp(1, R5A_BYTES)));
+            }
+        }
+        for (max_rows, max_bytes) in bounds {
+            // Named by INDEX, never by source: this helper also runs over a
+            // real graph, where a query source is content.
+            let at = format!("{label}: shape #{index} rows={max_rows} bytes={max_bytes}");
+            let expected = r5a_walk(handle, source, max_rows, max_bytes);
+            handle.reset_managed_query_census();
+            let actual = match r4a_navigate(handle, source, max_rows, max_bytes) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    differences.push(format!("{at} failed: {error}"));
+                    continue;
+                }
+            };
+            let (statement_reads, pending_reads, fallbacks, failures, _) = r5a_census(handle);
+            let skipped_but_nonempty = statement_reads == 0 && expected.total > 0;
+            if statement_reads > 1
+                || pending_reads != statement_reads
+                || fallbacks != 0
+                || failures != 0
+                || skipped_but_nonempty
+            {
+                differences.push(format!(
+                    "{at} did not answer from the two-source read: \
+                     statement_reads={statement_reads} pending_reads={pending_reads} \
+                     fallbacks={fallbacks} failures={failures} walk_total={}",
+                    expected.total
+                ));
+            }
+            if actual.total != expected.total {
+                differences.push(format!(
+                    "{at} total walk={} read={}",
+                    expected.total, actual.total
+                ));
+            }
+            if actual.exceeded != expected.exceeded {
+                differences.push(format!(
+                    "{at} exceeded walk={} read={}",
+                    expected.exceeded, actual.exceeded
+                ));
+            }
+            // An unsorted `(sample N)` admits an arbitrary N of the matches, so
+            // it is compared as a SET of ids, exactly as the walk's own
+            // admission cap allows.
+            let unordered = source.contains("(sample ");
+            let compare = |answer: &SyncApplicationBoundedRefGroups| {
+                if unordered {
+                    let mut ids = answer
+                        .groups
+                        .iter()
+                        .flat_map(|group| group.blocks.iter().map(|block| block.id.clone()))
+                        .collect::<Vec<_>>();
+                    ids.sort();
+                    serde_json::to_value(ids).unwrap()
+                } else {
+                    serde_json::to_value(&answer.groups).unwrap()
+                }
+            };
+            if compare(&actual) != compare(&expected) {
+                differences.push(format!(
+                    "{at} groups differ (walk groups={} read groups={})",
+                    expected.groups.len(),
+                    actual.groups.len()
+                ));
+            }
+        }
+    }
+    (rows, differences)
+}
+
+/// A small Managed graph whose page PATHS discriminate the merge:
+/// `notes/Zebra.md` sorts BEFORE `notes/apple.md` under SQLite's BINARY
+/// collation (`Z` = 0x5A, `a` = 0x61) and after it under any case-insensitive
+/// order; `notes/Ärger.md` starts with a two-byte UTF-8 sequence and therefore
+/// sorts after every ASCII path; the Org page proves the dialect does not
+/// change the route; and the journal gives `(sort-by modified)` a page whose
+/// recency is read from its display NAME rather than from a file `stat`.
+fn r5a_fixture(label: &str, seed: u128) -> ActivationFixture {
+    let fixture = ActivationFixture::empty(label, seed);
+    fs::create_dir_all(fixture.graph_root.join("notes")).unwrap();
+    fs::create_dir_all(fixture.graph_root.join("diary")).unwrap();
+    for (path, body) in [
+        (
+            "notes/Alpha.md",
+            "- TODO r5a alpha one\n- DONE r5a alpha two\n",
+        ),
+        ("notes/Bravo.md", "- TODO r5a bravo one\n"),
+        ("notes/Delta.md", "- DONE r5a delta only\n"),
+        ("notes/Echo.md", "- TODO r5a echo only\n"),
+        ("notes/Kilo.org", "* TODO r5a kilo org\n"),
+        ("notes/Zebra.md", "- TODO r5a zebra one\n"),
+        ("notes/apple.md", "- TODO r5a apple one\n"),
+        ("notes/Ärger.md", "- TODO r5a arger one\n"),
+        ("diary/20-07-2026.md", "- TODO r5a journal one\n"),
+    ] {
+        fs::write(fixture.graph_root.join(path), body).unwrap();
+    }
+    fixture
+}
+
+/// **The headline fail-before.** A pending page-local query is answered OFF the
+/// actor from two databases: one statement read, no fallback, no page document
+/// loaded, exactly the walk's answer. Then a memo hit; then, after the drain,
+/// the ACCEPTED route answers the same question.
+#[test]
+fn r5a_a_pending_page_local_query_is_answered_off_the_actor() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    let (fixture, handle) = r4b_reopened("r5a-pending-off-actor", 0x5a01);
+    let witness_path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .expect("the fixture has pages")
+        .rel_path;
+    r5a_pending_append(&handle, &witness_path, "TODO r5a-off-actor-witness");
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+    let (_, pending) = r5a_overlay(&handle);
+    assert_eq!(
+        pending.pending_paths,
+        std::collections::BTreeSet::from([witness_path.clone()])
+    );
+    assert!(pending.incomplete.is_empty(), "{pending:?}");
+    assert_eq!(pending.failed, None);
+
+    // The two spellings of "the walk" agree: the handle's own fallback (an
+    // injected `Busy`), the actor-side complete-page evaluator, and — for this
+    // ordinary `Existing` save, whose file was written in the same turn — the
+    // Direct oracle over the graph FILES.
+    let forced = {
+        r4b_inject(&handle, vec![Outcome::Busy]);
+        let walked = r4b_query(&handle).unwrap();
+        assert_eq!(
+            r4b_census(&handle),
+            (0, 1, 0, 0),
+            "the forced walk answered"
+        );
+        r4b_inject(&handle, vec![]);
+        walked
+    };
+    let actor_walk = r5a_walk(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+    r4a_assert_same("the two walk spellings agree", &forced, &actor_walk);
+    assert_managed_simple_query_matches_direct(
+        "the pending walk equals Direct over the files",
+        forced,
+        r4b_oracle(&fixture),
+    );
+
+    // The executor's own answer: one two-source read, no page hydrated.
+    handle.reset_managed_query_census();
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    let answered = r4b_query(&handle).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 1, 0, 0, 0),
+        "one PENDING statement read, no fallback, no failure, no re-capture"
+    );
+    let counters = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        counters.result_page_hydrations, 0,
+        "the off-actor pending read loads no page DTO: {counters:?}"
+    );
+    assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
+    assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+    r4a_assert_same("pending two-source answer", &answered, &actor_walk);
+
+    // A query is a read: it advanced no overlay revision, and the answer is
+    // memoized under the capture's stamp, so the same question executes
+    // nothing at all.
+    let (_, after_read) = r5a_overlay(&handle);
+    assert_eq!(after_read.flushed_revision, pending.flushed_revision);
+    let memoized = r4b_query(&handle).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 1, 0, 0, 0),
+        "a memo hit executes nothing"
+    );
+    r4a_assert_same("memo hit", &memoized, &actor_walk);
+
+    // The drain empties the pending set; the ACCEPTED route answers next, and
+    // its answer is the same one (the batch changed nothing the query sees).
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    let drained = r4b_query(&handle).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (2, 1, 0, 0, 0),
+        "after the drain the accepted route answers and notes no pending read"
+    );
+    assert_managed_simple_query_matches_direct(
+        "accepted route after the drain",
+        drained,
+        r4b_oracle(&fixture),
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Scenarios (a), (b), (e), (g)–(k): an edit that ADDS the first matching block
+/// to a page, an edit that REMOVES the only matching block, several pending
+/// pages interleaved alphabetically with accepted ones, both dialects, a
+/// Unicode path and two case-differing paths, over every shape and every bound.
+#[test]
+fn r5a_pending_edits_of_every_shape_equal_the_walk() {
+    let fixture = r5a_fixture("r5a-pending-edits", 0x5a02);
+    let handle = r4a_reopen(&fixture);
+
+    // (a) `Delta` had no TODO; (b) `Echo`'s only TODO goes; (e)/(j)/(k) the
+    // pending set interleaves with the accepted pages in BINARY path order and
+    // spans an Org page, a Unicode path and the `Zebra`/`apple` case pair.
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a delta added");
+    r5a_pending_replace(
+        &handle,
+        "notes/Echo.md",
+        vec![application_move_test_root("r5a echo without a marker", 0)],
+    );
+    r5a_pending_append(&handle, "notes/Kilo.org", "TODO r5a kilo added");
+    r5a_pending_append(&handle, "notes/Zebra.md", "TODO r5a zebra added");
+    r5a_pending_append(&handle, "notes/Ärger.md", "TODO r5a arger added");
+    r5a_pending_append(&handle, "diary/20-07-2026.md", "TODO r5a journal added");
+    let (_, state) = r5a_overlay(&handle);
+    assert_eq!(state.pending_paths.len(), 6, "{state:?}");
+    assert!(state.incomplete.is_empty(), "{state:?}");
+    assert_eq!(state.failed, None);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 6);
+
+    let (rows, differences) = r5a_parity_over(&handle, "pending edits");
+    assert!(
+        rows > 0,
+        "the corpus admitted nothing; the gate proves nothing"
+    );
+    assert!(
+        differences.is_empty(),
+        "the pending read and the walk disagree:\n{}",
+        differences.join("\n")
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Scenarios (c) and (d): a page that was NEVER accepted and a page DELETED
+/// while pending. The new page exists only in the overlay; the deleted page is
+/// tombstoned there (in the pending set, no rows) and masked out of the
+/// accepted statement, so it contributes nothing.
+#[test]
+fn r5a_a_new_pending_page_and_a_deleted_pending_page_equal_the_walk() {
+    let fixture = r5a_fixture("r5a-pending-new-and-deleted", 0x5a03);
+    let handle = r4a_reopen(&fixture);
+
+    // Delete-by-name only reaches a page the accepted engine owns the LOGICAL
+    // NAME for, which the fixture's imported `notes/…` paths are not. So the
+    // page this test deletes is created through the runtime — at the graph's
+    // own new-page path — and ACCEPTED first, leaving a settled base to walk.
+    let doomed = r5a_pending_new_page(
+        &handle,
+        "Foxtrot",
+        vec![application_move_test_root("TODO r5a foxtrot doomed", 0)],
+    );
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    let before = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+
+    // (c) A page nobody has accepted, whose path sorts between two accepted
+    // ones, plus (d) an accepted page deleted while pending.
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Foxtrot".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: Some(doomed.clone()),
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied
+    );
+    let new_path = r5a_pending_new_page(
+        &handle,
+        "Charlie",
+        vec![application_move_test_root("TODO r5a charlie new", 0)],
+    );
+    let (_, state) = r5a_overlay(&handle);
+    assert!(
+        state.pending_paths.contains(&new_path) && state.pending_paths.contains(&doomed),
+        "both the never-accepted page and the deleted one are pending: {state:?}"
+    );
+    assert!(state.incomplete.is_empty(), "{state:?}");
+    assert_eq!(state.failed, None);
+
+    let after = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    assert_eq!(
+        after.total, before.total,
+        "the fixture must gain one match and lose one: {before:?} -> {after:?}"
+    );
+    let (rows, differences) = r5a_parity_over(&handle, "new and deleted");
+    assert!(rows > 0);
+    assert!(
+        differences.is_empty(),
+        "the pending read and the walk disagree:\n{}",
+        differences.join("\n")
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Scenario (l): a pending MOVE. Both rename sides are pending, both are masked
+/// out of the accepted statement, and both are present in the overlay — a
+/// missed side would leave the accepted file's unmasked rows beside the
+/// overlay's for one physical page, which the merged constructor reports as
+/// `Corrupt("page in two sources")` rather than answering twice.
+#[test]
+fn r5a_a_pending_move_masks_both_sides_and_equals_the_walk() {
+    let fixture = r5a_fixture("r5a-pending-move", 0x5a04);
+    let handle = r4a_reopen(&fixture);
+    let (source_page, source_revision) = load_application_exact(&handle, "notes/Alpha.md");
+    let (destination_page, destination_revision) =
+        load_application_exact(&handle, "notes/Bravo.md");
+    let outcome = handle
+        .move_application_subtrees(SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: source_page.path.clone(),
+            source_revision,
+            destination_path: destination_page.path.clone(),
+            destination_revision,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: source_page.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root { position: 0 },
+            admission: application_move_admission(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ),
+        "the pending move did not commit: {outcome:?}"
+    );
+
+    let (_, state) = r5a_overlay(&handle);
+    assert!(
+        state.pending_paths.contains("notes/Alpha.md")
+            && state.pending_paths.contains("notes/Bravo.md"),
+        "both move sides must be pending and masked: {state:?}"
+    );
+    assert!(state.incomplete.is_empty(), "{state:?}");
+    assert_eq!(state.failed, None);
+
+    let (rows, differences) = r5a_parity_over(&handle, "pending move");
+    assert!(rows > 0);
+    assert!(
+        differences.is_empty(),
+        "the pending read and the walk disagree over a move:\n{}",
+        differences.join("\n")
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Scenario (f) — a pending page whose DISPLAY NAME equals an accepted page's
+/// — is NOT producible through a Managed runtime, and this gate records why
+/// rather than pretending otherwise.
+///
+/// Two graph files that resolve to one display name (two `title::`s, or a
+/// journal whose title format collides with a page name) are ONE Managed page:
+/// the second file's path has no page at all
+/// (`load_application_exact` → `Missing`), even though `Graph::list_pages`
+/// sees both files. So a Managed pending set can never hold a page whose name
+/// an accepted page also carries.
+///
+/// The property the pending route actually needs — two PHYSICAL pages sharing
+/// a display name stay two groups before the view, one per source — is
+/// therefore proven where the grouping lives:
+/// `query::results` `the_managed_order_is_the_binary_path_order` (one source)
+/// and `two_sources_merge_in_the_base_order_under_one_budget`, whose two
+/// `Alpha` pages are deliberately split across the two sources.
+#[test]
+fn r5a_two_files_of_one_display_name_are_one_managed_page() {
+    let fixture = r5a_fixture("r5a-pending-twin", 0x5a05);
+    fs::write(
+        fixture.graph_root.join("notes/twin-one.md"),
+        "title:: R5a Twin\n\n- TODO r5a twin accepted\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/twin-two.md"),
+        "title:: R5a Twin\n\n- DONE r5a twin pending\n",
+    )
+    .unwrap();
+    let handle = r4a_reopen(&fixture);
+    let files = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .map(|page| page.rel_path)
+        .collect::<Vec<_>>();
+    assert!(
+        files.contains(&"notes/twin-one.md".to_owned())
+            && files.contains(&"notes/twin-two.md".to_owned()),
+        "both files are on disk: {files:?}"
+    );
+    let second = handle
+        .load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "notes/twin-two.md".into(),
+            },
+        })
+        .unwrap();
+    assert!(
+        matches!(second, SyncApplicationPageLoadOutcome::Missing { .. }),
+        "a second file of one display name is not a second Managed page: {second:?}"
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// A flush LATER than the capture required is not stale: the answer is "as of
+/// overlay acquisition" (plan §2B). The second pending save lands inside the
+/// executor's own pre-open hook, and `pending_overlay_state()` forces its flush
+/// there, so the outcome is deterministic rather than a race with the worker.
+///
+/// The entry is stored under the OLD stamp; the next turn computes a new
+/// `overlay_revision`, misses, and captures again — which is what is asserted,
+/// never that the memo is empty.
+#[test]
+fn r5a_a_later_overlay_flush_than_the_capture_required_is_not_stale() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    let fixture = r5a_fixture("r5a-later-flush", 0x5a06);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a first pending");
+
+    let pushed = std::cell::Cell::new(0usize);
+    let handle_for_hook: *const SyncRuntimeHandle = &handle;
+    crate::managed_query::set_before_managed_open_hook(Some(Box::new(move || {
+        if pushed.replace(1) != 0 {
+            return;
+        }
+        // SAFETY: the executor runs on THIS thread, inside this test's own
+        // call, and the handle outlives the hook, which is cleared below. A
+        // `close`/`clean_shutdown` here WOULD deadlock (the drain waits for
+        // this thread's slot); a save does not.
+        let handle = unsafe { &*handle_for_hook };
+        r5a_pending_append(handle, "notes/Zebra.md", "TODO r5a second pending");
+        // Force the flush: without it the open races the worker, and the
+        // outcome would be either the OLD state (the second page's effects
+        // missing) or `Stale` (a flush between the two validations).
+        let (_, state) = handle
+            .pending_overlay_state()
+            .unwrap()
+            .expect("the overlay is installed");
+        assert!(
+            state.pending_paths.contains("notes/Zebra.md"),
+            "the second pending save must be flushed before the open: {state:?}"
+        );
+        assert!(state.incomplete.is_empty(), "{state:?}");
+    })));
+
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let answered = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    crate::managed_query::set_before_managed_open_hook(None);
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 1, 0, 0, 0),
+        "a later flush than the capture required is not stale"
+    );
+    // The answer carries BOTH pending pages' effects: it is the walk's answer
+    // at the state the overlay was acquired at, which is now the actor's state.
+    let walk = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    r4a_assert_same("answer as of overlay acquisition", &answered, &walk);
+
+    // The entry was stored under the OLD stamp and is unreachable at the new
+    // one: the next query captures again and the injected outcome is consumed.
+    r4b_inject(&handle, vec![Outcome::Busy]);
+    let _ = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(
+        handle
+            .inner
+            .managed_query
+            .injected_outcomes
+            .lock()
+            .unwrap()
+            .len(),
+        0,
+        "the memo entry under the older overlay revision must be unreachable"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The other half of the coherence proof: the overlay snapshot is pinned FIRST,
+/// so a real ACCEPTED-frontier advance in the same window fails the second open
+/// and the execution is `Stale`. The handle re-captures — with no pending
+/// suffix left — and answers at the new frontier.
+#[test]
+fn r5a_an_accepted_advance_between_the_two_opens_is_a_stale_recapture() {
+    let fixture = r5a_fixture("r5a-accepted-advance", 0x5a07);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a advance witness");
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+    let drained = std::cell::Cell::new(0usize);
+    let handle_for_hook: *const SyncRuntimeHandle = &handle;
+    crate::managed_query::set_before_managed_open_hook(Some(Box::new(move || {
+        if drained.replace(1) != 0 {
+            return;
+        }
+        // SAFETY: as above — the executor runs on this thread inside this call.
+        let handle = unsafe { &*handle_for_hook };
+        drain_managed_local(handle);
+    })));
+
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let answered = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    crate::managed_query::set_before_managed_open_hook(None);
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 0, 0, 0, 1),
+        "the pending open is Stale, and the re-capture is the ACCEPTED route"
+    );
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    let walk = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    r4a_assert_same("answer at the new frontier", &answered, &walk);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// An overlay that cannot be OPENED costs a WALK, never an answer and never a
+/// refusal: availability over refusal for a cache that could not be built
+/// (`managed_overlay.rs` module doc), which supersedes the R5 design note's
+/// `Failed`. Nothing is memoized, so the next query captures again.
+///
+/// The overlay's three files are removed from inside the executor's own
+/// pre-open hook: the worker keeps its own descriptor, and the read-only
+/// `open_direct` of a path that is no longer there is `Unavailable`. (Marking
+/// the owner `failed` reaches the same disposition through the same branch of
+/// `open_snapshot`, but `PendingOverlay::mark_failed` is actor-side state with
+/// no test accessor on the handle, and `sync_runtime.rs` is not in this lane's
+/// write set.)
+#[test]
+fn r5a_an_unopenable_overlay_walks_and_counts_a_fallback() {
+    let fixture = r5a_fixture("r5a-overlay-unavailable", 0x5a08);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a unavailable witness");
+    let (overlay_path, _) = r5a_overlay(&handle);
+    let walk = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    assert!(walk.total > 0);
+
+    let removed = std::cell::Cell::new(0usize);
+    crate::managed_query::set_before_managed_open_hook(Some(Box::new(move || {
+        if removed.replace(1) != 0 {
+            return;
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = overlay_path.as_os_str().to_os_string();
+            name.push(suffix);
+            let _ = fs::remove_file(name);
+        }
+    })));
+
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let answered = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    crate::managed_query::set_before_managed_open_hook(None);
+    assert_eq!(
+        r5a_census(&handle),
+        (0, 0, 1, 0, 0),
+        "an unopenable overlay is one counted fallback and no statement read"
+    );
+    r4a_assert_same("walk after an unopenable overlay", &answered, &walk);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// D-3 on the OVERLAY file: a row that decodes wrong inside a successfully
+/// opened, validated snapshot FAILS the read. It is never a silently smaller
+/// answer, never a walk (SPEC §5.9 M10), and nothing is memoized.
+///
+/// Two damages, each on its own runtime, mirroring the accepted file's gate:
+/// the descriptor's `query_block_results` row for an admitted block (the LEFT
+/// JOIN miss), and one admitted block's required `block_text` payload row under
+/// a `(task TODO)` shape whose MATCH set does not read that table. For a
+/// CONTENT shape a deleted `block_text` row leaves the match set instead — R4a
+/// finding F1, contract §"What no read can see" — so it is recorded here and
+/// not asserted.
+#[test]
+fn r5a_a_damaged_overlay_row_fails_the_pending_read() {
+    let damages: [(&str, &str, &str); 2] = [
+        (
+            "descriptor",
+            "(content-regex \"r5a\")",
+            "DELETE FROM query_block_results WHERE block_id IN \
+             (SELECT block_id FROM blocks WHERE page_id IN \
+             (SELECT page_id FROM pages WHERE path = ?1))",
+        ),
+        (
+            "payload",
+            "(task TODO)",
+            "DELETE FROM block_text WHERE block_id IN \
+             (SELECT block_id FROM blocks WHERE page_id IN \
+             (SELECT page_id FROM pages WHERE path = ?1))",
+        ),
+    ];
+    for (index, (label, query, damage)) in damages.into_iter().enumerate() {
+        let fixture = r5a_fixture(
+            &format!("r5a-overlay-damage-{label}"),
+            0x5a09 + index as u128,
+        );
+        let handle = r4a_reopen(&fixture);
+        r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a damage witness");
+        let (overlay_path, state) = r5a_overlay(&handle);
+        assert!(state.pending_paths.contains("notes/Delta.md"), "{state:?}");
+
+        handle.clear_application_simple_query_memo().unwrap();
+        handle.reset_managed_query_census();
+        let writer = rusqlite::Connection::open(&overlay_path).unwrap();
+        let removed = writer.execute(damage, ["notes/Delta.md"]).unwrap();
+        drop(writer);
+        assert!(removed > 0, "{label}: the damage must remove a row");
+
+        let error = r4a_navigate(&handle, query, R5A_ROWS, R5A_BYTES).unwrap_err();
+        assert_eq!(
+            error,
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_simple_query_managed_read"
+            ),
+            "{label}: a damaged overlay row is an error, never fewer rows"
+        );
+        assert_eq!(
+            r5a_census(&handle),
+            (0, 0, 0, 1, 0),
+            "{label}: one failed read, no fallback"
+        );
+        // Nothing memoized: the next query captures and fails again for the
+        // same reason rather than answering from a cache.
+        let again = r4a_navigate(&handle, query, R5A_ROWS, R5A_BYTES).unwrap_err();
+        assert_eq!(again, error, "{label}");
+        assert_eq!(r5a_census(&handle), (0, 0, 0, 2, 0), "{label}");
+    }
+}
+
+/// The mask read's own refusal: an ACCEPTED file holding two `pages` rows at
+/// one pending path. Masking one of them would leave the other's rows beside
+/// the overlay's; masking neither would double the page. The walk refuses the
+/// same shape (`application_simple_query_overlay_path_ambiguous`), so the
+/// two-source read refuses too (D-3).
+#[test]
+fn r5a_an_ambiguous_accepted_path_fails_the_pending_read() {
+    let fixture = r5a_fixture("r5a-ambiguous-path", 0x5a0b);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a ambiguous witness");
+    let (_, state) = r5a_overlay(&handle);
+    assert!(state.pending_paths.contains("notes/Delta.md"), "{state:?}");
+
+    // The runtime cannot author two accepted `pages` rows at one path (the
+    // accept path keys a page by its path), so the fixture is built at the
+    // storage level: a second row copied from an unrelated accepted page and
+    // re-pathed onto the pending one.
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
+    let changed = writer
+        .execute(
+            "UPDATE pages SET path = ?1 WHERE path = ?2",
+            ["notes/Delta.md", "notes/Bravo.md"],
+        )
+        .unwrap();
+    drop(writer);
+    assert_eq!(changed, 1, "the fixture must gain a duplicate path");
+
+    let error = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
+    assert_eq!(
+        error,
+        SyncApplicationPageRequestError::ActorRefusedAt("application_simple_query_managed_read"),
+        "an ambiguous accepted path is an error, never a duplicated or dropped page"
+    );
+    assert_eq!(r5a_census(&handle), (0, 0, 0, 1, 0));
+}
+
+/// A drain reaches a PENDING read mid-flight: both snapshots were registered
+/// under the one slot, so the drain cancels the read, the walk answers, nothing
+/// is counted as a fallback, and the drain does not return until the job has
+/// released its slot (I-21). The overlay file still exists when the read stops;
+/// it is deleted only with the runtime, after the drain.
+#[test]
+fn r5a_a_drain_cancels_a_live_pending_read_and_waits_for_its_slot() {
+    use std::sync::mpsc;
+    let fixture = r5a_fixture("r5a-pending-drain", 0x5a0c);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a drain witness");
+    let (overlay_path, _) = r5a_overlay(&handle);
+    let walk = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    assert!(walk.total > 0);
+    handle.reset_managed_query_census();
+
+    let probe = match handle
+        .managed_query_jobs()
+        .acquire_within(Duration::from_secs(5))
+    {
+        crate::query_jobs::Admission::Slot(slot) => slot,
+        _ => panic!("the owner must admit a probe"),
+    };
+
+    let answered = std::thread::scope(|scope| {
+        let (reached_tx, reached) = mpsc::channel::<()>();
+        let (resume_tx, resume) = mpsc::channel::<()>();
+        let handle_ref = &handle;
+        let query = scope.spawn(move || {
+            crate::query::results::set_before_payload_batch_hook(Some(Box::new(move |_batch| {
+                let _ = reached_tx.send(());
+                let _ = resume.recv();
+            })));
+            let answer = r4a_navigate(handle_ref, "(task TODO)", R5A_ROWS, R5A_BYTES);
+            crate::query::results::set_before_payload_batch_hook(None);
+            answer
+        });
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the pending read must reach its payload batch");
+        assert_eq!(handle.managed_query_jobs().active(), 2);
+
+        let jobs = handle.managed_query_jobs();
+        let drainer = scope.spawn(move || jobs.cancel_all_and_drain());
+        let started = Instant::now();
+        while !probe.is_cancelled() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the drain must cancel every admitted job"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !drainer.is_finished(),
+            "the drain must not return while a job still holds its slot"
+        );
+        assert!(
+            overlay_path.exists(),
+            "the overlay file outlives every reader of it (I-21)"
+        );
+        drop(probe);
+        let _ = resume_tx.send(());
+        drainer.join().unwrap();
+        assert_eq!(handle.managed_query_jobs().active(), 0, "I-21");
+        query.join().unwrap().unwrap()
+    });
+
+    assert_eq!(
+        r5a_census(&handle),
+        (0, 0, 0, 0, 0),
+        "a drain's cancellation is answered by the walk and counted nowhere"
+    );
+    r4a_assert_same("walk after a drain", &answered, &walk);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    drop(handle);
+    assert!(
+        !overlay_path.exists(),
+        "the overlay is deleted with its runtime, after the drain"
+    );
+}
+
+/// Capacity bounds the PENDING route too: no slot within the wait is `Busy`,
+/// the walk answers, and it IS counted as a fallback.
+#[test]
+fn r5a_an_exhausted_job_owner_walks_while_pending() {
+    let fixture = r5a_fixture("r5a-pending-busy", 0x5a0d);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a busy witness");
+    let walk = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    assert!(walk.total > 0);
+
+    *handle.inner.managed_query.job_wait.lock().unwrap() = Some(Duration::from_millis(5));
+    let mut held = Vec::new();
+    loop {
+        match handle
+            .managed_query_jobs()
+            .acquire_within(Duration::from_millis(5))
+        {
+            crate::query_jobs::Admission::Slot(slot) => held.push(slot),
+            crate::query_jobs::Admission::Busy => break,
+            crate::query_jobs::Admission::Cancelled => panic!("the owner must not be closed"),
+        }
+    }
+    assert_eq!(held.len(), crate::query_jobs::DEFAULT_QUERY_JOB_CAPACITY);
+
+    handle.reset_managed_query_census();
+    let walked = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (0, 0, 1, 0, 0),
+        "no slot within the wait is one counted fallback and no statement read"
+    );
+    r4a_assert_same("walk after Busy while pending", &walked, &walk);
+
+    drop(held);
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let read = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 1, 0, 0, 0),
+        "a freed slot puts the next pending query back on the two-source route"
+    );
+    r4a_assert_same("pending read after the slots freed", &read, &walk);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Every SQL-gate shape that R5b's turn rule captures while pending, over the
+/// fast corpus with three pending edits, against the walk.
+///
+/// The shapes are the SQL gates' own tables filtered to `page_locality() ==
+/// Local` and no property leaf; the ones that WALK under the turn rule are
+/// counted and reported rather than skipped silently.
+fn r5a_shape_parity_over(handle: &SyncRuntimeHandle, label: &str) -> (usize, usize, Vec<String>) {
+    use crate::query::sql::sql_gates_tests::{CONTENT_PLAN_SHAPES, IDENTITY_SHAPES, PLAN_SHAPES};
+
+    let mut sources: Vec<String> = Vec::new();
+    for (source, _dialect) in IDENTITY_SHAPES.iter().chain(PLAN_SHAPES.iter()) {
+        sources.push((*source).to_owned());
+    }
+    for (source, _dialect, _plan) in CONTENT_PLAN_SHAPES {
+        sources.push((*source).to_owned());
+    }
+    let today = crate::date::JournalDate::today();
+    let mut captured = 0usize;
+    let mut walked = 0usize;
+    let mut differences = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        // R5b's turn rule, applied to the same parse the actor applies it to.
+        let (parsed, _view) = crate::query::parse_query_source(source, today);
+        let capturable = !parsed.filter.has_props_leaf()
+            && parsed.page_locality() == crate::query::ir::PageLocality::Local;
+        if !capturable {
+            walked += 1;
+            continue;
+        }
+        captured += 1;
+        let at = format!("{label}: shape #{index}");
+        let expected = r5a_walk(handle, source, R5A_ROWS, R5A_BYTES);
+        handle.reset_managed_query_census();
+        let actual = match r4a_navigate(handle, source, R5A_ROWS, R5A_BYTES) {
+            Ok(actual) => actual,
+            Err(error) => {
+                differences.push(format!("{at} failed: {error}"));
+                continue;
+            }
+        };
+        let (statement_reads, pending_reads, fallbacks, failures, _) = r5a_census(handle);
+        if statement_reads > 1
+            || pending_reads != statement_reads
+            || fallbacks != 0
+            || failures != 0
+            || (statement_reads == 0 && expected.total > 0)
+        {
+            differences.push(format!(
+                "{at} did not answer from the two-source read: \
+                 statement_reads={statement_reads} pending_reads={pending_reads} \
+                 fallbacks={fallbacks} failures={failures} walk_total={}",
+                expected.total
+            ));
+        }
+        if actual.total != expected.total || actual.exceeded != expected.exceeded {
+            differences.push(format!(
+                "{at} total/exceeded walk=({},{}) read=({},{})",
+                expected.total, expected.exceeded, actual.total, actual.exceeded
+            ));
+        }
+        if serde_json::to_value(&actual.groups).unwrap()
+            != serde_json::to_value(&expected.groups).unwrap()
+        {
+            differences.push(format!(
+                "{at} groups differ (walk groups={} read groups={})",
+                expected.groups.len(),
+                actual.groups.len()
+            ));
+        }
+    }
+    (captured, walked, differences)
+}
+
+/// Three pending edits on the fast corpus the SQL gates own, then every
+/// capturable shape against the walk.
+#[test]
+fn r5a_the_pending_route_answers_every_page_local_shape_exactly_as_the_walk() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("r5a-shape-parity", 0x5a0e);
+    let handle = r4a_reopen(&fixture);
+    let mut edited = 0usize;
+    for page in Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .take(3)
+    {
+        r5a_pending_append(&handle, &page.rel_path, "TODO r5a shape-parity witness");
+        edited += 1;
+    }
+    assert_eq!(edited, 3, "the fast corpus must offer three pages to edit");
+    let (_, state) = r5a_overlay(&handle);
+    assert_eq!(state.pending_paths.len(), 3, "{state:?}");
+
+    let (captured, walked, differences) = r5a_shape_parity_over(&handle, "fast corpus");
+    eprintln!("r5a_pending_shape_parity captured={captured} walked_by_turn_rule={walked}");
+    assert!(captured > 0, "no shape reached the pending route");
+    assert!(
+        differences.is_empty(),
+        "the pending read and the walk disagree over {captured} shapes:\n{}",
+        differences.join("\n")
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The same bar over the anonymized graph (AGENTS §4 tier 2). Only shape
+/// INDICES and counts are printed — never a source, a page name or a row.
+#[test]
+#[ignore = "acceptance gate over a real corpus: set TINE_QUERY_IDENTITY_GRAPH"]
+fn r5a_the_pending_route_answers_every_page_local_shape_over_a_real_corpus() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let Some(root) = std::env::var_os("TINE_QUERY_IDENTITY_GRAPH") else {
+        eprintln!("skipped: set TINE_QUERY_IDENTITY_GRAPH to a corpus directory");
+        return;
+    };
+    let fixture = ActivationFixture::copied_graph("r5a-corpus-parity", 0x5a0f, Path::new(&root));
+    let handle = r4a_reopen(&fixture);
+    // A handful of pending edits chosen by the seed, so the pending set is a
+    // sample of the corpus rather than its first pages.
+    let pages = Graph::open(&fixture.graph_root).list_pages();
+    assert!(!pages.is_empty());
+    let mut seed = 0x5a0fu128;
+    let mut chosen = std::collections::BTreeSet::new();
+    for _ in 0..32 {
+        if chosen.len() >= 5.min(pages.len()) {
+            break;
+        }
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        chosen.insert((seed % pages.len() as u128) as usize);
+    }
+    for index in &chosen {
+        r5a_pending_append(&handle, &pages[*index].rel_path, "TODO r5a corpus witness");
+    }
+    assert!(!chosen.is_empty());
+    let (_, state) = r5a_overlay(&handle);
+    assert!(
+        state.failed.is_none(),
+        "the overlay must build on the corpus"
+    );
+
+    let (captured, walked, differences) = r5a_shape_parity_over(&handle, "corpus");
+    eprintln!(
+        "r5a_pending_route_over_a_real_corpus pending_pages={} captured={captured} \
+         walked_by_turn_rule={walked} disagreements={}",
+        state.pending_paths.len(),
+        differences.len()
+    );
+    assert!(captured > 0);
+    assert!(
+        differences.is_empty(),
+        "the pending read and the walk disagree on a real graph:\n{}",
+        differences.join("\n")
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// I-13's claim, measured rather than argued: the same bounded query over the
+/// same pending state, answered by the walk and by the two-source read.
+/// Reports only timings and counts, never a query source or a page name.
+#[test]
+#[ignore = "paired-base pending measurement: set TINE_QUERY_IDENTITY_GRAPH"]
+fn r5a_the_pending_walk_and_the_pending_read_are_timed_on_a_real_corpus() {
+    let Some(root) = std::env::var_os("TINE_QUERY_IDENTITY_GRAPH") else {
+        eprintln!("skipped: set TINE_QUERY_IDENTITY_GRAPH to a corpus directory");
+        return;
+    };
+    const SAMPLES: usize = 20;
+    let fixture = ActivationFixture::copied_graph("r5a-corpus-timing", 0x5a10, Path::new(&root));
+    let handle = r4a_reopen(&fixture);
+    let page = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .expect("the corpus has pages");
+    r5a_pending_append(&handle, &page.rel_path, "TODO r5a timing witness");
+    let query = "(task TODO)";
+
+    let mut walk_us = Vec::new();
+    let mut read_us = Vec::new();
+    for _ in 0..SAMPLES {
+        handle.clear_application_simple_query_memo().unwrap();
+        let started = Instant::now();
+        let walked = handle
+            .application_complete_page_simple_query(query, R5A_ROWS, R5A_BYTES)
+            .unwrap();
+        walk_us.push(started.elapsed().as_micros());
+        handle.clear_application_simple_query_memo().unwrap();
+        let started = Instant::now();
+        let read = r4a_navigate(&handle, query, R5A_ROWS, R5A_BYTES).unwrap();
+        read_us.push(started.elapsed().as_micros());
+        assert_eq!(walked.total, read.total, "the two routes must agree");
+    }
+    walk_us.sort_unstable();
+    read_us.sort_unstable();
+    eprintln!(
+        "r5a_pending_paired_base samples={SAMPLES} pending_pages=1 \
+         walk_median_us={} read_median_us={}",
+        walk_us[SAMPLES / 2],
+        read_us[SAMPLES / 2]
+    );
+
+    // The overlay buffer's cost for a big pending set, measured on the same
+    // corpus: ~1000 pending blocks, and the bytes the merged constructor holds
+    // for them. One save cannot carry them — the actor refuses a request above
+    // 512 blocks (`RequestTooLarge`) — so the pending set is two pages of 500,
+    // which is the same buffer either way: it holds ROWS, not pages.
+    let mut big_paths = Vec::new();
+    for (index, target) in Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .take(2)
+        .enumerate()
+    {
+        let (mut big, revision) = load_application_exact(&handle, &target.rel_path);
+        big.blocks = (0..500)
+            .map(|block| {
+                application_move_test_root(&format!("TODO r5a buffered {index}-{block}"), 0)
+            })
+            .collect();
+        let save = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: big.path.clone(),
+                    revision,
+                },
+                page: big,
+            })
+            .unwrap();
+        assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+        big_paths.push(target.rel_path);
+    }
+    let (_, state) = r5a_overlay(&handle);
+    assert!(state.failed.is_none(), "{state:?}");
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    crate::query::results::reset_buffered_descriptor_bytes();
+    let started = Instant::now();
+    let answered = r4a_navigate(&handle, query, R5A_ROWS, R5A_BYTES).unwrap();
+    let elapsed = started.elapsed().as_micros();
+    let buffered = crate::query::results::buffered_descriptor_bytes();
+    assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0));
+    eprintln!(
+        "r5a_pending_big_page pages={} blocks=1000 total={} read_us={elapsed} \
+         buffered_rows={} buffered_bytes={}",
+        big_paths.len(),
+        answered.total,
+        buffered.0,
+        buffered.1
+    );
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),

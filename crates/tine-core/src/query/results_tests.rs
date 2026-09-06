@@ -1398,3 +1398,346 @@ fn journals_and_pages_keep_their_kind() {
         "the fixture's ordinary pages must reach the answer as pages"
     );
 }
+
+// ===== R5a: the merged read =====
+
+/// `(path, page_id)` for every page of a projection, in BINARY path order.
+fn projection_pages(path: &Path) -> Vec<(String, [u8; 16])> {
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(path, || Ok(()))
+        .expect("the projection opens");
+    let rows = snapshot
+        .run_projection_query("SELECT path, page_id FROM pages ORDER BY path", &[])
+        .expect("the page rows are readable");
+    snapshot.finish();
+    rows.iter()
+        .map(|row| match (row.first(), row.get(1)) {
+            (Some(PhysicalQueryValue::Text(path)), Some(PhysicalQueryValue::Blob(id)))
+                if id.len() == 16 =>
+            {
+                (
+                    path.clone(),
+                    id.as_slice().try_into().expect("a 16-byte page id"),
+                )
+            }
+            other => panic!("pages selects (path, page_id), got {other:?}"),
+        })
+        .collect()
+}
+
+/// **One source is today's behaviour, byte for byte.**
+///
+/// `read_results` is re-expressed as a one-source `read_results_merged`, so the
+/// single-source path IS the merged path. This gate pins that relationship
+/// rather than assuming it: the two entry points are called SEPARATELY, on
+/// separate snapshots, over every shape and bound, and both the whole
+/// `PreViewGroups` and the whole `ResultReadCensus` must be equal. A later
+/// fork of `read_results` into its own body fails here first.
+#[test]
+fn a_one_source_merged_read_is_the_single_source_read() {
+    use crate::query::results::{read_results_merged, ResultReadShared, ResultSource};
+    let _serial = serialize();
+    let root = scratch("r5a-one-source");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let graph_root = corpus.root.clone();
+    let mut compared = 0usize;
+    for (source, dialect) in every_shape() {
+        let (_query, statement) = corpus.lower_block_anchored(source, dialect);
+        if statement.matches_nothing {
+            continue;
+        }
+        for (max_rows, max_bytes, profile) in bound_combinations() {
+            let recency = recency_for(&graph_root);
+            let mut snapshot = corpus.snapshot();
+            reset_result_read_census();
+            let single = read_results(
+                &mut snapshot,
+                &ResultReadInputs {
+                    statement: &statement,
+                    order: BackendOrder::Managed,
+                    identity: &ResultIdentity::Stored,
+                    max_rows,
+                    max_bytes,
+                    profile,
+                    recency: &recency,
+                },
+            )
+            .expect("the single-source read answers");
+            let single_census = result_read_census();
+            snapshot.finish();
+
+            let recency = recency_for(&graph_root);
+            let mut snapshot = corpus.snapshot();
+            reset_result_read_census();
+            let merged = read_results_merged(
+                &mut [ResultSource {
+                    snapshot: &mut snapshot,
+                    statement: &statement,
+                }],
+                &ResultReadShared {
+                    order: BackendOrder::Managed,
+                    identity: &ResultIdentity::Stored,
+                    max_rows,
+                    max_bytes,
+                    profile,
+                    recency: &recency,
+                },
+            )
+            .expect("the one-source merged read answers");
+            let merged_census = result_read_census();
+            snapshot.finish();
+
+            let label = format!("{source} rows={max_rows} bytes={max_bytes}");
+            assert!(
+                differences(&label, &single, &merged).is_empty(),
+                "one source is not today's answer: {}",
+                differences(&label, &single, &merged).join("\n")
+            );
+            assert_eq!(
+                single_census, merged_census,
+                "{label}: one source is not today's read arithmetic"
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 0, "the gate compared nothing");
+}
+
+/// **Two sources are one answer.** The two halves of ONE projection — the same
+/// file copied twice, each lowered with §5.9's mask over the OTHER half's page
+/// ids, exactly as the Managed pending route masks the accepted file — merge
+/// into the answer the whole projection gives in one read: same rows, same
+/// order, same `total`, same `exceeded`, same public ids, under every bound.
+///
+/// Two copies of one file rather than two corpora, deliberately: the page ids,
+/// the stored `result_id`s and the stored estimates are then IDENTICAL on both
+/// sides, so a difference can only be the merge.
+///
+/// The ordering corpus is the one whose paths separate SQLite's BINARY
+/// collation from anything case-folding, and its two physical pages named
+/// `Alpha` land in DIFFERENT sources — the pending route's same-display-name
+/// case, which stays two groups before the view.
+#[test]
+fn two_sources_merge_in_the_base_order_under_one_budget() {
+    use crate::query::results::{read_results_merged, ResultReadShared, ResultSource};
+    let _serial = serialize();
+    let root = scratch("r5a-two-sources");
+    write_ordering_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let graph_root = corpus.root.clone();
+    let pages = projection_pages(&corpus.projection_path());
+    assert!(pages.len() >= 7, "the ordering corpus lost pages");
+
+    // The BUFFERED half and the STREAMED half interleave in BINARY path order,
+    // and the two `Alpha`s are split across them.
+    let buffered_paths = ["pages/Alpha.md", "pages/Caf\u{e9}.md", "pages/_leading.md"];
+    let buffered_ids: Vec<[u8; 16]> = pages
+        .iter()
+        .filter(|(path, _)| buffered_paths.contains(&path.as_str()))
+        .map(|(_, id)| *id)
+        .collect();
+    let streamed_ids: Vec<[u8; 16]> = pages
+        .iter()
+        .filter(|(path, _)| !buffered_paths.contains(&path.as_str()))
+        .map(|(_, id)| *id)
+        .collect();
+    assert_eq!(buffered_ids.len(), buffered_paths.len(), "{pages:?}");
+    assert!(streamed_ids.len() >= 4);
+
+    let buffered_file = copy_projection(&corpus, "merge-buffered");
+    let streamed_file = copy_projection(&corpus, "merge-streamed");
+
+    let mut compared = 0usize;
+    for (source, dialect) in [
+        ("content match 'marker'", QueryDialect::Tql),
+        ("(content-regex \"marker\")", QueryDialect::Og),
+    ] {
+        // Each source sees only its own half: the other half is MASKED, which
+        // is what makes the two page sets disjoint.
+        let (_query, whole) = corpus.lower_block_anchored(source, dialect);
+        let (_query, buffered_statement) =
+            corpus.lower_block_anchored_masked(source, dialect, &streamed_ids);
+        let (_query, streamed_statement) =
+            corpus.lower_block_anchored_masked(source, dialect, &buffered_ids);
+
+        let unbounded = {
+            let recency = recency_for(&graph_root);
+            let mut snapshot = corpus.snapshot();
+            let answer = read_results(
+                &mut snapshot,
+                &ResultReadInputs {
+                    statement: &whole,
+                    order: BackendOrder::Managed,
+                    identity: &ResultIdentity::Stored,
+                    max_rows: usize::MAX,
+                    max_bytes: usize::MAX,
+                    profile: ConstructionProfile::default(),
+                    recency: &recency,
+                },
+            )
+            .expect("the whole projection answers");
+            snapshot.finish();
+            answer
+        };
+        assert!(unbounded.total >= 7, "{source}: {}", unbounded.total);
+        let names: Vec<&str> = unbounded
+            .groups
+            .iter()
+            .map(|group| group.page.as_str())
+            .collect();
+        assert_eq!(
+            names.iter().filter(|name| **name == "Alpha").count(),
+            2,
+            "the fixture must hold two physical pages named Alpha"
+        );
+
+        let mut bounds: Vec<(usize, usize, ConstructionProfile)> = bound_combinations();
+        for budget in byte_boundaries(&unbounded) {
+            bounds.push((usize::MAX, budget, ConstructionProfile::default()));
+        }
+        for rows in 1..=unbounded.total.min(8) {
+            bounds.push((rows, usize::MAX, ConstructionProfile::default()));
+        }
+
+        for (max_rows, max_bytes, profile) in bounds {
+            let label = format!("{source} rows={max_rows} bytes={max_bytes} {profile:?}");
+            let recency = recency_for(&graph_root);
+            let mut snapshot = corpus.snapshot();
+            reset_result_read_census();
+            let expected = read_results(
+                &mut snapshot,
+                &ResultReadInputs {
+                    statement: &whole,
+                    order: BackendOrder::Managed,
+                    identity: &ResultIdentity::Stored,
+                    max_rows,
+                    max_bytes,
+                    profile,
+                    recency: &recency,
+                },
+            )
+            .expect("the whole projection answers");
+            let expected_census = result_read_census();
+            snapshot.finish();
+
+            let recency = recency_for(&graph_root);
+            let mut buffered_snapshot =
+                PhysicalProjectionQuerySnapshot::open_direct(&buffered_file, || Ok(()))
+                    .expect("the buffered copy opens");
+            let mut streamed_snapshot =
+                PhysicalProjectionQuerySnapshot::open_direct(&streamed_file, || Ok(()))
+                    .expect("the streamed copy opens");
+            reset_result_read_census();
+            let merged = read_results_merged(
+                &mut [
+                    ResultSource {
+                        snapshot: &mut buffered_snapshot,
+                        statement: &buffered_statement,
+                    },
+                    ResultSource {
+                        snapshot: &mut streamed_snapshot,
+                        statement: &streamed_statement,
+                    },
+                ],
+                &ResultReadShared {
+                    order: BackendOrder::Managed,
+                    identity: &ResultIdentity::Stored,
+                    max_rows,
+                    max_bytes,
+                    profile,
+                    recency: &recency,
+                },
+            )
+            .expect("the merged read answers");
+            let merged_census = result_read_census();
+            buffered_snapshot.finish();
+            streamed_snapshot.finish();
+
+            let found = differences(&label, &expected, &merged);
+            assert!(
+                found.is_empty(),
+                "two sources are not one answer:\n{}",
+                found.join("\n")
+            );
+            // Every match is SEEN exactly once across the two sources, whatever
+            // the budget did with it — that is what makes `total` the walk's.
+            //
+            // The one exception is the unsorted `(sample N)` cap, the only
+            // early exit there is: the buffered source is read to its end
+            // BEFORE the merge starts, so a break that would have left rows
+            // unread in a single source has already read them here. The answer
+            // is still the walk's (checked above, `total` included) — only the
+            // rows physically pulled from SQL differ, and never downwards.
+            if profile.sample_admission_cap.is_none() {
+                assert_eq!(
+                    merged_census.descriptor_rows, expected_census.descriptor_rows,
+                    "{label}: the merged read saw a different number of matches"
+                );
+            } else {
+                assert!(
+                    merged_census.descriptor_rows >= expected_census.descriptor_rows,
+                    "{label}: the merged read saw fewer matches than the single source \
+                     ({} < {})",
+                    merged_census.descriptor_rows,
+                    expected_census.descriptor_rows
+                );
+            }
+            compared += 1;
+        }
+    }
+    assert!(compared > 0);
+    let _ = std::fs::remove_file(&buffered_file);
+    let _ = std::fs::remove_file(&streamed_file);
+}
+
+/// D-3: the sources' pages must be DISJOINT. Two sources that both answer for
+/// one page would count and emit it twice, so the merged read FAILS instead —
+/// the assertion behind the pending route's mask, held even if the mask were
+/// ever computed wrongly (a missed rename side is the shape that would do it).
+#[test]
+fn a_page_reachable_from_two_sources_fails_the_merged_read() {
+    use crate::query::results::{read_results_merged, ResultReadShared, ResultSource};
+    let _serial = serialize();
+    let root = scratch("r5a-two-sources-overlap");
+    write_ordering_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let graph_root = corpus.root.clone();
+    let one = copy_projection(&corpus, "overlap-one");
+    let two = copy_projection(&corpus, "overlap-two");
+    // Neither statement masks anything, so BOTH sources answer for every page.
+    let (_query, statement) =
+        corpus.lower_block_anchored("content match 'marker'", QueryDialect::Tql);
+    let recency = recency_for(&graph_root);
+    let mut first = PhysicalProjectionQuerySnapshot::open_direct(&one, || Ok(())).expect("one");
+    let mut second = PhysicalProjectionQuerySnapshot::open_direct(&two, || Ok(())).expect("two");
+    let answer = read_results_merged(
+        &mut [
+            ResultSource {
+                snapshot: &mut first,
+                statement: &statement,
+            },
+            ResultSource {
+                snapshot: &mut second,
+                statement: &statement,
+            },
+        ],
+        &ResultReadShared {
+            order: BackendOrder::Managed,
+            identity: &ResultIdentity::Stored,
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+            profile: ConstructionProfile::default(),
+            recency: &recency,
+        },
+    );
+    first.finish();
+    second.finish();
+    match answer {
+        Err(ResultReadError::Corrupt(what)) => {
+            assert_eq!(what, "page in two sources");
+        }
+        other => panic!("overlapping sources must fail the read, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&one);
+    let _ = std::fs::remove_file(&two);
+}

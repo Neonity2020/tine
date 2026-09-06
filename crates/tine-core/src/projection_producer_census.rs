@@ -1933,9 +1933,20 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // byte-identical because none of those tokens is a journal, immutable,
     // durable-directory or package boundary; the projection write goes through
     // the same `PhysicalGraphProjectionDatabase` type the accepted apply uses.
+    // Re-pinned 2026-09-06 (query engine R5a, the two-source pending read).
+    // Derived by diffing the dump at `2ad7911d` (352 entries) against the
+    // working head (355): added (3), all in `managed_query.rs` and nothing
+    // removed or changed anywhere else — a second
+    // `PhysicalProjectionQuerySnapshot::open_managed(` (the coherence-proof
+    // open of the accepted snapshot AFTER the overlay snapshot, so a
+    // successful open proves no path left the pending set since capture),
+    // ONE `PhysicalQueryValue::Text(` and ONE `PhysicalQueryValue::Blob(`
+    // (decoding the overlay-mask `page_id` lookup and the descriptor row's
+    // path/preorder columns). All read-side; the write-crossing table above is
+    // byte-identical.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "9f5655438c6dbe026c25ced30e54505c3b7b54199b4bacbe6076646ea547dc96",
+        "23513f42e3a756dd36bed48070bb9ed45538af27f867caa74e77d6be8dac239d",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

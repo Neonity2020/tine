@@ -866,11 +866,30 @@ Coherence with the accepted file follows from acceptance itself — a pending
 path leaves the set only when its batch is accepted, which advances the
 acceptance sequence the capture's `open_managed` validates inside its read
 transaction, so a snapshot that opens `Current` was captured before any
-pending page it masks could have moved. Until R5a lands the two-source read,
-the captured pending query executes as `Busy` and walks (R5b, stub); until R5c
-patches the registry off the actor, a query with a property leaf, and any
-query whose relations leave one page (`PageLocality`), still walk on the
-actor uncaptured.
+pending page it masks could have moved.
+
+**A captured pending query is answered off the actor from BOTH databases.**
+The executor opens the overlay first, at the flushed revision the capture
+required or later, and only then opens the accepted file and validates the
+capture's stamp inside that read transaction — that open ORDER is the whole
+coherence proof, because a path can only leave the pending set by being
+accepted, which advances the sequence the validation checks. It then lowers ONE
+compiled query twice: once against the overlay unmasked, once against the
+accepted file with every page of the overlay's pending set masked out (§5.9's
+`NOT IN`), so the two sources are disjoint by construction and no page can be
+answered for twice. The two descriptor streams are merged in the walk's own
+base order — `pages.path` under SQLite's binary collation, then preorder —
+under ONE construction budget, and payloads are read per source only for the
+rows that budget admitted. **The answer is the walk's answer**: same rows, same
+order, same `total`, same `exceeded`, same public ids; no page document is
+loaded and nothing is parsed, on either side. Availability is preferred to
+refusal: an overlay that is unflushed, incomplete or failed opens `Unavailable`
+and the query walks as a counted fallback, and a stale stamp re-captures like
+any other. Only a damaged ROW inside a snapshot that opened and validated is
+`Failed`, and a page the mask failed to remove — reachable from both sources —
+is `Failed` too rather than answered twice. Until R5c patches the registry off
+the actor, a query with a property leaf, and any query whose relations leave
+one page (`PageLocality`), still walk on the actor uncaptured.
 
 ## 2. Enrollment and synchronization state machine
 

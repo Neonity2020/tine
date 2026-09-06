@@ -382,6 +382,18 @@ impl Corpus {
         source: &str,
         dialect: QueryDialect,
     ) -> (crate::query::ir::Query, SqlQuery) {
+        self.lower_block_anchored_masked(source, dialect, &[])
+    }
+
+    /// The same statement with §5.9's overlay mask applied — the shape the
+    /// Managed PENDING route lowers its ACCEPTED source with (R5a). One
+    /// producer, so a masked gate cannot drift from the unmasked one.
+    pub(crate) fn lower_block_anchored_masked(
+        &self,
+        source: &str,
+        dialect: QueryDialect,
+        masked_pages: &[[u8; 16]],
+    ) -> (crate::query::ir::Query, SqlQuery) {
         let today = self.today();
         let (parsed, _view) = crate::query::parse_query_text(source, dialect, today);
         let query = crate::query::block_anchored_query(&parsed);
@@ -390,7 +402,7 @@ impl Corpus {
         let inputs = LoweringInputs {
             today,
             registry: &registry,
-            masked_pages: &[],
+            masked_pages,
             cutoff: None,
             compiled: &compiled,
             fts_ready: self.fts_ready(),
@@ -402,7 +414,18 @@ impl Corpus {
 
     /// `(plan, positively_bounded, matches_nothing)`.
     fn explain(&self, source: &str, dialect: QueryDialect) -> (Vec<String>, bool, bool) {
-        let (_anchor, statement) = self.lower(source, dialect, self.fts_ready(), &[]);
+        self.explain_masked(source, dialect, &[])
+    }
+
+    /// The same plan with §5.9's overlay mask applied — what the pending
+    /// route's ACCEPTED source actually runs (R5a).
+    fn explain_masked(
+        &self,
+        source: &str,
+        dialect: QueryDialect,
+        masked_pages: &[[u8; 16]],
+    ) -> (Vec<String>, bool, bool) {
+        let (_anchor, statement) = self.lower(source, dialect, self.fts_ready(), masked_pages);
         self.bind_regexes(&statement.regexes);
         // The parameters are bound for the EXPLAIN too: with `sqlite_stat4`
         // present the planner may choose differently for a bound value than for
@@ -1679,6 +1702,58 @@ fn a_positively_bounded_query_searches_its_anchor_and_indexes_its_subqueries() {
     );
 }
 
+/// §5.9 + §5.7 together (R5a): the ACCEPTED source of a pending read is lowered
+/// with a non-empty overlay mask, and a mask is a `NOT IN (…)` on the anchor's
+/// page column — the one shape that could push a planner off a positive index
+/// and onto a base-table scan, turning a bounded query into a graph-sized one
+/// (I-13). Every `PLAN_SHAPES` entry therefore has to hold its plan with the
+/// mask on, and a shape that does not is REPORTED here, not quietly excused.
+#[test]
+fn a_masked_statement_keeps_every_plan_shape_off_a_base_table_scan() {
+    let _serial = serialize();
+    let root = scratch("plan-masked");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let masked = mask_sample(&corpus);
+    assert!(
+        masked.len() >= 2,
+        "the mask must name real pages or the gate measures the unmasked plan"
+    );
+    let (failures, vacuous) = measure_plans_masked(&corpus, &masked);
+    assert!(
+        failures.is_empty(),
+        "§5.7 plan gate failures with §5.9's overlay mask applied:\n{}",
+        failures.join("\n")
+    );
+    // Masking pages must not make a shape unsatisfiable either: the fast corpus
+    // spreads every shape over more pages than the mask names.
+    assert!(
+        vacuous.is_empty(),
+        "the mask emptied these plan shapes, so the gate is not measuring them:\n{}",
+        vacuous.join("\n")
+    );
+}
+
+/// A few real page ids from the corpus, in the projection's own order, to mask
+/// with. Ids the projection does not name would be lowered into the statement
+/// all the same, but they would not exercise a planner decision.
+fn mask_sample(corpus: &Corpus) -> Vec<[u8; 16]> {
+    corpus
+        .reader
+        .run_projection_query("SELECT page_id FROM pages ORDER BY path LIMIT 3", &[])
+        .expect("the projection names its pages")
+        .into_iter()
+        .filter_map(|row| match row.first() {
+            Some(PhysicalQueryValue::Blob(id)) if id.len() == 16 => {
+                let mut page = [0u8; 16];
+                page.copy_from_slice(id);
+                Some(page)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The same gate on the anonymized graph, where the row counts are real and the
 /// planner's choices are the ones that matter (AGENTS §4 tier 2).
 #[test]
@@ -1790,10 +1865,15 @@ fn a_nested_refs_child_predicate_cannot_bound_its_anchor() {
 
 /// `(failures, shapes that provably read nothing on this corpus)`.
 fn measure_plans(corpus: &Corpus) -> (Vec<String>, Vec<String>) {
+    measure_plans_masked(corpus, &[])
+}
+
+/// `(failures, shapes that provably read nothing on this corpus)`.
+fn measure_plans_masked(corpus: &Corpus, masked_pages: &[[u8; 16]]) -> (Vec<String>, Vec<String>) {
     let mut failures = Vec::new();
     let mut vacuous = Vec::new();
     for (source, dialect) in PLAN_SHAPES {
-        let (plan, bounded, nothing) = corpus.explain(source, *dialect);
+        let (plan, bounded, nothing) = corpus.explain_masked(source, *dialect, masked_pages);
         if nothing {
             vacuous.push(format!(
                 "{source}: unsatisfiable on this corpus (the key's effective type \

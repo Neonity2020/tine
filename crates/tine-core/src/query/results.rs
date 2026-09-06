@@ -40,6 +40,7 @@
 //! into the middle of an answer.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use tine_storage::sqlite::{
@@ -127,6 +128,43 @@ pub(crate) struct ResultReadInputs<'a> {
     pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
 }
 
+impl<'a> ResultReadInputs<'a> {
+    /// The half of these inputs that a MERGED read shares across its sources.
+    fn shared(&self) -> ResultReadShared<'a> {
+        ResultReadShared {
+            order: self.order,
+            identity: self.identity,
+            max_rows: self.max_rows,
+            max_bytes: self.max_bytes,
+            profile: self.profile,
+            recency: self.recency,
+        }
+    }
+}
+
+/// Everything a result read needs that is NOT per source.
+///
+/// [`ResultReadInputs`] minus the statement. A merged read (R5a: the Managed
+/// pending route) lowers ONE IR into one statement per source — they differ
+/// only in the masked pages and in that source's own FTS readiness — so the
+/// statement is per source and the order, identity, bounds, profile and
+/// recency axis are shared. There is exactly one budget and one set of groups.
+pub(crate) struct ResultReadShared<'a> {
+    pub(crate) order: BackendOrder,
+    pub(crate) identity: &'a ResultIdentity,
+    pub(crate) max_rows: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) profile: ConstructionProfile,
+    pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
+}
+
+/// One source of a merged read: an owned read snapshot and the statement
+/// lowered for it.
+pub(crate) struct ResultSource<'a> {
+    pub(crate) snapshot: &'a mut PhysicalProjectionQuerySnapshot,
+    pub(crate) statement: &'a SqlQuery,
+}
+
 /// What the descriptor row knows about one admitted page, handed to the
 /// caller's recency producer. The two backends' walks read different inputs
 /// (Direct the stored day and path; Managed the kind and name), so the read
@@ -173,12 +211,66 @@ pub(crate) fn read_results(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     inputs: &ResultReadInputs<'_>,
 ) -> Result<PreViewGroups, ResultReadError> {
-    install_regexes(snapshot, inputs.statement)?;
+    read_results_merged(
+        &mut [ResultSource {
+            snapshot,
+            statement: inputs.statement,
+        }],
+        &inputs.shared(),
+    )
+}
+
+/// The same construction over ONE OR MORE projections of one graph (R5a).
+///
+/// The Managed pending route answers from two owned snapshots — the pending
+/// overlay, and the accepted projection with every pending page masked out of
+/// its statement — and the two descriptor streams are merged BEFORE the budget
+/// is charged (plan §2F). Merged order is charge order, so `total`, `exceeded`
+/// and the cut point are exactly the walk's over the same pending state.
+///
+/// **The merge key is the descriptor statement's OWN ordering**, read off the
+/// row that statement already selects: Managed Storage `(pages.path` under
+/// SQLite's BINARY collation, which is `String::cmp` on the UTF-8 bytes,
+/// `query_block_results.preorder)`, Direct Files `(query_page_order.position,
+/// preorder)`. Nothing is added to the SELECT list — `admit_descriptor` rejects
+/// any row whose width is not [`descriptor_column::COLUMNS`].
+///
+/// **The LAST source is streamed; every earlier source is BUFFERED in full.**
+/// A buffered source may not be truncated with a `LIMIT`: `total` counts the
+/// matches SEEN, which is why both callers lower with `cutoff: None`. The
+/// buffer therefore holds the DECODED row — its merge key, its public identity
+/// and its counts, with the page's own fields shared by `Rc` across the page's
+/// blocks — and never the raw `PhysicalQueryValue` vector.
+///
+/// **With exactly one source this IS the single-source read**, statement for
+/// statement and batch for batch: nothing is buffered, nothing is compared, and
+/// the streamed source is the only one.
+///
+/// The sources' pages must be DISJOINT — the Managed pending route masks every
+/// pending page out of the accepted statement — because [`PageGroups`] is keyed
+/// by physical page id. A page id that reaches two sources is
+/// [`ResultReadError::Corrupt`], never a page emitted or counted twice.
+pub(crate) fn read_results_merged(
+    sources: &mut [ResultSource<'_>],
+    shared: &ResultReadShared<'_>,
+) -> Result<PreViewGroups, ResultReadError> {
+    // Per CONNECTION, not per statement: the compiled-regex table is snapshot
+    // state, so each source installs its own statement's program (they compile
+    // the same leaves, so the two programs agree).
+    for source in sources.iter_mut() {
+        install_regexes(source.snapshot, source.statement)?;
+    }
     let mut pages = PageGroups::default();
-    let mut budget = ConstructionBudget::new(inputs.max_rows, inputs.max_bytes);
-    let admitted = read_descriptors(snapshot, inputs, &mut pages, &mut budget)?;
-    read_payload(snapshot, &mut pages, &admitted)?;
-    Ok(pages.finish(inputs, budget))
+    let mut budget = ConstructionBudget::new(shared.max_rows, shared.max_bytes);
+    let admitted = read_descriptors_merged(sources, shared, &mut pages, &mut budget)?;
+    // The payload of the rows the budget admitted, per source over its OWN
+    // snapshot. A group's blocks all come from one source (the pages are
+    // disjoint), so per-source batching keeps each page's `owner_id, ordinal`
+    // order exactly as one source produces it.
+    for (source, admitted) in sources.iter_mut().zip(admitted.iter()) {
+        read_payload(source.snapshot, &mut pages, admitted)?;
+    }
+    Ok(pages.finish(shared, budget))
 }
 
 /// §4.3.2's compiled-regex table for THIS statement, installed unconditionally.
@@ -282,7 +374,7 @@ impl PageGroups {
     /// The pre-view answer: groups that admitted nothing are dropped (the walk
     /// pushes a group only for a non-empty `matched`), and the recency axis is
     /// measured once per surviving page and only when the view needs it.
-    fn finish(self, inputs: &ResultReadInputs<'_>, budget: ConstructionBudget) -> PreViewGroups {
+    fn finish(self, inputs: &ResultReadShared<'_>, budget: ConstructionBudget) -> PreViewGroups {
         let mut groups = Vec::with_capacity(self.order.len());
         let mut recency_by_page = HashMap::new();
         for page in self.order {
@@ -331,57 +423,268 @@ mod descriptor_column {
     pub(super) const COLUMNS: usize = 14;
 }
 
-/// Walk the ordered descriptors ONCE, charging [`ConstructionBudget`] exactly
-/// as `collect_sql_matched_blocks` does, and keep only what was admitted.
+/// Walk the ordered descriptors of every source ONCE, charging
+/// [`ConstructionBudget`] exactly as `collect_sql_matched_blocks` does, in the
+/// order the walk charges it, and keep only what was admitted.
 ///
 /// The budget rules are transcribed in the walk's order and not re-derived:
 /// the unsorted `(sample N)` cap STOPS counting (which is what makes its
 /// `total` the truncated count), a closed budget `deny_match`es, and an
 /// over-budget row is counted without being emitted. Everything a denied row
-/// would have carried is dropped here, so peak memory is bounded by
-/// `max_rows` rather than by the size of the match set.
-fn read_descriptors(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
-    inputs: &ResultReadInputs<'_>,
+/// would have carried is dropped here, so the STREAMED source's peak memory is
+/// bounded by `max_rows` rather than by the size of the match set; a BUFFERED
+/// source's is bounded by its own match set, which is why only the small
+/// pending overlay is ever buffered.
+///
+/// A closed budget does NOT stop a stream: every remaining row is still visited
+/// and still `deny_match`ed, because `total` is the number of matches SEEN. The
+/// only early exit is the `(sample N)` cap's `ControlFlow::Break`, and it stops
+/// BOTH the streamed source and the remaining buffered rows at once, so the
+/// truncation point is exactly the walk's.
+fn read_descriptors_merged(
+    sources: &mut [ResultSource<'_>],
+    shared: &ResultReadShared<'_>,
     pages: &mut PageGroups,
     budget: &mut ConstructionBudget,
-) -> Result<Vec<Descriptor>, ResultReadError> {
-    if snapshot.cancellation().is_cancelled() {
+) -> Result<Vec<Vec<Descriptor>>, ResultReadError> {
+    let mut admitted: Vec<Vec<Descriptor>> = (0..sources.len()).map(|_| Vec::new()).collect();
+    let Some((streamed, earlier)) = sources.split_last_mut() else {
+        return Ok(admitted);
+    };
+    let streamed_at = earlier.len();
+
+    // Every source but the last, read in full into one key-ordered buffer.
+    // With one source this loop does not run and nothing is allocated.
+    let mut buffered: Vec<BufferedDescriptor> = Vec::new();
+    let mut buffered_pages: HashSet<[u8; 16]> = HashSet::new();
+    for (at, source) in earlier.iter_mut().enumerate() {
+        buffer_descriptors(source, shared, at, &mut buffered, &mut buffered_pages)?;
+    }
+    if earlier.len() > 1 {
+        // Each source's own stream already arrives in key order, so this only
+        // interleaves them; the sort is stable, so equal keys keep the sources'
+        // given order (which is the walk's concatenation order).
+        buffered.sort_by(|left, right| {
+            merge_key(shared.order, &left.page, &left.row).cmp(&merge_key(
+                shared.order,
+                &right.page,
+                &right.row,
+            ))
+        });
+    }
+    let mut buffered = buffered.into_iter().peekable();
+
+    if streamed.snapshot.cancellation().is_cancelled() {
         return Err(ResultReadError::Cancelled);
     }
     let statement =
-        descriptor_statement(inputs.statement, inputs.order).map_err(ResultReadError::Sql)?;
-    let mut admitted: Vec<Descriptor> = Vec::new();
+        descriptor_statement(streamed.statement, shared.order).map_err(ResultReadError::Sql)?;
     let mut damage: Option<String> = None;
-    let visit = snapshot.visit_projection_query(&statement.sql, &statement.params, |row| {
-        #[cfg(test)]
-        note(|census| census.descriptor_rows += 1);
-        match admit_descriptor(row, inputs, pages, budget, &mut admitted) {
-            Ok(flow) => Ok(flow),
-            Err(what) => {
-                damage = Some(what);
-                Ok(std::ops::ControlFlow::Break(()))
+    let mut capped = false;
+    let visit =
+        streamed
+            .snapshot
+            .visit_projection_query(&statement.sql, &statement.params, |row| {
+                #[cfg(test)]
+                note(|census| census.descriptor_rows += 1);
+                let (page, decoded) = match decode_descriptor(row, shared) {
+                    Ok(decoded) => decoded,
+                    Err(what) => {
+                        damage = Some(what);
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
+                };
+                // The sources are disjoint by masking; a page in two of them would
+                // be counted twice and emitted twice, which is the one thing a
+                // damaged disposable cache may never do (D-3).
+                if buffered_pages.contains(&page.page_id) {
+                    damage = Some("page in two sources".to_string());
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                let key = merge_key(shared.order, &page, &decoded);
+                // Everything buffered that sorts at or before this row is charged
+                // FIRST. `<=` rather than `<` is the walk's own tie-break: its
+                // `sources.sort_by` is stable over `[overlay pages…, accepted
+                // pages…]`. Disjoint sources cannot actually tie.
+                while buffered
+                    .peek()
+                    .is_some_and(|held| merge_key(shared.order, &held.page, &held.row) <= key)
+                {
+                    let held = buffered.next().expect("peeked");
+                    if admit_decoded(
+                        &held.page,
+                        held.row,
+                        shared,
+                        pages,
+                        budget,
+                        &mut admitted[held.source],
+                    )
+                    .is_break()
+                    {
+                        capped = true;
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
+                }
+                let flow = admit_decoded(
+                    &page,
+                    decoded,
+                    shared,
+                    pages,
+                    budget,
+                    &mut admitted[streamed_at],
+                );
+                if flow.is_break() {
+                    capped = true;
+                }
+                Ok(flow)
+            });
+    if let Err(error) = visit {
+        return Err(sql_or_cancelled(streamed.snapshot, error));
+    }
+    if let Some(what) = damage {
+        return Err(ResultReadError::Corrupt(what));
+    }
+    // The stream ended: everything still buffered sorts after its last row.
+    if !capped {
+        for held in buffered {
+            if admit_decoded(
+                &held.page,
+                held.row,
+                shared,
+                pages,
+                budget,
+                &mut admitted[held.source],
+            )
+            .is_break()
+            {
+                break;
             }
         }
-    });
+    }
+    Ok(admitted)
+}
+
+/// One buffered source's whole descriptor stream, decoded in statement order.
+///
+/// No budget is charged here: the budget belongs to the MERGED order, which is
+/// not known until the streamed source's rows interleave with these.
+fn buffer_descriptors(
+    source: &mut ResultSource<'_>,
+    shared: &ResultReadShared<'_>,
+    at: usize,
+    buffered: &mut Vec<BufferedDescriptor>,
+    buffered_pages: &mut HashSet<[u8; 16]>,
+) -> Result<(), ResultReadError> {
+    if source.snapshot.cancellation().is_cancelled() {
+        return Err(ResultReadError::Cancelled);
+    }
+    let statement =
+        descriptor_statement(source.statement, shared.order).map_err(ResultReadError::Sql)?;
+    let mut damage: Option<String> = None;
+    let mut current: Option<Rc<DescriptorPage>> = None;
+    let visit = source
+        .snapshot
+        .visit_projection_query(&statement.sql, &statement.params, |row| {
+            #[cfg(test)]
+            note(|census| census.descriptor_rows += 1);
+            match decode_descriptor(row, shared) {
+                Ok((page, decoded)) => {
+                    // The stream is ordered by page, so ONE `Rc` per page
+                    // serves all of its rows: a 9 999-block pending page pays
+                    // for its name and path once, not once per block.
+                    let page = match current.as_ref().filter(|held| held.page_id == page.page_id) {
+                        Some(held) => Rc::clone(held),
+                        None => {
+                            let held = Rc::new(page);
+                            buffered_pages.insert(held.page_id);
+                            current = Some(Rc::clone(&held));
+                            held
+                        }
+                    };
+                    #[cfg(test)]
+                    note_buffered_bytes(&page, &decoded, Rc::strong_count(&page) == 2);
+                    buffered.push(BufferedDescriptor {
+                        source: at,
+                        page,
+                        row: decoded,
+                    });
+                    Ok(std::ops::ControlFlow::Continue(()))
+                }
+                Err(what) => {
+                    damage = Some(what);
+                    Ok(std::ops::ControlFlow::Break(()))
+                }
+            }
+        });
     if let Err(error) = visit {
-        return Err(sql_or_cancelled(snapshot, error));
+        return Err(sql_or_cancelled(source.snapshot, error));
     }
     match damage {
         Some(what) => Err(ResultReadError::Corrupt(what)),
-        None => Ok(admitted),
+        None => Ok(()),
     }
 }
 
-/// One descriptor row: validate it, resolve its public identity, and offer it
-/// to the budget.
-fn admit_descriptor(
+/// One buffered descriptor: which source produced it, its page (shared with
+/// that page's other blocks) and the row itself.
+struct BufferedDescriptor {
+    source: usize,
+    page: Rc<DescriptorPage>,
+    row: DecodedDescriptor,
+}
+
+/// What the descriptor row says about one PAGE. Decoded once per page in a
+/// buffered stream, once per row in the streamed one (where it is dropped
+/// immediately after admission).
+struct DescriptorPage {
+    page_id: [u8; 16],
+    name: String,
+    kind: PageKind,
+    journal_day: Option<i64>,
+    path: String,
+    /// Direct Files' cross-page base order. `None` is damage on that backend
+    /// and unread on Managed Storage.
+    position: Option<i64>,
+}
+
+/// One descriptor row, decoded and identity-resolved, without the raw
+/// `PhysicalQueryValue` vector and without the two columns already consumed:
+/// `blocks.order_key` and the stored id, which [`resolve_identity`] folded into
+/// `result_id` and `estimated_bytes`.
+struct DecodedDescriptor {
+    block_id: [u8; 16],
+    preorder: i64,
+    result_id: String,
+    estimated_bytes: usize,
+    tag_count: usize,
+    property_count: usize,
+}
+
+/// The order the descriptor statement itself imposed, as a comparable key.
+///
+/// It is not a second ordering policy: `descriptor_statement` ends
+/// `ORDER BY {base}, q.preorder` with `base` = `o.position` (Direct Files) or
+/// `p.path` (Managed Storage), and both columns are on the row already. Paths
+/// compare as byte strings, which is what SQLite's BINARY collation does and
+/// what the walk's own `sources.sort_by` does.
+fn merge_key<'a>(
+    order: BackendOrder,
+    page: &'a DescriptorPage,
+    row: &DecodedDescriptor,
+) -> (Option<i64>, &'a str, i64) {
+    match order {
+        BackendOrder::Direct => (page.position, "", row.preorder),
+        BackendOrder::Managed => (None, page.path.as_str(), row.preorder),
+    }
+}
+
+/// One descriptor row: validate it and resolve its public identity. Nothing
+/// here touches the budget or the groups — a buffered row is decoded long
+/// before it is charged.
+fn decode_descriptor(
     row: &[PhysicalQueryValue],
-    inputs: &ResultReadInputs<'_>,
-    pages: &mut PageGroups,
-    budget: &mut ConstructionBudget,
-    admitted: &mut Vec<Descriptor>,
-) -> Result<std::ops::ControlFlow<()>, String> {
+    inputs: &ResultReadShared<'_>,
+) -> Result<(DescriptorPage, DecodedDescriptor), String> {
     use descriptor_column as column;
     if row.len() != column::COLUMNS {
         return Err(format!(
@@ -426,12 +729,11 @@ fn admit_descriptor(
         "query_block_results.property_count",
     )?;
     let order_key = text(row, column::ORDER_KEY, "blocks.order_key")?;
+    let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
     // Direct Files' cross-page order IS this column; a NULL would silently
     // sort a page to one end of the answer, which changes which rows survive a
     // truncated budget.
-    if inputs.order == BackendOrder::Direct
-        && opt_integer(row, column::POSITION, "query_page_order.position")?.is_none()
-    {
+    if inputs.order == BackendOrder::Direct && position.is_none() {
         return Err("query_page_order has no position for a result page".to_string());
     }
     let (result_id, estimated_bytes) = resolve_identity(
@@ -442,8 +744,37 @@ fn admit_descriptor(
         &stored_id,
         stored_estimate,
     )?;
+    Ok((
+        DescriptorPage {
+            page_id,
+            name,
+            kind,
+            journal_day,
+            path,
+            position,
+        },
+        DecodedDescriptor {
+            block_id,
+            preorder,
+            result_id,
+            estimated_bytes,
+            tag_count,
+            property_count,
+        },
+    ))
+}
 
-    // The budget, in the walk's order (`collect_sql_matched_blocks`).
+/// Offer one decoded descriptor to the budget, in MERGED order.
+///
+/// The four rules, in `collect_sql_matched_blocks`' own order.
+fn admit_decoded(
+    page: &DescriptorPage,
+    row: DecodedDescriptor,
+    inputs: &ResultReadShared<'_>,
+    pages: &mut PageGroups,
+    budget: &mut ConstructionBudget,
+    admitted: &mut Vec<Descriptor>,
+) -> std::ops::ControlFlow<()> {
     if inputs
         .profile
         .sample_admission_cap
@@ -452,25 +783,31 @@ fn admit_descriptor(
         // Stop COUNTING here: an unsorted `(sample N)` reports the truncated
         // count as its total, and the walk stops at the first matched block it
         // sees after the cap on every remaining page.
-        return Ok(std::ops::ControlFlow::Break(()));
+        return std::ops::ControlFlow::Break(());
     }
     if budget.closed() {
         budget.deny_match();
-        return Ok(std::ops::ControlFlow::Continue(()));
+        return std::ops::ControlFlow::Continue(());
     }
-    let page = pages.slot(page_id, &name, kind, journal_day, &path);
-    if !budget.admit_estimated(&name, estimated_bytes) {
-        return Ok(std::ops::ControlFlow::Continue(()));
+    let at = pages.slot(
+        page.page_id,
+        &page.name,
+        page.kind,
+        page.journal_day,
+        &page.path,
+    );
+    if !budget.admit_estimated(&page.name, row.estimated_bytes) {
+        return std::ops::ControlFlow::Continue(());
     }
     admitted.push(Descriptor {
-        block_id,
-        page,
-        result_id,
-        estimated_bytes,
-        tag_count,
-        property_count,
+        block_id: row.block_id,
+        page: at,
+        result_id: row.result_id,
+        estimated_bytes: row.estimated_bytes,
+        tag_count: row.tag_count,
+        property_count: row.property_count,
     });
-    Ok(std::ops::ControlFlow::Continue(()))
+    std::ops::ControlFlow::Continue(())
 }
 
 /// The public id of one admitted row and the construction estimate that goes
@@ -900,6 +1237,38 @@ pub(crate) fn reset_result_read_census() {
 #[cfg(test)]
 pub(crate) fn result_read_census() -> ResultReadCensus {
     CENSUS.with(std::cell::Cell::get)
+}
+
+/// What the merged read's BUFFER actually costs (test-only), so I-13's claim
+/// about a big pending page is measured rather than argued: the heap bytes the
+/// decoded rows retain, page fields counted once per page.
+#[cfg(test)]
+thread_local! {
+    static BUFFERED_BYTES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn note_buffered_bytes(page: &DescriptorPage, row: &DecodedDescriptor, first_of_page: bool) {
+    BUFFERED_BYTES.with(|counter| {
+        let (rows, bytes) = counter.get();
+        let mut added = std::mem::size_of::<BufferedDescriptor>() + row.result_id.capacity();
+        if first_of_page {
+            added +=
+                std::mem::size_of::<DescriptorPage>() + page.name.capacity() + page.path.capacity();
+        }
+        counter.set((rows + 1, bytes + added));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_buffered_descriptor_bytes() {
+    BUFFERED_BYTES.with(|counter| counter.set((0, 0)));
+}
+
+/// `(buffered rows, retained bytes)` since the last reset.
+#[cfg(test)]
+pub(crate) fn buffered_descriptor_bytes() -> (usize, usize) {
+    BUFFERED_BYTES.with(std::cell::Cell::get)
 }
 
 /// A barrier point at the top of each payload batch (test-only), so a gate can
