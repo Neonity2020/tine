@@ -1742,9 +1742,33 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // surface because no tine-core file calls it yet; the lowering that will is
     // P1-b's, and this census is an inventory of actual call sites, not of what
     // the dependency offers.
+    // Re-pinned 2026-09-05 (query engine P1-b): the IR -> SQL lowering,
+    // `query/sql.rs`, is the ONLY new contributor, and it contributes 35 read
+    // entries and no write crossing:
+    //   `usetine_storage::sqlite::PhysicalQueryValue;`         1 (its one import)
+    //   `import-associated:PhysicalQueryValue::Text(`         21
+    //   `import-associated:PhysicalQueryValue::Integer(`       7
+    //   `import-associated:PhysicalQueryValue::Real(`          5
+    //   `import-associated:PhysicalQueryValue::Blob(`          1
+    // Every one is a bound-parameter constructor: SPEC §5.5 requires values to
+    // be BOUND, so the compiler's only contact with the physical layer is the
+    // value enum the seam's signature takes (I-22 — an interpolated statement is
+    // not expressible through it). `PhysicalQueryValue` is not in
+    // `write_capable_types`, and the write-crossing table above is byte-identical.
+    // Derived, not assumed: the surface was dumped at the working head and every
+    // entry was read back; the only other production files this packet touches
+    // are `query.rs` (a module declaration and its comment) and `query/eval.rs`
+    // (`format_number` widened to `pub(crate)` so the compiler reuses the walk's
+    // number formatting rather than growing a twin, D-14), and neither names
+    // `tine_storage` at all.
+    // The gates that DO call `PhysicalProjectionQueryReader` live in
+    // `query/sql_gates_tests.rs`, included by `sql.rs` under `#[cfg(test)]`, so
+    // the shared production scanner blanks them and the read-only statement seam
+    // is still absent from this surface — as the P1-a2 note above predicted it
+    // would be until §5.9's dispatch is wired.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "067d57c3b8d94e3573f835b8a51bb741a6b505f082e86d23768ff1a5cd38d86d",
+        "6d74f55098ba6fe1989f482e31d8f5dc83db518fd0cacdd0b14d4562774ecb64",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

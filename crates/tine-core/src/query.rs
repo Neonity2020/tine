@@ -14,6 +14,17 @@ pub(crate) mod og;
 pub mod path_refs;
 pub mod print;
 pub mod registry;
+// §5.1–§5.7's compiler. Its two acceptance gates live in `sql_gates_tests.rs`,
+// declared from `sql.rs` itself: the production-source scanner every census
+// guard shares recognises a `*_tests.rs` file included by a SIBLING under
+// `#[cfg(test)]`, and only then does it stop counting the gates' `eprintln!`
+// receipts as production print sites (I-5).
+//
+// §5.9's dispatch — what a release build would call the compiler from — is not
+// wired in this packet, so outside `cfg(test)` the module is dead code and says
+// so once, here, rather than through forty individual suppressions.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod sql;
 pub(crate) mod tql;
 pub mod view;
 
