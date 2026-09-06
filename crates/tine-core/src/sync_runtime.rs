@@ -11328,7 +11328,27 @@ impl ManagedLocalRuntimeState {
     }
 
     /// The pending state of `path` is this page.
+    ///
+    /// The overlay's membership key is the projection intent's path
+    /// (`note_latest_projection_frame`); the content arrives under the
+    /// application page's path, a different structure. If the two ever
+    /// diverged the overlay would hold a page the accepted-side mask does not
+    /// cover and the two-source read (R5a) would answer
+    /// `Corrupt("page in two sources")` — an error, not a wrong answer, but a
+    /// confusing one. So content for a path that was never announced marks the
+    /// overlay failed instead: pending queries walk (I-10) and the divergence
+    /// is visible as a fallback count, and in tests it panics.
     fn note_pending_page_content(&self, path: &ManagedPath, page: Arc<MaterializedPage>) {
+        if !self.latest_projection_frames.contains_key(path.as_str()) {
+            debug_assert!(
+                false,
+                "pending content for {:?} arrived under a path the pending set does not \
+                 hold; the frame's intent path and the application page path diverged",
+                path.as_str()
+            );
+            self.note_pending_overlay_failed("pending content path not announced");
+            return;
+        }
         if let Some(overlay) = self.pending_overlay.as_ref() {
             overlay.content(path.as_str(), page);
         }

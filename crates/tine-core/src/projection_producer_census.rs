@@ -2029,10 +2029,21 @@ fn g_i_managed_query_jobs_drain_before_projection_file_close() {
         let tail = &runtime[start..];
         &tail[..tail.find("\n}\n").expect("impl block closes")]
     };
+    let actor_drop = block("impl Drop for RuntimeActor {");
+    let actor_drain = actor_drop
+        .find("managed_query.jobs.cancel_all_and_drain()")
+        .expect(
+            "I-21: RuntimeActor::drop must drain every off-actor query job before its \
+             SqliteFrontier closes the projection file (see the guard's doc comment)",
+        );
+    let actor_overlay_close = actor_drop.find("self.close_pending_overlay()").expect(
+        "I-21: RuntimeActor::drop must close the pending overlay (R5b), whose file the \
+         two-source pending read (R5a) holds open exactly like the projection file",
+    );
     assert!(
-        block("impl Drop for RuntimeActor {").contains("managed_query.jobs.cancel_all_and_drain()"),
-        "I-21: RuntimeActor::drop must drain every off-actor query job before its \
-         SqliteFrontier closes the projection file (see the guard's doc comment)"
+        actor_drain < actor_overlay_close,
+        "I-21: the overlay closes (worker join + file delete) only AFTER every off-actor \
+         query job is drained; a reader may hold the overlay file open"
     );
     let handle_drop = block("impl Drop for HandleInner {");
     let close = handle_drop
@@ -2057,10 +2068,19 @@ fn g_i_managed_query_jobs_drain_before_projection_file_close() {
     );
     for (at, _) in takes {
         let preceding = &runtime[at.saturating_sub(400)..at];
+        let drain = preceding
+            .find("managed_query.jobs.cancel_all_and_drain()")
+            .expect(
+                "I-21: `self.clean.take()` closes the projection file; drain the query-job \
+                 owner immediately before it (exemplar: the shared-join install)",
+            );
+        let overlay_close = preceding.find("self.close_pending_overlay()").expect(
+            "I-21: `self.clean.take()` replaces the file the pending overlay sits next to; \
+             close the overlay before it, after the drain (exemplar: the shared-join install)",
+        );
         assert!(
-            preceding.contains("managed_query.jobs.cancel_all_and_drain()"),
-            "I-21: `self.clean.take()` closes the projection file; drain the query-job \
-             owner immediately before it (exemplar: the shared-join install)"
+            drain < overlay_close,
+            "I-21: drain the query jobs BEFORE closing the overlay they may be reading"
         );
     }
     assert_eq!(
