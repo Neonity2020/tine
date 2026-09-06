@@ -59,7 +59,7 @@ const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2870, 3165, 3209], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "projection diagnostics are available only for an explicitly directed phase trace", gate: "TINE_PHASE_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2975], macro_name: "eprintln", bucket: "b", class: "directed-core-content", why: "this one DOES render target bytes as lossy UTF-8; it is graph content and stays behind the directed trace", gate: "TINE_PHASE_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/semantic.rs", lines: &[935], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "semantic snapshot diagnostic contains counts and encoded byte sizes", gate: "TINE_SEMANTIC_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", lines: &[1893, 4501, 4505, 4512, 4525, 4537, 4545, 4557, 5317], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_TERMINAL_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", lines: &[1893, 4501, 4505, 4512, 4525, 4537, 4545, 4557, 5317], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
     AllowedSite { file: "crates/tine-core/src/publish.rs", lines: &[4400, 4430], macro_name: "eprintln", bucket: "a", class: "content-free-debug", why: "publication refusals report only a fixed shape or collision count", gate: "runtime_debug_diagnostics_enabled" },
     AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[6312], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "watcher trace is explicitly enabled for a directed investigation", gate: "TINE_CLEAN_WATCHER_TRACE" },
     AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[7087, 7105], macro_name: "eprintln", bucket: "a", class: "numeric-debug", why: "clean-open stage and counter reports contain fixed names and numeric measurements", gate: "runtime_debug_diagnostics_enabled" },
@@ -318,4 +318,85 @@ fn real_corpus_open_save_publish_emits_no_page_name_with_debug_disabled() {
         matches, 0,
         "captured stderr contained {matches} corpus page-name matches"
     );
+}
+
+/// I-11: a directed trace flag is a contract row, not a free-text gate.
+///
+/// The class-(b) `gate:` fields above and the class-(b) paragraph of
+/// `docs/contracts/diagnostics.md` named the same flags in two places with
+/// nothing comparing them, so either could drift silently — a flag could be
+/// retired from the contract and still gate a live print site, or a new
+/// `TINE_*_TRACE` channel could be added with no contract row at all. Both
+/// directions are pinned here.
+///
+/// `docs/contracts/diagnostics.md` is the exemplar to follow when adding a
+/// channel: name the flag in that paragraph first, then classify the site.
+///
+/// Scope: `crates/tine-core/src` only. src-tauri's directed channel is
+/// `debug_enabled()` behind `TINE_DEBUG`, which has its own producer pin in
+/// `exactly_one_function_reads_the_debug_diagnostics_flag`; it reads no
+/// `_TRACE` flag, and this packet does not touch that tree.
+#[test]
+fn directed_trace_flags_are_the_same_set_in_the_contract_and_in_the_census() {
+    let repair = "I-11: a directed trace flag is a contract row, not a free-text gate. \
+         Every `TINE_*_TRACE` channel is named in the class (b) paragraph of \
+         `docs/contracts/diagnostics.md` (the exemplar) AND appears in the `gate:` field of \
+         the class (b) ALLOWLIST row for the site it gates. Add the contract row first.";
+    let flag = Regex::new(r"TINE_[A-Z0-9_]*_TRACE").unwrap();
+
+    let contract = fs::read_to_string(repo_root().join("docs/contracts/diagnostics.md")).unwrap();
+    let paragraph = contract
+        .split_once("The retained class (b) channels are named")
+        .expect("diagnostics.md must carry the class (b) channel paragraph")
+        .1
+        .split_once("\n\n")
+        .expect("the class (b) channel paragraph must end")
+        .0;
+    let mut contract_flags = flag
+        .find_iter(paragraph)
+        .map(|found| found.as_str().to_owned())
+        .collect::<Vec<_>>();
+    contract_flags.sort();
+    contract_flags.dedup();
+    assert!(
+        paragraph.contains("TINE_DEBUG"),
+        "{repair} The process-level `TINE_DEBUG` opt-in stays named in the same paragraph; \
+         it is not a directed trace channel and has its own producer pin."
+    );
+
+    let mut census_flags = ALLOWLIST
+        .iter()
+        .filter(|entry| entry.bucket == "b")
+        .flat_map(|entry| {
+            flag.find_iter(entry.gate)
+                .map(|found| found.as_str().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    census_flags.sort();
+    census_flags.dedup();
+    assert_eq!(census_flags, contract_flags, "{repair}");
+
+    let root = repo_root();
+    let core = root.join("crates/tine-core/src");
+    let read = Regex::new(r#"env::var(?:_os)?\s*\(\s*"(TINE_[A-Z0-9_]+)""#).unwrap();
+    let mut unpinned = Vec::new();
+    for file in production_source_files() {
+        if !file.starts_with(&core) {
+            continue;
+        }
+        let source = compiled_source(&file);
+        for found in read.captures_iter(&source) {
+            let name = found[1].to_string();
+            if !name.ends_with("_TRACE") || contract_flags.contains(&name) {
+                continue;
+            }
+            unpinned.push(format!(
+                "{}:{} {name}",
+                relative_path(&root, &file),
+                line_of(&source, found.get(0).unwrap().start())
+            ));
+        }
+    }
+    assert!(unpinned.is_empty(), "{repair} Unpinned: {unpinned:?}");
 }

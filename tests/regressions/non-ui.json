@@ -6427,6 +6427,26 @@
     "failBefore": "necessity-census-1.txt at 37c9b22d (the fix backed out of prepare_page_name_updates)"
    },
    "notes": "The managed-local drain publishes a batch's manifest at stage ArchivePublication and only then offers it to the engine at EngineAcceptance, and replay treats a manifest-committed clean operation that does not validate as accepted as archive corruption. The run-local page-name ownership index was the one identity index the CommittedLocalOverlay did not carry -- portable paths and block claims were both layered over the accepted index, page names were not -- so a foreground draft evaluated page names against accepted history alone. Saving a page named \"Alpha\" and then, before the drain ran, a page named \"/Alpha\" (different exact name and different derived path, same canonical page-name key `alpha`) reported BOTH saves as Saved; the drain then met \"canonical page-name key is occupied at the declared dependency frontier\" after publishing the second manifest, the journal wedged at managed_local_pending=1, and every later open returned OpenRefused/clean_open.engine. Fixed by layering CommittedLocalOverlay::page_names under the accepted index inside the single producer (prepare_page_name_updates), exactly as portable_path_records_many already layers the overlay for portable paths, so the refusal is now raised at draft time before the journal append. The full class enumeration is the census table in the \"Acceptance-only refusals for drain-published local batches\" subsection of docs/storage-sync-contract.md; every other refusal on that path is U (a draft-time check is at least as strict) or S (an in-scope scenario the drain already recovers from)."
+  },
+  {
+   "id": "REG-HARVEST-W5-SMALLS-ORPHAN-REFUSAL-001",
+   "title": "A stale orphan staging diagnostic refused the provider operation that owned it, forever",
+   "family": "managed-storage-provider-transport",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W5-smalls, from LANE-RESIDUE-receipt.md \u00a710 item 1; invariants I-8, I-10, I-14"},
+   "platforms": ["all"],
+   "layer": "tine-core-provider-transport",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/wire.rs::tests::a_stale_orphan_diagnostic_never_refuses_the_operation_that_owns_it",
+     "crates/tine-core/src/oplog/wire.rs::tests::an_orphan_diagnostic_leaked_by_the_cleanup_crash_window_is_retired_by_the_next_sweep",
+     "crates/tine-core/src/oplog/wire.rs::tests::reserving_removed_capacity_has_exactly_one_production_front_door",
+     "crates/tine-core/src/oplog/wire.rs::tests::only_tests_can_quarantine_a_raced_shared_provider_name"
+    ],
+    "scenario": "managed-storage.provider-orphan-diagnostic-never-refuses-its-own-operation",
+    "failBefore": "necessity-smalls-1.txt at 37c9b22d55d1a87bd0b2ea5b1cdc7f153a574a7a"
+   },
+   "notes": "quarantine_unowned_staging asked shared_diagnostic_name_is_taken whether removed/orphan-<operation id>-<generation> was occupied and returned UnsafeProviderEntry when a NON-EMPTY entry of that name existed. The name is built from the operation id whose transaction gate the caller holds, so the occupant is always named for the very operation being refused. Two honest ways it exists: a crash between the quarantine rename and cleanup_journal_staging's identity-matched delete, and an operation re-created from scratch at generation 0 while a stale generation-0 orphan was still in place. User outcome: a provider operation -- the shared-tree publish behind managed-storage sync -- refuses forever after a crash, or after a repeat, until an unrelated residue sweep happens to run past the trigger (128), which on a quiet removed/ may be never. This is the residue-cap defect's family one site over (REG-HARVEST-RESIDUE-CAP-001). The owner now retires its own stale entry through the same per-entry front door the sweep uses (retire_provider_residue_entry: no-follow regular validation, remove_file, directory fsync) and proceeds with the quarantine; the refusal branch was dead by construction of the name and is gone, so no refusal without a nameable in-scope scenario is left behind (I-8). Same packet: the retirement placeholder in reconcile_provider_retirement now reserves through the compacting front door reserve_provider_diagnostic_capacity instead of the non-compacting ensure_provider_diagnostic_capacity, guarded by a production source count, and the leak window the crash leaves is stated with its bound in docs/storage-sync-contract.md 2.10c-ii."
   }
  ]
 }

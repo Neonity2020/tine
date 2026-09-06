@@ -2879,6 +2879,43 @@ is history:
   for anything; the publish path quarantines it so a foreign or crash-left
   staging file is preserved rather than destroyed.
 
+**An operation retires its own stale orphan rather than refusing over it.**
+`quarantine_unowned_staging` builds `orphan-<operation id>-<generation>` from
+the operation id whose transaction gate it holds, so an occupant of that exact
+name is always named for the operation doing the writing — there is no
+foreign-entry case to refuse, and the refusal that used to be there wedged the
+operation until an unrelated sweep happened to run past the trigger (I-10). Two
+honest ways an occupant exists: a crash between the quarantine rename and the
+identity-matched delete in `cleanup_journal_staging`, and an operation
+re-created from scratch at generation 0 while a stale generation-0 orphan is
+still in place. The owner now retires it — through the same per-entry front
+door the sweep uses, `retire_provider_residue_entry`: validate the entry
+no-follow-regular, `remove_file`, `fsync` the directory — and proceeds with the
+quarantine. This destroys at most the one entry the sweep is already licensed
+to retire once this operation finishes, and its bytes are reconstructible from
+the private journal blob, which is the same reason the quarantine itself is a
+RECONSTRUCTIBLE move. A NON-EMPTY occupant of any OTHER diagnostic name is
+still reported as occupied and left untouched: `shared_diagnostic_name_is_taken`
+keeps that answer for the `<prefix>-<digest>` quarantine, whose bytes are
+foreign.
+`oplog::wire::tests::a_stale_orphan_diagnostic_never_refuses_the_operation_that_owns_it`
+drives the whole journey — crash, completion, provider deletion, record
+compaction, exact repeat.
+
+**The put path's `orphan-` leak window, and its bound.** The crash between the
+quarantine rename and the identity-matched delete leaks one entry that outlives
+its operation's record compaction. It is bounded, not absent: the name is
+deterministic and the write is no-clobber, so at most ONE entry exists per
+(operation, staging generation), and the sweep is what retires it — once the
+record naming the operation has been compacted (§2.10c-i), the next sweep takes
+it. The sweep is the only bound, and it is a real one because every production
+writer of `removed/` reserves through the compacting front door
+`reserve_provider_diagnostic_capacity`, so the directory cannot grow past the
+trigger unswept (I-14).
+`oplog::wire::tests::an_orphan_diagnostic_leaked_by_the_cleanup_crash_window_is_retired_by_the_next_sweep`
+plants the crash-window entry, proves it is pinned while a record names it, and
+proves the sweep retires it once none does.
+
 A third shape, `removed/<prefix>-<digest>`, quarantines FOREIGN bytes that took
 a name this device expected to own. The graph is not their authority, so no
 sweep retires them. Nothing in a production build writes one
@@ -2897,6 +2934,13 @@ way out from inside the app (I-10, I-14).
 the lifetime of the store. Before an operation adds a diagnostic, if the
 directory holds `PROVIDER_RESIDUE_COMPACTION_TRIGGER` (128) entries or more it
 is first swept against the journal (`reconcile_residue_against_journal`).
+`reserve_provider_diagnostic_capacity` is the ONE front door every production
+writer of `removed/` goes through, including the retirement placeholder in
+`reconcile_provider_retirement`; the non-compacting
+`ensure_provider_diagnostic_capacity` only refuses, so a second production
+caller of it would reintroduce the store-lifetime cap on that one path (D-14).
+`oplog::wire::tests::reserving_removed_capacity_has_exactly_one_production_front_door`
+counts its callers in production source.
 `MAX_PROVIDER_RESIDUE_ENTRIES` (512) remains the structural scan bound, and the
 sweep keeps the directory well below it. The trigger sits above the journal's
 own completed-store trigger (64) because the two stores compact in lockstep: a
@@ -2915,7 +2959,7 @@ a time or count window over it could suppress the wrong operation's evidence.
 | --- | --- | --- |
 | `retired-<operation id>` of a **remove** | No record in `records/` or `completed/` names the operation | Source gone: the diagnostic was read by nobody — a `RequirePresent` caller gets `UnknownProviderPath` and a `SettleIfAbsent` caller settles, with or without it (see the §3.1 row). Source back: the settle shortcut goes with the diagnostic, so the repeat performs the ordinary authorized removal it would have performed had this device never run the operation. Same end state — and for the conflict-copy cleanup that is this store's only production remove, the state the caller actually wants, because the settle shortcut left the redelivered copy in place (I-10). |
 | `orphan-<operation id>-<generation>` | No record in `records/` or `completed/` names the operation | Nothing reads it as authority. Retiring it also frees the name, which the no-clobber reservation in `quarantine_unowned_staging` would otherwise refuse on a repeat of the same staging generation. |
-| `<prefix>-<digest>` quarantine | Never | These are foreign bytes the graph is not the authority for. No production writer exists, so the class contributes nothing to growth. |
+| `<prefix>-<digest>` quarantine | Never | These are foreign bytes the graph is not the authority for. No production writer exists, so the class contributes nothing to growth — `quarantine_provider_name` is `#[cfg(test)]`, which `oplog::wire::tests::only_tests_can_quarantine_a_raced_shared_provider_name` pins as compile-time structure rather than intent. |
 
 **The rename caveat, stated rather than assumed.** A retired RENAME is the one
 operation whose diagnostic stays load-bearing after its record is gone: an
