@@ -1766,9 +1766,29 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // the shared production scanner blanks them and the read-only statement seam
     // is still absent from this surface — as the P1-a2 note above predicted it
     // would be until §5.9's dispatch is wired.
+    // Re-pinned 2026-09-06 (query engine P1-c): §5.10's `content match` lowering
+    // changes exactly ONE entry in this surface —
+    // `query/sql.rs`'s `import-associated:PhysicalQueryValue::Text(` 21 -> 23.
+    // The two new sites are both bound-parameter constructors, and they are the
+    // two values a content leaf binds: the parsed term's own canonically folded
+    // needle for the exact `instr` predicate, and the FTS5 phrase literal for
+    // the trigram candidate bound. SPEC §5.5 requires values to be BOUND, so a
+    // content predicate's only contact with the physical layer is still the
+    // value enum the seam's signature takes (I-22 — an interpolated statement
+    // is not expressible through it). Derived, not assumed: the production
+    // halves of `query/sql.rs` at `5d99a33a` and at the working head were
+    // diffed token by token, and `PhysicalQueryValue::{Blob,Integer,Real}` and
+    // the single `use tine_storage::sqlite::PhysicalQueryValue;` are unchanged
+    // at 1/7/5/1. The packet's other production edits name `tine_storage` not
+    // at all: `query/eval.rs` widens `CompiledLeaves::regex` to `pub(crate)` so
+    // the compiler reads the walk's ONE parse instead of growing a twin
+    // (D-14/I-12), and `oplog/sqlite_materialization.rs` changes only its
+    // `#[cfg(test)]` module, which `without_test_items` blanks. No new write
+    // crossing: the write-crossing table above is byte-identical, and the
+    // certified dependency stays at v0.14.0.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "6d74f55098ba6fe1989f482e31d8f5dc83db518fd0cacdd0b14d4562774ecb64",
+        "4e7f1f8ce1432e83c5494b9de94849d6bf30343e7489cd878ae675100be858f4",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

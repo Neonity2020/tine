@@ -89,7 +89,12 @@ impl CompiledLeaves {
     pub(crate) fn match_program(&self, source: &str) -> Option<&Matcher> {
         self.matchers.get(source)
     }
-    fn regex(&self, source: &str) -> Option<&regex::Regex> {
+    /// The compiled legacy `content regexp` pattern for one leaf, or `None`
+    /// when the pattern did not compile — which §4.3.2 keeps as a retained leaf
+    /// that matches false. The SQL compiler reads the SAME map, so an invalid
+    /// pattern is a constant-false leaf on both engines rather than a second
+    /// `regex::Regex::new` that could disagree about validity (I-12).
+    pub(crate) fn regex(&self, source: &str) -> Option<&regex::Regex> {
         self.regexes.get(source).and_then(Option::as_ref)
     }
     fn fold(&self, text: &str) -> String {

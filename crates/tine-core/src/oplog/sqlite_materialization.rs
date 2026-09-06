@@ -4458,6 +4458,12 @@ mod tests {
                         block.query_visible.clone(),
                         block.query_visible_folded.clone(),
                         block.searchable_text.clone(),
+                        // §5.10: this is the column the substring FTS indexes,
+                        // so the candidate bound the SQL compiler emits is only
+                        // backend-independent if the two producers write it the
+                        // same way. It is `canonical_fold(searchable_text)` on
+                        // both, i.e. the same fold over COLLAPSED text.
+                        block.normalized_searchable_text.clone(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -4483,11 +4489,21 @@ mod tests {
         assert_eq!(
             direct_columns
                 .iter()
-                .map(|(visible, folded, _)| (visible.clone(), folded.clone()))
+                .map(|(visible, folded, _, _)| (visible.clone(), folded.clone()))
                 .collect::<Vec<_>>(),
             expected,
             "the columns are exactly `visible` and `canonical_fold(visible)`"
         );
+        // And the FTS source column is the same fold over the COLLAPSED text,
+        // on both backends — which is what makes §5.10's candidate needle a
+        // whitespace-free run rather than the whole phrase.
+        for (_, _, searchable, normalized) in &direct_columns {
+            assert_eq!(
+                normalized,
+                &crate::search_query::canonical_fold(searchable),
+                "`normalized_searchable_text` is `canonical_fold(searchable_text)`"
+            );
+        }
 
         // And they are NOT `searchable_text`: the multi-line planning block
         // keeps its newlines here and loses them there. Stated as a difference
@@ -4496,7 +4512,7 @@ mod tests {
         assert!(
             direct_columns
                 .iter()
-                .any(|(visible, _, searchable)| visible != searchable),
+                .any(|(visible, _, searchable, _)| visible != searchable),
             "the fixture must contain a block whose visible text is not its collapsed text"
         );
     }

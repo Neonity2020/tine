@@ -52,11 +52,28 @@
 //! `atom_key`, `search_query::canonical_fold` for `query_visible_folded`) —
 //! never a second normalizer that agrees by inspection.
 //!
+//! **`content match` (§5.10).** The compiler consumes the SAME parsed
+//! [`search_query::Matcher`] the walk consumes — [`crate::query::eval::CompiledLeaves`],
+//! keyed by [`Filter::match_sources`] — and never re-parses the payload
+//! (I-12, D-14). Each retained OR arm becomes an `AND` of `instr` predicates on
+//! `blocks.query_visible_folded`, and, when the FTS index is READY, gains a
+//! trigram CANDIDATE BOUND that may only ever OVER-approximate: the exact
+//! `instr` predicates stay as the final conditions on every path, so a bound
+//! that admitted too many rows costs time and a bound that excluded one would
+//! be a correctness bug. `foobar` is therefore found by `foo`, by `oob` AND by
+//! `oo` — the last one through no bound at all, because word-token FTS cannot
+//! answer it.
+//!
 //! **What this wave declines** ([`Lowered::Unsupported`], §5.9's dispatch, NOT a
-//! divergence): `content match` and `content regexp`, whose acceleration and
-//! exact SQL predicate are P1-c (§5.10), and a `refs` leaf nested inside a
-//! `children` relation predicate — see [`Compiler::leaf_block`] for why that one
-//! cannot be lowered from `block_path_refs` without disagreeing with the walk.
+//! divergence): a VALID regex — `content regexp <pattern>` and the whole-query
+//! `/pattern/` form of `content match` — because §4.3.2's fixed SQL predicate is
+//! a registered scalar function backed by the same compiled `regex::Regex`, and
+//! `PhysicalProjectionQueryReader` (tine-storage v0.14.0) exposes no way to
+//! register one on its read-only connection. An INVALID pattern needs no engine:
+//! it is a retained leaf that matches false (§4.3.2), so it lowers to the
+//! constant `0` here. Also declined: a `refs` leaf nested inside a `children`
+//! relation predicate — see [`Compiler::leaf_block`] for why that one cannot be
+//! lowered from `block_path_refs` without disagreeing with the walk.
 
 use tine_storage::sqlite::PhysicalQueryValue;
 
@@ -70,11 +87,11 @@ mod sql_gates_tests;
 use crate::date::JournalDate;
 use crate::doc::property_key_norm;
 use crate::query::atom::atom_key;
-use crate::query::eval::format_number;
+use crate::query::eval::{format_number, CompiledLeaves};
 use crate::query::ir::{Anchor, Attr, CmpOp, Filter, Leaf, ObservedType, Quant, Query, Rel, Value};
 use crate::query::registry::Registry;
 use crate::refs;
-use crate::search_query::canonical_fold;
+use crate::search_query::{canonical_fold, AndGroup, Matcher, Term};
 
 /// `owner_type` as the projection spells it (`PhysicalEntityId::sql_parts`).
 const OWNER_PAGE: i64 = 0;
@@ -101,6 +118,37 @@ pub(crate) struct SqlQuery {
     /// no row. It is still a statement — the caller has one path, not two — but
     /// there is no index for SQLite to choose and none to demand of it.
     pub(crate) matches_nothing: bool,
+    /// §5.10's plan classes, one entry per `content match` / `content regexp`
+    /// leaf that reached the statement, in depth-first order. They are recorded
+    /// SEPARATELY from the indexed case rather than as failures or as a blanket
+    /// content exemption: three of the four are content paths §5.10 says are
+    /// explicitly not index-bounded, and a plan gate that could not name them
+    /// would have to choose between failing them and exempting all content.
+    pub(crate) content_plans: Vec<ContentPlan>,
+}
+
+/// How ONE content leaf reaches its rows (SPEC §5.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentPlan {
+    /// Every retained OR arm supplied a trigram candidate needle and the FTS
+    /// index is ready: the leaf bounds the anchor.
+    Fts,
+    /// At least one retained OR arm has no positive term yielding a
+    /// three-scalar whitespace-free run (or its only candidates bear a NUL), so
+    /// that arm is an explicitly unbounded SQL content predicate. `foobar`
+    /// queried by `oo` lands here, correctly, and is still found.
+    ShortUnindexable,
+    /// The transient state: the FTS index is still building on this
+    /// materialized read, so the SAME exact predicates are evaluated on the
+    /// ready block columns with no candidate bounds. Not empty results, not an
+    /// error, not a new walk route, and never a rebuild request or a wait
+    /// inside a query (I-13) — the existing index owner finishes the build.
+    FtsBuilding,
+    /// A regex leaf. §4.3.2 makes it an explicitly unindexed content predicate;
+    /// regex can never claim an FTS bound. Only the INVALID-pattern form
+    /// reaches a statement in this wave (it is a constant-false leaf); a valid
+    /// pattern is declined — see the module header.
+    Regex,
 }
 
 /// The compiler's answer.
@@ -125,6 +173,19 @@ pub(crate) struct LoweringInputs<'a> {
     pub(crate) masked_pages: &'a [[u8; 16]],
     /// `LIMIT cutoff + 1` when the caller supplies a cutoff (§5.6).
     pub(crate) cutoff: Option<usize>,
+    /// The ONE parse of every `content match` payload for this execution
+    /// (§5.10) — the same value the walk reads through
+    /// `CompiledLeaves::match_program`, over the same `Filter::match_sources`
+    /// keys. A second `Matcher::parse` here is the fork this campaign exists to
+    /// prevent: `content match` and legacy `(search …)` would stop meaning the
+    /// same thing the moment the two parses disagreed (I-12, D-14).
+    pub(crate) compiled: &'a CompiledLeaves,
+    /// The EXISTING FTS-building signal, read on the SAME materialized
+    /// read/generation as the query and separately from projection readiness
+    /// (§5.10). `false` is the transient `fts-building` class: the same exact
+    /// predicates, evaluated on the ready block columns, with no candidate
+    /// bounds anywhere in the statement.
+    pub(crate) fts_ready: bool,
 }
 
 /// Lower one resolved query (SPEC §5.1–§5.7).
@@ -227,8 +288,12 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> Lowered
         params,
         // §5.7 asks for an index only where there are rows to find. A filter
         // that folded to false reads nothing, so there is no bound to demand.
-        positively_bounded: !matches_nothing && positively_bounded(&filter, query.anchor),
+        positively_bounded: !matches_nothing && positively_bounded(&filter, query.anchor, inputs),
         matches_nothing,
+        // Classified from the FILTER, not accumulated while compiling: §5.3's
+        // parent probe compiles the same tree a second time, and a class
+        // counted once per compilation pass would double every entry.
+        content_plans: content_plans(&filter, inputs),
     })
 }
 
@@ -444,14 +509,141 @@ impl Compiler<'_> {
                 let literal = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
                 format!("{column} <> {literal}")
             }
-            // §5.10 is P1-c: `Match`'s friendly-search semantics need the
-            // trigram prefilter plus an exact SQL substring predicate, and
-            // `Regex` needs a compiled Rust regex SQLite does not have. The walk
-            // answers both, correctly, today.
-            CmpOp::Match => self.decline("content match (§5.10, P1-c)"),
-            CmpOp::Regex => self.decline("content regexp (§5.10, P1-c)"),
+            CmpOp::Match => self.content_match(text, b),
+            CmpOp::Regex => self.content_regex(text),
             _ => "0".to_string(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.10 — `content match`
+    // -----------------------------------------------------------------------
+
+    /// One `content match <text>` leaf, from the SAME parsed
+    /// [`Matcher`] the walk consumes for this execution.
+    ///
+    /// The walk's arm is `compiled.match_program(text).is_some_and(|m|
+    /// m.matches(visible_lower, visible))`, so a payload that was never
+    /// collected is FALSE there and is the constant `0` here — the two engines
+    /// agree without the compiler having to know why the payload is missing.
+    fn content_match(&mut self, source: &str, b: &str) -> String {
+        match match_program(self.inputs.compiled, source) {
+            // `Matcher::matches` answers false for `Empty` and `InvalidRegex`
+            // (an exclusion-only query, a blank one, a pattern that did not
+            // compile). §5.10: that is a FALSE LEAF, not an enabled whole-query
+            // diagnostic — so `not (content match '-foo')` is classically true
+            // on both engines (§3.4), and the matcher's own error message may
+            // still be displayed without changing this truth rule.
+            MatchProgram::AlwaysFalse | MatchProgram::Regex { compiled: false } => "0".to_string(),
+            MatchProgram::Regex { compiled: true } => self.decline(REGEX_DECLINED),
+            MatchProgram::Boolean(groups) => {
+                let arms = groups
+                    .iter()
+                    .map(|group| self.match_group(group, b))
+                    .collect();
+                fold_or(arms)
+            }
+        }
+    }
+
+    /// One retained OR arm: the exact `instr` conjunction, plus — only when the
+    /// FTS index is ready and the arm offers a needle — a candidate bound in
+    /// front of it.
+    ///
+    /// **The exact predicates are never replaced by the bound, on any path.**
+    /// That is what makes the bound safe to be a superset and fatal to be a
+    /// subset, and it is why `search_fts`'s word tokens are not substituted for
+    /// substrings (§5.10, CLOSURE §4).
+    fn match_group(&mut self, group: &AndGroup, b: &str) -> String {
+        let exact = fold_and(
+            group
+                .iter()
+                .map(|term| self.match_term(term, b))
+                .collect::<Vec<_>>(),
+        );
+        // An arm that provably matches nothing is not worth asking the index
+        // for, and `AND 0` inside the bound subquery would be planned as a scan.
+        if exact == "0" {
+            return exact;
+        }
+        match self.fts_bound(group, b) {
+            Some(bound) => fold_and(vec![bound, exact]),
+            None => exact,
+        }
+    }
+
+    /// One term of an AND group, transcribing `search_query::group_matches`
+    /// verbatim: `present = !text.is_empty() && lower.contains(text)`, then
+    /// `present != negated`.
+    ///
+    /// **Emptiness is decided in the parsed [`Term`], never in SQLite.**
+    /// `instr(text, '')` is 1 and would make an empty positive term true, and
+    /// `length()` stops at the first NUL so it cannot even measure the string —
+    /// so the two engines can only agree if the Rust side answers (§5.10).
+    fn match_term(&mut self, term: &Term, b: &str) -> String {
+        if term.text.is_empty() {
+            // `present` is false, so the term is satisfied exactly when it is a
+            // negative one. (A group of only negative terms never reaches here:
+            // `Matcher::parse` discards it.)
+            return if term.negated { "1" } else { "0" }.to_string();
+        }
+        // The needle is the parser's own canonically folded text and the column
+        // is `canonical_fold(visible)` written by both producers — the same
+        // fold on both sides, never a second normalizer that agrees by
+        // inspection.
+        let needle = self.bind(PhysicalQueryValue::Text(term.text.clone()));
+        let present = format!("(instr({b}.query_visible_folded, {needle}) > 0)");
+        if term.negated {
+            fold_not(present)
+        } else {
+            present
+        }
+    }
+
+    /// The trigram candidate bound for one OR arm, or `None` when the arm
+    /// supplies none — which makes the arm an explicitly unbounded SQL content
+    /// predicate rather than a defect to work around (§5.10).
+    ///
+    /// `search_substring_fts` is a `tokenize = 'trigram'` FTS5 table over
+    /// `normalized_searchable_text`, associated to its owner through
+    /// `search_fts_owners.rowid`; both producers write that column as
+    /// `canonical_fold(searchable_text)`, i.e. the SAME fold as the exact
+    /// column over WHITESPACE-COLLAPSED text. That is the whole reason the
+    /// needle is a whitespace-free run and not the phrase: a phrase with
+    /// leading, repeated or line-breaking whitespace does not survive the
+    /// collapse, and a bound that required it to would exclude a true match.
+    fn fts_bound(&mut self, group: &AndGroup, b: &str) -> Option<String> {
+        if !self.inputs.fts_ready {
+            return None;
+        }
+        let needle = fts_candidate_needle(group)?;
+        let literal = self.bind(PhysicalQueryValue::Text(fts_phrase_literal(needle)));
+        let fts = self.alias("sf");
+        let owners = self.alias("fo");
+        Some(format!(
+            "{b}.block_id IN (SELECT {owners}.entity_id \
+             FROM search_substring_fts {fts} \
+             JOIN search_fts_owners {owners} ON {owners}.rowid = {fts}.rowid \
+             WHERE {fts}.normalized_text MATCH {literal} \
+             AND {owners}.entity_type = {OWNER_BLOCK})"
+        ))
+    }
+
+    /// One legacy `content regexp <pattern>` leaf (§4.3.2).
+    ///
+    /// The walk's arm is `compiled.regex(text).is_some_and(|r|
+    /// r.is_match(visible))`, and `CompiledLeaves` stores `Regex::new(text).ok()`
+    /// — so a pattern that did not compile is a retained leaf matching FALSE,
+    /// which needs no regex engine in SQLite and lowers to the constant `0`.
+    /// A pattern that DID compile needs §4.3.2's fixed registered scalar
+    /// predicate over `blocks.query_visible`, which the read-only seam cannot
+    /// host at this tine-storage pin; declining sends the query to the walk,
+    /// which is the SAME answer (§5.9), not a different one.
+    fn content_regex(&mut self, source: &str) -> String {
+        if self.inputs.compiled.regex(source).is_none() {
+            return "0".to_string();
+        }
+        self.decline(REGEX_DECLINED)
     }
 
     /// `task` reads `tasks.marker`. Both producers write the marker
@@ -1376,6 +1568,117 @@ impl Compiler<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// §5.10 — the shared Match payload, and the candidate needle
+// ---------------------------------------------------------------------------
+
+/// The one reason this wave declines a content leaf (§4.3.2, see the module
+/// header). It names the operator family, not the packet, because the walk
+/// answers it and the dispatch counts it.
+const REGEX_DECLINED: &str = "content regex (§4.3.2 needs a registered SQL regex predicate)";
+
+/// What the compiler does with ONE `content match` payload.
+///
+/// Owned rather than borrowed so that reading the shared parse does not hold a
+/// borrow of the compiler across the `&mut self` calls that consume it; the
+/// clone is a handful of small strings per leaf, and it is the SAME parsed
+/// value — not a second parse (I-12).
+enum MatchProgram {
+    /// `Empty` — a blank or exclusion-only query — or a payload the walk never
+    /// collected. Both are false in `Matcher::matches`.
+    AlwaysFalse,
+    /// The whole-query `/pattern/` form, already restricted by
+    /// `common_regex_pattern` at parse time. `compiled` is false for a pattern
+    /// the regex engine rejected, which §4.3.2 retains as a leaf matching
+    /// false — still a REGEX leaf for §5.10's plan classes, just one that needs
+    /// no engine to answer.
+    Regex {
+        compiled: bool,
+    },
+    Boolean(Vec<AndGroup>),
+}
+
+/// Read the shared parse for one `content match` payload.
+fn match_program(compiled: &CompiledLeaves, source: &str) -> MatchProgram {
+    match compiled.match_program(source) {
+        None | Some(Matcher::Empty) => MatchProgram::AlwaysFalse,
+        Some(Matcher::InvalidRegex(_)) => MatchProgram::Regex { compiled: false },
+        Some(Matcher::Regex(_)) => MatchProgram::Regex { compiled: true },
+        Some(Matcher::Boolean(groups)) => MatchProgram::Boolean(groups.clone()),
+    }
+}
+
+/// The FTS candidate needle for one OR arm, or `None` when the arm has none
+/// (SPEC §5.10, verbatim):
+///
+/// > scan positive folded terms in order, excluding NUL-bearing terms, split
+/// > each with Rust `str::split_whitespace` (the producers' rule), and take its
+/// > first whitespace-free run of at least three Unicode scalars. Use the first
+/// > such run as the candidate needle, not the entire phrase.
+///
+/// **Never a negative term.** A negative term says the text does NOT contain
+/// it; using it as a candidate bound would select exactly the rows the arm
+/// rejects. Three scalars is the trigram tokenizer's own floor, not a tuning
+/// constant: a shorter needle produces no token and would match nothing.
+fn fts_candidate_needle(group: &AndGroup) -> Option<&str> {
+    group
+        .iter()
+        .filter(|term| !term.negated && !term.text.contains('\0'))
+        .find_map(|term| {
+            term.text
+                .split_whitespace()
+                .find(|run| run.chars().count() >= 3)
+        })
+}
+
+/// One FTS5 string literal holding `needle` as a single phrase: FTS5 quotes
+/// with `"` and escapes an embedded `"` by doubling it. Quoting is what keeps
+/// the needle a LITERAL rather than an expression — `-`, `*`, `(`, `:` and the
+/// bare words `AND`/`OR`/`NOT` are query syntax outside quotes.
+fn fts_phrase_literal(needle: &str) -> String {
+    format!("\"{}\"", needle.replace('"', "\"\""))
+}
+
+/// §5.10's plan classes for every content leaf of one filter, depth-first.
+///
+/// A leaf that folds to the constant false contributes nothing: it reads no
+/// row, so it has no plan. Every other content leaf gets exactly one class.
+fn content_plans(filter: &Filter, inputs: &LoweringInputs<'_>) -> Vec<ContentPlan> {
+    let mut out = Vec::new();
+    filter.for_each_leaf(&mut |leaf| {
+        let Leaf::Attr {
+            attr: Attr::Content,
+            op,
+            value: Value::Text { text },
+        } = leaf
+        else {
+            return;
+        };
+        match op {
+            // Every regex leaf is a regex plan class, compiled or not: §4.3.2
+            // makes regex an explicitly unindexed content predicate either way.
+            // Only the invalid ones reach a statement in this wave.
+            CmpOp::Regex => out.push(ContentPlan::Regex),
+            CmpOp::Match => match match_program(inputs.compiled, text) {
+                MatchProgram::AlwaysFalse => {}
+                MatchProgram::Regex { .. } => out.push(ContentPlan::Regex),
+                MatchProgram::Boolean(groups) => out.push(if !inputs.fts_ready {
+                    ContentPlan::FtsBuilding
+                } else if groups
+                    .iter()
+                    .all(|group| fts_candidate_needle(group).is_some())
+                {
+                    ContentPlan::Fts
+                } else {
+                    ContentPlan::ShortUnindexable
+                }),
+            },
+            _ => {}
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
 // §5.7 — positive boundedness
 // ---------------------------------------------------------------------------
 
@@ -1388,12 +1691,16 @@ impl Compiler<'_> {
 ///
 /// **The table below is exhaustive** (A6): a leaf/operator pair absent from it
 /// is unbounded. "Every OG head" is not a category.
-pub(crate) fn positively_bounded(filter: &Filter, anchor: Anchor) -> bool {
+pub(crate) fn positively_bounded(
+    filter: &Filter,
+    anchor: Anchor,
+    inputs: &LoweringInputs<'_>,
+) -> bool {
     let row = match anchor {
         Anchor::Block => BoundRow::Block,
         Anchor::Page => BoundRow::Page,
     };
-    bounded(filter, false, row)
+    bounded(filter, false, row, inputs)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1402,30 +1709,49 @@ enum BoundRow {
     Page,
 }
 
-fn bounded(filter: &Filter, negated: bool, row: BoundRow) -> bool {
+fn bounded(filter: &Filter, negated: bool, row: BoundRow, inputs: &LoweringInputs<'_>) -> bool {
     match filter {
         // A conjunction needs ONE bounded conjunct; a disjunction needs ALL of
         // its arms bounded, because the anchor is reached once per arm.
-        Filter::And { items } if !negated => items.iter().any(|item| bounded(item, false, row)),
+        Filter::And { items } if !negated => {
+            items.iter().any(|item| bounded(item, false, row, inputs))
+        }
         Filter::And { items } => {
-            !items.is_empty() && items.iter().all(|item| bounded(item, true, row))
+            !items.is_empty() && items.iter().all(|item| bounded(item, true, row, inputs))
         }
         Filter::Or { items } if !negated => {
-            !items.is_empty() && items.iter().all(|item| bounded(item, false, row))
+            !items.is_empty() && items.iter().all(|item| bounded(item, false, row, inputs))
         }
-        Filter::Or { items } => items.iter().any(|item| bounded(item, true, row)),
-        Filter::Not { inner } => bounded(inner, !negated, row),
-        Filter::Leaf { leaf } => !negated && leaf_bounds(leaf, row),
+        Filter::Or { items } => items.iter().any(|item| bounded(item, true, row, inputs)),
+        Filter::Not { inner } => bounded(inner, !negated, row, inputs),
+        Filter::Leaf { leaf } => !negated && leaf_bounds(leaf, row, inputs),
         Filter::Off { .. } | Filter::True | Filter::False | Filter::Raw { .. } => false,
     }
 }
 
-fn leaf_bounds(leaf: &Leaf, row: BoundRow) -> bool {
+fn leaf_bounds(leaf: &Leaf, row: BoundRow, inputs: &LoweringInputs<'_>) -> bool {
     match leaf {
-        Leaf::Attr { attr, op, .. } => match (row, attr) {
-            // `content` has no index on `blocks`; `starts_with` on it is not
-            // range-lowerable either.
-            (BoundRow::Block, Attr::Content) => false,
+        Leaf::Attr { attr, op, value } => match (row, attr) {
+            // `blocks` has no content index, so every content operator but
+            // `match` is unbounded: `starts_with` on `content` is not
+            // range-lowerable, and regex is explicitly unindexed (§4.3.2).
+            //
+            // `match` bounds the anchor when the FTS index is READY and EVERY
+            // retained OR arm supplies a candidate needle. One unbounded arm
+            // makes the whole leaf unbounded — the arms are OR-ed, so the
+            // anchor is reached once per arm and a single unbounded arm
+            // enumerates it (§5.10, §5.7's `Or` rule).
+            (BoundRow::Block, Attr::Content) => {
+                *op == CmpOp::Match
+                    && inputs.fts_ready
+                    && matches!(value, Value::Text { text }
+                    if match match_program(inputs.compiled, text) {
+                        MatchProgram::Boolean(groups) => groups
+                            .iter()
+                            .all(|group| fts_candidate_needle(group).is_some()),
+                        _ => false,
+                    })
+            }
             (BoundRow::Block, Attr::Task) => matches!(
                 op,
                 CmpOp::Eq | CmpOp::NotEq | CmpOp::In | CmpOp::NotIn | CmpOp::IsSet
@@ -1485,8 +1811,8 @@ fn leaf_bounds(leaf: &Leaf, row: BoundRow) -> bool {
                 (_, Rel::Props) => {
                     pred.props_key().is_some() && matches!(quant, Quant::Any | Quant::Every)
                 }
-                (BoundRow::Block, Rel::Children) => bounded(pred, false, BoundRow::Block),
-                (BoundRow::Block, Rel::Page) => bounded(pred, false, BoundRow::Page),
+                (BoundRow::Block, Rel::Children) => bounded(pred, false, BoundRow::Block, inputs),
+                (BoundRow::Block, Rel::Page) => bounded(pred, false, BoundRow::Page, inputs),
                 _ => false,
             }
         }
@@ -1622,19 +1948,38 @@ mod tests {
     use crate::query::ir::{Source, ViewSettings};
     use crate::query::registry::Registry;
 
+    /// No content leaf: the empty shared parse is what the walk would build for
+    /// a filter carrying none, so the two engines still read the same map.
+    static NO_COMPILED_LEAVES: std::sync::LazyLock<CompiledLeaves> =
+        std::sync::LazyLock::new(|| CompiledLeaves::for_query(&Filter::True));
+
     fn inputs<'a>(registry: &'a Registry) -> LoweringInputs<'a> {
         LoweringInputs {
             today: JournalDate::from_ordinal(20260905),
             registry,
             masked_pages: &[],
             cutoff: None,
+            compiled: &NO_COMPILED_LEAVES,
+            fts_ready: true,
         }
     }
 
-    fn lower(filter: Filter, anchor: Anchor) -> SqlQuery {
+    /// The lowering of one filter, with the shared Match parse the walk would
+    /// build for it — never a second parse (I-12).
+    fn lower_with(filter: Filter, anchor: Anchor, fts_ready: bool) -> Lowered {
         let registry = Registry::none().clone();
+        let compiled = CompiledLeaves::for_query(&filter);
         let query = Query::new(anchor, filter, Source::Builder);
-        match lower_query(&query, &inputs(&registry)) {
+        let inputs = LoweringInputs {
+            compiled: &compiled,
+            fts_ready,
+            ..inputs(&registry)
+        };
+        lower_query(&query, &inputs)
+    }
+
+    fn lower(filter: Filter, anchor: Anchor) -> SqlQuery {
+        match lower_with(filter, anchor, true) {
             Lowered::Statement(statement) => statement,
             Lowered::Unsupported(reason) => panic!("unexpectedly declined: {reason}"),
         }
@@ -1903,6 +2248,8 @@ mod tests {
     /// §5.7: the boundedness table is exhaustive, and negation never bounds.
     #[test]
     fn boundedness_follows_the_exhaustive_table() {
+        let registry = Registry::none().clone();
+        let inputs = inputs(&registry);
         let bounded_shapes = [
             "[[Project]]",
             "(task TODO)",
@@ -1913,7 +2260,7 @@ mod tests {
         for source in bounded_shapes {
             let (query, _) = og(source);
             assert!(
-                positively_bounded(&query.evaluable_filter(), Anchor::Block),
+                positively_bounded(&query.evaluable_filter(), Anchor::Block, &inputs),
                 "{source} must be positively bounded"
             );
         }
@@ -1925,7 +2272,7 @@ mod tests {
         for source in unbounded_shapes {
             let (query, _) = og(source);
             assert!(
-                !positively_bounded(&query.evaluable_filter(), Anchor::Block),
+                !positively_bounded(&query.evaluable_filter(), Anchor::Block, &inputs),
                 "{source} must NOT be positively bounded"
             );
         }
@@ -1935,32 +2282,281 @@ mod tests {
     /// a negated leaf bound nothing even though their positive twins do.
     #[test]
     fn absence_and_negation_bound_nothing() {
+        let registry = Registry::none().clone();
+        let inputs = inputs(&registry);
         let absent = Filter::attr(Attr::Scheduled, CmpOp::IsNotSet, Value::None);
-        assert!(!positively_bounded(&absent, Anchor::Block));
+        assert!(!positively_bounded(&absent, Anchor::Block, &inputs));
         let present = Filter::attr(Attr::Scheduled, CmpOp::IsSet, Value::None);
-        assert!(positively_bounded(&present, Anchor::Block));
-        assert!(!positively_bounded(&Filter::not(present), Anchor::Block));
+        assert!(positively_bounded(&present, Anchor::Block, &inputs));
+        assert!(!positively_bounded(
+            &Filter::not(present),
+            Anchor::Block,
+            &inputs
+        ));
     }
 
-    /// §5.9's dispatch, not a divergence: the two `content` operators whose SQL
-    /// acceleration is P1-c decline, and the walk answers them.
+    // -----------------------------------------------------------------------
+    // §5.10
+    // -----------------------------------------------------------------------
+
+    fn content_match(text: &str) -> Filter {
+        Filter::attr(Attr::Content, CmpOp::Match, Value::text(text))
+    }
+
+    fn match_sql(text: &str, fts_ready: bool) -> SqlQuery {
+        match lower_with(content_match(text), Anchor::Block, fts_ready) {
+            Lowered::Statement(statement) => statement,
+            Lowered::Unsupported(reason) => panic!("unexpectedly declined: {reason}"),
+        }
+    }
+
+    /// The one rule that decides this packet: the exact `instr` predicates are
+    /// the final SQL conditions on EVERY path, so the trigram probe only
+    /// narrows which rows are asked. A bound that replaced them would answer
+    /// "different results, faster".
     #[test]
-    fn the_content_operators_p1_c_owns_decline_rather_than_answering_differently() {
+    fn the_candidate_bound_narrows_and_never_replaces_the_exact_predicate() {
+        let bounded = match_sql("alpha", true);
+        assert!(
+            bounded.sql.contains("search_substring_fts")
+                && bounded.sql.contains("MATCH ?")
+                && bounded.sql.contains("instr(b.query_visible_folded, ?"),
+            "{}",
+            bounded.sql
+        );
+        assert!(bounded.positively_bounded);
+        assert_eq!(bounded.content_plans, vec![ContentPlan::Fts]);
+        // The needle is the FTS phrase literal, and the exact needle is the
+        // parser's own folded term — two different bound values.
+        assert!(bounded
+            .params
+            .contains(&PhysicalQueryValue::Text("\"alpha\"".to_string())));
+        assert!(bounded
+            .params
+            .contains(&PhysicalQueryValue::Text("alpha".to_string())));
+    }
+
+    /// §5.10's acceptance corollary, at the compiler: `foobar` is reachable by
+    /// `foo` and `oob` THROUGH the index and by `oo` WITHOUT it — the two-scalar
+    /// term yields no trigram, and answering it is not optional.
+    #[test]
+    fn a_two_scalar_term_is_unbounded_rather_than_unanswered() {
+        for needle in ["foo", "oob"] {
+            let statement = match_sql(needle, true);
+            assert!(statement.sql.contains("search_substring_fts"), "{needle}");
+            assert_eq!(statement.content_plans, vec![ContentPlan::Fts]);
+        }
+        let short = match_sql("oo", true);
+        assert!(
+            !short.sql.contains("search_substring_fts")
+                && short.sql.contains("instr(b.query_visible_folded, ?"),
+            "{}",
+            short.sql
+        );
+        assert!(!short.positively_bounded);
+        assert_eq!(short.content_plans, vec![ContentPlan::ShortUnindexable]);
+    }
+
+    /// One unbounded OR arm makes the LEAF unbounded, and that is not a defect
+    /// to work around: the anchor is reached once per arm.
+    #[test]
+    fn one_unbounded_or_arm_unbounds_the_whole_leaf() {
+        let mixed = match_sql("oo OR alpha", true);
+        assert!(!mixed.positively_bounded);
+        assert_eq!(mixed.content_plans, vec![ContentPlan::ShortUnindexable]);
+        // The bounded arm still gets its bound — bounds are per-arm.
+        assert_eq!(mixed.sql.matches("search_substring_fts").count(), 2);
+        assert!(match_sql("beta OR alpha", true).positively_bounded);
+    }
+
+    /// §5.10: emptiness comes from the parsed `Term`, not from SQLite.
+    /// `instr(text, '')` is 1 and `length` stops at NUL, so only the Rust side
+    /// can reproduce `group_matches`' `!text.is_empty() && contains`.
+    #[test]
+    fn an_empty_term_is_false_and_an_empty_negative_term_is_true() {
+        // A whitespace-only quoted phrase is NOT empty: it is a real needle the
+        // exact column can hold and the collapsed FTS text cannot.
+        let spaces = match_sql("\"   \"", true);
+        assert!(!spaces.matches_nothing && !spaces.sql.contains("search_substring_fts"));
+        assert!(spaces
+            .params
+            .contains(&PhysicalQueryValue::Text("   ".to_string())));
+        assert_eq!(spaces.content_plans, vec![ContentPlan::ShortUnindexable]);
+
+        // The empty term itself, against `group_matches`' own answer. It is
+        // constructed rather than parsed because `Matcher::parse` drops an
+        // empty TOKEN — but the rule has to hold for the parsed value it does
+        // produce, whatever a future fold makes empty, and SQLite's `instr`
+        // answers the opposite of it.
         let registry = Registry::none().clone();
-        for (op, expected) in [
-            (CmpOp::Match, "content match (§5.10, P1-c)"),
-            (CmpOp::Regex, "content regexp (§5.10, P1-c)"),
-        ] {
-            let query = Query::new(
-                Anchor::Block,
-                Filter::attr(Attr::Content, op, Value::text("needle")),
-                Source::Builder,
-            );
+        let inputs = inputs(&registry);
+        let mut compiler = Compiler {
+            inputs: &inputs,
+            params: Vec::new(),
+            next_alias: 0,
+            unsupported: None,
+        };
+        for negated in [false, true] {
+            let term = Term {
+                text: String::new(),
+                negated,
+                quoted: false,
+            };
+            let group = vec![term.clone()];
             assert_eq!(
-                lower_query(&query, &inputs(&registry)),
-                Lowered::Unsupported(expected)
+                compiler.match_term(&term, "b"),
+                if negated { "1" } else { "0" },
+                "an empty {}term",
+                if negated { "negative " } else { "" }
+            );
+            // And the walk agrees, on text that contains everything and nothing.
+            for text in ["", "anything at all"] {
+                let matcher = Matcher::Boolean(vec![group.clone()]);
+                assert_eq!(
+                    matcher.matches(text, text),
+                    negated,
+                    "the walk's answer for an empty term over {text:?}"
+                );
+            }
+        }
+        assert!(compiler.params.is_empty(), "a constant binds nothing");
+    }
+
+    /// Exclusion-only input and an invalid regex are FALSE LEAVES (§5.10), so
+    /// `not` over them is classically true — the existing truth rule, not a
+    /// whole-query diagnostic.
+    #[test]
+    fn exclusion_only_and_invalid_regex_lower_to_a_false_leaf_under_not_too() {
+        for (source, plans) in [
+            ("-alpha", &[][..]),
+            ("   ", &[][..]),
+            // An invalid `/pattern/` is still a REGEX leaf for §5.10's plan
+            // classes — it just needs no engine to answer false.
+            ("/[unclosed/", &[ContentPlan::Regex][..]),
+        ] {
+            let statement = match_sql(source, true);
+            assert!(statement.matches_nothing, "{source}: {}", statement.sql);
+            assert_eq!(statement.content_plans, plans, "{source}");
+            let negated = match lower_with(Filter::not(content_match(source)), Anchor::Block, true)
+            {
+                Lowered::Statement(statement) => statement,
+                Lowered::Unsupported(reason) => panic!("declined {source}: {reason}"),
+            };
+            assert!(!negated.matches_nothing, "{source}: {}", negated.sql);
+            assert!(!negated.positively_bounded, "{source}");
+        }
+    }
+
+    /// The `fts-building` class (§5.10): the SAME exact predicates on the ready
+    /// block columns, with no bound anywhere — never empty results, an error, a
+    /// new walk route, or a rebuild request (I-13).
+    #[test]
+    fn a_building_index_omits_the_bounds_and_keeps_the_exact_predicates() {
+        let building = match_sql("alpha beta OR gamma", false);
+        assert!(
+            !building.sql.contains("search_substring_fts")
+                && !building.sql.contains("search_fts_owners")
+                && !building.sql.contains("MATCH"),
+            "{}",
+            building.sql
+        );
+        assert_eq!(building.sql.matches("instr(").count(), 6);
+        assert!(!building.positively_bounded);
+        assert_eq!(building.content_plans, vec![ContentPlan::FtsBuilding]);
+        // Same predicates, same bound needles, as the ready lowering: only the
+        // candidate bound differs.
+        let ready = match_sql("alpha beta OR gamma", true);
+        for term in ["alpha", "beta", "gamma"] {
+            let value = PhysicalQueryValue::Text(term.to_string());
+            assert!(building.params.contains(&value) && ready.params.contains(&value));
+        }
+    }
+
+    /// A negative term never bounds anything: it says the text does NOT contain
+    /// it, so using it as a candidate would select exactly the rejected rows.
+    #[test]
+    fn a_negative_term_is_negated_and_never_becomes_the_candidate() {
+        let statement = match_sql("oo -draft", true);
+        assert!(
+            statement
+                .sql
+                .contains("(NOT (instr(b.query_visible_folded, ?"),
+            "{}",
+            statement.sql
+        );
+        assert!(
+            !statement.sql.contains("search_substring_fts"),
+            "the only three-scalar run is the NEGATIVE term: {}",
+            statement.sql
+        );
+        assert!(!statement
+            .params
+            .contains(&PhysicalQueryValue::Text("\"draft\"".to_string())));
+    }
+
+    /// §5.10's needle rule, at the unit that owns it.
+    #[test]
+    fn the_candidate_needle_is_the_first_three_scalar_whitespace_free_run() {
+        let needle = |source: &str| {
+            let Matcher::Boolean(groups) = Matcher::parse(source) else {
+                panic!("{source} is not a boolean query");
+            };
+            fts_candidate_needle(&groups[0]).map(str::to_owned)
+        };
+        // Not the whole phrase: the run survives the producers' whitespace
+        // collapsing, the leading/repeated spaces need not.
+        assert_eq!(needle("\"  alpha  beta\""), Some("alpha".to_string()));
+        assert_eq!(needle("\"a b cde\""), Some("cde".to_string()));
+        // Terms are scanned in order, and a term with no long-enough run is
+        // skipped rather than ending the scan.
+        assert_eq!(needle("ab cd efgh"), Some("efgh".to_string()));
+        assert_eq!(needle("ab cd"), None);
+        assert_eq!(needle("-longenough ab"), None);
+        // Three SCALARS, not three bytes.
+        assert_eq!(needle("日本語"), Some("日本語".to_string()));
+        assert_eq!(needle("日本"), None);
+        // A NUL-bearing term supplies no bound at all.
+        let nul = vec![Term {
+            text: "abc\0def".to_string(),
+            negated: false,
+            quoted: false,
+        }];
+        assert_eq!(fts_candidate_needle(&nul), None);
+    }
+
+    /// The needle crosses the boundary as ONE FTS5 phrase literal, so `-`,
+    /// `*`, `(` and a bare `OR` inside it are text and not query syntax.
+    #[test]
+    fn the_fts_needle_is_quoted_as_one_literal_with_doubled_quotes() {
+        assert_eq!(fts_phrase_literal("say\"hi"), "\"say\"\"hi\"");
+        assert_eq!(fts_phrase_literal("a OR b"), "\"a OR b\"");
+        assert_eq!(fts_phrase_literal("-x*"), "\"-x*\"");
+    }
+
+    /// §5.9's dispatch, not a divergence: a VALID regex declines because
+    /// §4.3.2's predicate is a registered scalar function the read-only seam
+    /// cannot host. An INVALID one needs no engine and is a false leaf.
+    #[test]
+    fn a_valid_regex_declines_and_an_invalid_one_is_a_false_leaf() {
+        for source in ["content regexp '[a-z]+'", "content match '/[a-z]+/'"] {
+            let (query, _) = tql(source);
+            let filter = query.evaluable_filter();
+            assert_eq!(
+                lower_with(filter, Anchor::Block, true),
+                Lowered::Unsupported(REGEX_DECLINED),
+                "{source}"
             );
         }
+        let invalid = match lower_with(
+            Filter::attr(Attr::Content, CmpOp::Regex, Value::text("[unclosed")),
+            Anchor::Block,
+            true,
+        ) {
+            Lowered::Statement(statement) => statement,
+            Lowered::Unsupported(reason) => panic!("declined: {reason}"),
+        };
+        assert!(invalid.matches_nothing);
+        assert_eq!(invalid.content_plans, vec![ContentPlan::Regex]);
     }
 
     /// The walk evaluates a `refs` leaf inside a `children` predicate against
