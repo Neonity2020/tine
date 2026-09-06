@@ -1391,7 +1391,9 @@ pub(super) fn document_facets_from_parsed_block(block: &crate::doc::DocBlock) ->
     }
 }
 
-fn materialized_page_input(page: super::MaterializedPage) -> super::MaterializedPageInput {
+pub(crate) fn materialized_page_input(
+    page: super::MaterializedPage,
+) -> super::MaterializedPageInput {
     let is_org = super::reference_catalog::reference_source_is_org(&page.path);
     let preamble_facets = page
         .preamble

@@ -306,6 +306,7 @@ Managed storage selection, and no byte is written into the user's graph.
 | `archive/operations.<generation>/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
+| `<configured projection>.pending-overlay.sqlite` (+ `-wal`/`-shm`) | pending-overlay worker thread of the clean runtime | off-actor Managed simple queries whose stamp names a pending suffix | current `tine-storage` physical projection schema, rows of the pending pages only, no frontier or authority | disposable: created empty on every runtime open, deleted on close; a damaged file makes the query walk |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
@@ -805,9 +806,10 @@ not counted as a fallback; and a `Failed` read is an error, as a failed
 materialized read is today, because the walk reads the same file and has
 nothing better to say. The walk is the actor evaluation every simple query ran
 before this route, over the capture it already prepared, so a query is parsed
-and its registry read once. A pending local suffix is never captured: the turn
-answers it on the actor exactly as before, neither reading nor filling the
-memo. The projection file is closed in exactly three places — the runtime
+and its registry read once. A pending local suffix is not a reason to walk by
+itself: it is part of the stamp (the overlay revision below), and the turn
+captures a page-local, property-free query with it exactly as it captures an
+accepted-only one. The projection file is closed in exactly three places — the runtime
 actor dropping, a handle closing, and the shared-join install replacing the
 clean runtime — and each drains the job owner first; the accepted batch apply
 is not one of them, because it writes a checkpoint sidecar, never a WAL
@@ -839,6 +841,36 @@ answers as if it succeeded. What no read can see: a missing `block_text` or
 `pages` row under a shape whose match set joins that table simply drops the
 block from the match set, on this route and on Direct alike, because the
 shared lowering has no row-count cross-check (R4a finding F1, open).
+
+**The pending local suffix has one mirror off the actor: the overlay
+projection.** Beside the accepted projection the clean runtime keeps
+`<accepted projection>.pending-overlay.sqlite`, a second database of the same
+`tine-storage` physical schema holding the lowered rows of exactly the pages
+whose latest projection frame is still pending — the same set the actor's
+frame map holds, no more. It is disposable in the strongest sense: it is
+deleted and recreated empty on every runtime open, deleted again on close,
+carries no frontier, no stamp and no authority, and is never read to decide
+anything the accepted file or the journal decides. The actor never writes it:
+every change to the pending set — a frame published, a page's post-save
+content, a deletion, a drain retiring the frame — is pushed as one revisioned
+update to a single overlay worker thread, which lowers the newest state per
+path through the same per-page lowering the accepted apply uses and publishes
+the revision it has flushed. A path whose content the actor could not supply
+is `incomplete`, and a lowering or write failure marks the whole overlay
+`failed`; either makes every open of it `Stale`/`Unavailable` and the query
+walks, so a damaged overlay costs a walk and never an answer. The revision the
+actor read when it stamped a query is the stamp's `overlay_revision`, so an
+answer is memoized under, and a capture validated against, the exact pending
+state it saw. A query is a read: it pushes nothing and advances no revision.
+Coherence with the accepted file follows from acceptance itself — a pending
+path leaves the set only when its batch is accepted, which advances the
+acceptance sequence the capture's `open_managed` validates inside its read
+transaction, so a snapshot that opens `Current` was captured before any
+pending page it masks could have moved. Until R5a lands the two-source read,
+the captured pending query executes as `Busy` and walks (R5b, stub); until R5c
+patches the registry off the actor, a query with a property leaf, and any
+query whose relations leave one page (`PageLocality`), still walk on the
+actor uncaptured.
 
 ## 2. Enrollment and synchronization state machine
 

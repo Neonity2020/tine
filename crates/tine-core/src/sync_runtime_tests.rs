@@ -2578,6 +2578,11 @@ fn managed_task_query_overlay_stays_at_exact_existing_page_seams() {
         "managed_sparse_task_query_candidate_from_sqlite",
         "note_managed_sparse_task_query_",
         "task_candidate_blocks_after",
+        // R5b retired the actor-side task-query overlay map the runner used to
+        // read: the pending state's ONE mirror is the overlay projection.
+        "latest_task_query_overlay",
+        "LatestTaskQueryOverlay",
+        "sparse_task_query_order_is_valid",
     ] {
         assert!(
             !production.contains(retired),
@@ -3913,9 +3918,12 @@ fn crash_replayed_task_overlay_falls_back_instead_of_answering_stale_sqlite() {
     drop(handle);
 
     let reopened = active_handle(SyncRuntimeHandle::open(request));
-    let overlay = reopened.managed_task_query_overlay_snapshot().unwrap();
+    let (_, overlay) = reopened
+        .pending_overlay_state()
+        .unwrap()
+        .expect("a clean runtime installs its pending overlay");
     assert!(
-        overlay.entries.is_empty(),
+        overlay.pending_paths.is_empty(),
         "cold open now drains the semantic journal before actor handoff: {overlay:?}"
     );
 
@@ -27847,9 +27855,11 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
         "the memo fixture edit was not accepted: {save:?}"
     );
 
-    // While the save is still an undrained local suffix the accepted frontier
-    // is NOT the whole story, so the turn neither reads nor fills the memo and
-    // answers on the actor over the overlay -- "pending may temporarily walk".
+    // While the save is still an undrained local suffix the stamp carries the
+    // pending overlay's revision (R5b), so the earlier memo entry cannot be
+    // reused: the query is captured, the executor (a stub until R5a) reports
+    // `Busy`, and the actor walk answers over the overlay -- "pending may
+    // temporarily walk".
     assert_eq!(handle.status().unwrap().managed_local_pending, 1);
     let (pending, counters, census) = run("query while the save is pending");
     assert_eq!(
@@ -27858,8 +27868,8 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
     );
     assert_eq!(
         census,
-        (0, 0, 0, 0),
-        "a pending suffix is never captured: {census:?}"
+        (0, 1, 0, 0),
+        "a pending page-local query is captured and the stub walks: {census:?}"
     );
     assert!(
         counters.result_page_hydrations > 0,
@@ -32973,9 +32983,23 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_falls_back_to_the_
     ));
 }
 
+/// R5b: a pending local suffix no longer forces the walk. A page-local,
+/// property-free query is CAPTURED with the overlay's revision; the executor
+/// (a stub until R5a) reports `Busy`, the walk answers and it is counted as a
+/// fallback. The overlay projection meanwhile holds exactly the pending page.
 #[test]
-fn r4b_a_pending_local_suffix_is_answered_on_the_actor_and_never_captured() {
-    let (fixture, handle) = r4b_reopened("r4b-pending-suffix", 0x4b02);
+fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
+    let (fixture, handle) = r4b_reopened("r5b-pending-suffix", 0x5b01);
+    let (overlay_path, before) = handle
+        .pending_overlay_state()
+        .unwrap()
+        .expect("a clean runtime installs its pending overlay");
+    assert!(overlay_path.exists());
+    assert!(before.pending_paths.is_empty());
+    assert!(before.incomplete.is_empty());
+    assert_eq!(before.failed, None);
     let witness_path = Graph::open(&fixture.graph_root)
         .list_pages()
         .into_iter()
@@ -32999,29 +33023,169 @@ fn r4b_a_pending_local_suffix_is_answered_on_the_actor_and_never_captured() {
     );
     assert_eq!(handle.status().unwrap().managed_local_pending, 1);
 
-    // Were the pending query captured, this outcome would turn it into an
-    // error; it is answered on the actor instead and the injection is never
-    // consumed.
-    r4b_inject(
-        &handle,
-        vec![crate::managed_query::ManagedQueryOutcome::Failed(
-            "must not be consumed",
-        )],
+    // The overlay mirrors the pending set, and its rows are the pending
+    // page's: one `pages` row at the witness path, its blocks written.
+    let (_, pending) = handle.pending_overlay_state().unwrap().unwrap();
+    assert_eq!(
+        pending.pending_paths,
+        std::collections::BTreeSet::from([witness_path.clone()])
     );
+    assert!(pending.incomplete.is_empty(), "{pending:?}");
+    assert_eq!(pending.failed, None);
+    assert!(pending.flushed_revision >= 2, "{pending:?}");
+    let overlay_rows = |sql: &str| -> Vec<Vec<PhysicalQueryValue>> {
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&overlay_path, || Ok(()))
+            .expect("the overlay file opens");
+        snapshot.run_projection_query(sql, &[]).unwrap()
+    };
+    assert_eq!(
+        overlay_rows("SELECT path FROM pages ORDER BY path"),
+        vec![vec![PhysicalQueryValue::Text(witness_path.clone())]]
+    );
+    let (saved, _) = load_application_exact(&handle, &witness_path);
+    let saved_blocks = flatten_application_blocks(&saved.blocks).len();
+    assert_eq!(
+        overlay_rows("SELECT count(*) FROM blocks"),
+        vec![vec![PhysicalQueryValue::Integer(saved_blocks as i64)]]
+    );
+    assert_eq!(
+        overlay_rows("SELECT count(*) FROM query_block_results"),
+        vec![vec![PhysicalQueryValue::Integer(saved_blocks as i64)]],
+        "every pending block carries its stored result identity"
+    );
+
+    // Captured: the injected outcome IS consumed. Busy → the walk answers and
+    // the fallback is counted; no statement read happened (the stub).
+    let oracle = r4b_oracle(&fixture);
+    r4b_inject(&handle, vec![Outcome::Busy]);
     let result = r4b_query(&handle).unwrap();
-    assert!(result.total > 0);
+    assert_managed_simple_query_matches_direct("pending stub walk", result, oracle);
+    assert_eq!(r4b_census(&handle), (0, 1, 0, 0), "captured, Busy, walked");
+    assert_eq!(
+        handle
+            .inner
+            .managed_query
+            .injected_outcomes
+            .lock()
+            .unwrap()
+            .len(),
+        0,
+        "a pending page-local query reaches the executor"
+    );
+
+    // A query is a read: it never advances the overlay (no push, no re-lower).
+    let (_, after_query) = handle.pending_overlay_state().unwrap().unwrap();
+    assert_eq!(
+        after_query.flushed_revision, pending.flushed_revision,
+        "{after_query:?}"
+    );
+
+    // The pending answer is memoized under the overlay revision: the same
+    // query again is a memo hit and executes nothing. (`r4b_inject` clears
+    // the memo, so the outcome is queued directly.)
+    handle
+        .inner
+        .managed_query
+        .injected_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Outcome::Failed("must not be consumed"));
+    let _ = r4b_query(&handle).unwrap();
+    assert_eq!(r4b_census(&handle), (0, 1, 0, 0), "memo hit");
+    assert_eq!(
+        handle
+            .inner
+            .managed_query
+            .injected_outcomes
+            .lock()
+            .unwrap()
+            .len(),
+        1
+    );
+    handle
+        .inner
+        .managed_query
+        .injected_outcomes
+        .lock()
+        .unwrap()
+        .clear();
+
+    // Draining the batch removes the path from the overlay and empties the
+    // file; the next query is the accepted route again.
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    let (_, drained) = handle.pending_overlay_state().unwrap().unwrap();
+    assert!(drained.pending_paths.is_empty(), "{drained:?}");
+    assert_eq!(
+        overlay_rows("SELECT count(*) FROM pages"),
+        vec![vec![PhysicalQueryValue::Integer(0)]]
+    );
+    assert_eq!(
+        overlay_rows("SELECT count(*) FROM blocks"),
+        vec![vec![PhysicalQueryValue::Integer(0)]]
+    );
+    let _ = r4b_query(&handle).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (1, 1, 0, 0),
+        "accepted route after the drain"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    drop(handle);
+    assert!(
+        !overlay_path.exists(),
+        "the overlay is deleted with its runtime"
+    );
+}
+
+/// R5b: a query with a property leaf still walks on the actor while pending
+/// (its registry would have to be patched off the actor — R5c), and is never
+/// captured.
+#[test]
+fn r5b_a_property_query_still_walks_uncaptured_while_pending() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    let (fixture, handle) = r4b_reopened("r5b-pending-props", 0x5b02);
+    let witness_path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .expect("the fixture has pages")
+        .rel_path;
+    let (mut page, revision) = load_application_exact(&handle, &witness_path);
+    page.blocks[0].raw = format!("{} pending-props-witness", page.blocks[0].raw);
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+    r4b_inject(&handle, vec![Outcome::Failed("must not be consumed")]);
+    let result = handle
+        .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+            query: "(property type pending-props-no-such-value)".into(),
+            max_rows: R4B_ROWS,
+            max_bytes: R4B_BYTES,
+        })
+        .unwrap();
+    assert!(matches!(
+        result,
+        SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(_)
+        }
+    ));
     assert_eq!(
         r4b_census(&handle),
         (0, 0, 0, 0),
         "nothing captured, nothing counted"
-    );
-    // Spelled out because R4a is the packet that made a statement read
-    // possible at all: a pending local suffix must still cost ZERO of them.
-    // "Pending may temporarily walk" is the route, not a fallback.
-    assert_eq!(
-        handle.managed_query_census().statement_reads,
-        0,
-        "an undrained local suffix never reaches the database route"
     );
     assert_eq!(
         handle
@@ -33032,7 +33196,7 @@ fn r4b_a_pending_local_suffix_is_answered_on_the_actor_and_never_captured() {
             .unwrap()
             .len(),
         1,
-        "a pending suffix never reaches the executor"
+        "a pending property query never reaches the executor"
     );
     handle
         .inner
@@ -33041,7 +33205,6 @@ fn r4b_a_pending_local_suffix_is_answered_on_the_actor_and_never_captured() {
         .lock()
         .unwrap()
         .clear();
-
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)

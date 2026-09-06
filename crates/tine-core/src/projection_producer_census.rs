@@ -982,6 +982,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             2,
         ),
         ("crates/tine-core/src/graph_name_folding.rs", "fs.write", 2),
+        // R5b: the pending-overlay projection is disposable — deleted (with its
+        // `-wal`/`-shm` sidecars, one `remove_file` site in a loop) on every
+        // runtime open before it is recreated, and again on close.
+        (
+            "crates/tine-core/src/managed_overlay.rs",
+            "fs.remove_file",
+            1,
+        ),
         (
             "crates/tine-core/src/managed_storage_journey.rs",
             "file.create",
@@ -1906,9 +1914,28 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `PhysicalQueryValue::Integer(` (the FTS readiness probe's row). No other
     // file gained or lost a `tine_storage` reference; no `storage-receiver:`
     // entry moved. All read-side.
+    // Re-pinned 2026-09-06 (query engine R5b, the pending-overlay projection).
+    // Derived by diffing the dump at `b93f6758` (342 entries) against the
+    // working head (352): added (10), ALL in the new `managed_overlay.rs` and
+    // nothing removed or changed anywhere else — its `use` line
+    // (`MaterializationError`, `PhysicalGraphProjectionChange`,
+    // `PhysicalGraphProjectionDatabase`, `PhysicalProjectionQuerySnapshot`),
+    // three `MaterializationError::Incomplete(` (the open validator's
+    // "revision moved" answers), ONE `PhysicalGraphProjectionDatabase::open_writable(`
+    // with the receiver calls `initialize_schema`, `validate_schema` and
+    // `apply` — the overlay worker's WRITE crossing, into a file that is
+    // app-private, disposable, holds no authority and is recreated on every
+    // open (contract §1.2 row, "The pending local suffix has one mirror off the
+    // actor") — ONE `PhysicalProjectionQuerySnapshot::open_direct(` (the
+    // overlay read, validated by revision) and ONE
+    // `sqlite::materialized_page_input(` (the per-page lowering input the
+    // accepted apply already uses). The write-crossing table above is
+    // byte-identical because none of those tokens is a journal, immutable,
+    // durable-directory or package boundary; the projection write goes through
+    // the same `PhysicalGraphProjectionDatabase` type the accepted apply uses.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "256585797ab5066ac76c6c9ef91a9d04ba2f708faec3979f001c18567d26dfd6",
+        "9f5655438c6dbe026c25ced30e54505c3b7b54199b4bacbe6076646ea547dc96",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

@@ -508,36 +508,6 @@ struct ApplicationJournalFeedIndex {
 }
 
 #[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ManagedTaskQueryOverlaySnapshot {
-    entries: Vec<ManagedTaskQueryOverlayEntrySnapshot>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ManagedTaskQueryOverlayEntrySnapshot {
-    path: String,
-    sequence: u64,
-    state: ManagedTaskQueryOverlayStateSnapshot,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ManagedTaskQueryOverlayStateSnapshot {
-    Complete {
-        page_id: PageId,
-        name: String,
-        kind: ManagedTextKind,
-        format: Format,
-        preamble: Option<String>,
-        structures: Vec<(BlockId, Option<BlockId>, String)>,
-        candidates: Vec<(BlockId, String, Option<LogseqUuid>)>,
-        candidate_ids_by_marker: Vec<(String, Vec<BlockId>)>,
-    },
-    Incomplete,
-}
-
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ManagedApplicationSaveStageTimings {
     actor_total: Duration,
@@ -5157,56 +5127,6 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
-    #[cfg(test)]
-    fn managed_task_query_overlay_snapshot(
-        &self,
-    ) -> Result<ManagedTaskQueryOverlaySnapshot, SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::ManagedTaskQueryOverlaySnapshot {
-            reply: reply_sender,
-        })?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
-    fn force_managed_task_query_overlay_incomplete(
-        &self,
-        path: &str,
-    ) -> Result<(), SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let path =
-            ManagedPath::parse(path).map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::ForceManagedTaskQueryOverlayIncomplete {
-            path,
-            reply: reply_sender,
-        })?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
-    fn force_managed_task_query_overlay_invalid_order(
-        &self,
-        path: &str,
-    ) -> Result<(), SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let path =
-            ManagedPath::parse(path).map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::ForceManagedTaskQueryOverlayInvalidOrder {
-            path,
-            reply: reply_sender,
-        })?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
     /// Drain the exact feed, execute the production Safe transaction once, and
     /// join the actor. A pre-Safe refusal leaves the actor available for an
     /// explicit retry or crash-style drop.
@@ -5348,6 +5268,23 @@ impl SyncRuntimeHandle {
                 reply: reply_sender,
             },
         )?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// Test-only: the pending overlay's file and its published state once
+    /// every update pushed so far has been flushed (bounded wait).
+    #[cfg(test)]
+    fn pending_overlay_state(
+        &self,
+    ) -> Result<Option<(PathBuf, crate::managed_overlay::OverlayState)>, SyncRuntimeRequestError>
+    {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::PendingOverlayState {
+            reply: reply_sender,
+        })?;
         reply_receiver
             .recv()
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
@@ -6775,13 +6712,7 @@ fn drain_open_managed_local_journal(
                         .get(projection.intent().path().as_str())
                         .is_some_and(|latest| latest.sequence() == completion.sequence)
                     {
-                        managed
-                            .latest_projection_frames
-                            .remove(projection.intent().path().as_str());
-                        managed.retire_latest_task_query_overlay(
-                            projection.intent().path(),
-                            completion.sequence,
-                        );
+                        managed.retire_latest_projection_frame(projection.intent().path());
                     }
                 }
                 managed.continuation = None;
@@ -10472,18 +10403,8 @@ enum ActorRequest {
         reply: mpsc::Sender<crate::oplog::hot_engine::validation_tests::ObservableEngineState>,
     },
     #[cfg(test)]
-    ManagedTaskQueryOverlaySnapshot {
-        reply: mpsc::Sender<ManagedTaskQueryOverlaySnapshot>,
-    },
-    #[cfg(test)]
-    ForceManagedTaskQueryOverlayIncomplete {
-        path: ManagedPath,
-        reply: mpsc::Sender<()>,
-    },
-    #[cfg(test)]
-    ForceManagedTaskQueryOverlayInvalidOrder {
-        path: ManagedPath,
-        reply: mpsc::Sender<()>,
+    PendingOverlayState {
+        reply: mpsc::Sender<Option<(PathBuf, crate::managed_overlay::OverlayState)>>,
     },
     #[cfg(test)]
     InstallManagedLocalAppendFault {
@@ -10529,7 +10450,10 @@ fn actor_thread_from_clean_resources(
         recovery,
         managed_query,
     ) {
-        Ok(actor) => actor,
+        Ok(mut actor) => {
+            actor.install_pending_overlay();
+            actor
+        }
         Err(error) => {
             let _ = started.send(ActorStartupEvent(Err(error)));
             return;
@@ -10942,20 +10866,8 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
-            ActorRequest::ManagedTaskQueryOverlaySnapshot { reply } => {
-                let _ = reply.send(actor.managed_task_query_overlay_snapshot());
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::ForceManagedTaskQueryOverlayIncomplete { path, reply } => {
-                actor.force_managed_task_query_overlay_incomplete(&path);
-                let _ = reply.send(());
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::ForceManagedTaskQueryOverlayInvalidOrder { path, reply } => {
-                actor.force_managed_task_query_overlay_invalid_order(&path);
-                let _ = reply.send(());
+            ActorRequest::PendingOverlayState { reply } => {
+                let _ = reply.send(actor.pending_overlay_state());
                 false
             }
             #[cfg(test)]
@@ -11026,53 +10938,6 @@ enum PendingManagedLocalCommit {
     Projection(TrustedLocalCommittedPendingProjection),
     Overlay(TrustedLocalCommittedRecovery),
     Response(TrustedLocalCommitted),
-}
-
-/// Parser-owned sparse input retained for one exact, not-yet-materialized page.
-///
-/// Every block contributes only immutable structure. Raw parser input and UUID
-/// identity are retained only for blocks selected by the exact canonical task
-/// marker index, so a later query never has to copy or scan the whole hot page.
-#[derive(Clone, Debug)]
-struct LatestTaskQueryOverlayPage {
-    page_id: PageId,
-    name: String,
-    path: ManagedPath,
-    kind: ManagedTextKind,
-    format: Format,
-    #[cfg(test)]
-    preamble: Option<String>,
-    structures: BTreeMap<BlockId, LatestTaskQueryOverlayStructure>,
-    candidates: BTreeMap<BlockId, LatestTaskQueryOverlayCandidate>,
-    candidate_ids_by_marker: BTreeMap<String, Vec<BlockId>>,
-}
-
-#[derive(Clone, Debug)]
-struct LatestTaskQueryOverlayStructure {
-    parent: Option<BlockId>,
-    order: String,
-}
-
-#[derive(Clone, Debug)]
-struct LatestTaskQueryOverlayCandidate {
-    raw: String,
-    logseq_uuid: Option<LogseqUuid>,
-}
-
-/// Every locally newest projection frame has one entry.  An incomplete entry
-/// is authority too: it prevents a later sparse reader from accidentally
-/// combining a stale SQLite row with a hot frame it cannot fully re-evaluate.
-#[derive(Clone, Debug)]
-enum LatestTaskQueryOverlayState {
-    Complete(LatestTaskQueryOverlayPage),
-    Incomplete,
-}
-
-#[derive(Clone, Debug)]
-struct LatestTaskQueryOverlayEntry {
-    sequence: u64,
-    path: ManagedPath,
-    state: LatestTaskQueryOverlayState,
 }
 
 /// Rebuildable point indexes over the uncheckpointed local journal. A record
@@ -11244,7 +11109,12 @@ struct ManagedLocalRuntimeState {
     frames: VecDeque<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     pending_index: ManagedLocalPendingIndex,
     latest_projection_frames: BTreeMap<String, LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
-    latest_task_query_overlay: BTreeMap<String, LatestTaskQueryOverlayEntry>,
+    /// The pending-page overlay projection (R5b, `managed_overlay.rs`): every
+    /// change to `latest_projection_frames` is mirrored into it, so a query
+    /// can answer the pending suffix from the database instead of a walk.
+    /// `None` only when the overlay could not be created; pending queries
+    /// then walk exactly as before R5.
+    pending_overlay: Option<Arc<crate::managed_overlay::PendingOverlay>>,
     checkpoint: ManagedLocalDrainCheckpoint,
     checkpoint_batch_id: Option<BatchId>,
     continuation: Option<ManagedLocalDrainContinuation>,
@@ -11440,58 +11310,50 @@ impl ManagedLocalRuntimeState {
             .or_else(|| (!self.frames.is_empty()).then(|| "authenticate".into()))
     }
 
+    /// A path entered (or re-entered) the pending set. The overlay is told in
+    /// the same call, so the two can never disagree about membership; its
+    /// content follows from the same actor turn (`note_pending_page_content`
+    /// / `note_pending_page_missing`), or the overlay stays incomplete for
+    /// that path and pending queries walk until it arrives.
     fn note_latest_projection_frame(
         &mut self,
         path: ManagedPath,
         frame: LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     ) {
         let key = path.as_str().to_owned();
-        self.latest_projection_frames
-            .insert(key.clone(), frame.clone());
-        self.latest_task_query_overlay.insert(
-            key,
-            LatestTaskQueryOverlayEntry {
-                sequence: frame.sequence(),
-                path,
-                state: LatestTaskQueryOverlayState::Incomplete,
-            },
-        );
+        if let Some(overlay) = self.pending_overlay.as_ref() {
+            overlay.announce(&key);
+        }
+        self.latest_projection_frames.insert(key, frame);
     }
 
-    fn install_latest_task_query_overlay(
-        &mut self,
-        sequence: u64,
-        page: LatestTaskQueryOverlayPage,
-    ) {
-        let key = page.path.as_str().to_owned();
-        if self
-            .latest_projection_frames
-            .get(&key)
-            .is_some_and(|frame| frame.sequence() == sequence)
-            && self
-                .latest_task_query_overlay
-                .get(&key)
-                .is_some_and(|entry| entry.sequence == sequence)
-        {
-            self.latest_task_query_overlay.insert(
-                key,
-                LatestTaskQueryOverlayEntry {
-                    sequence,
-                    path: page.path.clone(),
-                    state: LatestTaskQueryOverlayState::Complete(page),
-                },
-            );
+    /// The pending state of `path` is this page.
+    fn note_pending_page_content(&self, path: &ManagedPath, page: Arc<MaterializedPage>) {
+        if let Some(overlay) = self.pending_overlay.as_ref() {
+            overlay.content(path.as_str(), page);
         }
     }
 
-    fn retire_latest_task_query_overlay(&mut self, path: &ManagedPath, sequence: u64) {
-        let key = path.as_str();
-        if self
-            .latest_task_query_overlay
-            .get(key)
-            .is_some_and(|entry| entry.sequence == sequence)
-        {
-            self.latest_task_query_overlay.remove(key);
+    /// The pending state of `path` is "no page".
+    fn note_pending_page_missing(&self, path: &ManagedPath) {
+        if let Some(overlay) = self.pending_overlay.as_ref() {
+            overlay.tombstone(path.as_str());
+        }
+    }
+
+    /// The pending state of `path` cannot be represented: the overlay is not
+    /// to be trusted until the next open, and pending queries walk.
+    fn note_pending_overlay_failed(&self, reason: &'static str) {
+        if let Some(overlay) = self.pending_overlay.as_ref() {
+            overlay.mark_failed(reason);
+        }
+    }
+
+    /// `path`'s batch was accepted and drained: it left the pending set.
+    fn retire_latest_projection_frame(&mut self, path: &ManagedPath) {
+        self.latest_projection_frames.remove(path.as_str());
+        if let Some(overlay) = self.pending_overlay.as_ref() {
+            overlay.remove(path.as_str());
         }
     }
 
@@ -11611,91 +11473,6 @@ impl ManagedLocalRuntimeState {
             .map_err(CleanOpenError::from)
             .map_err(String::from)
     }
-}
-
-fn latest_task_query_overlay_page_from_application(
-    current: &ApplicationCurrentPage,
-) -> Result<LatestTaskQueryOverlayPage, ()> {
-    let parsed = flatten_application_blocks(&current.page.blocks);
-    if parsed.len() != current.editor.dto.blocks.len()
-        || parsed.len() != current.editor.blocks.len()
-    {
-        return Err(());
-    }
-    let materialized = current
-        .editor
-        .blocks
-        .iter()
-        .map(|block| (block.block_id, block))
-        .collect::<HashMap<_, _>>();
-    if materialized.len() != current.editor.blocks.len() {
-        return Err(());
-    }
-    let mut structures = BTreeMap::new();
-    let mut candidates = BTreeMap::new();
-    let mut candidate_ids_by_marker = BTreeMap::<String, Vec<BlockId>>::new();
-    for (index, parsed_block) in parsed.iter().enumerate() {
-        let SyncEditorBlockKey::Existing(id) = &current.editor.dto.blocks[index].key else {
-            return Err(());
-        };
-        let block_id = parse_editor_block_id(id).map_err(|_| ())?;
-        let materialized = materialized.get(&block_id).ok_or(())?;
-        if materialized.content != parsed_block.block.raw
-            || !sparse_task_query_order_is_valid(&materialized.order)
-            || structures
-                .insert(
-                    block_id,
-                    LatestTaskQueryOverlayStructure {
-                        parent: materialized.parent,
-                        order: materialized.order.clone(),
-                    },
-                )
-                .is_some()
-        {
-            return Err(());
-        }
-        if let Some(marker) = parsed_block.block.marker.as_deref() {
-            let marker = marker.to_ascii_uppercase();
-            if marker.is_empty()
-                || candidates
-                    .insert(
-                        block_id,
-                        LatestTaskQueryOverlayCandidate {
-                            raw: parsed_block.block.raw.clone(),
-                            logseq_uuid: materialized.logseq_uuid,
-                        },
-                    )
-                    .is_some()
-            {
-                return Err(());
-            }
-            candidate_ids_by_marker
-                .entry(marker)
-                .or_default()
-                .push(block_id);
-        }
-    }
-    if structures.len() != materialized.len()
-        || structures.values().any(|structure| {
-            structure
-                .parent
-                .is_some_and(|parent| !structures.contains_key(&parent))
-        })
-    {
-        return Err(());
-    }
-    Ok(LatestTaskQueryOverlayPage {
-        page_id: current.editor.page.page_id,
-        name: current.page.name.clone(),
-        path: current.editor.page.path.clone(),
-        kind: current.editor.page.kind,
-        format: current.page.format,
-        #[cfg(test)]
-        preamble: current.page.pre_block.clone(),
-        structures,
-        candidates,
-        candidate_ids_by_marker,
-    })
 }
 
 const CLEAN_FOREGROUND_JOURNAL_WORKSPACE_PREFIX: &str = "clean-workspace";
@@ -12046,7 +11823,6 @@ fn open_clean_foreground_journal(
         .ok_or_else(|| "clean foreground journal creation did not return a journal".to_owned())?;
 
     let mut latest_projection_frames = BTreeMap::new();
-    let mut latest_task_query_overlay = BTreeMap::new();
     let mut pending_index = ManagedLocalPendingIndex::default();
     for frame in &recovered_frames {
         let record = crate::oplog::decode_managed_local_record(frame).map_err(|error| {
@@ -12057,16 +11833,9 @@ fn open_clean_foreground_journal(
             )
         })?;
         for projection in record.projections() {
-            let path = projection.intent().path().clone();
-            let key = path.as_str().to_owned();
-            latest_projection_frames.insert(key.clone(), frame.clone());
-            latest_task_query_overlay.insert(
-                key,
-                LatestTaskQueryOverlayEntry {
-                    sequence: frame.sequence(),
-                    path,
-                    state: LatestTaskQueryOverlayState::Incomplete,
-                },
+            latest_projection_frames.insert(
+                projection.intent().path().as_str().to_owned(),
+                frame.clone(),
             );
         }
         pending_index.insert(record)?;
@@ -12102,7 +11871,9 @@ fn open_clean_foreground_journal(
         frames: recovered_frames.into(),
         pending_index,
         latest_projection_frames,
-        latest_task_query_overlay,
+        // Installed by the actor once it owns the projection file
+        // (`install_pending_overlay`): the overlay sits next to that file.
+        pending_overlay: None,
         checkpoint,
         checkpoint_batch_id,
         continuation: None,
@@ -12120,14 +11891,6 @@ pub(crate) fn sparse_task_query_identity(
         || format!("{SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX}{block_id}"),
         |uuid| uuid.to_string(),
     )
-}
-
-/// A stored sibling order key is usable only while it is a bounded, printable
-/// scalar. Retained after R4a's sparse-runner retirement because the pending
-/// task-query overlay is built from it (`latest_task_query_overlay_page_from_
-/// application`), which is actor state and not the retired runner.
-fn sparse_task_query_order_is_valid(order: &str) -> bool {
-    !order.is_empty() && order.len() <= 512 && !order.chars().any(char::is_control)
 }
 
 struct ManagedLocalPublisherAttempt {
@@ -12969,6 +12732,84 @@ fn managed_registry_page_key(page_id: PageId) -> String {
     format!("page:{}", page_id.as_uuid())
 }
 
+impl RuntimeActor {
+    /// (Re)create the pending-page overlay projection next to the active
+    /// projection file and rebuild it from the authoritative pending set
+    /// (`latest_projection_frames`), page by page through the same pending
+    /// load the walk uses. Never reuses a file from an earlier process. A
+    /// creation failure leaves no overlay installed: pending queries then walk
+    /// exactly as before R5, and nothing is refused (I-10).
+    fn install_pending_overlay(&mut self) {
+        self.close_pending_overlay();
+        let Ok(database) = self.active_database() else {
+            return;
+        };
+        let accepted_path = database.path().to_path_buf();
+        let config = self.graph.config.parse_config();
+        let Ok(overlay) = crate::managed_overlay::PendingOverlay::open(
+            &accepted_path,
+            config,
+            crate::managed_overlay::next_instance(),
+        ) else {
+            return;
+        };
+        let paths = match self.managed_local.as_mut() {
+            Some(managed) => {
+                managed.pending_overlay = Some(Arc::clone(&overlay));
+                managed
+                    .latest_projection_frames
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+            None => {
+                overlay.close();
+                return;
+            }
+        };
+        for path in paths {
+            overlay.announce(&path);
+            let Ok(parsed) = ManagedPath::parse(path.clone()) else {
+                overlay.mark_failed("pending overlay rebuild path");
+                continue;
+            };
+            let load = match self.load_clean_foreground_pending_exact_ready(&parsed) {
+                Ok(Some(load)) => Ok(load),
+                Ok(None) => self.load_hot_application_exact_ready(&parsed),
+                Err(error) => Err(error),
+            };
+            match load {
+                Ok(ApplicationExactLoad::Loaded(current)) => {
+                    overlay.content(&path, Arc::new(current.editor.page.clone()));
+                }
+                Ok(ApplicationExactLoad::Missing) => overlay.tombstone(&path),
+                Ok(ApplicationExactLoad::Ambiguous) | Err(_) => {
+                    overlay.mark_failed("pending overlay rebuild page");
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_overlay_state(&self) -> Option<(PathBuf, crate::managed_overlay::OverlayState)> {
+        let overlay = self.managed_local.as_ref()?.pending_overlay.as_ref()?;
+        let state = overlay.wait_flushed(overlay.latest_revision(), Duration::from_secs(10));
+        Some((overlay.path().to_path_buf(), state))
+    }
+
+    /// Stop and delete the pending overlay. Every off-actor query job has been
+    /// drained by the caller (I-21); the overlay's own close joins its worker.
+    fn close_pending_overlay(&mut self) {
+        if let Some(overlay) = self
+            .managed_local
+            .as_mut()
+            .and_then(|managed| managed.pending_overlay.take())
+        {
+            overlay.close();
+        }
+    }
+}
+
 impl Drop for RuntimeActor {
     fn drop(&mut self) {
         // The runtime's `SqliteFrontier` closes the projection file (and
@@ -12976,6 +12817,7 @@ impl Drop for RuntimeActor {
         // must be gone first. Idempotent, so the handle's `close` and this
         // drain compose in either order.
         self.managed_query.jobs.cancel_all_and_drain();
+        self.close_pending_overlay();
     }
 }
 
@@ -13523,107 +13365,6 @@ impl RuntimeActor {
         current.hydration_cache_hits = hits;
         current.hydration_cache_misses = misses;
         current
-    }
-
-    #[cfg(test)]
-    fn managed_task_query_overlay_snapshot(&self) -> ManagedTaskQueryOverlaySnapshot {
-        let entries = self
-            .managed_local
-            .as_ref()
-            .map(|managed| {
-                managed
-                    .latest_task_query_overlay
-                    .values()
-                    .map(|entry| {
-                        let state = match &entry.state {
-                            LatestTaskQueryOverlayState::Complete(page) => {
-                                ManagedTaskQueryOverlayStateSnapshot::Complete {
-                                    page_id: page.page_id,
-                                    name: page.name.clone(),
-                                    kind: page.kind,
-                                    format: page.format,
-                                    preamble: page.preamble.clone(),
-                                    structures: page
-                                        .structures
-                                        .iter()
-                                        .map(|(block_id, structure)| {
-                                            (*block_id, structure.parent, structure.order.clone())
-                                        })
-                                        .collect(),
-                                    candidates: page
-                                        .candidates
-                                        .iter()
-                                        .map(|(block_id, candidate)| {
-                                            (
-                                                *block_id,
-                                                candidate.raw.clone(),
-                                                candidate.logseq_uuid,
-                                            )
-                                        })
-                                        .collect(),
-                                    candidate_ids_by_marker: page
-                                        .candidate_ids_by_marker
-                                        .iter()
-                                        .map(|(marker, block_ids)| {
-                                            (marker.clone(), block_ids.clone())
-                                        })
-                                        .collect(),
-                                }
-                            }
-                            LatestTaskQueryOverlayState::Incomplete => {
-                                ManagedTaskQueryOverlayStateSnapshot::Incomplete
-                            }
-                        };
-                        ManagedTaskQueryOverlayEntrySnapshot {
-                            path: entry.path.as_str().to_owned(),
-                            sequence: entry.sequence,
-                            state,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        ManagedTaskQueryOverlaySnapshot { entries }
-    }
-
-    #[cfg(test)]
-    fn force_managed_task_query_overlay_incomplete(&mut self, path: &ManagedPath) {
-        let managed = self
-            .managed_local
-            .as_mut()
-            .expect("active test actor retains managed-local state");
-        let entry = managed
-            .latest_task_query_overlay
-            .get_mut(path.as_str())
-            .expect("test requests an exact latest overlay path");
-        entry.state = LatestTaskQueryOverlayState::Incomplete;
-    }
-
-    #[cfg(test)]
-    fn force_managed_task_query_overlay_invalid_order(&mut self, path: &ManagedPath) {
-        let managed = self
-            .managed_local
-            .as_mut()
-            .expect("active test actor retains managed-local state");
-        let entry = managed
-            .latest_task_query_overlay
-            .get_mut(path.as_str())
-            .expect("test requests an exact latest overlay path");
-        let LatestTaskQueryOverlayState::Complete(page) = &mut entry.state else {
-            panic!("malformed-order test requires a complete exact overlay")
-        };
-        let candidate_id = page
-            .candidate_ids_by_marker
-            .values()
-            .flatten()
-            .next()
-            .copied()
-            .expect("complete test overlay retains a task candidate");
-        page.structures
-            .get_mut(&candidate_id)
-            .expect("task candidate retains exact structure")
-            .order
-            .clear();
     }
 
     #[cfg(test)]
@@ -15642,13 +15383,26 @@ impl RuntimeActor {
             }));
         }
         let prepared = self.application_simple_query_prepared(query, max_rows, max_bytes)?;
-        // "Pending may temporarily walk": a local suffix the accepted frontier
-        // does not cover keeps today's masked evaluation, on the actor.
+        // No stamp (no overlay could be created for a pending suffix): the
+        // walk answers on the actor, as before R5.
         let Some(stamp) = prepared.stamp.clone() else {
             return Ok(SimpleQueryTurn::Answered(
                 self.application_simple_query_walk(query, Some(prepared), max_rows, max_bytes)?,
             ));
         };
+        // R5b: with a pending suffix, only a query every relation of which
+        // stays inside one page can be split between the accepted file and
+        // the overlay (`PageLocality`, exhaustive over the IR), and — until
+        // R5c patches the registry off the actor — only one without a
+        // property leaf. Everything else walks, memoized under this stamp.
+        if stamp.overlay_revision.is_some()
+            && (prepared.props
+                || prepared.query.page_locality() != crate::query::ir::PageLocality::Local)
+        {
+            return Ok(SimpleQueryTurn::Answered(
+                self.application_simple_query_walk(query, Some(prepared), max_rows, max_bytes)?,
+            ));
+        }
         if let Some(hit) = self.managed_query.memo.lock().unwrap().get(
             &stamp,
             prepared.registry_generation,
@@ -15662,9 +15416,24 @@ impl RuntimeActor {
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let overlay = match stamp.overlay_revision {
+            Some(required_revision) => {
+                let overlay = self
+                    .managed_local
+                    .as_ref()
+                    .and_then(|managed| managed.pending_overlay.clone())
+                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+                Some(crate::managed_query::PendingOverlayCapture {
+                    required_revision,
+                    overlay,
+                })
+            }
+            None => None,
+        };
         Ok(SimpleQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
                 path: database.path().to_path_buf(),
+                overlay,
                 graph_root: self.graph.root.clone(),
                 stamp,
                 config: prepared.config,
@@ -15696,13 +15465,18 @@ impl RuntimeActor {
         today: crate::date::JournalDate,
     ) -> Result<Option<crate::managed_query::ManagedQueryStamp>, SyncApplicationPageRequestError>
     {
-        if !self
-            .managed_local
-            .as_ref()
-            .is_none_or(|managed| managed.latest_projection_frames.is_empty())
-        {
-            return Ok(None);
-        }
+        // R5b: a pending suffix is part of the stamp, not a reason to have
+        // none — its overlay revision. Without an overlay (creation failed)
+        // the pending state has no stamp and every pending query walks.
+        let overlay_revision = match self.managed_local.as_ref() {
+            Some(managed) if !managed.latest_projection_frames.is_empty() => {
+                match managed.pending_overlay.as_ref() {
+                    Some(overlay) => Some(overlay.latest_revision()),
+                    None => return Ok(None),
+                }
+            }
+            _ => None,
+        };
         let read = self.application_materialized_read_ready()?;
         let acceptance_sequence = read.acceptance_sequence();
         drop(read);
@@ -15714,6 +15488,7 @@ impl RuntimeActor {
             frontier_digest: database.required_frontier_digest(),
             config_digest: config.digest(),
             today: today.ordinal_key(),
+            overlay_revision,
         }))
     }
 
@@ -15839,10 +15614,10 @@ impl RuntimeActor {
 
         // Every open of a page carrying this query recomputes an identical
         // answer from identical durable evidence, at one whole-page hydration
-        // per candidate page. Consult the shared memo first -- but only where
-        // the accepted frontier is the whole story (`stamp` is `Some`). An
-        // actor still holding a pending local suffix has evidence that
-        // frontier does not cover, so it neither reads nor fills the memo.
+        // per candidate page. Consult the shared memo first -- but only with
+        // a stamp (`Some`): the accepted frontier plus, since R5b, the pending
+        // overlay's revision. Without an overlay a pending suffix has no
+        // stamp, and the walk neither reads nor fills the memo.
         if let Some(stamp) = prepared.stamp.as_ref() {
             if let Some(hit) = self.managed_query.memo.lock().unwrap().get(
                 stamp,
@@ -19390,31 +19165,15 @@ impl RuntimeActor {
         for projection in record.projections() {
             managed.note_latest_projection_frame(projection.intent().path().clone(), frame.clone());
             if projection.intent().target().bytes().is_none() {
+                managed.note_pending_page_missing(projection.intent().path());
                 continue;
             }
-            let Some(post_page) = committed.post_pages().get(&projection.intent().page_id()) else {
-                continue;
-            };
-            let Some(target) = projection.intent().target().bytes() else {
-                continue;
-            };
-            let Ok(parsed) = self
-                .graph
-                .parse_exact_page_dto(projection.intent().path(), target)
-            else {
-                continue;
-            };
-            let Ok(editor) = editor_current_page_from_materialized(
-                post_page.clone(),
-                MAX_SYNC_APPLICATION_PAGE_BLOCKS,
-            ) else {
-                continue;
-            };
-            let Ok(application) = join_application_page(parsed, editor) else {
-                continue;
-            };
-            if let Ok(overlay) = latest_task_query_overlay_page_from_application(&application) {
-                managed.install_latest_task_query_overlay(sequence, overlay);
+            match committed.post_pages().get(&projection.intent().page_id()) {
+                Some(post_page) => managed.note_pending_page_content(
+                    projection.intent().path(),
+                    Arc::new(post_page.clone()),
+                ),
+                None => managed.note_pending_overlay_failed("application unit post page"),
             }
         }
         managed.frames.push_back(frame);
@@ -21179,9 +20938,10 @@ impl RuntimeActor {
         )?;
         let application = join_application_page(parsed, editor)
             .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_response_join"))?;
-        if let Ok(overlay) = latest_task_query_overlay_page_from_application(&application) {
-            managed.install_latest_task_query_overlay(sequence, overlay);
-        }
+        managed.note_pending_page_content(
+            &application.editor.page.path,
+            Arc::new(application.editor.page.clone()),
+        );
         let page = application.editor.dto.clone();
         self.prepared_application_reply = Some((batch_id.to_string(), application));
         Ok(SyncEditorSaveOutcome::Durable {
@@ -21255,12 +21015,13 @@ impl RuntimeActor {
         match outcome {
             TrustedLocalCommitOutcome::Committed(committed) => {
                 let application = self.application_from_clean_foreground_commit(&committed)?;
-                if let Ok(overlay) = latest_task_query_overlay_page_from_application(&application) {
-                    self.managed_local
-                        .as_mut()
-                        .expect("clean foreground journal remains installed")
-                        .install_latest_task_query_overlay(sequence, overlay);
-                }
+                self.managed_local
+                    .as_ref()
+                    .expect("clean foreground journal remains installed")
+                    .note_pending_page_content(
+                        &application.editor.page.path,
+                        Arc::new(application.editor.page.clone()),
+                    );
                 let page = application.editor.dto.clone();
                 self.prepared_application_reply = Some((batch_id.to_string(), application));
                 Ok(SyncEditorSaveOutcome::Durable {
@@ -21419,9 +21180,10 @@ impl RuntimeActor {
         let source = application(source_page_id)?;
         let destination = application(destination_page_id)?;
         for current in [&source, &destination] {
-            if let Ok(overlay) = latest_task_query_overlay_page_from_application(current) {
-                managed.install_latest_task_query_overlay(sequence, overlay);
-            }
+            managed.note_pending_page_content(
+                &current.editor.page.path,
+                Arc::new(current.editor.page.clone()),
+            );
         }
         Ok(SyncApplicationMoveSubtreesOutcome::Committed {
             episode_id: episode_id.to_string(),
@@ -21483,14 +21245,13 @@ impl RuntimeActor {
             PendingManagedLocalCommit::Response(committed) => {
                 return match self.application_from_clean_foreground_commit(&committed) {
                     Ok(application) => {
-                        if let Ok(overlay) =
-                            latest_task_query_overlay_page_from_application(&application)
-                        {
-                            self.managed_local
-                                .as_mut()
-                                .expect("clean foreground journal remains installed")
-                                .install_latest_task_query_overlay(committed.sequence(), overlay);
-                        }
+                        self.managed_local
+                            .as_ref()
+                            .expect("clean foreground journal remains installed")
+                            .note_pending_page_content(
+                                &application.editor.page.path,
+                                Arc::new(application.editor.page.clone()),
+                            );
                         Ok(true)
                     }
                     Err(_) => {
@@ -21507,14 +21268,13 @@ impl RuntimeActor {
             TrustedLocalCommitOutcome::Committed(committed) => {
                 match self.application_from_clean_foreground_commit(&committed) {
                     Ok(application) => {
-                        if let Ok(overlay) =
-                            latest_task_query_overlay_page_from_application(&application)
-                        {
-                            self.managed_local
-                                .as_mut()
-                                .expect("clean foreground journal remains installed")
-                                .install_latest_task_query_overlay(committed.sequence(), overlay);
-                        }
+                        self.managed_local
+                            .as_ref()
+                            .expect("clean foreground journal remains installed")
+                            .note_pending_page_content(
+                                &application.editor.page.path,
+                                Arc::new(application.editor.page.clone()),
+                            );
                         self.managed_local
                             .as_mut()
                             .expect("clean foreground journal remains installed")
@@ -21699,13 +21459,7 @@ impl RuntimeActor {
                             .get(projection.intent().path().as_str())
                             .is_some_and(|latest| latest.sequence() == completion.sequence)
                         {
-                            managed
-                                .latest_projection_frames
-                                .remove(projection.intent().path().as_str());
-                            managed.retire_latest_task_query_overlay(
-                                projection.intent().path(),
-                                completion.sequence,
-                            );
+                            managed.retire_latest_projection_frame(projection.intent().path());
                         }
                     }
                     managed.continuation = None;
@@ -23792,8 +23546,10 @@ impl RuntimeActor {
         // a fresh generation. The old generation stays untouched until the
         // marker replacement commits; open reclaims whichever generation the
         // marker does not name. Every off-actor query job over the old file
-        // is cancelled and drained first (R4).
+        // is cancelled and drained first (R4), and the pending overlay that
+        // sits next to the old file goes with it (R5b).
         self.managed_query.jobs.cancel_all_and_drain();
+        self.close_pending_overlay();
         self.clean.take();
         let installation = (|| {
             fs::rename(&baseline_directory, &replacement_directories.baseline)
@@ -23882,6 +23638,7 @@ impl RuntimeActor {
         // until a scan reconciles it (GH #351 audit finding 1).
         self.clean = Some(CleanRuntimeActorCore::new(runtime, sweeps, true));
         self.managed_local = Some(managed_local);
+        self.install_pending_overlay();
         self.projection_turns = Some(projection_turns);
         for batch_id in recovered_provider_batches {
             self.queue_clean_provider_publication(batch_id);

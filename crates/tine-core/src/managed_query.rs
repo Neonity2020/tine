@@ -68,6 +68,19 @@ pub(crate) struct ManagedQueryStamp {
     pub(crate) frontier_digest: ContentDigest,
     pub(crate) config_digest: ContentDigest,
     pub(crate) today: i64,
+    /// R5b: the pending overlay's latest revision when the actor holds an
+    /// undrained local suffix, `None` when the accepted frontier is the whole
+    /// story. Every pending save moves it, so a memo entry or a capture is
+    /// exact for the pending state it was taken under.
+    pub(crate) overlay_revision: Option<u64>,
+}
+
+/// The pending half of a capture (R5b): the overlay the executor opens and
+/// the revision it must carry before the executor may read it.
+#[derive(Clone)]
+pub(crate) struct PendingOverlayCapture {
+    pub(crate) required_revision: u64,
+    pub(crate) overlay: Arc<crate::managed_overlay::PendingOverlay>,
 }
 
 /// The immutable inputs one actor turn captures for an accepted-frontier
@@ -76,6 +89,8 @@ pub(crate) struct ManagedQueryStamp {
 pub(crate) struct ManagedQueryCapture {
     /// The accepted projection's SQLite file.
     pub(crate) path: PathBuf,
+    /// The pending overlay to merge with, when the actor held a pending suffix.
+    pub(crate) overlay: Option<PendingOverlayCapture>,
     /// The graph root the projection's relative page paths hang off (recency).
     pub(crate) graph_root: PathBuf,
     pub(crate) stamp: ManagedQueryStamp,
@@ -237,6 +252,13 @@ fn execute_on_slot(
 ) -> ManagedQueryOutcome {
     #[cfg(test)]
     run_before_managed_open_hook();
+    // R5b ships the pending route as a stub: the capture is taken, the slot is
+    // held and released, and the walk answers (counted as a fallback), so the
+    // whole turn → capture → walk wiring runs end to end before R5a fills in
+    // the two-source read.
+    if capture.overlay.is_some() {
+        return ManagedQueryOutcome::Busy;
+    }
     // The stamp is validated INSIDE the read transaction that will serve every
     // later statement, so an accepted batch cannot land between the check and
     // the rows. A projection that has moved on is `Stale`, not a failure: the
@@ -609,6 +631,7 @@ mod tests {
             frontier_digest: ContentDigest::of(b"frontier"),
             config_digest: ContentDigest::of(config.as_bytes()),
             today,
+            overlay_revision: None,
         }
     }
 
@@ -747,7 +770,7 @@ mod tests {
             "re-captures at most twice, then walks",
             "`Cancelled` (a drain caught it) walks and is\nnot counted as a fallback",
             "a `Failed` read is an error",
-            "A pending local suffix is never captured",
+            "A pending local suffix is not a reason to walk by\nitself",
             "closed in exactly three places",
             "writes a checkpoint sidecar, never a WAL\ncheckpoint",
         ] {
@@ -799,6 +822,7 @@ mod tests {
         let config = crate::config::Config::default();
         let capture = ManagedQueryCapture {
             path: PathBuf::from("/nonexistent/projection.sqlite"),
+            overlay: None,
             graph_root: PathBuf::from("/nonexistent"),
             stamp: stamp(1, "c", today.ordinal_key()),
             config: config.parse_config(),
