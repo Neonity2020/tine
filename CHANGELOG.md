@@ -30,6 +30,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A Managed Storage sync operation no longer gets stuck behind its own
+  leftover crash evidence.** If Tine lost power midway through tidying up after
+  publishing a file to the shared sync folder, it left behind a small record
+  named for that exact operation — and the next time the same operation ran, it
+  refused to start because that name was taken. The refusal could only clear
+  when an unrelated periodic sweep happened to run, which on a quiet graph might
+  be never. An operation now clears its own leftover record and carries on.
+
 - **Managed Storage keeps cleaning up sync conflict copies for the life of the
   graph.** When a file-sync service delivered a conflict copy of a shared
   provider file, Tine cleaned it up and kept one small record of what it had
