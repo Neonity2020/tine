@@ -463,9 +463,10 @@ struct ApplicationJournalFeedIndexKey {
 ///
 /// The frontier pair covers the accepted rows exactly as it does for the
 /// journal day index; the config digest covers the atomizer's rules, which are
-/// not in the frontier stamp. An actor still holding a pending local suffix has
-/// evidence the sequence does not cover, so it neither reads nor fills this
-/// cache -- the same rule `application_simple_query_memo` follows.
+/// not in the frontier stamp. R5c: a pending local suffix is deliberately NOT
+/// part of it. The suffix is not accepted evidence and cannot change what the
+/// accepted table says; the pending route patches that table off the actor
+/// (`managed_registry_patch`) rather than evicting it once per keystroke.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ApplicationPropertyRegistryKey {
     acceptance_sequence: u64,
@@ -473,13 +474,24 @@ struct ApplicationPropertyRegistryKey {
     config_digest: ContentDigest,
 }
 
-/// The published Managed registry snapshot and the evidence it was built from.
+/// Test-only: both registry tables an actor can produce, plus the parse config
+/// they were built under, so a gate can compare the actor's MERGED table (the
+/// walk's) and the ACCEPTED base (the capture's) against an off-actor build
+/// over the same pending state.
+#[cfg(test)]
+struct ApplicationPropertyRegistryProbe {
+    accepted: std::sync::Arc<crate::query::registry::Registry>,
+    merged: std::sync::Arc<crate::query::registry::Registry>,
+    config: crate::config::ParseConfig,
+}
+
+/// The published Managed registry snapshot and the accepted evidence it was
+/// built from. R5c: only ACCEPTED tables are published, so the key is always
+/// present — the walk's merged table while a suffix is pending is built per
+/// read and never enters this slot.
 struct ApplicationPropertyRegistryState {
     registry: std::sync::Arc<crate::query::registry::Registry>,
-    /// `None` when the snapshot was built while a pending local suffix was
-    /// outstanding: it is still publishable as the last-known table, but it is
-    /// never reusable, because no stamp describes the suffix it merged.
-    key: Option<ApplicationPropertyRegistryKey>,
+    key: ApplicationPropertyRegistryKey,
 }
 
 /// The graph's journal days, deduplicated and newest first, retained across
@@ -3540,6 +3552,20 @@ enum SimpleQueryTurn {
 
 /// One simple query's shared per-request inputs (see
 /// `RuntimeActor::application_simple_query_prepared`).
+/// Which property registry one preparation of a simple query is lowered
+/// under (R5c).
+///
+/// `AcceptedBase` is the table the actor caches and publishes; it is what the
+/// turn's CAPTURE path prepares under, because the off-actor executor patches
+/// that base under its own two snapshots. `MergedWalk` is the actor's
+/// mask-and-overlay merge, which is what an actor-side WALK must coerce
+/// against. With nothing pending they are the same table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrySource {
+    AcceptedBase,
+    MergedWalk,
+}
+
 struct PreparedSimpleQuery {
     query: crate::query::ir::Query,
     view: crate::query::ir::ViewSettings,
@@ -5268,6 +5294,22 @@ impl SyncRuntimeHandle {
                 reply: reply_sender,
             },
         )?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// Test-only: the actor's two property-registry tables and the parse
+    /// config they were built under.
+    #[cfg(test)]
+    fn application_property_registry_probe(
+        &self,
+    ) -> Result<ApplicationPropertyRegistryProbe, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ApplicationPropertyRegistryProbe {
+            reply: reply_sender,
+        })?;
         reply_receiver
             .recv()
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
@@ -10407,6 +10449,10 @@ enum ActorRequest {
         reply: mpsc::Sender<Option<(PathBuf, crate::managed_overlay::OverlayState)>>,
     },
     #[cfg(test)]
+    ApplicationPropertyRegistryProbe {
+        reply: mpsc::Sender<ApplicationPropertyRegistryProbe>,
+    },
+    #[cfg(test)]
     InstallManagedLocalAppendFault {
         fault: ManagedLocalAppendFault,
         reply: mpsc::Sender<()>,
@@ -10840,7 +10886,12 @@ fn run_actor_loop(
             } => {
                 let _ = reply.send(
                     actor
-                        .application_simple_query_prepared(&query, max_rows, max_bytes)
+                        .application_simple_query_prepared(
+                            &query,
+                            max_rows,
+                            max_bytes,
+                            RegistrySource::MergedWalk,
+                        )
                         .and_then(|prepared| {
                             actor.application_simple_query_pages_ready(
                                 &query, prepared, max_rows, max_bytes,
@@ -10868,6 +10919,15 @@ fn run_actor_loop(
             #[cfg(test)]
             ActorRequest::PendingOverlayState { reply } => {
                 let _ = reply.send(actor.pending_overlay_state());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ApplicationPropertyRegistryProbe { reply } => {
+                let _ = reply.send(ApplicationPropertyRegistryProbe {
+                    accepted: actor.accepted_property_registry(),
+                    merged: actor.application_property_registry(),
+                    config: actor.graph.config.parse_config(),
+                });
                 false
             }
             #[cfg(test)]
@@ -15119,41 +15179,98 @@ impl RuntimeActor {
         Ok(accumulator.finish())
     }
 
-    /// The Managed Storage property registry (SPEC §6.2): the materialized owner
-    /// rows with the unaccepted local overlay's pages **masked**, followed by the
-    /// overlay's own owner rows — the same mask-and-overlay merge
-    /// `application_property_facets_ready` performs, over the raw rows rather
-    /// than the owner-less `(key, value)` pairs.
+    /// The ACCEPTED Managed Storage property registry (SPEC §6.2): the
+    /// materialized owner rows of the accepted frontier, with NO mask and NO
+    /// pending overlay.
     ///
-    /// **C4:** the `page_id → (format, name)` map is masked and overlaid exactly
-    /// as the rows are, so a new pending page has an entry and a replaced path
-    /// does not keep its accepted format.
-    fn application_property_registry_ready(
+    /// **R5c: this is the only table this actor caches and publishes**, keyed
+    /// by `(acceptance sequence, frontier state digest, parse config digest)`.
+    /// A pending local suffix no longer evicts it and no longer advances its
+    /// generation: the suffix is not accepted evidence, so it cannot change
+    /// what this table says. A captured pending query carries this table and
+    /// the executor PATCHES it off the actor, over exactly the keys the
+    /// pending pages can have changed
+    /// (`managed_registry_patch::patched_pending_registry`), instead of making
+    /// every keystroke rebuild the graph's whole registry here (I-13).
+    ///
+    /// Deliberately NOT named `application_*`: R5c adds no read-surface entry
+    /// point. `application_property_registry_ready` still owns the question and
+    /// this is the accepted-only half of its body, so it is a shared core in the
+    /// sense `application_family_is_pinned_by_name` means by the exemplar
+    /// `application_equivalent_page_names_ready` + `equivalent_page_names` —
+    /// cores carry no prefix and no row in `docs/contracts/managed-read-surface.md`.
+    fn accepted_property_registry_ready(
         &self,
     ) -> Result<std::sync::Arc<crate::query::registry::Registry>, SyncApplicationPageRequestError>
     {
         let config = self.graph.config.parse_config();
         // Before any evidence is touched: a snapshot built from the same
-        // frontier under the same parse rules is the same table, and rebuilding
-        // it would hydrate overlay pages a query never asked for.
+        // frontier under the same parse rules is the same table.
         let cache_key = self.application_property_registry_cache_key(&config)?;
-        if let Some(key) = cache_key.as_ref() {
-            if let Some(state) = self.application_property_registry.borrow().as_ref() {
-                if state.key.as_ref() == Some(key) {
-                    #[cfg(test)]
-                    self.note_application_property_registry_read(true);
-                    return Ok(std::sync::Arc::clone(&state.registry));
-                }
+        if let Some(state) = self.application_property_registry.borrow().as_ref() {
+            if state.key == cache_key {
+                #[cfg(test)]
+                self.note_application_property_registry_read(true);
+                return Ok(std::sync::Arc::clone(&state.registry));
             }
         }
-        // Past this point the whole table is rebuilt. `cache_key` is `None`
-        // exactly while this runtime holds a pending local suffix, and a `None`
-        // key can never match a published one, so every read during an edit
-        // lands here — measured, not assumed (F1, and the receipt line in
-        // `managed_property_registry_cost_while_typing_manual_receipt`).
+        #[cfg(test)]
+        self.note_application_property_registry_read(false);
+        let registry = self
+            .build_application_property_registry(&ApplicationNavigationOverlay::new(), &config)?;
+        Ok(self.publish_application_property_registry(registry, cache_key))
+    }
+
+    /// The registry the actor's own WALK coerces against: the accepted table
+    /// when nothing is pending, and otherwise the mask-and-overlay merge of the
+    /// accepted rows with the unaccepted local overlay's pages — the same merge
+    /// `application_property_facets_ready` performs, over the raw rows rather
+    /// than the owner-less `(key, value)` pairs.
+    ///
+    /// **C4:** the `page_id → (format, name)` map is masked and overlaid
+    /// exactly as the rows are, so a new pending page has an entry and a
+    /// replaced path does not keep its accepted format.
+    ///
+    /// **R5c:** the merged table is built PER READ and never published. It is
+    /// returned at the accepted base's generation, because the pending state a
+    /// reader is looking at is identified by the query stamp's
+    /// `overlay_revision`, not by G7's generation, which belongs to the
+    /// accepted table. This build is the residue R5c leaves behind: the ordinary
+    /// pending route no longer reaches it, only the recovery walk and the
+    /// non-simple-query readers do, and removing it needs an
+    /// ordinal-preserving by-key/by-page property read `tine-storage` v0.16.0
+    /// does not expose.
+    fn application_property_registry_ready(
+        &self,
+    ) -> Result<std::sync::Arc<crate::query::registry::Registry>, SyncApplicationPageRequestError>
+    {
+        let pending = self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| !managed.latest_projection_frames.is_empty());
+        let base = self.accepted_property_registry_ready()?;
+        if !pending {
+            return Ok(base);
+        }
+        let config = self.graph.config.parse_config();
         #[cfg(test)]
         self.note_application_property_registry_read(false);
         let overlay = self.application_navigation_overlay_ready()?;
+        let merged = self.build_application_property_registry(&overlay, &config)?;
+        Ok(std::sync::Arc::new(
+            merged.with_generation(base.generation()),
+        ))
+    }
+
+    /// The ONE row-and-page scan both registry builds share: every accepted
+    /// owner row and page whose path is not in `overlay`, then the overlay
+    /// pages' own rows appended under `overlay:<path>` keys. An empty `overlay`
+    /// is the accepted build — no mask, no overlay rows, the same two scans.
+    fn build_application_property_registry(
+        &self,
+        overlay: &ApplicationNavigationOverlay,
+        config: &crate::config::ParseConfig,
+    ) -> Result<crate::query::registry::Registry, SyncApplicationPageRequestError> {
         let read = self.application_materialized_read_ready()?;
 
         let mut masked_page_ids = HashSet::new();
@@ -15287,36 +15404,32 @@ impl RuntimeActor {
                 },
             );
             owner_rows.extend(crate::query::application_page_property_owner_rows(
-                &page, &page_key, true,
+                page, &page_key, true,
             ));
         }
 
-        let registry = crate::query::registry::build_registry(
+        crate::query::registry::build_registry(
             owner_rows.into_iter(),
             &|page_id: &str| pages.get(page_id).cloned(),
-            &config,
+            config,
         )
         .map_err(|_| {
             SyncApplicationPageRequestError::ActorRefusedAt(
                 "application_property_registry_unknown_page",
             )
-        })?;
-        Ok(self.publish_application_property_registry(registry, cache_key))
+        })
     }
 
-    /// The evidence stamp for a registry snapshot, or `None` when this runtime
-    /// holds a pending local suffix the accepted sequence does not describe.
+    /// The accepted evidence a published registry snapshot is keyed by.
+    ///
+    /// R5c: a pending local suffix is NOT part of it and no longer refuses it.
+    /// The slot holds accepted tables only, and a suffix cannot change what an
+    /// accepted table says — the pending route patches that table off the actor
+    /// and the walk's merged build is never published.
     fn application_property_registry_cache_key(
         &self,
         config: &crate::config::ParseConfig,
-    ) -> Result<Option<ApplicationPropertyRegistryKey>, SyncApplicationPageRequestError> {
-        if self
-            .managed_local
-            .as_ref()
-            .is_some_and(|managed| !managed.latest_projection_frames.is_empty())
-        {
-            return Ok(None);
-        }
+    ) -> Result<ApplicationPropertyRegistryKey, SyncApplicationPageRequestError> {
         let read = self.application_materialized_read_ready()?;
         let acceptance_sequence = read.acceptance_sequence();
         drop(read);
@@ -15330,20 +15443,20 @@ impl RuntimeActor {
                 )
             })?
             .state_digest();
-        Ok(Some(ApplicationPropertyRegistryKey {
+        Ok(ApplicationPropertyRegistryKey {
             acceptance_sequence,
             state_digest,
             config_digest: config.digest(),
-        }))
+        })
     }
 
-    /// Publish a freshly built Managed registry, advancing the generation when
-    /// its rows or its config digest differ from the last published snapshot
-    /// (§6.2, G7), and swapping it in atomically.
+    /// Publish a freshly built ACCEPTED Managed registry, advancing the
+    /// generation when its rows or its config digest differ from the last
+    /// published snapshot (§6.2, G7), and swapping it in atomically.
     fn publish_application_property_registry(
         &self,
         built: crate::query::registry::Registry,
-        key: Option<ApplicationPropertyRegistryKey>,
+        key: ApplicationPropertyRegistryKey,
     ) -> std::sync::Arc<crate::query::registry::Registry> {
         let mut guard = self.application_property_registry.borrow_mut();
         let previous = guard.as_ref().map(|state| &state.registry);
@@ -15364,12 +15477,32 @@ impl RuntimeActor {
         published
     }
 
-    /// The registry snapshot the Managed walk coerces against. A refusal from
-    /// the materialized read is never a reason to answer with a half-built
-    /// table: the last published snapshot stands, and an empty one is the honest
-    /// answer before the first build.
+    /// The registry snapshot the Managed walk coerces against (the merged table
+    /// while a suffix is pending). A refusal from the materialized read is
+    /// never a reason to answer with a half-built table: the last published
+    /// ACCEPTED snapshot stands — a coherent, honest, older answer, never a
+    /// merged table from some other pending revision — and an empty one is the
+    /// honest answer before the first build.
     fn application_property_registry(&self) -> std::sync::Arc<crate::query::registry::Registry> {
-        match self.application_property_registry_ready() {
+        self.serve_application_property_registry(self.application_property_registry_ready())
+    }
+
+    /// The ACCEPTED table alone: what the turn's CAPTURE path prepares a
+    /// property query under, so the capture carries the base the executor
+    /// patches (R5c). With nothing pending it is the same table
+    /// `application_property_registry` returns.
+    fn accepted_property_registry(&self) -> std::sync::Arc<crate::query::registry::Registry> {
+        self.serve_application_property_registry(self.accepted_property_registry_ready())
+    }
+
+    fn serve_application_property_registry(
+        &self,
+        built: Result<
+            std::sync::Arc<crate::query::registry::Registry>,
+            SyncApplicationPageRequestError,
+        >,
+    ) -> std::sync::Arc<crate::query::registry::Registry> {
+        match built {
             Ok(registry) => registry,
             Err(_) => match self.application_property_registry.borrow().as_ref() {
                 Some(current) => std::sync::Arc::clone(&current.registry),
@@ -15402,23 +15535,37 @@ impl RuntimeActor {
                 exceeded: false,
             }));
         }
-        let prepared = self.application_simple_query_prepared(query, max_rows, max_bytes)?;
+        // The CAPTURE path prepares a property query under the ACCEPTED table,
+        // because that is the base the off-actor executor patches. Every walk
+        // below re-takes the registry through `RegistrySource::MergedWalk`: the
+        // discriminator is "is this preparation the turn's capture path?",
+        // never "is a suffix pending?", which is also true on the recovery
+        // walk — and the recovery walk must see the merged table.
+        let prepared = self.application_simple_query_prepared(
+            query,
+            max_rows,
+            max_bytes,
+            RegistrySource::AcceptedBase,
+        )?;
         // No stamp (no overlay could be created for a pending suffix): the
         // walk answers on the actor, as before R5.
         let Some(stamp) = prepared.stamp.clone() else {
+            let prepared = self.prepared_for_walk(prepared);
             return Ok(SimpleQueryTurn::Answered(
                 self.application_simple_query_walk(query, Some(prepared), max_rows, max_bytes)?,
             ));
         };
-        // R5b: with a pending suffix, only a query every relation of which
-        // stays inside one page can be split between the accepted file and
-        // the overlay (`PageLocality`, exhaustive over the IR), and — until
-        // R5c patches the registry off the actor — only one without a
-        // property leaf. Everything else walks, memoized under this stamp.
+        // R5b/R5c: with a pending suffix, only a query every relation of which
+        // stays inside one page can be split between the accepted file and the
+        // overlay (`PageLocality`, exhaustive over the IR). A property leaf is
+        // no longer an exclusion: R5c patches the registry off the actor, so a
+        // `props` query is captured like any other and the executor lowers both
+        // sources under the patched table. Everything else walks, memoized
+        // under this stamp.
         if stamp.overlay_revision.is_some()
-            && (prepared.props
-                || prepared.query.page_locality() != crate::query::ir::PageLocality::Local)
+            && prepared.query.page_locality() != crate::query::ir::PageLocality::Local
         {
+            let prepared = self.prepared_for_walk(prepared);
             return Ok(SimpleQueryTurn::Answered(
                 self.application_simple_query_walk(query, Some(prepared), max_rows, max_bytes)?,
             ));
@@ -15513,10 +15660,17 @@ impl RuntimeActor {
     }
 
     /// A capture that came back from the handle is reusable only while its
-    /// stamp is still this actor's accepted stamp: the same acceptance
-    /// sequence, frontier, config and day mean the same registry snapshot
-    /// and the same memo key. A pending suffix, a moved frontier or a new day
-    /// makes it `None`, and the walk prepares afresh.
+    /// stamp is still this actor's stamp: the same acceptance sequence,
+    /// frontier, config, day and pending overlay revision mean the same
+    /// evidence and the same memo key. A moved frontier, a new day or a moved
+    /// pending suffix makes it `None`, and the walk prepares afresh.
+    ///
+    /// R5c: a PENDING `props` capture is never reused either, whatever its
+    /// stamp says. Its registry is the unpatched ACCEPTED base — the executor
+    /// was going to patch it — and the walk this reuse feeds must coerce
+    /// against the actor's MERGED table, so it has to prepare afresh through
+    /// `RegistrySource::MergedWalk`. That is the one merged build the recovery
+    /// walk still pays for while a suffix is pending.
     fn managed_simple_query_reuse(
         &self,
         capture: Box<crate::managed_query::ManagedQueryCapture>,
@@ -15524,6 +15678,9 @@ impl RuntimeActor {
         let today = crate::date::JournalDate::today();
         let config = self.graph.config.parse_config();
         if self.managed_simple_query_stamp(&config, today)?.as_ref() != Some(&capture.stamp) {
+            return Ok(None);
+        }
+        if capture.props && capture.stamp.overlay_revision.is_some() {
             return Ok(None);
         }
         let capture = *capture;
@@ -15541,28 +15698,38 @@ impl RuntimeActor {
         }))
     }
 
+    /// Which property registry a preparation is lowered under (R5c).
+    ///
+    /// The two differ only while a local suffix is pending, and the
+    /// discriminator is the CALLER'S INTENT, never the pending state: a
+    /// pending suffix is equally true on the recovery walk, which must see the
+    /// merged table.
     fn application_simple_query_prepared(
         &self,
         query: &str,
         max_rows: usize,
         max_bytes: usize,
+        source: RegistrySource,
     ) -> Result<PreparedSimpleQuery, SyncApplicationPageRequestError> {
         let today = crate::date::JournalDate::today();
         let (parsed, view) = crate::query::parse_query_source(query, today);
         let profile = crate::query::ConstructionProfile::from_view(&view);
         let config = self.graph.config.parse_config();
+        let props = parsed.filter.has_props_leaf();
+        // The stamp comes FIRST: it is one materialized-read open, and the
+        // registry choice below is keyed by the intent it is prepared for, so
+        // computing it after the registry would only invite a second open.
+        let stamp = self.managed_simple_query_stamp(&config, today)?;
         // C6: the registry generation is part of the key only for a query that
         // reads property atoms. A query without a `props` leaf never consults an
         // effective type, so building the registry to key it would be cost with
         // no meaning.
-        let props = parsed.filter.has_props_leaf();
-        let registry = if props {
-            self.application_property_registry()
-        } else {
-            std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
+        let registry = match (props, source) {
+            (false, _) => std::sync::Arc::new(crate::query::registry::Registry::empty(&config)),
+            (true, RegistrySource::AcceptedBase) => self.accepted_property_registry(),
+            (true, RegistrySource::MergedWalk) => self.application_property_registry(),
         };
         let registry_generation = if props { registry.generation() } else { 0 };
-        let stamp = self.managed_simple_query_stamp(&config, today)?;
         let key = crate::query::simple_query_cache_key(&parsed, max_rows, max_bytes, profile);
         Ok(PreparedSimpleQuery {
             query: parsed,
@@ -15576,6 +15743,18 @@ impl RuntimeActor {
             stamp,
             key,
         })
+    }
+
+    /// Re-take the registry for a preparation that was made for the CAPTURE
+    /// path and is now going to walk instead (no stamp, or a non-`Local`
+    /// query). The walk coerces against the merged table; with nothing pending
+    /// the two are the same table and this is a cache hit.
+    fn prepared_for_walk(&self, mut prepared: PreparedSimpleQuery) -> PreparedSimpleQuery {
+        if prepared.props {
+            prepared.registry = self.application_property_registry();
+            prepared.registry_generation = prepared.registry.generation();
+        }
+        prepared
     }
 
     fn application_simple_query_ready(
@@ -15609,7 +15788,12 @@ impl RuntimeActor {
     ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
         let prepared = match prepared {
             Some(prepared) => prepared,
-            None => self.application_simple_query_prepared(query, max_rows, max_bytes)?,
+            None => self.application_simple_query_prepared(
+                query,
+                max_rows,
+                max_bytes,
+                RegistrySource::MergedWalk,
+            )?,
         };
         self.application_simple_query_pages_ready(query, prepared, max_rows, max_bytes)
     }

@@ -32592,26 +32592,28 @@ fn c7b_measure_anonymized_corpus() {
 // actually costs while the user is typing.
 // ---------------------------------------------------------------------------
 
-/// The real rule, as a test rather than as a comment (AGENTS §2).
+/// The rule, as a test rather than as a comment (AGENTS §2).
 ///
-/// **This corrects Wave B's receipt.** §B3 of it says the Managed registry is
-/// "rebuilt only when the stamp moves and never while local frames are
-/// pending". The code does the opposite:
-/// `application_property_registry_cache_key` returns `Ok(None)` for the whole
-/// time a local suffix is undrained, a `None` key can never match a published
-/// one, so a registry read during an edit rebuilds the entire table — overlay
-/// merge, page scan, property-row scan — on EVERY call.
+/// **R5c rewrote this test.** Through R5b it asserted the opposite of what it
+/// asserts now — `(builds, hits) == (2, 0)` while pending — because
+/// `application_property_registry_cache_key` returned `Ok(None)` for the whole
+/// time a local suffix was undrained, so a registry read during an edit
+/// rebuilt the entire table (overlay merge, page scan, property-row scan) on
+/// EVERY call. That was the F1 cost: typing made a property query cost the
+/// graph (I-13).
 ///
-/// That is deliberate and it is the same rule the simple-query memo states for
-/// itself: an actor holding a pending local suffix has evidence the accepted
-/// sequence does not cover, so it must not serve a snapshot that predates the
-/// pending edits. What was wrong was the description, not the behaviour.
+/// R5c retires it. The actor caches exactly ONE table, the ACCEPTED one, and a
+/// pending suffix neither evicts it nor advances its generation; the pending
+/// route carries that table off the actor and patches the affected keys under
+/// its own two snapshots. So a pending property read is a CACHE HIT here, and
+/// the two full scans happen once per accepted frontier instead of once per
+/// keystroke.
 ///
 /// C6's other half is asserted here too: a query with no `props` leaf never
 /// reads the registry at all, pending or not, so none of this cost exists for
 /// the task and page-ref queries that make up every query in the real corpora.
 #[test]
-fn a_pending_local_suffix_rebuilds_the_managed_property_registry_on_every_read() {
+fn r5c_a_pending_local_suffix_reads_the_accepted_property_registry_from_cache() {
     let fixture = c7b_parity_fixture("wave-d-registry-pending", 0xd501);
     let overlay_path = Graph::open(&fixture.graph_root)
         .list_pages()
@@ -32701,10 +32703,10 @@ fn a_pending_local_suffix_rebuilds_the_managed_property_registry_on_every_read()
             pending.property_registry_builds,
             pending.property_registry_cache_hits
         ),
-        (2, 0),
-        "while a local suffix is pending EVERY property-query read rebuilds the \
-         whole registry — this is the rule Wave B's receipt described backwards: \
-         {pending:?}"
+        (0, 2),
+        "R5c: a pending suffix does not evict the accepted table, so both \
+         property reads while pending are cache hits and the actor rebuilds \
+         nothing — the patch happens off the actor: {pending:?}"
     );
 
     // C6: no `props` leaf, no registry, pending or not.
@@ -32730,26 +32732,34 @@ fn a_pending_local_suffix_rebuilds_the_managed_property_registry_on_every_read()
     ));
 }
 
-/// F1's paired A/B, as a receipt line rather than a threshold.
+/// F1's paired A/B/C, as a receipt line rather than a threshold.
 ///
 /// The same property query, on the same actor, in one session, re-run with and
-/// without a pending local suffix — the ONE place the `None` cache key is a
-/// marginal cost (the advanced and export paths already hydrate every query
-/// page before the registry is touched, so a build there is not the margin).
+/// without a pending local suffix — the ONE place the registry was a marginal
+/// cost (the advanced and export paths already hydrate every query page before
+/// the registry is touched, so a build there is not the margin).
+///
+/// **R5c rewrote the pending arms.** Through R5b the pending arm measured the
+/// actor rebuilding the whole registry once per read and asserted
+/// `property_registry_builds == ROUNDS`. R5c retires that: the actor's ACCEPTED
+/// table is a cache hit while pending, the query is CAPTURED, and the registry
+/// it is lowered under is patched off the actor once per distinct pending
+/// state. So the pending arms now assert `builds == 0` and exactly ONE patch
+/// per arm, and the medians below are the R5c route's.
 ///
 /// ```text
 /// TINE_MANAGED_ACTIVATION_GRAPH_COPY=<a disposable copy of the graph> \
-///   cargo test --release -p tine-core \
+///   cargo test --release -p tine-core --lib \
 ///   managed_property_registry_cost_while_typing_manual_receipt \
 ///   -- --ignored --nocapture --test-threads=1
 /// ```
 ///
-/// It prints medians and counters; it asserts only that the two arms did what
-/// they claim (cache hits versus builds), because the ≤ 20 ms §6.4 budget is a
-/// judgement the manager makes against a number, not a threshold that should
-/// fail a build on a loaded machine. The query names no key from the graph, so
-/// no corpus content enters this file: what is being measured is the registry
-/// build, and a property query that matches nothing pays exactly the same one.
+/// It prints medians and counters; it asserts only that the three arms did
+/// what they claim (cache hits, builds, patches), because the ≤ 20 ms §6.4
+/// budget is a judgement the manager makes against a number, not a threshold
+/// that should fail a build on a loaded machine. The query names no key from
+/// the graph, and the key arm C edits is chosen programmatically and never
+/// printed, so no corpus content enters this file.
 #[test]
 #[ignore = "manual receipt: needs a disposable real graph copy named by TINE_MANAGED_ACTIVATION_GRAPH_COPY"]
 fn managed_property_registry_cost_while_typing_manual_receipt() {
@@ -32809,6 +32819,7 @@ fn managed_property_registry_cost_while_typing_manual_receipt() {
     handle
         .reset_managed_application_query_instrumentation()
         .unwrap();
+    handle.reset_managed_query_census();
     let settled = median((0..ROUNDS).map(|_| sample()).collect());
     let settled_counters = handle.managed_application_query_instrumentation().unwrap();
     assert_eq!(
@@ -32816,7 +32827,9 @@ fn managed_property_registry_cost_while_typing_manual_receipt() {
         "arm A must be measuring the cache-hit path: {settled_counters:?}"
     );
 
-    // Arm B — a committed-undrained local suffix, i.e. the user is typing.
+    // Arm B — a committed-undrained TEXT-ONLY local suffix, i.e. the user is
+    // typing prose. No property row moves, so no key is affected and the patch
+    // reads no accepted property row at all.
     let (mut page, revision) = load_application_exact(&handle, &overlay_path);
     page.blocks[0].raw = format!("{} registry-cost-edit", page.blocks[0].raw);
     let save = handle
@@ -32834,18 +32847,78 @@ fn managed_property_registry_cost_while_typing_manual_receipt() {
     handle
         .reset_managed_application_query_instrumentation()
         .unwrap();
+    handle.reset_managed_query_census();
+    handle.inner.managed_query.patched_registry.clear();
     let pending = median((0..ROUNDS).map(|_| sample()).collect());
     let pending_counters = handle.managed_application_query_instrumentation().unwrap();
+    let pending_patches = r5c_patches(&handle);
     assert_eq!(
-        pending_counters.property_registry_builds, ROUNDS,
-        "arm B must be rebuilding on every read: {pending_counters:?}"
+        pending_counters.property_registry_builds, 0,
+        "arm B: R5c reads the ACCEPTED table from cache while pending: {pending_counters:?}"
     );
+    assert_eq!(
+        pending_patches, 1,
+        "arm B: one patch per distinct pending state, not one per read"
+    );
+
+    // Arm C — a pending PROPERTY edit on the graph's most common key, so the
+    // patch rebuilds that key's complete row set. The key is read from the
+    // projection and never printed.
+    let keys = crate::managed_registry_patch::most_common_keys(&fixture.request.database_path, 16);
+    let probe = handle.application_property_registry_probe().unwrap();
+    let common = keys
+        .iter()
+        .find(|(key, _)| {
+            !crate::query::registry::is_internal_key(key, &probe.config)
+                && probe.accepted.row(key).is_some()
+        })
+        .cloned();
+    let (property_median, property_patches, property_builds, affected_rows) = match common {
+        Some((key, rows)) => {
+            let (mut page, revision) = load_application_exact(&handle, &overlay_path);
+            page.blocks.push(application_move_test_root(
+                &format!("registry-cost-property-edit\n  {key}:: registry-cost-value"),
+                0,
+            ));
+            let save = handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: page.path.clone(),
+                        revision,
+                    },
+                    page,
+                })
+                .unwrap();
+            assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
+            handle.reset_managed_query_census();
+            handle.inner.managed_query.patched_registry.clear();
+            let measured = median((0..ROUNDS).map(|_| sample()).collect());
+            let counters = handle.managed_application_query_instrumentation().unwrap();
+            let patches = r5c_patches(&handle);
+            assert_eq!(
+                counters.property_registry_builds, 0,
+                "arm C: the accepted table is still a cache hit: {counters:?}"
+            );
+            assert_eq!(patches, 1, "arm C: one patch per distinct pending state");
+            (measured, patches, counters.property_registry_builds, rows)
+        }
+        None => (0, 0, 0, 0),
+    };
 
     eprintln!(
         "REGISTRYWHILETYPING\tgraph=<named by env>\trounds={ROUNDS}\t\
-         settled_median_us={settled}\tpending_median_us={pending}\t\
-         delta_us={}\tsettled_builds={}\tsettled_hits={}\tpending_builds={}\tpending_hits={}",
+         settled_median_us={settled}\tpending_text_median_us={pending}\t\
+         pending_property_median_us={property_median}\t\
+         text_delta_us={}\tproperty_delta_us={}\t\
+         settled_builds={}\tsettled_hits={}\t\
+         pending_builds={}\tpending_hits={}\tpending_patches={pending_patches}\t\
+         property_builds={property_builds}\tproperty_patches={property_patches}\t\
+         property_affected_key_rows={affected_rows}",
         pending.saturating_sub(settled),
+        property_median.saturating_sub(settled),
         settled_counters.property_registry_builds,
         settled_counters.property_registry_cache_hits,
         pending_counters.property_registry_builds,
@@ -33157,14 +33230,18 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
     );
 }
 
-/// R5b: a query with a property leaf still walks on the actor while pending
-/// (its registry would have to be patched off the actor — R5c), and is never
-/// captured.
+/// **R5c's headline fail-before.** Through R5b this test asserted the
+/// opposite: a pending query with a property leaf walked on the actor,
+/// uncaptured, census `(0, 0, 0, 0)`, with its injected outcome left
+/// unconsumed. R5c lifts that exclusion — the registry is patched off the
+/// actor — so the same fixture now proves the query IS captured, the injected
+/// outcome IS consumed, one two-source statement read answers it, exactly one
+/// registry patch was computed, and the answer is the forced walk's.
 #[test]
-fn r5b_a_property_query_still_walks_uncaptured_while_pending() {
+fn r5c_a_pending_property_query_is_captured_and_patched() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
-    let (fixture, handle) = r4b_reopened("r5b-pending-props", 0x5b02);
-    let witness_path = Graph::open(&fixture.graph_root)
+    let (_fixture, handle) = r4b_reopened("r5c-pending-props", 0x5c02);
+    let witness_path = Graph::open(&_fixture.graph_root)
         .list_pages()
         .into_iter()
         .next()
@@ -33183,24 +33260,19 @@ fn r5b_a_property_query_still_walks_uncaptured_while_pending() {
         .unwrap();
     assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
     assert_eq!(handle.status().unwrap().managed_local_pending, 1);
-    r4b_inject(&handle, vec![Outcome::Failed("must not be consumed")]);
-    let result = handle
-        .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
-            query: "(property type pending-props-no-such-value)".into(),
-            max_rows: R4B_ROWS,
-            max_bytes: R4B_BYTES,
-        })
-        .unwrap();
-    assert!(matches!(
-        result,
-        SyncApplicationNavigationOutcome::Loaded {
-            reply: SyncApplicationNavigationReply::SimpleQuery(_)
-        }
-    ));
+
+    const QUERY: &str = "(property type pending-props-no-such-value)";
+    const OTHER: &str = "(property status pending-props-no-such-value)";
+
+    // The oracle: the forced walk over the same pending state. The injected
+    // outcome IS consumed now — through R5b this queue was left untouched,
+    // which is exactly what proved the query never reached the executor.
+    r4b_inject(&handle, vec![Outcome::Busy]);
+    let walked = r4a_navigate(&handle, QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (0, 0, 0, 0),
-        "nothing captured, nothing counted"
+        (0, 1, 0, 0),
+        "the pending property query reached the executor and fell back to the walk"
     );
     assert_eq!(
         handle
@@ -33210,16 +33282,54 @@ fn r5b_a_property_query_still_walks_uncaptured_while_pending() {
             .lock()
             .unwrap()
             .len(),
-        1,
-        "a pending property query never reaches the executor"
+        0,
+        "R5c: a pending property query IS captured, so the outcome is consumed"
     );
-    handle
-        .inner
-        .managed_query
-        .injected_outcomes
-        .lock()
-        .unwrap()
-        .clear();
+
+    // The executor's own answer: one PENDING statement read and ONE patch.
+    r4b_inject(&handle, vec![]);
+    handle.inner.managed_query.patched_registry.clear();
+    let answered = r4a_navigate(&handle, QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 1, 0, 0, 0),
+        "one two-source read, no fallback, no failure, no re-capture"
+    );
+    assert_eq!(
+        r5c_patches(&handle),
+        1,
+        "the accepted registry was patched exactly once"
+    );
+    r4a_assert_same("the patched pending answer", &answered, &walked);
+
+    // The same question again: the memo answers and nothing is patched.
+    let memoized = r4a_navigate(&handle, QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (1, 1, 0, 0, 0),
+        "a memo hit executes nothing"
+    );
+    assert_eq!(r5c_patches(&handle), 1);
+    r4a_assert_same("memo hit", &memoized, &walked);
+
+    // A DIFFERENT property query under the SAME pending state executes, but
+    // the patched registry is a one-entry cache hit: still one patch. This is
+    // what makes N property queries in one pause between keystrokes cost one.
+    let other = r4a_navigate(&handle, OTHER, R4B_ROWS, R4B_BYTES).unwrap();
+    assert_eq!(
+        r5a_census(&handle),
+        (2, 2, 0, 0, 0),
+        "a second distinct property query is a second two-source read"
+    );
+    assert_eq!(
+        r5c_patches(&handle),
+        1,
+        "the patch cache is keyed by the stamp, not by the query"
+    );
+    r4b_inject(&handle, vec![Outcome::Busy]);
+    let other_walk = r4a_navigate(&handle, OTHER, R4B_ROWS, R4B_BYTES).unwrap();
+    r4a_assert_same("the second property query", &other, &other_walk);
+
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
@@ -35228,6 +35338,1242 @@ fn r5a_the_pending_walk_and_the_pending_read_are_timed_on_a_real_corpus() {
         buffered.1
     );
 
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// R5c: the pending route patches the property registry OFF the actor. A
+// captured pending query with a property leaf carries the ACCEPTED table and
+// the executor rebuilds exactly the affected keys under its two snapshots.
+// Every gate below compares the patch against a FULL build over the same two
+// snapshots (the I-19 oracle for the patch) and, where the answer is what
+// matters, against the forced actor WALK over the same pending state.
+// ---------------------------------------------------------------------------
+
+/// Registry patches actually computed off the actor (a patch-cache hit is not
+/// one).
+fn r5c_patches(handle: &SyncRuntimeHandle) -> usize {
+    handle.managed_query_census().registry_patches
+}
+
+fn r5c_block(raw: &str) -> BlockDto {
+    BlockDto {
+        id: format!("temporary-{}", raw.replace(['\n', ' ', ':'], "-")),
+        raw: raw.to_owned(),
+        ..BlockDto::default()
+    }
+}
+
+/// A small Managed graph whose property rows exercise every patch rule: two
+/// pages sharing keys, a key with exactly one owner, a DECLARATION page
+/// (`score`, named after the key, carrying `tine.type::`), an Org page whose
+/// dialect the atomizer must reach through `page_of`, an internal key and a
+/// `tine.*` key that must never become rows, and a page with no property rows
+/// at all (the ordinary text edit).
+fn r5c_fixture(label: &str, seed: u128) -> ActivationFixture {
+    let fixture = ActivationFixture::empty(label, seed);
+    fs::create_dir_all(fixture.graph_root.join("notes")).unwrap();
+    fs::create_dir_all(fixture.graph_root.join("diary")).unwrap();
+    for (path, body) in [
+        (
+            "notes/Data.md",
+            "- TODO row one\n  score:: 01\n  status:: open\n- DONE row two\n  score:: 02\n  status:: done\n",
+        ),
+        (
+            "notes/More.md",
+            "- TODO row three\n  score:: 03\n  tone:: warm\n",
+        ),
+        ("notes/Solo.md", "- TODO only owner\n  lonely:: yes\n"),
+        ("notes/Plain.md", "- TODO no properties here\n"),
+        (
+            "notes/score.md",
+            "tine.type:: number\n\n- the key page for score\n",
+        ),
+        (
+            "notes/Kilo.org",
+            "* TODO org row\n:PROPERTIES:\n:tone: cool\n:END:\n",
+        ),
+        ("diary/20-07-2026.md", "- TODO journal row\n  tone:: mild\n"),
+    ] {
+        fs::write(fixture.graph_root.join(path), body).unwrap();
+    }
+    fixture
+}
+
+/// Author a page NAMED after a property key, carrying `tine.type:: <declared>`,
+/// through the runtime, and ACCEPT it — so the accepted engine owns its logical
+/// name and a later rename or deletion of it reaches the page.
+fn r5c_accept_declaration_page(handle: &SyncRuntimeHandle, key: &str, declared: &str) {
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: key.into(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(
+                key,
+                SyncPageKind::Page,
+                Some(&format!("tine.type:: {declared}")),
+                vec![r5c_block(&format!("the key page for {key}"))],
+            ),
+        })
+        .unwrap();
+    assert!(
+        matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+        "the declaration page was not saved: {save:?}"
+    );
+    drain_managed_local(handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+}
+
+/// The patched registry and the FULL build over the same two snapshots and the
+/// same mask, taken off the actor exactly as the executor would.
+fn r5c_registry_pair(
+    fixture: &ActivationFixture,
+    handle: &SyncRuntimeHandle,
+) -> (
+    crate::query::registry::Registry,
+    crate::query::registry::Registry,
+) {
+    let (overlay_path, state) = r5a_overlay(handle);
+    assert!(state.failed.is_none(), "{state:?}");
+    assert!(state.incomplete.is_empty(), "{state:?}");
+    let probe = handle.application_property_registry_probe().unwrap();
+    crate::managed_registry_patch::pending_registry_pair(
+        &fixture.request.database_path,
+        &overlay_path,
+        &state.pending_paths,
+        &probe.accepted,
+        &probe.config,
+    )
+    .expect("the two-snapshot patch and full build both read")
+}
+
+/// The I-19 gate itself: `patched.rows()` is row-for-row the full build's.
+fn r5c_assert_patch_matches_full_build(
+    label: &str,
+    fixture: &ActivationFixture,
+    handle: &SyncRuntimeHandle,
+) -> crate::query::registry::Registry {
+    let (patched, full) = r5c_registry_pair(fixture, handle);
+    assert!(
+        patched.rows_equal(&full),
+        "{label}: the patched registry is not the full build over the same two snapshots\n\
+         patched keys: {:?}\nfull keys:    {:?}",
+        patched
+            .rows()
+            .iter()
+            .map(|row| (
+                row.normalized_name.as_str(),
+                row.observed_type,
+                row.declared
+            ))
+            .collect::<Vec<_>>(),
+        full.rows()
+            .iter()
+            .map(|row| (
+                row.normalized_name.as_str(),
+                row.observed_type,
+                row.declared
+            ))
+            .collect::<Vec<_>>(),
+    );
+    patched
+}
+
+/// Scenarios (a)–(i) and (k): every shape of pending property change, each
+/// compared against the full build over the same two snapshots.
+#[test]
+fn r5c_the_patch_equals_the_full_build_over_every_pending_shape() {
+    // (a) a pending edit that changes one key's value on one block.
+    {
+        let fixture = r5c_fixture("r5c-shape-value", 0x5c10);
+        let handle = r4a_reopen(&fixture);
+        let settled = r5c_assert_patch_matches_full_build("nothing pending", &fixture, &handle);
+        assert_eq!(
+            settled.row("score").map(|row| row.top_values.len()),
+            Some(3),
+            "the accepted table holds three score values"
+        );
+        r5a_pending_replace(
+            &handle,
+            "notes/Data.md",
+            vec![
+                r5c_block("TODO row one\n  score:: 41\n  status:: open"),
+                r5c_block("DONE row two\n  score:: 02\n  status:: done"),
+            ],
+        );
+        let patched = r5c_assert_patch_matches_full_build("(a) value change", &fixture, &handle);
+        assert!(
+            patched
+                .row("score")
+                .unwrap()
+                .top_values
+                .iter()
+                .any(|(text, _)| text == "41"),
+            "the pending value is in the patched key's top values"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (b) a pending edit that ADDS a key the graph has never seen, sorting
+    // between two existing ones (`sonar` between `score` and `status`).
+    {
+        let fixture = r5c_fixture("r5c-shape-insert", 0x5c11);
+        let handle = r4a_reopen(&fixture);
+        r5a_pending_replace(
+            &handle,
+            "notes/More.md",
+            vec![r5c_block(
+                "TODO row three\n  score:: 03\n  tone:: warm\n  sonar:: ping",
+            )],
+        );
+        let patched = r5c_assert_patch_matches_full_build("(b) new key", &fixture, &handle);
+        let keys: Vec<&str> = patched
+            .rows()
+            .iter()
+            .map(|row| row.normalized_name.as_str())
+            .collect();
+        assert!(keys.contains(&"sonar"), "{keys:?}");
+        assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "insertion keeps byte order: {keys:?}"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (c) a pending edit that REMOVES the last owner of a key.
+    {
+        let fixture = r5c_fixture("r5c-shape-remove", 0x5c12);
+        let handle = r4a_reopen(&fixture);
+        assert!(r5c_registry_pair(&fixture, &handle)
+            .0
+            .row("lonely")
+            .is_some());
+        r5a_pending_replace(
+            &handle,
+            "notes/Solo.md",
+            vec![r5c_block("TODO only owner, no longer")],
+        );
+        let patched = r5c_assert_patch_matches_full_build("(c) key removed", &fixture, &handle);
+        assert!(
+            patched.row("lonely").is_none(),
+            "the key's last owner went with the pending edit"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (d) a pending page carrying `tine.type::` for an existing key whose rows
+    // are all on OTHER, unmasked pages: the declaration binds and the
+    // effective type moves although not one of the key's rows was read from a
+    // masked page. This is the case rule (3) exists for.
+    {
+        let fixture = r5c_fixture("r5c-shape-declare", 0x5c13);
+        let handle = r4a_reopen(&fixture);
+        assert_eq!(
+            r5c_registry_pair(&fixture, &handle)
+                .0
+                .effective_type("score"),
+            Some(crate::query::ir::ObservedType::Number)
+        );
+        let (mut key_page, revision) = load_application_exact(&handle, "notes/score.md");
+        key_page.pre_block = Some("tine.type:: text".to_string());
+        let save = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: key_page.path.clone(),
+                    revision,
+                },
+                page: key_page,
+            })
+            .unwrap();
+        assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+        let patched =
+            r5c_assert_patch_matches_full_build("(d) declaration flip", &fixture, &handle);
+        assert_eq!(
+            patched.effective_type("score"),
+            Some(crate::query::ir::ObservedType::Text),
+            "the pending declaration binds to the key whose rows are elsewhere"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (e) DELETING the pending page that held a declaration: it unbinds and
+    // the key falls back to its observed type. The declaration page is created
+    // THROUGH the runtime and accepted first, because delete-by-name only
+    // reaches a page the accepted engine owns the logical name for.
+    {
+        let fixture = r5c_fixture("r5c-shape-undeclare", 0x5c14);
+        let handle = r4a_reopen(&fixture);
+        r5c_accept_declaration_page(&handle, "tone", "checkbox");
+        assert_eq!(
+            r5c_registry_pair(&fixture, &handle)
+                .0
+                .effective_type("tone"),
+            Some(crate::query::ir::ObservedType::Checkbox),
+            "the accepted declaration binds before the deletion"
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                    name: "tone".into(),
+                    page_kind: SyncPageKind::Page,
+                    expected_path: None,
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let patched =
+            r5c_assert_patch_matches_full_build("(e) declaration deleted", &fixture, &handle);
+        assert_eq!(
+            patched.row("tone").and_then(|row| row.declared),
+            None,
+            "the declaration went with its page"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (f) a pending RENAME of a declaration page: both names are pending, so
+    // rule (3) sees the old one through the masked accepted `pages` row and the
+    // new one through the overlay.
+    {
+        let fixture = r5c_fixture("r5c-shape-rename", 0x5c15);
+        let handle = r4a_reopen(&fixture);
+        r5c_accept_declaration_page(&handle, "tone", "checkbox");
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "tone".into(),
+                    new: "lonely".into(),
+                    expected_path: None,
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let patched =
+            r5c_assert_patch_matches_full_build("(f) declaration renamed", &fixture, &handle);
+        assert_eq!(
+            patched.row("tone").and_then(|row| row.declared),
+            None,
+            "the old name no longer declares"
+        );
+        assert_eq!(
+            patched.effective_type("lonely"),
+            Some(crate::query::ir::ObservedType::Checkbox),
+            "the new name declares instead"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (g) a pending page carrying a `hidden_properties` key and a `tine.*`
+    // key: neither becomes a row, on either side of the comparison.
+    {
+        let fixture = r5c_fixture("r5c-shape-internal", 0x5c16);
+        fs::create_dir_all(fixture.graph_root.join("logseq")).unwrap();
+        fs::write(
+            fixture.graph_root.join("logseq/config.edn"),
+            "{:block-hidden-properties #{:secret}}\n",
+        )
+        .unwrap();
+        let handle = r4a_reopen(&fixture);
+        r5a_pending_replace(
+            &handle,
+            "notes/More.md",
+            vec![r5c_block(
+                "TODO row three\n  score:: 03\n  secret:: hidden\n  tine.view:: table",
+            )],
+        );
+        let patched = r5c_assert_patch_matches_full_build("(g) internal keys", &fixture, &handle);
+        assert!(patched.row("secret").is_none(), "hidden_properties");
+        assert!(patched.row("tine.view").is_none(), "every `tine.*` key");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (h) a NEW pending page, never accepted, carrying properties.
+    {
+        let fixture = r5c_fixture("r5c-shape-new-page", 0x5c17);
+        let handle = r4a_reopen(&fixture);
+        r5a_pending_new_page(
+            &handle,
+            "R5c Fresh",
+            vec![r5c_block("TODO fresh row\n  score:: 44\n  fresh:: yes")],
+        );
+        let patched =
+            r5c_assert_patch_matches_full_build("(h) new pending page", &fixture, &handle);
+        assert!(patched.row("fresh").is_some());
+        assert_eq!(
+            patched.row("score").map(|row| row.count_blocks),
+            Some(4),
+            "the new page's owner joins the existing three"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // (i) two pending pages sharing a key: ONE rebuild of that key, both
+    // contribute. (k) rides along: one of them is the Org page, whose dialect
+    // reaches the atomizer only through `page_of`.
+    {
+        let fixture = r5c_fixture("r5c-shape-shared-key", 0x5c18);
+        let handle = r4a_reopen(&fixture);
+        r5a_pending_replace(
+            &handle,
+            "notes/More.md",
+            vec![r5c_block(
+                "TODO row three\n  score:: 03\n  tone:: [[north]]",
+            )],
+        );
+        r5a_pending_replace(
+            &handle,
+            "notes/Kilo.org",
+            vec![r5c_block(
+                "TODO org row\n:PROPERTIES:\n:tone: [[south]]\n:END:",
+            )],
+        );
+        let (_, state) = r5a_overlay(&handle);
+        assert_eq!(state.pending_paths.len(), 2, "{state:?}");
+        let patched = r5c_assert_patch_matches_full_build(
+            "(i)/(k) shared key, both dialects",
+            &fixture,
+            &handle,
+        );
+        let tone = patched.row("tone").expect("tone survives");
+        assert!(tone.count_blocks >= 2, "{tone:?}");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+}
+
+/// Scenario (j): an ordinary text edit on a page with no property rows affects
+/// no key, so the patch reads NO accepted property row at all and returns the
+/// base unchanged. This is the whole point of the packet (I-13).
+#[test]
+fn r5c_a_text_only_edit_affects_no_key_and_reads_no_accepted_property_row() {
+    let fixture = r5c_fixture("r5c-text-only", 0x5c20);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Plain.md", "TODO r5c text-only witness");
+    let (_, state) = r5a_overlay(&handle);
+    assert_eq!(state.pending_paths.len(), 1, "{state:?}");
+
+    crate::managed_registry_patch::reset_accepted_key_reads();
+    let (patched, full) = r5c_registry_pair(&fixture, &handle);
+    assert_eq!(
+        crate::managed_registry_patch::accepted_key_reads(),
+        0,
+        "a text-only edit affects no key, so no per-key accepted read is issued"
+    );
+    assert!(patched.rows_equal(&full));
+    let probe = handle.application_property_registry_probe().unwrap();
+    assert!(
+        patched.rows_equal(&probe.accepted),
+        "with no affected key the patch IS the accepted base"
+    );
+
+    // And a pending edit that DOES touch a property row reads exactly its keys.
+    r5a_pending_replace(
+        &handle,
+        "notes/Solo.md",
+        vec![r5c_block("TODO only owner\n  lonely:: no")],
+    );
+    crate::managed_registry_patch::reset_accepted_key_reads();
+    let (patched, full) = r5c_registry_pair(&fixture, &handle);
+    assert_eq!(
+        crate::managed_registry_patch::accepted_key_reads(),
+        1,
+        "exactly the one affected key is rebuilt"
+    );
+    assert!(patched.rows_equal(&full));
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Scenario (l): two pages whose names collide under `refs::page_key`, both
+/// carrying `tine.type::` with different values.
+///
+/// A Managed runtime folds two files of one display name into ONE page
+/// (`r5a_two_files_of_one_display_name_are_one_managed_page`), so the second
+/// declaring page is authored at the STORAGE level — the same technique
+/// `r5a_an_ambiguous_accepted_path_fails_the_pending_read` uses for a shape the
+/// runtime cannot produce: an existing accepted page is re-NAMED onto the key's
+/// name and given a `tine.type::` row of its own.
+///
+/// `build_registry`'s declaration map is last-write-wins, so the two builds can
+/// only agree if the patch feeds declarations in the ACTOR's stream order
+/// (`owner_type, owner_id, name, ordinal`) rather than in
+/// `properties_lookup_idx`'s natural value order — and then the overlay's after
+/// them, which the pending leg below pins exactly.
+#[test]
+fn r5c_a_page_key_collision_resolves_the_declaration_as_the_full_build_does() {
+    let fixture = r5c_fixture("r5c-declaration-collision", 0x5c21);
+    let handle = r4a_reopen(&fixture);
+    let expected_accepted = {
+        let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
+        assert_eq!(
+            writer
+                .execute(
+                    "UPDATE pages SET name = 'SCORE', name_key = 'score' WHERE path = ?1",
+                    ["notes/Plain.md"],
+                )
+                .unwrap(),
+            1,
+            "the collision fixture needs a second page named like the key"
+        );
+        assert_eq!(
+            writer
+                .execute(
+                    "INSERT INTO properties \
+                     (owner_type, owner_id, page_id, name, normalized_name, value, ordinal) \
+                     SELECT 0, page_id, page_id, 'tine.type', 'tine.type', 'text', 0 \
+                     FROM pages WHERE path = ?1",
+                    ["notes/Plain.md"],
+                )
+                .unwrap(),
+            1,
+            "the collision fixture needs its second declaration"
+        );
+        // The oracle for WHICH declaration wins, read in the actor's own stream
+        // order straight out of the file: last write wins.
+        let mut statement = writer
+            .prepare(
+                "SELECT value FROM properties WHERE normalized_name = 'tine.type' \
+                 AND owner_type = 0 ORDER BY owner_type, owner_id, name, ordinal",
+            )
+            .unwrap();
+        let values: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|value| value.unwrap())
+            .collect();
+        assert_eq!(values.len(), 2, "two colliding declarations: {values:?}");
+        crate::query::registry::parse_declaration(values.last().unwrap())
+            .expect("both fixture declarations parse")
+            .0
+    };
+    r5a_pending_append(&handle, "notes/More.md", "TODO r5c collision witness");
+
+    let (patched, full) = r5c_registry_pair(&fixture, &handle);
+    assert!(
+        patched.rows_equal(&full),
+        "the two colliding declarations must resolve identically in both builds\n\
+         patched: {:?}\nfull:    {:?}",
+        patched
+            .rows()
+            .iter()
+            .map(|row| (row.normalized_name.as_str(), row.declared))
+            .collect::<Vec<_>>(),
+        full.rows()
+            .iter()
+            .map(|row| (row.normalized_name.as_str(), row.declared))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        patched.effective_type("score"),
+        Some(expected_accepted),
+        "the actor's stream order decides which colliding declaration wins"
+    );
+
+    // Now with the DECLARING page itself pending on top of the collision: the
+    // overlay's declaration is fed AFTER every accepted one, so it wins
+    // whatever the accepted order was.
+    let (mut key_page, revision) = load_application_exact(&handle, "notes/score.md");
+    key_page.pre_block = Some("tine.type:: checkbox".to_string());
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: key_page.path.clone(),
+                revision,
+            },
+            page: key_page,
+        })
+        .unwrap();
+    assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+    let (patched, full) = r5c_registry_pair(&fixture, &handle);
+    assert!(
+        patched.rows_equal(&full),
+        "accepted declarations first, the overlay's after them, in both builds"
+    );
+    assert_eq!(
+        patched.effective_type("score"),
+        Some(crate::query::ir::ObservedType::Checkbox),
+        "the overlay's declaration is the last write"
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// **The bridge.** The forced-walk oracle coerces against the ACTOR's merged
+/// table, which is built by a DIFFERENT overlay-row producer (page DTOs
+/// through `application_page_property_owner_rows`) than the overlay database's
+/// rows (the accept path's per-page lowering). Every other gate here proves
+/// `patch == two-snapshot full build`; this one is the only thing that ties
+/// that to the walk's answer.
+///
+/// If it fails it is a pre-existing R5b/R5a producer divergence, not R5c's.
+#[test]
+fn r5c_the_walk_registry_equals_the_two_snapshot_full_build() {
+    let fixture = r5c_fixture("r5c-bridge", 0x5c22);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_replace(
+        &handle,
+        "notes/Data.md",
+        vec![
+            r5c_block("TODO row one\n  score:: 41\n  status:: open"),
+            r5c_block("DONE row two\n  score:: 02\n  bridge:: yes"),
+        ],
+    );
+    r5a_pending_replace(
+        &handle,
+        "notes/Kilo.org",
+        vec![r5c_block(
+            "TODO org row\n:PROPERTIES:\n:tone: cool\n:score: 7\n:END:",
+        )],
+    );
+    r5a_pending_new_page(
+        &handle,
+        "R5c Bridge",
+        vec![r5c_block("TODO bridge row\n  bridge:: also")],
+    );
+
+    let (patched, full) = r5c_registry_pair(&fixture, &handle);
+    assert!(
+        patched.rows_equal(&full),
+        "patch == two-snapshot full build"
+    );
+    let probe = handle.application_property_registry_probe().unwrap();
+    assert!(
+        probe.merged.rows_equal(&full),
+        "the actor's merged table (the walk's) is not the two-snapshot full build \
+         over the same pending state — the two overlay-row producers diverge\n\
+         walk: {:?}\nfull: {:?}",
+        probe
+            .merged
+            .rows()
+            .iter()
+            .map(|row| (
+                row.normalized_name.as_str(),
+                row.observed_type,
+                row.count_blocks,
+                row.count_pages,
+                row.cardinality,
+                row.declared
+            ))
+            .collect::<Vec<_>>(),
+        full.rows()
+            .iter()
+            .map(|row| (
+                row.normalized_name.as_str(),
+                row.observed_type,
+                row.count_blocks,
+                row.count_pages,
+                row.cardinality,
+                row.declared
+            ))
+            .collect::<Vec<_>>(),
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Walk parity for TYPED pending queries: two questions whose answer depends
+/// on an effective type the patch had to get right.
+#[test]
+fn r5c_typed_pending_queries_equal_the_forced_walk() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    let fixture = r5c_fixture("r5c-typed-parity", 0x5c23);
+    let handle = r4a_reopen(&fixture);
+
+    // Accepted: `score` is DECLARED number, so `01` is the number 1.
+    const NUMERIC: &str = "(property score 1)";
+    let accepted = r4a_navigate(&handle, NUMERIC, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(
+        accepted.total, 1,
+        "under a number key `01` is the number 1: {accepted:?}"
+    );
+
+    // A pending declaration flip to text: `01` is no longer `1`. The pending
+    // page carries no `score` row at all — only the declaration moves — so this
+    // is exactly the case rule (3) exists for, end to end.
+    let (mut key_page, revision) = load_application_exact(&handle, "notes/score.md");
+    key_page.pre_block = Some("tine.type:: text".to_string());
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: key_page.path.clone(),
+                revision,
+            },
+            page: key_page,
+        })
+        .unwrap();
+    assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+
+    r4b_inject(&handle, vec![Outcome::Busy]);
+    let walked = r4a_navigate(&handle, NUMERIC, R5A_ROWS, R5A_BYTES).unwrap();
+    r4b_inject(&handle, vec![]);
+    let read = r4a_navigate(&handle, NUMERIC, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0));
+    assert_eq!(r5c_patches(&handle), 1);
+    r4a_assert_same("a retyped numeric comparison", &read, &walked);
+    assert_eq!(
+        read.total, 0,
+        "under a text key `01` is not `1`; a stale registry would still say 1"
+    );
+
+    // A key whose ONLY owner is a pending page.
+    r5a_pending_new_page(
+        &handle,
+        "R5c Typed",
+        vec![r5c_block("TODO typed row\n  freshness:: crisp")],
+    );
+    const FRESH: &str = "(property freshness crisp)";
+    r4b_inject(&handle, vec![Outcome::Busy]);
+    let walked = r4a_navigate(&handle, FRESH, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(walked.total, 1, "the pending page is the key's only owner");
+    r4b_inject(&handle, vec![]);
+    let read = r4a_navigate(&handle, FRESH, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0));
+    assert_eq!(r5c_patches(&handle), 1);
+    r4a_assert_same("a key owned only by a pending page", &read, &walked);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// D-3/E4: a property row naming a page the SAME snapshot cannot answer is a
+/// snapshot-consistency defect, so the pending read FAILS. It is never a
+/// silently wrong registry — which would be a silently wrong ANSWER, since the
+/// registry decides how the key's values are compared.
+#[test]
+fn r5c_a_property_row_naming_an_absent_page_fails_the_pending_read() {
+    let fixture = r5c_fixture("r5c-registry-damage", 0x5c24);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_replace(
+        &handle,
+        "notes/Solo.md",
+        vec![r5c_block("TODO only owner\n  lonely:: still")],
+    );
+    let (overlay_path, state) = r5a_overlay(&handle);
+    assert!(state.pending_paths.contains("notes/Solo.md"), "{state:?}");
+
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    handle.inner.managed_query.patched_registry.clear();
+    let writer = rusqlite::Connection::open(&overlay_path).unwrap();
+    let removed = writer
+        .execute("DELETE FROM pages WHERE path = ?1", ["notes/Solo.md"])
+        .unwrap();
+    drop(writer);
+    assert_eq!(removed, 1, "the damage must remove the overlay's page row");
+
+    let error = r4a_navigate(&handle, "(property lonely still)", R5A_ROWS, R5A_BYTES).unwrap_err();
+    assert_eq!(
+        error,
+        SyncApplicationPageRequestError::ActorRefusedAt("application_simple_query_managed_read"),
+        "a page the patch cannot resolve is an error, never a wrongly typed table"
+    );
+    assert_eq!(
+        r5a_census(&handle),
+        (0, 0, 0, 1, 0),
+        "one failed read, no fallback, no statement read"
+    );
+    assert_eq!(r5c_patches(&handle), 0, "a refused patch is not a patch");
+    // Nothing memoized and nothing cached: the next query fails again for the
+    // same reason rather than answering from a cache.
+    let again = r4a_navigate(&handle, "(property lonely still)", R5A_ROWS, R5A_BYTES).unwrap_err();
+    assert_eq!(again, error);
+    assert_eq!(r5a_census(&handle), (0, 0, 0, 2, 0));
+}
+
+/// I-20 exactness: a memoized pending answer is exact for the pending state it
+/// was taken under. A second pending save on the same page moves the stamp, so
+/// the memo misses, the patch cache misses and the answer follows the new
+/// value; the drain then rebuilds the ACCEPTED table exactly once and the
+/// drained answer is Direct's.
+#[test]
+fn r5c_a_second_pending_save_repatches_and_the_drain_rebuilds_the_accepted_table_once() {
+    let fixture = r5c_fixture("r5c-memo-exactness", 0x5c25);
+    let handle = r4a_reopen(&fixture);
+    const QUERY: &str = "(property lonely maybe)";
+
+    r5a_pending_replace(
+        &handle,
+        "notes/Solo.md",
+        vec![r5c_block("TODO only owner\n  lonely:: no")],
+    );
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    handle.inner.managed_query.patched_registry.clear();
+    let first = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(first.total, 0, "`maybe` is not the pending value yet");
+    assert_eq!(r5c_patches(&handle), 1);
+    // Memoized: the same question under the same pending state executes nothing.
+    let _ = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0));
+    assert_eq!(r5c_patches(&handle), 1);
+
+    // A SECOND pending save on the same page, changing the property value.
+    r5a_pending_replace(
+        &handle,
+        "notes/Solo.md",
+        vec![r5c_block("TODO only owner\n  lonely:: maybe")],
+    );
+    let second = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(
+        r5c_patches(&handle),
+        2,
+        "the stamp moved, so the patch cache missed and the base was re-patched"
+    );
+    assert_eq!(
+        second.total, 1,
+        "the answer follows the new pending value: {second:?}"
+    );
+
+    // The drain: the accepted table is rebuilt once, and the drained answer is
+    // Direct's over the same graph.
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    handle.clear_application_simple_query_memo().unwrap();
+    let drained = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
+    let counters = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        counters.property_registry_builds, 1,
+        "the accepted frontier moved, so the accepted table is rebuilt ONCE: {counters:?}"
+    );
+    assert_managed_simple_query_matches_direct(
+        "the drained answer",
+        drained,
+        Graph::open(&fixture.graph_root).run_query_bounded(QUERY, R5A_ROWS, R5A_BYTES),
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// G7: the published generation belongs to the ACCEPTED table. A pending save
+/// does not advance it — the patched view is identified by the stamp's
+/// `overlay_revision` — and draining a suffix whose rows differ advances it by
+/// exactly one.
+#[test]
+fn r5c_a_pending_suffix_does_not_advance_the_published_registry_generation() {
+    let fixture = r5c_fixture("r5c-generation", 0x5c26);
+    let handle = r4a_reopen(&fixture);
+    let generation = |handle: &SyncRuntimeHandle| -> u64 {
+        match c7b_navigation(handle, SyncApplicationNavigationRequest::PropertyRegistry) {
+            SyncApplicationNavigationReply::PropertyRegistry(snapshot) => snapshot.generation,
+            other => panic!("unexpected navigation reply: {other:?}"),
+        }
+    };
+    let before = generation(&handle);
+    assert!(before > 0, "the accepted table has been published once");
+
+    r5a_pending_replace(
+        &handle,
+        "notes/Solo.md",
+        vec![r5c_block("TODO only owner\n  lonely:: changed")],
+    );
+    assert_eq!(
+        generation(&handle),
+        before,
+        "a pending suffix is not accepted evidence and publishes nothing"
+    );
+    assert_eq!(
+        generation(&handle),
+        before,
+        "and reading it again does not advance it either"
+    );
+
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    assert_eq!(
+        generation(&handle),
+        before + 1,
+        "draining a suffix whose rows differ advances the generation by one"
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The two conventions the by-key read is only CORRECT under, pinned against a
+/// real projection rather than remembered: the producer writes
+/// `normalized_name = property_key_norm(name)` (so a lookup by normalized key
+/// finds every row of that key), and a PAGE owner is `owner_type = 0` (so the
+/// declaration read collects declarations rather than the empty set).
+#[test]
+fn r5c_the_producer_writes_normalized_names_and_page_owner_polarity() {
+    let fixture = ActivationFixture::empty("r5c-row-conventions", 0x5c27);
+    fs::create_dir_all(fixture.graph_root.join("notes")).unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/Mixed.md"),
+        "tine.type:: text\n\n- TODO mixed keys\n  UPPER_Key:: two\n  Mixed-Case:: three\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/Plain.md"),
+        "alias:: Other\n\n- TODO plain\n  plain:: four\n",
+    )
+    .unwrap();
+    let handle = r4a_reopen(&fixture);
+    let (rows, page_owned) =
+        crate::managed_registry_patch::pin_property_row_conventions(&fixture.request.database_path);
+    assert!(rows >= 4, "the fixture must produce property rows: {rows}");
+    assert!(
+        page_owned >= 2,
+        "the fixture must produce PAGE-owner rows (owner_type = 0): {page_owned}"
+    );
+    // And the keys the registry reports are the normalized spellings.
+    let probe = handle.application_property_registry_probe().unwrap();
+    let keys: Vec<&str> = probe
+        .accepted
+        .rows()
+        .iter()
+        .map(|row| row.normalized_name.as_str())
+        .collect();
+    for key in ["upper-key", "mixed-case", "plain"] {
+        assert!(
+            probe.accepted.row(key).is_some(),
+            "missing key {key}: {keys:?}"
+        );
+    }
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// **The corpus gate (I-19, tiered corpus rule).** The same two claims over the
+/// anonymized graph: the patch equals the full build over the same two
+/// snapshots, and the executor's answer equals the forced walk's, for the
+/// corpus's most common property key, a numeric comparison, and a compound
+/// shape. Three pages are pending: one with many property rows, one journal,
+/// and one text-only edit.
+///
+/// Keys and values are chosen PROGRAMMATICALLY from the graph and never
+/// printed — only counts and indices reach the log (AGENTS §4).
+#[test]
+#[ignore = "acceptance gate over a real corpus: set TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY to a disposable graph copy"]
+fn r5c_the_patch_equals_the_full_build_over_a_real_corpus() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let source = real_graph_copy_source_from_env("TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY");
+    let fixture = ActivationFixture::copied_graph("r5c-corpus-patch", 0x5c30, &source);
+    let handle = r4a_reopen(&fixture);
+
+    // The most property-dense page, a journal, and a page for the text-only
+    // edit — all chosen from the graph's own shape.
+    let pages = Graph::open(&fixture.graph_root).list_pages();
+    assert!(!pages.is_empty(), "the corpus copy has pages");
+    let probe = handle.application_property_registry_probe().unwrap();
+    let keys = crate::managed_registry_patch::most_common_keys(&fixture.request.database_path, 64);
+    let common = keys
+        .iter()
+        .find(|(key, _)| {
+            !crate::query::registry::is_internal_key(key, &probe.config)
+                && probe.accepted.row(key).is_some_and(|row| {
+                    row.observed_type == crate::query::ir::ObservedType::Text
+                        && !row.top_values.is_empty()
+                })
+        })
+        .map(|(key, rows)| (key.clone(), *rows));
+    let numeric = keys
+        .iter()
+        .find(|(key, _)| {
+            !crate::query::registry::is_internal_key(key, &probe.config)
+                && probe.accepted.row(key).is_some_and(|row| {
+                    row.declared.map_or(row.observed_type, |(kind, _)| kind)
+                        == crate::query::ir::ObservedType::Number
+                        && !row.top_values.is_empty()
+                })
+        })
+        .map(|(key, rows)| (key.clone(), *rows));
+    eprintln!(
+        "r5c_corpus keys={} common_key_rows={:?} numeric_key_rows={:?}",
+        keys.len(),
+        common.as_ref().map(|(_, rows)| *rows),
+        numeric.as_ref().map(|(_, rows)| *rows),
+    );
+    let Some((common_key, _)) = common else {
+        eprintln!("skipped: the corpus has no non-internal text property key");
+        return;
+    };
+
+    // Three pending pages: the most property-dense, a journal, and a text-only
+    // edit on a page with no property rows at all.
+    let mut by_properties: Vec<&crate::model::PageEntry> = pages.iter().collect();
+    by_properties.sort_by_key(|page| {
+        std::cmp::Reverse(
+            fs::read_to_string(fixture.graph_root.join(&page.rel_path))
+                .unwrap_or_default()
+                .matches(":: ")
+                .count(),
+        )
+    });
+    let dense = by_properties[0].rel_path.clone();
+    let journal = pages
+        .iter()
+        .find(|page| page.kind == crate::model::PageKind::Journal)
+        .map(|page| page.rel_path.clone());
+    let plain = by_properties
+        .last()
+        .map(|page| page.rel_path.clone())
+        .filter(|path| *path != dense);
+    r5a_pending_append(&handle, &dense, "TODO r5c corpus dense witness");
+    if let Some(journal) = journal.as_ref() {
+        if *journal != dense {
+            r5a_pending_append(&handle, journal, "TODO r5c corpus journal witness");
+        }
+    }
+    if let Some(plain) = plain.as_ref() {
+        if Some(plain) != journal.as_ref() {
+            r5a_pending_append(&handle, plain, "TODO r5c corpus text-only witness");
+        }
+    }
+    let (_, state) = r5a_overlay(&handle);
+    assert!(state.failed.is_none(), "{state:?}");
+    eprintln!("r5c_corpus pending_pages={}", state.pending_paths.len());
+
+    let started = Instant::now();
+    let (patched, full) = r5c_registry_pair(&fixture, &handle);
+    let patch_us = started.elapsed().as_micros();
+    eprintln!(
+        "r5c_corpus patched_rows={} full_rows={} pair_us={patch_us}",
+        patched.rows().len(),
+        full.rows().len()
+    );
+    assert!(
+        patched.rows_equal(&full),
+        "the patched registry differs from the full build over the same two snapshots \
+         ({} vs {} rows)",
+        patched.rows().len(),
+        full.rows().len()
+    );
+
+    // Executor == forced walk, for three shapes built from the corpus's own
+    // vocabulary. The sources are never printed.
+    let value_of = |key: &str| -> String {
+        probe
+            .accepted
+            .row(key)
+            .and_then(|row| row.top_values.first().map(|(text, _)| text.clone()))
+            .expect("a key with top values")
+    };
+    let quote = |value: &str| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut shapes = vec![
+        format!("(property {common_key} {})", quote(&value_of(&common_key))),
+        format!("(and (property {common_key}) (task TODO))"),
+    ];
+    if let Some((numeric_key, _)) = numeric.as_ref() {
+        shapes.push(format!(
+            "(property {numeric_key} {})",
+            quote(&value_of(numeric_key))
+        ));
+    }
+    for (index, source) in shapes.iter().enumerate() {
+        use crate::managed_query::ManagedQueryOutcome as Outcome;
+        r4b_inject(&handle, vec![Outcome::Busy]);
+        let walked = r4a_navigate(&handle, source, R5A_ROWS, R5A_BYTES).unwrap();
+        r4b_inject(&handle, vec![]);
+        let read = r4a_navigate(&handle, source, R5A_ROWS, R5A_BYTES).unwrap();
+        let (statement_reads, pending_reads, fallbacks, failures, _) = r5a_census(&handle);
+        eprintln!(
+            "r5c_corpus shape #{index} total={} statement_reads={statement_reads} \
+             pending_reads={pending_reads} patches={}",
+            walked.total,
+            r5c_patches(&handle)
+        );
+        assert_eq!((fallbacks, failures), (0, 0), "shape #{index}");
+        assert_eq!(statement_reads, pending_reads, "shape #{index}");
+        r4a_assert_same(&format!("corpus shape #{index}"), &read, &walked);
+    }
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// **The worst case the design names, measured rather than capped.** A graph
+/// where EVERY block carries the same key, so one pending edit of that key
+/// rebuilds a row over the whole graph's rows. No environment variable: the
+/// graph is synthetic, so the receipt can always be produced.
+///
+/// ```text
+/// cargo test --release -p tine-core --lib \
+///   r5c_the_worst_case_patch_is_measured -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "release receipt: the worst-case affected-key rebuild, measured"]
+fn r5c_the_worst_case_patch_is_measured() {
+    assert!(
+        !cfg!(debug_assertions),
+        "release-only; run with --release --ignored --nocapture --test-threads=1"
+    );
+    const PAGES: usize = 40;
+    const BLOCKS: usize = 50;
+    let fixture = ActivationFixture::empty("r5c-worst-case", 0x5c31);
+    fs::create_dir_all(fixture.graph_root.join("notes")).unwrap();
+    for page in 0..PAGES {
+        let mut body = String::new();
+        for block in 0..BLOCKS {
+            body.push_str(&format!(
+                "- TODO worst case {page}-{block}\n  type:: kind-{}\n",
+                block % 7
+            ));
+        }
+        fs::write(
+            fixture.graph_root.join(format!("notes/Worst{page:02}.md")),
+            body,
+        )
+        .unwrap();
+    }
+    let handle = r4a_reopen(&fixture);
+
+    let rows = crate::managed_registry_patch::most_common_keys(&fixture.request.database_path, 4);
+    let type_rows = rows
+        .iter()
+        .find(|(key, _)| key == "type")
+        .map(|(_, rows)| *rows)
+        .expect("every block carries `type::`");
+    assert_eq!(
+        type_rows as usize,
+        PAGES * BLOCKS,
+        "the fixture must put `type::` on every block"
+    );
+
+    // One pending page that EDITS a `type::` value: the key is affected, so
+    // its complete row set — the whole graph's — is rebuilt.
+    r5a_pending_replace(
+        &handle,
+        "notes/Worst00.md",
+        (0..BLOCKS)
+            .map(|block| {
+                r5c_block(&format!(
+                    "TODO worst case 0-{block}\n  type:: kind-{}",
+                    (block + 1) % 7
+                ))
+            })
+            .collect(),
+    );
+    let (_, state) = r5a_overlay(&handle);
+    assert!(state.failed.is_none(), "{state:?}");
+
+    const SAMPLES: usize = 9;
+    // Once, for correctness: at this size the patch is still the full build.
+    let (patched, full) = r5c_registry_pair(&fixture, &handle);
+    assert!(patched.rows_equal(&full));
+
+    // Everything the executor already holds when it reaches the registry is
+    // hoisted OUT of the timed region: the overlay path, the pending set, and
+    // the accepted base the capture carries. In particular
+    // `application_property_registry_probe` rebuilds the actor's MERGED table
+    // on every call, and timing that beside the patch would measure the very
+    // build R5c exists to stop performing.
+    let (overlay_path, state) = r5a_overlay(&handle);
+    assert!(state.failed.is_none(), "{state:?}");
+    let probe = handle.application_property_registry_probe().unwrap();
+
+    // The PATCH alone, without the oracle it was just checked against.
+    let mut patch_us: Vec<u128> = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let measured = crate::managed_registry_patch::pending_registry_patched(
+            &fixture.request.database_path,
+            &overlay_path,
+            &state.pending_paths,
+            &probe.accepted,
+            &probe.config,
+        )
+        .expect("the two-snapshot patch reads");
+        patch_us.push(started.elapsed().as_micros());
+        assert!(measured.rows_equal(&patched));
+    }
+    patch_us.sort_unstable();
+
+    // The full build over the same two snapshots, for the ratio the receipt
+    // reports. `pending_registry_pair` runs the patch too, so this is the pair;
+    // the receipt names it as such rather than pretending it is the oracle
+    // alone.
+    let mut full_us: Vec<u128> = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let (_, measured) = crate::managed_registry_patch::pending_registry_pair(
+            &fixture.request.database_path,
+            &overlay_path,
+            &state.pending_paths,
+            &probe.accepted,
+            &probe.config,
+        )
+        .expect("the two-snapshot patch and full build both read");
+        full_us.push(started.elapsed().as_micros());
+        assert!(measured.rows_equal(&full));
+    }
+    full_us.sort_unstable();
+
+    // The same question through the public route, so the receipt also carries
+    // what one pending typed query costs end to end.
+    const QUERY: &str = "(property type kind-1)";
+    let mut query_us: Vec<u128> = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        handle.clear_application_simple_query_memo().unwrap();
+        handle.inner.managed_query.patched_registry.clear();
+        let started = Instant::now();
+        let answered = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
+        query_us.push(started.elapsed().as_micros());
+        assert!(answered.total > 0);
+    }
+    query_us.sort_unstable();
+
+    eprintln!(
+        "R5CWORSTCASE\tpages={PAGES}\tblocks={}\taffected_key_rows={type_rows}\t\
+         patch_median_us={}\tpatch_max_us={}\tpair_median_us={}\tpair_max_us={}\t\
+         query_median_us={}\tquery_max_us={}",
+        PAGES * BLOCKS,
+        patch_us[SAMPLES / 2],
+        patch_us[SAMPLES - 1],
+        full_us[SAMPLES / 2],
+        full_us[SAMPLES - 1],
+        query_us[SAMPLES / 2],
+        query_us[SAMPLES - 1],
+    );
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)

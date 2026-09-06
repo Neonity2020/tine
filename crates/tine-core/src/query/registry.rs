@@ -212,6 +212,54 @@ impl Registry {
     }
 }
 
+/// Replace, insert or remove whole KEYS in a copy of `base` (R5c).
+///
+/// `patches` is `(normalized key, Some(the key's rebuilt row) | None when the
+/// key has no rows left)`. Each replacement row is produced by
+/// [`build_registry`] itself over that key's COMPLETE row set, so the
+/// classifier, the atomizer, the histogram, the top values, the mismatch count
+/// and the declaration binding stay the one producer's (§6.2, D-4).
+///
+/// The result carries `base.generation()` and `base.config_digest()`
+/// unchanged: a patched table is a VIEW of the accepted table under a pending
+/// suffix, not a new published generation. The pending state is keyed by the
+/// query stamp's `overlay_revision`; G7's generation belongs to the ACCEPTED
+/// table and only [`crate::sync_runtime`]'s publish step advances it.
+pub fn patch_registry(
+    base: &Registry,
+    patches: impl IntoIterator<Item = (String, Option<RegistryRow>)>,
+) -> Registry {
+    // `BTreeMap` over the normalized key IS the emitted order: `build_registry`
+    // collects into one too, and `Registry::index` assumes unique keys.
+    let mut rows: BTreeMap<String, RegistryRow> = base
+        .rows
+        .iter()
+        .map(|row| (row.normalized_name.clone(), row.clone()))
+        .collect();
+    for (key, replacement) in patches {
+        match replacement {
+            Some(row) => {
+                rows.insert(row.normalized_name.clone(), row);
+            }
+            None => {
+                rows.remove(&property_key_norm(&key));
+            }
+        }
+    }
+    let rows: Vec<RegistryRow> = rows.into_values().collect();
+    let index = rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| (row.normalized_name.clone(), at))
+        .collect();
+    Registry {
+        rows,
+        index,
+        generation: base.generation,
+        config_digest: base.config_digest,
+    }
+}
+
 const SUGGESTION_THRESHOLD: f64 = 0.85;
 
 /// At most eight top values per key (§6.1).
@@ -876,6 +924,166 @@ mod tests {
         assert_eq!(jaro_winkler("abc", "abc"), 1.0);
         assert_eq!(jaro_winkler("", ""), 1.0);
         assert_eq!(jaro_winkler("abc", ""), 0.0);
+    }
+
+    // --- the R5c patch step (§6.2, the pending route's registry view) -------
+
+    /// The one rebuild rule the patch uses: a key's replacement row is
+    /// `build_registry`'s own row over that key's complete row set.
+    fn rebuilt(rows: Vec<OwnerRow>, key: &str) -> Option<RegistryRow> {
+        build(rows).row(key).cloned()
+    }
+
+    #[test]
+    fn r5c_a_patch_replaces_inserts_and_removes_rows_in_key_order() {
+        let base = build(vec![
+            row(OwnerType::Block, "b1", "alpha", 0, "1"),
+            row(OwnerType::Block, "b1", "gamma", 0, "x"),
+            row(OwnerType::Block, "b1", "zulu", 0, "y"),
+        ]);
+        assert_eq!(
+            base.rows()
+                .iter()
+                .map(|row| row.normalized_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "gamma", "zulu"]
+        );
+
+        // Replace: `alpha` keeps its position and takes the rebuilt row.
+        let replaced = patch_registry(
+            &base,
+            vec![(
+                "alpha".to_string(),
+                rebuilt(
+                    vec![
+                        row(OwnerType::Block, "b1", "alpha", 0, "1"),
+                        row(OwnerType::Block, "b2", "alpha", 0, "2"),
+                    ],
+                    "alpha",
+                ),
+            )],
+        );
+        assert_eq!(replaced.row("alpha").unwrap().count_blocks, 2);
+        assert_eq!(replaced.rows().len(), 3);
+
+        // Insert between two existing keys, and past the end.
+        let inserted = patch_registry(
+            &base,
+            vec![
+                (
+                    "beta".to_string(),
+                    rebuilt(vec![row(OwnerType::Block, "b1", "beta", 0, "b")], "beta"),
+                ),
+                (
+                    "zzz".to_string(),
+                    rebuilt(vec![row(OwnerType::Block, "b1", "zzz", 0, "z")], "zzz"),
+                ),
+            ],
+        );
+        assert_eq!(
+            inserted
+                .rows()
+                .iter()
+                .map(|row| row.normalized_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma", "zulu", "zzz"]
+        );
+
+        // Remove: the key's last owner went with the pending edit.
+        let removed = patch_registry(&base, vec![("gamma".to_string(), None)]);
+        assert_eq!(
+            removed
+                .rows()
+                .iter()
+                .map(|row| row.normalized_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zulu"]
+        );
+        assert!(removed.row("gamma").is_none());
+        // Removing a key the base never had is a no-op, not a panic.
+        assert!(patch_registry(&base, vec![("nope".to_string(), None)]).rows_equal(&base));
+    }
+
+    #[test]
+    fn r5c_an_empty_patch_is_the_base_at_the_bases_generation() {
+        let base = build(vec![
+            row(OwnerType::Block, "b1", "alpha", 0, "1"),
+            row(OwnerType::Block, "b1", "gamma", 0, "x"),
+        ])
+        .with_generation(9);
+        let patched = patch_registry(&base, Vec::new());
+        assert!(patched.rows_equal(&base));
+        assert_eq!(
+            patched.generation(),
+            9,
+            "a patched table is a VIEW of the base, never a new published generation"
+        );
+        assert_eq!(patched.config_digest(), base.config_digest());
+        // And a non-empty patch does not advance it either.
+        let after = patch_registry(&base, vec![("gamma".to_string(), None)]);
+        assert_eq!(after.generation(), 9);
+    }
+
+    /// The invariant `Registry::index` and every consumer rely on: rows are
+    /// strictly increasing by `normalized_name`, and the index agrees with
+    /// them, after ANY patch sequence.
+    #[test]
+    fn r5c_rows_stay_strictly_ordered_and_indexed_after_any_patch_sequence() {
+        let mut registry = build(vec![
+            row(OwnerType::Block, "b1", "alpha", 0, "1"),
+            row(OwnerType::Block, "b1", "gamma", 0, "x"),
+            row(OwnerType::Block, "b1", "zulu", 0, "y"),
+        ]);
+        let steps: Vec<Vec<(String, Option<RegistryRow>)>> = vec![
+            vec![(
+                "beta".into(),
+                rebuilt(vec![row(OwnerType::Block, "b1", "beta", 0, "b")], "beta"),
+            )],
+            vec![("alpha".into(), None)],
+            vec![
+                (
+                    "aaa".into(),
+                    rebuilt(vec![row(OwnerType::Block, "b1", "aaa", 0, "a")], "aaa"),
+                ),
+                ("zulu".into(), None),
+                (
+                    "gamma".into(),
+                    rebuilt(vec![row(OwnerType::Page, "p9", "gamma", 0, "g")], "gamma"),
+                ),
+            ],
+            vec![("beta".into(), None), ("aaa".into(), None)],
+        ];
+        for step in steps {
+            registry = patch_registry(&registry, step);
+            assert!(
+                registry
+                    .rows()
+                    .windows(2)
+                    .all(|pair| pair[0].normalized_name < pair[1].normalized_name),
+                "rows must stay strictly increasing: {:?}",
+                registry
+                    .rows()
+                    .iter()
+                    .map(|row| row.normalized_name.as_str())
+                    .collect::<Vec<_>>()
+            );
+            for expected in registry.rows() {
+                assert_eq!(
+                    registry.row(&expected.normalized_name),
+                    Some(expected),
+                    "the index must answer for every row"
+                );
+            }
+        }
+        assert_eq!(
+            registry
+                .rows()
+                .iter()
+                .map(|row| row.normalized_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gamma"]
+        );
+        assert_eq!(registry.row("gamma").unwrap().count_pages, 1);
     }
 
     #[test]

@@ -1944,9 +1944,22 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // (decoding the overlay-mask `page_id` lookup and the descriptor row's
     // path/preorder columns). All read-side; the write-crossing table above is
     // byte-identical.
+    // Re-pinned 2026-09-06 (query engine R5c, the patched pending property
+    // registry). Derived by diffing the dump at `70dfa709` (355 entries)
+    // against the working head (363): added (8), ALL in the new
+    // `managed_registry_patch.rs` and nothing removed or changed anywhere
+    // else — its `use` line (`PhysicalProjectionQuerySnapshot`,
+    // `PhysicalQueryValue`), three `PhysicalQueryValue::Text(` (the by-key,
+    // declaration and path binds), three `PhysicalQueryValue::Blob(` (the
+    // page-id binds) and ONE `PhysicalQueryValue::Integer(` (the
+    // `owner_type`/`ordinal` decode). The module opens nothing in production:
+    // the executor hands it the two snapshots it already owns; its
+    // `open_direct` calls are `#[cfg(test)]` and outside `production_rust()`.
+    // Removing exactly those 8 entries from the head dump reproduces the R5a
+    // digest above, so the other 355 are byte-identical.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "23513f42e3a756dd36bed48070bb9ed45538af27f867caa74e77d6be8dac239d",
+        "3e80bb92d8a04f02f84b53c21049125e4c86b17d755b1c39ecada82743dcc3a6",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

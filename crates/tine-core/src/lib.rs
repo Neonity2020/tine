@@ -28,6 +28,7 @@ pub mod journal_feed;
 pub mod logbook;
 mod managed_overlay;
 mod managed_query;
+mod managed_registry_patch;
 pub mod managed_storage_journey;
 pub mod model;
 pub mod onboarding;

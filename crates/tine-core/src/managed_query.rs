@@ -12,9 +12,9 @@
 //! the statement runs; `QueryJobOwner` bounds how many run at once and drains
 //! them before the actor removes, replaces, reopens or resets the file.
 //!
-//! **R5a: an actor holding a pending local suffix is answered here too.** A
-//! captured pending query — by R5b's turn rule, one whose relations all stay
-//! inside a page and which reads no property atom — is answered OFF the actor
+//! **R5a/R5c: an actor holding a pending local suffix is answered here too.**
+//! A captured pending query — by the turn rule, one whose relations all stay
+//! inside a page — is answered OFF the actor
 //! from TWO owned snapshots: the pending overlay at the flushed state the
 //! capture required (or a later one), and the accepted projection validated
 //! against the captured stamp with every pending page MASKED out of its
@@ -25,6 +25,11 @@
 //! rows, same order, same `total` and `exceeded`, same public ids — and it
 //! still loads no page document and parses nothing. The walk stays as the
 //! recovery path (`Busy`, `Cancelled`, a third `Stale`) and as the oracle.
+//!
+//! R5c lifts the last pending exclusion: a query with a property leaf is
+//! captured too, and the registry it is lowered under is the actor's ACCEPTED
+//! table patched here, off the actor, over exactly the keys the pending pages
+//! can have changed (`crate::managed_registry_patch`).
 //!
 //! Ownership (R4/R5 dossiers): this file's types, the shared memo, the census
 //! and the capture/reply/drain wiring in `sync_runtime.rs` are the manager's
@@ -171,6 +176,10 @@ pub(crate) struct ManagedQueryCensus {
     pub(crate) failed_reads: AtomicUsize,
     /// Re-captures after a `Stale` execution.
     pub(crate) stale_recaptures: AtomicUsize,
+    /// R5c: pending property-registry patches actually COMPUTED off the actor
+    /// (a patched-registry cache hit costs nothing and is not counted). One
+    /// per distinct pending state per property query, never one per read.
+    pub(crate) registry_patches: AtomicUsize,
 }
 
 /// A copy of [`ManagedQueryCensus`] for assertions.
@@ -182,6 +191,7 @@ pub(crate) struct ManagedQueryCensusSnapshot {
     pub(crate) fallback_reads: usize,
     pub(crate) failed_reads: usize,
     pub(crate) stale_recaptures: usize,
+    pub(crate) registry_patches: usize,
 }
 
 impl ManagedQueryCensus {
@@ -205,6 +215,10 @@ impl ManagedQueryCensus {
         self.stale_recaptures.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn note_registry_patch(&self) {
+        self.registry_patches.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> ManagedQueryCensusSnapshot {
         ManagedQueryCensusSnapshot {
@@ -213,6 +227,7 @@ impl ManagedQueryCensus {
             fallback_reads: self.fallback_reads.load(Ordering::Relaxed),
             failed_reads: self.failed_reads.load(Ordering::Relaxed),
             stale_recaptures: self.stale_recaptures.load(Ordering::Relaxed),
+            registry_patches: self.registry_patches.load(Ordering::Relaxed),
         }
     }
 
@@ -223,6 +238,7 @@ impl ManagedQueryCensus {
         self.fallback_reads.store(0, Ordering::Relaxed);
         self.failed_reads.store(0, Ordering::Relaxed);
         self.stale_recaptures.store(0, Ordering::Relaxed);
+        self.registry_patches.store(0, Ordering::Relaxed);
     }
 }
 
@@ -251,6 +267,7 @@ pub(crate) fn execute_managed_query(
     capture: &ManagedQueryCapture,
     owner: &QueryJobOwner,
     census: &ManagedQueryCensus,
+    patched: &PatchedRegistryCache,
     wait: Duration,
 ) -> ManagedQueryOutcome {
     // Capacity BEFORE any transaction (plan §2B): a job waiting for a slot
@@ -263,7 +280,7 @@ pub(crate) fn execute_managed_query(
     // The snapshot lives in the inner call, so its `Drop` ends the read
     // transaction BEFORE `slot`'s `Drop` releases the capacity: a drain that
     // observes a free slot can never still be waiting on this transaction.
-    let outcome = execute_on_slot(capture, &slot, census);
+    let outcome = execute_on_slot(capture, &slot, census, patched);
     drop(slot);
     outcome
 }
@@ -273,6 +290,7 @@ fn execute_on_slot(
     capture: &ManagedQueryCapture,
     slot: &JobSlot<'_>,
     census: &ManagedQueryCensus,
+    patched: &PatchedRegistryCache,
 ) -> ManagedQueryOutcome {
     #[cfg(test)]
     run_before_managed_open_hook();
@@ -280,7 +298,7 @@ fn execute_on_slot(
     // answered from TWO snapshots. It stays BELOW the hook, so every barrier
     // gate still runs before the first snapshot of either file.
     if let Some(pending) = capture.overlay.as_ref() {
-        return execute_pending_on_slot(capture, pending, slot, census);
+        return execute_pending_on_slot(capture, pending, slot, census, patched);
     }
     // The stamp is validated INSIDE the read transaction that will serve every
     // later statement, so an accepted batch cannot land between the check and
@@ -405,18 +423,9 @@ fn execute_pending_on_slot(
     pending: &PendingOverlayCapture,
     slot: &JobSlot<'_>,
     census: &ManagedQueryCensus,
+    patched: &PatchedRegistryCache,
 ) -> ManagedQueryOutcome {
     use crate::managed_overlay::OverlayOpen;
-
-    // R5b's turn rule captures a pending query only when it has NO property
-    // leaf, so `capture.registry` is the empty registry and the two sources
-    // cannot be lowered under different effective types. R5c lifts the
-    // exclusion by patching the registry off the actor; until then this is the
-    // invariant that makes ONE registry correct for both files.
-    debug_assert!(
-        !capture.props,
-        "R5b's turn rule never captures a pending query with a property leaf"
-    );
 
     // (1) The OVERLAY first, at exactly one published state. `Unavailable` —
     // not flushed within the budget, incomplete content, or a worker that
@@ -468,6 +477,17 @@ fn execute_pending_on_slot(
         Ok(mask) => mask,
         Err(outcome) => return outcome,
     };
+    // (3b) R5c: ONE registry for both sources, so the two files can never be
+    // lowered under different effective types. `capture.registry` is the
+    // ACCEPTED table the actor caches; for a query with a property leaf it is
+    // patched HERE, under these two snapshots and this mask, over exactly the
+    // keys the pending pages can have changed. A query with no property leaf
+    // reads no effective type at all (C6) and carries the empty registry.
+    let registry =
+        match patched_registry(capture, &mut accepted, &mut overlay, &mask, census, patched) {
+            Ok(registry) => registry,
+            Err(outcome) => return outcome,
+        };
     // (4) Readiness PER SOURCE. The overlay's `fts_ready` is 1 by schema
     // seeding, but it is probed with the same statement and the same mapping
     // anyway: a file that says otherwise is damaged, not "still building".
@@ -488,7 +508,7 @@ fn execute_pending_on_slot(
             &query,
             &LoweringInputs {
                 today: capture.today,
-                registry: &capture.registry,
+                registry: &registry,
                 masked_pages,
                 // NOT `max_rows`: `total` is the number of matches SEEN, and a
                 // buffered source may not be truncated at all.
@@ -563,6 +583,51 @@ fn execute_pending_on_slot(
     drop(overlay);
     drop(accepted);
     outcome
+}
+
+/// The registry BOTH sources of a pending read are lowered under (R5c).
+///
+/// For a query with no property leaf this is the capture's empty registry and
+/// nothing is read (C6). For a query WITH one it is the accepted table the
+/// capture carries, patched over the affected keys under these two snapshots —
+/// from the one-entry cache when the same pending state already paid for it,
+/// which is what makes a burst of property queries between two keystrokes cost
+/// one patch.
+///
+/// A patch refusal is `Failed` (D-3: a damaged read fails, never a silently
+/// wrong table); a cancelled read is `Cancelled`, exactly as the probes are.
+fn patched_registry(
+    capture: &ManagedQueryCapture,
+    accepted: &mut PhysicalProjectionQuerySnapshot,
+    overlay: &mut PhysicalProjectionQuerySnapshot,
+    mask: &[[u8; 16]],
+    census: &ManagedQueryCensus,
+    cache: &PatchedRegistryCache,
+) -> Result<Arc<Registry>, ManagedQueryOutcome> {
+    if !capture.props {
+        return Ok(Arc::clone(&capture.registry));
+    }
+    let base_generation = capture.registry.generation();
+    if let Some(hit) = cache.get(&capture.stamp, base_generation) {
+        return Ok(hit);
+    }
+    let built = crate::managed_registry_patch::patched_pending_registry(
+        accepted,
+        overlay,
+        mask,
+        &capture.registry,
+        &capture.config,
+    )
+    .map_err(|error| match error {
+        crate::managed_registry_patch::PatchError::Cancelled => ManagedQueryOutcome::Cancelled,
+        crate::managed_registry_patch::PatchError::Damaged => {
+            ManagedQueryOutcome::Failed("property_registry patch")
+        }
+    })?;
+    census.note_registry_patch();
+    let built = Arc::new(built);
+    cache.put(&capture.stamp, base_generation, &built);
+    Ok(built)
 }
 
 /// The accepted page id of every path the overlay holds pending, so the
@@ -660,14 +725,51 @@ fn probe_fts_ready(
     }
 }
 
+/// The ONE patched pending registry this runtime retains (R5c).
+///
+/// Keyed by `(the capture's stamp, the accepted base's generation)`. The stamp
+/// carries `overlay_revision`, so a new save misses; it carries
+/// `acceptance_sequence` and `frontier_digest`, so an accepted batch misses;
+/// it carries `config_digest`, so a config edit misses. The base generation
+/// additionally separates the pre-first-build empty table from the first
+/// published one. One entry, replaced on every miss: that is what makes N
+/// different property queries during one pause between keystrokes cost ONE
+/// patch, and it can never serve a table built for another pending state.
+///
+/// It is a cache of a pure function over two owned snapshots, never authority.
+#[derive(Default)]
+pub(crate) struct PatchedRegistryCache {
+    entry: Mutex<Option<(ManagedQueryStamp, u64, Arc<Registry>)>>,
+}
+
+impl PatchedRegistryCache {
+    fn get(&self, stamp: &ManagedQueryStamp, base_generation: u64) -> Option<Arc<Registry>> {
+        let entry = self.entry.lock().unwrap();
+        entry.as_ref().and_then(|(cached, generation, registry)| {
+            (cached == stamp && *generation == base_generation).then(|| Arc::clone(registry))
+        })
+    }
+
+    fn put(&self, stamp: &ManagedQueryStamp, base_generation: u64, registry: &Arc<Registry>) {
+        *self.entry.lock().unwrap() = Some((stamp.clone(), base_generation, Arc::clone(registry)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        *self.entry.lock().unwrap() = None;
+    }
+}
+
 /// Everything the accepted route shares between the actor and the handle:
 /// the job owner (the actor drains it before touching the file), the census,
-/// and the memo (the actor turn reads it, the handle and the walk fill it).
+/// the memo (the actor turn reads it, the handle and the walk fill it), and
+/// the one patched pending registry.
 #[derive(Default)]
 pub(crate) struct ManagedQueryShared {
     pub(crate) jobs: QueryJobOwner,
     pub(crate) census: ManagedQueryCensus,
     pub(crate) memo: Mutex<ApplicationSimpleQueryMemo>,
+    pub(crate) patched_registry: PatchedRegistryCache,
     /// Test hook: the outcomes the handle uses INSTEAD of executing the next
     /// captures, in order. Lets a test drive every handle-side transition
     /// (`Stale` re-capture, the third `Stale`, `Busy`, `Cancelled`, `Failed`)
@@ -703,7 +805,13 @@ impl ManagedQueryShared {
         if let Some(outcome) = self.injected_outcomes.lock().unwrap().pop_front() {
             return outcome;
         }
-        execute_managed_query(capture, &self.jobs, &self.census, self.job_wait())
+        execute_managed_query(
+            capture,
+            &self.jobs,
+            &self.census,
+            &self.patched_registry,
+            self.job_wait(),
+        )
     }
 }
 
@@ -746,9 +854,10 @@ struct ApplicationSimpleQueryMemoEntry {
 /// Keyed by the resolved IR (`query::simple_query_cache_key`) and the
 /// [`ManagedQueryStamp`]; every entry goes when the stamp moves — an accepted
 /// batch, a config edit, or the execution day — and the `props` entries go
-/// when the registry generation advances. A runtime holding a pending local
-/// suffix neither reads nor fills it: the suffix is evidence the stamp does
-/// not cover. Filled by the executor after a successful read and by the walk
+/// when the registry generation advances. Since R5b a pending suffix is part
+/// of the stamp (`overlay_revision`) rather than a reason to have none, so a
+/// pending answer is memoized too and every pending save moves the stamp and
+/// clears it. Filled by the executor after a successful read and by the walk
 /// after a complete evaluation; NEVER after `Stale`, `Busy`, `Cancelled` or
 /// `Failed`, which are not answers.
 ///
@@ -1131,7 +1240,13 @@ is `Failed` too rather than answered twice",
             profile,
         };
         assert!(matches!(
-            execute_managed_query(&capture, &owner, &census, Duration::from_millis(1)),
+            execute_managed_query(
+                &capture,
+                &owner,
+                &census,
+                &PatchedRegistryCache::default(),
+                Duration::from_millis(1)
+            ),
             ManagedQueryOutcome::Failed("managed projection snapshot")
         ));
         assert_eq!(census.snapshot(), ManagedQueryCensusSnapshot::default());
@@ -1148,7 +1263,13 @@ is `Failed` too rather than answered twice",
             _ => panic!("the only slot admits"),
         };
         assert!(matches!(
-            execute_managed_query(&capture, &owner, &census, Duration::from_millis(1)),
+            execute_managed_query(
+                &capture,
+                &owner,
+                &census,
+                &PatchedRegistryCache::default(),
+                Duration::from_millis(1)
+            ),
             ManagedQueryOutcome::Busy
         ));
         drop(held);
@@ -1157,7 +1278,13 @@ is `Failed` too rather than answered twice",
         // and nothing is counted as a fallback.
         owner.close();
         assert!(matches!(
-            execute_managed_query(&capture, &owner, &census, Duration::from_millis(1)),
+            execute_managed_query(
+                &capture,
+                &owner,
+                &census,
+                &PatchedRegistryCache::default(),
+                Duration::from_millis(1)
+            ),
             ManagedQueryOutcome::Cancelled
         ));
         assert_eq!(census.snapshot(), ManagedQueryCensusSnapshot::default());

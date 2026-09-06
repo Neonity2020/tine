@@ -887,9 +887,25 @@ refusal: an overlay that is unflushed, incomplete or failed opens `Unavailable`
 and the query walks as a counted fallback, and a stale stamp re-captures like
 any other. Only a damaged ROW inside a snapshot that opened and validated is
 `Failed`, and a page the mask failed to remove — reachable from both sources —
-is `Failed` too rather than answered twice. Until R5c patches the registry off
-the actor, a query with a property leaf, and any query whose relations leave
-one page (`PageLocality`), still walk on the actor uncaptured.
+is `Failed` too rather than answered twice. A query whose relations leave one
+page (`PageLocality`) still walks on the actor uncaptured; a query with a
+property leaf does not, because the registry it needs is patched off the actor
+too.
+
+**The property registry is patched, never rebuilt, for a pending query.**
+The actor caches ONE registry: the accepted table, keyed by acceptance
+sequence, frontier digest and parse config; a pending suffix does not evict it
+and does not advance its generation. A captured query with a property leaf
+carries that table and the executor patches, off the actor and under its two
+snapshots, exactly the keys the pending pages can have changed: the keys of the
+masked pages' rows, the keys of the overlay's rows, and every key whose
+declaration page (a page named like the key, carrying `tine.type::`) is
+pending. Each affected key's row is rebuilt by the one producer over the key's
+complete row set. An ordinary text edit affects no key and reads no accepted
+property row. The walk's merged table while pending is built per read and never
+published; when a pending build is refused, readers fall back to the accepted
+table (a coherent older answer), never to a merged table from another pending
+revision.
 
 ## 2. Enrollment and synchronization state machine
 
