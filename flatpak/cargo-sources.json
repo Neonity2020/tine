@@ -1,5 +1,109 @@
 [
     {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/ar_archive_writer/ar_archive_writer-0.5.3.crate",
+        "sha256": "73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6",
+        "dest": "cargo/vendor/ar_archive_writer-0.5.3"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6\", \"files\": {}}",
+        "dest": "cargo/vendor/ar_archive_writer-0.5.3",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/object/object-0.39.1.crate",
+        "sha256": "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b",
+        "dest": "cargo/vendor/object-0.39.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b\", \"files\": {}}",
+        "dest": "cargo/vendor/object-0.39.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/psm/psm-0.1.32.crate",
+        "sha256": "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622",
+        "dest": "cargo/vendor/psm-0.1.32"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622\", \"files\": {}}",
+        "dest": "cargo/vendor/psm-0.1.32",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/recursive/recursive-0.1.1.crate",
+        "sha256": "0786a43debb760f491b1bc0269fe5e84155353c67482b9e60d0cfb596054b43e",
+        "dest": "cargo/vendor/recursive-0.1.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"0786a43debb760f491b1bc0269fe5e84155353c67482b9e60d0cfb596054b43e\", \"files\": {}}",
+        "dest": "cargo/vendor/recursive-0.1.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/recursive-proc-macro-impl/recursive-proc-macro-impl-0.1.1.crate",
+        "sha256": "76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b",
+        "dest": "cargo/vendor/recursive-proc-macro-impl-0.1.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b\", \"files\": {}}",
+        "dest": "cargo/vendor/recursive-proc-macro-impl-0.1.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/sqlparser/sqlparser-0.62.0.crate",
+        "sha256": "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec",
+        "dest": "cargo/vendor/sqlparser-0.62.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec\", \"files\": {}}",
+        "dest": "cargo/vendor/sqlparser-0.62.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/sqlparser_derive/sqlparser_derive-0.5.0.crate",
+        "sha256": "a6dd45d8fc1c79299bfbb7190e42ccbbdf6a5f52e4a6ad98d92357ea965bd289",
+        "dest": "cargo/vendor/sqlparser_derive-0.5.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"a6dd45d8fc1c79299bfbb7190e42ccbbdf6a5f52e4a6ad98d92357ea965bd289\", \"files\": {}}",
+        "dest": "cargo/vendor/sqlparser_derive-0.5.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/stacker/stacker-0.1.25.crate",
+        "sha256": "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967",
+        "dest": "cargo/vendor/stacker-0.1.25"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967\", \"files\": {}}",
+        "dest": "cargo/vendor/stacker-0.1.25",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
         "type": "git",
         "url": "https://github.com/martinkoutecky/lsdoc",
         "commit": "ab054c3fd2cd52c5599564fb0433116c47b0b782",
@@ -14,8 +118,8 @@
     {
         "type": "git",
         "url": "https://github.com/martinkoutecky/tine-storage",
-        "commit": "3d348ddd83c7f6cc6ac0348da07ba912d14d1dc1",
-        "dest": "flatpak-cargo/git/tine-storage-3d348dd"
+        "commit": "d5d4d9e4aa4a1c8db0224589d7c9043e6b34e4e0",
+        "dest": "flatpak-cargo/git/tine-storage-d5d4d9e"
     },
     {
         "type": "archive",
@@ -6769,12 +6873,12 @@
     {
         "type": "shell",
         "commands": [
-            "mkdir -p \"cargo/git-vendor\" && cp -r --reflink=auto \"flatpak-cargo/git/tine-storage-3d348dd/.\" \"cargo/git-vendor/tine-storage\""
+            "mkdir -p \"cargo/git-vendor\" && cp -r --reflink=auto \"flatpak-cargo/git/tine-storage-d5d4d9e/.\" \"cargo/git-vendor/tine-storage\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"tine-storage\"\nversion = \"0.12.2\"\nedition = \"2021\"\nlicense = \"AGPL-3.0-only\"\nauthors = [\"Martin Koutecký\"]\ndescription = \"Physical persistence mechanisms for Tine\"\nrepository = \"https://github.com/martinkoutecky/tine-storage\"\nreadme = \"README.md\"\npublish = false\n\n[features]\ntest-support = []\n\n[dependencies]\ncap-std = \"4.0.2\"\nfs2 = \"0.4.3\"\nserde_json = \"1\"\nsha2 = \"0.10\"\n\n[dependencies.postcard]\nversion = \"1.1.3\"\nfeatures = [\"alloc\"]\n\n[dependencies.rusqlite]\nversion = \"0.37.0\"\nfeatures = [\"bundled\", \"functions\"]\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n\n[dependencies.uuid]\nversion = \"1\"\nfeatures = [\"v4\", \"serde\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2\"\n\n[target.\"cfg(windows)\".dependencies]\ncap-fs-ext = \"=4.0.2\"\n\n[target.\"cfg(windows)\".dependencies.windows-sys]\nversion = \"0.61.2\"\nfeatures = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"]\n",
+        "contents": "[package]\nname = \"tine-storage\"\nversion = \"0.15.0\"\nedition = \"2021\"\nlicense = \"AGPL-3.0-only\"\nauthors = [\"Martin Koutecký\"]\ndescription = \"Physical persistence mechanisms for Tine\"\nrepository = \"https://github.com/martinkoutecky/tine-storage\"\nreadme = \"README.md\"\npublish = false\n\n[features]\ntest-support = []\n\n[dependencies]\ncap-std = \"4.0.2\"\nfs2 = \"0.4.3\"\nserde_json = \"1\"\nsha2 = \"0.10\"\n\n[dependencies.postcard]\nversion = \"1.1.3\"\nfeatures = [\"alloc\"]\n\n[dependencies.rusqlite]\nversion = \"0.37.0\"\nfeatures = [\"bundled\", \"functions\"]\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n\n[dependencies.uuid]\nversion = \"1\"\nfeatures = [\"v4\", \"serde\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2\"\n\n[target.\"cfg(windows)\".dependencies]\ncap-fs-ext = \"=4.0.2\"\n\n[target.\"cfg(windows)\".dependencies.windows-sys]\nversion = \"0.61.2\"\nfeatures = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"]\n",
         "dest": "cargo/git-vendor/tine-storage",
         "dest-filename": "Cargo.toml"
     },
@@ -9308,7 +9412,7 @@
     },
     {
         "type": "inline",
-        "contents": "[source.vendored-registry]\ndirectory = \"cargo/vendor\"\n\n[source.vendored-git]\ndirectory = \"cargo/git-vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-registry\"\n\n[source.\"https://github.com/martinkoutecky/lsdoc\"]\ngit = \"https://github.com/martinkoutecky/lsdoc\"\nreplace-with = \"vendored-git\"\ntag = \"v0.5.7\"\n\n[source.\"https://github.com/tauri-apps/tao\"]\ngit = \"https://github.com/tauri-apps/tao\"\nreplace-with = \"vendored-git\"\nrev = \"07f3742b1833b64be27b1ef991e38d557d4276c9\"\n\n[source.\"https://github.com/martinkoutecky/tine-storage\"]\ngit = \"https://github.com/martinkoutecky/tine-storage\"\nreplace-with = \"vendored-git\"\ntag = \"v0.12.2\"\n",
+        "contents": "[source.vendored-registry]\ndirectory = \"cargo/vendor\"\n\n[source.vendored-git]\ndirectory = \"cargo/git-vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-registry\"\n\n[source.\"https://github.com/martinkoutecky/lsdoc\"]\ngit = \"https://github.com/martinkoutecky/lsdoc\"\nreplace-with = \"vendored-git\"\ntag = \"v0.5.7\"\n\n[source.\"https://github.com/tauri-apps/tao\"]\ngit = \"https://github.com/tauri-apps/tao\"\nreplace-with = \"vendored-git\"\nrev = \"07f3742b1833b64be27b1ef991e38d557d4276c9\"\n\n[source.\"https://github.com/martinkoutecky/tine-storage\"]\ngit = \"https://github.com/martinkoutecky/tine-storage\"\nreplace-with = \"vendored-git\"\ntag = \"v0.15.0\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }
