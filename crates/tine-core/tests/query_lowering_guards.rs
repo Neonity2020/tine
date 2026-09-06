@@ -106,13 +106,6 @@ const NON_OWNED_DRAINS: &[DrainOwner] = &[
     },
     DrainOwner {
         file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_sparse_task_query_ready",
-        read_family: "task_candidate_blocks_after",
-        question: "managed sparse task blocks",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
         enclosing_symbol: "application_fuzzy_candidate_paths_ready",
         read_family: "fuzzy_subsequence_candidate_pages_after",
         question: "managed fuzzy candidates",

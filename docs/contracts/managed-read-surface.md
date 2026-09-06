@@ -83,8 +83,7 @@ adapter call edges.
 | application_simple_query_prepared | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Parses a Managed simple query once and stamps it with the actor's accepted-frontier evidence (memo key, registry snapshot). |
 | application_simple_query_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed simple-query execution boundary. |
 | application_simple_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The actor half of a Managed simple query (R4): readiness, memo hit, pending-suffix walk, or a capture for off-actor execution. |
-| application_simple_query_walk | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The actor-side evaluation (sparse runner or complete-page evaluator); reuses a still-current capture so a query is prepared once. |
-| application_sparse_task_query_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed task-index sparse hydration boundary. |
+| application_simple_query_walk | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The actor-side evaluation: the complete-page evaluator, reusing a still-current capture so a query is prepared once. |
 | application_subtree_nodes | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Counts nodes in a Managed DTO subtree for admission. |
 | application_templates_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | application_page_templates | Supplies hydrated Managed pages to the canonical template walk. |
 | application_unit_page_home_hints | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed unit-transaction page-location hints. |
@@ -101,6 +100,7 @@ adapter call edges.
 | application_backlink_filter_entry | `crates/tine-core/src/query.rs` | backlink_filter_entry | C7a-1 |
 | template_dto_from_application | `crates/tine-core/src/query.rs` | template_dto | C7a-3 |
 | application_crumb_line | `crates/tine-core/src/sync_runtime.rs` | crumb_line | W4-C7b-1 |
+| application_sparse_task_query_ready | `crates/tine-core/src/sync_runtime.rs` | execute_managed_query | R4a |
 
 ## UUID ownership policy
 

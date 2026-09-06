@@ -26,14 +26,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tine_storage::sqlite::{
+    MaterializationError, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
+};
+
 use crate::config::ParseConfig;
 use crate::date::{JournalDate, JournalFormat};
-use crate::model::RefGroup;
+use crate::model::{PageKind, RefGroup};
 use crate::oplog::ContentDigest;
 use crate::query::ir::{Query, ViewSettings};
 use crate::query::registry::Registry;
+use crate::query::results::{
+    read_results, BackendOrder, RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs,
+};
+use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
 use crate::query::{ConstructionProfile, PreViewGroups};
-use crate::query_jobs::QueryJobOwner;
+use crate::query_jobs::{Admission, JobSlot, QueryJobOwner};
 
 /// The ONE definition of "the full-text index is ready to be queried": the row
 /// the FTS builder stamps when its build completed at this projection's
@@ -196,17 +204,188 @@ pub(crate) const MAX_STALE_RECAPTURES: usize = 2;
 /// owner's bounded slot wait — `QUERY_JOB_WAIT` in production, shorter under
 /// a test that exercises `Busy`.
 ///
-/// R4b ships this as a stub that reports `Busy` — the executor cannot run —
-/// so the whole capture → execute → walk wiring is exercised end to end (and
-/// counted as a fallback) before the lane replaces the body.
+/// It loads no page document and reads no source text: an answer is one stamp
+/// validation, one FTS probe, one descriptor statement and the payload batches
+/// `read_results` charges for the rows it admitted. The only filesystem work is
+/// the recency `stat` of a non-journal page the answer already admitted.
 pub(crate) fn execute_managed_query(
     capture: &ManagedQueryCapture,
     owner: &QueryJobOwner,
     census: &ManagedQueryCensus,
     wait: Duration,
 ) -> ManagedQueryOutcome {
-    let _ = (capture, owner, census, wait);
-    ManagedQueryOutcome::Busy
+    // Capacity BEFORE any transaction (plan §2B): a job waiting for a slot
+    // holds its request intent and pins no WAL page.
+    let slot = match owner.acquire_within(wait) {
+        Admission::Slot(slot) => slot,
+        Admission::Busy => return ManagedQueryOutcome::Busy,
+        Admission::Cancelled => return ManagedQueryOutcome::Cancelled,
+    };
+    // The snapshot lives in the inner call, so its `Drop` ends the read
+    // transaction BEFORE `slot`'s `Drop` releases the capacity: a drain that
+    // observes a free slot can never still be waiting on this transaction.
+    let outcome = execute_on_slot(capture, &slot, census);
+    drop(slot);
+    outcome
+}
+
+/// The read itself, with the slot already held.
+fn execute_on_slot(
+    capture: &ManagedQueryCapture,
+    slot: &JobSlot<'_>,
+    census: &ManagedQueryCensus,
+) -> ManagedQueryOutcome {
+    #[cfg(test)]
+    run_before_managed_open_hook();
+    // The stamp is validated INSIDE the read transaction that will serve every
+    // later statement, so an accepted batch cannot land between the check and
+    // the rows. A projection that has moved on is `Stale`, not a failure: the
+    // handle re-captures against the actor's new stamp.
+    let mut snapshot = match PhysicalProjectionQuerySnapshot::open_managed(
+        &capture.path,
+        capture.stamp.acceptance_sequence,
+        capture.stamp.frontier_digest,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(MaterializationError::Stale { .. }) => return ManagedQueryOutcome::Stale,
+        Err(_) => return ManagedQueryOutcome::Failed("managed projection snapshot"),
+    };
+    // Registered exactly as `DirectProjection::open_query_job` registers: a job
+    // admitted before a drain but opening after it is cancelled here, so no
+    // reader retains a handle to a file that is about to be replaced (I-21).
+    if !slot.register(snapshot.cancellation()) {
+        return ManagedQueryOutcome::Cancelled;
+    }
+    let fts_ready = match probe_fts_ready(&mut snapshot) {
+        Ok(ready) => ready,
+        Err(outcome) => return outcome,
+    };
+    // The tree the WALK evaluates, at the anchor it evaluates it at — the same
+    // `block_anchored_query` rebase Direct lowers through, never a second one.
+    let query = crate::query::block_anchored_query(&capture.query);
+    let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+    let statement = lower_query(
+        &query,
+        &LoweringInputs {
+            today: capture.today,
+            registry: &capture.registry,
+            // Empty BY CONSTRUCTION: the actor captures only when it holds no
+            // pending local suffix, so there is no unaccepted overlay to mask
+            // (the masked walk is the pending route, and R5 replaces it).
+            masked_pages: &[],
+            // NOT `max_rows`: `total` is the number of matches SEEN, so a
+            // `LIMIT` in the statement would truncate the count the user is
+            // shown. The bounds are charged by `read_results`' budget.
+            cutoff: None,
+            compiled: &compiled,
+            fts_ready,
+            result_set_rule: RESULT_SET_RULE,
+        },
+    );
+    // A filter that folded to false has its answer already (§3.5, I-15).
+    // Lowering can only happen after the snapshot is open, because `fts_ready`
+    // is a property of THIS snapshot, so an empty answer pays one transaction
+    // here where Direct pays none. That is the price of validating the stamp
+    // inside the read, not a regression.
+    if statement.matches_nothing {
+        return ManagedQueryOutcome::Answered(PreViewGroups::default());
+    }
+    // The recency axis is the Managed WALK's producer
+    // (`application_query_page_recency`), over the descriptor row: a journal
+    // page by its display NAME's date (`i64::MIN` when the name does not
+    // parse), any other page by the file's mtime. Deliberately NOT
+    // `page_recency_secs_for(journal_day, …)`: the stored `journal_day` comes
+    // from the file stem and the walk reads the display name, and a Managed
+    // journal page whose two disagree is legal. Parity is with the walk.
+    let recency = |page: RecencyPage<'_>| {
+        capture.journal_format.page_recency_secs(
+            page.kind == PageKind::Journal,
+            page.name,
+            &capture.graph_root.join(page.path),
+        )
+    };
+    let outcome = match read_results(
+        &mut snapshot,
+        &ResultReadInputs {
+            statement: &statement,
+            order: BackendOrder::Managed,
+            identity: &ResultIdentity::Stored,
+            max_rows: capture.max_rows,
+            max_bytes: capture.max_bytes,
+            profile: capture.profile,
+            recency: &recency,
+        },
+    ) {
+        Ok(pre) => {
+            census.note_statement_read();
+            ManagedQueryOutcome::Answered(pre)
+        }
+        Err(ResultReadError::Cancelled) => ManagedQueryOutcome::Cancelled,
+        // A seam refusal or a projection that contradicts itself: the read was
+        // attempted and did not answer (D-3). The reason names a table class,
+        // never a value (I-5).
+        Err(ResultReadError::Sql(_)) => ManagedQueryOutcome::Failed("managed projection statement"),
+        Err(ResultReadError::Corrupt(_)) => {
+            ManagedQueryOutcome::Failed("managed projection result rows")
+        }
+    };
+    drop(snapshot);
+    outcome
+}
+
+/// A barrier between the slot admission and the snapshot open (test-only), so
+/// a gate can move the accepted frontier for real in the window the stamp
+/// validation exists to catch, instead of racing a sleep against the actor.
+/// The same shape as `query::results`' `BEFORE_PAYLOAD_BATCH` hook, which
+/// exists for the same reason.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MANAGED_OPEN: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_managed_open_hook(hook: Option<Box<dyn Fn()>>) {
+    BEFORE_MANAGED_OPEN.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_before_managed_open_hook() {
+    // Taken out of the borrow first: the hook drives a whole save-and-accept
+    // turn through the handle, which is free to execute another query on this
+    // same thread, and holding the `RefCell` borrow across that would panic.
+    let taken = BEFORE_MANAGED_OPEN.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = taken {
+        hook();
+        BEFORE_MANAGED_OPEN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
+/// §5.10's readiness probe on THIS snapshot: one statement,
+/// [`FTS_READY_PROBE_SQL`], ready iff the row's integer is 1.
+///
+/// Deliberately NOT Direct's "an unreadable probe means not ready". Direct
+/// probes a pooled seam it can abandon; this runs on an OWNED snapshot whose
+/// transaction the drain is waiting on, so swallowing an error would turn a
+/// cancelled probe into a full unbounded scan the drain then has to interrupt.
+/// A cancelled probe is `Cancelled`, any other probe error is `Failed`, and
+/// only a successful read of a non-`1` value is "still building".
+fn probe_fts_ready(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+) -> Result<bool, ManagedQueryOutcome> {
+    match snapshot.run_projection_query(FTS_READY_PROBE_SQL, &[]) {
+        Ok(rows) => Ok(matches!(
+            rows.first().and_then(|row| row.first()),
+            Some(PhysicalQueryValue::Integer(1))
+        )),
+        Err(_) if snapshot.cancellation().is_cancelled() => Err(ManagedQueryOutcome::Cancelled),
+        Err(_) => Err(ManagedQueryOutcome::Failed("search_fts_build phase")),
+    }
 }
 
 /// Everything the accepted route shares between the actor and the handle:
@@ -577,8 +756,41 @@ mod tests {
         assert_eq!(MAX_STALE_RECAPTURES, 2, "the contract says twice");
     }
 
+    /// The same pin for the executor's own paragraph: what one accepted-route
+    /// read costs, and what each of its outcomes owes.
     #[test]
-    fn the_stub_executor_reports_busy_and_counts_nothing() {
+    fn storage_contract_names_what_the_accepted_read_costs() {
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        let section = contract
+            .split("**That read is one snapshot, and it never opens a page.**")
+            .nth(1)
+            .and_then(|tail| tail.split("## 2. Enrollment").next())
+            .expect("the executor paragraph precedes section 2");
+        for sentence in [
+            "takes\nits job slot BEFORE any transaction",
+            "validates the capture's acceptance sequence and frontier\nroot digest INSIDE the read transaction",
+            "the full-text\nreadiness probe",
+            "one descriptor statement",
+            "the payload batches charged for the rows the budget admitted",
+            "that page file's modification\ntime",
+            "No page document is loaded, no source text is parsed",
+            "`pages.path` under SQLite's\nbinary collation",
+            "read from its display NAME exactly as the walk reads it",
+            "the transaction ends before the slot is released",
+            "never\nanswers as if it succeeded",
+            "has no row-count cross-check",
+        ] {
+            assert!(section.contains(sentence), "contract lost: {sentence}");
+        }
+    }
+
+    /// The executor's outermost shape, with no projection at all: capacity is
+    /// taken and released, an unopenable file is `Failed` (never a silent
+    /// fallback), and the executor counts NOTHING for it — `failed_reads` is
+    /// the handle's to count, because only the handle knows the request ended
+    /// in an error rather than a walk.
+    #[test]
+    fn an_unopenable_projection_fails_the_read_and_releases_its_slot() {
         let owner = QueryJobOwner::new(1);
         let census = ManagedQueryCensus::default();
         let today = JournalDate::today();
@@ -607,9 +819,34 @@ mod tests {
         };
         assert!(matches!(
             execute_managed_query(&capture, &owner, &census, Duration::from_millis(1)),
-            ManagedQueryOutcome::Busy
+            ManagedQueryOutcome::Failed("managed projection snapshot")
         ));
         assert_eq!(census.snapshot(), ManagedQueryCensusSnapshot::default());
-        assert_eq!(owner.active(), 0);
+        assert_eq!(
+            owner.active(),
+            0,
+            "I-21: the slot is released on the error path"
+        );
+
+        // Capacity is acquired BEFORE any transaction, so an exhausted owner
+        // is `Busy` without the file being touched at all.
+        let held = match owner.acquire() {
+            crate::query_jobs::Admission::Slot(slot) => slot,
+            _ => panic!("the only slot admits"),
+        };
+        assert!(matches!(
+            execute_managed_query(&capture, &owner, &census, Duration::from_millis(1)),
+            ManagedQueryOutcome::Busy
+        ));
+        drop(held);
+
+        // A closed owner cancels instead of reporting Busy: the walk answers
+        // and nothing is counted as a fallback.
+        owner.close();
+        assert!(matches!(
+            execute_managed_query(&capture, &owner, &census, Duration::from_millis(1)),
+            ManagedQueryOutcome::Cancelled
+        ));
+        assert_eq!(census.snapshot(), ManagedQueryCensusSnapshot::default());
     }
 }

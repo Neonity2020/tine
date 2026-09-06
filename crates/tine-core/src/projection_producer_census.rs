@@ -1896,9 +1896,19 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     //                       `NotReady`). All three are read-side.
     // `PhysicalProjectionQuerySnapshot` is not in `write_capable_types`; the
     // write-crossing table above is byte-identical.
+    // Re-pinned 2026-09-06 (query engine R4a, the Managed off-actor executor).
+    // Derived by diffing the dump at `fac4c938` (339 entries) against the
+    // working head (342): added (3), all in `managed_query.rs` and nothing
+    // removed — its `use` line (`MaterializationError`,
+    // `PhysicalProjectionQuerySnapshot`, `PhysicalQueryValue`), ONE
+    // `PhysicalProjectionQuerySnapshot::open_managed(` (the accepted-frontier
+    // read snapshot, stamp validated inside its transaction) and ONE
+    // `PhysicalQueryValue::Integer(` (the FTS readiness probe's row). No other
+    // file gained or lost a `tine_storage` reference; no `storage-receiver:`
+    // entry moved. All read-side.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "320ac8cacf4aa86394bd4100ba088f6b1e3a8a22960656cadfcee1eb94947ade",
+        "256585797ab5066ac76c6c9ef91a9d04ba2f708faec3979f001c18567d26dfd6",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

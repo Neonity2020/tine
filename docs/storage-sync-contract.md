@@ -813,6 +813,33 @@ clean runtime — and each drains the job owner first; the accepted batch apply
 is not one of them, because it writes a checkpoint sidecar, never a WAL
 checkpoint, and readers and the writer coexist under WAL.
 
+**That read is one snapshot, and it never opens a page.** The executor takes
+its job slot BEFORE any transaction, then opens the projection with
+`open_managed`, which validates the capture's acceptance sequence and frontier
+root digest INSIDE the read transaction that serves every later statement — so
+an accepted batch can never land between the check and the rows, and a
+projection that has moved on answers `Stale` rather than a mixture. Everything
+after that is four kinds of read on that one snapshot: the full-text
+readiness probe, one descriptor statement that carries each admitted block's
+page name, kind, journal day, path, stored result identity and estimated size,
+the payload batches charged for the rows the budget admitted, and — only for a
+non-journal page the answer already admitted — that page file's modification
+time. No page document is loaded, no source text is parsed and no whole-graph
+pass is made, so a query costs what its answer costs and nothing more. The
+answer's cross-page order is the projection's own `pages.path` under SQLite's
+binary collation, its per-block identity is the stored one, and a journal
+page's recency is read from its display NAME exactly as the walk reads it, so
+the two routes are one behaviour. Cancellation is checked by the snapshot, not
+by the reader: a drain cancels the open snapshot, the statement in flight
+stops, and the transaction ends before the slot is released, so an owner that
+reports no active job has no reader left on the file. A snapshot that cannot be
+opened, a statement the seam refuses and a projection that contradicts itself
+are all `Failed` — a read the seam or the descriptor can see is damaged never
+answers as if it succeeded. What no read can see: a missing `block_text` or
+`pages` row under a shape whose match set joins that table simply drops the
+block from the match set, on this route and on Direct alike, because the
+shared lowering has no row-count cross-check (R4a finding F1, open).
+
 ## 2. Enrollment and synchronization state machine
 
 ### 2.1 Actors and authority

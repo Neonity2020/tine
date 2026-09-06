@@ -2555,48 +2555,42 @@ fn managed_task_query_overlay_stays_at_exact_existing_page_seams() {
         .next()
         .expect("production source has its test boundary");
     let simple_query_router = production
-        .split_once("    fn application_simple_query_ready(")
-        .and_then(|(_, tail)| {
-            tail.split_once("\n    fn application_sparse_task_query_ready(")
-                .map(|(body, _)| body)
-        })
-        .expect("simple query retains a narrow boundary");
-    assert!(
-        simple_query_router.contains("sparse_task_query_eligibility"),
-        "Q2 must ask the strict sparse eligibility gate before the page evaluator"
-    );
-    assert!(
-        simple_query_router.contains("application_simple_query_pages_ready"),
-        "an ineligible or incomplete sparse attempt must retain the one established fallback"
-    );
-    let sparse_query = production
-        .split_once("    fn application_sparse_task_query_ready(")
+        .split_once("    fn application_simple_query_walk(")
         .and_then(|(_, tail)| {
             tail.split_once("\n    fn application_simple_query_pages_ready(")
                 .map(|(body, _)| body)
         })
-        .expect("sparse query retains a complete-or-fallback boundary");
+        .expect("simple query retains a narrow boundary");
     assert!(
-        sparse_query.contains("latest_task_query_overlay"),
-        "the sparse path must use the exact actor-local overlay rather than hydrating pages"
+        simple_query_router.contains("application_simple_query_pages_ready"),
+        "the actor-side walk must retain the one established complete-page evaluator"
     );
+    // R4a retired the Managed sparse task-index runner: its accepted-frontier
+    // case is the off-actor database route and its pending case is this walk,
+    // so the walk has exactly ONE evaluator and no second Managed answer to
+    // disagree with it (I-19). The whole production file is scanned, not the
+    // router alone, so reintroducing the runner anywhere fails here.
+    for retired in [
+        "fn application_sparse_task_query_ready(",
+        "ManagedSparseTaskQueryFallback",
+        "ManagedSparseTaskQueryCandidate",
+        "ManagedSparseTaskQueryMetrics",
+        "managed_sparse_task_query_candidate_from_sqlite",
+        "note_managed_sparse_task_query_",
+        "task_candidate_blocks_after",
+    ] {
+        assert!(
+            !production.contains(retired),
+            "the Managed sparse task runner is retired; {retired} is back"
+        );
+    }
     assert!(
-        sparse_query.contains("candidate_ids_by_marker.get(marker)"),
-        "the hot sparse path must enter each page through its exact marker index"
+        !simple_query_router.contains("sparse_task_query_eligibility"),
+        "the walk must not consult the sparse planner it no longer has a runner for"
     );
-    assert!(
-        !sparse_query.contains("overlay_pages.clone()")
-            && !sparse_query.contains("latest_task_query_overlay.clone()"),
-        "the sparse path must borrow overlay pages rather than cloning them"
-    );
-    assert!(
-        !sparse_query.contains("structures.values()"),
-        "the sparse path must never scan every hot block structure"
-    );
-    assert!(
-        !sparse_query.contains("application_navigation_overlay_ready"),
-        "the sparse path must not reparse the pending overlay at query time"
-    );
+    // The planner itself is NOT retired -- it is Direct Files' query-job
+    // planner -- and neither is the Managed exposed-identity producer.
+    assert!(production.contains("fn sparse_task_query_identity("));
 
     let unit = production
         .split_once("    fn execute_application_unit_transaction(")
@@ -2609,128 +2603,24 @@ fn managed_task_query_overlay_stays_at_exact_existing_page_seams() {
     assert!(unit.contains("settle_application_publication"));
 }
 
-fn assert_managed_sparse_task_query_hot_overlay_is_candidate_bounded(
-    total_blocks: usize,
-    label: &str,
-    seed: u128,
-) {
-    const MAX_ROWS: usize = 128;
-    const MAX_BYTES: usize = 1024 * 1024;
-    const TASK_RAW: &str = "TODO only hot task";
-    assert!(total_blocks >= 5);
-    let fixture = ActivationFixture::empty(label, seed);
-    let path = format!("notes/Sparse Hot {total_blocks}.md");
-    let page_name = format!("Sparse Hot {total_blocks}");
-    let mut body = String::with_capacity(total_blocks * 28);
-    for block in 0..total_blocks - 5 {
-        body.push_str(&format!("- unrelated hot block {block}\n"));
-    }
-    body.push_str(
-            "- ancestor one\n  - ancestor two\n    - ancestor three\n      - ancestor four\n        - DONE only hot task\n",
-        );
-    let file = fixture.graph_root.join(&path);
-    fs::create_dir_all(file.parent().unwrap()).unwrap();
-    fs::write(file, body.as_bytes()).unwrap();
-    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-    let handle = activated.handle.expect("hot-overlay fixture activates");
-    drive_initial_feed(&handle);
-
-    fn rewrite_task(blocks: &mut [BlockDto]) -> bool {
-        for block in blocks {
-            if block.raw == "DONE only hot task" {
-                block.raw = TASK_RAW.into();
-                return true;
-            }
-            if rewrite_task(&mut block.children) {
-                return true;
-            }
-        }
-        false
-    }
-
-    let (mut page, revision) = load_application_exact(&handle, &path);
-    assert_eq!(flatten_application_blocks(&page.blocks).len(), total_blocks);
-    assert!(rewrite_task(&mut page.blocks));
-    let _ = accepted_application_save(
-        &handle,
-        handle
-            .save_application_page(SyncApplicationPageSaveRequest {
-                target: SyncApplicationPageSaveTarget::Existing {
-                    path: path.clone(),
-                    revision,
-                },
-                page,
-            })
-            .unwrap(),
-        &page_name,
-        SyncPageKind::Page,
-    );
-    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
-
-    handle
-        .reset_managed_application_query_instrumentation()
-        .unwrap();
-    let outcome = handle
-        .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
-            query: "(task TODO)".into(),
-            max_rows: MAX_ROWS,
-            max_bytes: MAX_BYTES,
-        })
-        .unwrap();
-    let SyncApplicationNavigationOutcome::Loaded {
-        reply: SyncApplicationNavigationReply::SimpleQuery(managed),
-    } = outcome
-    else {
-        panic!("hot one-match sparse query returned the wrong outcome: {outcome:?}")
-    };
-    assert_managed_simple_query_matches_direct(
-        &format!("{total_blocks}-block hot one-match candidate receipt"),
-        managed,
-        Graph::open(&fixture.graph_root).run_query_bounded("(task TODO)", MAX_ROWS, MAX_BYTES),
-    );
-    let counters = handle.managed_application_query_instrumentation().unwrap();
-    assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
-    assert_eq!(counters.sparse_completions, 1, "{counters:?}");
-    assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
-    assert_eq!(counters.sparse_candidate_rows, 1, "{counters:?}");
-    assert_eq!(counters.sparse_parser_rows, 1, "{counters:?}");
-    assert_eq!(counters.sparse_overlay_rows, 1, "{counters:?}");
-    assert_eq!(counters.sparse_overlay_index_visits, 1, "{counters:?}");
-    assert_eq!(counters.sparse_overlay_candidate_visits, 1, "{counters:?}");
-    assert_eq!(counters.sparse_overlay_structure_lookups, 5, "{counters:?}");
-    assert_eq!(
-        counters.sparse_overlay_raw_bytes_cloned,
-        TASK_RAW.len(),
-        "{counters:?}"
-    );
-    assert_eq!(counters.sparse_sqlite_rows_fetched, 0, "{counters:?}");
-    assert_eq!(counters.sparse_masked_page_fast_forwards, 0, "{counters:?}");
-    assert_eq!(counters.sparse_ancestor_rows, 0, "{counters:?}");
-    assert_eq!(counters.sparse_dto_constructions, 1, "{counters:?}");
-    assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
-    assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
-    assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
-
-    drain_managed_local(&handle);
-    assert!(matches!(
-        handle.clean_shutdown().unwrap(),
-        SyncShutdownOutcome::Safe(_)
-    ));
-}
-
-#[test]
-fn managed_sparse_task_query_maximum_hot_overlay_is_candidate_bounded() {
-    // A complete application save can retain at most
-    // `MAX_SYNC_EDITOR_BLOCKS` (511) blocks: the 1,024-row mutation budget
-    // reserves two operations per block plus the page preamble. This is
-    // therefore the largest product-reachable hot overlay; the separate
-    // 20k regression covers settled SQLite state.
-    assert_managed_sparse_task_query_hot_overlay_is_candidate_bounded(
-        MAX_SYNC_EDITOR_BLOCKS,
-        "sync-runtime-sparse-task-query-hot-maximum",
-        0xa350,
-    );
+/// The DFS key the retired Managed sparse runner built for one candidate:
+/// root-to-leaf `(order, block_id)` pairs, flattened. It moved here with
+/// R4a's retirement because the parser-side runner it feeds
+/// (`run_application_sparse_task_query_bounded`) is now reached only from
+/// this test, and a production helper with no production caller is a
+/// retirement that did not finish.
+///
+/// `BlockId` derives `Ord` from `Uuid`; its canonical lower-case hyphenated
+/// UUID spelling is fixed-width hexadecimal, so lexical string order preserves
+/// that UUID order. Keeping the two values adjacent mirrors projection's
+/// `(order, block_id)` sibling key.
+fn sparse_task_query_dfs_key(leaf_to_root: Vec<(String, BlockId)>) -> Vec<String> {
+    let mut root_to_leaf = leaf_to_root;
+    root_to_leaf.reverse();
+    root_to_leaf
+        .into_iter()
+        .flat_map(|(order, block_id)| [order, block_id.to_string()])
+        .collect()
 }
 
 #[test]
@@ -4050,13 +3940,14 @@ fn crash_replayed_task_overlay_falls_back_instead_of_answering_stale_sqlite() {
         managed,
         Graph::open(&fixture.graph_root).run_query_bounded("(task TODO)", MAX_ROWS, MAX_BYTES),
     );
-    let counters = reopened
-        .managed_application_query_instrumentation()
-        .unwrap();
-    assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
-    assert_eq!(counters.sparse_completions, 1, "{counters:?}");
-    assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
-    assert_eq!(counters.sparse_fallback_reason, None, "{counters:?}");
+    // R4a: the drained cold open holds no pending suffix, so the accepted
+    // frontier IS the whole story and the query is answered from the database
+    // off the actor -- one statement read, no fallback, no failed read.
+    assert_eq!(
+        r4b_census(&reopened),
+        (1, 0, 0, 0),
+        "a crash-replayed drained runtime answers from the accepted projection"
+    );
 
     drain_managed_local(&reopened);
     assert!(matches!(
@@ -27343,6 +27234,7 @@ fn managed_query_search_manual_receipt(
         handle
             .reset_managed_application_query_instrumentation()
             .unwrap();
+        handle.reset_managed_query_census();
         // Each sample is a cold measurement by construction: the receipt
         // is about what one evaluation costs, not what the second one
         // costs once the memo holds the answer.
@@ -27366,6 +27258,7 @@ fn managed_query_search_manual_receipt(
             elapsed,
             result,
             handle.managed_application_query_instrumentation().unwrap(),
+            r4b_census(&handle),
         )
     };
     let run_graph_search = || {
@@ -27402,10 +27295,11 @@ fn managed_query_search_manual_receipt(
     let mut regex_all_samples = Vec::with_capacity(samples);
     let mut graph_search_samples = Vec::with_capacity(samples);
     let mut indexed_counters = Vec::with_capacity(samples);
+    let mut indexed_census = Vec::with_capacity(samples);
     let mut regex_all_counters = Vec::with_capacity(samples);
     let mut graph_search_counters = Vec::with_capacity(samples);
     for sample in 0..samples {
-        let (elapsed, result, counters) = run_simple(indexed);
+        let (elapsed, result, counters, census) = run_simple(indexed);
         let bounded_result_rows = result
             .groups
             .iter()
@@ -27417,17 +27311,14 @@ fn managed_query_search_manual_receipt(
             result,
             direct_indexed.clone(),
         );
+        // R4a: the indexed task query is answered from ONE owned read
+        // snapshot of the accepted projection, off the actor. The retired
+        // sparse runner's shape claim ("one candidate-bounded attempt, no
+        // page evaluator fallback") is now this: one statement read, no
+        // fallback, no failed read, no re-capture.
         assert_eq!(
-            counters.sparse_attempts, 1,
-            "indexed task query must make exactly one sparse attempt: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_completions, 1,
-            "indexed task query must complete exactly one sparse attempt: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_fallbacks, 0,
-            "indexed task query must not fall back to the page evaluator: {counters:?}"
+            census, (1, 0, 0, 0),
+            "indexed task query must be answered by exactly one accepted-frontier statement read: {census:?}"
         );
         assert_eq!(
             counters.full_inventory_passes, 0,
@@ -27445,85 +27336,56 @@ fn managed_query_search_manual_receipt(
             counters.metadata_page_hydrations, 0,
             "indexed task query must not hydrate metadata pages: {counters:?}"
         );
-        assert_eq!(
-                counters.sparse_parser_rows, counters.sparse_candidate_rows,
-                "indexed task query must parse each deduplicated sparse candidate exactly once: {counters:?}"
-            );
-        assert_eq!(
-            counters.sparse_overlay_rows, 0,
-            "the settled indexed-query receipt must have no overlay candidates: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_sqlite_rows_fetched, counters.sparse_candidate_rows,
-            "settled indexed-query SQLite reads must stay candidate-row bounded: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_overlay_index_visits, 0,
-            "settled indexed-query receipt must not visit a hot marker index: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_overlay_candidate_visits, 0,
-            "settled indexed-query receipt must not visit hot candidates: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_overlay_structure_lookups, 0,
-            "settled indexed-query receipt must not read hot structures: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_overlay_raw_bytes_cloned, 0,
-            "settled indexed-query receipt must not clone hot raw bytes: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_masked_page_fast_forwards, 0,
-            "settled indexed-query receipt must not fast-forward masked pages: {counters:?}"
-        );
-        assert_eq!(
-            counters.sparse_dto_constructions, bounded_result_rows,
-            "indexed task query must construct DTOs only for its bounded result rows: {counters:?}"
-        );
         assert!(
                 bounded_result_rows <= bounded_result_total,
                 "indexed task query emitted more bounded rows than its total: rows={bounded_result_rows} total={bounded_result_total}"
             );
         if let Some(expected) = expected_task_result_rows {
+            // The synthetic fixture puts one task on each candidate page, so
+            // the emitted row count IS its declared density. The retired
+            // runner asserted this through its own candidate/parser/DTO
+            // counters; the answer itself says the same thing and does not
+            // depend on which route produced it.
             assert_eq!(
-                counters.sparse_candidate_rows, expected,
-                "synthetic task candidate density drifted: {counters:?}"
+                bounded_result_rows, expected,
+                "synthetic task candidate density drifted: rows={bounded_result_rows}"
             );
             assert_eq!(
-                counters.sparse_parser_rows, expected,
-                "synthetic task parser rows drifted: {counters:?}"
-            );
-            assert_eq!(
-                counters.sparse_ancestor_rows, 0,
-                "synthetic root task candidates must not read ancestors: {counters:?}"
-            );
-            assert_eq!(
-                counters.sparse_dto_constructions, expected,
-                "synthetic task DTO count drifted: {counters:?}"
+                bounded_result_total, expected,
+                "synthetic task total drifted: total={bounded_result_total}"
             );
         }
         indexed_samples.push(elapsed);
         indexed_counters.push(counters);
+        indexed_census.push(census);
 
-        let (elapsed, result, counters) = run_simple(regex_all);
+        let (elapsed, result, counters, regex_census) = run_simple(regex_all);
         assert_managed_simple_query_matches_direct(
             &format!("{label} Regex-All sample={sample}"),
             result,
             direct_regex_all.clone(),
         );
+        // R4a: Regex-All used to be the receipt's whole-graph counterexample
+        // -- one inventory pass and one full hydration per page, every time.
+        // The accepted route answers it from the same single snapshot as the
+        // indexed shape: how many rows a shape selects does not decide the
+        // route, only whether the accepted frontier is the whole story.
         assert_eq!(
-            counters.full_inventory_passes, 1,
-            "Regex-All must make exactly one inventory pass: {counters:?}"
+            regex_census, (1, 0, 0, 0),
+            "Regex-All must be answered by exactly one accepted-frontier statement read: {regex_census:?}"
         );
         assert_eq!(
-            counters.inventory_pages, total_pages,
-            "Regex-All inventory did not cover each page exactly once: {counters:?}"
+            counters.full_inventory_passes, 0,
+            "Regex-All must no longer scan the page inventory: {counters:?}"
         );
         assert_eq!(
-                counters.result_page_hydrations, total_pages,
-                "Regex-All must hydrate every inventoried page as a query result exactly once: {counters:?}"
-            );
+            counters.inventory_pages, 0,
+            "Regex-All must visit no inventory row: {counters:?}"
+        );
+        assert_eq!(
+            counters.result_page_hydrations, 0,
+            "Regex-All must hydrate no result page: {counters:?}"
+        );
         regex_all_samples.push(elapsed);
         regex_all_counters.push(counters);
 
@@ -27582,7 +27444,7 @@ fn managed_query_search_manual_receipt(
     let graph_search_p50 = startup_median(&graph_search_samples);
     let graph_search_p95 = startup_p95(&graph_search_samples);
     eprintln!(
-            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} indexed_complete_page_p50_ms={:.3} indexed_complete_page_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_sparse_attempts_max={} indexed_sparse_completions_max={} indexed_sparse_fallbacks_max={} indexed_sparse_candidates_max={} indexed_sparse_sqlite_rows_fetched_max={} indexed_sparse_ancestors_max={} indexed_sparse_parser_rows_max={} indexed_sparse_overlay_rows_max={} indexed_sparse_overlay_index_visits_max={} indexed_sparse_overlay_candidate_visits_max={} indexed_sparse_overlay_structure_lookups_max={} indexed_sparse_overlay_raw_bytes_cloned_max={} indexed_sparse_masked_page_fast_forwards_max={} indexed_sparse_dtos_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
+            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} indexed_complete_page_p50_ms={:.3} indexed_complete_page_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_statement_reads_max={} indexed_fallback_reads_max={} indexed_failed_reads_max={} indexed_stale_recaptures_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
             startup_ms(indexed_p50),
             startup_ms(indexed_p95),
             startup_ms(complete_page_p50),
@@ -27591,26 +27453,10 @@ fn managed_query_search_manual_receipt(
             startup_ms(regex_all_p95),
             startup_ms(graph_search_p50),
             startup_ms(graph_search_p95),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_attempts),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_completions),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_fallbacks),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_candidate_rows),
-            max_query_gate_counter(&indexed_counters, |counters| counters
-                .sparse_sqlite_rows_fetched),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_ancestor_rows),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_parser_rows),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_overlay_rows),
-            max_query_gate_counter(&indexed_counters, |counters| counters
-                .sparse_overlay_index_visits),
-            max_query_gate_counter(&indexed_counters, |counters| counters
-                .sparse_overlay_candidate_visits),
-            max_query_gate_counter(&indexed_counters, |counters| counters
-                .sparse_overlay_structure_lookups),
-            max_query_gate_counter(&indexed_counters, |counters| counters
-                .sparse_overlay_raw_bytes_cloned),
-            max_query_gate_counter(&indexed_counters, |counters| counters
-                .sparse_masked_page_fast_forwards),
-            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_dto_constructions),
+            indexed_census.iter().map(|census| census.0).max().unwrap_or(0),
+            indexed_census.iter().map(|census| census.1).max().unwrap_or(0),
+            indexed_census.iter().map(|census| census.2).max().unwrap_or(0),
+            indexed_census.iter().map(|census| census.3).max().unwrap_or(0),
             max_query_gate_counter(&indexed_counters, |counters| counters.full_inventory_passes),
             max_query_gate_counter(&indexed_counters, |counters| counters.result_page_hydrations),
             max_query_gate_counter(&indexed_counters, |counters| counters.metadata_page_hydrations),
@@ -27777,7 +27623,7 @@ fn managed_graph_search_accounts_for_pending_overlay_metadata_separately() {
     ));
 }
 
-/// The sparse task-query fast path, driven through the only actor a
+/// The accepted-frontier database route, driven through the only actor a
 /// non-test build can construct.
 ///
 /// `pre_07_activation_oracle_has_no_production_entry_point` holds the other
@@ -27789,9 +27635,12 @@ fn managed_graph_search_accounts_for_pending_overlay_metadata_separately() {
 ///
 /// It exists because that actor used to answer `{{query (task TODO)}}` by
 /// hydrating every candidate page in full, having refused the block-bounded
-/// path for the absence of a journal it can never have.
+/// path for the absence of a journal it can never have. R4a replaced the
+/// block-bounded sparse runner that fixed it with the shared database result
+/// read, which loads no page at all; the zero-hydration bar below is the same
+/// bar, now met by the route this packet built.
 #[test]
-fn clean_runtime_task_query_takes_the_sparse_fast_path_without_hydrating_pages() {
+fn clean_runtime_task_query_is_answered_from_the_database_without_hydrating_pages() {
     const TOTAL_PAGES: usize = 32;
     const CANDIDATE_PAGES: usize = 8;
     const MAX_ROWS: usize = 20_000;
@@ -27847,13 +27696,6 @@ fn clean_runtime_task_query_takes_the_sparse_fast_path_without_hydrating_pages()
     );
 
     let counters = handle.managed_application_query_instrumentation().unwrap();
-    assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
-    assert_eq!(
-        counters.sparse_completions, 1,
-        "the production-shaped actor must COMPLETE the sparse path: {counters:?}"
-    );
-    assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
-    assert_eq!(counters.sparse_fallback_reason, None, "{counters:?}");
     assert_eq!(
         counters.result_page_hydrations, 0,
         "the task query must not hydrate a single result page: {counters:?}"
@@ -27861,29 +27703,14 @@ fn clean_runtime_task_query_takes_the_sparse_fast_path_without_hydrating_pages()
     assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
     assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
     assert_eq!(counters.inventory_pages, 0, "{counters:?}");
+    // R4a: the answer came from ONE owned read snapshot of the accepted
+    // projection, off the actor -- not from the retired sparse runner and not
+    // from the walk.
     assert_eq!(
-        counters.sparse_candidate_rows, CANDIDATE_PAGES,
-        "{counters:?}"
+        r4b_census(&handle),
+        (1, 0, 0, 0),
+        "one statement read, no fallback, no failed read, no re-capture"
     );
-    assert_eq!(counters.sparse_parser_rows, CANDIDATE_PAGES, "{counters:?}");
-    assert_eq!(
-        counters.sparse_sqlite_rows_fetched, CANDIDATE_PAGES,
-        "the SQLite read must stay candidate-row bounded: {counters:?}"
-    );
-    assert_eq!(counters.sparse_ancestor_rows, 0, "{counters:?}");
-    assert_eq!(
-        counters.sparse_dto_constructions, CANDIDATE_PAGES,
-        "{counters:?}"
-    );
-    assert_eq!(
-        counters.sparse_overlay_rows, 0,
-        "a clean runtime has no overlay candidates at all: {counters:?}"
-    );
-    assert_eq!(counters.sparse_overlay_index_visits, 0, "{counters:?}");
-    assert_eq!(counters.sparse_overlay_candidate_visits, 0, "{counters:?}");
-    assert_eq!(counters.sparse_overlay_structure_lookups, 0, "{counters:?}");
-    assert_eq!(counters.sparse_overlay_raw_bytes_cloned, 0, "{counters:?}");
-    assert_eq!(counters.sparse_masked_page_fast_forwards, 0, "{counters:?}");
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -27926,14 +27753,16 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
     assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
     let handle = opened.handle.expect("clean reopen retains its actor");
 
-    // Regex-All is the whole-graph shape of the evaluator the sparse task
-    // path deliberately does NOT cover: one inventory pass and one full
-    // hydration per page, every time.
+    // Regex-All: a whole-graph shape with no candidate bound at all. R4a
+    // answers it from the accepted projection like every other shape, so the
+    // witness for "this evaluation recomputed" is the accepted route's
+    // statement read rather than the walk's page hydrations.
     let query = format!("(content-regex \"{WITNESS}\")");
     let run = |label: &str| {
         handle
             .reset_managed_application_query_instrumentation()
             .unwrap();
+        handle.reset_managed_query_census();
         let outcome = handle
             .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
                 query: query.clone(),
@@ -27950,42 +27779,51 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
         (
             managed,
             handle.managed_application_query_instrumentation().unwrap(),
+            r4b_census(&handle),
         )
     };
 
-    let (cold, counters) = run("cold complete-page query");
+    let (cold, counters, census) = run("cold accepted-frontier query");
     assert_eq!(cold.total, 0);
-    assert_eq!(counters.full_inventory_passes, 1, "{counters:?}");
     assert_eq!(
-        counters.result_page_hydrations, TOTAL_PAGES,
-        "the cold evaluation must hydrate every page: {counters:?}"
+        census,
+        (1, 0, 0, 0),
+        "the cold evaluation reads the accepted projection once: {census:?}"
     );
+    assert_eq!(
+        counters.result_page_hydrations, 0,
+        "the database route hydrates no page at all: {counters:?}"
+    );
+    assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
     assert_managed_simple_query_matches_direct(
-        "cold complete-page query",
+        "cold accepted-frontier query",
         cold,
         Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
     );
 
-    let (repeat, counters) = run("memoized complete-page query");
+    let (repeat, counters, census) = run("memoized query");
     assert_eq!(repeat.total, 0);
     assert_eq!(
-        counters.result_page_hydrations, 0,
-        "the repeated evaluation must be served from the memo: {counters:?}"
+        census,
+        (0, 0, 0, 0),
+        "the repeated evaluation must be served from the memo, on the actor turn: {census:?}"
     );
+    assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
     assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
 
     handle.clear_application_simple_query_memo().unwrap();
-    let (recomputed, counters) = run("query after an explicitly dropped memo");
+    let (recomputed, _counters, census) = run("query after an explicitly dropped memo");
     assert_eq!(recomputed.total, 0);
     assert_eq!(
-        counters.result_page_hydrations, TOTAL_PAGES,
-        "a dropped memo must recompute rather than answer empty: {counters:?}"
+        census,
+        (1, 0, 0, 0),
+        "a dropped memo must recompute rather than answer empty: {census:?}"
     );
 
     // Refill the memo, then change the graph through the ordinary save
     // path. The accepted batch, not the caller, is what has to invalidate.
-    let (_, counters) = run("refilled memo");
-    assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+    let (_, _counters, census) = run("refilled memo");
+    assert_eq!(census, (0, 0, 0, 0), "{census:?}");
 
     let witness_path = Graph::open(&fixture.graph_root)
         .list_pages()
@@ -28009,15 +27847,45 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
         "the memo fixture edit was not accepted: {save:?}"
     );
 
-    let (after_save, counters) = run("query after an accepted batch");
+    // While the save is still an undrained local suffix the accepted frontier
+    // is NOT the whole story, so the turn neither reads nor fills the memo and
+    // answers on the actor over the overlay -- "pending may temporarily walk".
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+    let (pending, counters, census) = run("query while the save is pending");
+    assert_eq!(
+        pending.total, 1,
+        "a memo that answered a pending turn would still answer zero"
+    );
+    assert_eq!(
+        census,
+        (0, 0, 0, 0),
+        "a pending suffix is never captured: {census:?}"
+    );
+    assert!(
+        counters.result_page_hydrations > 0,
+        "the pending answer is the actor walk: {counters:?}"
+    );
+    assert_managed_simple_query_matches_direct(
+        "query while the save is pending",
+        pending,
+        Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+    );
+
+    // Once the batch is accepted the frontier IS the whole story again. The
+    // stamp moved, so the entry memoized before the save is gone and the
+    // answer is recomputed from the new projection.
+    drain_managed_local(&handle);
+    let (after_save, counters, census) = run("query after an accepted batch");
     assert_eq!(
         after_save.total, 1,
         "a memo that survived its accepted batch would still answer zero"
     );
-    assert!(
-        counters.result_page_hydrations > 0,
-        "the invalidated memo must recompute: {counters:?}"
+    assert_eq!(
+        census,
+        (1, 0, 0, 0),
+        "the invalidated memo must recompute from the accepted projection: {census:?}"
     );
+    assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
     assert_managed_simple_query_matches_direct(
         "query after an accepted batch",
         after_save,
@@ -32998,6 +32866,14 @@ const R4B_QUERY: &str = "(content-regex \"TODO\")";
 
 fn r4b_reopened(label: &str, seed: u128) -> (ActivationFixture, SyncRuntimeHandle) {
     let fixture = ActivationFixture::scaled_query_candidate_density(label, seed, 24, 6);
+    let handle = r4a_reopen(&fixture);
+    (fixture, handle)
+}
+
+/// Activate a fixture, feed it, shut down cleanly, reopen, and drain: a
+/// runtime holding NO pending local suffix, which is the only state the
+/// accepted-frontier route is ever captured in.
+fn r4a_reopen(fixture: &ActivationFixture) -> SyncRuntimeHandle {
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     assert_eq!(activated.status, SyncLocalActivationStatus::Active);
     let handle = activated.handle.expect("activation retains its actor");
@@ -33012,7 +32888,7 @@ fn r4b_reopened(label: &str, seed: u128) -> (ActivationFixture, SyncRuntimeHandl
     let handle = opened.handle.expect("clean reopen retains its actor");
     drain_managed_local(&handle);
     assert_eq!(handle.status().unwrap().managed_local_pending, 0);
-    (fixture, handle)
+    handle
 }
 
 fn r4b_query(
@@ -33061,6 +32937,7 @@ fn r4b_census(handle: &SyncRuntimeHandle) -> (usize, usize, usize, usize) {
 
 #[test]
 fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_falls_back_to_the_walk() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
     let (fixture, handle) = r4b_reopened("r4b-capture-fallback", 0x4b01);
     let oracle = r4b_oracle(&fixture);
     assert!(
@@ -33068,12 +32945,15 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_falls_back_to_the_
         "the fixture must answer the query nonempty"
     );
 
-    r4b_inject(&handle, Vec::new());
+    // R4b drove this leg with the stub executor, which was always `Busy`.
+    // R4a's executor answers, so the disposition under test is injected: the
+    // handle's job here is the FALLBACK, not the read.
+    r4b_inject(&handle, vec![Outcome::Busy]);
     let first = r4b_query(&handle).unwrap();
     assert_eq!(
         r4b_census(&handle),
         (0, 1, 0, 0),
-        "the stub executor is Busy: one fallback, no statement read"
+        "a Busy executor is one fallback and no statement read"
     );
     assert_managed_simple_query_matches_direct("walk after Busy", first, oracle);
 
@@ -33134,6 +33014,14 @@ fn r4b_a_pending_local_suffix_is_answered_on_the_actor_and_never_captured() {
         r4b_census(&handle),
         (0, 0, 0, 0),
         "nothing captured, nothing counted"
+    );
+    // Spelled out because R4a is the packet that made a statement read
+    // possible at all: a pending local suffix must still cost ZERO of them.
+    // "Pending may temporarily walk" is the route, not a fallback.
+    assert_eq!(
+        handle.managed_query_census().statement_reads,
+        0,
+        "an undrained local suffix never reaches the database route"
     );
     assert_eq!(
         handle
@@ -33242,9 +33130,9 @@ fn r4b_a_failed_managed_read_is_an_error_and_the_next_query_recovers() {
     assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
 
     // The failure was the read's, not the runtime's: the next query captures
-    // again and (the stub being Busy) walks.
+    // again and is answered from the accepted projection.
     let recovered = r4b_query(&handle).unwrap();
-    assert_eq!(r4b_census(&handle), (0, 1, 1, 0));
+    assert_eq!(r4b_census(&handle), (1, 0, 1, 0));
     assert_managed_simple_query_matches_direct(
         "query after a failed read",
         recovered,
@@ -33281,4 +33169,630 @@ fn r4b_dropping_the_handle_closes_the_query_job_owner() {
         ),
         "a closed runtime refuses every later query job (I-21)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R4a: the off-actor executor. Every gate below drives the PUBLIC navigation
+// surface; the accepted-frontier route is proven by what it costs
+// (`managed_query_census`, the page-hydration counters) and by the answer
+// being exactly the walk's, never by reaching into the executor.
+// ---------------------------------------------------------------------------
+
+/// The ONE oracle for these gates: the actor-side complete-page evaluator, on
+/// a cleared memo so it computes rather than reads the entry the route just
+/// filled. It dispatches to the same `application_simple_query_pages_ready`
+/// the walk calls, so it is load-bearing only where the EXECUTOR produced the
+/// answer under test.
+fn r4a_oracle(
+    handle: &SyncRuntimeHandle,
+    query: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> SyncApplicationBoundedRefGroups {
+    handle.clear_application_simple_query_memo().unwrap();
+    let answer = handle
+        .application_complete_page_simple_query(query, max_rows, max_bytes)
+        .unwrap();
+    handle.clear_application_simple_query_memo().unwrap();
+    answer
+}
+
+/// One query through the public route, at explicit bounds.
+fn r4a_navigate(
+    handle: &SyncRuntimeHandle,
+    query: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+    handle
+        .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+            query: query.into(),
+            max_rows,
+            max_bytes,
+        })
+        .map(|outcome| match outcome {
+            SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::SimpleQuery(result),
+            } => result,
+            other => panic!("simple query returned the wrong outcome: {other:?}"),
+        })
+}
+
+/// Full-DTO equality between two answers of the SAME backend: group order,
+/// page names, every `BlockDto` field, `total` and `exceeded`. No
+/// canonicalization -- both sides are Managed, so a difference is a defect
+/// and not a mode difference.
+fn r4a_assert_same(
+    label: &str,
+    actual: &SyncApplicationBoundedRefGroups,
+    expected: &SyncApplicationBoundedRefGroups,
+) {
+    assert_eq!(actual.total, expected.total, "{label}: total");
+    assert_eq!(actual.exceeded, expected.exceeded, "{label}: exceeded");
+    assert_eq!(
+        serde_json::to_value(&actual.groups).unwrap(),
+        serde_json::to_value(&expected.groups).unwrap(),
+        "{label}: the accepted route's answer differs from the walk's"
+    );
+}
+
+#[test]
+fn r4a_an_accepted_only_query_is_one_statement_read_and_no_page_load() {
+    let (_fixture, handle) = r4b_reopened("r4a-one-statement", 0x4a01);
+
+    let oracle = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+    assert!(oracle.total > 0, "the fixture must answer nonempty");
+
+    handle.reset_managed_query_census();
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    let answered = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (1, 0, 0, 0),
+        "one statement read, no fallback, no failure, no re-capture"
+    );
+    let counters = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        counters.result_page_hydrations, 0,
+        "the accepted route loads no page DTO: {counters:?}"
+    );
+    assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
+    assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+    r4a_assert_same("accepted-frontier answer", &answered, &oracle);
+
+    // The same query again: the handle memoized the executor's answer under
+    // the capture's stamp, so the turn answers it and the census does not move.
+    let memoized = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (1, 0, 0, 0),
+        "a memo hit executes nothing"
+    );
+    r4a_assert_same("memo hit", &memoized, &oracle);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Every shape §5's three tables name, at every bound §4's acceptance list
+/// names, through the public route against the actor-side walk.
+///
+/// The shapes are the SQL gates' own tables, not a second list. Byte
+/// boundaries are derived per shape from the unbounded answer so one of them
+/// closes the construction between two rows of a single page.
+fn r4a_parity_over(
+    handle: &SyncRuntimeHandle,
+    label: &str,
+    bounds_per_shape: usize,
+) -> (usize, usize, Vec<String>) {
+    use crate::query::sql::sql_gates_tests::{CONTENT_PLAN_SHAPES, IDENTITY_SHAPES, PLAN_SHAPES};
+
+    let mut sources: Vec<String> = Vec::new();
+    for (source, _dialect) in IDENTITY_SHAPES.iter().chain(PLAN_SHAPES.iter()) {
+        sources.push((*source).to_owned());
+    }
+    for (source, _dialect, _plan) in CONTENT_PLAN_SHAPES {
+        sources.push((*source).to_owned());
+    }
+    // The two view directives that change what is CONSTRUCTED rather than how
+    // it is displayed: an unsorted `(sample N)` stops admission at N, and a
+    // recency sort measures the per-result-page axis this packet had to
+    // reproduce from the descriptor row.
+    let with_views = sources
+        .iter()
+        .take(24)
+        .flat_map(|source| {
+            [
+                format!("{source} (sample 3)"),
+                format!("{source} (sort-by modified desc)"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    sources.extend(with_views);
+
+    let mut differences = Vec::new();
+    let mut rows = 0usize;
+    for (index, source) in sources.iter().enumerate() {
+        let unbounded = r4a_oracle(handle, source, R4B_ROWS, R4B_BYTES);
+        rows += unbounded
+            .groups
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum::<usize>();
+
+        // Bounds are the PUBLIC route's admissible range: it refuses 0 and
+        // anything above the ceiling outright, so the smallest bound a user can
+        // reach is 1, not 0 (recorded in the receipt). The byte boundaries are
+        // this shape's own cumulative charge under
+        // `ConstructionBudget::admit_estimated` -- the payload estimate, the
+        // page name and the fixed group overhead -- so one of them closes the
+        // construction between two rows of a single page.
+        let mut bounds: Vec<(usize, usize)> = vec![
+            (R4B_ROWS, R4B_BYTES),
+            (1, R4B_BYTES),
+            (R4B_ROWS, 1),
+            (2, R4B_BYTES),
+        ];
+        bounds.truncate(bounds_per_shape.max(1));
+        let mut cumulative = 0usize;
+        for group in &unbounded.groups {
+            for block in &group.blocks {
+                if bounds.len() >= bounds_per_shape {
+                    break;
+                }
+                cumulative = cumulative
+                    .saturating_add(crate::model::block_dto_estimated_bytes(block))
+                    .saturating_add(group.page.len())
+                    .saturating_add(256);
+                bounds.push((R4B_ROWS, cumulative.clamp(1, R4B_BYTES)));
+                bounds.push((R4B_ROWS, cumulative.saturating_sub(1).clamp(1, R4B_BYTES)));
+            }
+        }
+
+        for (max_rows, max_bytes) in bounds {
+            // The shape is named by its INDEX, never by its source: this helper
+            // also runs over a real graph, where a query source is content.
+            let at = format!("{label}: shape #{index} rows={max_rows} bytes={max_bytes}");
+            let expected = r4a_oracle(handle, source, max_rows, max_bytes);
+            handle.reset_managed_query_census();
+            let actual = match r4a_navigate(handle, source, max_rows, max_bytes) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    differences.push(format!("{at} failed: {error}"));
+                    continue;
+                }
+            };
+            // The route never walked, and it skipped the database only where
+            // the filter folded to false and the answer is empty by
+            // construction (I-15) -- there is nothing to read for those.
+            let (statement_reads, fallbacks, failures, _) = r4b_census(handle);
+            let skipped_but_nonempty = statement_reads == 0 && expected.total > 0;
+            if statement_reads > 1 || fallbacks != 0 || failures != 0 || skipped_but_nonempty {
+                differences.push(format!(
+                    "{at} did not answer from the database: \
+                     statement_reads={statement_reads} fallbacks={fallbacks} \
+                     failures={failures} walk_total={}",
+                    expected.total
+                ));
+            }
+            if actual.total != expected.total {
+                differences.push(format!(
+                    "{at} total walk={} read={}",
+                    expected.total, actual.total
+                ));
+            }
+            if actual.exceeded != expected.exceeded {
+                differences.push(format!(
+                    "{at} exceeded walk={} read={}",
+                    expected.exceeded, actual.exceeded
+                ));
+            }
+            if serde_json::to_value(&actual.groups).unwrap()
+                != serde_json::to_value(&expected.groups).unwrap()
+            {
+                differences.push(format!(
+                    "{at} groups differ (walk groups={} read groups={})",
+                    expected.groups.len(),
+                    actual.groups.len()
+                ));
+            }
+        }
+    }
+    (sources.len(), rows, differences)
+}
+
+/// The fast corpus §5's gates already own, imported into a Managed runtime.
+fn r4a_fast_corpus_fixture(label: &str, seed: u128) -> ActivationFixture {
+    let root = crate::query::sql::sql_gates_tests::scratch(label);
+    crate::query::sql::sql_gates_tests::write_fast_corpus(&root);
+    let fixture = ActivationFixture::copied_graph(label, seed, &root);
+    let _ = fs::remove_dir_all(&root);
+    fixture
+}
+
+#[test]
+fn r4a_the_accepted_route_answers_every_shape_exactly_as_the_walk() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("r4a-shape-parity", 0x4a02);
+    let handle = r4a_reopen(&fixture);
+    let (shapes, rows, differences) = r4a_parity_over(&handle, "fast corpus", 12);
+    assert!(
+        rows > 0,
+        "the corpus admitted nothing; the gate proves nothing"
+    );
+    assert!(
+        differences.is_empty(),
+        "the accepted route and the walk disagree over {shapes} shapes:\n{}",
+        differences.join("\n")
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The same bar over the anonymized graph (AGENTS §4 tier 2). Only shape
+/// INDICES and counts are printed -- never a source, a page name or a row.
+#[test]
+#[ignore = "acceptance gate over a real corpus: set TINE_QUERY_IDENTITY_GRAPH"]
+fn r4a_the_accepted_route_answers_every_shape_over_a_real_corpus() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let Some(root) = std::env::var_os("TINE_QUERY_IDENTITY_GRAPH") else {
+        eprintln!("skipped: set TINE_QUERY_IDENTITY_GRAPH to a corpus directory");
+        return;
+    };
+    let fixture = ActivationFixture::copied_graph("r4a-corpus-parity", 0x4a03, Path::new(&root));
+    let handle = r4a_reopen(&fixture);
+    // The SHAPE breadth is this gate's point; the bound sweep is the fast
+    // corpus's. Each comparison costs one full actor-side walk of a large
+    // graph, so the real graph gets two bounds per shape, not twelve.
+    let (shapes, rows, differences) = r4a_parity_over(&handle, "corpus", 2);
+    eprintln!(
+        "r4a_managed_accepted_route_over_a_real_corpus shapes={shapes} admitted_rows={rows} \
+         disagreements={}",
+        differences.len()
+    );
+    assert!(rows > 0);
+    assert!(
+        differences.is_empty(),
+        "the accepted route and the walk disagree on a real graph:\n{}",
+        differences.join("\n")
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The recency axis (D4): the walk reads a journal page's day from its
+/// display NAME, so the executor must too. The fixture's config gives
+/// journals a file-name format (`dd-MM-yyyy`) that differs from the page
+/// title format (`yyyy-MM-dd`), and one journal carries an explicit `title::`
+/// that is not a date at all -- the stored `journal_day` and the walk's
+/// producer disagree there, and parity is with the walk.
+#[test]
+fn r4a_the_recency_axis_is_the_walks_journal_name_producer() {
+    let fixture = ActivationFixture::empty("r4a-recency", 0x4a04);
+    fs::create_dir_all(fixture.graph_root.join("diary")).unwrap();
+    fs::create_dir_all(fixture.graph_root.join("notes")).unwrap();
+    fs::write(
+        fixture.graph_root.join("diary/20-07-2026.md"),
+        "- TODO earlier journal task\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("diary/25-07-2026.md"),
+        "- TODO later journal task\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("diary/28-07-2026.md"),
+        "title:: Not A Date At All\n\n- TODO unparseable journal task\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/Ordinary.md"),
+        "- TODO ordinary page task\n",
+    )
+    .unwrap();
+    let handle = r4a_reopen(&fixture);
+
+    for query in [
+        "(task TODO) (sort-by modified desc)",
+        "(task TODO) (sort-by modified asc)",
+        "(task TODO)",
+    ] {
+        let oracle = r4a_oracle(&handle, query, R4B_ROWS, R4B_BYTES);
+        assert!(oracle.total >= 4, "{query}: {oracle:?}");
+        handle.reset_managed_query_census();
+        let answered = r4a_navigate(&handle, query, R4B_ROWS, R4B_BYTES).unwrap();
+        assert_eq!(r4b_census(&handle), (1, 0, 0, 0), "{query}");
+        r4a_assert_same(query, &answered, &oracle);
+    }
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// A REAL accepted batch lands between the capture and the open: the
+/// executor's stamp validation inside its own read transaction sees a
+/// projection that has moved on, reports `Stale`, and the handle re-captures
+/// and answers at the NEW frontier. The barrier is the executor's own
+/// pre-open hook -- no injected outcome, no sleep.
+#[test]
+fn r4a_a_real_frontier_advance_between_capture_and_open_is_a_stale_recapture() {
+    let (fixture, handle) = r4b_reopened("r4a-stale-advance", 0x4a06);
+    let before = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+    assert!(before.total > 0);
+
+    // Advance the accepted frontier exactly once, from inside the executor,
+    // after the capture and before its snapshot is opened.
+    let witness_path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .expect("the fixture has pages")
+        .rel_path;
+    let advanced = std::cell::Cell::new(0usize);
+    let handle_for_hook: *const SyncRuntimeHandle = &handle;
+    crate::managed_query::set_before_managed_open_hook(Some(Box::new(move || {
+        if advanced.replace(1) != 0 {
+            return;
+        }
+        // SAFETY: the executor runs on THIS thread, inside this test's own
+        // call, and the handle outlives the hook, which is cleared below.
+        let handle = unsafe { &*handle_for_hook };
+        let (mut page, revision) = load_application_exact(handle, &witness_path);
+        page.blocks
+            .push(application_move_test_root("TODO stale-advance-witness", 0));
+        let save = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+        drain_managed_local(handle);
+    })));
+
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let answered = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    crate::managed_query::set_before_managed_open_hook(None);
+    assert_eq!(
+        r4b_census(&handle),
+        (1, 0, 0, 1),
+        "one Stale re-capture, then one statement read at the new frontier"
+    );
+    let after = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+    assert_eq!(
+        after.total,
+        before.total + 1,
+        "the frontier really advanced by one match"
+    );
+    r4a_assert_same("answer at the new frontier", &answered, &after);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// A drain reaches a statement mid-flight: the executor reports `Cancelled`,
+/// the walk answers, nothing is counted as a fallback, and the drain does not
+/// return until the job has released its slot (I-21). This is the executor
+/// half of `g_i_managed_query_jobs_drain_before_projection_file_close`: the
+/// three call sites are pinned there, that a live read actually stops is
+/// pinned here.
+#[test]
+fn r4a_a_drain_cancels_a_live_read_and_waits_for_its_slot() {
+    use std::sync::mpsc;
+    let (fixture, handle) = r4b_reopened("r4a-drain", 0x4a07);
+    let oracle = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+    assert!(oracle.total > 0);
+    handle.reset_managed_query_census();
+
+    // A slot admitted BEFORE the drain, so its `is_cancelled` is the drain's
+    // observable: the test never sleeps against the cancellation.
+    let probe = match handle
+        .managed_query_jobs()
+        .acquire_within(Duration::from_secs(5))
+    {
+        crate::query_jobs::Admission::Slot(slot) => slot,
+        other => panic!(
+            "the owner must admit a probe: {}",
+            match other {
+                crate::query_jobs::Admission::Busy => "busy",
+                crate::query_jobs::Admission::Cancelled => "cancelled",
+                crate::query_jobs::Admission::Slot(_) => unreachable!(),
+            }
+        ),
+    };
+
+    let answered = std::thread::scope(|scope| {
+        let (reached_tx, reached) = mpsc::channel::<()>();
+        let (resume_tx, resume) = mpsc::channel::<()>();
+        let handle_ref = &handle;
+        let query = scope.spawn(move || {
+            crate::query::results::set_before_payload_batch_hook(Some(Box::new(move |_batch| {
+                let _ = reached_tx.send(());
+                let _ = resume.recv();
+            })));
+            let answer = r4a_navigate(handle_ref, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+            crate::query::results::set_before_payload_batch_hook(None);
+            answer
+        });
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the executor must reach its payload read");
+        assert_eq!(
+            handle.managed_query_jobs().active(),
+            2,
+            "the live read and the probe both hold a slot"
+        );
+
+        let jobs = handle.managed_query_jobs();
+        let drainer = scope.spawn(move || jobs.cancel_all_and_drain());
+        let started = Instant::now();
+        while !probe.is_cancelled() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the drain must cancel every admitted job"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !drainer.is_finished(),
+            "the drain must not return while a job still holds its slot"
+        );
+        drop(probe);
+        let _ = resume_tx.send(());
+        drainer.join().unwrap();
+        assert_eq!(handle.managed_query_jobs().active(), 0, "I-21");
+        query.join().unwrap().unwrap()
+    });
+
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 0),
+        "a drain's cancellation is answered by the walk and counted nowhere"
+    );
+    r4a_assert_same("walk after a drain", &answered, &oracle);
+    let _ = fixture;
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// D-3: a projection that contradicts itself FAILS the read. It never
+/// answers with fewer rows, never falls back to the walk (SPEC §5.9 M10),
+/// and memoizes nothing -- the next query captures and reads again.
+#[test]
+fn r4a_a_corrupt_projection_fails_the_read_and_memoizes_nothing() {
+    // Both halves of the read, each on its OWN runtime so neither damage can
+    // stand in for the other:
+    //
+    // * the descriptor's `query_block_results` row for a block the statement
+    //   ADMITTED -- the LEFT JOIN miss D-3 exists to catch; and
+    // * one admitted block's required `block_text` payload row, under a
+    //   `(task TODO)` shape whose MATCH set does not read that table.
+    //
+    // The shape matters. A content leaf correlates its regex on
+    // `block_text.query_visible`, so deleting that row removes the block from
+    // the match set itself: the read then answers a smaller-but-internally
+    // consistent projection and cannot know a row is missing. That is a
+    // property of the lowering both backends share, not of this executor, and
+    // it is recorded as a finding rather than asserted as a failure here.
+    let damages: [(&str, &str, &str); 2] = [
+        (
+            "descriptor",
+            R4B_QUERY,
+            "DELETE FROM query_block_results WHERE block_id IN (SELECT b.block_id FROM blocks b \
+             JOIN pages p ON p.page_id = b.page_id WHERE p.name = ?1)",
+        ),
+        (
+            "payload",
+            "(task TODO)",
+            "DELETE FROM block_text WHERE block_id IN (SELECT b.block_id FROM blocks b \
+             JOIN pages p ON p.page_id = b.page_id WHERE p.name = ?1)",
+        ),
+    ];
+    for (index, (label, query, damage)) in damages.into_iter().enumerate() {
+        let (fixture, handle) =
+            r4b_reopened(&format!("r4a-corrupt-{label}"), 0x4a08 + index as u128);
+        let oracle = r4a_oracle(&handle, query, R4B_ROWS, R4B_BYTES);
+        let page = oracle
+            .groups
+            .first()
+            .unwrap_or_else(|| panic!("{label}: the fixture must answer {query} nonempty"))
+            .page
+            .clone();
+
+        handle.clear_application_simple_query_memo().unwrap();
+        handle.reset_managed_query_census();
+        let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
+        let removed = writer.execute(damage, [&page]).unwrap();
+        drop(writer);
+        assert!(removed > 0, "{label}: the damage must remove a row");
+
+        let error = r4a_navigate(&handle, query, R4B_ROWS, R4B_BYTES).unwrap_err();
+        assert_eq!(
+            error,
+            SyncApplicationPageRequestError::ActorRefusedAt(
+                "application_simple_query_managed_read"
+            ),
+            "{label}: a damaged Managed read is an error, never fewer rows"
+        );
+        assert_eq!(
+            r4b_census(&handle),
+            (0, 0, 1, 0),
+            "{label}: one failed read, no fallback, no statement read"
+        );
+
+        // Nothing was memoized: the next query captures and reads again, and
+        // fails again for the same reason rather than answering from a cache.
+        let again = r4a_navigate(&handle, query, R4B_ROWS, R4B_BYTES).unwrap_err();
+        assert_eq!(again, error, "{label}");
+        assert_eq!(r4b_census(&handle), (0, 0, 2, 0), "{label}");
+    }
+}
+
+/// Capacity is bounded and exhaustion is not an error: `Busy` walks, and it
+/// IS counted as a fallback, because a query that could not reach the
+/// database is exactly what the Q18 retirement card watches for.
+#[test]
+fn r4a_an_exhausted_job_owner_is_busy_and_the_walk_answers() {
+    let (_fixture, handle) = r4b_reopened("r4a-busy", 0x4a09);
+    let oracle = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+    assert!(oracle.total > 0);
+
+    *handle.inner.managed_query.job_wait.lock().unwrap() = Some(Duration::from_millis(5));
+    let mut held = Vec::new();
+    loop {
+        match handle
+            .managed_query_jobs()
+            .acquire_within(Duration::from_millis(5))
+        {
+            crate::query_jobs::Admission::Slot(slot) => held.push(slot),
+            crate::query_jobs::Admission::Busy => break,
+            crate::query_jobs::Admission::Cancelled => panic!("the owner must not be closed"),
+        }
+    }
+    assert_eq!(held.len(), crate::query_jobs::DEFAULT_QUERY_JOB_CAPACITY);
+
+    handle.reset_managed_query_census();
+    let walked = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 1, 0, 0),
+        "no slot within the wait is one counted fallback and no statement read"
+    );
+    r4a_assert_same("walk after Busy", &walked, &oracle);
+
+    drop(held);
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let read = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (1, 0, 0, 0),
+        "a freed slot puts the next query back on the database route"
+    );
+    r4a_assert_same("read after the slots freed", &read, &oracle);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
 }
