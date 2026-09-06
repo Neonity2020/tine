@@ -460,6 +460,28 @@ owners and removed on replacement, deletion and reset. Existing typed payload
 reads retain their fields; missing payload is an error, not an omitted entity.
 Projection-only filtering does not load these payload tables.
 
+**The result read is a descriptor read plus payload batches, and a damaged one
+fails.** One ready query's public result is constructed from ONE owned read
+snapshot, in two stages. The DESCRIPTOR read wraps the compiler's selected-id
+relation and adds only ordering and result metadata — `query_block_results`,
+the page's display fields, `blocks.order_key`, and `query_page_order.position`
+for Direct — with no raw text, tag or property payload; every join in it is
+LEFT, so a missing `query_block_results`, `blocks` or `pages` row, a Direct
+result page with no `query_page_order` position, a `query_block_results.page_id`
+that does not own its block's page, or a `pages.text_kind` outside the two
+written values FAILS the read rather than dropping a selected descriptor. Cross-
+page order is `query_page_order.position` on Direct and `pages.path` under
+SQLite's default BINARY collation on Managed, then `query_block_results.preorder`
+within a page. The PAYLOAD read then runs for ADMITTED ids only, in batches of
+128 bound ids and exactly three statements per batch — block/text/task/planning
+facets, then `tags` by owner and ordinal, then `properties` by owner and ordinal
+— never one statement per block and never a tags×properties join. Each batch is
+validated for exact id coverage, page ownership, the stored tag/property counts
+and, finally, the stored construction estimate against the estimate of the DTO
+actually built; any violation abandons the WHOLE result with no partially
+substituted rows. A read that fails this way is a rebuild request, never a
+shorter answer (D-3).
+
 **A tag key is a page key.** `tags.tag_key` is `refs::page_key(tag)` — the same
 key page identity uses — because `#x` is OG's `[[x]]`; `tags_lookup_idx` leads
 with it. `pages.journal_day` is the journal page's `yyyymmdd`, derived from the

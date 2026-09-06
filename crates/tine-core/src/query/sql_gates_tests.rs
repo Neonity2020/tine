@@ -49,23 +49,23 @@ static GATE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A poisoned lock means a NEIGHBOURING gate failed, which must not turn this
 /// gate's own result into a second, misleading failure.
-fn serialize() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serialize() -> std::sync::MutexGuard<'static, ()> {
     GATE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn scratch(tag: &str) -> PathBuf {
+pub(crate) fn scratch(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tine-query-sql-{tag}-{}", Uuid::new_v4()))
 }
 
 /// A graph plus the ready Direct Files projection built from it by the
 /// PRODUCTION producer — never by a re-implementation in the test, which would
 /// prove only that the test agrees with itself.
-struct Corpus {
-    graph: Graph,
+pub(crate) struct Corpus {
+    pub(crate) graph: Graph,
     reader: PhysicalProjectionQueryReader,
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     owns_root: bool,
 }
 
@@ -82,7 +82,7 @@ impl Drop for Corpus {
 }
 
 impl Corpus {
-    fn projection_dir(&self) -> PathBuf {
+    pub(crate) fn projection_dir(&self) -> PathBuf {
         std::env::temp_dir().join(format!(
             "tine-query-sql-projection-{}",
             self.root
@@ -92,7 +92,7 @@ impl Corpus {
         ))
     }
 
-    fn open(root: PathBuf, owns_root: bool) -> Corpus {
+    pub(crate) fn open(root: PathBuf, owns_root: bool) -> Corpus {
         let graph = Graph::open(&root);
         graph.warm_cache();
         let projection_dir = std::env::temp_dir().join(format!(
@@ -123,7 +123,26 @@ impl Corpus {
         }
     }
 
-    fn today(&self) -> JournalDate {
+    /// The projection file this corpus built, for the R3 gates that need an
+    /// OWNED read snapshot (and, in the corruption gates, a writable
+    /// `rusqlite` connection to damage a copy of it) rather than the pooled
+    /// read-only reader beside them.
+    pub(crate) fn projection_path(&self) -> PathBuf {
+        self.projection_dir().join("projection.sqlite")
+    }
+
+    /// One owned read snapshot of this corpus's projection, acquired the way
+    /// Direct Files acquires one. The validator has nothing to check here:
+    /// the projection is already converged and no writer is running.
+    pub(crate) fn snapshot(&self) -> tine_storage::sqlite::PhysicalProjectionQuerySnapshot {
+        tine_storage::sqlite::PhysicalProjectionQuerySnapshot::open_direct(
+            &self.projection_path(),
+            || Ok(()),
+        )
+        .expect("the owned read snapshot opens")
+    }
+
+    pub(crate) fn today(&self) -> JournalDate {
         JournalDate::today()
     }
 
@@ -155,7 +174,7 @@ impl Corpus {
     /// created projection is published `phase = 1` and maintains its FTS rows
     /// inline; `phase = 0` is the transient building state, where the change
     /// rows go to `search_fts_outbox` and the FTS tables stay empty.
-    fn fts_ready(&self) -> bool {
+    pub(crate) fn fts_ready(&self) -> bool {
         let rows = self
             .reader
             .run_projection_query(
@@ -218,7 +237,7 @@ impl Corpus {
 
     /// One page's id, read through the seam — the value §5.9's overlay masking
     /// binds.
-    fn page_id(&self, name: &str) -> [u8; 16] {
+    pub(crate) fn page_id(&self, name: &str) -> [u8; 16] {
         let rows = self
             .reader
             .run_projection_query(
@@ -256,7 +275,7 @@ impl Corpus {
 
     /// One lowered statement, with the SAME shared Match parse the walk builds
     /// for this execution (§5.10) — never a second `Matcher::parse`.
-    fn lower(
+    pub(crate) fn lower(
         &self,
         source: &str,
         dialect: QueryDialect,
@@ -350,6 +369,37 @@ impl Corpus {
             .collect()
     }
 
+    /// The statement §5.9's dispatch actually runs for a block-group query,
+    /// with the query it lowered.
+    ///
+    /// The rebase is `block_anchored_query` — the ONE producer of it — so the
+    /// returned `Query` is exactly what `collect_pred_bounded_over` evaluates
+    /// and the returned statement is exactly what the projection answers. A
+    /// gate that lowered one tree and walked another would compare two
+    /// questions.
+    pub(crate) fn lower_block_anchored(
+        &self,
+        source: &str,
+        dialect: QueryDialect,
+    ) -> (crate::query::ir::Query, SqlQuery) {
+        let today = self.today();
+        let (parsed, _view) = crate::query::parse_query_text(source, dialect, today);
+        let query = crate::query::block_anchored_query(&parsed);
+        let registry = self.graph.property_registry();
+        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let inputs = LoweringInputs {
+            today,
+            registry: &registry,
+            masked_pages: &[],
+            cutoff: None,
+            compiled: &compiled,
+            fts_ready: self.fts_ready(),
+            result_set_rule: RESULT_SET_RULE,
+        };
+        let statement = lower_query(&query, &inputs);
+        (query, statement)
+    }
+
     /// `(plan, positively_bounded, matches_nothing)`.
     fn explain(&self, source: &str, dialect: QueryDialect) -> (Vec<String>, bool, bool) {
         let (_anchor, statement) = self.lower(source, dialect, self.fts_ready(), &[]);
@@ -372,7 +422,7 @@ impl Corpus {
 
 /// The permanent fast corpus. Every shape §5's tables name has a row here, and a
 /// disagreement found on the real graph is extracted INTO this function.
-fn write_fast_corpus(root: &Path) {
+pub(crate) fn write_fast_corpus(root: &Path) {
     std::fs::create_dir_all(root.join("pages")).expect("pages");
     std::fs::create_dir_all(root.join("journals")).expect("journals");
 
@@ -559,7 +609,7 @@ fn write_fast_corpus(root: &Path) {
 
 /// Every query shape this wave lowers, in both dialects where both spell it.
 /// The two engines must agree on every one of them.
-const IDENTITY_SHAPES: &[(&str, QueryDialect)] = &[
+pub(crate) const IDENTITY_SHAPES: &[(&str, QueryDialect)] = &[
     // refs — the flagship leaf, through the ancestor closure and the page
     ("[[Project]]", QueryDialect::Og),
     ("(page-ref Project)", QueryDialect::Og),
@@ -935,7 +985,7 @@ fn the_fast_corpus_answers_every_shape_it_can_and_matches_something() {
 /// The shapes §5.7's table calls positively bounded, plus the two presence
 /// probes the dossier names as a hard stop, plus the two controls §5.7 predicts
 /// will NOT be bounded.
-const PLAN_SHAPES: &[(&str, QueryDialect)] = &[
+pub(crate) const PLAN_SHAPES: &[(&str, QueryDialect)] = &[
     ("[[Project]]", QueryDialect::Og),
     ("#inline-tag", QueryDialect::Og),
     ("tag('inline-tag')", QueryDialect::Tql),
@@ -986,7 +1036,7 @@ const PLAN_SHAPES: &[(&str, QueryDialect)] = &[
 /// §5.10's plan classes and the shape that produces each. They are recorded
 /// SEPARATELY from the indexed case — as classes, not as failures and not as a
 /// blanket content exemption.
-const CONTENT_PLAN_SHAPES: &[(&str, QueryDialect, ContentPlan)] = &[
+pub(crate) const CONTENT_PLAN_SHAPES: &[(&str, QueryDialect, ContentPlan)] = &[
     ("content match 'alpha'", QueryDialect::Tql, ContentPlan::Fts),
     ("(search \"needle\")", QueryDialect::Og, ContentPlan::Fts),
     // No positive term yields a three-scalar whitespace-free run.

@@ -24043,20 +24043,72 @@ pub fn block_to_dto(b: &DocBlock) -> io::Result<BlockDto> {
 /// validation stays with the callers — their polite-error vs assert difference
 /// is deliberate.
 fn doc_block_facets_dto(block: &DocBlock, id: String) -> BlockDto {
-    BlockDto {
+    shallow_block_facets_dto(ShallowBlockFacets {
         id,
         raw: block.raw.clone(),
         collapsed: block.collapsed(),
-        children: Vec::new(),
-        breadcrumb: Vec::new(),
-        page_property: false,
+        heading_level: block.heading_level(),
         marker: block.marker().map(str::to_string),
         priority: block.priority().map(str::to_string),
-        heading_level: block.heading_level(),
         scheduled: block.scheduled().map(str::to_string),
         deadline: block.deadline().map(str::to_string),
         tags: block.tags(),
         properties: block.properties(),
+    })
+}
+
+/// The facets a shallow result row carries, independent of where they were
+/// read from. [`doc_block_facets_dto`] fills them from a parsed `DocBlock`;
+/// R3's database result read fills the same ten from `block_text`, `blocks`,
+/// `tasks`, `block_planning`, `tags` and `properties`.
+pub(crate) struct ShallowBlockFacets {
+    pub(crate) id: String,
+    pub(crate) raw: String,
+    pub(crate) collapsed: bool,
+    pub(crate) heading_level: Option<u8>,
+    pub(crate) marker: Option<String>,
+    pub(crate) priority: Option<String>,
+    pub(crate) scheduled: Option<String>,
+    pub(crate) deadline: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) properties: Vec<(String, String)>,
+}
+
+/// The ONE shallow `BlockDto` FIELD LIST (DUP-6/B9, extended for R3).
+///
+/// The three fixed fields a result row never carries — `children`,
+/// `breadcrumb`, `page_property` — are decided exactly here, so the
+/// parser-backed and the database-backed constructors cannot drift into two
+/// different answers to the same question (I-12, I-19). A new `BlockDto` facet
+/// is still a one-site decision; it is now a one-site decision for BOTH
+/// backends.
+pub(crate) fn shallow_block_facets_dto(facets: ShallowBlockFacets) -> BlockDto {
+    let ShallowBlockFacets {
+        id,
+        raw,
+        collapsed,
+        heading_level,
+        marker,
+        priority,
+        scheduled,
+        deadline,
+        tags,
+        properties,
+    } = facets;
+    BlockDto {
+        id,
+        raw,
+        collapsed,
+        children: Vec::new(),
+        breadcrumb: Vec::new(),
+        page_property: false,
+        marker,
+        priority,
+        heading_level,
+        scheduled,
+        deadline,
+        tags,
+        properties,
     }
 }
 
