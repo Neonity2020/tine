@@ -610,7 +610,7 @@ impl Compiler<'_> {
 
     /// `content` predicates read `blocks.query_visible_folded` — the EXACT
     /// visible text folded once at write time (§5.8), never the
-    /// whitespace-collapsed `searchable_text` beside it. The walk compares
+    /// whitespace-collapsed `block_text.searchable_text` payload. The walk compares
     /// `BlockProjection::visible_lower`, which is the same fold of the same
     /// text.
     fn content(&mut self, op: CmpOp, value: &Value, b: &str) -> String {
@@ -765,7 +765,7 @@ impl Compiler<'_> {
     /// — so a pattern that did not compile is a retained leaf matching FALSE,
     /// which needs no regex engine in SQLite and lowers to the constant `0`.
     /// A pattern that DID compile needs §4.3.2's fixed registered scalar
-    /// predicate over `blocks.query_visible`, which the read-only seam cannot
+    /// predicate over `blocks.query_visible_folded`, which the read-only seam cannot
     /// host at this tine-storage pin; declining sends the query to the walk,
     /// which is the SAME answer (§5.9), not a different one.
     fn content_regex(&mut self, source: &str) -> String {

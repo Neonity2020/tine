@@ -1278,7 +1278,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             return;
         }
     };
-    let mut database = match open_projection_database(&shared.path) {
+    let mut writer_slot = match open_projection_database(&shared.path) {
         Ok(database) => Some(database),
         Err(error) => {
             report_projection_failure("disabled: its database could not be opened", &error);
@@ -1319,7 +1319,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             Err("a prior projection failure requires a complete parser snapshot".into())
         } else {
             (|| {
-                if rebuild || requires_full_rebuild || database.is_none() {
+                if rebuild || requires_full_rebuild || writer_slot.is_none() {
                     // Drop every connection before the disposable file can be
                     // replaced; a reader must not retain an old file handle.
                     let mut reader = shared.reader.lock().unwrap();
@@ -1327,15 +1327,15 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     reader.take();
                     seam.take();
                     shared.fts_ever_ready.store(false, Ordering::Release);
-                    database.take();
-                    let mut reopened = open_projection_database(&shared.path)
+                    writer_slot.take();
+                    let mut database = open_projection_database(&shared.path)
                         .map_err(|error| error.to_string())?;
                     // Even repaired DDL leaves unchanged source stamps behind.
                     // Reset them so the full snapshot lowers every source page.
-                    reopened.reset().map_err(|error| error.to_string())?;
-                    database = Some(reopened);
+                    database.reset().map_err(|error| error.to_string())?;
+                    writer_slot = Some(database);
                 }
-                apply_pending(database.as_mut().unwrap(), full, deltas)
+                apply_pending(writer_slot.as_mut().unwrap(), full, deltas)
             })()
         };
         if let Err(error) = applied {

@@ -1827,9 +1827,18 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // adds or removes a `PhysicalQueryValue` construction. The certified
     // dependency stays at v0.14.0 — the seam has been on it since P1-a2 and
     // nothing new is required to call it.
+    // DB2/P1-d recovery review: persistent query-table damage must invalidate
+    // unchanged source stamps. Three Direct projection entries are added:
+    // database.reset (1), reader.take (1), reader.lock (12 -> 13). The reset
+    // is the existing transactional disposable-cache API, called only on the
+    // leased worker before applying a complete parser snapshot. Cached readers
+    // are dropped before the existing reopen helper may replace the file.
+    // No authority write boundary or new SQL write API is introduced. The
+    // writer_slot Option is not a storage handle; the reset receiver remains
+    // named database so this inventory sees the actual storage call.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "6ddd2d721952301ccd11f8720c5824006ab0f372b05542a73513008165adacc7",
+        "6056c09182303144616d6fbd5e9ac1da8cab4d0f2f23cd534524065588e1f20a",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
