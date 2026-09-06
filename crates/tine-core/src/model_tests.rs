@@ -10030,6 +10030,24 @@ fn persisted_query_sources_cannot_reach_unbounded_cache_keys_or_parser_recursion
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// §5.9's advanced-cache key, built from the SAME two producers production uses:
+/// the one advanced resolve and the one key function. Spelling the key by hand
+/// here would be a second key producer, and a test that guessed the key wrong
+/// would silently stop testing the cache.
+fn advanced_cache_key(query_src: &str, max_rows: usize, max_bytes: usize) -> String {
+    let crate::query::ResolvedAdvanced::Executable { query, .. } =
+        crate::query::resolve_advanced_source(query_src, None)
+    else {
+        panic!("the fixture advanced query resolves");
+    };
+    crate::query::simple_query_cache_key(
+        &crate::query::block_anchored_query(&query),
+        max_rows,
+        max_bytes,
+        crate::query::ConstructionProfile::default(),
+    )
+}
+
 #[test]
 fn advanced_query_reuses_cached_result_until_graph_changes() {
     let dir = scratch("adv-memo");
@@ -10043,45 +10061,44 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
     g.warm_cache();
     let q = r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#;
 
-    let first = g.run_advanced_query_cached(q, None);
-    let second = g.run_advanced_query_cached(q, None);
+    // §5.9: the advanced cache is keyed by the RESOLVED NORMALIZED IR and stores
+    // the pre-view rows. `ran`/`ignored` are a report about the source and are
+    // recomputed per call, so the shared value — the thing "served from the memo
+    // cache" now means — is the rows `Arc`.
+    let cached_rows = |max_rows: usize, max_bytes: usize| {
+        let key = advanced_cache_key(q, max_rows, max_bytes);
+        g.advanced_cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .results
+            .get(&key)
+            .unwrap()
+            .0
+            .groups
+            .clone()
+    };
+
+    let first_result = g.run_advanced_query_cached(q, None);
+    let first = cached_rows(usize::MAX, usize::MAX);
+    let _ = g.run_advanced_query_cached(q, None);
+    let second = cached_rows(usize::MAX, usize::MAX);
     assert!(
         Arc::ptr_eq(&first, &second),
         "identical advanced query should be served from the memo cache"
     );
-    assert_eq!(first.groups.len(), 1);
-    let bounded_key = format!("AQ\0{}\0{}\0n:\0{q}", 20_000, 32 * 1024 * 1024);
+    assert_eq!(first_result.groups.len(), 1);
     let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
-    let bounded_first = g
-        .advanced_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .results
-        .get(&bounded_key)
-        .unwrap()
-        .0
-        .result
-        .clone();
+    let bounded_first = cached_rows(20_000, 32 * 1024 * 1024);
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_unrelated = g.run_advanced_query_cached(q, None);
+    let _ = g.run_advanced_query_cached(q, None);
+    let after_unrelated = cached_rows(usize::MAX, usize::MAX);
     let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
-    let bounded_after_unrelated = g
-        .advanced_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .results
-        .get(&bounded_key)
-        .unwrap()
-        .0
-        .result
-        .clone();
+    let bounded_after_unrelated = cached_rows(20_000, 32 * 1024 * 1024);
     assert!(
         Arc::ptr_eq(&first, &after_unrelated),
         "an unrelated edit must retain the advanced-query memo"
@@ -10091,7 +10108,8 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.pre_block = Some("alias:: Renamed Scratch\n".into());
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_alias_change = g.run_advanced_query_cached(q, None);
+    let _ = g.run_advanced_query_cached(q, None);
+    let after_alias_change = cached_rows(usize::MAX, usize::MAX);
     assert!(
         !Arc::ptr_eq(&first, &after_alias_change),
         "a semantic alias change must invalidate graph-wide derived results"
@@ -10101,26 +10119,16 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DONE");
     g.save_page(&dto, dto.rev.as_deref()).unwrap();
 
-    let third = g.run_advanced_query_cached(q, None);
+    let third_result = g.run_advanced_query_cached(q, None);
+    let third = cached_rows(usize::MAX, usize::MAX);
     let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
-    let bounded_after_affected = g
-        .advanced_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .results
-        .get(&bounded_key)
-        .unwrap()
-        .0
-        .result
-        .clone();
+    let bounded_after_affected = cached_rows(20_000, 32 * 1024 * 1024);
     assert!(
         !Arc::ptr_eq(&first, &third),
         "graph mutation must invalidate the advanced-query memo"
     );
     assert!(!Arc::ptr_eq(&bounded_first, &bounded_after_affected));
-    assert!(third.groups.is_empty());
+    assert!(third_result.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -10208,6 +10216,58 @@ fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
     let after_affected = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
     assert!(!Arc::ptr_eq(&first.groups, &after_affected.groups));
     assert!(after_affected.groups.is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// §5.9's cache-key claim has two halves, and the second one is the one a
+/// coarse "bump a generation" invalidation would silently fail.
+///
+/// [`bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages`]
+/// checks that ONE query keeps its memo across an unrelated edit. This checks
+/// the cross-query direction: with TWO queries cached and one page edited, the
+/// query that page contributes to loses its entry and the query it cannot
+/// contribute to keeps its. Both directions are needed — an invalidation that
+/// clears everything passes the first test and fails this one, and an
+/// invalidation that clears nothing passes this one and fails the first.
+#[test]
+fn a_page_edit_evicts_only_the_memo_of_the_query_that_page_can_answer() {
+    let dir = scratch("scoped-memo-two-queries");
+    fs::write(
+        dir.join("pages").join("Roadmap.md"),
+        "tags:: work\n- TODO ship\n",
+    )
+    .unwrap();
+    fs::write(dir.join("pages").join("Errand.md"), "- TODO buy milk\n").unwrap();
+    let g = Graph::open(&dir);
+    g.warm_cache();
+
+    let tagged = || g.run_query_bounded("(page-tags work)", 20_000, 32 * 1024 * 1024);
+    let tasks = || g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+
+    let tagged_first = tagged();
+    let tasks_first = tasks();
+    assert_eq!(tagged_first.groups.len(), 1, "one tagged page");
+    assert_eq!(tasks_first.groups.len(), 2, "both pages carry a TODO");
+    assert!(Arc::ptr_eq(&tagged_first.groups, &tagged().groups));
+    assert!(Arc::ptr_eq(&tasks_first.groups, &tasks().groups));
+
+    // Errand carries no `tags::`, so it cannot contribute to `(page-tags work)`
+    // however it is edited; it does carry the TODO that `(task TODO)` returns.
+    let mut errand = g.load_named("Errand", PageKind::Page).unwrap().unwrap();
+    errand.blocks[0].raw = "DONE buy milk".into();
+    g.save_page(&errand, errand.rev.as_deref()).unwrap();
+
+    let tagged_after = tagged();
+    let tasks_after = tasks();
+    assert!(
+        Arc::ptr_eq(&tagged_first.groups, &tagged_after.groups),
+        "editing a page the query cannot match must leave that query's memo alone"
+    );
+    assert!(
+        !Arc::ptr_eq(&tasks_first.groups, &tasks_after.groups),
+        "editing a page the query DOES match must evict that query's memo"
+    );
+    assert_eq!(tasks_after.groups.len(), 1, "one TODO survives the edit");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -10392,21 +10452,11 @@ fn derived_and_advanced_memos_are_lru_bounded() {
     let g = Graph::open(&dir);
     for i in 0..(DERIVED_CACHE_MAX_ENTRIES + 20) {
         let _ = g.derived_memo(format!("test\0{i}"), Vec::new);
-        let _ = g.advanced_memo(format!("test\0{i}"), || crate::query::AdvancedResult {
-            groups: Vec::new(),
-            ran: Vec::new(),
-            ignored: Vec::new(),
-            supported: true,
-        });
+        let _ = g.advanced_memo(format!("test\0{i}"), Vec::new);
     }
     let oversized_key = "x".repeat(DERIVED_CACHE_MAX_ENTRY_BYTES / 2 + 1);
     let _ = g.derived_memo(oversized_key.clone(), Vec::new);
-    let _ = g.advanced_memo(oversized_key.clone(), || crate::query::AdvancedResult {
-        groups: Vec::new(),
-        ran: Vec::new(),
-        ignored: Vec::new(),
-        supported: true,
-    });
+    let _ = g.advanced_memo(oversized_key.clone(), Vec::new);
     let derived = g.derived_cache.read().unwrap();
     let advanced = g.advanced_cache.read().unwrap();
     assert_eq!(

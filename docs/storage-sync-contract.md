@@ -555,8 +555,9 @@ scheduled/deadline and presentation directives), literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
 inventory used by autocomplete and navigation. They also include the shared
 property-facet rows used by the query builder and editor autocomplete, and the
-PageRef simple-query candidate plan lowered through the same SQL read family in
-both storage regimes. The switched families further include page aliases and
+PageRef simple-query candidate plan, which managed storage lowers through the same SQL read family in
+both storage regimes and which Direct Files no longer uses for a query at all
+(see the Direct Files query route below). The switched families further include page aliases and
 real-page ownership, explicit backlink and safely tokenizable unlinked-reference
 candidate selection, persisted/runtime block-identity lookup, block-referrer
 candidates, and distinct-referrer counts. Once current, these families
@@ -584,14 +585,71 @@ also use that parser fallback. All other query, navigation, and search families 
 implementation until an equivalent generation-bound differential packet
 replaces and deletes each old route.
 
-When the exact current parser-cache generation is ready, every
-`SimpleQueryCandidatePlan::Indexed` plan obtains its candidate page set from the
-shared lowering and evaluates only those pages, unless the candidate set is
-larger than one thirty-second of the graph's page count or 32 pages, whichever
-is greater, in which case the projection read is abandoned and the parser
-fallback runs instead. `Empty` returns without projection or graph access. `All`
-uses the parser whole-graph evaluator. An unavailable, stale, failed, or raced
+**The Direct Files query route: three shapes, and no fourth.** When the
+worker has published the exact current parser-cache generation, ONE lowered SQL
+statement answers a simple `{{query ...}}` or advanced datalog query, whatever
+that query's shape. There is no cost test and no selectivity hatch in front of
+that decision. The statement selects the ANSWER, not a candidate page superset,
+so an unselective query costs what its answer costs; and a second engine kept
+alive for some class of queries would make the tree walk's retirement
+unreachable, which is the point of having a projection at all. The other two
+shapes already existed. A projection that is NOT ready — open reconciliation, a
+full rebuild, or the milliseconds after a save while the delta applies — is
+answered by the tree walk over the same query IR, with nothing scheduled,
+because the worker is already on its way and asking for a whole-graph snapshot
+on every keystroke after a save is the unrequested whole-graph work this route
+exists to remove. A read that was ATTEMPTED and did not answer is the
+failed-read shape below. A query the compiler does not lower is answered by the
+walk with nothing counted and nothing scheduled: nothing failed.
+
+**What one dispatched query reads.** One statement, plus one `Document` load per
+page the RESULT names — never a candidate superset and never a page the answer
+does not contain. Pages loaded equals result pages, and a hydration that loaded
+more refuses that read rather than serving a result it cannot account for.
+`@page`-shaped results load no document at all. Base order and within-page order
+are the caller's and are reproduced in the result construction, because the tree
+walk's base order is its page source's enumeration order and no projection
+column reproduces it; the statement therefore carries no `ORDER BY`, and the
+dispatched result equals the walk's result including order. The FTS-readiness
+signal the content predicates' candidate bounds depend on is probed through the
+same seam and remembered once per generation, never once per query — and only a
+READY observation is remembered, because readiness is monotonic within one
+projection file while a rebuild publishes a new generation.
+
+**A failed read recovers; it never refuses.** The in-scope scenarios are §3.1's:
+a torn or truncated projection file after a crash or power loss, a disk error, a
+resource limit, or a projection whose page set has drifted from the parsed
+cache. The projection is a disposable cache, so the answer is recovery. The
+fallback is counted, the tree walk answers the user's query, and the same
+full-snapshot enqueue the open path uses is scheduled from the already-parsed
+page cache — no reparse, no disk read, no user action, and no refusal reaches
+the user. Clearing readiness alone would not do: it leaves the projection
+unusable until the user happens to save a page. Every route out of a query
+passes through the one place that owns both obligations, so a later route cannot
+carry one and forget the other. An unavailable, stale, failed, or raced
 projection uses the parser fallback.
+
+**What a cached query result is keyed by.** A Direct Files simple or advanced
+query result is memoized PRE-VIEW — the matched rows in base order, before
+`sort-by` and `sample` — under the resolved normalized query IR, the
+parser-cache generation, the execution day, the construction bounds, the
+parse-config digest, and, when the query names a property, the observed-registry
+generation. The key is the IR and not the query text, so `(task TODO)`, `(and
+(task TODO))` and the datalog spelling of the same question are ONE entry, and a
+view-only edit re-sorts rows the cache already holds instead of recomputing
+them. The parse-config digest is unconditional, because
+`:journal/page-title-format` decides whether a page is a journal day at all and
+a query with no property leaf is still config-sensitive. A page edit evicts an
+entry when that page could contribute to the entry's own IR, judged by the same
+evaluator the query itself uses; a `tine.type::` change on a property-key page
+advances the registry generation and so evicts every typed query over that key.
+
+Managed storage still routes a `SimpleQueryCandidatePlan::Indexed` query through
+the candidate page set the shared lowering returns, evaluating only those pages
+unless the candidate set is larger than one thirty-second of the graph's page
+count or 32 pages, whichever is greater, in which case the projection read is
+abandoned and the parser fallback runs instead. `Empty` returns without
+projection or graph access. `All` uses the parser whole-graph evaluator.
 
 That cutoff is a cost decision, not a correctness one: both routes return the
 same answer, and abandoning simply returns the query to the behaviour it had
@@ -602,7 +660,9 @@ measured on the 1,045-file anonymized corpus, routing such a plan cost
 while every plan below the cutoff got between 1.6x and 13x faster. The cutoff
 scales with the graph because the walk it replaces costs one cheap in-memory
 predicate per page, so the route only wins while the candidate set is a small
-fraction of the whole.
+fraction of the whole. The Direct Files route above removes the reason for that
+cutoff rather than its symptom, and the cutoff goes with the candidate plan when
+managed storage stops using it.
 
 ## 2. Enrollment and synchronization state machine
 

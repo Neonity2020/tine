@@ -1786,9 +1786,50 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `#[cfg(test)]` module, which `without_test_items` blanks. No new write
     // crossing: the write-crossing table above is byte-identical, and the
     // certified dependency stays at v0.14.0.
+    // Re-pinned 2026-09-06 (query engine P1-d): §5.9's dispatch is the FIRST
+    // tine-core caller of the D-15 read-only statement seam, which the P1-a2
+    // note above predicted would appear here exactly now. It contributes five
+    // new read entries and changes one existing one; there is no new write
+    // crossing, and the write-crossing table above is byte-identical.
+    //   `direct_projection.rs`
+    //     `usetine_storage::sqlite::{…};`   widened by `PhysicalProjectionQueryReader`
+    //                                        and `PhysicalQueryValue` (1 changed entry)
+    //     `import-associated:PhysicalProjectionQueryReader::open(`   1 (new)
+    //     `import-associated:PhysicalQueryValue::Integer(`           1 (new)
+    //   `model.rs`
+    //     `usetine_storage::sqlite::PhysicalQueryValue;`             1 (new)
+    //     `import-associated:PhysicalQueryValue::Blob(`              1 (new)
+    //     `import-associated:PhysicalQueryValue::Text(`              1 (new)
+    // `PhysicalProjectionQueryReader` is the read-only handle: it exposes
+    // `open`, `run_projection_query` and `explain_query_plan` and cannot reach a
+    // writable connection, which is D-15's whole enforcement (the handle, not a
+    // statement validator). It is not in `write_capable_types`, and neither is
+    // `PhysicalQueryValue`, which is the BOUND-parameter enum §5.5 requires
+    // (I-22 — an interpolated statement is not expressible through it). The
+    // model-side entries are the two columns §5.3's hydration decodes from the
+    // statement's select list, the block id and the page path.
+    // Derived, not assumed, and two naming choices in the packet exist to keep
+    // this inventory truthful rather than to satisfy it:
+    //   * the seam's field is `statement_seam` and its local is `seam`, because
+    //     `direct_projection.rs` already holds the WRITE-CAPABLE
+    //     `PhysicalGraphProjectionDatabase` under the name `reader` and the
+    //     `storage-receiver:` scan attributes by receiver NAME (by substring, so
+    //     a `query_reader` field would have filed `run_projection_query` under
+    //     the writable handle). With the rename, `reader.as_ref`, `reader.lock`
+    //     and `reader.is_none` stay at 12 each, exactly as at `514e8495`.
+    //   * `model.rs` imports `PhysicalQueryValue` unaliased, because an `as`
+    //     rename mangles the identifier this scan extracts from the `use`
+    //     declaration and would have hidden both decode sites from the
+    //     inventory.
+    // The packet's other production edits name `tine_storage` not at all:
+    // `query.rs` splits the shared walk driver and adds the IR-keyed retention
+    // rule, `query/sql.rs` changes only §5.3's result-set spelling, and neither
+    // adds or removes a `PhysicalQueryValue` construction. The certified
+    // dependency stays at v0.14.0 — the seam has been on it since P1-a2 and
+    // nothing new is required to call it.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "4e7f1f8ce1432e83c5494b9de94849d6bf30343e7489cd878ae675100be858f4",
+        "6ddd2d721952301ccd11f8720c5824006ab0f372b05542a73513008165adacc7",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

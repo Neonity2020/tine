@@ -60,6 +60,12 @@ const LOGSEQ_TEXT_EXTENSIONS: [&str; 3] = ["md", "markdown", "org"];
 #[cfg(test)]
 thread_local! {
     static DIRECT_CANDIDATE_EVALUATED_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// §5.3's hydration census: the pages a DISPATCHED query loaded a `Document`
+    /// for. The claim it makes observable is I-13/I-15's — "pages loaded equals
+    /// result pages" — which production also enforces by refusing a mismatched
+    /// hydration, but a counter a test can read is what keeps the claim from
+    /// quietly becoming "pages loaded is at most the whole graph".
+    static DIRECT_HYDRATED_PAGES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// On-disk file format of a page. Markdown (`.md`/`.markdown`) is the default; Logseq org
@@ -3982,9 +3988,33 @@ struct DerivedCache {
     props_keys: std::collections::HashSet<String>,
     // `Arc<Vec<RefGroup>>` so serving a memoized result (every dataRev re-render)
     // is a refcount bump, not a deep clone of every matched block (see derived_memo).
-    results: std::collections::HashMap<String, (BoundedRefGroups, usize)>,
+    results: std::collections::HashMap<String, (DerivedEntry, usize)>,
     lru: std::collections::VecDeque<String>,
     bytes: usize,
+}
+
+/// One derived-cache value.
+///
+/// §5.9 stores the **pre-view** result of a simple/advanced query — the matched
+/// rows in base order, before `sort-by` and `sample` — so a view-only edit does
+/// not invalidate rows the view has not looked at yet. A `(sort-by modified …)`
+/// applied AFTER the cache still needs the recency axis its construction
+/// measured, so that axis travels with the rows. Every other entry family
+/// (backlinks, unlinked references, block referrers) has no view at all and
+/// carries an empty map.
+#[derive(Clone)]
+struct DerivedEntry {
+    result: BoundedRefGroups,
+    recency_by_page: Arc<std::collections::HashMap<String, i64>>,
+}
+
+impl DerivedEntry {
+    fn plain(result: BoundedRefGroups) -> DerivedEntry {
+        DerivedEntry {
+            result,
+            recency_by_page: Arc::new(std::collections::HashMap::new()),
+        }
+    }
 }
 
 /// One published registry snapshot plus what it was built from, so the refresh
@@ -4003,6 +4033,32 @@ struct PropertyRegistryState {
 /// The registry refresh debounce (§6.4): a burst of saves rebuilds once.
 const PROPERTY_REGISTRY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Which of SPEC §5.9's states one dispatched query attempt reached.
+enum DispatchedQuery {
+    /// The statement answered and its rows were hydrated.
+    Answered(crate::query::PreViewGroups),
+    /// No statement was run: the compiler declined this shape (a leaf family
+    /// this wave does not lower), or no projection is attached at all. Nothing
+    /// failed, so nothing is counted and nothing is scheduled.
+    Declined,
+    /// The projection is not ready at this cache generation.
+    NotReady,
+    /// A read was attempted and did not answer. Counted, and recovered.
+    FailedRead,
+}
+
+/// The order [`Graph::direct_projection_pages_for_paths_ordered`] returns loaded
+/// pages in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageLoadOrder {
+    /// The order the caller listed the paths in.
+    AsRequested,
+    /// The graph's own page enumeration order — the order the walk visits pages
+    /// in, and therefore the order a dispatched query has to charge its
+    /// construction budget in (§5.9).
+    GraphSnapshot,
+}
+
 /// Which half of the C6 cache identity an entry needs.
 ///
 /// The config digest is part of EVERY entry's identity (E6); the registry
@@ -4013,8 +4069,11 @@ enum CacheSensitivity {
     /// A derived-cache key of the shape `<tag>\0…`; the query key shapes carry
     /// the query source and are parsed once, at insert.
     Plain,
-    /// An advanced-query key: `<tag>\0<page-key>\0<bounds>\0<source>`.
-    Advanced,
+    /// The caller already parsed the query and knows the answer (§5.9's
+    /// IR-keyed entries): the key carries serialized IR, not a query source, so
+    /// re-deriving this from the key would mean a second deserialization per
+    /// insert to learn something the caller was holding.
+    Known(bool),
 }
 
 impl CacheSensitivity {
@@ -4027,7 +4086,7 @@ impl CacheSensitivity {
                 Some(("Q" | "SQ", rest)) => rest.splitn(3, '\0').nth(2),
                 _ => None,
             },
-            CacheSensitivity::Advanced => key.split('\0').next_back(),
+            CacheSensitivity::Known(props) => return props,
         };
         source.is_some_and(crate::query::query_source_has_props_leaf)
     }
@@ -4072,9 +4131,18 @@ struct AdvancedCache {
     bytes: usize,
 }
 
+/// One advanced-cache value: §5.9's PRE-VIEW result, the matched rows in base
+/// order.
+///
+/// `ran`/`ignored`/`supported` are deliberately NOT stored. They are a report
+/// about the SOURCE, and the key is the RESOLVED IR — two datalog spellings can
+/// lower to one filter and still list different `ignored` clauses, so storing
+/// the report would let one spelling's clause list be shown beside another's
+/// rows. The resolve that produced the key recomputes it on every call, which is
+/// what makes "one question, one entry" safe here.
 #[derive(Clone)]
 struct CachedAdvancedResult {
-    result: Arc<crate::query::AdvancedResult>,
+    groups: Arc<Vec<RefGroup>>,
     total: usize,
     exceeded: bool,
 }
@@ -6309,6 +6377,286 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
 
+    /// **SPEC §5.9's Direct Files dispatch, in ONE place.**
+    ///
+    /// Every route out of a simple or advanced query goes through here — ready,
+    /// declined, not ready, failed — so that a future arm cannot
+    /// forget the two obligations a fallback carries. Today's code is why that
+    /// matters and not a stylistic preference: `run_query`'s sparse-task arm and
+    /// `run_query_bounded`'s fell back with a bare `map_or_else`/`unwrap_or_else`
+    /// and never called `note_fallback_read`, so a FAILED sparse read scheduled
+    /// no recovery and the projection could sit unusable until the next save.
+    ///
+    /// The three §5.9 states, and what each owes:
+    ///
+    /// * **ready** — the statement answers. Full stop: there is no fourth route
+    ///   and no cost test in front of it (§5.9's first line, "exactly today's
+    ///   shapes … no third route", and §5.10's refusal of "a new walk route" for
+    ///   the transient FTS-building class). The walk survives only as the
+    ///   recovery path and the test oracle, and its retirement is carded (Q18);
+    ///   a dispatch that permanently needed it for some class of queries would
+    ///   make that retirement unreachable. A slow unbounded shape is a reason to
+    ///   make the statement faster or to add an index, never a reason to keep a
+    ///   second engine alive. `SqlQuery::positively_bounded` stays §5.7's
+    ///   plan-gate concept and a diagnostic; it is not an input here.
+    /// * **not ready** (open reconciliation, a full rebuild, or the
+    ///   milliseconds after each save while the delta applies) — the walk
+    ///   answers over the SAME IR. The fallback is counted, and nothing is
+    ///   scheduled: the worker is already on its way, and asking for a
+    ///   whole-graph snapshot on every keystroke after a save is the unrequested
+    ///   whole-graph work this campaign exists to delete (I-13).
+    /// * **failed read** — the walk answers AND full-snapshot recovery is
+    ///   scheduled through `direct_projection_enqueue_full`, the same call the
+    ///   open path makes. `mark_stale` alone would only clear `ready` and strand
+    ///   the projection (M9). **In-scope scenario** (AGENTS §5): a torn or
+    ///   truncated projection file after a crash or power loss, a disk error, or
+    ///   a projection whose page set has drifted from the parsed cache. The
+    ///   projection is disposable derived state (D-3), so the answer is recovery
+    ///   and never refusal — the user's query is answered by the walk either
+    ///   way, and no refusal reaches them.
+    fn direct_simple_query_pre_view(
+        &self,
+        query: &crate::query::ir::Query,
+        today: crate::date::JournalDate,
+        max_rows: usize,
+        max_bytes: usize,
+        profile: crate::query::ConstructionProfile,
+    ) -> crate::query::PreViewGroups {
+        let walk = |graph: &Graph| {
+            crate::query::collect_pred_bounded_over(
+                &crate::query::GraphQueryPages(graph),
+                query,
+                today,
+                max_rows,
+                max_bytes,
+                profile,
+            )
+        };
+        match self.direct_projection_statement_pre_view(query, today, max_rows, max_bytes, profile)
+        {
+            DispatchedQuery::Answered(pre) => pre,
+            // The compiler declined this shape, or there is no projection to
+            // ask. Nothing failed and nothing is stale, so there is no fallback
+            // to count and no recovery to schedule.
+            DispatchedQuery::Declined => walk(self),
+            DispatchedQuery::NotReady => {
+                self.direct_projection_note_fallback_read();
+                walk(self)
+            }
+            DispatchedQuery::FailedRead => {
+                self.direct_projection_note_fallback_read();
+                self.direct_projection_recover_after_failed_read();
+                walk(self)
+            }
+        }
+    }
+
+    /// The statement half of [`Graph::direct_simple_query_pre_view`]: lower,
+    /// run, hydrate. It performs no fallback of its own — it only reports which
+    /// §5.9 state it reached, so the note and the recovery live in exactly one
+    /// place.
+    fn direct_projection_statement_pre_view(
+        &self,
+        query: &crate::query::ir::Query,
+        today: crate::date::JournalDate,
+        max_rows: usize,
+        max_bytes: usize,
+        profile: crate::query::ConstructionProfile,
+    ) -> DispatchedQuery {
+        use crate::query::sql::{lower_query, Lowered, LoweringInputs, RESULT_SET_RULE};
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        else {
+            // No projection is attached at all (an export, a test graph, a
+            // headless tool). There is nothing to be ready or to fail.
+            return DispatchedQuery::Declined;
+        };
+        if !projection.ready_at(generation) {
+            return DispatchedQuery::NotReady;
+        }
+        // §4.4/§6.2: ONE registry snapshot and ONE parse of every `content match`
+        // payload for this execution — the same values the walk reads, never a
+        // second parse (I-12).
+        let registry = self.property_registry();
+        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let inputs = LoweringInputs {
+            today,
+            registry: &registry,
+            // Direct Files has no unaccepted local overlay; masking is Managed
+            // Storage's read-your-writes route (§5.9), which is P1-e's.
+            masked_pages: &[],
+            // NOT `max_rows`: the walk reports `total` as the number of matches
+            // it SAW, not the number it admitted, so a `LIMIT` in the statement
+            // would silently truncate the count the user is shown. The bounds
+            // are charged during hydration instead, by the same
+            // `ConstructionBudget` the walk charges.
+            cutoff: None,
+            compiled: &compiled,
+            fts_ready: projection.fts_ready(generation),
+            result_set_rule: RESULT_SET_RULE,
+        };
+        // §5.9: when the projection is ready and the statement lowers, the
+        // statement answers. `statement.positively_bounded` is deliberately NOT
+        // consulted — it is §5.7's plan-gate concept, and reading it here would
+        // be the fourth route ("ready but unbounded") that §5.9's first line and
+        // §5.10 both forbid.
+        let Lowered::Statement(statement) = lower_query(query, &inputs) else {
+            return DispatchedQuery::Declined;
+        };
+        // A filter that folded to false — an invalid query's zero results
+        // (§3.5), or a leaf that can never hold — has an answer already. Reading
+        // the projection to be told `0 rows` is the same answer at the price of
+        // a round trip (I-15).
+        if statement.matches_nothing {
+            return DispatchedQuery::Answered(crate::query::PreViewGroups::default());
+        }
+        let rows = match projection.run_statement(generation, &statement.sql, &statement.params) {
+            crate::direct_projection::StatementRead::Rows(rows) => rows,
+            crate::direct_projection::StatementRead::NotReady => return DispatchedQuery::NotReady,
+            crate::direct_projection::StatementRead::Failed => return DispatchedQuery::FailedRead,
+        };
+        self.hydrate_direct_statement_rows(generation, rows, max_rows, max_bytes, profile)
+    }
+
+    /// §5.3's block hydration (M8). The statement answered `(block_id, page_id,
+    /// name, text_kind, path)` rows; group them by page, load exactly those
+    /// pages' already-parsed documents, and collect the named blocks.
+    ///
+    /// **Cost is O(result pages), never a candidate superset**, and the guard
+    /// below says so in a way that can fail: a hydration that loaded more pages
+    /// than the result named would be the whole-graph walk this campaign exists
+    /// to delete, wearing a different hat (I-13, I-15).
+    fn hydrate_direct_statement_rows(
+        &self,
+        generation: u64,
+        rows: Vec<Vec<tine_storage::sqlite::PhysicalQueryValue>>,
+        max_rows: usize,
+        max_bytes: usize,
+        profile: crate::query::ConstructionProfile,
+    ) -> DispatchedQuery {
+        // Named in full rather than aliased: the tine-storage boundary census
+        // records `<ImportedName>::Variant(` call sites, and an `as` rename
+        // hides them from that inventory.
+        use tine_storage::sqlite::PhysicalQueryValue;
+        // Group by the page's relative path — the key
+        // `direct_projection_pages_for_paths` loads by, which is why §5.3 puts
+        // `pages.path` in the select list.
+        let mut by_path: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (Some(PhysicalQueryValue::Blob(block_id)), Some(PhysicalQueryValue::Text(path))) =
+                (row.first(), row.get(4))
+            else {
+                // The row shape is the lowering's own select list. A row that
+                // does not have it means the statement and this reader disagree
+                // about the projection, which is a failed read and not an empty
+                // answer.
+                return DispatchedQuery::FailedRead;
+            };
+            let Ok(uuid) = Uuid::from_slice(block_id) else {
+                return DispatchedQuery::FailedRead;
+            };
+            by_path
+                .entry(PathBuf::from(path))
+                .or_default()
+                .insert(uuid.to_string());
+        }
+        if by_path.is_empty() {
+            return DispatchedQuery::Answered(crate::query::PreViewGroups::default());
+        }
+        let result_pages = by_path.len();
+        let paths: Vec<PathBuf> = by_path.keys().cloned().collect();
+        let Some(pages) = self.direct_projection_pages_for_paths_ordered(
+            generation,
+            paths,
+            PageLoadOrder::GraphSnapshot,
+        ) else {
+            // `pages_for_paths` collapses two very different things into `None`.
+            // A generation that moved under the read is not a defect — the
+            // snapshot straddled a rebuild, the walk answers, and the worker is
+            // already producing the next one. A page the hydration cannot load
+            // at an UNCHANGED generation is the other kind: the projection names
+            // a page the parsed cache does not have, so the projection is wrong
+            // and §5.9 says to recover it.
+            return if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
+                DispatchedQuery::FailedRead
+            } else {
+                DispatchedQuery::NotReady
+            };
+        };
+        // **The guard (I-13, I-15).** Pages loaded must equal the pages the
+        // RESULT named. This is the assertion that keeps the hydration honest:
+        // it is the difference between "load the answer's pages" and "load a
+        // candidate superset and filter in Rust", and the second one is what the
+        // dispatched path replaces.
+        if pages.len() != result_pages {
+            return DispatchedQuery::FailedRead;
+        }
+        #[cfg(test)]
+        DIRECT_HYDRATED_PAGES.with(|recorded| {
+            *recorded.borrow_mut() = pages
+                .iter()
+                .map(|(entry, _)| PathBuf::from(&entry.rel_path))
+                .collect();
+        });
+        let empty = std::collections::HashSet::new();
+        // The recency axis is the WALK'S producer, called on the WALK'S input —
+        // `GraphQueryPages::for_each_page` computes exactly this per matched
+        // page. A second spelling here (the `JournalFormat::page_recency_secs`
+        // the candidate path uses, say) would be a second answer to a question
+        // that already has one, and it would show up as a `(sort-by modified …)`
+        // that reorders when the projection happens to be ready (I-12).
+        let recency: Vec<Box<dyn Fn() -> i64 + '_>> = pages
+            .iter()
+            .map(|(entry, _)| {
+                Box::new(move || crate::query::page_recency_secs(entry)) as Box<dyn Fn() -> i64>
+            })
+            .collect();
+        let result_pages: Vec<crate::query::SqlResultPage<'_>> = pages
+            .iter()
+            .zip(&recency)
+            .map(|((entry, document), recency)| crate::query::SqlResultPage {
+                name: &entry.name,
+                kind: entry.kind,
+                roots: &document.roots,
+                matched: by_path.get(Path::new(&entry.rel_path)).unwrap_or(&empty),
+                recency: recency.as_ref(),
+            })
+            .collect();
+        let pre =
+            crate::query::hydrate_sql_result_pages(&result_pages, max_rows, max_bytes, profile);
+        // The generation is re-checked after the hydration for the same reason
+        // every other projection reader re-checks it: a snapshot that straddles
+        // a rebuild is not a snapshot.
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return DispatchedQuery::NotReady;
+        }
+        DispatchedQuery::Answered(pre)
+    }
+
+    /// §5.9/M9: schedule the recovery a FAILED projection read owes.
+    ///
+    /// `mark_stale` alone only clears `ready`, which would leave the projection
+    /// unusable until the user happened to save a page. This is the same
+    /// full-snapshot enqueue the open path makes, from the same already-parsed
+    /// cache — no reparse, no disk read, no user action.
+    fn direct_projection_recover_after_failed_read(&self) {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) else {
+            // Nothing is warm to rebuild FROM; clearing `ready` is all that is
+            // available, and the next warm cache enqueues a full snapshot anyway.
+            self.direct_projection_mark_stale();
+            return;
+        };
+        let revisions = self.disk_revs.read().unwrap().clone();
+        self.direct_projection_enqueue_full(generation, pages, Arc::new(revisions));
+    }
+
     fn direct_projection_note_fallback_read(&self) {
         if let Some(projection) = self
             .direct_projection
@@ -6369,6 +6717,29 @@ impl Graph {
         generation: u64,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        self.direct_projection_pages_for_paths_ordered(
+            generation,
+            paths,
+            PageLoadOrder::AsRequested,
+        )
+    }
+
+    /// [`Graph::direct_projection_pages_for_paths`], with a say in the ORDER the
+    /// loaded pages come back in.
+    ///
+    /// Every pre-existing caller wants the order it asked in (source-path order,
+    /// which is what the reference accumulators charge their budget in).
+    /// §5.9's dispatched query wants [`PageLoadOrder::GraphSnapshot`] instead:
+    /// the walk visits pages in the graph's own page enumeration order and
+    /// charges its construction budget in that order, so a dispatched result
+    /// that hydrated in a different order could admit a DIFFERENT set of rows
+    /// once the budget truncates. Same rows in, same rows out.
+    fn direct_projection_pages_for_paths_ordered(
+        &self,
+        generation: u64,
+        paths: impl IntoIterator<Item = PathBuf>,
+        order: PageLoadOrder,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
         let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             return None;
@@ -6383,8 +6754,12 @@ impl Graph {
             if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
                 return None;
             }
-            pages.push(page.clone());
+            pages.push((slot, page.clone()));
         }
+        if order == PageLoadOrder::GraphSnapshot {
+            pages.sort_by_key(|(slot, _)| *slot);
+        }
+        let pages = pages.into_iter().map(|(_, page)| page).collect();
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
     }
 
@@ -6508,6 +6883,16 @@ impl Graph {
             .map_or(0, |projection| projection.indexed_reads())
     }
 
+    /// §5.9: how many user queries the dispatched statement ANSWERED.
+    #[cfg(test)]
+    pub(crate) fn direct_projection_statement_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.statement_reads())
+    }
+
     #[cfg(test)]
     pub(crate) fn direct_projection_fallback_reads_test(&self) -> u64 {
         self.direct_projection
@@ -6538,7 +6923,32 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn reset_direct_projection_candidate_probe_test(&self) {
         DIRECT_CANDIDATE_EVALUATED_PATHS.with(|paths| paths.borrow_mut().clear());
+        DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow_mut().clear());
         crate::query::reset_full_graph_query_evaluations();
+    }
+
+    /// Drop both query memos, so the next query is measured cold. The paired
+    /// walk-vs-dispatch receipt has to compare two COMPUTATIONS, not a
+    /// computation against a cache hit.
+    #[cfg(test)]
+    pub(crate) fn clear_query_memos_test(&self) {
+        *self.derived_cache.write().unwrap() = None;
+        *self.advanced_cache.write().unwrap() = None;
+    }
+
+    /// §5.3: exactly the pages the last dispatched query hydrated.
+    #[cfg(test)]
+    pub(crate) fn direct_projection_hydrated_pages_test(&self) -> Vec<std::path::PathBuf> {
+        DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow().clone())
+    }
+
+    /// §5.9: make the NEXT read through the statement seam fail, as a torn or
+    /// truncated projection file, a disk error or a resource limit would.
+    #[cfg(test)]
+    pub(crate) fn direct_projection_inject_read_failure_test(&self) {
+        if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+            projection.inject_next_statement_failure();
+        }
     }
 
     #[cfg(test)]
@@ -15253,6 +15663,7 @@ impl Graph {
                 // otherwise. Comparing both parsed documents makes omitted overflow
                 // matches visible without retaining a graph-sized membership set.
                 if result
+                    .result
                     .groups
                     .iter()
                     .any(|grp| crate::refs::same_page(&grp.page, pname))
@@ -15278,13 +15689,21 @@ impl Graph {
                     Some(("br", uuid)) => {
                         crate::query::page_affects_block_referrers(uuid, candidate)
                     }
-                    Some(("q", source)) => crate::query::page_affects_query(
-                        source,
-                        entry,
-                        candidate,
-                        &parse_config,
-                        &registry,
-                    ),
+                    // §5.9: one query key family, carrying the resolved
+                    // normalized IR after its four structural fields
+                    // (`simple_query_cache_key`). The retention rule reads the
+                    // IR back instead of re-parsing a query source, which is
+                    // what makes the keep/evict decision independent of the
+                    // dialect the query happened to be written in.
+                    Some(("q", rest)) => rest.splitn(5, '\0').nth(4).is_none_or(|ir| {
+                        crate::query::page_affects_query_ir(
+                            ir,
+                            entry,
+                            candidate,
+                            &parse_config,
+                            &registry,
+                        )
+                    }),
                     Some(("B", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|target| {
                         crate::query::page_affects_backlinks(
                             &real_pages,
@@ -15301,15 +15720,6 @@ impl Graph {
                             target,
                             entry,
                             candidate,
-                        )
-                    }),
-                    Some(("Q", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|source| {
-                        crate::query::page_affects_query(
-                            source,
-                            entry,
-                            candidate,
-                            &parse_config,
-                            &registry,
                         )
                     }),
                     Some(("R", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|uuid| {
@@ -15352,7 +15762,6 @@ impl Graph {
         let mut removed_bytes = 0usize;
         advanced.results.retain(|key, (result, result_bytes)| {
             if result
-                .result
                 .groups
                 .iter()
                 .any(|group| crate::refs::same_page(&group.page, &entry.name))
@@ -15360,26 +15769,19 @@ impl Graph {
                 removed_bytes = removed_bytes.saturating_add(*result_bytes);
                 return false;
             }
-            // Split only structural fields; the final query source is opaque and
-            // may itself contain NUL bytes. Treating it as another delimiter used
-            // to make warm invalidation evaluate a truncated query.
-            let (page_key, query_src) = if let Some(rest) = key.strip_prefix("aq\0") {
-                rest.split_once('\0')
-                    .map_or((None, None), |(page, query)| (Some(page), Some(query)))
-            } else if let Some(rest) = key.strip_prefix("AQ\0") {
-                let mut parts = rest.splitn(4, '\0');
-                let _max_rows = parts.next();
-                let _max_bytes = parts.next();
-                (parts.next(), parts.next())
-            } else {
-                (None, None)
-            };
+            // §5.9: the advanced cache is keyed by the SAME resolved normalized
+            // IR the simple cache is (`simple_query_cache_key`), so it is judged
+            // by the SAME retention rule — one question, one keep/evict answer,
+            // whichever dialect asked it. Split only the four structural fields;
+            // the serialized IR that follows them is opaque.
+            let query_ir = key
+                .split_once('\0')
+                .filter(|(tag, _)| *tag == "q")
+                .and_then(|(_, rest)| rest.splitn(5, '\0').nth(4));
             let page_affects = |candidate: &Document| {
-                page_key.zip(query_src).is_none_or(|(page_key, query_src)| {
-                    let current_page = page_key.strip_prefix("p:");
-                    crate::query::page_affects_advanced_query(
-                        query_src,
-                        current_page,
+                query_ir.is_none_or(|ir| {
+                    crate::query::page_affects_query_ir(
+                        ir,
                         entry,
                         candidate,
                         &parse_config,
@@ -15657,14 +16059,73 @@ impl Graph {
         self.derived_memo_bounded_typed(key, CacheSensitivity::Plain, compute)
     }
 
-    /// The C6 cache identity: `(cache_gen, today, ParseConfig::digest(),
-    /// registry generation iff the entry is `props`-sensitive)`.
     fn derived_memo_bounded_typed(
         &self,
         key: String,
         sensitivity: CacheSensitivity,
         compute: impl FnOnce() -> crate::query::BoundedGroups,
     ) -> BoundedRefGroups {
+        self.derived_memo_entry(key, sensitivity, || {
+            let computed = compute();
+            DerivedEntry::plain(BoundedRefGroups {
+                groups: Arc::new(computed.groups),
+                total: computed.total,
+                exceeded: computed.exceeded,
+            })
+        })
+        .result
+    }
+
+    /// §5.9's PRE-VIEW memo: the matched rows in base order, keyed by the
+    /// resolved normalized IR and the construction bounds, with the view applied
+    /// AFTER the cache.
+    ///
+    /// The `Arc` matters here and is the reason base order is inside the cached
+    /// value rather than outside it: a query with no `sort-by` and no `sample` —
+    /// which is nearly all of them — hands back the very `Arc` it stored, so
+    /// every re-render is a refcount bump. Only a query that actually carries a
+    /// view directive pays for a copy, and it pays it for its own view rather
+    /// than for a recomputation.
+    fn derived_memo_pre_view(
+        &self,
+        query: &crate::query::ir::Query,
+        view: &crate::query::ir::ViewSettings,
+        max_rows: usize,
+        max_bytes: usize,
+        compute: impl FnOnce(crate::query::ConstructionProfile) -> crate::query::PreViewGroups,
+    ) -> BoundedRefGroups {
+        let profile = crate::query::ConstructionProfile::from_view(view);
+        let key = crate::query::simple_query_cache_key(query, max_rows, max_bytes, profile);
+        let sensitivity = CacheSensitivity::Known(query.filter.has_props_leaf());
+        let entry = self.derived_memo_entry(key, sensitivity, || {
+            let mut pre = compute(profile);
+            crate::query::base_order_groups(&mut pre.groups);
+            DerivedEntry {
+                result: BoundedRefGroups {
+                    groups: Arc::new(pre.groups),
+                    total: pre.total,
+                    exceeded: pre.exceeded,
+                },
+                recency_by_page: Arc::new(pre.recency_by_page),
+            }
+        });
+        crate::query::apply_cached_view(
+            &entry.result.groups,
+            &entry.recency_by_page,
+            view,
+            entry.result.total,
+            entry.result.exceeded,
+        )
+    }
+
+    /// The C6 cache identity: `(cache_gen, today, ParseConfig::digest(),
+    /// registry generation iff the entry is `props`-sensitive)`.
+    fn derived_memo_entry(
+        &self,
+        key: String,
+        sensitivity: CacheSensitivity,
+        compute: impl FnOnce() -> DerivedEntry,
+    ) -> DerivedEntry {
         use std::sync::atomic::Ordering;
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
@@ -15690,13 +16151,8 @@ impl Graph {
                 }
             }
         }
-        let computed = compute();
-        let result = BoundedRefGroups {
-            groups: Arc::new(computed.groups),
-            total: computed.total,
-            exceeded: computed.exceeded,
-        };
-        let result_bytes = ref_groups_estimated_bytes(result.groups.as_slice())
+        let result = compute();
+        let result_bytes = ref_groups_estimated_bytes(result.result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
             return result;
@@ -15761,7 +16217,8 @@ impl Graph {
     fn advanced_memo_bounded(
         &self,
         key: String,
-        compute: impl FnOnce() -> (crate::query::AdvancedResult, bool, usize),
+        sensitivity: CacheSensitivity,
+        compute: impl FnOnce() -> crate::query::BoundedGroups,
     ) -> CachedAdvancedResult {
         use std::sync::atomic::Ordering;
         let gen = self.cache_gen.load(Ordering::Acquire);
@@ -15788,20 +16245,18 @@ impl Graph {
                 }
             }
         }
-        let (computed, exceeded, total) = compute();
+        let computed = compute();
         let result = CachedAdvancedResult {
-            result: Arc::new(computed),
-            total,
-            exceeded,
+            groups: Arc::new(computed.groups),
+            total: computed.total,
+            exceeded: computed.exceeded,
         };
-        let result_bytes = ref_groups_estimated_bytes(&result.result.groups)
-            .saturating_add(result.result.ran.iter().map(String::len).sum::<usize>())
-            .saturating_add(result.result.ignored.iter().map(String::len).sum::<usize>())
+        let result_bytes = ref_groups_estimated_bytes(result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
             return result;
         }
-        let props = CacheSensitivity::Advanced.is_props_sensitive(&key);
+        let props = sensitivity.is_props_sensitive(&key);
         let mut g = self.advanced_cache.write().unwrap();
         match g.as_mut() {
             Some(dc) if dc.gen == gen && dc.today == today && dc.config_digest == config_digest => {
@@ -15844,14 +16299,18 @@ impl Graph {
     fn advanced_memo(
         &self,
         key: String,
-        compute: impl FnOnce() -> crate::query::AdvancedResult,
-    ) -> Arc<crate::query::AdvancedResult> {
-        self.advanced_memo_bounded(key, || {
-            let result = compute();
-            let total = result.groups.iter().map(|group| group.blocks.len()).sum();
-            (result, false, total)
+        compute: impl FnOnce() -> Vec<RefGroup>,
+    ) -> Arc<Vec<RefGroup>> {
+        self.advanced_memo_bounded(key, CacheSensitivity::Known(false), || {
+            let groups = compute();
+            let total = groups.iter().map(|group| group.blocks.len()).sum();
+            crate::query::BoundedGroups {
+                groups,
+                total,
+                exceeded: false,
+            }
         })
-        .result
+        .groups
     }
 
     fn run_advanced_query_cached(
@@ -15859,20 +16318,9 @@ impl Graph {
         query_src: &str,
         current_page: Option<&str>,
     ) -> Arc<crate::query::AdvancedResult> {
-        if !crate::query::query_source_within_limit(query_src) {
-            return Arc::new(crate::query::rejected_advanced_query("query-too-large"));
-        }
-        if !crate::query::query_nesting_within_limit(query_src) {
-            return Arc::new(crate::query::rejected_advanced_query(
-                "query-nesting-too-deep",
-            ));
-        }
-        let page_key = current_page
-            .map(|p| format!("p:{}", crate::refs::page_key(p)))
-            .unwrap_or_else(|| "n:".to_string());
-        self.advanced_memo(format!("aq\0{page_key}\0{query_src}"), || {
-            crate::query::run_advanced_query(self, query_src, current_page)
-        })
+        let (result, _, _) =
+            self.advanced_query_cached(query_src, current_page, usize::MAX, usize::MAX);
+        Arc::new(result)
     }
 
     pub fn run_advanced_query_bounded_cached(
@@ -15882,37 +16330,59 @@ impl Graph {
         max_rows: usize,
         max_bytes: usize,
     ) -> (crate::query::AdvancedResult, bool, usize) {
-        if !crate::query::query_source_within_limit(query_src) {
-            return (
-                crate::query::rejected_advanced_query("query-too-large"),
-                false,
-                0,
-            );
-        }
-        if !crate::query::query_nesting_within_limit(query_src) {
-            return (
-                crate::query::rejected_advanced_query("query-nesting-too-deep"),
-                false,
-                0,
-            );
-        }
-        let page_key = current_page
-            .map(|page| format!("p:{}", crate::refs::page_key(page)))
-            .unwrap_or_else(|| "n:".to_string());
-        let cached = self.advanced_memo_bounded(
-            format!("AQ\0{max_rows}\0{max_bytes}\0{page_key}\0{query_src}"),
-            || {
-                crate::query::run_advanced_query_bounded(
-                    self,
-                    query_src,
-                    current_page,
-                    max_rows,
-                    max_bytes,
-                )
-            },
-        );
+        self.advanced_query_cached(query_src, current_page, max_rows, max_bytes)
+    }
+
+    /// **SPEC §5.9's Direct Files entry point for an advanced (datalog) query.**
+    /// Resolve once, key by the resolved normalized IR, dispatch, report.
+    ///
+    /// It is the SAME dispatch and the SAME key shape the `{{query …}}` route
+    /// uses, because §4.4 resolves a datalog source to the SAME IR: an advanced
+    /// `(task ?b #{"TODO"})` and an OG `(task TODO)` are one question, so they
+    /// take one engine and one answer (I-12, I-19). Only the cache MAP differs —
+    /// advanced results carry the clause report and are kept on their own LRU
+    /// budget, as they are today.
+    ///
+    /// The advanced route carries no view directives, so its pre-view result IS
+    /// its result and the construction profile is the default one.
+    fn advanced_query_cached(
+        &self,
+        query_src: &str,
+        current_page: Option<&str>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> (crate::query::AdvancedResult, bool, usize) {
+        let (query, today, ran, ignored) =
+            match crate::query::resolve_advanced_source(query_src, current_page) {
+                crate::query::ResolvedAdvanced::Refused(result) => return (result, false, 0),
+                crate::query::ResolvedAdvanced::Executable {
+                    query,
+                    today,
+                    ran,
+                    ignored,
+                } => (query, today, ran, ignored),
+            };
+        let query = crate::query::block_anchored_query(&query);
+        let profile = crate::query::ConstructionProfile::default();
+        let key = crate::query::simple_query_cache_key(&query, max_rows, max_bytes, profile);
+        let sensitivity = CacheSensitivity::Known(query.filter.has_props_leaf());
+        let cached = self.advanced_memo_bounded(key, sensitivity, || {
+            let mut pre =
+                self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile);
+            crate::query::base_order_groups(&mut pre.groups);
+            crate::query::BoundedGroups {
+                groups: pre.groups,
+                total: pre.total,
+                exceeded: pre.exceeded,
+            }
+        });
         (
-            cached.result.as_ref().clone(),
+            crate::query::AdvancedResult {
+                groups: cached.groups.as_ref().clone(),
+                ran,
+                ignored,
+                supported: true,
+            },
             cached.exceeded,
             cached.total,
         )
@@ -15961,52 +16431,27 @@ impl Graph {
 
     /// Evaluate a `{{query ...}}` body over the graph (memoized).
     pub fn run_query(&self, query_src: &str) -> Arc<Vec<RefGroup>> {
-        if !crate::query::query_source_within_limit(query_src)
-            || !crate::query::query_nesting_within_limit(query_src)
-        {
-            return Arc::new(Vec::new());
-        }
-        if crate::query::sparse_task_query_eligibility(query_src).is_some()
-            && self.direct_projection_ready()
-        {
-            return self.derived_memo(format!("sq\0{query_src}"), || {
-                self.direct_projection_sparse_task_query(query_src, usize::MAX, usize::MAX)
-                    .map_or_else(
-                        || crate::query::run_query(self, query_src),
-                        |result| result.groups,
-                    )
-            });
-        }
-        let plan = crate::query::simple_query_candidate_plan(query_src);
-        match plan {
-            crate::query::SimpleQueryCandidatePlan::Empty => return Arc::new(Vec::new()),
-            crate::query::SimpleQueryCandidatePlan::Indexed(_) => {
-                if self.direct_projection_ready() {
-                    return self.derived_memo(format!("q\0{query_src}"), || {
-                        self.direct_projection_candidate_query(
-                            &plan,
-                            query_src,
-                            usize::MAX,
-                            usize::MAX,
-                        )
-                        .map_or_else(
-                            || {
-                                self.direct_projection_note_fallback_read();
-                                crate::query::run_query(self, query_src)
-                            },
-                            |result| result.groups,
-                        )
-                    });
-                }
-                self.direct_projection_note_fallback_read();
-            }
-            crate::query::SimpleQueryCandidatePlan::All => {}
-        }
-        self.derived_memo(format!("q\0{query_src}"), || {
-            crate::query::run_query(self, query_src)
-        })
+        self.run_query_bounded(query_src, usize::MAX, usize::MAX)
+            .groups
     }
 
+    /// **SPEC §5.9's Direct Files entry point.** Parse once, key by the resolved
+    /// normalized IR, dispatch, apply the view.
+    ///
+    /// The four things that changed here, and why each is not a refactor:
+    ///
+    /// 1. **One parse.** The source is parsed ONCE and the IR travels: the
+    ///    dispatch lowers the same tree the walk evaluates, so the two engines
+    ///    cannot be handed different queries (I-12).
+    /// 2. **The key is the IR, not the text.** `(task TODO)`, `(and (task
+    ///    TODO))` and TQL `task = 'TODO'` are one question and now one cache
+    ///    entry.
+    /// 3. **The cached value is pre-view.** Adding `(sort-by …)` to a query
+    ///    re-sorts rows the cache already holds instead of recomputing them.
+    /// 4. **The candidate planner is gone from this path.** It selected a page
+    ///    SUPERSET for the walk; the statement selects the ANSWER. (The planner
+    ///    itself is still alive and still reachable — Managed Storage uses it,
+    ///    and it goes with that route in P1-e.)
     pub fn run_query_bounded(
         &self,
         query_src: &str,
@@ -16022,51 +16467,16 @@ impl Graph {
                 exceeded: false,
             };
         }
-        if crate::query::sparse_task_query_eligibility(query_src).is_some()
-            && self.direct_projection_ready()
-        {
-            return self.derived_memo_bounded(
-                format!("SQ\0{max_rows}\0{max_bytes}\0{query_src}"),
-                || {
-                    self.direct_projection_sparse_task_query(query_src, max_rows, max_bytes)
-                        .unwrap_or_else(|| {
-                            crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
-                        })
-                },
-            );
-        }
-        let plan = crate::query::simple_query_candidate_plan(query_src);
-        match plan {
-            crate::query::SimpleQueryCandidatePlan::Empty => {
-                return BoundedRefGroups {
-                    groups: Arc::new(Vec::new()),
-                    total: 0,
-                    exceeded: false,
-                };
-            }
-            crate::query::SimpleQueryCandidatePlan::Indexed(_) => {
-                if self.direct_projection_ready() {
-                    return self.derived_memo_bounded(
-                        format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"),
-                        || {
-                            self.direct_projection_candidate_query(
-                                &plan, query_src, max_rows, max_bytes,
-                            )
-                            .unwrap_or_else(|| {
-                                self.direct_projection_note_fallback_read();
-                                crate::query::run_query_bounded(
-                                    self, query_src, max_rows, max_bytes,
-                                )
-                            })
-                        },
-                    );
-                }
-                self.direct_projection_note_fallback_read();
-            }
-            crate::query::SimpleQueryCandidatePlan::All => {}
-        }
-        self.derived_memo_bounded(format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"), || {
-            crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
+        // §4.4: the ONE execution-day snapshot for this answer, taken here and
+        // handed to both the lowering and the walk. A rollover between two
+        // halves of one answer is not a thing that can happen.
+        let today = crate::date::JournalDate::today();
+        let (query, view) = crate::query::parse_query_source(query_src, today);
+        // The block-anchored tree both engines evaluate (`block_anchored_query`
+        // is the one producer of that rebase).
+        let query = crate::query::block_anchored_query(&query);
+        self.derived_memo_pre_view(&query, &view, max_rows, max_bytes, |profile| {
+            self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile)
         })
     }
 

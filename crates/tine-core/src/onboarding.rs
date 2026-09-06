@@ -905,6 +905,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The Guide's task query, run for real against the Guide's own corpus.
+    ///
+    /// [`capture_plan_day_workflow_is_registered_linked_and_copyable`] checks
+    /// that the sentence and the query are PRESENT. This checks that the
+    /// sentence is TRUE: "the query covers the whole graph - a task written on
+    /// any page turns up here, not just the ones on this page".
+    ///
+    /// It matters now because the query engine no longer answers by reading
+    /// every page (P1-d routes a Direct Files graph through the projection and
+    /// loads only the pages the result names). That is exactly the kind of
+    /// change that can quietly narrow a promise the Guide makes to someone on
+    /// their first day, and a string assertion would not have noticed. So the
+    /// claim is asserted the way the reader experiences it: copy the two Guide
+    /// pages the sentence names, run the Guide's own query text, and require
+    /// answers from BOTH pages and no `DONE`.
+    #[test]
+    fn the_guides_task_query_reaches_tasks_on_a_page_other_than_its_own() {
+        let dir = scratch("tine-guide-task-query-is-graph-wide");
+        let graph = Graph::open(&dir);
+        let workflow = copy_guide_into_graph(&graph, "Workflows/Capture and plan your day")
+            .unwrap()
+            .name;
+        let showcase = copy_guide_into_graph(&graph, "Feature showcase")
+            .unwrap()
+            .name;
+        graph.warm_cache();
+
+        let result =
+            graph.run_query_bounded("(task TODO DOING NOW LATER)", 20_000, 32 * 1024 * 1024);
+        let pages: HashSet<&str> = result
+            .groups
+            .iter()
+            .map(|group| group.page.as_str())
+            .collect();
+        assert!(
+            pages.contains(workflow.as_str()),
+            "the workflow page's own tasks must answer: {pages:?}"
+        );
+        assert!(
+            pages.contains(showcase.as_str()),
+            "the sentence promises the showcase's tasks too, from a page the \
+             query was not written on: {pages:?}"
+        );
+
+        let markers = ["TODO", "DOING", "NOW", "LATER"];
+        for group in result.groups.iter() {
+            for block in group.blocks.iter() {
+                let raw = block.raw.trim_start();
+                assert!(
+                    markers.iter().any(|marker| raw.starts_with(marker)),
+                    "only the four named markers answer, got {raw:?}"
+                );
+                assert!(!raw.starts_with("DONE"), "DONE must not appear: {raw:?}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn journals_scheduling_reference_page_is_registered_linked_and_copyable() {
         let title = "Reference/Journals, tasks, and scheduling";

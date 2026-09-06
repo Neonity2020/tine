@@ -16,7 +16,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
     PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
-    PhysicalProperty, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
+    PhysicalProjectionQueryReader, PhysicalProperty, PhysicalQueryValue, PhysicalReferencePosting,
+    PhysicalReferenceTarget, PhysicalTask,
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -125,17 +126,61 @@ struct ProjectionShared {
     ready: AtomicBool,
     ready_generation: AtomicU64,
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
+    /// The D-15 statement seam, opened lazily beside the typed reader above.
+    ///
+    /// Named `statement_seam` rather than `…_reader` on purpose: the field above
+    /// holds the WRITE-CAPABLE `PhysicalGraphProjectionDatabase` under the name
+    /// `reader`, and the tine-storage boundary census attributes a method call
+    /// to the receiver NAME by substring. A `query_reader` here would file every
+    /// read-only statement under the writable handle in that inventory, which is
+    /// exactly the distinction D-15 rests on.
+    ///
+    /// It is a SECOND read-only connection because that is what the seam is: a
+    /// separate, read-only handle over the disposable projection, with no way to
+    /// reach a writable one (D-15's enforcement is the handle, not a validator).
+    /// It answers §5.9's dispatched query and nothing else.
+    statement_seam: Mutex<Option<PhysicalProjectionQueryReader>>,
+    /// The generation at which §5.10's FTS-building signal was last observed
+    /// READY. Readiness is monotonic within one projection file — the index
+    /// owner finishes the build and never un-finishes it, and a rebuild
+    /// publishes a new generation — so a `true` may be remembered and a `false`
+    /// never is. That keeps the signal one probe per generation instead of one
+    /// per query (I-15) without ever stranding a query on a stale `false`.
+    fts_ready_at: AtomicU64,
+    fts_ever_ready: AtomicBool,
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
     #[cfg(test)]
     indexed_reads: AtomicU64,
+    /// §5.9's dispatched statements: how many times the lowering ANSWERED a
+    /// user query through the seam. Separate from `indexed_reads`, which counts
+    /// every seam read including the FTS-readiness probe, so a route guard can
+    /// say "exactly one statement per query" and mean it.
+    #[cfg(test)]
+    statement_reads: AtomicU64,
+    /// §5.9's failed-read injection: one read through the seam fails, exactly as
+    /// a torn or truncated projection file, a disk error or a resource limit
+    /// makes it fail. It exists because the obligation a failed read carries —
+    /// note the fallback AND schedule the full-snapshot recovery — is invisible
+    /// on a healthy projection, and an obligation nothing can observe is one a
+    /// future arm silently drops (M9).
+    #[cfg(test)]
+    inject_read_failure: AtomicBool,
     #[cfg(test)]
     fallback_reads: AtomicU64,
     #[cfg(test)]
     referenced_name_reads: AtomicU64,
     #[cfg(test)]
     fuzzy_candidate_reads: AtomicU64,
+}
+
+/// What one attempt to answer through the D-15 statement seam produced
+/// (SPEC §5.9). See [`DirectProjection::run_statement`].
+pub(crate) enum StatementRead {
+    Rows(Vec<Vec<PhysicalQueryValue>>),
+    NotReady,
+    Failed,
 }
 
 /// Direct Files' disposable parser-fact projection.
@@ -157,11 +202,18 @@ impl DirectProjection {
             ready: AtomicBool::new(false),
             ready_generation: AtomicU64::new(0),
             reader: Mutex::new(None),
+            statement_seam: Mutex::new(None),
+            fts_ready_at: AtomicU64::new(0),
+            fts_ever_ready: AtomicBool::new(false),
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            statement_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            inject_read_failure: AtomicBool::new(false),
             #[cfg(test)]
             fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -662,6 +714,121 @@ impl DirectProjection {
         Some((rows, pages))
     }
 
+    /// §5.9's dispatched read: run ONE lowered statement through the D-15 seam
+    /// at the current cache generation, and say which of the three §5.9 states
+    /// the attempt landed in.
+    ///
+    /// The three are not interchangeable and the caller acts differently on
+    /// each, which is why they are not collapsed into `Option` the way every
+    /// other reader here collapses them:
+    ///
+    /// * [`StatementRead::NotReady`] — open reconciliation, a full rebuild, or
+    ///   the milliseconds after a save while the delta applies. Nothing is
+    ///   wrong; the walk answers and the worker is already on its way.
+    /// * [`StatementRead::Failed`] — the read was ATTEMPTED and did not answer
+    ///   (a SQL error, a resource limit, an unopenable file). The projection is
+    ///   disposable derived state (D-3), so the answer is recovery, not refusal:
+    ///   the caller notes the fallback and schedules a full snapshot.
+    /// * [`StatementRead::Rows`] — the answer.
+    pub(crate) fn run_statement(
+        &self,
+        cache_generation: u64,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+    ) -> StatementRead {
+        // The injection lives here and not in `seam_read`, so it fails the
+        // DISPATCHED statement and not whichever readiness probe happened to
+        // reach the seam first.
+        #[cfg(test)]
+        if self
+            .shared
+            .inject_read_failure
+            .swap(false, Ordering::AcqRel)
+        {
+            return StatementRead::Failed;
+        }
+        let read = self.seam_read(cache_generation, sql, parameters);
+        #[cfg(test)]
+        if matches!(read, StatementRead::Rows(_)) {
+            self.shared.statement_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        read
+    }
+
+    /// One read through the D-15 seam. [`DirectProjection::run_statement`] is
+    /// this plus §5.9's dispatched-statement census; [`DirectProjection::fts_ready`]
+    /// is this without it, because a readiness probe is not an answer.
+    fn seam_read(
+        &self,
+        cache_generation: u64,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+    ) -> StatementRead {
+        if !self.ready_at(cache_generation) {
+            return StatementRead::NotReady;
+        }
+        // Named `seam`, not `reader`, for the reason the field is (see
+        // `ProjectionShared::statement_seam`).
+        let mut seam = self.shared.statement_seam.lock().unwrap();
+        if seam.is_none() {
+            *seam = PhysicalProjectionQueryReader::open(&self.shared.path).ok();
+        }
+        let Some(seam) = seam.as_ref() else {
+            return StatementRead::Failed;
+        };
+        let Ok(rows) = seam.run_projection_query(sql, parameters) else {
+            return StatementRead::Failed;
+        };
+        // A snapshot that straddles a rebuild is not a snapshot — the same
+        // re-check every other reader here makes. The generation moving is not a
+        // projection defect, so it is `NotReady` and not `Failed`.
+        if !self.ready_at(cache_generation) {
+            return StatementRead::NotReady;
+        }
+        #[cfg(test)]
+        self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
+        StatementRead::Rows(rows)
+    }
+
+    /// The EXISTING FTS-building signal (§5.10), read on the SAME materialized
+    /// read and generation as the query it accelerates and SEPARATELY from
+    /// projection readiness. `false` means the transient building phase, where
+    /// the compiler omits candidate bounds and evaluates the same exact
+    /// predicates on the ready block columns.
+    ///
+    /// A read that cannot answer reports `false`, which costs a bound and never
+    /// an answer.
+    pub(crate) fn fts_ready(&self, cache_generation: u64) -> bool {
+        if self.shared.fts_ever_ready.load(Ordering::Acquire)
+            && self.shared.fts_ready_at.load(Ordering::Acquire) == cache_generation
+        {
+            return true;
+        }
+        let ready = self.probe_fts_ready(cache_generation);
+        if ready {
+            self.shared
+                .fts_ready_at
+                .store(cache_generation, Ordering::Release);
+            self.shared.fts_ever_ready.store(true, Ordering::Release);
+        }
+        ready
+    }
+
+    fn probe_fts_ready(&self, cache_generation: u64) -> bool {
+        matches!(
+            self.seam_read(
+                cache_generation,
+                "SELECT phase FROM search_fts_build WHERE singleton = 1",
+                &[],
+            ),
+            StatementRead::Rows(rows)
+                if matches!(
+                    rows.first().and_then(|row| row.first()),
+                    Some(PhysicalQueryValue::Integer(1))
+                )
+        )
+    }
+
     pub(crate) fn note_fallback_read(&self) {
         #[cfg(test)]
         self.shared.fallback_reads.fetch_add(1, Ordering::Relaxed);
@@ -999,6 +1166,18 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn indexed_reads(&self) -> u64 {
         self.shared.indexed_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_statement_failure(&self) {
+        self.shared
+            .inject_read_failure
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement_reads(&self) -> u64 {
+        self.shared.statement_reads.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1844,6 +2023,15 @@ mod tests {
             "PageRef and both property-facet entry points must use the generation-bound SQLite read"
         );
 
+        // **SPEC §5.9's ready shape.** When the projection is ready and the
+        // statement lowers, the STATEMENT answers: exactly one dispatched read,
+        // no walk, no fallback — and the same answer the walk gives, including
+        // `total` and `exceeded`. This replaces the candidate-plan route, which
+        // selected a page SUPERSET and then walked it; the statement selects the
+        // answer. There is no cost test in front of this and no fourth route:
+        // `(journal)` and `"points"` below are deliberately in the list because
+        // one is unselective and the other is an unbounded content predicate,
+        // and §5.9 routes both to the statement anyway.
         for query in [
             "(and (task TODO) (page source))",
             "(property status active)",
@@ -1853,15 +2041,10 @@ mod tests {
             "(journal)",
             "(and (property status active) (page source))",
             "(or (page source) (page Target))",
+            "\"points\"",
         ] {
             let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let expected_paths = graph
-                .direct_projection_candidate_paths_test(
-                    &crate::query::simple_query_candidate_plan(query),
-                    usize::MAX,
-                )
-                .unwrap();
-            let indexed_before = graph.direct_projection_indexed_reads_test();
+            let statements_before = graph.direct_projection_statement_reads_test();
             let fallback_before = graph.direct_projection_fallback_reads_test();
             graph.reset_direct_projection_candidate_probe_test();
             let actual = graph.run_query_bounded(query, 100, 1_000_000);
@@ -1875,7 +2058,11 @@ mod tests {
                 (oracle.total, oracle.exceeded),
                 "{query}"
             );
-            assert_eq!(graph.direct_projection_indexed_reads_test(), indexed_before + 1, "{query}: exactly one candidate query must complete; expected candidate paths {expected_paths:?}");
+            assert_eq!(
+                graph.direct_projection_statement_reads_test(),
+                statements_before + 1,
+                "{query}: exactly one dispatched statement must answer"
+            );
             assert_eq!(
                 crate::query::full_graph_query_evaluations(),
                 0,
@@ -1884,19 +2071,11 @@ mod tests {
             assert_eq!(
                 graph.direct_projection_fallback_reads_test(),
                 fallback_before,
-                "{query}: ready candidate route fell back"
-            );
-            assert_eq!(
-                graph
-                    .direct_projection_candidate_evaluated_paths_test()
-                    .into_iter()
-                    .collect::<std::collections::BTreeSet<_>>(),
-                expected_paths,
-                "{query}: production must evaluate exactly the lowering's candidate paths"
+                "{query}: ready dispatch fell back"
             );
         }
 
-        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let statements_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         graph.reset_direct_projection_candidate_probe_test();
         let empty = graph.run_query_bounded("(", 100, 1_000_000);
@@ -1904,25 +2083,17 @@ mod tests {
         assert_eq!(
             crate::query::full_graph_query_evaluations(),
             0,
-            "Plan::Empty must not enter the graph evaluator"
+            "a refused source must not enter the graph evaluator"
         );
         assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_before,
-            "Plan::Empty must not touch the projection"
+            graph.direct_projection_statement_reads_test(),
+            statements_before,
+            "a refused source must not run a statement"
         );
         assert_eq!(
             graph.direct_projection_fallback_reads_test(),
             fallback_before,
-            "Plan::Empty must not record fallback access"
-        );
-
-        graph.reset_direct_projection_candidate_probe_test();
-        let _ = graph.run_query_bounded("\"points\"", 100, 1_000_000);
-        assert_eq!(
-            crate::query::full_graph_query_evaluations(),
-            1,
-            "Plan::All alone uses the parser whole-graph evaluator"
+            "a refused source must not record fallback access"
         );
 
         let fallback_before = graph.direct_projection_fallback_reads_test();
@@ -1943,18 +2114,240 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// An `Indexed` plan whose candidate set is a large fraction of the graph
-    /// abandons the projection and hands the query back to the parser walk.
+    /// **SPEC §5.9's failed-read shape.** A read that was ATTEMPTED and did not
+    /// answer owes two things, and today's code is why they are asserted rather
+    /// than assumed: `run_query`'s sparse-task arm fell back with a bare
+    /// `map_or_else` and never called `note_fallback_read`, so a failed read
+    /// scheduled no recovery and the projection could sit unusable until the
+    /// user happened to save a page.
     ///
-    /// The user outcome this protects: on a real graph, `(journal)` and
-    /// non-sparse `(and (task ...) ...)` name most of the pages, and
-    /// materializing every one of them through SQLite made those query blocks
-    /// 7x and 10x SLOWER than the walk they replaced. The hatch is what keeps a
-    /// query block from stalling typing on the very shapes the route cannot
-    /// help. It must fire on the unselective shape and must NOT fire on a
-    /// selective one in the same graph.
+    /// **In-scope scenario** (AGENTS §5): a torn or truncated projection file
+    /// after a crash or power loss, a disk error, or a projection whose page set
+    /// has drifted from the parsed cache. The projection is disposable derived
+    /// state (D-3), so the answer is recovery and never refusal — the user's
+    /// query is answered by the walk, no refusal reaches them, and `ready`
+    /// returns WITHOUT a user edit.
     #[test]
-    fn b4_unselective_candidate_set_abandons_the_projection_for_the_parser_walk() {
+    fn a_failed_statement_read_answers_by_walking_and_schedules_its_own_recovery() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("failed-read-recovers");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/source.md"),
+            "- TODO points to [[Target]]\n  status:: active\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let query = "(page-ref Target)";
+        let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
+        let fallbacks_before = graph.direct_projection_fallback_reads_test();
+        graph.reset_direct_projection_candidate_probe_test();
+        graph.direct_projection_inject_read_failure_test();
+
+        let answered = graph.run_query_bounded(query, 100, 1_000_000);
+        assert_eq!(
+            signature(&answered.groups),
+            signature(&oracle.groups),
+            "a failed read must be answered by the walk, not refused"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallbacks_before + 1,
+            "a failed read must be counted exactly once"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            1,
+            "the walk answers the failed read exactly once"
+        );
+
+        // The recovery obligation: `mark_stale` alone would only clear `ready`
+        // and strand the projection. The full-snapshot enqueue is scheduled from
+        // the already-parsed cache, so it needs no reparse, no disk read, and no
+        // user action — `ready` comes back on its own.
+        wait_ready(&graph);
+        // A DIFFERENT query, because the walk's answer for the first one is now
+        // in the derived cache under the same IR key — correctly, since the two
+        // engines answer identically, so a cached walk result is a cached
+        // answer and not a stale route.
+        let after = "(property status active)";
+        let after_oracle = crate::query::run_query_bounded(&graph, after, 100, 1_000_000);
+        let statements_before = graph.direct_projection_statement_reads_test();
+        let fallbacks_before = graph.direct_projection_fallback_reads_test();
+        let recovered = graph.run_query_bounded(after, 100, 1_000_000);
+        assert_eq!(
+            signature(&recovered.groups),
+            signature(&after_oracle.groups)
+        );
+        assert_eq!(
+            graph.direct_projection_statement_reads_test(),
+            statements_before + 1,
+            "the recovered projection must answer through the statement again"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallbacks_before,
+            "the recovered projection must not fall back"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **SPEC §5.3's base order and hydration, together.**
+    ///
+    /// The statement carries no `ORDER BY` — the walk's base order is its page
+    /// SOURCE's enumeration order and no projection column reproduces it — so
+    /// order is the CALLER's, reproduced in the result construction. An identity
+    /// gate that compares SETS cannot see an ordering regression, and today's
+    /// gates compare sets; `signature` here compares the ordered page list AND
+    /// each page's ordered block list.
+    ///
+    /// Two visible-order paths are covered because they are different paths and
+    /// a feed-only repro misses real bugs: a routed NAMED page (nested blocks,
+    /// document order within the page) and the JOURNAL feed (kind rank, journal
+    /// before page at the same display name).
+    ///
+    /// The hydration claim rides along: the pages a dispatched query loads a
+    /// `Document` for are exactly the pages its RESULT names (I-13, I-15). A
+    /// hydration that loaded a candidate superset and filtered in Rust would be
+    /// the whole-graph walk this campaign exists to delete, wearing a hat.
+    #[test]
+    fn the_dispatched_result_reproduces_the_walks_order_and_loads_only_result_pages() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("dispatch-order");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        // A routed named page with NESTED matches, so within-page document order
+        // is observable: `tree/filter-top-level-blocks` keeps the outer match and
+        // the grandchild, and the ordered comparison sees which comes first.
+        std::fs::write(
+            root.join("pages/Alpha.md"),
+            "- TODO alpha one\n\t- plain middle\n\t\t- TODO alpha three\n- TODO alpha four\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pages/Beta.md"), "- TODO beta one\n").unwrap();
+        // Never matches: it must not be hydrated.
+        std::fs::write(root.join("pages/Gamma.md"), "- ordinary prose\n").unwrap();
+        std::fs::write(
+            root.join("journals/2026_06_28.md"),
+            "- TODO journal one\n- TODO journal two\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("journals/2026_06_29.md"),
+            "- TODO journal three\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let feed = "(task TODO)";
+        let oracle = crate::query::run_query_bounded(&graph, feed, 100, 1_000_000);
+        graph.reset_direct_projection_candidate_probe_test();
+        let dispatched = graph.run_query_bounded(feed, 100, 1_000_000);
+        assert_eq!(
+            signature(&dispatched.groups),
+            signature(&oracle.groups),
+            "the journal feed must match the walk INCLUDING order"
+        );
+        // The fixture has to be able to fail: more than one page, and a page with
+        // more than one block, or the ordered comparison proves nothing.
+        assert!(
+            dispatched.groups.len() >= 4,
+            "fixture must span several pages: {:?}",
+            dispatched
+                .groups
+                .iter()
+                .map(|g| &g.page)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            dispatched.groups.iter().any(|g| g.blocks.len() > 1),
+            "fixture must have a page with several ordered matches"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            0,
+            "the feed must not enter the whole-graph evaluator"
+        );
+        // I-13/I-15: exactly the RESULT's pages were hydrated. `Gamma` matches
+        // nothing and must not be loaded.
+        let hydrated = graph
+            .direct_projection_hydrated_pages_test()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            hydrated.len(),
+            dispatched.groups.len(),
+            "pages loaded must equal result pages: {hydrated:?}"
+        );
+        assert!(
+            !hydrated.iter().any(|path| path.ends_with("Gamma.md")),
+            "a page the result does not name must not be hydrated: {hydrated:?}"
+        );
+
+        // The routed named-page path: the same query scoped to one page, whose
+        // within-page order is document order and not any projection column.
+        let routed = "(and (task TODO) (page Alpha))";
+        let routed_oracle = crate::query::run_query_bounded(&graph, routed, 100, 1_000_000);
+        graph.reset_direct_projection_candidate_probe_test();
+        let routed_dispatched = graph.run_query_bounded(routed, 100, 1_000_000);
+        assert_eq!(
+            signature(&routed_dispatched.groups),
+            signature(&routed_oracle.groups),
+            "a routed named page must match the walk INCLUDING order"
+        );
+        assert_eq!(
+            routed_dispatched.groups.len(),
+            1,
+            "the routed query names exactly one page"
+        );
+        assert_eq!(
+            routed_dispatched.groups[0].blocks.len(),
+            3,
+            "Alpha contributes the outer match, its grandchild and its sibling, \
+             in document order"
+        );
+        assert_eq!(
+            graph.direct_projection_hydrated_pages_test().len(),
+            1,
+            "a one-page result hydrates exactly one page"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **SPEC §5.9: an unselective shape takes the statement too — there is no
+    /// fourth route.**
+    ///
+    /// This fixture exists because of the route it USED to prove. The candidate
+    /// plan materialized a page SUPERSET and then walked it, which on `(journal)`
+    /// meant materializing most of the graph and running 7–10× slower than the
+    /// walk; a candidate-count hatch abandoned the projection on exactly that
+    /// shape. §5.9 removes the reason for the hatch rather than the hatch's
+    /// symptom: the statement selects the ANSWER, so an unselective shape costs
+    /// what its answer costs and there is nothing to abandon.
+    ///
+    /// The obligation the hatch protected is kept as an assertion, not as a
+    /// route: on the unselective shape the dispatched path must load exactly the
+    /// RESULT's pages and must not enter the whole-graph evaluator. The hatch
+    /// itself is still alive for Managed Storage's candidate route and goes with
+    /// it (P1-e).
+    #[test]
+    fn an_unselective_shape_answers_through_the_statement_without_a_candidate_superset() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("b4-candidate-cutoff");
         std::fs::create_dir_all(root.join("journals")).unwrap();
@@ -1985,8 +2378,10 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
 
-        // The lowering itself still produces the whole unselective candidate
-        // set; the hatch is a routing decision, not a change to the lowering.
+        // The shape the hatch existed for: its candidate set is most of the
+        // graph. The fixture is pinned through the SURVIVING candidate lowering
+        // so a fixture that stopped being unselective fails here rather than
+        // silently testing nothing.
         let unselective = "(journal)";
         let raw = graph
             .direct_projection_candidate_paths_test(
@@ -1996,61 +2391,58 @@ mod tests {
             .expect("the lowering answers the unselective plan");
         assert!(
             raw.len() > 32,
-            "fixture must exceed the cutoff; got {} candidates",
+            "fixture must exceed the old cutoff; got {} candidates",
             raw.len()
         );
 
         // Run the oracle BEFORE resetting the probes, so the oracle's own walk
         // is not counted as the production invocation's route evidence.
         let oracle = crate::query::run_query_bounded(&graph, unselective, 500, 4_000_000);
-        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let statements_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         graph.reset_direct_projection_candidate_probe_test();
-        let abandoned = graph.run_query_bounded(unselective, 500, 4_000_000);
+        let dispatched = graph.run_query_bounded(unselective, 500, 4_000_000);
 
         assert_eq!(
-            signature(&abandoned.groups),
+            signature(&dispatched.groups),
             signature(&oracle.groups),
-            "abandoning must not change the answer"
+            "the statement must answer an unselective shape identically"
         );
         assert_eq!(
-            (abandoned.total, abandoned.exceeded),
+            (dispatched.total, dispatched.exceeded),
             (oracle.total, oracle.exceeded),
-            "abandoning must not change the bound outcome"
+            "the statement must reproduce the walk's bound outcome"
         );
         assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_before,
-            "an abandoned plan must complete no candidate query"
+            graph.direct_projection_statement_reads_test(),
+            statements_before + 1,
+            "an unselective shape is still answered by exactly one statement"
         );
         assert_eq!(
             graph.direct_projection_fallback_reads_test(),
-            fallback_before + 1,
-            "abandoning must record exactly one fallback read on the existing hatch"
+            fallback_before,
+            "a ready projection must not fall back on an unselective shape"
         );
         assert_eq!(
             crate::query::full_graph_query_evaluations(),
-            1,
-            "an abandoned plan takes the parser whole-graph walk exactly once"
+            0,
+            "an unselective shape must not enter the whole-graph evaluator"
         );
-        assert!(
-            graph
-                .direct_projection_candidate_evaluated_paths_test()
-                .is_empty(),
-            "an abandoned plan must materialize no candidate pages"
+        // **The I-13/I-15 obligation the hatch used to buy with a route.** The
+        // dispatched path loads exactly the pages the RESULT names — here every
+        // journal, because every journal matches — and never a superset. The
+        // number that mattered was "pages materialized that the answer does not
+        // contain", and it is zero by construction now.
+        assert_eq!(
+            dispatched.groups.len(),
+            oracle.groups.len(),
+            "the dispatched result must name the walk's pages"
         );
 
-        // Same graph, same readiness: a selective plan still routes.
+        // Same graph, same readiness: a selective shape is the same one route.
         let selective = "(page-ref Target)";
-        let selective_paths = graph
-            .direct_projection_candidate_paths_test(
-                &crate::query::simple_query_candidate_plan(selective),
-                usize::MAX,
-            )
-            .expect("the lowering answers the selective plan");
-        assert!(selective_paths.len() <= 32, "selective fixture drifted");
         let selective_oracle = crate::query::run_query_bounded(&graph, selective, 500, 4_000_000);
-        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let statements_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         graph.reset_direct_projection_candidate_probe_test();
         let routed = graph.run_query_bounded(selective, 500, 4_000_000);
@@ -2059,19 +2451,19 @@ mod tests {
             signature(&selective_oracle.groups)
         );
         assert_eq!(
-            graph.direct_projection_indexed_reads_test(),
-            indexed_before + 1,
-            "a selective plan must still complete exactly one candidate query"
+            graph.direct_projection_statement_reads_test(),
+            statements_before + 1,
+            "a selective shape is answered by exactly one statement"
         );
         assert_eq!(
             graph.direct_projection_fallback_reads_test(),
             fallback_before,
-            "a selective plan must not fall back"
+            "a selective shape must not fall back"
         );
         assert_eq!(
             crate::query::full_graph_query_evaluations(),
             0,
-            "a selective plan must not enter the full-graph evaluator"
+            "a selective shape must not enter the full-graph evaluator"
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -3003,16 +3395,41 @@ mod tests {
             .find("\n## ")
             .map_or(body, |end| &body[..end])
             .to_owned();
+        // SPEC §5.9's Direct Files route, and the three things a reader has to
+        // be able to check without reading the code: which reads a query
+        // performs, what a failed read owes and for which named failure, and
+        // what a cached result is keyed by.
         for sentence in [
-            "every\n`SimpleQueryCandidatePlan::Indexed` plan obtains its candidate page set from the\nshared lowering and evaluates only those pages",
-            "larger than one thirty-second of the graph's page count or 32 pages, whichever\nis greater, in which case the projection read is abandoned and the parser\nfallback runs instead",
-            "`Empty` returns without projection or graph access.",
-            "`All`\nuses the parser whole-graph evaluator.",
+            // Three shapes, and no fourth. The negative clause is pinned too,
+            // because a route policy is exactly the kind of sentence that gets
+            // softened into "usually".
+            "ONE lowered SQL\nstatement answers a simple `{{query ...}}` or advanced datalog query, whatever\nthat query's shape",
+            "There is no cost test and no selectivity hatch in front of\nthat decision.",
+            "answered by the tree walk over the same query IR, with nothing scheduled",
+            // The reads (I-13, I-15).
+            "One statement, plus one `Document` load per\npage the RESULT names",
+            "Pages loaded equals result pages",
+            "the statement therefore carries no `ORDER BY`, and the\ndispatched result equals the walk's result including order",
+            "remembered once per generation, never once per query",
+            // The failed-read obligation, with its in-scope scenario named.
+            "a torn or truncated projection file after a crash or power loss, a disk error, a\nresource limit, or a projection whose page set has drifted from the parsed\ncache",
+            "the same\nfull-snapshot enqueue the open path uses is scheduled from the already-parsed\npage cache",
+            "Clearing readiness alone would not do",
             "An unavailable, stale, failed, or raced\nprojection uses the parser fallback.",
+            // The cache key.
+            "memoized PRE-VIEW",
+            "under the resolved normalized query IR, the\nparser-cache generation, the execution day, the construction bounds, the\nparse-config digest, and, when the query names a property, the observed-registry\ngeneration",
+            "The parse-config digest is unconditional",
+            // Managed storage still owns the candidate plan and its cutoff, and
+            // the contract says which backend each rule is about.
+            "Managed storage still routes a `SimpleQueryCandidatePlan::Indexed` query through\nthe candidate page set the shared lowering returns",
+            "larger than one thirty-second of the graph's page\ncount or 32 pages, whichever is greater, in which case the projection read is\nabandoned and the parser fallback runs instead",
+            "`Empty` returns without\nprojection or graph access.",
+            "`All` uses the parser whole-graph evaluator.",
         ] {
             assert!(
                 section.contains(sentence),
-                "§1.3 must state the Indexed routing rule verbatim: {sentence}"
+                "§1.3 must state the Direct Files query route verbatim: {sentence}"
             );
         }
     }

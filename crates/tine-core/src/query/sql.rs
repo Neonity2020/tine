@@ -151,6 +151,69 @@ pub(crate) enum ContentPlan {
     Regex,
 }
 
+/// How §5.3's result-set rule — OG's `tree/filter-top-level-blocks`, "drop a
+/// matched block whose IMMEDIATE parent also matched" — is spelled in SQL.
+///
+/// The two spellings are the SAME predicate, because `filter(row)` is a pure
+/// function of the row: "the parent matches" and "the parent is in the match
+/// set" cannot differ. They differ only in how many times SQLite evaluates the
+/// filter, which is why the choice between them is settled by MEASUREMENT
+/// (§5.9's packet) and pinned by an identity gate that compares the two
+/// spellings against each other and against the walk — including the transitive
+/// case, a block whose GRANDPARENT matches but whose parent does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultSetRule {
+    /// A correlated probe on the primary key: `parent_block_id NOT IN (SELECT …
+    /// WHERE block_id = <anchor>.parent_block_id AND <filter>)`. One seek per
+    /// candidate row, but the whole filter is re-evaluated per row — for a
+    /// `children` predicate that nests a subquery per row.
+    CorrelatedProbe,
+    /// SPEC §3.5's own spelling: name the match set as a CTE and anti-join it
+    /// against its own `parent_block_id`. The anti-join subquery is
+    /// UNCORRELATED, so SQLite evaluates it once for the whole statement
+    /// instead of once per candidate row — but SQLite also INLINES an ordinary
+    /// CTE, so the filter itself is still evaluated twice (once as the row
+    /// source, once to build the anti-join list).
+    MatchSetCte,
+    /// The same anti-join with SQLite's `MATERIALIZED` hint, which is the only
+    /// spelling that actually evaluates the filter ONCE: the match set is
+    /// computed into a transient table and both references read it. This is the
+    /// "single-evaluation spelling" §5.9's policy question is really about, and
+    /// the reason the plain CTE is not it.
+    MatchSetCteMaterialized,
+}
+
+/// The production spelling, chosen by the measurement recorded in P1-d's receipt
+/// and reproducible through
+/// `the_two_result_set_spellings_are_timed_against_each_other_on_a_real_corpus`.
+///
+/// **Measured, not argued** (anonymized graph, release, eight independent
+/// sessions). On the decisive shape `any(children, task = 'DONE')`, 263 rows:
+/// the correlated probe costs ~5.1 ms, the plain CTE ~5.3 ms (a regression) and
+/// the materialized CTE ~2.8 ms — **0.54-0.56×, in every one of the eight
+/// runs**. The plain CTE loses because SQLite INLINES it and the filter still
+/// runs twice, so it is not the single-evaluation spelling the question was
+/// about; only the `MATERIALIZED` hint forces one evaluation.
+///
+/// **The honest remainder, in three parts.**
+/// 1. The decision rule's second half — "no other `PLAN_SHAPES` entry regresses
+///    by more than 10%" — does NOT hold cleanly. `deadline is not null`
+///    (~100-125 µs, 86 rows) straddles the threshold run to run, and the gate
+///    printed ADOPT in three of eight sessions and KEEP in five. Every flagged
+///    regression is 1-13 µs on a sub-millisecond shape; the win it is weighed
+///    against is 2.3 ms. Adopting is therefore a recorded LANE DECISION, and
+///    `RESULT_SET_RULE` is the single line that reverts it.
+/// 2. Even with the win, that shape measures walk 435 µs vs SQL 2935 µs. It is
+///    recorded, not routed around (§5.9 has no fourth route). The next thing to
+///    try is an index that lets the `children` subquery seek by
+///    `(parent_block_id, block_id)` instead of probing per candidate row — a
+///    projection addition, not a second engine.
+/// 3. The plain `MatchSetCte` variant is kept ALIVE rather than deleted,
+///    because it is what makes claim (1) checkable: it is the spelling that
+///    shows the inlining, and a gate that could only compare two options could
+///    not have found that the third was the real one.
+pub(crate) const RESULT_SET_RULE: ResultSetRule = ResultSetRule::MatchSetCteMaterialized;
+
 /// The compiler's answer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Lowered {
@@ -186,6 +249,10 @@ pub(crate) struct LoweringInputs<'a> {
     /// predicates, evaluated on the ready block columns, with no candidate
     /// bounds anywhere in the statement.
     pub(crate) fts_ready: bool,
+    /// Which spelling of §5.3's result-set rule to emit. Production passes
+    /// [`RESULT_SET_RULE`]; the measurement gate passes both so the choice
+    /// stays reproducible rather than remembered.
+    pub(crate) result_set_rule: ResultSetRule,
 }
 
 /// Lower one resolved query (SPEC §5.1–§5.7).
@@ -225,43 +292,84 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> Lowered
     // `tree/filter-top-level-blocks` drops a matched block whose IMMEDIATE
     // parent also matched, and the walk implements it in
     // `collect_og_query_roots`'s `matched` stack — a block is emitted iff it
-    // matches and its parent does not. The parent probe is correlated on the
-    // primary key, so it costs one seek plus whatever the filter itself costs,
-    // never a second pass over `blocks`.
+    // matches and its parent does not. Two spellings say that (see
+    // [`ResultSetRule`]); which one is emitted is settled by measurement, not by
+    // argument, and both are pinned identical by a gate.
     let matches_nothing = where_ == "0";
-    if let Row::Block(alias) = row {
-        let parent = compiler.alias("root");
-        let parent_matches = compiler.filter(&filter, Row::Block(&parent));
-        // A parent that can never match cannot shadow anything, so the whole
-        // probe folds away rather than becoming a correlated subquery over `0`.
-        let unshadowed = if parent_matches == "0" {
-            "1".to_string()
-        } else {
-            format!(
-                "({alias}.parent_block_id IS NULL OR {alias}.parent_block_id NOT IN \
-                 (SELECT {parent}.block_id FROM blocks {parent} \
-                 WHERE {parent}.block_id = {alias}.parent_block_id AND {parent_matches}))"
-            )
-        };
-        where_ = fold_and(vec![where_, unshadowed]);
+    let mut cte: Option<String> = None;
+    // A filter that folded to false reads nothing under either spelling, and
+    // neither the probe nor the CTE can add a row to the empty set. Leaving the
+    // statement as the bare `WHERE 0` keeps that case byte-identical across the
+    // two spellings, so the identity gate below compares real statements.
+    if let (Row::Block(alias), false) = (row, matches_nothing) {
+        match inputs.result_set_rule {
+            ResultSetRule::CorrelatedProbe => {
+                let parent = compiler.alias("root");
+                let parent_matches = compiler.filter(&filter, Row::Block(&parent));
+                // A parent that can never match cannot shadow anything, so the
+                // whole probe folds away rather than becoming a correlated
+                // subquery over `0`.
+                let unshadowed = if parent_matches == "0" {
+                    "1".to_string()
+                } else {
+                    format!(
+                        "({alias}.parent_block_id IS NULL OR {alias}.parent_block_id NOT IN \
+                         (SELECT {parent}.block_id FROM blocks {parent} \
+                         WHERE {parent}.block_id = {alias}.parent_block_id AND {parent_matches}))"
+                    )
+                };
+                where_ = fold_and(vec![where_, unshadowed]);
+            }
+            ResultSetRule::MatchSetCte | ResultSetRule::MatchSetCteMaterialized => {
+                // SPEC §3.5's own spelling. The match set is named once and
+                // anti-joined against its own `parent_block_id`; the anti-join
+                // subquery is uncorrelated, so the filter is never re-evaluated
+                // per candidate row.
+                let hint = if inputs.result_set_rule == ResultSetRule::MatchSetCteMaterialized {
+                    " MATERIALIZED"
+                } else {
+                    ""
+                };
+                cte = Some(format!(
+                    "WITH m(block_id, page_id, parent_block_id) AS{hint} \
+                     (SELECT {alias}.block_id, {alias}.page_id, {alias}.parent_block_id \
+                     {from} WHERE {where_})"
+                ));
+                where_ = "(m.parent_block_id IS NULL OR m.parent_block_id NOT IN \
+                     (SELECT block_id FROM m))"
+                    .to_string();
+            }
+        }
     }
     if let Some(unsupported) = compiler.unsupported {
         return Lowered::Unsupported(unsupported);
     }
+    // The anchor of the statement, once the result-set rule has chosen its
+    // shape: `blocks b` for the correlated probe, the materialized match set for
+    // the CTE. `@page` has no suppression rule and keeps `pages p`.
+    let (select, from, mask_column) = match (row, &cte) {
+        (Row::Block(alias), None) => (select, from, format!("{alias}.page_id")),
+        // The mask stays on the ANCHOR, outside `m`, exactly as it is outside
+        // the correlated probe today: a block and its parent are always on the
+        // same page, so masking inside `m` would be unobservable either way, and
+        // staying outside keeps the masked statement the same predicate.
+        (Row::Block(_), Some(_)) => (
+            "SELECT m.block_id, m.page_id, p.name, p.text_kind, p.path",
+            "FROM m JOIN pages p ON p.page_id = m.page_id",
+            "m.page_id".to_string(),
+        ),
+        (Row::Page(alias), _) => (select, from, format!("{alias}.page_id")),
+    };
     // §5.9: the overlay-masked page ids are removed inside the statement, so the
     // masked read and the overlay walk cannot both answer for one page.
     if !inputs.masked_pages.is_empty() {
-        let column = match row {
-            Row::Block(alias) => format!("{alias}.page_id"),
-            Row::Page(alias) => format!("{alias}.page_id"),
-        };
         let list = inputs
             .masked_pages
             .iter()
             .map(|page| compiler.bind(PhysicalQueryValue::Blob(page.to_vec())))
             .collect::<Vec<_>>()
             .join(", ");
-        where_ = fold_and(vec![where_, format!("{column} NOT IN ({list})")]);
+        where_ = fold_and(vec![where_, format!("{mask_column} NOT IN ({list})")]);
     }
     // **No `ORDER BY` (§5.3, measured).** The walk's base order is its page
     // SOURCE's enumeration order, which no column of the projection reproduces —
@@ -273,7 +381,10 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> Lowered
     // anyway when it groups the rows by page. Base order and grouping therefore
     // belong to the result construction, and this statement answers only which
     // rows match.
-    let mut sql = format!("{select} {from} WHERE {where_}");
+    let mut sql = match &cte {
+        Some(cte) => format!("{cte} {select} {from} WHERE {where_}"),
+        None => format!("{select} {from} WHERE {where_}"),
+    };
     if let Some(cutoff) = inputs.cutoff {
         let limit = compiler.bind(PhysicalQueryValue::Integer(
             i64::try_from(cutoff.saturating_add(1)).unwrap_or(i64::MAX),
@@ -1961,6 +2072,7 @@ mod tests {
             cutoff: None,
             compiled: &NO_COMPILED_LEAVES,
             fts_ready: true,
+            result_set_rule: RESULT_SET_RULE,
         }
     }
 
@@ -2005,11 +2117,13 @@ mod tests {
     fn two_property_conjuncts_lower_to_two_undecomposed_subqueries() {
         let (query, _) = og("(and (property status open) (property priority done))");
         let statement = lower(query.evaluable_filter(), Anchor::Block);
-        // Two conjuncts, each ONE subquery — and the whole filter again for
-        // §5.3's parent probe, which is the same tree in the parent's row scope.
+        // Two conjuncts, each ONE subquery. §5.3's result-set rule reads the
+        // match set back by name under [`ResultSetRule::MatchSetCteMaterialized`],
+        // so the filter is compiled ONCE — the correlated spelling compiled the
+        // same tree a second time in the parent's row scope and this count was 4.
         assert_eq!(
             statement.sql.matches("FROM property_atoms").count(),
-            4,
+            2,
             "one atom subquery per quantifier, per row scope: {}",
             statement.sql
         );
@@ -2364,8 +2478,9 @@ mod tests {
         let mixed = match_sql("oo OR alpha", true);
         assert!(!mixed.positively_bounded);
         assert_eq!(mixed.content_plans, vec![ContentPlan::ShortUnindexable]);
-        // The bounded arm still gets its bound — bounds are per-arm.
-        assert_eq!(mixed.sql.matches("search_substring_fts").count(), 2);
+        // The bounded arm still gets its bound — bounds are per-arm. One
+        // occurrence, because §5.3's CTE spelling compiles the filter once.
+        assert_eq!(mixed.sql.matches("search_substring_fts").count(), 1);
         assert!(match_sql("beta OR alpha", true).positively_bounded);
     }
 
@@ -2460,7 +2575,8 @@ mod tests {
             "{}",
             building.sql
         );
-        assert_eq!(building.sql.matches("instr(").count(), 6);
+        // Three terms, compiled once (§5.3's CTE spelling).
+        assert_eq!(building.sql.matches("instr(").count(), 3);
         assert!(!building.positively_bounded);
         assert_eq!(building.content_plans, vec![ContentPlan::FtsBuilding]);
         // Same predicates, same bound needles, as the ready lowering: only the
@@ -2588,8 +2704,12 @@ mod tests {
         let Lowered::Statement(statement) = lower_query(&query, &inputs) else {
             panic!("statement");
         };
+        // The mask sits on the ANCHOR, which under §5.3's CTE spelling is the
+        // materialized match set: a block and its parent are always on the same
+        // page, so masking inside `m` would be unobservable, and staying outside
+        // keeps the masked statement the same predicate it is today.
         assert!(
-            statement.sql.contains("b.page_id NOT IN ("),
+            statement.sql.contains("m.page_id NOT IN ("),
             "{}",
             statement.sql
         );

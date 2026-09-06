@@ -2477,6 +2477,47 @@ pub(crate) fn run_resolved_query_result_over(
     result
 }
 
+/// What the CONSTRUCTION of a simple query produced, before any view directive
+/// has looked at it (SPEC §5.9's "pre-view result").
+///
+/// This is the value §5.9's cache stores, and the reason the cache key names the
+/// IR and not the query source: `(sort-by …)` and `(sample N)` are decisions
+/// about already-constructed rows, so two queries that differ only in them
+/// construct the same thing. The two construction inputs that are NOT view
+/// decisions — the sample ADMISSION cap (an unsorted `(sample N)` stops
+/// constructing at N, which is what makes its `total` the truncated count) and
+/// whether the recency axis was measured — travel in the cache key beside the
+/// result bounds, because they change what is built rather than how it is
+/// displayed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreViewGroups {
+    pub(crate) groups: Vec<RefGroup>,
+    pub(crate) recency_by_page: std::collections::HashMap<String, i64>,
+    pub(crate) total: usize,
+    pub(crate) exceeded: bool,
+}
+
+/// The two construction inputs a view implies (see [`PreViewGroups`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct ConstructionProfile {
+    /// An unsorted `(sample N)` semantically needs only the first N matches in
+    /// deterministic traversal order, and stops counting there.
+    pub(crate) sample_admission_cap: Option<usize>,
+    /// A `(sort-by modified …)` needs each result page's position on the recency
+    /// axis, which costs a `stat` per result page and is skipped otherwise.
+    pub(crate) want_recency: bool,
+}
+
+impl ConstructionProfile {
+    pub(crate) fn from_view(view: &ViewSettings) -> ConstructionProfile {
+        let opts = QueryOpts::from_view(view);
+        ConstructionProfile {
+            sample_admission_cap: opts.sample.filter(|_| opts.sort.is_none()),
+            want_recency: matches!(&opts.sort, Some((field, _)) if is_recency_field(field)),
+        }
+    }
+}
+
 /// The ONE simple-query evaluator. Both storage modes reach it through
 /// [`QueryPageSource`]; neither owns a second copy of the budget, the page loop,
 /// the OG top-level-root filter, the sample cap or the recency axis.
@@ -2492,29 +2533,79 @@ fn run_pred_bounded_over(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
+    let pre = collect_pred_bounded_over(
+        source,
+        query,
+        today,
+        max_rows,
+        max_bytes,
+        ConstructionProfile::from_view(view),
+    );
+    apply_view(pre, view)
+}
+
+/// §5.9: the view applied to an already-constructed (possibly CACHED) pre-view
+/// result. Base order, then `sort-by`, then `sample` — `finish_query_groups`
+/// unchanged, reached from both the walk and the dispatched statement.
+pub(crate) fn apply_view(pre: PreViewGroups, view: &ViewSettings) -> BoundedGroups {
+    let opts = QueryOpts::from_view(view);
+    let mut budget = ConstructionBudget::new(usize::MAX, usize::MAX);
+    budget.total = pre.total;
+    budget.exceeded = pre.exceeded;
+    finish_query_groups(pre.groups, pre.recency_by_page, &opts, budget)
+}
+
+/// §5.9: apply a view to an already-cached PRE-VIEW result.
+///
+/// A query with no `sort-by` and no `sample` shares the cached `Arc` — the rows
+/// are already in base order, and a view that reorders nothing has nothing to
+/// do. Anything else copies once and applies its own directives, which is the
+/// point of storing the pre-view result: two views of one filter no longer
+/// recompute it.
+pub(crate) fn apply_cached_view(
+    groups: &std::sync::Arc<Vec<RefGroup>>,
+    recency_by_page: &std::collections::HashMap<String, i64>,
+    view: &ViewSettings,
+    total: usize,
+    exceeded: bool,
+) -> crate::model::BoundedRefGroups {
+    let opts = QueryOpts::from_view(view);
+    let groups = if opts.sort.is_none() && opts.sample.is_none() {
+        std::sync::Arc::clone(groups)
+    } else {
+        std::sync::Arc::new(apply_view_directives(
+            groups.as_ref().clone(),
+            recency_by_page,
+            &opts,
+        ))
+    };
+    crate::model::BoundedRefGroups {
+        groups,
+        total,
+        exceeded,
+    }
+}
+
+/// The construction half of [`run_pred_bounded_over`]: the matched rows in the
+/// SOURCE's traversal order, under the result bounds and the profile's two
+/// construction inputs. No view directive has looked at these rows.
+pub(crate) fn collect_pred_bounded_over(
+    source: &dyn QueryPageSource,
+    query: &Query,
+    today: JournalDate,
+    max_rows: usize,
+    max_bytes: usize,
+    profile: ConstructionProfile,
+) -> PreViewGroups {
     #[cfg(test)]
     source.note_predicate_evaluation();
     // An invalid query (an unknown head, a syntax refusal, a depth/size refusal)
     // returns zero results plus its diagnostics — never a truncated answer
     // (§3.5).
     if query.is_invalid() {
-        return BoundedGroups {
-            groups: Vec::new(),
-            total: 0,
-            exceeded: false,
-        };
+        return PreViewGroups::default();
     }
-    let opts = QueryOpts::from_view(view);
-    let opts = &opts;
-    // The legacy block-group adapter evaluates a `@page`-anchored filter
-    // BLOCK-anchored — page attributes and relations read through `block.page` —
-    // because that is today's semantics verbatim (`(page-property …)`,
-    // `(page-tags …)` and `(namespace …)` have always returned blocks). The
-    // page-anchored result rows live behind `run_query_result_over`.
-    let filter = match query.anchor {
-        Anchor::Block => query.evaluable_filter(),
-        Anchor::Page => og::rebase_to_block(&query.evaluable_filter()),
-    };
+    let filter = block_anchored_filter(query);
     let compiled = eval::CompiledLeaves::for_query(&filter);
     let parse_config = source.parse_config();
     let registry = source.registry();
@@ -2524,11 +2615,11 @@ fn run_pred_bounded_over(
     // deterministic traversal order. Do not construct or classify the rest as
     // an over-budget failure. Sorted samples still require global ranking and
     // therefore retain the ordinary construction ceiling.
-    let sample_admission_cap = opts.sample.filter(|_| opts.sort.is_none());
+    let sample_admission_cap = profile.sample_admission_cap;
     // A recency sort (`(sort-by modified …)`) needs each result page's position on
     // a single time axis: journal pages by the day they represent, other pages by
     // file mtime. Only computed when such a sort is active (else we skip the stat).
-    let want_recency = matches!(&opts.sort, Some((f, _)) if is_recency_field(f));
+    let want_recency = profile.want_recency;
     let mut groups: Vec<RefGroup> = Vec::new();
     let mut recency_by_page: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
@@ -2588,7 +2679,207 @@ fn run_pred_bounded_over(
         std::ops::ControlFlow::Continue(())
     });
 
-    finish_query_groups(groups, recency_by_page, opts, budget)
+    PreViewGroups {
+        groups,
+        recency_by_page,
+        total: budget.total,
+        exceeded: budget.exceeded,
+    }
+}
+
+/// The BLOCK-anchored evaluable filter of a `{{query …}}`/advanced source.
+///
+/// The legacy block-group adapter evaluates a `@page`-anchored filter
+/// BLOCK-anchored — page attributes and relations read through `block.page` —
+/// because that is today's semantics verbatim (`(page-property …)`,
+/// `(page-tags …)` and `(namespace …)` have always returned blocks). The
+/// page-anchored result rows live behind [`run_query_result_over`].
+///
+/// ONE producer, because §5.9's dispatch has to lower exactly the filter the
+/// walk evaluates: a second rebase here is a walk/SQL fork by construction
+/// (I-12).
+pub(crate) fn block_anchored_filter(query: &Query) -> Filter {
+    match query.anchor {
+        Anchor::Block => query.evaluable_filter(),
+        Anchor::Page => og::rebase_to_block(&query.evaluable_filter()),
+    }
+}
+
+/// [`block_anchored_filter`] as a `Query` the lowering can consume — the same
+/// tree, already `Off`-removed, presented at the anchor the walk evaluates it
+/// at. Diagnostics travel so an invalid query still lowers to "no rows" (§3.5).
+pub(crate) fn block_anchored_query(query: &Query) -> Query {
+    Query {
+        anchor: Anchor::Block,
+        filter: block_anchored_filter(query),
+        diagnostics: query.diagnostics.clone(),
+        source: ir::Source::Builder,
+    }
+}
+
+/// §5.9's cache identity for one simple/advanced query: the **resolved
+/// normalized IR** plus the bounds the construction ran under.
+///
+/// The query SOURCE is deliberately absent. `(task TODO)`, `(and (task TODO))`
+/// and TQL `task = 'TODO'` are one question, so they are one cache entry; two
+/// spellings of one filter no longer compute it twice, and — the reason §5.9
+/// asks for this — a view-only edit (`(sort-by …)`, `(sample N)`) no longer
+/// invalidates rows the view has not looked at yet.
+///
+/// [`ConstructionProfile`]'s two flags travel WITH the bounds rather than being
+/// dropped as view state: they change what is CONSTRUCTED (an unsorted
+/// `(sample N)` stops the walk at N and reports that as `total`; a recency sort
+/// measures a per-result-page axis), so a cached entry built without them cannot
+/// answer for a view that needs them.
+///
+/// The remaining components of §5.9's key — execution day, `ParseConfig::digest`
+/// and the registry generation — are the derived cache's own identity
+/// (`DerivedCache`), not part of this string.
+pub(crate) fn simple_query_cache_key(
+    query: &Query,
+    max_rows: usize,
+    max_bytes: usize,
+    profile: ConstructionProfile,
+) -> String {
+    let cap = profile
+        .sample_admission_cap
+        .map_or_else(|| "-".to_string(), |cap| cap.to_string());
+    let recency = u8::from(profile.want_recency);
+    // `serde_json` escapes control characters, so the serialized IR contains no
+    // raw NUL and the structural fields in front of it stay unambiguous.
+    let ir = serde_json::to_string(&query.normalized()).unwrap_or_default();
+    format!("q\0{max_rows}\0{max_bytes}\0{cap}\0{recency}\0{ir}")
+}
+
+/// The retention rule (§5.9) over an IR-keyed entry: "could an edit to page
+/// (entry, doc) change this query's result?".
+///
+/// The same predicate and the same evaluator the real matcher uses — now read
+/// back from the key's IR instead of re-parsed from a query source, which is
+/// what makes the answer independent of the dialect the query was written in.
+/// An unreadable key evicts, because a retained entry nobody can judge is the
+/// one failure mode this rule exists to prevent.
+pub(crate) fn page_affects_query_ir(
+    serialized_ir: &str,
+    entry: &PageEntry,
+    doc: &Document,
+    config: &crate::config::ParseConfig,
+    registry: &registry::Registry,
+) -> bool {
+    let Ok(query) = serde_json::from_str::<Query>(serialized_ir) else {
+        return true;
+    };
+    if query.is_invalid() {
+        return false;
+    }
+    page_contributes_to_filter(
+        &block_anchored_filter(&query),
+        entry,
+        doc,
+        JournalDate::today(),
+        config,
+        registry,
+    )
+}
+
+/// One RESULT page handed to [`hydrate_sql_result_pages`]: the page the
+/// statement named, its already-parsed document, and the block ids the statement
+/// returned for it.
+pub(crate) struct SqlResultPage<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: PageKind,
+    pub(crate) roots: &'a [DocBlock],
+    pub(crate) matched: &'a std::collections::HashSet<String>,
+    pub(crate) recency: &'a dyn Fn() -> i64,
+}
+
+/// §5.3's block hydration (M8), and the reason the statement carries no
+/// `ORDER BY`.
+///
+/// The statement answered block IDS; the user sees BLOCKS, in the walk's order.
+/// This is ONE pass over each result page's already-parsed document — never a
+/// candidate superset, never a page the result did not name — collecting the
+/// `DocBlock`s whose ids the statement returned, in the document order
+/// [`collect_og_query_roots`] visits them in. That is what reproduces the walk's
+/// within-page order without a projection column that could reproduce it, and
+/// [`finish_query_groups`] (reached through [`apply_view`]) supplies the same
+/// base order across pages that the walk gets.
+///
+/// The result-set rule is NOT re-applied here: the statement already applied it
+/// (§5.3), so `matched` is the final set and the hydration pass is a lookup.
+/// Applying it twice would drop a block whose parent the statement had already
+/// dropped.
+///
+/// Cost is O(result pages) with the SAME [`ConstructionBudget`] the walk
+/// charges, in the SAME page order (the caller supplies the graph's own page
+/// enumeration order), so `total`, `exceeded` and which rows survive a truncated
+/// budget are the walk's answers and not a second policy.
+pub(crate) fn hydrate_sql_result_pages(
+    pages: &[SqlResultPage<'_>],
+    max_rows: usize,
+    max_bytes: usize,
+    profile: ConstructionProfile,
+) -> PreViewGroups {
+    let mut budget = ConstructionBudget::new(max_rows, max_bytes);
+    let mut groups: Vec<RefGroup> = Vec::new();
+    let mut recency_by_page: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    for page in pages {
+        let mut matched: Vec<BlockDto> = Vec::new();
+        collect_sql_matched_blocks(
+            page.roots,
+            page.matched,
+            page.name,
+            &mut budget,
+            &mut matched,
+            profile,
+        );
+        if !matched.is_empty() {
+            if profile.want_recency {
+                recency_by_page.insert(page.name.to_owned(), (page.recency)());
+            }
+            groups.push(RefGroup {
+                page: page.name.to_owned(),
+                kind: page.kind,
+                blocks: matched,
+                evidence: Vec::new(),
+            });
+        }
+    }
+    PreViewGroups {
+        groups,
+        recency_by_page,
+        total: budget.total,
+        exceeded: budget.exceeded,
+    }
+}
+
+/// The hydration pass itself: pre-order over the page's blocks, admitting the
+/// ones the statement named under the walk's budget rules verbatim.
+fn collect_sql_matched_blocks(
+    blocks: &[DocBlock],
+    wanted: &std::collections::HashSet<String>,
+    page_name: &str,
+    budget: &mut ConstructionBudget,
+    out: &mut Vec<BlockDto>,
+    profile: ConstructionProfile,
+) {
+    for block in blocks {
+        if wanted.contains(&block.uuid) {
+            if profile
+                .sample_admission_cap
+                .is_some_and(|cap| budget.rows >= cap)
+            {
+                return;
+            }
+            if budget.closed() {
+                budget.deny_match();
+            } else if budget.admit_estimated(page_name, shallow_dto_estimated_bytes(block, &[])) {
+                out.push(result_dto(block));
+            }
+        }
+        collect_sql_matched_blocks(&block.children, wanted, page_name, budget, out, profile);
+    }
 }
 
 #[cfg(test)]
@@ -2607,14 +2898,32 @@ pub(crate) fn full_graph_query_evaluations() -> u64 {
 }
 
 fn finish_query_groups(
-    mut groups: Vec<RefGroup>,
+    groups: Vec<RefGroup>,
     recency_by_page: std::collections::HashMap<String, i64>,
     opts: &QueryOpts,
     budget: ConstructionBudget,
 ) -> BoundedGroups {
-    // The source traversal is path-stable in both Direct Files and the managed
-    // application gateway. Make the displayed base order stable before sampling
-    // and before it becomes the tie-breaker for an explicit sort.
+    let mut groups = groups;
+    base_order_groups(&mut groups);
+    BoundedGroups {
+        groups: apply_view_directives(groups, &recency_by_page, opts),
+        total: budget.total,
+        exceeded: budget.exceeded,
+    }
+}
+
+/// SPEC §3.5's BASE ORDER (M13): page display name, then kind rank (journal 0,
+/// page 1). Within a page the blocks keep the document order the construction
+/// emitted them in.
+///
+/// The source traversal is path-stable in both Direct Files and the managed
+/// application gateway. Make the displayed base order stable before sampling and
+/// before it becomes the tie-breaker for an explicit sort.
+///
+/// This is base order, not a view directive, so §5.9's cache stores rows that
+/// have ALREADY been through it — which is what lets a query with no `sort-by`
+/// and no `sample` return the cached `Arc` itself rather than a copy of it.
+pub(crate) fn base_order_groups(groups: &mut [RefGroup]) {
     groups.sort_by(|a, b| {
         a.page.cmp(&b.page).then_with(|| {
             let rank = |kind| match kind {
@@ -2624,7 +2933,16 @@ fn finish_query_groups(
             rank(a.kind).cmp(&rank(b.kind))
         })
     });
+}
 
+/// The VIEW half: `sort-by` then `sample`, over already base-ordered rows.
+/// Nothing here reads the graph, so it may run on a cached pre-view result.
+pub(crate) fn apply_view_directives(
+    groups: Vec<RefGroup>,
+    recency_by_page: &std::collections::HashMap<String, i64>,
+    opts: &QueryOpts,
+) -> Vec<RefGroup> {
+    let mut groups = groups;
     // sort-by is GLOBAL (like Logseq): order every matched block across all pages on
     // one axis, so e.g. priority-A tasks float to the very top regardless of which
     // page they live on. We flatten to one block per group, sort, then RE-COALESCE
@@ -2700,11 +3018,7 @@ fn finish_query_groups(
             true
         });
     }
-    BoundedGroups {
-        groups,
-        total: budget.total,
-        exceeded: budget.exceeded,
-    }
+    groups
 }
 
 /// One exact parser-owned page selected by the managed query candidate plan.
@@ -3793,26 +4107,6 @@ pub(crate) fn run_parser_sparse_task_query_bounded(
 // the SAME parse + EvalCtx + eval (or alias resolution) as the real matcher, so
 // the keep/evict decision can never drift from what a full recompute would give.
 
-/// Whether page (entry, doc) contributes any block to query `src`.
-pub(crate) fn page_affects_query(
-    src: &str,
-    entry: &PageEntry,
-    doc: &Document,
-    config: &crate::config::ParseConfig,
-    registry: &registry::Registry,
-) -> bool {
-    let today = JournalDate::today();
-    let (query, _view) = parse_query_source(src, today);
-    if query.is_invalid() {
-        return false;
-    }
-    let filter = match query.anchor {
-        Anchor::Block => query.evaluable_filter(),
-        Anchor::Page => og::rebase_to_block(&query.evaluable_filter()),
-    };
-    page_contributes_to_filter(&filter, entry, doc, today, config, registry)
-}
-
 /// Whether a query source carries a `props` leaf, and is therefore sensitive to
 /// the registry's effective types (C6): its cached result must be evicted when
 /// the registry generation advances, because per-page retention evaluates the
@@ -3968,31 +4262,6 @@ pub(crate) fn page_affects_block_referrers(uuid: &str, doc: &Document) -> bool {
     hit
 }
 
-/// Whether an edited page can contribute to the supported advanced-query
-/// subset. Parsing and evaluation are shared with the real advanced query, so
-/// scoped cache invalidation cannot drift into a second query dialect.
-pub(crate) fn page_affects_advanced_query(
-    query_src: &str,
-    current_page: Option<&str>,
-    entry: &PageEntry,
-    doc: &Document,
-    config: &crate::config::ParseConfig,
-    registry: &registry::Registry,
-) -> bool {
-    let today = JournalDate::today();
-    let (Some(query), _, _) = advanced_pred(query_src, current_page, today) else {
-        return false;
-    };
-    page_contributes_to_filter(
-        &query.evaluable_filter(),
-        entry,
-        doc,
-        today,
-        config,
-        registry,
-    )
-}
-
 /// Result of an advanced (datalog) query: matched groups + which clause heads
 /// ran vs were ignored, so the UI shows "ran X; ignored Y" rather than a blunt
 /// "unsupported". `supported` is false only when nothing in the subset matched.
@@ -4066,27 +4335,43 @@ pub(crate) fn run_application_advanced_query_pages_bounded(
     )
 }
 
-/// The ONE advanced-query evaluator: source limits, clause lowering, the
-/// `ran`/`ignored` report and delegation to the shared simple-query driver all
-/// live here, so the two storage modes cannot answer an advanced query
-/// differently (I-12, I-19).
-fn run_advanced_query_bounded_over(
-    source: &dyn QueryPageSource,
+/// What one advanced (datalog) SOURCE resolved to: the executable IR, or the
+/// refusal to show instead, plus the clause report either way.
+///
+/// The report is a fact about the SOURCE, not about the answer — two datalog
+/// spellings can lower to one filter and still list different `ignored` clauses
+/// — which is why §5.9's cache stores the rows and this report travels beside
+/// them rather than inside the cached value.
+pub(crate) enum ResolvedAdvanced {
+    /// The IR to evaluate, and the clause report to show with its rows.
+    Executable {
+        query: Query,
+        today: JournalDate,
+        ran: Vec<String>,
+        ignored: Vec<String>,
+    },
+    /// A size/depth refusal or a wholly unsupported clause set. Nothing runs and
+    /// nothing is cached; today's strict no-results behaviour is unchanged.
+    Refused(AdvancedResult),
+}
+
+/// **The ONE advanced-query resolve** (§4.4): source limits, then the SAME
+/// `resolve_for_execution` boundary the §7.1 commands use.
+///
+/// Every caller that needs the executable IR of a datalog source goes through
+/// here — the evaluator below, and §5.9's dispatch and cache key. A second
+/// resolve is how one lowerer ends up with two callers that disagree about what
+/// a missing input means (I-12).
+pub(crate) fn resolve_advanced_source(
     query_src: &str,
     current_page: Option<&str>,
-    max_rows: usize,
-    max_bytes: usize,
-) -> (AdvancedResult, bool, usize) {
+) -> ResolvedAdvanced {
     if !query_source_within_limit(query_src) {
-        return (rejected_advanced_query("query-too-large"), false, 0);
+        return ResolvedAdvanced::Refused(rejected_advanced_query("query-too-large"));
     }
     if !query_nesting_within_limit(query_src) {
-        return (rejected_advanced_query("query-nesting-too-deep"), false, 0);
+        return ResolvedAdvanced::Refused(rejected_advanced_query("query-nesting-too-deep"));
     }
-    // §4.4: the SAME `resolve_for_execution` boundary the §7.1 commands use.
-    // This path used to call `advanced_pred` itself, which is how one lowerer
-    // ended up with two callers that could disagree about what a missing input
-    // means.
     let today = JournalDate::today();
     let (parsed, _) = advanced_source_query(query_src, String::new());
     let resolved = resolve_for_execution(
@@ -4099,22 +4384,45 @@ fn run_advanced_query_bounded_over(
     let ran = resolved.report().ran.clone();
     let ignored = resolved.report().ignored.clone();
     if !resolved.report().supported {
-        return (
-            AdvancedResult {
-                groups: Vec::new(),
-                ran,
-                ignored,
-                supported: false,
-            },
-            false,
-            0,
-        );
+        return ResolvedAdvanced::Refused(AdvancedResult {
+            groups: Vec::new(),
+            ran,
+            ignored,
+            supported: false,
+        });
     }
+    ResolvedAdvanced::Executable {
+        query: resolved.query().clone(),
+        today: resolved.today(),
+        ran,
+        ignored,
+    }
+}
+
+/// The ONE advanced-query evaluator: the resolve above, the `ran`/`ignored`
+/// report and delegation to the shared simple-query driver all live here, so the
+/// two storage modes cannot answer an advanced query differently (I-12, I-19).
+fn run_advanced_query_bounded_over(
+    source: &dyn QueryPageSource,
+    query_src: &str,
+    current_page: Option<&str>,
+    max_rows: usize,
+    max_bytes: usize,
+) -> (AdvancedResult, bool, usize) {
+    let (query, today, ran, ignored) = match resolve_advanced_source(query_src, current_page) {
+        ResolvedAdvanced::Refused(result) => return (result, false, 0),
+        ResolvedAdvanced::Executable {
+            query,
+            today,
+            ran,
+            ignored,
+        } => (query, today, ran, ignored),
+    };
     let bounded = run_pred_bounded_over(
         source,
-        resolved.query(),
+        &query,
         &ViewSettings::default(),
-        resolved.today(),
+        today,
         max_rows,
         max_bytes,
     );
@@ -4692,7 +5000,7 @@ fn is_recency_field(field: &str) -> bool {
 /// midnight of the day it represents (stable — independent of when it was last
 /// edited); any other page by its file's last-modified time. `i64::MIN` when a
 /// non-journal page can't be stat'd (so it sorts oldest).
-fn page_recency_secs(entry: &PageEntry) -> i64 {
+pub(crate) fn page_recency_secs(entry: &PageEntry) -> i64 {
     if let Some(dk) = entry.date_key {
         return JournalDate::from_ordinal(dk).to_days() * 86_400;
     }
@@ -7947,23 +8255,39 @@ mod tests {
                 .expect("inherited-only fixture page");
             let config = crate::config::ParseConfig::default();
             let registry = registry::Registry::empty(&config);
-            assert!(page_affects_query(
-                "(and (task TODO) [[Target]])",
+            // §5.9's retention rule reads the cache key's serialized IR back,
+            // which is what makes the keep/evict answer independent of the
+            // dialect the query was written in: the OG form and the advanced
+            // form below produce the SAME key and are judged by the SAME
+            // predicate. `page_affects_query` and `page_affects_advanced_query`
+            // were two spellings of that one question (I-12).
+            let key_ir = |query: &Query| {
+                serde_json::to_string(&block_anchored_query(query).normalized())
+                    .expect("the IR serializes")
+            };
+            let og_ir = |src: &str| key_ir(&parse_query_source(src, JournalDate::today()).0);
+            let advanced_ir = |src: &str| match resolve_advanced_source(src, None) {
+                ResolvedAdvanced::Executable { query, .. } => key_ir(&query),
+                ResolvedAdvanced::Refused(_) => panic!("the fixture advanced query resolves"),
+            };
+            assert!(page_affects_query_ir(
+                &og_ir("(and (task TODO) [[Target]])"),
                 entry,
                 doc,
                 &config,
                 &registry
             ));
-            assert!(!page_affects_query(
-                "(and (task TODO) (page \"Target\"))",
+            assert!(!page_affects_query_ir(
+                &og_ir("(and (task TODO) (page \"Target\"))"),
                 entry,
                 doc,
                 &config,
                 &registry
             ));
-            assert!(page_affects_advanced_query(
-                r#"[:find (pull ?b [*]) :where (and (task ?b #{"TODO"}) (page-ref ?b "Target"))]"#,
-                None,
+            assert!(page_affects_query_ir(
+                &advanced_ir(
+                    r#"[:find (pull ?b [*]) :where (and (task ?b #{"TODO"}) (page-ref ?b "Target"))]"#
+                ),
                 entry,
                 doc,
                 &config,

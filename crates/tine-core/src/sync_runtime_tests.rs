@@ -31473,6 +31473,14 @@ fn c7b_query_driver_producers_share_one_page_source() {
             "run_query_bounded_over",
         ),
         ("run_pred_bounded", "run_pred_bounded_over"),
+        // §5.9 split the shared simple-query driver in two so the SAME
+        // construction can be reached by the walk and by a dispatched
+        // statement's hydration: `collect_pred_bounded_over` builds the
+        // pre-view rows, `apply_view` applies `sort-by`/`sample` after the
+        // cache. The obligation is unchanged — the budget, the page loop and
+        // the OG root filter still live in exactly one `*_over` driver, and no
+        // mode adapter may own them.
+        ("run_pred_bounded_over", "collect_pred_bounded_over"),
         (
             "run_advanced_query_bounded",
             "run_advanced_query_bounded_over",

@@ -32,7 +32,7 @@ icon:: ✅
 		SCHEDULED: <2026-08-12 Wed +1w>
 	- Then this query lists them:
 	- {{query (task TODO DOING NOW LATER)}}
-	- What you should see: the marked tasks above, plus tasks elsewhere in the graph that use `TODO`, `DOING`, `NOW`, or `LATER` (the [[Feature showcase]] has a few; a copied Guide adds your own). The query scans the whole graph for those four markers; DONE tasks and tasks using other markers do not appear.
+	- What you should see: the marked tasks above, plus tasks elsewhere in the graph that use `TODO`, `DOING`, `NOW`, or `LATER` (the [[Feature showcase]] has a few; a copied Guide adds your own). The query covers the whole graph — a task written on any page turns up here, not just the ones on this page; DONE tasks and tasks using other markers do not appear.
 - ## See the plan: the Agenda
   - 1. Scroll to the bottom of today's journal: the **Scheduled &amp; Deadline** list shows open items whose date is near today, wherever in the graph they were written.
   - 2. What you should see: your dated tasks, each with its date chip; click one to jump to it. Widen or narrow the range in Settings → **Journals** → **Agenda window** (default: a week back and a week ahead).
