@@ -196,7 +196,7 @@ interpret the mere presence of the directory as an opt-in marker.
 | `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | publishing device | peer recovery | canonical JSON recovery link v1 | immutable |
 | `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | publishing device | peer recovery | exact manifest bytes | immutable; digest-addressed |
 | `{inbox,outbox}/.part/` | provider transport | provider transport | temporary publication bytes | disposable after recovery |
-| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit, and the evidence an exact repeat of a retired rename/remove settles from (§2.10c-i) | retired provider items | bounded cleanup evidence, capped at `MAX_PROVIDER_RESIDUE_ENTRIES` |
+| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit, and the evidence an exact repeat of a retired rename/remove settles from (§2.10c-i) | retired provider items | bounded cleanup evidence; retired against live journal state, not store lifetime (§2.10c-ii). `MAX_PROVIDER_RESIDUE_ENTRIES` remains the structural scan bound |
 | `{inbox,outbox}/rename-evidence/` | provider transport | provider recovery | interrupted-rename evidence | disposable after recovery |
 
 The device-private provider journal also has `pending-publication-v1/` and
@@ -2778,12 +2778,106 @@ prove exact idempotency after retirement, and that the settle is bound to this
 device's evidence for that exact operation rather than to a destination that
 merely exists.
 
-**Known neighbouring bound, not addressed here.** `{inbox,outbox}/removed/` is
-capped at `MAX_PROVIDER_RESIDUE_ENTRIES` (512) by
-`ensure_provider_diagnostic_capacity`, which refuses beyond it, and nothing
-retires those diagnostics. That is a separate lifetime-growth bound in the
-provider tree rather than in the journal; it is recorded here so the next
-reader does not mistake this section's guarantee for covering it.
+### 2.10c-ii The provider residue directory is bounded by live journal state
+
+`{inbox,outbox}/removed/` is the shared-tree half of the bound §2.10c-i states
+for the journal. It holds two kinds of residue this store writes, and neither
+is history:
+
+* `removed/retired-<operation id>` — the exact bytes ONE completed rename or
+  remove retired. While that operation's journal record exists,
+  `reconcile_provider_retirement` and `validate_retired_source` read it; once
+  the completed record has been compacted away (§2.10c-i), it is what an exact
+  repeat settles from.
+* `removed/orphan-<operation id>-<generation>` — an abandoned staging copy
+  whose authority is the private journal blob. Nothing reads it as authority
+  for anything; the publish path quarantines it so a foreign or crash-left
+  staging file is preserved rather than destroyed.
+
+A third shape, `removed/<prefix>-<digest>`, quarantines FOREIGN bytes that took
+a name this device expected to own. The graph is not their authority, so no
+sweep retires them. Nothing in a production build writes one
+(`quarantine_provider_name` is `#[cfg(test)]`).
+
+**The defect this replaces.** `ensure_provider_diagnostic_capacity` refused any
+write that would exceed `MAX_PROVIDER_RESIDUE_ENTRIES` (512), and nothing ever
+retired an entry. The cap was therefore a bound on the LIFETIME of a shared,
+sync-replicated tree, and the write it refused first is the conflict-copy
+CLEANUP (`remove_identical_generated_conflict`, one entry per sync-service
+conflict copy cleaned up, on a boundary that produces them indefinitely). Past
+512 cleanups the user kept every further conflict copy, permanently, with no
+way out from inside the app (I-10, I-14).
+
+**Retention bound.** `removed/` is bounded by *live journal state*, never by
+the lifetime of the store. Before an operation adds a diagnostic, if the
+directory holds `PROVIDER_RESIDUE_COMPACTION_TRIGGER` (128) entries or more it
+is first swept against the journal (`reconcile_residue_against_journal`).
+`MAX_PROVIDER_RESIDUE_ENTRIES` (512) remains the structural scan bound, and the
+sweep keeps the directory well below it. The trigger sits above the journal's
+own completed-store trigger (64) because the two stores compact in lockstep: a
+diagnostic becomes retirable exactly when the completed record naming it has
+been retired, so the residue steady state tracks the journal steady state.
+Reaching the trigger is an instruction to re-observe the journal, **not** a
+reason to fail the user's next cleanup.
+
+**What the sweep retires, and why each is safe.** The predicate is one
+question — *does any journal record, pending or completed, still name this
+operation?* — and it never consults age or arrival order: these names are
+hashes over the operation and its bytes, so the directory has no chronology and
+a time or count window over it could suppress the wrong operation's evidence.
+
+| Entry | Retired when | Why an exact repeat still reaches the same outcome |
+| --- | --- | --- |
+| `retired-<operation id>` of a **remove** | No record in `records/` or `completed/` names the operation | Source gone: the diagnostic was read by nobody — a `RequirePresent` caller gets `UnknownProviderPath` and a `SettleIfAbsent` caller settles, with or without it (see the §3.1 row). Source back: the settle shortcut goes with the diagnostic, so the repeat performs the ordinary authorized removal it would have performed had this device never run the operation. Same end state — and for the conflict-copy cleanup that is this store's only production remove, the state the caller actually wants, because the settle shortcut left the redelivered copy in place (I-10). |
+| `orphan-<operation id>-<generation>` | No record in `records/` or `completed/` names the operation | Nothing reads it as authority. Retiring it also frees the name, which the no-clobber reservation in `quarantine_unowned_staging` would otherwise refuse on a repeat of the same staging generation. |
+| `<prefix>-<digest>` quarantine | Never | These are foreign bytes the graph is not the authority for. No production writer exists, so the class contributes nothing to growth. |
+
+**The rename caveat, stated rather than assumed.** A retired RENAME is the one
+operation whose diagnostic stays load-bearing after its record is gone: an
+exact repeat settles from it with the source gone (the destination holds the
+retired bytes) *and* with the source back, and without it the repeat either
+reports an unknown source path or conflicts with the destination it published
+itself. The sweep cannot tell a rename diagnostic from a remove diagnostic —
+both are `retired-<operation id>`, and the operation id is a hash that does not
+carry the operation's paths back. What makes the sweep sound is that **no
+production code writes a rename retirement diagnostic**:
+`run_provider_rename_with` is `#[cfg(test)]`, which
+`oplog::wire::tests::only_tests_can_write_a_provider_rename_retirement_diagnostic`
+pins as compile-time structure rather than intent. A production rename writer
+may not be added without giving its diagnostic a retention rule here.
+
+**The sweep commits per entry, and needs no generation pointer.** Each entry is
+*independently* retirable and its retirement is idempotent, so a crash part-way
+through leaves a prefix retired and the rest untouched — a state the next sweep
+reaches again by itself. There is no mixed generation to publish atomically.
+Every individual removal is a `remove_file` followed by a directory `fsync`.
+
+**Capacity and validation are two questions, not one.** The capacity check used
+to answer "is there room for one more" by walking the whole directory and, per
+entry, calling `open_provider_file_nofollow` and `validate_provider_regular_file`
+— up to 512 opens and 512 stats on a path the user waits on, to answer a
+question that needs only a count (I-13, I-15). Counting is now count-only. The
+no-follow regular-file check is real work and it runs where it is used: once
+per sweep, and on the exact entry every reader opens through
+`open_provider_regular_optional`. Validating 511 unrelated diagnostics told the
+512th write nothing, and that write is no-clobber, so a hostile sibling cannot
+be published over.
+
+**Proof.**
+`oplog::wire::tests::provider_removed_residue_retires_against_live_journal_state`
+drives `MAX_PROVIDER_RESIDUE_ENTRIES + 64` conflict cleanups through the
+production writer — past the cap, where the old refusal fired — and asserts no
+cleanup fails and that the steady-state and peak `removed/` counts stay at or
+below the trigger.
+`…::retired_provider_residue_still_reaches_the_same_outcome_for_an_exact_repeat`
+proves the diagnostic is pinned while a record names it, retired once none
+does, and that both exact repeats — source gone and source back — reach the
+same end state afterwards.
+`…::a_crash_across_provider_residue_retirement_reopens_and_converges` cuts a
+sweep at the `ResidueRetired` boundary, reopens, and proves the next sweep
+converges.
+`…::provider_residue_classification_covers_only_this_stores_own_diagnostics`
+pins that a foreign-bytes quarantine is not classified as this store's residue.
 
 ### 2.10d When the graph filesystem folds two page names into one file
 

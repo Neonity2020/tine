@@ -6386,6 +6386,28 @@
     "failBefore": "cargo test -p tine-core --lib concord_ledger::tests::prune_reclaims with the two new match arms reverted: dangling_entries_removed 0, expected 3"
    },
    "notes": "prune() collected the hash named by each index and pin file and deleted only blobs nothing referenced, plus files that failed to parse. An entry whose blob had been removed from outside the ledger -- antivirus quarantine (the GH #411 reporter's case), a disk cleaner, a partial restore -- still parsed, so it was kept and its hash was even added to the referenced set. Every lookup through it already answered None, because base() verifies the blob's content hash, so no user-visible behaviour was wrong; the entry was simply dead metadata that accumulated and was re-read by every later prune. prune() now also removes index and pin files naming an absent blob. This is hygiene only: the ledger is disposable state that may never warn, refuse, or report a missing blob, so no diagnostic was added."
+  },
+  {
+   "id": "REG-HARVEST-RESIDUE-CAP-001",
+   "title": "The provider residue directory grew for the life of the graph and then refused the cleanup that wrote into it",
+   "family": "managed-storage-provider-transport",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest follow-up PVTI_lAHOAAbLVc4BhPsyzg47jbM, raised by wave-3 packet A2; invariants I-8, I-10, I-14, I-15"},
+   "platforms": ["all"],
+   "layer": "tine-core-provider-transport",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/wire.rs::tests::provider_removed_residue_retires_against_live_journal_state",
+     "crates/tine-core/src/oplog/wire.rs::tests::retired_provider_residue_still_reaches_the_same_outcome_for_an_exact_repeat",
+     "crates/tine-core/src/oplog/wire.rs::tests::a_crash_across_provider_residue_retirement_reopens_and_converges",
+     "crates/tine-core/src/oplog/wire.rs::tests::provider_residue_classification_covers_only_this_stores_own_diagnostics",
+     "crates/tine-core/src/oplog/wire.rs::tests::only_tests_can_write_a_provider_rename_retirement_diagnostic",
+     "crates/tine-core/src/oplog/wire.rs::tests::the_contract_carries_the_residue_bound_this_module_implements"
+    ],
+    "scenario": "managed-storage.provider-residue-bounded-by-live-journal-state",
+    "failBefore": "proven"
+   },
+   "notes": "`{inbox,outbox}/removed/` was capped at MAX_PROVIDER_RESIDUE_ENTRIES (512) and nothing ever retired an entry, so the cap was a bound on the LIFETIME of a shared, sync-replicated tree. The write that reached it first is the conflict-copy CLEANUP: remove_identical_generated_conflict writes one removed/retired-<operation id> diagnostic per sync-service conflict copy it cleans up, and Syncthing/Dropbox delivery produces those indefinitely on a busy multi-device graph, so past 512 cleanups the user kept every further conflict copy permanently with no way out from inside the app. removed/ is now bounded by live journal state the way the journal's own completed/ store is (docs/storage-sync-contract.md 2.10c-ii): before adding a diagnostic past PROVIDER_RESIDUE_COMPACTION_TRIGGER (128) the directory is swept, and an entry is retired when no journal record -- pending or completed -- still names its operation. The card blamed retire_frontier_head, which is #[cfg(test)] and cannot drive production growth; the mechanism was right and the exemplar was wrong. Second finding fixed in the same function: the capacity check walked the whole directory and per entry called open_provider_file_nofollow plus validate_provider_regular_file, up to 511 opens and 511 stats to answer 'is there room for one more' on a path the user waits on. Counting is now count-only and the no-follow regular-file check runs once per sweep instead. Fail-before: residue-cap-fail-before.log at b889fc08 with compaction disabled in reserve_provider_diagnostic_capacity -- 'cleanup 512 must never fail on residue capacity: provider rescan exceeded explicit bound'."
   }
  ]
 }
