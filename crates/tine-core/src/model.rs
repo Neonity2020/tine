@@ -23852,21 +23852,28 @@ fn doc_has_content(blocks: &[DocBlock]) -> bool {
 const FILE_BLOCK_RUNTIME_NAMESPACE_V1: Uuid =
     Uuid::from_u128(0x1e0c_5a13_9b42_5da4_a73c_0be5_8f6a_2320);
 
-fn normalized_runtime_owner(owner: &str) -> String {
+fn normalized_runtime_owner(owner: &str) -> io::Result<String> {
     let owner = owner.replace('\\', "/");
     let mut parts = Vec::new();
     for part in owner.split('/') {
         match part {
             "" | "." => {}
-            ".." => panic!("runtime identity owner must be graph-relative"),
+            ".." => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "runtime identity owner must be graph-relative",
+                ))
+            }
             _ => parts.push(part),
         }
     }
-    assert!(
-        !parts.is_empty(),
-        "runtime identity owner must not be empty"
-    );
-    parts.join("/")
+    if parts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime identity owner must not be empty",
+        ));
+    }
+    Ok(parts.join("/"))
 }
 
 fn deterministic_runtime_uuid(namespace: Uuid, name: &[u8]) -> Uuid {
@@ -23883,14 +23890,51 @@ fn deterministic_runtime_uuid(namespace: Uuid, name: &[u8]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn runtime_owner_namespace(domain: &str, owner: &str) -> Uuid {
-    let owner = normalized_runtime_owner(owner);
+fn runtime_owner_namespace(domain: &str, owner: &str) -> io::Result<Uuid> {
+    let owner = normalized_runtime_owner(owner)?;
     let mut name = Vec::with_capacity(domain.len() + owner.len() + 16);
     name.extend_from_slice(&(domain.len() as u64).to_be_bytes());
     name.extend_from_slice(domain.as_bytes());
     name.extend_from_slice(&(owner.len() as u64).to_be_bytes());
     name.extend_from_slice(owner.as_bytes());
-    deterministic_runtime_uuid(FILE_BLOCK_RUNTIME_NAMESPACE_V1, &name)
+    Ok(deterministic_runtime_uuid(
+        FILE_BLOCK_RUNTIME_NAMESPACE_V1,
+        &name,
+    ))
+}
+
+fn structural_runtime_child(parent: Uuid, sibling: u64) -> Uuid {
+    deterministic_runtime_uuid(parent, &sibling.to_be_bytes())
+}
+
+/// Reproduce a fresh Direct parse's runtime ID from its stored structural path.
+/// Public/external `id::` is a separate identity. This is the R3 result
+/// constructor seam: resolve admitted output without a startup-wide ID rewrite.
+pub(crate) fn doc_runtime_id_for_order(owner_rel_path: &str, order_key: &str) -> io::Result<Uuid> {
+    let mut structural = runtime_owner_namespace("file-block-runtime-v1", owner_rel_path)?;
+    let mut depth = 0;
+    for component in order_key.split('/') {
+        depth += 1;
+        if depth > MAX_MANAGED_BLOCK_DEPTH
+            || component.len() != 8
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid projected structural order",
+            ));
+        }
+        let sibling = u32::from_str_radix(component, 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid projected structural order",
+            )
+        })?;
+        structural = structural_runtime_child(structural, u64::from(sibling));
+    }
+    Ok(structural)
 }
 
 fn assign_runtime_ids_checked(blocks: &mut [DocBlock], parent: Uuid) -> io::Result<()> {
@@ -23919,8 +23963,7 @@ fn assign_runtime_ids_checked(blocks: &mut [DocBlock], parent: Uuid) -> io::Resu
             .sibling
             .checked_add(1)
             .ok_or_else(allocation_overflow)?;
-        let structural =
-            deterministic_runtime_uuid(frame.parent, &usize_to_u64(sibling)?.to_be_bytes());
+        let structural = structural_runtime_child(frame.parent, usize_to_u64(sibling)?);
         frames[len - 1] = Some(frame);
         if block.uuid.is_empty() {
             block.uuid = structural.to_string();
@@ -23946,7 +23989,8 @@ fn assign_runtime_ids_checked(blocks: &mut [DocBlock], parent: Uuid) -> io::Resu
 /// Seed missing runtime keys for a graph-backed document from its normalized,
 /// graph-relative physical owner. Existing live keys survive ordinary saves.
 pub fn assign_doc_runtime_ids(roots: &mut [DocBlock], owner_rel_path: &str) {
-    let owner = runtime_owner_namespace("file-block-runtime-v1", owner_rel_path);
+    let owner = runtime_owner_namespace("file-block-runtime-v1", owner_rel_path)
+        .expect("validated document runtime owner");
     let _ = assign_runtime_ids_checked(roots, owner);
 }
 
@@ -23955,7 +23999,7 @@ fn assign_virtual_doc_runtime_ids(
     domain: &str,
     owner: &str,
 ) -> io::Result<()> {
-    let owner = runtime_owner_namespace(domain, owner);
+    let owner = runtime_owner_namespace(domain, owner)?;
     assign_runtime_ids_checked(roots, owner)
 }
 

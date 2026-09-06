@@ -86,6 +86,7 @@ enum PageDelta {
         document: Arc<Document>,
         revision: String,
         parse_config: Arc<ParseConfig>,
+        query_page_order: u64,
     },
     Delete {
         entry: PageEntry,
@@ -118,6 +119,33 @@ struct PendingProjection {
     deltas: BTreeMap<String, (u64, PageDelta)>,
     latest_generation: u64,
     stop: bool,
+    page_order: BTreeMap<String, u64>,
+    next_page_order: u64,
+}
+
+impl PendingProjection {
+    fn record_delta(&mut self, generation: u64, mut delta: PageDelta) {
+        let key = delta.entry().rel_path.clone();
+        match &mut delta {
+            PageDelta::Replace {
+                query_page_order, ..
+            } => {
+                *query_page_order = if let Some(position) = self.page_order.get(&key) {
+                    *position
+                } else {
+                    let position = self.next_page_order;
+                    self.next_page_order += 1;
+                    self.page_order.insert(key.clone(), position);
+                    position
+                };
+            }
+            PageDelta::Delete { .. } => {
+                self.page_order.remove(&key);
+            }
+        }
+        self.deltas.insert(key, (generation, delta));
+        self.latest_generation = self.latest_generation.max(generation);
+    }
 }
 
 struct ProjectionShared {
@@ -246,6 +274,12 @@ impl DirectProjection {
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
+        pending.page_order = pages
+            .iter()
+            .enumerate()
+            .map(|(position, (entry, _))| (entry.rel_path.clone(), position as u64))
+            .collect();
+        pending.next_page_order = pages.len() as u64;
         pending.full = Some(PendingFull {
             pages,
             revisions,
@@ -271,6 +305,7 @@ impl DirectProjection {
                 document,
                 revision,
                 parse_config,
+                query_page_order: 0, // Filled under the queue lock, before coalescing.
             },
         );
     }
@@ -281,10 +316,8 @@ impl DirectProjection {
 
     fn enqueue_delta(&self, generation: u64, delta: PageDelta) {
         self.shared.ready.store(false, Ordering::Release);
-        let key = delta.entry().rel_path.clone();
         let mut pending = self.shared.pending.lock().unwrap();
-        pending.deltas.insert(key, (generation, delta));
-        pending.latest_generation = pending.latest_generation.max(generation);
+        pending.record_delta(generation, delta);
         self.shared.changed.notify_one();
     }
 
@@ -1428,10 +1461,19 @@ fn apply_pending(
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let inventory = sources
+            .iter()
+            .map(|source| source.page_id)
+            .collect::<Vec<_>>();
         let lowered = pages
             .iter()
-            .filter(|(entry, _)| replacements_needed.contains(&page_id(&entry.rel_path)))
-            .map(|(entry, document)| physical_page(entry, document, parse_config))
+            .enumerate()
+            .filter(|(_, (entry, _))| replacements_needed.contains(&page_id(&entry.rel_path)))
+            .map(|(position, (entry, document))| {
+                let (mut page, postings, aliases) = physical_page(entry, document, parse_config)?;
+                page.query_page_order = Some(position as u64);
+                Ok::<_, String>((page, postings, aliases))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let mut replacements = Vec::with_capacity(lowered.len());
         let mut reference_postings = Vec::new();
@@ -1446,7 +1488,7 @@ fn apply_pending(
             .filter(|source| replacements_needed.contains(&source.page_id))
             .collect::<Vec<_>>();
         database
-            .apply_with_source_revisions_and_aliases(
+            .apply_with_source_revisions_aliases_and_page_order(
                 &PhysicalGraphProjectionChange {
                     replacements,
                     deletions: source_delta.deletions,
@@ -1454,6 +1496,7 @@ fn apply_pending(
                 },
                 &replacement_sources,
                 &aliases,
+                &inventory,
             )
             .map_err(|error| error.to_string())?;
     }
@@ -1472,13 +1515,15 @@ fn apply_pending(
                     document,
                     revision,
                     parse_config,
+                    query_page_order,
                 } => {
                     replacement_sources.push(PhysicalGraphProjectionSourceRevision {
                         page_id: page_id(&entry.rel_path),
                         revision: projection_source_revision(&revision, parse_config.digest()),
                     });
-                    let (page, mut postings, mut page_aliases) =
+                    let (mut page, mut postings, mut page_aliases) =
                         physical_page(&entry, &document, &parse_config)?;
+                    page.query_page_order = Some(query_page_order);
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
@@ -1629,6 +1674,7 @@ fn physical_page(
     Ok((
         PhysicalPage {
             page_id: id,
+            query_page_order: None,
             home_document_id: id,
             name: entry.name.clone(),
             name_key: crate::refs::page_key(&entry.name),
@@ -1736,6 +1782,8 @@ fn lower_blocks(
             .map(Uuid::into_bytes);
         out.push(PhysicalBlock {
             block_id,
+            query_result_id: block.uuid.clone(),
+            own_refs: projection.refs_norm.clone(),
             home_document_id: page_id,
             parent,
             order,
@@ -3255,6 +3303,49 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_edits_keep_first_insertion_page_order_and_readds_append() {
+        let entry = |name: &str| PageEntry {
+            name: name.into(),
+            kind: PageKind::Page,
+            date_key: None,
+            rel_path: format!("pages/{name}.md"),
+            path: PathBuf::from(format!("pages/{name}.md")),
+        };
+        let replacement = |name: &str| PageDelta::Replace {
+            entry: entry(name),
+            document: Arc::new(crate::doc::parse("- text")),
+            revision: "exact-revision".into(),
+            parse_config: Arc::new(ParseConfig::default()),
+            query_page_order: 0,
+        };
+        let position = |pending: &PendingProjection, name: &str| match &pending.deltas
+            [&format!("pages/{name}.md")]
+            .1
+        {
+            PageDelta::Replace {
+                query_page_order, ..
+            } => *query_page_order,
+            _ => panic!("replacement expected"),
+        };
+        let mut pending = PendingProjection::default();
+        pending.record_delta(1, replacement("z-first"));
+        pending.record_delta(2, replacement("a-second"));
+        pending.record_delta(3, replacement("z-first"));
+        assert_eq!(position(&pending, "z-first"), 0);
+        assert_eq!(position(&pending, "a-second"), 1);
+        assert_eq!(pending.deltas.len(), 2, "first page edit is coalesced");
+        pending.record_delta(
+            4,
+            PageDelta::Delete {
+                entry: entry("z-first"),
+            },
+        );
+        pending.record_delta(5, replacement("z-first"));
+        assert_eq!(position(&pending, "a-second"), 1);
+        assert_eq!(position(&pending, "z-first"), 2);
+    }
+
+    #[test]
     fn clean_reopen_reuses_sqlite_and_external_edit_relowers_only_one_page() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("reopen-revisions");
@@ -3388,6 +3479,7 @@ mod tests {
                         }),
                         revision: format!("sha256:{rel_path}"),
                         parse_config: Arc::clone(parse_config),
+                        query_page_order: u64::from(rel_path == "beta.md"),
                     },
                 ),
             )

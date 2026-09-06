@@ -581,28 +581,21 @@ fn crumb_line_estimated_bytes(block: &DocBlock) -> usize {
 
 fn shallow_dto_estimated_bytes(block: &DocBlock, ancestors: &[&DocBlock]) -> usize {
     let projection = block.projection();
-    let id_bytes = if block.uuid.is_empty() {
-        36
-    } else {
-        block.uuid.len()
-    };
-    id_bytes
-        .saturating_add(block.raw.len())
-        .saturating_add(
-            ancestors
-                .iter()
-                .map(|ancestor| crumb_line_estimated_bytes(ancestor))
-                .sum::<usize>(),
-        )
-        .saturating_add(projection.tags.iter().map(String::len).sum::<usize>())
-        .saturating_add(
-            projection
-                .properties
-                .iter()
-                .map(|(key, value)| key.len().saturating_add(value.len()))
-                .sum::<usize>(),
-        )
-        .saturating_add(128)
+    tine_storage::sqlite::query_result_estimated_bytes(
+        &block.uuid,
+        &block.raw,
+        projection.tags.iter().map(String::as_str),
+        projection
+            .properties
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .saturating_add(
+        ancestors
+            .iter()
+            .map(|ancestor| crumb_line_estimated_bytes(ancestor))
+            .sum::<usize>(),
+    )
 }
 
 pub(crate) fn reference_evidence_estimated_bytes(evidence: &ReferenceBlockEvidence) -> usize {

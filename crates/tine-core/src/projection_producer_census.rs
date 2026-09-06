@@ -1655,7 +1655,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.14.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.15.0\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -1836,9 +1836,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // No authority write boundary or new SQL write API is introduced. The
     // writer_slot Option is not a storage handle; the reset receiver remains
     // named database so this inventory sees the actual storage call.
+    // R1: two pure shared helper calls replace local byte estimation and tree
+    // traversal. Direct full reconciliation changes one of the two existing
+    // database.apply_with_source_revisions_and_aliases calls to the ordered
+    // inventory variant; live deltas retain the original call. Both remain
+    // within the existing disposable page transaction. No authority crossing
+    // was added. The dependency assertion above also catches up to DB2's pin.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "6056c09182303144616d6fbd5e9ac1da8cab4d0f2f23cd534524065588e1f20a",
+        "fffe25d2bab8df89f2343391fa658edba2366e89412c314142442ec1c4e99160",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

@@ -12078,7 +12078,10 @@ struct ManagedSparseTaskQueryMetrics {
     dto_constructions: usize,
 }
 
-fn sparse_task_query_identity(block_id: BlockId, logseq_uuid: Option<LogseqUuid>) -> String {
+pub(crate) fn sparse_task_query_identity(
+    block_id: BlockId,
+    logseq_uuid: Option<LogseqUuid>,
+) -> String {
     logseq_uuid.map_or_else(
         || format!("{SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX}{block_id}"),
         |uuid| uuid.to_string(),
@@ -25603,51 +25606,20 @@ fn ensure_editor_frontier_parts(
 fn ordered_editor_blocks(
     blocks: &[MaterializedBlock],
 ) -> Result<Vec<SyncEditorBlockDto>, SyncEditorRequestError> {
-    let mut indexes = HashMap::with_capacity(blocks.len());
-    for (index, block) in blocks.iter().enumerate() {
-        if indexes.insert(block.block_id, index).is_some() {
-            return Err(SyncEditorRequestError::ActorRefusedAt(
-                "ordered_blocks_duplicate_id",
-            ));
-        }
-    }
-    let mut children = BTreeMap::<Option<BlockId>, Vec<usize>>::new();
-    for (index, block) in blocks.iter().enumerate() {
-        if block
-            .parent
-            .is_some_and(|parent| !indexes.contains_key(&parent))
-        {
-            return Err(SyncEditorRequestError::ActorRefusedAt(
-                "ordered_blocks_unknown_parent",
-            ));
-        }
-        children.entry(block.parent).or_default().push(index);
-    }
-    for siblings in children.values_mut() {
-        siblings.sort_unstable_by(|left, right| {
-            (&blocks[*left].order, blocks[*left].block_id)
-                .cmp(&(&blocks[*right].order, blocks[*right].block_id))
-        });
-    }
-    let mut stack = children
-        .get(&None)
-        .into_iter()
-        .flatten()
-        .rev()
-        .map(|index| (*index, 1_usize))
-        .collect::<Vec<_>>();
-    let mut visited = HashSet::with_capacity(blocks.len());
+    let traversal = tine_storage::sqlite::query_block_preorder(blocks.iter().map(|block| {
+        (
+            block.block_id.as_uuid().into_bytes(),
+            block.parent.map(|parent| parent.as_uuid().into_bytes()),
+            block.order.as_str(),
+        )
+    }))
+    .map_err(|_| SyncEditorRequestError::ActorRefusedAt("ordered_blocks_invalid_tree"))?;
     let mut output = Vec::with_capacity(blocks.len());
-    while let Some((index, depth)) = stack.pop() {
+    for (index, depth) in traversal {
         if depth > MAX_SYNC_EDITOR_DEPTH {
             return Err(editor_too_large(blocks.len(), depth, 0, 0));
         }
         let block = &blocks[index];
-        if !visited.insert(block.block_id) {
-            return Err(SyncEditorRequestError::ActorRefusedAt(
-                "ordered_blocks_cycle",
-            ));
-        }
         output.push(SyncEditorBlockDto {
             key: SyncEditorBlockKey::Existing(block.block_id.to_string()),
             parent: block
@@ -25655,19 +25627,6 @@ fn ordered_editor_blocks(
                 .map(|parent| SyncEditorBlockKey::Existing(parent.to_string())),
             content: block.content.clone(),
         });
-        if let Some(nested) = children.get(&Some(block.block_id)) {
-            stack.extend(
-                nested
-                    .iter()
-                    .rev()
-                    .map(|child| (*child, depth.saturating_add(1))),
-            );
-        }
-    }
-    if visited.len() != blocks.len() {
-        return Err(SyncEditorRequestError::ActorRefusedAt(
-            "ordered_blocks_unreachable",
-        ));
     }
     Ok(output)
 }

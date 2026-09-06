@@ -1583,6 +1583,7 @@ fn lower_page(
     let mut path_refs = crate::query::derived::path_ref_rows(&page.name, &flat);
     Ok(storage::PhysicalPage {
         page_id: page.page_id.as_uuid().into_bytes(),
+        query_page_order: None,
         home_document_id: page.home_document_id.as_uuid().into_bytes(),
         name: page.name.clone(),
         name_key: page.name_key.clone(),
@@ -1634,6 +1635,11 @@ fn lower_block(
     );
     Ok(storage::PhysicalBlock {
         block_id: block.block_id.as_uuid().into_bytes(),
+        query_result_id: crate::sync_runtime::sparse_task_query_identity(
+            block.block_id,
+            block.logseq_uuid,
+        ),
+        own_refs: block.path_ref_names.clone(),
         home_document_id: block.home_document_id.as_uuid().into_bytes(),
         parent: block.parent.map(|id| id.as_uuid().into_bytes()),
         order: block.order.clone(),
@@ -4354,6 +4360,40 @@ mod tests {
             .expect("one lowered page")
     }
 
+    #[test]
+    fn result_metadata_uses_each_backends_existing_public_identity_and_own_refs() {
+        let direct = direct_files_page(PARITY_NAME, PARITY_PATH, crate::model::PageKind::Page);
+        let parsed = parse_page(PARITY_PATH, PARITY_FIXTURE);
+        fn check(
+            blocks: &[crate::doc::DocBlock],
+            physical: &mut impl Iterator<Item = storage::PhysicalBlock>,
+        ) {
+            for block in blocks {
+                let row = physical.next().expect("one physical row per parsed block");
+                assert_eq!(row.query_result_id, block.uuid);
+                assert_eq!(row.own_refs, block.projection().refs_norm);
+                check(&block.children, physical);
+            }
+        }
+        let mut physical = direct.blocks.into_iter();
+        check(&parsed.roots, &mut physical);
+        assert!(physical.next().is_none());
+
+        let input = parity_page_input();
+        let managed = managed_page(&input, &ParseConfig::default());
+        assert!(managed.query_page_order.is_none());
+        for (source, physical) in input.blocks.iter().zip(&managed.blocks) {
+            assert_eq!(
+                physical.query_result_id,
+                crate::sync_runtime::sparse_task_query_identity(
+                    source.block_id,
+                    source.logseq_uuid
+                )
+            );
+            assert_eq!(physical.own_refs, source.path_ref_names);
+        }
+    }
+
     /// Guard 2b (§5.8, §3.2 M2, I-19). `block_planning` is the same list on
     /// both backends and under the tree walk -- and it is populated for the
     /// three blocks `tasks` cannot hold at all.
@@ -5012,7 +5052,14 @@ mod tests {
 
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection, ContentDigest::of(b"empty")).unwrap();
-        for table in ["block_path_refs", "property_atoms", "block_planning"] {
+        for table in [
+            "block_path_refs",
+            "property_atoms",
+            "block_planning",
+            "block_own_refs",
+            "query_block_results",
+            "query_page_order",
+        ] {
             let found: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

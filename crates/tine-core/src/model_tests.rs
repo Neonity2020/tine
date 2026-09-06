@@ -1733,6 +1733,88 @@ fn runtime_ids_are_owner_structural_and_separate_from_explicit_ids() {
 }
 
 #[test]
+fn projected_order_reproduces_reopened_runtime_ids_after_live_structural_edits() {
+    for owner in ["pages/Case.md", "pages/é/日本.org", "pages\\é\\日本.org"] {
+        let mut roots = vec![DocBlock::new("same\nid:: external"), DocBlock::new("same")];
+        roots[0].children.push(DocBlock::new("child"));
+        assign_doc_runtime_ids(&mut roots, owner);
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000000")
+                .unwrap()
+                .to_string(),
+            roots[0].uuid
+        );
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000000/00000000")
+                .unwrap()
+                .to_string(),
+            roots[0].children[0].uuid
+        );
+        let old_id = roots[0].uuid.clone();
+        roots.insert(0, DocBlock::new("inserted"));
+        roots[1].children.push(DocBlock::new("new child"));
+        assign_doc_runtime_ids(&mut roots, owner);
+        assert_eq!(roots[1].uuid, old_id, "live identity survives insertion");
+        let mut reopened = roots.clone();
+        for root in &mut reopened {
+            root.uuid.clear();
+            for child in &mut root.children {
+                child.uuid.clear();
+            }
+        }
+        assign_doc_runtime_ids(&mut reopened, owner);
+        assert_ne!(reopened[1].uuid, old_id);
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000001")
+                .unwrap()
+                .to_string(),
+            reopened[1].uuid
+        );
+        assert_eq!(
+            doc_runtime_id_for_order(owner, "00000001/00000001")
+                .unwrap()
+                .to_string(),
+            reopened[1].children[1].uuid
+        );
+        assert_eq!(
+            roots[1].children[1].uuid, reopened[1].children[1].uuid,
+            "new children use structural namespace even when parent keeps live ID"
+        );
+    }
+    assert_eq!(
+        doc_runtime_id_for_order("pages/é/日本.org", "00000000").unwrap(),
+        doc_runtime_id_for_order("pages\\é\\日本.org", "00000000").unwrap()
+    );
+    assert_ne!(
+        doc_runtime_id_for_order("pages/Case.md", "00000000").unwrap(),
+        doc_runtime_id_for_order("pages/case.md", "00000000").unwrap()
+    );
+}
+
+#[test]
+fn projected_order_rejects_invalid_identity_metadata() {
+    for order in [
+        "",
+        "0",
+        "0000000g",
+        "0000000A",
+        "00000000/",
+        "/00000000",
+        "000000000",
+    ] {
+        assert!(
+            doc_runtime_id_for_order("pages/a.md", order).is_err(),
+            "{order:?}"
+        );
+    }
+    let deepest = vec!["00000000"; MAX_MANAGED_BLOCK_DEPTH].join("/");
+    assert!(doc_runtime_id_for_order("pages/a.md", &deepest).is_ok());
+    assert!(doc_runtime_id_for_order("pages/a.md", &format!("{deepest}/00000000")).is_err());
+    assert!(doc_runtime_id_for_order("../a.md", "00000000").is_err());
+    assert!(doc_runtime_id_for_order("", "00000000").is_err());
+}
+
+#[test]
 fn reserve_asset_avoids_overwrite() {
     let dir = std::env::temp_dir().join(format!("tine-asset-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
