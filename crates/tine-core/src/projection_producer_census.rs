@@ -1952,6 +1952,82 @@ fn g_h_repository_root_tracks_no_lane_evidence() {
     );
 }
 
+/// I-21 / I-20: an off-actor query job holds an owned snapshot of the Managed
+/// projection file, so every site that closes or replaces that file drains the
+/// runtime's query-job owner first. The file closes in exactly three places —
+/// `RuntimeActor` dropping (its `SqliteFrontier` truncates the WAL on drop),
+/// `HandleInner` dropping (which must refuse new jobs BEFORE it stops the
+/// actor), and the shared-join install replacing the clean runtime — and this
+/// guard pins each one to its drain. The accepted-batch apply is deliberately
+/// not a site: it writes the checkpoint sidecar, never a WAL checkpoint.
+/// Exemplar to imitate when adding a fourth: the shared-join install in
+/// `sync_runtime.rs` (`cancel_all_and_drain()` on the line before
+/// `self.clean.take()`).
+#[test]
+fn g_i_managed_query_jobs_drain_before_projection_file_close() {
+    let files = production_rust();
+    let source = |relative: &str| {
+        &files
+            .iter()
+            .find(|file| file.relative == relative)
+            .unwrap_or_else(|| panic!("{relative} is a production file"))
+            .code
+    };
+    let runtime = source("crates/tine-core/src/sync_runtime.rs");
+    let block = |header: &str| {
+        let start = runtime
+            .find(header)
+            .unwrap_or_else(|| panic!("{header} exists in sync_runtime.rs"));
+        let tail = &runtime[start..];
+        &tail[..tail.find("\n}\n").expect("impl block closes")]
+    };
+    assert!(
+        block("impl Drop for RuntimeActor {").contains("managed_query.jobs.cancel_all_and_drain()"),
+        "I-21: RuntimeActor::drop must drain every off-actor query job before its \
+         SqliteFrontier closes the projection file (see the guard's doc comment)"
+    );
+    let handle_drop = block("impl Drop for HandleInner {");
+    let close = handle_drop
+        .find("managed_query.jobs.close()")
+        .expect("I-21: HandleInner::drop must close the query-job owner");
+    let stop = handle_drop
+        .find("sender.get_mut().unwrap().take()")
+        .expect("HandleInner::drop stops the actor by dropping its sender");
+    assert!(
+        close < stop,
+        "I-21: the handle must refuse and drain query jobs BEFORE it stops the actor, \
+         because the actor's exit closes the projection file"
+    );
+    let takes = runtime
+        .match_indices("self.clean.take()")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        takes.len(),
+        1,
+        "a new site replaces the clean runtime; drain `managed_query.jobs` on the line \
+         before it and extend this guard (I-21)"
+    );
+    for (at, _) in takes {
+        let preceding = &runtime[at.saturating_sub(400)..at];
+        assert!(
+            preceding.contains("managed_query.jobs.cancel_all_and_drain()"),
+            "I-21: `self.clean.take()` closes the projection file; drain the query-job \
+             owner immediately before it (exemplar: the shared-join install)"
+        );
+    }
+    assert_eq!(
+        runtime.matches("self.clean = Some(").count(),
+        1,
+        "the clean runtime is reinstalled in exactly one place (the shared-join install), \
+         after the drained take above; a second installer needs its own drain (I-21)"
+    );
+    let sqlite = source("crates/tine-core/src/oplog/sqlite.rs");
+    assert!(
+        sqlite.contains("impl Drop for SqliteFrontier"),
+        "the reason the drains exist: SqliteFrontier checkpoints the WAL on drop"
+    );
+}
+
 #[test]
 fn g_e_shipped_native_targets_and_writers_are_pinned() {
     let repo = repository_root();
@@ -2270,14 +2346,14 @@ fn census_guard_itself_names_every_required_guard() {
         .filter_map(|line| line.trim().strip_prefix("fn g_"))
         .filter_map(|line| line.split_once('(').map(|(name, _)| name))
         .collect::<BTreeSet<_>>();
-    assert_eq!(tests.len(), 8);
+    assert_eq!(tests.len(), 9);
     let prefixes = tests
         .iter()
         .map(|name| name.split('_').next().unwrap())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         prefixes,
-        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g", "h"])
+        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g", "h", "i"])
     );
     assert!(
         include_str!("oplog/mod.rs")

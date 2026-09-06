@@ -78,8 +78,12 @@ adapter call edges.
 | application_query_run_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | run_application_query_result | SPEC §7.1 `query_run`: the IR arrives parsed, so only the Managed page assembly is mode-specific; the evaluator is the shared one. |
 | application_request | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed application request boundary. |
 | application_resolve_blocks_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Materializes resolved Managed UUID groups. |
+| application_simple_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed simple-query driver (R4): one short actor turn, then the captured accepted-frontier read executes on the caller's thread with `operation` released; `Stale` re-captures, `Busy`/`Cancelled` walk, `Failed` errors. |
 | application_simple_query_pages_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed simple-query candidate index boundary. |
+| application_simple_query_prepared | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Parses a Managed simple query once and stamps it with the actor's accepted-frontier evidence (memo key, registry snapshot). |
 | application_simple_query_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed simple-query execution boundary. |
+| application_simple_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The actor half of a Managed simple query (R4): readiness, memo hit, pending-suffix walk, or a capture for off-actor execution. |
+| application_simple_query_walk | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The actor-side evaluation (sparse runner or complete-page evaluator); reuses a still-current capture so a query is prepared once. |
 | application_sparse_task_query_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed task-index sparse hydration boundary. |
 | application_subtree_nodes | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Counts nodes in a Managed DTO subtree for admission. |
 | application_templates_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | application_page_templates | Supplies hydrated Managed pages to the canonical template walk. |

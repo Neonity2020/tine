@@ -4342,6 +4342,13 @@ impl SqliteFrontier {
         &self.required_frontier_root
     }
 
+    /// The frontier digest every accepted row in this file was applied under —
+    /// with `required_frontier_root().acceptance_sequence()`, the stamp an
+    /// off-actor query snapshot validates against (`managed_query`).
+    pub(crate) const fn required_frontier_digest(&self) -> ContentDigest {
+        self.required_frontier_digest
+    }
+
     /// Explicit whole-frontier materialization for diagnostics and recovery.
     /// Normal apply, startup, and point authorization use `frontier_root` and
     /// `contains_frontier` instead.

@@ -6529,8 +6529,8 @@ impl Graph {
         };
         // The recency axis is the WALK'S producer, by the two inputs the
         // projection stores; it runs only for a page the answer admitted.
-        let recency = |journal_day: Option<i64>, path: &str| {
-            crate::query::page_recency_secs_for(journal_day, &self.root.join(path))
+        let recency = |page: crate::query::results::RecencyPage<'_>| {
+            crate::query::page_recency_secs_for(page.journal_day, &self.root.join(page.path))
         };
         let inputs = crate::query::results::ResultReadInputs {
             statement: &statement,

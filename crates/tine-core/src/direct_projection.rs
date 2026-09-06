@@ -975,7 +975,7 @@ impl DirectProjection {
         matches!(
             self.seam_read(
                 cache_generation,
-                "SELECT phase FROM search_fts_build WHERE singleton = 1",
+                crate::managed_query::FTS_READY_PROBE_SQL,
                 &[],
             ),
             StatementRead::Rows(rows)

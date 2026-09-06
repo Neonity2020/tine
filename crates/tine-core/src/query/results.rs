@@ -116,13 +116,27 @@ pub(crate) struct ResultReadInputs<'a> {
     pub(crate) max_rows: usize,
     pub(crate) max_bytes: usize,
     pub(crate) profile: ConstructionProfile,
-    /// The recency axis for `(sort-by modified …)`, by page: the EXISTING
-    /// producer ([`crate::query::page_recency_secs_for`]) presented as
-    /// `(journal day, page path)`. It is a callback because it is a filesystem
-    /// `stat` that must not run for a page the answer did not admit, and
-    /// because only the caller knows the graph root the stored relative path
-    /// hangs off.
-    pub(crate) recency: &'a dyn Fn(Option<i64>, &str) -> i64,
+    /// The recency axis for `(sort-by modified …)`, by page: each backend's
+    /// EXISTING walk producer — Direct Files' `page_recency_secs_for` over the
+    /// stored journal day and path, Managed Storage's
+    /// `JournalFormat::page_recency_secs` over the page's kind and NAME — given
+    /// everything the descriptor row knows about the page. It is a callback
+    /// because it is a filesystem `stat` that must not run for a page the
+    /// answer did not admit, and because only the caller knows the graph root
+    /// the stored relative path hangs off and which producer its walk uses.
+    pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
+}
+
+/// What the descriptor row knows about one admitted page, handed to the
+/// caller's recency producer. The two backends' walks read different inputs
+/// (Direct the stored day and path; Managed the kind and name), so the read
+/// offers all four rather than choosing for them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecencyPage<'a> {
+    pub(crate) journal_day: Option<i64>,
+    pub(crate) kind: PageKind,
+    pub(crate) name: &'a str,
+    pub(crate) path: &'a str,
 }
 
 /// Why a result read produced no answer. There is no fourth outcome: a read
@@ -278,7 +292,12 @@ impl PageGroups {
             if inputs.profile.want_recency {
                 recency_by_page.insert(
                     page.group.page.clone(),
-                    (inputs.recency)(page.journal_day, &page.path),
+                    (inputs.recency)(RecencyPage {
+                        journal_day: page.journal_day,
+                        kind: page.group.kind,
+                        name: &page.group.page,
+                        path: &page.path,
+                    }),
                 );
             }
             groups.push(page.group);

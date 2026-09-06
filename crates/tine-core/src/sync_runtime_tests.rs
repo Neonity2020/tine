@@ -4831,6 +4831,7 @@ fn managed_search_build_failure_is_reported_once_without_hot_retrying() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     assert!(actor.snapshot().search_index_building);
@@ -6647,6 +6648,7 @@ fn cold_open_repairs_only_torn_objects_covered_by_an_undrained_local_record() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     let (mut page, revision) = match actor
@@ -7054,6 +7056,7 @@ fn clean_runtime_actor_assembles_one_current_authority_and_saves_one_edit() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     assert!(actor.clean.is_some());
@@ -7132,6 +7135,7 @@ fn a_foreground_no_claimant_crash_lands_in_the_conflict_dock_not_a_refusal() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     let (mut page, revision) = match actor
@@ -7249,6 +7253,7 @@ fn sweep_membership_is_durable_before_deletion_commit_and_reopen_drops_the_uncom
         identities,
         resources,
         SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
 
@@ -7303,6 +7308,7 @@ fn sweep_membership_is_durable_before_deletion_commit_and_reopen_drops_the_uncom
         identities,
         reopened,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     for _ in 0..64 {
@@ -7498,6 +7504,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     let root = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -7609,6 +7616,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .expect("startup resumes the durable restore cursor");
     assert_eq!(
@@ -7659,6 +7667,7 @@ fn restore_surfaces_failed_action_after_three_nondecreasing_interference_retries
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     let root = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -7877,6 +7886,7 @@ fn tier3_grace_holds_forced_publication_and_is_rederived_before_reopen_repair() 
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     for _ in 0..128 {
@@ -7950,6 +7960,7 @@ fn tier3_grace_holds_forced_publication_and_is_rederived_before_reopen_repair() 
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     assert!(reopened.publication_barrier_active());
@@ -8315,6 +8326,7 @@ fn one_quiet_local_completion_flushes_through_the_actor_deadline_tick() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     for _ in 0..128 {
@@ -9007,6 +9019,7 @@ fn cold_acknowledgement_cleanup_tolerates_stale_directory_entries() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     let acknowledgement = ApplicationMoveEpisodeAcknowledgement::from_record(&record);
@@ -9065,6 +9078,7 @@ fn live_acknowledgement_queue_saturation_drains_before_marker_publication() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     for _ in 0..MOVE_EPISODE_CLEANUP_QUEUE_LIMIT {
@@ -22801,6 +22815,7 @@ fn managed_absence_sweep_probe() {
         identities,
         resources,
         SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
     for _ in 0..4096 {
@@ -32696,82 +32711,6 @@ fn c7b_measure_anonymized_corpus() {
 }
 
 // ---------------------------------------------------------------------------
-// C6 cache identity for the Managed memo (SPEC §5.9, guards (b) and (c)).
-//
-// The memo is a private structure with two entry points, so its identity rule
-// is asserted where the rule lives. The end-to-end behaviour it produces -- a
-// config edit or a declared-type change answering anew -- is covered on the
-// Direct Files side in `model_tests.rs`, which can reopen a graph.
-
-fn memo_result(total: usize) -> SyncApplicationBoundedRefGroups {
-    SyncApplicationBoundedRefGroups {
-        groups: Vec::new(),
-        total,
-        exceeded: false,
-    }
-}
-
-fn memo_stamp(acceptance_sequence: u64, config: &str) -> ApplicationSimpleQueryMemoStamp {
-    ApplicationSimpleQueryMemoStamp {
-        acceptance_sequence,
-        config_digest: ContentDigest::of(config.as_bytes()),
-    }
-}
-
-#[test]
-fn the_managed_memo_is_keyed_by_the_parse_config_digest_as_well_as_the_sequence() {
-    let mut memo = ApplicationSimpleQueryMemo::default();
-    let before = memo_stamp(7, "one");
-    memo.insert(&before, 0, "(task TODO)", false, 10, 100, &memo_result(3));
-    assert_eq!(
-        memo.get(&before, 0, "(task TODO)", 10, 100)
-            .map(|r| r.total),
-        Some(3),
-        "the same evidence under the same rules is the same answer"
-    );
-
-    // E6: `journal_page_title_format` decides a page's kind and day, so a query
-    // with no property leaf at all is config-sensitive -- and editing
-    // `logseq/config.edn` never moves the acceptance sequence.
-    let after = memo_stamp(7, "two");
-    assert_eq!(
-        memo.get(&after, 0, "(task TODO)", 10, 100).map(|r| r.total),
-        None,
-        "a config change under an unchanged sequence must not serve the old answer"
-    );
-}
-
-#[test]
-fn a_registry_generation_advance_evicts_the_managed_memos_props_entries_only() {
-    let mut memo = ApplicationSimpleQueryMemo::default();
-    let stamp = memo_stamp(7, "one");
-    memo.insert(
-        &stamp,
-        4,
-        "(property size 5)",
-        true,
-        10,
-        100,
-        &memo_result(1),
-    );
-    memo.insert(&stamp, 4, "(task TODO)", false, 10, 100, &memo_result(2));
-
-    // A graph-wide effective-type change. Per-page retention cannot see it: the
-    // pages holding the answer did not change, only the key's type did.
-    assert_eq!(
-        memo.get(&stamp, 5, "(property size 5)", 10, 100)
-            .map(|r| r.total),
-        None,
-        "the typed query is recomputed under the new generation"
-    );
-    assert_eq!(
-        memo.get(&stamp, 5, "(task TODO)", 10, 100).map(|r| r.total),
-        Some(2),
-        "a query that reads no property atom cannot depend on an effective type"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // SPEC §6.2/§6.4 and MANAGER-FINDINGS F1: what the Managed property registry
 // actually costs while the user is typing.
 // ---------------------------------------------------------------------------
@@ -33041,4 +32980,305 @@ fn managed_property_registry_cost_while_typing_manual_receipt() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// R4b: the accepted-frontier route's handle-side transitions, driven through
+// the public navigation surface. The executor is R4a's; here it is the stub
+// (always `Busy`) or an injected outcome, so every transition the handle owns
+// — capture, re-capture, fallback, error, refusal after close — is proven
+// against the walk's answer without a projection that produces it.
+// ---------------------------------------------------------------------------
+
+const R4B_ROWS: usize = 20_000;
+const R4B_BYTES: usize = 32 * 1024 * 1024;
+/// A non-sparse shape so the walk fills the shared memo (the sparse task
+/// runner, which R4a retires, never did).
+const R4B_QUERY: &str = "(content-regex \"TODO\")";
+
+fn r4b_reopened(label: &str, seed: u128) -> (ActivationFixture, SyncRuntimeHandle) {
+    let fixture = ActivationFixture::scaled_query_candidate_density(label, seed, 24, 6);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("activation retains its actor");
+    drive_initial_feed(&handle);
+    assert!(matches!(
+        handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(handle);
+    let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+    let handle = opened.handle.expect("clean reopen retains its actor");
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    (fixture, handle)
+}
+
+fn r4b_query(
+    handle: &SyncRuntimeHandle,
+) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+    handle
+        .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+            query: R4B_QUERY.into(),
+            max_rows: R4B_ROWS,
+            max_bytes: R4B_BYTES,
+        })
+        .map(|outcome| match outcome {
+            SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::SimpleQuery(result),
+            } => result,
+            other => panic!("simple query returned the wrong outcome: {other:?}"),
+        })
+}
+
+fn r4b_oracle(fixture: &ActivationFixture) -> crate::model::BoundedRefGroups {
+    Graph::open(&fixture.graph_root).run_query_bounded(R4B_QUERY, R4B_ROWS, R4B_BYTES)
+}
+
+/// Arm the next captures with `outcomes`, on a cleared memo and census, so
+/// the very next query captures and the outcomes are consumed in order.
+fn r4b_inject(
+    handle: &SyncRuntimeHandle,
+    outcomes: Vec<crate::managed_query::ManagedQueryOutcome>,
+) {
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let mut queue = handle.inner.managed_query.injected_outcomes.lock().unwrap();
+    queue.clear();
+    queue.extend(outcomes);
+}
+
+fn r4b_census(handle: &SyncRuntimeHandle) -> (usize, usize, usize, usize) {
+    let census = handle.managed_query_census();
+    (
+        census.statement_reads,
+        census.fallback_reads,
+        census.failed_reads,
+        census.stale_recaptures,
+    )
+}
+
+#[test]
+fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_falls_back_to_the_walk() {
+    let (fixture, handle) = r4b_reopened("r4b-capture-fallback", 0x4b01);
+    let oracle = r4b_oracle(&fixture);
+    assert!(
+        oracle.total > 0,
+        "the fixture must answer the query nonempty"
+    );
+
+    r4b_inject(&handle, Vec::new());
+    let first = r4b_query(&handle).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 1, 0, 0),
+        "the stub executor is Busy: one fallback, no statement read"
+    );
+    assert_managed_simple_query_matches_direct("walk after Busy", first, oracle);
+
+    // The walk filled the shared memo, so the next turn answers on the actor
+    // and nothing is captured: the census does not move.
+    let second = r4b_query(&handle).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 1, 0, 0),
+        "a memo hit captures nothing"
+    );
+    assert_managed_simple_query_matches_direct("memo hit", second, r4b_oracle(&fixture));
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn r4b_a_pending_local_suffix_is_answered_on_the_actor_and_never_captured() {
+    let (fixture, handle) = r4b_reopened("r4b-pending-suffix", 0x4b02);
+    let witness_path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .expect("the fixture has pages")
+        .rel_path;
+    let (mut page, revision) = load_application_exact(&handle, &witness_path);
+    page.blocks[0].raw = format!("{} TODO pending-suffix-witness", page.blocks[0].raw);
+    let save = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    assert!(
+        matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
+        "{save:?}"
+    );
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+    // Were the pending query captured, this outcome would turn it into an
+    // error; it is answered on the actor instead and the injection is never
+    // consumed.
+    r4b_inject(
+        &handle,
+        vec![crate::managed_query::ManagedQueryOutcome::Failed(
+            "must not be consumed",
+        )],
+    );
+    let result = r4b_query(&handle).unwrap();
+    assert!(result.total > 0);
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 0),
+        "nothing captured, nothing counted"
+    );
+    assert_eq!(
+        handle
+            .inner
+            .managed_query
+            .injected_outcomes
+            .lock()
+            .unwrap()
+            .len(),
+        1,
+        "a pending suffix never reaches the executor"
+    );
+    handle
+        .inner
+        .managed_query
+        .injected_outcomes
+        .lock()
+        .unwrap()
+        .clear();
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn r4b_a_stale_snapshot_recaptures_twice_then_walks() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    let (fixture, handle) = r4b_reopened("r4b-stale", 0x4b03);
+    let oracle = r4b_oracle(&fixture);
+    assert!(oracle.total > 0);
+
+    // Two Stale re-captures, then an answer: the injected (empty) answer is
+    // what the caller sees, proving the third capture was executed.
+    r4b_inject(
+        &handle,
+        vec![
+            Outcome::Stale,
+            Outcome::Stale,
+            Outcome::Answered(crate::query::PreViewGroups::default()),
+        ],
+    );
+    let answered = r4b_query(&handle).unwrap();
+    assert_eq!(answered.total, 0, "the third capture's answer is served");
+    assert_eq!(r4b_census(&handle), (0, 0, 0, 2));
+
+    // A third Stale is a fallback: the walk answers, and the caller cannot
+    // tell the difference.
+    r4b_inject(
+        &handle,
+        vec![Outcome::Stale, Outcome::Stale, Outcome::Stale],
+    );
+    let walked = r4b_query(&handle).unwrap();
+    assert_eq!(r4b_census(&handle), (0, 1, 0, 2));
+    assert_managed_simple_query_matches_direct("walk after three Stale", walked, oracle);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn r4b_busy_and_cancelled_both_walk_and_only_busy_is_a_fallback() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    let (fixture, handle) = r4b_reopened("r4b-busy-cancelled", 0x4b04);
+
+    r4b_inject(&handle, vec![Outcome::Busy]);
+    let busy = r4b_query(&handle).unwrap();
+    assert_eq!(r4b_census(&handle), (0, 1, 0, 0));
+    assert_managed_simple_query_matches_direct("walk after Busy", busy, r4b_oracle(&fixture));
+
+    r4b_inject(&handle, vec![Outcome::Cancelled]);
+    let cancelled = r4b_query(&handle).unwrap();
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 0),
+        "a drain's cancellation is an answer by the walk, not a fallback"
+    );
+    assert_managed_simple_query_matches_direct(
+        "walk after Cancelled",
+        cancelled,
+        r4b_oracle(&fixture),
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn r4b_a_failed_managed_read_is_an_error_and_the_next_query_recovers() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    let (fixture, handle) = r4b_reopened("r4b-failed", 0x4b05);
+
+    r4b_inject(&handle, vec![Outcome::Failed("injected")]);
+    let error = r4b_query(&handle).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        SyncApplicationPageRequestError::ActorRefusedAt("application_simple_query_managed_read")
+            .to_string(),
+        "SPEC §5.9 M10: a failed Managed read is an error, not a walk"
+    );
+    assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
+
+    // The failure was the read's, not the runtime's: the next query captures
+    // again and (the stub being Busy) walks.
+    let recovered = r4b_query(&handle).unwrap();
+    assert_eq!(r4b_census(&handle), (0, 1, 1, 0));
+    assert_managed_simple_query_matches_direct(
+        "query after a failed read",
+        recovered,
+        r4b_oracle(&fixture),
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn r4b_dropping_the_handle_closes_the_query_job_owner() {
+    let (_fixture, handle) = r4b_reopened("r4b-close", 0x4b06);
+    let shared = handle.inner.managed_query.clone();
+    assert!(matches!(
+        shared
+            .jobs
+            .acquire_within(std::time::Duration::from_millis(1)),
+        crate::query_jobs::Admission::Slot(_)
+    ));
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    drop(handle);
+    assert!(
+        matches!(
+            shared
+                .jobs
+                .acquire_within(std::time::Duration::from_millis(1)),
+            crate::query_jobs::Admission::Cancelled
+        ),
+        "a closed runtime refuses every later query job (I-21)"
+    );
 }

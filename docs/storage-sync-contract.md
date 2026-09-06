@@ -785,6 +785,34 @@ fraction of the whole. The Direct Files route above removes the reason for that
 cutoff rather than its symptom, and the cutoff goes with the candidate plan when
 managed storage stops using it.
 
+**A Managed simple query over the accepted frontier runs off the actor.** A
+simple query whose evidence is wholly the accepted frontier — no pending local
+suffix — is answered in two phases: one short actor turn that checks readiness
+and the shared pre-view memo, and, on a miss, a CAPTURE the handle executes on
+the calling thread after the actor's operation lock is released. The capture
+carries everything the read needs and nothing the actor owns: the projection
+path, the parsed query and view, the parse config and journal format, the
+registry snapshot the actor keyed the query with, and the stamp — acceptance
+sequence, frontier digest, config digest and execution day — the answer is
+valid for. The executor opens its own owned snapshot under the runtime's
+query-job owner, the same owner every off-actor read of that file is admitted
+by, so the drain that precedes closing the file reaches it. Its answer lands
+in the memo only while that stamp is still the actor's current stamp (a late
+answer never evicts a newer entry), and every other outcome has one named
+disposition: a `Stale` snapshot re-captures at most twice, then walks; `Busy`
+(no slot within the wait) walks; `Cancelled` (a drain caught it) walks and is
+not counted as a fallback; and a `Failed` read is an error, as a failed
+materialized read is today, because the walk reads the same file and has
+nothing better to say. The walk is the actor evaluation every simple query ran
+before this route, over the capture it already prepared, so a query is parsed
+and its registry read once. A pending local suffix is never captured: the turn
+answers it on the actor exactly as before, neither reading nor filling the
+memo. The projection file is closed in exactly three places — the runtime
+actor dropping, a handle closing, and the shared-join install replacing the
+clean runtime — and each drains the job owner first; the accepted batch apply
+is not one of them, because it writes a checkpoint sidecar, never a WAL
+checkpoint, and readers and the writer coexist under WAL.
+
 ## 2. Enrollment and synchronization state machine
 
 ### 2.1 Actors and authority

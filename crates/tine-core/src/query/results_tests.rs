@@ -27,7 +27,7 @@ use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 use crate::model::{block_dto_estimated_bytes, BlockDto, PageKind};
 use crate::query::results::{
     read_results, reset_result_read_census, result_read_census, set_before_payload_batch_hook,
-    BackendOrder, ResultIdentity, ResultReadError, ResultReadInputs, PAYLOAD_BATCH,
+    BackendOrder, RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs, PAYLOAD_BATCH,
 };
 use crate::query::sql::sql_gates_tests::{
     scratch, serialize, write_fast_corpus, Corpus, CONTENT_PLAN_SHAPES, IDENTITY_SHAPES,
@@ -120,8 +120,8 @@ fn byte_boundaries(reference: &PreViewGroups) -> Vec<usize> {
 /// (`page_recency_secs_for`) reached through R3's `(journal day, page path)`
 /// signature. A second spelling here would make the gate agree with itself
 /// rather than with the walk.
-fn recency_for(root: &Path) -> impl Fn(Option<i64>, &str) -> i64 + '_ {
-    move |day, path| page_recency_secs_for(day, &root.join(path))
+fn recency_for(root: &Path) -> impl Fn(RecencyPage<'_>) -> i64 + '_ {
+    move |page| page_recency_secs_for(page.journal_day, &root.join(page.path))
 }
 
 /// The walk's answer for one shape under one set of bounds.
