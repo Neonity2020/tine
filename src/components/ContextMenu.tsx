@@ -63,7 +63,15 @@ import {
   focusCell,
   setCellSel,
 } from "../sheet/selection";
-import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, formulaReferenceName, isFieldId, type FieldId } from "../sheet/fields";
+import {
+  boardGroupByOptions,
+  fieldIdsForBlocks,
+  fieldLabel,
+  formulaReferenceName,
+  isFieldId,
+  type FieldId,
+  type QueryGroupingControl,
+} from "../sheet/fields";
 import { startEditing } from "../editorController";
 import { copyStripCollapsed } from "../copySettings";
 import { copyBlockOutline, writeClipboardText } from "../clipboard";
@@ -269,6 +277,7 @@ export function ContextMenu(): JSX.Element {
                   fields={(m() as { fields?: readonly string[] }).fields}
                   formulas={(m() as { formulas?: readonly [string, string][] }).formulas}
                   filter={(m() as { filter?: string | null }).filter}
+                  queryGrouping={(m() as { queryGrouping?: QueryGroupingControl }).queryGrouping}
                   x={m().x}
                   y={m().y}
                   close={close}
@@ -567,6 +576,7 @@ function SheetMenu(props: {
   fields?: readonly string[];
   formulas?: readonly [string, string][];
   filter?: string | null;
+  queryGrouping?: QueryGroupingControl;
   x: number;
   y: number;
   close: () => void;
@@ -588,8 +598,21 @@ function SheetMenu(props: {
     const normalized = raw.startsWith("formula.") ? `formula:${raw.slice("formula.".length)}` : raw;
     return isFieldId(normalized) ? normalized : "state";
   };
-  const doGroupBy = (field: FieldId) => {
-    setBoardGroupBy(props.ownerId, field);
+  // A query board's grouping is the QUERY's to write: the same control its own
+  // toolbar uses, so the two surfaces cannot state it two different ways.
+  const groupOptions = (): readonly FieldId[] =>
+    props.queryGrouping?.options ?? boardGroupByOptions(props.ownerId);
+  /** The grouping the board beside this menu is ACTUALLY showing, so the tick
+   *  marks the column set on screen. A query that states nothing is drawn with
+   *  the task-marker default (ADR 0030); only an explicit clear is ungrouped. */
+  const currentGroupField = (): FieldId | null => {
+    const control = props.queryGrouping;
+    if (!control) return boardGroupField();
+    return control.cleared ? null : control.field ?? "state";
+  };
+  const doGroupBy = (field: FieldId | null) => {
+    if (props.queryGrouping) props.queryGrouping.set(field);
+    else if (field) setBoardGroupBy(props.ownerId, field);
     props.close();
   };
 
@@ -648,14 +671,25 @@ function SheetMenu(props: {
         <div class="ctx-item ctx-submenu">
           <span>Group by →</span>
           <div class="ctx-submenu-menu">
-            <For each={boardGroupByOptions(props.ownerId)}>
+            {/* Only a query can be ungrouped, and only a query offers to be. */}
+            <Show when={props.queryGrouping}>
+              <div
+                class="ctx-item"
+                classList={{ "ctx-active": currentGroupField() === null }}
+                onClick={() => doGroupBy(null)}
+              >
+                {currentGroupField() === null ? "✓ " : ""}
+                No grouping
+              </div>
+            </Show>
+            <For each={groupOptions()}>
               {(field) => (
                 <div
                   class="ctx-item"
-                  classList={{ "ctx-active": field === boardGroupField() }}
+                  classList={{ "ctx-active": field === currentGroupField() }}
                   onClick={() => doGroupBy(field)}
                 >
-                  {field === boardGroupField() ? "✓ " : ""}
+                  {field === currentGroupField() ? "✓ " : ""}
                   {fieldLabel(field)}
                 </div>
               )}

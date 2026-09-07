@@ -1,4 +1,4 @@
-import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount, useContext, type JSX } from "solid-js";
+import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, onMount, useContext, type JSX } from "solid-js";
 import {
   blockPageReadOnly,
   blockProperty,
@@ -52,6 +52,8 @@ import {
   formulaReferenceName,
   isFormulaField,
   queryColumnFieldId,
+  queryColumnName,
+  querySortFieldName,
   readField,
   recordFacets,
   rowRaw,
@@ -72,7 +74,14 @@ import {
   type FieldType,
 } from "../sheet/config";
 import { planSheetFieldRename } from "../sheet/renameField";
-import { isLegacyBareColumnList, selectedQueryColumns } from "../editor/queryViewProperties";
+import {
+  isLegacyBareColumnList,
+  selectedQueryColumns,
+  serializeQuerySort,
+  type QueryDisplayControl,
+} from "../editor/queryViewProperties";
+import { querySummary, type QueryAggFn } from "../editor/queryAggregate";
+import type { ViewSettings } from "../editor/queryIr";
 import { formulaFieldId, formulaNameFromField, formulasOf, mergeFormulas } from "../sheet/formulaFields";
 import {
   createFormulaFilterMemo,
@@ -171,6 +180,9 @@ function compareSortKeys(a: SortKey, b: SortKey): number {
 export function SheetTable(props: {
   ownerId: string;
   rowSource: "children" | "query";
+  /** Present only on a QUERY table: the resolved view, and the ONE writer its
+   *  header sorts, column order and aggregate footer route through. */
+  queryDisplay?: QueryDisplayControl;
   groups?: readonly RefGroup[];
   addRow?: () => void | Promise<void>;
   addRowLabel?: string;
@@ -418,7 +430,52 @@ export function SheetTable(props: {
     });
     return tracks.join(" ");
   });
-  const hasAggregates = createMemo(() => config().colAggregates.size > 0);
+  /** A query column's aggregate KEY in `tine.col-aggregates`.
+   *
+   *  Only ordinary properties get one. A builtin's bare name and a query
+   *  aggregate key are the same bytes but not the same thing, and a formula has
+   *  no key at all — so rather than write a segment whose meaning depends on who
+   *  reads it, those columns simply have no footer aggregate. */
+  const queryAggregateKey = (field: FieldId): string | null =>
+    field.startsWith("prop:") ? queryColumnName(field) : null;
+  const queryAggregateFn = (field: FieldId): QueryAggFn | null => {
+    const key = queryAggregateKey(field);
+    if (key === null) return null;
+    return (props.queryDisplay?.view.aggregates ?? []).find(([k]) => k === key)?.[1] ?? null;
+  };
+  const setQueryAggregate = (field: FieldId, fn: QueryAggFn | null) => {
+    const control = props.queryDisplay;
+    const key = queryAggregateKey(field);
+    if (!control || key === null) return;
+    // Edited IN PLACE. The list is ordered and repeats are meaningful, so a
+    // change to one column's function must not reshuffle the others.
+    const entries = [...(control.view.aggregates ?? [])];
+    const at = entries.findIndex(([k]) => k === key);
+    if (fn === null) {
+      if (at < 0) return;
+      entries.splice(at, 1);
+    } else if (at >= 0) entries[at] = [key, fn];
+    else entries.push([key, fn]);
+    control.apply({ ...control.view, aggregates: entries });
+  };
+  /** The value, through the ONE query summary — never the sheet's `aggregate`,
+   *  whose vocabulary has no `avg` and whose numbers are its own. */
+  const queryAggregateText = (field: FieldId, fn: QueryAggFn): string => {
+    const key = queryAggregateKey(field);
+    if (key === null) return "";
+    const summary = querySummary<RowRecord>({
+      rows: sortedRows(),
+      aggregates: [[key, fn]],
+      groupKeys: null,
+      value: (row) => rowFieldValue(row, field)?.text ?? "",
+    });
+    return summary?.overall[0]?.text ?? "";
+  };
+  const hasAggregates = createMemo(() =>
+    props.queryDisplay
+      ? fields().some((field) => queryAggregateFn(field) !== null)
+      : config().colAggregates.size > 0,
+  );
   const footerPinned = createMemo(() => aggregateFooterPinned(props.ownerId));
   const showFooter = createMemo(() => hasAggregates() || footerPinned());
   const showFooterToggle = createMemo(() => !hasAggregates() && (sheetHovering() || footerPinned()));
@@ -644,7 +701,62 @@ export function SheetTable(props: {
     }
   });
 
+  /** The name a header sort can be SAVED under, or `null` when it cannot be.
+   *
+   *  The engine's `sort_key` understands `priority`, `page`, `scheduled`,
+   *  `deadline` and any property name — and nothing else. Sorting a query table
+   *  by its title, state, tags or a formula column is a real thing to want, and
+   *  this table can do it over the rows it already has; but the note cannot
+   *  carry it, and a control that looked like it saved and came back unsorted
+   *  would be lying. So those stay local and say so. */
+  const persistableSortField = (col: number): string | null => {
+    if (!props.queryDisplay) return null;
+    const column = columns()[col];
+    if (!column || column === "title") return null;
+    return querySortFieldName(column);
+  };
+  /** The SAVED sort, as a column of this table — so the header arrow shows the
+   *  order the engine actually returned the rows in. */
+  const persistedSort = createMemo<SortState>(() => {
+    const entries = props.queryDisplay?.view.sort ?? [];
+    if (entries.length !== 1) return null;
+    const [name, dir] = entries[0];
+    const col = columns().findIndex(
+      (column) => column !== "title" && querySortFieldName(column) === name,
+    );
+    return col < 0 ? null : { col, dir: dir === "desc" ? -1 : 1 };
+  });
+  /** A table-only arrangement belongs to the rows it was chosen for. A new
+   *  result revision or a newly saved sort replaces those rows, so the override
+   *  is dropped rather than silently re-applied to a set nobody sorted.
+   *
+   *  Only where there IS a saved sort to be second to. A query-sourced table
+   *  with no query display control — the tag page's reference table — has the
+   *  local arrangement as its ONLY sort, and dropping it on every refresh of the
+   *  references would be a reset the user never asked for. */
+  createEffect(
+    on(
+      [() => props.groups, () => serializeQuerySort(props.queryDisplay?.view.sort)],
+      () => {
+        if (props.queryDisplay) setSort(null);
+      },
+      { defer: true },
+    ),
+  );
   const sortHeader = (col: number) => {
+    const name = persistableSortField(col);
+    const control = props.queryDisplay;
+    if (name && control) {
+      const saved = persistedSort();
+      // asc → desc → no saved sort, the same three-step cycle the local one has.
+      const next: ViewSettings["sort"] =
+        saved?.col !== col ? [[name, "asc"]] : saved.dir > 0 ? [[name, "desc"]] : [];
+      // A saved sort is the order the engine returns; a local arrangement of the
+      // previous rows on top of it would be a second, invisible answer.
+      setSort(null);
+      control.apply({ ...control.view, sort: next });
+      return;
+    }
     setSort((cur) => {
       if (!cur || cur.col !== col) return { col, dir: 1 };
       if (cur.dir === 1) return { col, dir: -1 };
@@ -652,9 +764,21 @@ export function SheetTable(props: {
     });
   };
   const sortArrow = (col: number) => {
-    const s = sort();
+    const s = sort() ?? persistedSort();
     return s?.col === col ? (s.dir > 0 ? " ▲" : " ▼") : "";
   };
+  /** Shown while a query table is arranged by something the note cannot carry,
+   *  so the difference between "sorted" and "saved as sorted" is visible rather
+   *  than discovered after a reload. */
+  const tableOnlySortLabel = createMemo(() => {
+    if (props.rowSource !== "query" || !props.queryDisplay) return null;
+    const s = sort();
+    if (!s) return null;
+    const column = columns()[s.col];
+    return column === undefined
+      ? null
+      : `Table-only sort: ${column === "title" ? "Title" : fieldLabel(column)}`;
+  });
 
   const createSchemaHome = (): SchemaHome | null => {
     if (doc.byId[props.ownerId]) return { kind: "block", id: props.ownerId, value: "" };
@@ -746,16 +870,67 @@ export function SheetTable(props: {
     writeSchemaFields(specs);
   };
   const canDragFieldHeader = (field: FieldId) =>
-    field.startsWith("prop:") && schemaWriteAllowed() && (!schemaHome() || schemaFieldSet().has(field));
+    props.queryDisplay
+      // A query table's column ORDER is `tine.columns`, so anything that key can
+      // spell can be dragged — the six builtins included. What it cannot spell
+      // (a formula column) stays put rather than being silently dropped from the
+      // order it appears to be part of.
+      ? queryColumnName(field) !== null && !blockPageReadOnly(props.ownerId)
+      : field.startsWith("prop:") && schemaWriteAllowed() && (!schemaHome() || schemaFieldSet().has(field));
   const canDropFieldHeader = (field: FieldId, dragged: FieldId) => {
     if (field === dragged) return false;
+    if (props.queryDisplay) return queryColumnName(field) !== null;
     // Formula fields are not serialized in tine.fields. They still make a useful
     // terminal drop boundary: a property dropped on one is inserted before all
     // formulas, which are always rendered at the end.
     if (isFormulaField(field)) return true;
     return schemaHome() ? schemaFieldSet().has(field) : !!specForField(field);
   };
+  /** A query table's header reorder edits the VISIBLE COLUMN ORDER through the
+   *  query's own writer — never `tine.fields`, which is the typed schema and
+   *  says nothing about order or visibility.
+   *
+   *  **`tine.columns` is a complete selection, not a hint.** Whatever it lists
+   *  is what the table shows, so an order written from only the columns the
+   *  grammar can spell would not "leave the others where they are" — it would
+   *  HIDE them. The grammar has no token for a formula column, nor for a
+   *  property named like one of the six builtins (P5A, unchanged here), so when
+   *  one of those is on screen the order is left exactly as it was and the
+   *  reason is said out loud. Coercing it into another field identity is the
+   *  one thing that is never an option: that is a silent data change. */
+  const reorderQueryColumns = (field: FieldId, drop: FieldHeaderDrop) => {
+    const control = props.queryDisplay;
+    if (!control) return;
+    const order = [...fields()];
+    const from = order.indexOf(field);
+    if (from < 0) return;
+    const [moved] = order.splice(from, 1);
+    const target = order.indexOf(drop.field);
+    order.splice(target < 0 ? order.length : target + (drop.before ? 0 : 1), 0, moved);
+    const names: string[] = [];
+    const unrepresentable: FieldId[] = [];
+    for (const column of order) {
+      const name = queryColumnName(column);
+      if (name === null) unrepresentable.push(column);
+      else names.push(name);
+    }
+    if (unrepresentable.length > 0) {
+      const labels = unrepresentable.map(fieldLabel).join(", ");
+      pushToast(
+        unrepresentable.length > 1
+          ? `${labels} are computed columns with no name in a saved column list, so this order cannot be saved`
+          : `${labels} is a computed column with no name in a saved column list, so this order cannot be saved`,
+        "info",
+      );
+      return;
+    }
+    control.apply({ ...control.view, columns: names });
+  };
   const reorderFieldHeader = (field: FieldId, drop: FieldHeaderDrop) => {
+    if (props.queryDisplay) {
+      reorderQueryColumns(field, drop);
+      return;
+    }
     const owner = doc.byId[props.ownerId];
     const page = owner?.page ?? props.schemaPage;
     // A reorder that has to declare a schema first is still ONE user action, so
@@ -1187,6 +1362,24 @@ export function SheetTable(props: {
               </span>
             )}
           </Show>
+          {/* Say when the arrangement is this table's own and not the note's,
+              rather than let a reload look like a bug. */}
+          <Show when={tableOnlySortLabel()}>
+            {(label) => (
+              <button
+                type="button"
+                class="sheet-table-only-sort"
+                title="This order is not saved with the query. Click to clear it."
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSort(null);
+                }}
+              >
+                {label()} ✕
+              </button>
+            )}
+          </Show>
           {columnResizeHandle("title")}
         </div>
         <For each={fields()}>
@@ -1390,9 +1583,21 @@ export function SheetTable(props: {
               <SheetAggregateFooterCell
                 ownerId={props.ownerId}
                 columnKey={field}
-                fn={config().colAggregates.get(field) ?? null}
+                fn={props.queryDisplay ? null : config().colAggregates.get(field) ?? null}
+                query={
+                  props.queryDisplay && queryAggregateKey(field) !== null
+                    ? {
+                        fn: queryAggregateFn(field),
+                        text: (() => {
+                          const fn = queryAggregateFn(field);
+                          return fn ? queryAggregateText(field, fn) : "";
+                        })(),
+                        set: (fn) => setQueryAggregate(field, fn),
+                      }
+                    : undefined
+                }
                 values={sortedRows().map((row) => rowFieldValue(row, field))}
-                showEmpty={footerPinned()}
+                showEmpty={footerPinned() && (!props.queryDisplay || queryAggregateKey(field) !== null)}
               />
             )}
           </For>

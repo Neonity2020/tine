@@ -6,6 +6,7 @@ import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, GraphVerificationReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
 import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
 import { sourceOptions, sourceOriginal } from "./editor/queryIr";
+import { groupingToViewValue, resolveQueryGrouping } from "./editor/queryViewProperties";
 import type {
   ExplainEmptyResult,
   ParsedQuery,
@@ -83,15 +84,22 @@ function queryFixture(): MockQueryFixture | null {
 /** The `tine.*` view properties a host block carries, as `ViewSettings` (§4.1).
  *  The real command merges these OVER the directives lifted from the query text;
  *  the mock has no directives to merge with, so the properties are the whole
- *  answer. */
+ *  answer.
+ *
+ *  The GROUPING is not decided here. `tine.group-field` versus the legacy
+ *  `tine.group-by`, and what a bare token means at each view, is one question
+ *  with one answer — `resolveQueryGrouping`, the adapter the app itself uses —
+ *  and a second `if` in the dev-preview backend is exactly the twin that would
+ *  disagree with Rust on the inputs that matter. */
 function mockViewFromProperties(properties: [string, string][]): ViewSettings {
   const view: ViewSettings = {};
   for (const [key, value] of properties) {
     if (key === "tine.view" && ["search", "list", "table", "board"].includes(value)) {
       view.view = value as ViewKind;
     }
-    if (key === "tine.group-by" && value) view.group_by = value;
   }
+  const grouping = groupingToViewValue(resolveQueryGrouping(properties, { view: view.view }));
+  if (grouping !== undefined) view.group_by = grouping;
   return view;
 }
 

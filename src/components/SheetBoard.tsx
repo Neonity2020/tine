@@ -37,6 +37,7 @@ import {
   writeTagDelta,
   writeField,
   type FieldId,
+  type QueryGroupingControl,
 } from "../sheet/fields";
 import { parseFields, sheetConfig, type FieldSpec } from "../sheet/config";
 import { formulasOf, mergeFormulas } from "../sheet/formulaFields";
@@ -85,17 +86,34 @@ export function SheetBoard(props: {
   groupBy?: string | null;
   groups?: readonly RefGroup[];
   schemaPage?: string;
+  /** Present only on a QUERY board: the grouping the query resolved, the
+   *  options its own rows justify, and the one writer both this toolbar and the
+   *  context menu route through. */
+  queryGrouping?: QueryGroupingControl;
 }): JSX.Element {
   const surfaceId = useContext(SurfaceContext);
+  /** A query can say "no grouping" and mean it; a children board cannot, and
+   *  falls back to the task marker as it always has.
+   *
+   *  Only an EXPLICIT clear is ungrouped. A query that states no grouping at all
+   *  is the silence ADR 0030's default fills, exactly as it did before the
+   *  grouping key was split — otherwise every existing `tine.view:: board` note
+   *  with no group property would quietly lose its columns. */
+  const ungrouped = () =>
+    !!props.queryGrouping && props.queryGrouping.field === null && props.queryGrouping.cleared;
   const groupBy = createMemo<FieldId>(() => {
+    const control = props.queryGrouping;
+    if (control) return control.field ?? "state";
     const raw = props.groupBy || "state";
     const normalized = raw.startsWith("formula.") ? `formula:${raw.slice("formula.".length)}` : raw;
     return isFieldId(normalized) ? normalized : "state";
   });
   const groupByOptions = createMemo<FieldId[]>(() => {
-    const options = boardGroupByOptions(props.ownerId);
+    const options = props.queryGrouping
+      ? [...props.queryGrouping.options]
+      : boardGroupByOptions(props.ownerId);
     const current = groupBy();
-    return options.includes(current) ? options : [...options, current];
+    return options.includes(current) || ungrouped() ? options : [...options, current];
   });
   const [drag, setDrag] = createSignal<{ id: string; col: number; row: number; overCol: number | null } | null>(null);
   let boardElement: HTMLDivElement | undefined;
@@ -178,11 +196,14 @@ export function SheetBoard(props: {
 
   const baseColumns = createMemo<BoardColumn[]>(() => {
     const now = new Date();
+    // An explicitly ungrouped query is ONE column holding the whole result —
+    // not the task-marker board that the ABSENCE of a grouping produces.
+    if (ungrouped()) return [{ key: null, label: "All results", rows: rows() }];
     return buildColumns(rows(), groupBy(), schemaFields(), { formulas: formulas(), now });
   });
   const columns = createMemo<BoardColumn[]>(() => {
     const cols = baseColumns();
-    if (groupBy() !== "tags") return cols;
+    if (ungrouped() || groupBy() !== "tags") return cols;
     const existing = new Set(cols.map((col) => col.key));
     const empty = emptyTagColumnsForBoard(props.ownerId)
       .filter((tag) => !existing.has(tag))
@@ -415,6 +436,9 @@ export function SheetBoard(props: {
       fields: formulaHintFields(),
       formulas: formulaEntries(),
       filter: config().filter,
+      // The menu gets the SAME control the toolbar uses, so a query's grouping
+      // cannot be written through two different paths that disagree.
+      queryGrouping: props.queryGrouping,
     });
   };
 
@@ -439,12 +463,21 @@ export function SheetBoard(props: {
           <span>Group by</span>
           <select
             class="sheet-board-groupby"
-            value={groupBy()}
+            value={ungrouped() ? "" : groupBy()}
             aria-label="Group by"
             onPointerDown={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
-            onChange={(e) => setBoardGroupBy(props.ownerId, e.currentTarget.value as FieldId)}
+            onChange={(e) => {
+              const value = e.currentTarget.value;
+              const control = props.queryGrouping;
+              if (control) control.set(value ? (value as FieldId) : null);
+              else setBoardGroupBy(props.ownerId, value as FieldId);
+            }}
           >
+            {/* Only a query can be ungrouped, and only a query can say so. */}
+            <Show when={props.queryGrouping}>
+              <option value="">No grouping</option>
+            </Show>
             <For each={groupByOptions()}>
               {(field) => <option value={field}>{fieldLabel(field)}</option>}
             </For>
@@ -492,7 +525,7 @@ export function SheetBoard(props: {
                         rowIndex={rowIndex()}
                         selected={selected(colIndex(), rowIndex())}
                         dragging={drag()?.id === row.id && drag()?.col === colIndex() && drag()?.row === rowIndex()}
-                        canMove={!isFormulaField(groupBy())}
+                        canMove={!ungrouped() && !isFormulaField(groupBy())}
                         dragVersion={dragVersion()}
                         dragCoordinator={dragCoordinator}
                         hydrate={props.rowSource === "query"
@@ -507,7 +540,7 @@ export function SheetBoard(props: {
               </section>
             )}
           </For>
-          <Show when={groupBy() === "tags"}>
+          <Show when={!ungrouped() && groupBy() === "tags"}>
             <section class="sheet-board-column sheet-board-add-tag-column">
               <Show
                 when={addingTag()}

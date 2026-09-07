@@ -1569,6 +1569,12 @@ struct SheetConfig {
     /// selecting visible columns is a query-face question, and ordinary sheets
     /// keep their existing behaviour exactly.
     columns: crate::query::view::QueryColumns,
+    /// Which field a QUERY-backed board groups by, resolved by the ONE grouping
+    /// resolver (`query::view::resolve_query_grouping`). A children-backed
+    /// board ignores it and keeps reading `group_by` exactly as it does today:
+    /// the new key and its legacy reinterpretation are a query-face question
+    /// (P5B).
+    grouping: crate::query::view::QueryGrouping,
 }
 
 /// One `tine.fields` declaration: its column, whether cells render as
@@ -1660,6 +1666,10 @@ fn sheet_config(props: &[(String, String)]) -> Option<SheetConfig> {
         declared: Vec::new(),
         formulas: Vec::new(),
         columns: crate::query::view::resolve_query_columns(props),
+        grouping: crate::query::view::resolve_query_grouping(
+            props,
+            &crate::query::ir::ViewSettings::default(),
+        ),
     };
     let mut seen_declared: HashSet<String> = HashSet::new();
     let mut view: Option<SheetView> = None;
@@ -2242,6 +2252,26 @@ fn sheet_field_for_column(name: &str) -> SheetField {
     }
 }
 
+/// A CANONICAL grouping `FieldId` as a sheet column identity (P5B). The
+/// resolver has already decided what the token means, so this is a pure
+/// spelling map with no fallback of its own — the `prop:`/`formula:` prefixes
+/// are guaranteed to carry a nonempty name, and anything else is one of the six
+/// builtins. Mirrors `src/sheet/fields.ts::isFieldId`'s reading.
+fn sheet_field_for_group(field: &str) -> SheetField {
+    match field {
+        "state" => SheetField::State,
+        "priority" => SheetField::Priority,
+        "scheduled" => SheetField::Scheduled,
+        "deadline" => SheetField::Deadline,
+        "tags" => SheetField::Tags,
+        "page" => SheetField::Page,
+        other => match other.strip_prefix("formula:") {
+            Some(name) => SheetField::Formula(name.into()),
+            None => SheetField::Prop(other.strip_prefix("prop:").unwrap_or(other).into()),
+        },
+    }
+}
+
 /// The static `columns` memo: title (implicit) + declared fields + formula
 /// fields + observed fields not already present — in that order.
 ///
@@ -2512,14 +2542,31 @@ fn render_sheet_board(
     rows: &[SheetRow],
     emit: &SheetEmit,
     workflow: crate::Workflow,
+    query_backed: bool,
     counter: &mut u32,
     index: &mut Vec<serde_json::Value>,
     out: &mut String,
 ) {
-    let group_field = {
+    // **A query board asks the ONE grouping resolver; an ordinary sheet board is
+    // untouched** (P5B). `tine.group-field::` and the view-aware reinterpretation
+    // of the legacy token are a query-face question — a children-backed board
+    // keeps reading `tine.group-by::` exactly as it does today, so nothing about
+    // an ordinary published sheet changes.
+    //
+    // `None` here is an explicit "no grouping": one ungrouped column, never a
+    // silently reinstated `state` default.
+    let group_field: Option<SheetField> = if query_backed {
+        match &cfg.grouping {
+            crate::query::view::QueryGrouping::Field(field) => {
+                Some(sheet_field_for_group(field.as_str()))
+            }
+            crate::query::view::QueryGrouping::Cleared => None,
+            crate::query::view::QueryGrouping::Unset => Some(SheetField::State),
+        }
+    } else {
         let raw = cfg.group_by.as_deref().unwrap_or("state");
         let norm = crate::doc::property_key_norm(raw);
-        match norm.as_str() {
+        Some(match norm.as_str() {
             "state" => SheetField::State,
             "priority" => SheetField::Priority,
             "scheduled" => SheetField::Scheduled,
@@ -2535,11 +2582,15 @@ fn render_sheet_board(
                     SheetField::Prop(raw.into())
                 }
             }
-        }
+        })
     };
     // Group keys per row (tags give multi-membership).
     let keys_for = |row: &SheetRow| -> Vec<Option<String>> {
-        match &group_field {
+        let Some(group_field) = &group_field else {
+            // Explicitly ungrouped: every row lands in the single column.
+            return vec![None];
+        };
+        match group_field {
             SheetField::Tags => {
                 let tags = row.block.tags();
                 if tags.is_empty() {
@@ -2576,8 +2627,9 @@ fn render_sheet_board(
         }
     }
     let has_null = first_keys.contains(&None);
-    let order: Vec<Option<String>> = match &group_field {
-        SheetField::State => {
+    let order: Vec<Option<String>> = match group_field.as_ref() {
+        None => Vec::new(),
+        Some(SheetField::State) => {
             let standard: [&str; 3] = match workflow {
                 crate::Workflow::Todo => ["TODO", "DOING", "DONE"],
                 crate::Workflow::Now => ["LATER", "NOW", "DONE"],
@@ -2593,11 +2645,11 @@ fn render_sheet_board(
             }
             order
         }
-        SheetField::Priority => ["A", "B", "C"]
+        Some(SheetField::Priority) => ["A", "B", "C"]
             .iter()
             .map(|m| Some((*m).to_string()))
             .collect(),
-        SheetField::Prop(name) => {
+        Some(SheetField::Prop(name)) => {
             // A declared enum order wins; first-seen extras follow.
             let norm = crate::doc::property_key_norm(name);
             let mut order: Vec<Option<String>> = cfg
@@ -2616,7 +2668,7 @@ fn render_sheet_board(
             }
             order
         }
-        _ => {
+        Some(_) => {
             let mut order: Vec<Option<String>> = Vec::new();
             for key in &first_keys {
                 if key.is_some() && !order.contains(key) {
@@ -2637,7 +2689,7 @@ fn render_sheet_board(
     for key in &order {
         let label = match key {
             None => "(none)".to_string(),
-            Some(k) if matches!(group_field, SheetField::Priority) => format!("[#{k}]"),
+            Some(k) if matches!(group_field, Some(SheetField::Priority)) => format!("[#{k}]"),
             Some(k) => k.clone(),
         };
         out.push_str(&format!(
@@ -2793,7 +2845,7 @@ fn render_children_sheet(
                 .graph
                 .map(|g| g.config.preferred_workflow)
                 .unwrap_or(crate::Workflow::Now);
-            render_sheet_board(cfg, &rows, emit, workflow, counter, index, out);
+            render_sheet_board(cfg, &rows, emit, workflow, false, counter, index, out);
         }
         SheetView::Grid => render_sheet_grid(cfg, children, emit, counter, index, depth, out),
     }
@@ -2845,6 +2897,7 @@ fn render_query_sheet(
                 &rows,
                 emit,
                 graph.config.preferred_workflow,
+                true,
                 &mut counter,
                 &mut sink,
                 out,
@@ -6745,6 +6798,193 @@ mod tests {
             "non-matching blocks stay out of the board: {html}"
         );
         assert!(!html.contains("tine.view::"), "view prop hidden: {html}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **The identity pair the new key exists for** (P5B). `tine.group-field::
+    /// prop:state` is the ordinary property named `state`; bare `state` is the
+    /// task marker. One published fixture proves both, because a bare token
+    /// could never have.
+    #[test]
+    fn publish_query_board_tells_a_state_property_from_the_task_marker() {
+        let pages = |group: &str| {
+            vec![
+                (
+                    "GroupField.md",
+                    format!(
+                        "public:: true\n\
+                         - {{{{query (property owner Avery)}}}}\n  \
+                           tine.view:: board\n  \
+                           tine.group-field:: {group}\n"
+                    ),
+                ),
+                (
+                    "Tracker.md",
+                    "public:: true\n\
+                     - TODO Refresh Guide examples\n  \
+                       state:: shipped\n  \
+                       owner:: Avery\n"
+                        .to_string(),
+                ),
+            ]
+        };
+        let property = pages("prop:state");
+        let (dir, outdir) = publish_sheet_fixture(
+            "group-field-property",
+            "{:preferred-workflow :todo}\n",
+            &property
+                .iter()
+                .map(|(n, b)| (*n, b.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let html = read_out(&outdir, "groupfield.html");
+        assert!(
+            html.contains(">shipped</h3>"),
+            "prop:state groups by the ORDINARY property: {html}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let marker = pages("state");
+        let (dir, outdir) = publish_sheet_fixture(
+            "group-field-marker",
+            "{:preferred-workflow :todo}\n",
+            &marker
+                .iter()
+                .map(|(n, b)| (*n, b.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let html = read_out(&outdir, "groupfield.html");
+        assert!(
+            html.contains(">TODO</h3>") && !html.contains(">shipped</h3>"),
+            "bare `state` groups by the TASK MARKER: {html}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A PRESENT but empty `tine.group-field::` is an explicit "no grouping":
+    /// one ungrouped column, and the Board default never reinstates itself —
+    /// not even with a legacy `tine.group-by::` still on the block.
+    #[test]
+    fn publish_query_board_honours_an_explicit_group_clear() {
+        let (dir, outdir) = publish_sheet_fixture(
+            "group-field-cleared",
+            "{:preferred-workflow :todo}\n",
+            &[
+                (
+                    "ClearedGroup.md",
+                    "public:: true\n\
+                     - {{query (property owner Avery)}}\n  \
+                       tine.view:: board\n  \
+                       tine.group-field::\n  \
+                       tine.group-by:: status\n",
+                ),
+                (
+                    "Tracker.md",
+                    "public:: true\n\
+                     - TODO Refresh Guide examples\n  \
+                       status:: active\n  \
+                       owner:: Avery\n\
+                     - Publish the updated demo\n  \
+                       status:: planned\n  \
+                       owner:: Avery\n",
+                ),
+            ],
+        );
+        let html = read_out(&outdir, "clearedgroup.html");
+        assert_eq!(
+            html.matches("<div class=\"sheet-board-col\">").count(),
+            1,
+            "an explicit clear is ONE ungrouped column: {html}"
+        );
+        assert!(
+            !html.contains(">active</h3>") && !html.contains(">TODO</h3>"),
+            "neither the legacy key nor the state default may come back: {html}"
+        );
+        assert!(html.contains("Refresh Guide examples"), "{html}");
+        assert!(html.contains("Publish the updated demo"), "{html}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The two readings a query board gives a LEGACY block, both of which the
+    /// app must agree with (P5B):
+    ///
+    ///  * a bare `tine.group-by:: status` on a board face is now the ORDINARY
+    ///    property — it used to fall through to the task marker and publish a
+    ///    TODO/DONE board for a note whose author wrote `status`;
+    ///  * a board with NO grouping anywhere keeps the task-marker default
+    ///    (ADR 0030). `Unset` and an explicit clear are different answers, and
+    ///    only the clear is one ungrouped column.
+    #[test]
+    fn publish_query_board_reads_a_legacy_token_and_keeps_the_default() {
+        let rows = "public:: true\n\
+                    - TODO Refresh Guide examples\n  \
+                      status:: active\n  \
+                      owner:: Avery\n";
+        let (dir, outdir) = publish_sheet_fixture(
+            "legacy-group-token",
+            "{:preferred-workflow :todo}\n",
+            &[
+                (
+                    "LegacyGroup.md",
+                    "public:: true\n\
+                     - {{query (property owner Avery)}}\n  \
+                       tine.view:: board\n  \
+                       tine.group-by:: status\n",
+                ),
+                ("Tracker.md", rows),
+            ],
+        );
+        let html = read_out(&outdir, "legacygroup.html");
+        assert!(
+            html.contains(">active</h3>") && !html.contains(">TODO</h3>"),
+            "a bare legacy token on a board face is an ordinary property: {html}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let (dir, outdir) = publish_sheet_fixture(
+            "unset-group",
+            "{:preferred-workflow :todo}\n",
+            &[
+                (
+                    "UnsetGroup.md",
+                    "public:: true\n\
+                     - {{query (property owner Avery)}}\n  \
+                       tine.view:: board\n",
+                ),
+                ("Tracker.md", rows),
+            ],
+        );
+        let html = read_out(&outdir, "unsetgroup.html");
+        assert!(
+            html.contains(">TODO</h3>"),
+            "a grouping nothing states keeps the task-marker default: {html}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An ordinary children-backed board is NOT a query face: it keeps reading
+    /// `tine.group-by::` exactly as it did, and ignores the new key.
+    #[test]
+    fn publish_children_board_ignores_the_query_grouping_key() {
+        let (dir, outdir) = publish_sheet_fixture(
+            "children-group-field",
+            "{:preferred-workflow :todo}\n",
+            &[(
+                "ChildrenBoard.md",
+                "public:: true\n\
+                 - ## Children board\n  \
+                   tine.view:: board\n  \
+                   tine.group-by:: prop:status\n  \
+                   tine.group-field::\n\
+                 \t- A row\n\t  \
+                   status:: active\n",
+            )],
+        );
+        let html = read_out(&outdir, "childrenboard.html");
+        assert!(
+            html.contains(">active</h3>"),
+            "the children board still groups by its own tine.group-by: {html}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

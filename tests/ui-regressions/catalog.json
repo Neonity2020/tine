@@ -10833,6 +10833,132 @@
         "failBefore": "proven"
       },
       "notes": "User capability (§7.5, §7.8). Three dead ends closed. (1) The `⟨advanced⟩` row was a label: a query too deep to draw could be seen and removed but not edited. It is a button now, with its own `aria-label`, and it puts the cursor in the query text without touching the IR — the real subtree is never replaced by a `Raw` merely so that it can be drawn. (2) The §7.5 crossing notice was drawn under the block even while the sheet was open over it, which is behind an overlay the reader is not looking at; it is now ONE instance whose host moves — inside the pane while the sheet is open, inline under the block while it is shut — and it carries a bounded excerpt of what the block now reads, sliced from bytes the save already produced rather than from a second print (a second print would add an `og` dialect to the save path). (3) A query the engine understood only part of showed its diagnostics under a bare “No results”; the lead now says the query returned NO results, and never that the part was “ignored”, which is the reading `REG-P0-QUERY-UNKNOWN-HEAD-001` fixed in Rust. Fail-before: `evidence/qe/p4/failbefore-advanced-chip.log`, `failbefore-notice-one-instance.log`, `failbefore-unknown-head-lead.log`."
+    },
+    {
+      "id": "UI-QUERY-DISPLAY-INLINE-001",
+      "title": "A query block's six display settings are editable in one place, as the lists they are",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryDisplay.test.tsx::is stated by one control, and a switch to Board fills only an UNSET grouping",
+          "src/components/QueryDisplay.test.tsx::shows every sort, not just the first",
+          "src/components/QueryDisplay.test.tsx::shows every aggregate, repeats and the keyless whole-result count included",
+          "src/components/QueryDisplay.test.tsx::cycles ONE aggregate's function and preserves the list's order and repeats",
+          "src/components/QueryDisplay.test.tsx::treats zero as a real limit rather than as blank",
+          "src/components/QueryDisplay.test.tsx::refuses what the IR cannot carry",
+          "src/components/QueryDisplay.test.tsx::offers sorting only by what the engine can order by",
+          "src/components/QueryMacro.test.tsx::holds the sheet still under a press inside the portalled Display panel",
+          "src/components/QueryMacro.test.tsx::persists List, Table, and Board through tine.view properties with one undo unit per switch",
+          "scripts/e2e-query-display.mjs",
+          "scripts/shot-query-display.mjs"
+        ],
+        "scenario": "query-display.inline-panel",
+        "failBefore": "proven"
+      },
+      "notes": "User capability (SPEC §7.6; docs/contracts/query-display.md §7). A query block persists six display facts, and the inline surface could state one and a half of them: `+ sort` wrote ONE sort pair, `+ summarize` wrote ONE aggregate and one grouping, and the column list, the view kind and the sample had no inline control at all. Both pills also READ `sort[0]` / `aggregates[0]`, so a note carrying two of either lost the rest the first time anyone touched them. The panel edits `ViewSettings` — two enums, three ORDERED lists and a number — and hands it to the host's one writer (`queryViewPropertyPatch`), so entries it has no control for survive untouched and every change is one undo step. It is an opt-in capability (`QueryBuilder.inlineDisplay`, default false) enabled only where a builder is shown and the block is not a friendly search, whose execution returns search hits rather than the block result the six facts describe. The pills remain the control on the faces the panel is not offered on, and still write one entry there; that is recorded as open in the contract's last section rather than silently half-fixed. The native journey earned its keep immediately: on real WebKit a press is a pointer sequence, and the host sheet decided whether a press was \"outside\" by asking the DOM under its OWN element whether a popover was open. This panel is portalled to <body> (`.query-block`'s `translateZ(0)` traps a fixed child), so every press inside it read as a press outside the sheet: the sheet closed, the panel went with it, and the control's own click never landed — the whole panel was unusable with a real pointer while every `click()`-driven jsdom test passed. The panel now stamps its parent layer's id on its root and the sheet's check looks for exactly that."
+    },
+    {
+      "id": "UI-QUERY-GROUPING-IDENTITY-001",
+      "title": "A query groups by one canonical field identity, so a view switch cannot change what it means",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/query_grouping_resolution.rs::the_rust_grouping_resolver_matches_the_shared_fixtures",
+          "crates/tine-core/tests/query_grouping_resolution.rs::the_grouping_corpus_covers_every_frozen_branch",
+          "crates/tine-core/src/query/view.rs::the_merge_returns_the_canonical_grouping_field_id",
+          "crates/tine-core/src/query/view.rs::the_new_group_key_wins_and_an_empty_one_is_an_explicit_clear",
+          "src/editor/queryViewProperties.emptyProperty.test.ts::writing an empty value to a block that never had the key still states it",
+          "src/components/QueryMacro.test.tsx::does not clobber an existing board grouping when switching to Board",
+          "src/components/QueryMacro.test.tsx::switching to Board leaves an explicit no-grouping alone",
+          "src/components/QuerySummary.test.tsx::groups by the CANONICAL field the engine resolved, not by a bare token",
+          "src/components/QuerySummary.test.tsx::groups by the TASK MARKER when the field is the builtin",
+          "src/components/QuerySummary.test.tsx::renders no breakdown for an EXPLICIT clear",
+          "scripts/e2e-query-display.mjs"
+        ],
+        "scenario": "query-display.grouping-identity",
+        "failBefore": "proven"
+      },
+      "notes": "Exact-safety (docs/contracts/query-display.md §3; ADR 0030 successor note). `tine.group-by::` carried ONE bare token with TWO meanings: `state` was the task marker to the board and an ordinary property named `state` to the list grouper, and a board's `status` fell through `isFieldId` and silently became the task marker too — so switching a view changed what a note grouped by, with no way to say which was meant. Grouping moved to the query-owned `tine.group-field::`, whose value is a canonical sheet field id. ONE resolver answers it (`query::view::resolve_query_grouping`), called by the §4.1 property merge and by the static publisher, with a TypeScript adapter for the surfaces that render without a parse; the pair is pinned by one shared fixture corpus, so a published board cannot group differently from the app. The legacy key is still READ, at the view the note is CURRENTLY persisted with, and retired in the same patch and undo unit as the first save that states the grouping — which is what makes a view switch safe. An explicit \"no grouping\" is a PRESENT EMPTY value, not a removal, because only a genuinely unset grouping may be filled by ADR 0030's Board default."
+    },
+    {
+      "id": "UI-QUERY-TABLE-DISPLAY-SURFACES-001",
+      "title": "A query table's headers, footer and board dropdown write through the query's own one writer",
+      "family": "sheets",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryDisplayConsumers.test.tsx::routes a backend-sortable column to the SAVED sort",
+          "src/components/QueryDisplayConsumers.test.tsx::keeps a sort the note cannot carry local, and says so",
+          "src/components/QueryDisplayConsumers.test.tsx::drops a table-only arrangement when a NEW result revision arrives",
+          "src/components/QueryDisplayConsumers.test.tsx::leaves an ordinary children table's local sort exactly as it was",
+          "src/components/QueryDisplayConsumers.test.tsx::offers the QUERY's three functions, not the sheet's seventeen",
+          "src/components/QueryDisplayConsumers.test.tsx::edits one column's function IN PLACE, keeping the list's order",
+          "src/components/QueryDisplayConsumers.test.tsx::moves a visible column through tine.columns, never tine.fields",
+          "src/components/QueryDisplayConsumers.test.tsx::refuses to state an order it cannot spell, rather than dropping a column",
+          "src/components/QueryDisplayConsumers.test.tsx::routes the toolbar dropdown to the query's writer",
+          "src/components/QueryDisplayConsumers.test.tsx::routes the CONTEXT MENU to the same writer as the dropdown",
+          "src/components/QueryDisplayConsumers.test.tsx::leaves an ordinary children board writing its own tine.group-by"
+        ],
+        "scenario": "query-display.table-surfaces",
+        "failBefore": "proven"
+      },
+      "notes": "User capability (docs/contracts/query-display.md §8). A query table's own controls had no route to the query's properties: header sorts were transient and vanished on reload, header drag reached for `tine.fields` (the typed schema, which says nothing about order or visibility), the footer offered the sheet's seventeen-name aggregate vocabulary over a query whose property spells three, and a query board's Group-by dropdown and right-click submenu each wrote a property of their own. All four now call the SAME callback the Display panel calls. A header the engine cannot sort by (title, `state`, `tags`, a formula — `sort_key` would read the middle two as properties of those names) still sorts the rows on screen and is labelled \"Table-only sort\", so \"sorted\" and \"saved as sorted\" are never confused; a new result revision or a newly saved sort drops that local arrangement rather than re-applying it to rows nobody sorted. Children-backed tables and boards keep every behaviour they had, including their own `tine.group-by`."
+    },
+    {
+      "id": "UI-QUERY-SUMMARY-ALL-AGGREGATES-001",
+      "title": "A query summary shows every total it was asked for, over the same rows the board groups",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/queryAggregate.test.ts::renders in the requested order, repeats and the keyless count included",
+          "src/editor/queryAggregate.test.ts::gives every group one cell per requested aggregate, in the same order",
+          "src/editor/queryAggregate.test.ts::avg divides by the count of numeric contributors, not the row count",
+          "src/editor/queryAggregate.test.ts::counts a row in every group it belongs to and says so",
+          "src/editor/queryAggregate.test.ts::a group literally named like the none-marker stays distinct from it",
+          "src/components/QuerySummary.test.tsx::renders EVERY requested aggregate, in order, repeats included",
+          "src/components/QuerySummary.test.tsx::gives every group one cell per requested aggregate",
+          "src/components/QuerySummary.test.tsx::says that a tags grouping is not a partition",
+          "src/components/QuerySummary.test.tsx::groups by the source page, which the shadow row could only guess at"
+        ],
+        "scenario": "query-display.one-summary",
+        "failBefore": "proven"
+      },
+      "notes": "User capability (docs/contracts/query-display.md §6). `tine.col-aggregates::` is an ORDERED LIST in which repeats are meaningful, and the summary folded `aggregates[0]` and dropped the rest — so a note asking for `count; cost=sum` rendered one number, whichever the property happened to spell first. The list face and the board face also grouped through different code and could disagree about which group a row was in. `queryAggregate.ts::querySummary` is now the only fold: it returns one cell per requested aggregate for the whole result and for each group, and its grouping keys come from `sheet/fields.ts::groupKeysForBlock` over the same DTO rows the Board renders, with formula columns through `readFormulaRowField`. The arithmetic is unchanged (count / numeric sum / numeric avg dividing by the numeric contributors, three-decimal rounding, skipped-row accounting). A tags grouping places a row in every tag's group exactly as the board does, and the summary says so rather than presenting counts that do not partition the result as if they did."
     }
   ]
 }

@@ -10,6 +10,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **All of a query's display settings, in one place.** A query block carries six
+  presentation facts — the view, what the results are grouped by, the sort order,
+  which columns show, what the footer totals, and a row limit — and until now the
+  controls beside a query could state one and a half of them: `+ sort` held one
+  sort, `+ summarize` held one total and one grouping, and the column list, the
+  view and the limit had no inline control at all. A **Display** button in the
+  open sheet now holds all six. The sort, column and total lists are real lists:
+  add to them, move an entry up or down, remove one. A second sort or a second
+  total is editable rather than invisible, and a setting Tine's controls do not
+  cover is left exactly as your file spells it. Every change is one undo step and
+  one ordinary property line.
+
+  A **query table** now saves what you do to it, too. Clicking a header sorts the
+  results and keeps that sort in the note — ascending, descending, then off.
+  Where the engine cannot sort by a column (the title, the task marker, tags, a
+  computed column) the table still sorts what is on screen and says **Table-only
+  sort**, so the difference between *sorted* and *saved as sorted* is visible
+  rather than found after a reload. Dragging a header saves the column order, and
+  a column's footer cycles count / sum / average.
+
 - **Picking a field now shows you your own graph.** Adding a condition used to
   ask which KIND of thing you wanted first, and then — for a property — offer an
   alphabetical list of every key in the graph, with no counts and no types, in
@@ -127,6 +147,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   typo you wanted to find.
 
 ### Fixed
+
+- **A query and a board no longer disagree about what `group by state` means.**
+  One line, `tine.group-by:: state`, meant two different things depending on
+  which face was reading it: the task marker to a board, and an ordinary property
+  named `state` to a list — so changing a query from a list to a board could
+  change what it grouped by, and a board asked to group by a property called
+  `status` silently grouped by the task marker instead. A query now names its
+  grouping field outright, in a line of its own: `tine.group-field:: prop:status`
+  for the property, `tine.group-field:: state` for the task marker. There is one
+  reading of that line, and one piece of code produces it — the app, the saved
+  file and a published page cannot drift apart, which they could before.
+
+  Notes written the old way keep working with no migration and are not rewritten
+  until you change the grouping yourself; when you do, the old line is replaced
+  rather than left beside the new one. Turning grouping off on a board now stays
+  off: switching the view used to bring the task marker back, because "you said
+  no" and "nobody said anything" looked the same in the file. Tables and boards
+  built from a block's own children are unchanged.
+
+- **A query summary shows every total you asked for.** A query can ask for more
+  than one — `count; cost=sum` — and only the first was ever shown, whichever the
+  line happened to spell first; asking for a second one looked like it did
+  nothing. Every requested total now renders, in order, repeats included, both
+  overall and per group. The grouped breakdown, the board's columns and the
+  table's footer are now computed by one piece of code over one set of rows, so
+  they cannot disagree about which group a row belongs to. Grouping by tags puts
+  a row in every one of its tags' groups, exactly as the board does, and the
+  summary says so instead of presenting counts that do not add up to the result
+  as though they did.
 
 - **Which columns a query table shows, and what its columns ARE, are two
   different lines now — and neither erases the other.** A query block used to

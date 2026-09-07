@@ -50,6 +50,8 @@ import {
   type RegistryAccess,
 } from "./QuerySheet";
 import { sharedQueryResult } from "../queryResultCache";
+import { QueryDisplay } from "./QueryDisplay";
+import type { QueryDisplayControl } from "../editor/queryViewProperties";
 import { dataRev, graphEpoch, graphMeta, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
 import { dismissOnOutsidePointer, registerTransientLayer } from "../transientLayers";
 
@@ -820,6 +822,24 @@ export function QueryBuilder(props: {
   onStale?: (stale: boolean) => void;
   blockId?: string;
   parentTransientId?: string;
+  /** **The inline Display panel, off by default** (P5B).
+   *
+   *  A host that opts in gets one control for all six display facts and loses
+   *  the two that could only state a fraction of them: `+ sort` wrote one sort
+   *  pair and `+ summarize` one aggregate, and both rewrote a longer list as a
+   *  one-element one. Two controls writing the same keys with different ideas of
+   *  how many entries there are is exactly the disagreement this replaces — so
+   *  they are removed here rather than left beside it.
+   *
+   *  It is opt-in because the panel edits a BLOCK's `tine.*` properties, and a
+   *  host with no block (the workspace draft) or one whose display is being
+   *  presented some other way has nothing for it to write. */
+  inlineDisplay?: boolean;
+  /** The block's formula field names, for the Display panel's grouping list. */
+  displayFormulas?: () => readonly string[];
+  /** The one writer an inline display change goes through. Required when
+   *  `inlineDisplay` is set; without it there is nothing to save to. */
+  display?: () => QueryDisplayControl | undefined;
 }): JSX.Element {
   // The pane's last-good parse, not yet saved. `null` = the builder shows the
   // persisted reading. This is what makes "the rows follow the text you typed"
@@ -858,6 +878,7 @@ export function QueryBuilder(props: {
   const root = createMemo(() => builderRoot(session()?.query.filter ?? { kind: "and", items: [] }));
   const view = () => session()?.view ?? {};
 
+  const [displayOpen, setDisplayOpen] = createSignal(false);
   const sheetOpen = () => !!props.sheetAlwaysOpen || open();
   createEffect(() => { if (!sheetOpen()) invalidateAnchorPreview(); });
   // The host needs to know, because the §7.5 notice lives inline under the block
@@ -874,7 +895,7 @@ export function QueryBuilder(props: {
   //
   // Four properties, and each of them is a defect this replaced:
   //
-  //  - **Zero work at rest.** The key is `undefined` while no sheet is open, so
+  //  - **Zero work at rest.** The key is `undefined` while neither sheet nor Display is open, so
   //    a page of resting sentences issues nothing at all.
   //  - **One request per (graph, dataRev, declaration), across builders.**
   //    `sharedQueryResult` collapses identical in-flight and resolved work,
@@ -890,7 +911,7 @@ export function QueryBuilder(props: {
   //    the scope the rows were fetched under.
   const registryScope = () => `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
   const registryKey = () =>
-    sheetOpen() ? `${dataRev()}\0${declarationRevision()}` : undefined;
+    sheetOpen() || displayOpen() ? `${dataRev()}\0${declarationRevision()}` : undefined;
   const [registrySnapshot] = createResource(
     () => {
       const key = registryKey();
@@ -1074,8 +1095,20 @@ export function QueryBuilder(props: {
     // sort and summarize popovers are P5's and keep their own open state, so the
     // question is asked of the DOM instead of duplicating their signals: a panel
     // rendered inside the sheet right now IS an open popover.
+    //
+    // The inline Display panel is the one popover on this rung that is NOT
+    // rendered inside the sheet: its trigger is in the footer, but it is
+    // portalled to <body> because `.query-block`'s `translateZ(0)` would trap a
+    // fixed child. So the same DOM question has to be asked of the document,
+    // narrowed to the panel that named THIS sheet as its parent layer. Without
+    // it, a press on one of the panel's own controls read as a press outside
+    // the sheet: the sheet closed, the panel went with it, and the control's
+    // own click never landed — every setting in the panel was unreachable with
+    // a real pointer.
     inside: () =>
-      openMenu() !== null || sheetEl?.querySelector(".qs-menu, .qb-picker, .qb-menu")
+      openMenu() !== null
+      || sheetEl?.querySelector(".qs-menu, .qb-picker, .qb-menu")
+      || document.querySelector(`[data-transient-parent="${sheetLayerId}"]`)
         ? [document.body]
         : [sheetEl ?? null, sentenceEl ?? null],
     dismiss: () => setOpen(false),
@@ -1111,15 +1144,27 @@ export function QueryBuilder(props: {
   // It is cleared on unmount: a route that leads nowhere is not offered.
   const [paneHandle, setPaneHandle] = createSignal<PaneHandle | null>(null);
 
+  const inlineDisplay = () => (props.inlineDisplay ? props.display?.() : undefined);
+  const displayControl = (parentTransientId?: string) => (
+    <Show when={inlineDisplay()}>
+      {(control) => (
+        <QueryDisplay
+          control={control()}
+          registry={registry}
+          formulas={props.displayFormulas}
+          parentTransientId={parentTransientId}
+          onOpenChange={setDisplayOpen}
+        />
+      )}
+    </Show>
+  );
   const footer = () => (
     <>
-      <SortControl view={view} apply={applyView} parentTransientId={sheetLayerId} />
-      <SummarizeControl
-        view={view}
-        apply={applyView}
-        registry={registry}
-        parentTransientId={sheetLayerId}
-      />
+      {displayControl(sheetLayerId)}
+      <Show when={!props.inlineDisplay}>
+        <SortControl view={view} apply={applyView} parentTransientId={sheetLayerId} />
+        <SummarizeControl view={view} apply={applyView} registry={registry} parentTransientId={sheetLayerId} />
+      </Show>
       {/* **Visible and editable, always, inside an open sheet (§7.5).** It was a
           collapsed `<details>`, which meant the one control that can express
           everything the rows cannot was the one control a user had to know to
@@ -1188,6 +1233,7 @@ export function QueryBuilder(props: {
               }}
             />
           </Show>
+          <Show when={!sheetOpen()}>{displayControl(props.parentTransientId)}</Show>
           <Show when={previewError()}>
             {(message) => (
               <div class="qs-preview-error" role="alert">

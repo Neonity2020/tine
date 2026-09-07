@@ -725,6 +725,29 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-query-display.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "One Display panel beside a query's conditions states all six of its display facts \u2014 view, grouping field, sort order, visible columns, footer totals and row sample \u2014 each write lands in the block's own plain-text properties, and the settings the panel wrote are the settings that come back after a restart.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A query's grouping is one canonical field identity: an existing note spelled with the older ambiguous key keeps grouping by the same field it always did, and the first save that states the grouping writes the canonical key and removes the ambiguous one rather than leaving two answers in the file.",
+     "blocking": true,
+     "authority": "docs/contracts/query-display.md \u00a73 (the grouping resolution and its precedence), pinned across both languages by crates/tine-core/tests/fixtures/query-grouping/resolution.json"
+    }
+   ],
+   "acceptableVariations": [
+    "Section headings, control labels and the summary line on the panel's own button may evolve while the six facts stay editable in one place.",
+    "Where the panel is placed relative to its trigger may change, as long as it stays on screen at the narrowest window the desktop app allows."
+   ],
+   "nonRequirements": [
+    "Pixel geometry of the panel on a wide screen, animation, or the order of rows within one ordered list beyond what the user set."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-query-workspace.mjs": {
    "contracts": [
     {

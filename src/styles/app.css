@@ -7311,6 +7311,26 @@ body.file-drop-active::after {
   font-weight: 700;
   white-space: nowrap;
 }
+/* A query table arranged by something the note cannot carry says so, in the
+   header, with one click to drop the arrangement. */
+.sheet-table-only-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sheet-table-only-sort:hover {
+  color: var(--text-primary);
+}
 .sheet-board-wrap {
   display: flex;
   flex-direction: column;
@@ -8939,6 +8959,116 @@ img.emoji {
   z-index: 71;
   min-width: 320px;
 }
+/* ---------------------------------------------------------------------------
+   The inline Display panel (P5B). It reuses the sheet's own portalled shell
+   (`.qs-overlay` / `.qs-sheet-anchor` / `.qs-sheet`) so there is ONE panel
+   geometry — the narrow bottom-sheet layout below included — rather than a
+   second popover that drifts from it.
+   --------------------------------------------------------------------------- */
+.qd-panel {
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+}
+.qd-section + .qd-section {
+  border-top: 1px solid var(--border-color);
+  padding-top: 8px;
+  margin-top: 8px;
+}
+.qd-section-title {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.qd-views {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.qd-view,
+.qd-row-btn,
+.qd-add {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.qd-add {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+.qd-view:hover,
+.qd-row-btn:hover,
+.qd-add:hover {
+  border-color: var(--link-color);
+  color: var(--link-color);
+}
+.qd-view.active,
+.qd-row-btn.active {
+  background: var(--bg-hover);
+  border-color: var(--link-color);
+  color: var(--link-color);
+  font-weight: 600;
+}
+.qd-row-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.qd-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+}
+.qd-row-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qd-add-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.qd-empty,
+.qd-note {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.qd-error {
+  color: var(--danger-color, #c0392b);
+  font-size: 12px;
+}
+.qd-sample {
+  width: 8em;
+}
+/* The field pickers are the panel's own popover, one rung above it — and
+   portalled, because `.qd-panel` scrolls and a scrolling ancestor clips an
+   absolutely positioned popover. Deliberately NOT `.qb-picker`: that class is a
+   scroll box around content that is IN FLOW, and the vocabulary picker's root
+   is `.qs-menu`, which places itself at `top: 100%`. Nesting the two left a
+   2px-tall box whose only child hung outside it, so the option rows had layout
+   positions, painted nowhere and answered no click.
+
+   This is the anchor, not the box: no size of its own, placed in viewport
+   coordinates by `FieldPicker`'s `measure()`, with the picker inside it keeping
+   the sheet menus' geometry. Above `.qs-sheet-anchor` (71), which is the panel
+   it opens from. */
+.qd-field-picker {
+  position: fixed;
+  z-index: 72;
+  width: 0;
+  height: 0;
+}
+
 .qs-sheet {
   display: flex;
   flex-direction: column;
@@ -9617,6 +9747,13 @@ img.emoji {
     max-width: none;
     right: 0;
   }
+  /* The Display panel's pickers hang off a zero-width anchor, so the stretch
+     above would resolve to `left: 0; right: 0` on a container of width 0 and
+     collapse the list. They are placed against the window by `measure()`
+     instead — the same clamp the panel itself uses. */
+  .qd-field-picker .qs-menu {
+    right: auto;
+  }
   /* **The list has to END inside the window once the sheet has been scrolled.**
      The bottom sheet above is the scroll path — there is no second popover
      controller here — but at the desktop's 320px the vocabulary viewport still
@@ -9850,6 +9987,10 @@ img.emoji {
   font-size: 13px;
   margin: 2px 0 6px;
 }
+/* One entry per requested aggregate, laid out on one line. */
+.query-summary .qs-entry + .qs-entry {
+  margin-left: 12px;
+}
 .query-summary .qs-label {
   color: var(--text-muted);
 }
@@ -9872,9 +10013,17 @@ img.emoji {
   color: var(--text-muted);
   font-weight: 600;
 }
-.query-summary-table td:last-child,
-.query-summary-table th:last-child {
+/* Every aggregate column is a number; only the group key is a label. Anchored
+   on :not(:first-child) rather than :last-child, which right-aligned exactly one
+   column back when a summary could only show one. */
+.query-summary-table td:not(:first-child),
+.query-summary-table th:not(:first-child) {
   text-align: right;
+}
+.query-summary-note {
+  margin: -4px 0 8px;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .embed-block {

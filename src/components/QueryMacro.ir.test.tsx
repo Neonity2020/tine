@@ -126,7 +126,7 @@ describe("B1: a TQL block executes through query_run", () => {
       expect(explainEmpty).not.toHaveBeenCalled();
 
       root.querySelector<HTMLButtonElement>(".query-why-empty")!.click();
-      await vi.waitFor(() => expect(root.querySelector(".query-why-empty-panel")).not.toBeNull());
+      await vi.waitFor(() => expect(root.querySelector(".query-why-empty-panel")?.textContent).toContain("page = [[Nowhere]]"));
       const text = root.querySelector(".query-why-empty-panel")!.textContent ?? "";
       // The conjunct that matches nothing ALONE is the one that emptied it.
       expect(text).toContain("page = [[Nowhere]]");
@@ -364,7 +364,7 @@ describe("B5: the save path chooses the name and answers NotApplicable", () => {
       expect(savePrintDialects(print)).toEqual(["tql_macro"]);
       expect(blockProperty("query", "tine.sort")).toBe("updated desc");
       expect(blockProperty("query", "tine.sample")).toBe("20");
-      expect(blockProperty("query", "tine.group-by")).toBe("page");
+      expect(blockProperty("query", "tine.group-field")).toBe("page");
       // X3/W5: the whole-result count is a bare `count` segment, with no `=`.
       expect(blockProperty("query", "tine.col-aggregates")).toBe("count");
     } finally {
@@ -465,7 +465,9 @@ describe("B6: directive migration for blocks that stay {{query}}", () => {
     vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
     vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
     vi.spyOn(backend(), "printQuery").mockResolvedValue("(task DONE)");
-    parseWithView({ aggregates: [["", "count"], ["hours", "sum"]], group_by: "status" });
+    // The engine's merged `group_by` is a canonical field id (P5B): a bare
+    // `status` is the ORDINARY PROPERTY, spelled `prop:status`.
+    parseWithView({ aggregates: [["", "count"], ["hours", "sum"]], group_by: "prop:status" });
 
     const { root, dispose } = mount(() => <Block id="query" />);
     try {
@@ -473,7 +475,7 @@ describe("B6: directive migration for blocks that stay {{query}}", () => {
       await vi.waitFor(() =>
         expect(blockProperty("query", "tine.col-aggregates")).toBe("count;hours=sum"),
       );
-      expect(blockProperty("query", "tine.group-by")).toBe("status");
+      expect(blockProperty("query", "tine.group-field")).toBe("prop:status");
       // The block stayed `{{query}}` — the migration is about WHERE the view
       // lives, not about the macro name.
       expect(doc.byId.query.raw).toContain("{{query (task DONE)}}");
@@ -531,7 +533,7 @@ describe("B6: directive migration for blocks that stay {{query}}", () => {
     const saved: ViewSettings = {
       view: "table",
       sort: [["a", "desc"]],
-      group_by: "status",
+      group_by: "prop:status",
       columns: ["a", "b"],
       aggregates: [["hours", "sum"]],
       sample: 20,
@@ -549,7 +551,7 @@ describe("B6: directive migration for blocks that stay {{query}}", () => {
       expect(blockProperty("query", "tine.columns")).toBe("a;b");
       expect(blockProperty("query", "tine.fields")).toBeNull();
       expect(blockProperty("query", "tine.sort")).toBe("a desc");
-      expect(blockProperty("query", "tine.group-by")).toBe("status");
+      expect(blockProperty("query", "tine.group-field")).toBe("prop:status");
       expect(blockProperty("query", "tine.col-aggregates")).toBe("hours=sum");
       expect(blockProperty("query", "tine.sample")).toBe("20");
       // The properties the block now carries are exactly the ones the engine is

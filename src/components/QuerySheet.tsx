@@ -1392,6 +1392,9 @@ function QueryRow(props: {
                   if (choice.kind === "property" && props.sheet.registry.pending()) return;
                   props.sheet.setOpenMenu(null);
                   if (choice.kind === "property") return setPropertyKey(choice);
+                  // The filter sheet offers only the filter vocabulary; a
+                  // display field cannot reach this picker.
+                  if (choice.kind === "field") return;
                   const next = choice.leaf;
                   if (next === "scheduled" || next === "deadline") return replaceRow(planningFilter(next));
                   if (next === "journal") return replaceRow(journalFilter());

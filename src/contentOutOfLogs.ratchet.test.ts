@@ -50,9 +50,9 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class:
   { file: "render/parse.ts", line: 51, method: "warn", bucket: "d", class: "build-token", why: "compares two public parser build tags" },
   { file: "sheet/formulaEval.ts", line: 193, method: "warn", bucket: "d", class: "internal-id-count", why: "performance warning carries an internal owner id and numeric count" },
   { file: "store.ts", line: 7062, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — replay-evidence retirement errors carry the private store path" },
-  { file: "ui.ts", line: 491, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
-  { file: "ui.ts", line: 516, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },
-  { file: "ui.ts", line: 553, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
+  { file: "ui.ts", line: 492, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
+  { file: "ui.ts", line: 517, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },
+  { file: "ui.ts", line: 554, method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
   { file: "update.ts", line: 148, method: "error", bucket: "d", class: "scrubbed-error", why: "safeUpdaterErrorChain permits only classified updater stages and causes" },
 ];
 

@@ -32,6 +32,7 @@ import { clearDrawerOpener, mobileDrawerMode, captureDrawerOpener, restoreDrawer
 import type { PdfOwnership } from "./pdfOwnership";
 import { issue248Collector, issue248Now } from "./issue248Probe";
 import type { ExportNode } from "./editor/exportText";
+import type { QueryGroupingControl } from "./sheet/fields";
 
 const THEME_KEY = "logseq-claude.theme";
 export type ThemePreference = "light" | "dark" | "system";
@@ -1945,6 +1946,9 @@ export type CtxTarget =
       fields?: readonly string[];
       formulas?: readonly [string, string][];
       filter?: string | null;
+      /** A query board's own grouping writer, so the menu and the board toolbar
+       *  share ONE path instead of each writing a property. */
+      queryGrouping?: QueryGroupingControl;
     }
   | { kind: "action-menu"; items: readonly ContextMenuAction[] };
 export interface ContextMenuAction {
@@ -2019,6 +2023,7 @@ export function openSheetContextMenu(
     fields?: readonly string[];
     formulas?: readonly [string, string][];
     filter?: string | null;
+    queryGrouping?: QueryGroupingControl;
   } = {}
 ) {
   setContextMenu({ x, y, kind: "sheet", ownerId, surface, rowSource, groupBy, ...opts });

@@ -250,12 +250,14 @@ describe("clobber direction 1: a query save must not touch the typed schema", ()
     // The corrected baseline: not "did the user touch grouping", but "does the
     // property already spell it". `og_view` re-emits only sort-by and sample.
     load('{{query (task TODO) (group-by status) (aggregate count)}}');
-    stubSave({ group_by: "status", aggregates: [["", "count"]] }, "(task DONE)");
+    // What the engine hands back for that directive on a LIST face: the ordinary
+    // property `status`, spelled canonically (P5B).
+    stubSave({ group_by: "prop:status", aggregates: [["", "count"]] }, "(task DONE)");
 
     const { root, dispose } = mount(() => <Block id="query" />);
     try {
       await saveThroughPane(root, "-- task DONE");
-      await vi.waitFor(() => expect(blockProperty("query", "tine.group-by")).toBe("status"));
+      await vi.waitFor(() => expect(blockProperty("query", "tine.group-field")).toBe("prop:status"));
       expect(blockProperty("query", "tine.col-aggregates")).toBe("count");
     } finally {
       dispose();

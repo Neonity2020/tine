@@ -39,9 +39,13 @@ export type VocabularyChoice =
   | { kind: "builtin"; leaf: BuilderLeafKind }
   /** An ordinary property filter. `throughPage` is `og.rs::through_page`: a
    *  block row reading its owning PAGE's property (§7.4, F5). */
-  | { kind: "property"; key: string; throughPage: boolean };
+  | { kind: "property"; key: string; throughPage: boolean }
+  /** A DISPLAY field identity (P5B): what to group by, sort by, show as a
+   *  column or aggregate. It is not a filter and never becomes one — the
+   *  Display panel supplies its own entries and reads this back. */
+  | { kind: "field"; field: string };
 
-export type VocabularySection = "builtin" | "property" | "page" | "novel";
+export type VocabularySection = "builtin" | "property" | "page" | "novel" | "field";
 
 export interface VocabularyEntry {
   /** Stable row identity — the option id, never a filtered or virtual index. */
@@ -70,6 +74,10 @@ export const SECTION_LABEL: Record<VocabularySection, string> = {
   // key the graph HAS on the other kind of owner, and while the registry read
   // is in flight nobody knows which case it is.
   novel: "Use a key by name",
+  // The Display panel's own section: these are fields to present by, not
+  // conditions to filter on, and calling them "properties" would be wrong for
+  // the built-ins and the formulas among them.
+  field: "Fields",
 };
 
 /** The block-side built-in vocabulary, in `FILTER_TYPES` order (§7.4). */
@@ -294,7 +302,8 @@ export const VOCABULARY_HEADER_HEIGHT = 26;
  */
 export function vocabularyKey(entry: VocabularyEntry | undefined, fallback: string): string {
   if (!entry) return fallback;
-  return entry.choice.kind === "property" ? entry.choice.key : entry.choice.leaf;
+  if (entry.choice.kind === "property") return entry.choice.key;
+  return entry.choice.kind === "field" ? entry.choice.field : entry.choice.leaf;
 }
 
 /** Which SCOPE a property row authors — `og.rs::through_page` as an attribute,
@@ -328,22 +337,38 @@ export function QueryVocabularyPicker(props: {
   onPick: (choice: VocabularyChoice) => void;
   rootRef?: (element: HTMLDivElement) => void;
   onEmptyBackspace?: () => void;
+  /** An explicit entry list, replacing the FILTER vocabulary this picker builds
+   *  from the registry (P5B).
+   *
+   *  The Display panel picks fields to present by, which is a different list
+   *  from the conditions a filter can test — but it is the same list PROBLEM: a
+   *  graph with thousands of property keys must still mount a viewport's worth
+   *  of rows (I-22), and the keyboard, the roving active option and the
+   *  `aria-activedescendant` wiring must be the same ones. So it supplies the
+   *  entries and reuses everything else, rather than growing a second picker. */
+  entries?: (search: string) => VocabularyEntry[];
 }): JSX.Element {
   const [search, setSearch] = createSignal("");
-  const entries = createMemo(() => [
-    ...buildVocabulary({ rows: props.rows(), anchor: props.anchor, search: search() }),
-    ...novelKeyEntries(props.rows(), search(), props.anchor),
-  ]);
+  const entries = createMemo(() =>
+    props.entries
+      ? props.entries(search())
+      : [
+          ...buildVocabulary({ rows: props.rows(), anchor: props.anchor, search: search() }),
+          ...novelKeyEntries(props.rows(), search(), props.anchor),
+        ],
+  );
   const byId = createMemo(() => new Map(entries().map((entry) => [entry.id, entry])));
   const options = createMemo(() => withHeaders(entries()));
-  const same = (choice: VocabularyChoice, other: VocabularyChoice | null | undefined) =>
-    !!other
-    && other.kind === choice.kind
-    && (choice.kind === "builtin"
-      ? other.kind === "builtin" && other.leaf === choice.leaf
-      : other.kind === "property"
-        && other.key === choice.key
-        && other.throughPage === choice.throughPage);
+  const same = (choice: VocabularyChoice, other: VocabularyChoice | null | undefined) => {
+    if (!other || other.kind !== choice.kind) return false;
+    if (choice.kind === "builtin") return other.kind === "builtin" && other.leaf === choice.leaf;
+    if (choice.kind === "field") return other.kind === "field" && other.field === choice.field;
+    return (
+      other.kind === "property"
+      && other.key === choice.key
+      && other.throughPage === choice.throughPage
+    );
+  };
 
   const body = (context: ListboxBody) => (
     <VirtualList

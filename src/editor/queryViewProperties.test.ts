@@ -16,14 +16,19 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  canonicalGroupField,
   isLegacyBareColumnList,
+  legacyGroupField,
   mergeQueryAggregateValue,
   queryColumnTokens,
+  queryDisplayPropertyWrites,
   queryViewPropertyPatch,
   resolveQueryColumns,
+  resolveQueryGrouping,
   selectedQueryColumns,
   type PropertyPairs,
   type QueryColumnsResolution,
+  type QueryGroupingResolution,
 } from "./queryViewProperties";
 import type { ViewSettings } from "./queryIr";
 
@@ -39,6 +44,79 @@ const FIXTURES: Case[] = JSON.parse(
     "utf8",
   ),
 );
+
+interface GroupingCase {
+  why: string;
+  properties: [string, string][];
+  parsed?: { group_by?: string; view?: string };
+  resolution: QueryGroupingResolution;
+}
+
+const GROUPING_FIXTURES: GroupingCase[] = JSON.parse(
+  readFileSync(
+    new URL("../../crates/tine-core/tests/fixtures/query-grouping/resolution.json", import.meta.url),
+    "utf8",
+  ),
+);
+
+describe("the shared grouping resolver (P5B)", () => {
+  it("matches the Rust resolver on every shared fixture", () => {
+    expect(GROUPING_FIXTURES.length).toBeGreaterThan(20);
+    for (const item of GROUPING_FIXTURES) {
+      expect(
+        resolveQueryGrouping(item.properties, item.parsed ?? {}),
+        `${item.why} — ${JSON.stringify(item.properties)}`,
+      ).toEqual(item.resolution);
+    }
+  });
+
+  it("keeps the three outcomes distinct: a field, an explicit clear, and unset", () => {
+    const kinds = new Set(GROUPING_FIXTURES.map((item) => item.resolution.kind));
+    expect(kinds).toEqual(new Set(["field", "cleared", "unset"]));
+  });
+
+  it("tells the task marker from an ordinary property named state", () => {
+    // The one ambiguity the new key exists to end. Both spellings, one wire.
+    expect(resolveQueryGrouping([["tine.group-field", "state"]])).toEqual({
+      kind: "field",
+      field: "state",
+    });
+    expect(resolveQueryGrouping([["tine.group-field", "prop:state"]])).toEqual({
+      kind: "field",
+      field: "prop:state",
+    });
+    // And a property literally NAMED `prop:state` is reachable too, with no new
+    // escaping rule in the property bytes.
+    expect(canonicalGroupField("prop:prop:state")).toBe("prop:prop:state");
+  });
+
+  it("captures a legacy token's meaning at the view the note is persisted with", () => {
+    // The same bytes, two readings — which is exactly why they cannot both keep
+    // living on one bare token.
+    expect(legacyGroupField("state", true)).toBe("state");
+    expect(legacyGroupField("state", false)).toBe("prop:state");
+    // The defect the sheet-face reading fixes: `status` used to fall through
+    // `isFieldId` and silently become the task marker.
+    expect(legacyGroupField("status", true)).toBe("prop:status");
+    // The list reading keeps a literal `prop:` prefix inside the property KEY.
+    expect(legacyGroupField("prop:state", false)).toBe("prop:prop:state");
+  });
+
+  it("treats a present-but-unreadable new key as an explicit clear, with no fallback", () => {
+    for (const value of ["", "   ", "status", "prop:", "formula:"]) {
+      expect(
+        resolveQueryGrouping(
+          [
+            ["tine.group-field", value],
+            ["tine.group-by", "state"],
+          ],
+          { group_by: "cost" },
+        ),
+        value,
+      ).toEqual({ kind: "cleared" });
+    }
+  });
+});
 
 describe("the shared visible-column resolver", () => {
   it("matches the Rust resolver on every shared fixture", () => {
@@ -86,6 +164,9 @@ describe("the lossless query view-property patch", () => {
     const properties: PropertyPairs = [
       ["tine.view", "table"],
       ["tine.sort", "a desc"],
+      // A legacy token, untouched. On a TABLE face it resolves to the ordinary
+      // property `status`, and the destination view is the same table — so
+      // there is nothing to canonicalize and nothing to write (P5B).
       ["tine.group-by", "status"],
       ["tine.sample", "20"],
       ["tine.columns", "a;b"],
@@ -95,7 +176,7 @@ describe("the lossless query view-property patch", () => {
       view: {
         view: "table",
         sort: [["a", "desc"]],
-        group_by: "status",
+        group_by: "prop:status",
         sample: 20,
         columns: ["a", "b"],
         aggregates: [["", "count"], ["hours", "sum"]],
@@ -108,8 +189,8 @@ describe("the lossless query view-property patch", () => {
     // The reprint is about to drop them: `og_view` re-emits only `(sort-by …)`
     // and `(sample …)`. Nothing about the view "changed" — only the property
     // baseline can tell you the facts are about to be lost.
-    expect(patch({ group_by: "status", aggregates: [["", "count"]] })).toEqual({
-      "tine.group-by": "status",
+    expect(patch({ group_by: "prop:status", aggregates: [["", "count"]] })).toEqual({
+      "tine.group-field": "prop:status",
       "tine.col-aggregates": "count",
     });
   });
@@ -127,7 +208,7 @@ describe("the lossless query view-property patch", () => {
     })).toEqual({
       "tine.view": "table",
       "tine.sort": "updated desc",
-      "tine.group-by": "page",
+      "tine.group-field": "page",
       "tine.sample": "20",
       "tine.columns": "a",
       "tine.col-aggregates": "count",
@@ -135,8 +216,16 @@ describe("the lossless query view-property patch", () => {
   });
 
   it("removes a stale property when the setting is cleared", () => {
+    // The grouping clear is spelled differently from the others on purpose: the
+    // new key stays PRESENT and empty, because "no grouping" has to outlive a
+    // view switch, and the recognized legacy key is retired in the same patch.
     expect(patch({}, [["tine.sort", "a desc"], ["tine.group-by", "status"]])).toEqual({
       "tine.sort": null,
+      "tine.group-field": null,
+      "tine.group-by": null,
+    });
+    expect(patch({ group_by: "" }, [["tine.group-by", "status"]])).toEqual({
+      "tine.group-field": "",
       "tine.group-by": null,
     });
   });
@@ -198,6 +287,126 @@ describe("the lossless query view-property patch", () => {
       view: {},
       properties: [["tine.columns", ""], ["tine.fields", "page;status"]],
     })).toEqual([]);
+  });
+});
+
+describe("clearing a column selection", () => {
+  /** The writer removes `tine.columns` rather than emptying it, while the
+   *  resolver distinguishes a PRESENT-but-empty value from an absent one. That
+   *  asymmetry only matters if something behind the key can come back — so this
+   *  states, for the two things that could:
+   *
+   *   * the legacy `tine.fields` branch, which the same patch retires under
+   *     exactly the condition that branch would have read it;
+   *   * the query TEXT's own columns, which do not exist: no parser produces
+   *     `ViewSettings.columns` and no printer emits one (`query/print.rs::
+   *     og_view`), so `Unset` leaves an empty list either way.
+   *
+   *  Grouping is the opposite case and is written as the EMPTY value, because
+   *  the legacy key and the DSL directive behind it really can come back. */
+  it("removes the key, and nothing behind it comes back", () => {
+    const properties: PropertyPairs = [
+      ["tine.columns", "cost;status"],
+      // A proven pre-split bare list — the one thing the legacy branch reads.
+      ["tine.fields", "cost;status"],
+    ];
+    const writes = queryDisplayPropertyWrites({
+      before: { columns: ["cost", "status"] },
+      view: { columns: [] },
+      properties,
+    });
+    expect(writes).toEqual([
+      ["tine.columns", null],
+      ["tine.fields", null],
+    ]);
+    // The block as it stands after those writes.
+    expect(resolveQueryColumns([])).toEqual({ kind: "unset" });
+    expect(selectedQueryColumns([])).toBeNull();
+    // …which draws the same thing an explicit empty value does. `cleared` and
+    // `unset` differ in what they suppress, and there is nothing here to
+    // suppress.
+    expect(selectedQueryColumns([["tine.columns", ""]])).toBeNull();
+  });
+
+  it("keeps a TYPED schema, which the legacy branch would not have read anyway", () => {
+    // `tine.fields:: cost=number` is a schema, not a column list. It survives
+    // the clear (I-4) — and it cannot resurrect as columns, because the branch
+    // that would read it applies the same grammar that rejects it.
+    const properties: PropertyPairs = [
+      ["tine.columns", "cost"],
+      ["tine.fields", "cost=number"],
+    ];
+    expect(
+      queryDisplayPropertyWrites({ before: { columns: ["cost"] }, view: { columns: [] }, properties }),
+    ).toEqual([["tine.columns", null]]);
+    expect(resolveQueryColumns([["tine.fields", "cost=number"]])).toEqual({ kind: "unset" });
+  });
+});
+
+describe("a DISPLAY edit's write set", () => {
+  const writes = (before: ViewSettings, view: ViewSettings, properties: PropertyPairs = []) =>
+    Object.fromEntries(
+      queryDisplayPropertyWrites({ before, view, properties }).map(([k, v]) => [k, v]),
+    );
+
+  it("states only the fact the edit changed", () => {
+    // FAIL-BEFORE (I-20): the engine re-reads asynchronously, so a second edit
+    // made inside one parse round-trip still carries the reading that predates
+    // the first. Here the grouping was just saved and the panel's reading has
+    // not caught up; the wide save baseline would call that a disagreement and
+    // REMOVE the grouping the user set a moment ago.
+    const stale: ViewSettings = { view: "table" };
+    const properties: PropertyPairs = [
+      ["tine.view", "table"],
+      ["tine.group-field", "prop:status"],
+    ];
+    expect(writes(stale, { ...stale, columns: ["cost"] }, properties)).toEqual({
+      "tine.columns": "cost",
+    });
+  });
+
+  it("pins a legacy grouping when the VIEW changes, even though the grouping did not", () => {
+    // The one fact a view switch must state even when its own value is
+    // unchanged: a bare `tine.group-by` means different things at different
+    // views, which is the whole reason the canonical key exists.
+    const before: ViewSettings = { group_by: "prop:state" };
+    expect(
+      writes(before, { ...before, view: "board" }, [["tine.group-by", "state"]]),
+    ).toEqual({
+      "tine.view": "board",
+      "tine.group-field": "prop:state",
+      "tine.group-by": null,
+    });
+  });
+
+  it("leaves an untouched legacy key alone on an unrelated edit", () => {
+    // I-4: a column edit is not a licence to rewrite how a note spells its
+    // grouping. The legacy token still resolves the same way at the same view.
+    expect(
+      writes({ group_by: "prop:status" }, { group_by: "prop:status", columns: ["cost"] }, [
+        ["tine.group-by", "status"],
+      ]),
+    ).toEqual({ "tine.columns": "cost" });
+  });
+
+  it("does not re-state a canonical grouping the reading has not caught up to", () => {
+    // FAIL-BEFORE: the view-switch exemption existed for the LEGACY token, which
+    // reinterprets across views. `tine.group-field` does not — so once it is on
+    // the block, restating it from a stale reading is the same clobber, made by
+    // the exemption itself. Here the grouping was just saved and the very next
+    // click switches the view.
+    const stale: ViewSettings = { view: "board" };
+    expect(
+      writes(stale, { ...stale, view: "table" }, [
+        ["tine.view", "board"],
+        ["tine.group-field", "prop:status"],
+      ]),
+    ).toEqual({ "tine.view": "table" });
+  });
+
+  it("writes nothing when the edit changed nothing", () => {
+    const view: ViewSettings = { view: "board", group_by: "state" };
+    expect(queryDisplayPropertyWrites({ before: view, view, properties: [] })).toEqual([]);
   });
 });
 

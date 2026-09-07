@@ -39,7 +39,8 @@ const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_mill
 pub(crate) const WARM_STREAM_HIGH_WATER: usize = 64;
 
 #[cfg(test)]
-static PHYSICAL_PAGE_LOWERINGS: AtomicU64 = AtomicU64::new(0);
+// Test receipts count only their own graph, including its worker threads.
+static PHYSICAL_PAGE_LOWERINGS: Mutex<(Option<PathBuf>, u64)> = Mutex::new((None, 0));
 /// R6 test receipt: the most deltas a warm stream ever left queued, so a test
 /// can prove the stream never retained more than `WARM_STREAM_HIGH_WATER`.
 #[cfg(test)]
@@ -2343,7 +2344,16 @@ fn physical_page(
     String,
 > {
     #[cfg(test)]
-    PHYSICAL_PAGE_LOWERINGS.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut receipt = PHYSICAL_PAGE_LOWERINGS.lock().unwrap();
+        if receipt
+            .0
+            .as_ref()
+            .is_some_and(|root| entry.path.starts_with(root))
+        {
+            receipt.1 += 1;
+        }
+    }
     let id = page_id(&entry.rel_path);
     let format = Format::from_path(Path::new(&entry.rel_path));
     let is_org = format == Format::Org;
@@ -2691,12 +2701,12 @@ mod tests {
         std::env::temp_dir().join(format!("tine-direct-projection-{tag}-{}", Uuid::new_v4()))
     }
 
-    fn reset_lowerings() {
-        PHYSICAL_PAGE_LOWERINGS.store(0, Ordering::Relaxed);
+    fn reset_lowerings(root: &Path) {
+        *PHYSICAL_PAGE_LOWERINGS.lock().unwrap() = (Some(root.to_path_buf()), 0);
     }
 
     fn lowerings() -> u64 {
-        PHYSICAL_PAGE_LOWERINGS.load(Ordering::Relaxed)
+        PHYSICAL_PAGE_LOWERINGS.lock().unwrap().1
     }
 
     fn signature(groups: &[crate::model::RefGroup]) -> Vec<(String, Vec<(String, String)>)> {
@@ -3102,6 +3112,27 @@ mod tests {
     /// empty set, because those rows' stored ids came from an earlier session
     /// and must be answered structurally.
     #[test]
+    fn lowering_measurement_excludes_other_graphs() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("measurement-owner");
+        let other = scratch("measurement-other");
+        reset_lowerings(&root);
+        for graph_root in [&root, &other] {
+            std::fs::create_dir_all(graph_root.join("pages")).unwrap();
+            std::fs::write(graph_root.join("pages/one.md"), "- TODO one\n").unwrap();
+            let graph = Graph::open(graph_root);
+            graph
+                .attach_direct_projection(graph_root.join("projection.sqlite"))
+                .unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        assert_eq!(lowerings(), 1, "only the measured graph contributes");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
     fn session_pages_name_exactly_the_pages_this_process_lowered() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("session-pages");
@@ -3150,7 +3181,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
 
         std::fs::write(root.join("pages/two.md"), "- DONE two again\n").unwrap();
-        reset_lowerings();
+        reset_lowerings(&root);
         {
             let graph = Graph::open(&root);
             graph.attach_direct_projection(database.clone()).unwrap();
@@ -4291,7 +4322,7 @@ mod tests {
         std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
         let database = scratch("reopen-revisions-db").join("projection.sqlite");
 
-        reset_lowerings();
+        reset_lowerings(&root);
         {
             let graph = Graph::open(&root);
             graph.attach_direct_projection(database.clone()).unwrap();
@@ -4301,7 +4332,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(20));
 
-        reset_lowerings();
+        reset_lowerings(&root);
         {
             let graph = Graph::open(&root);
             graph.attach_direct_projection(database.clone()).unwrap();
@@ -4312,7 +4343,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
 
         std::fs::write(root.join("pages/one.md"), "- TODO one changed\n").unwrap();
-        reset_lowerings();
+        reset_lowerings(&root);
         {
             let graph = Graph::open(&root);
             graph.attach_direct_projection(database.clone()).unwrap();
@@ -4677,7 +4708,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(20));
 
-        reset_lowerings();
+        reset_lowerings(&root);
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database.clone()).unwrap();
         assert!(graph.warm_cache_cancellable(|| false));
@@ -4750,7 +4781,7 @@ mod tests {
             .unwrap();
         }
         let database = scratch("cold-stream-db").join("projection.sqlite");
-        reset_lowerings();
+        reset_lowerings(&root);
         MAX_PENDING_DELTAS.store(0, Ordering::Relaxed);
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database.clone()).unwrap();
@@ -4799,7 +4830,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(root.join("pages/two.md"), "- TODO two changed\n").unwrap();
 
-        reset_lowerings();
+        reset_lowerings(&root);
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database.clone()).unwrap();
         assert!(graph.warm_cache_cancellable(|| false));
@@ -4844,7 +4875,7 @@ mod tests {
         damaged.execute("DROP TABLE block_path_refs", []).unwrap();
         drop(damaged);
 
-        reset_lowerings();
+        reset_lowerings(&root);
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database.clone()).unwrap();
         assert!(graph.warm_cache_cancellable(|| false));
@@ -5078,7 +5109,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(20));
 
-        reset_lowerings();
+        reset_lowerings(&root);
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database.clone()).unwrap();
         let started = Instant::now();

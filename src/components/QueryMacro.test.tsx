@@ -5,11 +5,11 @@ import { Block } from "./Block";
 import { ContextMenu } from "./ContextMenu";
 import { initParser } from "../render/parse";
 import { backend } from "../backend";
-import { blockProperty, doc, resetStore, setDoc, undo, type FeedPage, type Node as StoreNode } from "../store";
+import { blockProperty, doc, resetStore, setDoc, setBlockProperty, undo, type FeedPage, type Node as StoreNode } from "../store";
 import { route } from "../router";
 import type { QueryExecution, QueryHit, RefGroup } from "../types";
 import type { QueryReport, QueryResult } from "../editor/queryIr";
-import { bumpDataRev } from "../ui";
+import { bumpDataRev, bumpGraphEpoch } from "../ui";
 import { queryMacroExtent } from "../editor/queryMacro";
 import { backendReadsQueries } from "../queryReadingsTestkit";
 import { searchFilter } from "../editor/queryBuilder";
@@ -91,16 +91,55 @@ async function settleQuery(): Promise<void> {
   await tick();
 }
 
-function clickView(root: HTMLElement, label: "Search" | "List" | "Table" | "Board"): void {
-  const button = [...root.querySelectorAll(".query-view-switcher button")].find(
+/** The Display panel, opened. A builder-backed query states its view there now
+ *  — the header switcher would be a second control writing the same key — so
+ *  the helper opens the sheet and the panel, in that order, exactly as a user
+ *  would. Hosts with no builder (an advanced query, a friendly search) keep the
+ *  header switcher, which is why both branches live here. */
+async function openDisplay(root: HTMLElement): Promise<HTMLElement> {
+  const gear = await vi.waitFor(() => {
+    const found = root.querySelector<HTMLButtonElement>(".qs-gear");
+    if (!found) throw new Error("the query sentence never appeared");
+    return found;
+  });
+  if (!document.querySelector(".qs-sheet")) gear.click();
+  const trigger = await vi.waitFor(() => {
+    const found = document.querySelector<HTMLButtonElement>(".qd-trigger");
+    if (!found) throw new Error("the Display control never appeared");
+    return found;
+  });
+  if (!document.querySelector(".qd-panel")) trigger.click();
+  return await vi.waitFor(() => {
+    const panel = document.querySelector<HTMLElement>(".qd-panel");
+    if (!panel) throw new Error("the Display panel never opened");
+    return panel;
+  });
+}
+
+async function clickView(
+  root: HTMLElement,
+  label: "Search" | "List" | "Table" | "Board",
+): Promise<void> {
+  const legacy = [...root.querySelectorAll(".query-view-switcher button")].find(
+    (el) => el.textContent?.trim() === label
+  ) as HTMLButtonElement | undefined;
+  if (legacy) {
+    legacy.click();
+    return;
+  }
+  const panel = await openDisplay(root);
+  const button = [...panel.querySelectorAll(".qd-view")].find(
     (el) => el.textContent?.trim() === label
   ) as HTMLButtonElement | undefined;
   if (!button) throw new Error(`missing query view button ${label}`);
   button.click();
 }
 
-function activeView(root: HTMLElement): string | undefined {
-  return root.querySelector(".query-view-switcher button.active")?.textContent?.trim();
+async function activeView(root: HTMLElement): Promise<string | undefined> {
+  const legacy = root.querySelector(".query-view-switcher button.active");
+  if (legacy) return legacy.textContent?.trim();
+  const panel = await openDisplay(root);
+  return panel.querySelector(".qd-view.active")?.textContent?.trim();
 }
 
 function presentedResultNumbers(
@@ -265,7 +304,7 @@ describe("QueryMacro sheet integration", () => {
     const { root, dispose } = mount(() => <Block id="query" />);
     await settleQuery();
 
-    expect(activeView(root)).toBe("Search");
+    expect(await activeView(root)).toBe("Search");
     // The resting SENTENCE says it, and says it as words plus one soft value —
     // not as the DSL text the block happens to hold.
     expect(root.querySelector(".qs-sentence")?.textContent).toBe("Blocks where search: alpha beta");
@@ -300,7 +339,7 @@ describe("QueryMacro sheet integration", () => {
     const { root, dispose } = mount(() => <Block id="query" />);
     await settleQuery();
 
-    expect(activeView(root)).toBe("Search");
+    expect(await activeView(root)).toBe("Search");
     expect(root.querySelector(".query-count")?.textContent).toBe("9");
     expect(root.querySelectorAll(".query-search-results .query-search-hit")).toHaveLength(9);
     expect(root.querySelector(".query-search-hit")?.textContent).toContain("Result 1");
@@ -308,9 +347,9 @@ describe("QueryMacro sheet integration", () => {
     expect(graphSearch).not.toHaveBeenCalled();
 
     for (const view of ["List", "Table", "Board", "Search"] as const) {
-      clickView(root, view);
+      await clickView(root, view);
       await settleQuery();
-      expect(activeView(root)).toBe(view);
+      expect(await activeView(root)).toBe(view);
       expect(root.querySelector(".query-count")?.textContent).toBe("9");
       expect(presentedResultNumbers(root, view)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
@@ -364,14 +403,14 @@ describe("QueryMacro sheet integration", () => {
     const { root, dispose } = mount(() => <Block id="query" />);
     await settleQuery();
 
-    expect(activeView(root)).toBe("Table");
+    expect(await activeView(root)).toBe("Table");
     expect(
       [...root.querySelectorAll(".sheet-title-cell .sheet-cell-body")].map((cell) => cell.textContent?.trim())
     ).toEqual(["High score"]);
 
-    clickView(root, "Board");
+    await clickView(root, "Board");
     await settleQuery();
-    expect(activeView(root)).toBe("Board");
+    expect(await activeView(root)).toBe("Board");
     expect([...root.querySelectorAll(".sheet-board-card-title")].map((card) => card.textContent?.trim())).toEqual([
       "High score",
     ]);
@@ -399,34 +438,72 @@ describe("QueryMacro sheet integration", () => {
     ));
     await settleQuery();
 
-    expect(activeView(root)).toBe("List");
+    expect(await activeView(root)).toBe("List");
 
-    clickView(root, "Table");
-    expect(activeView(root)).toBe("Table");
+    await clickView(root, "Table");
+    expect(await activeView(root)).toBe("Table");
     expect(blockProperty("query", "tine.view")).toBe("table");
     expect(doc.byId.query.raw).toBe("{{query (todo TODO)}}\ntine.view:: table");
     undo();
     expect(doc.byId.query.raw).toBe(originalRaw);
-    expect(activeView(root)).toBe("List");
+    expect(await activeView(root)).toBe("List");
 
-    clickView(root, "Table");
-    clickView(root, "Board");
-    expect(activeView(root)).toBe("Board");
+    await clickView(root, "Table");
+    await clickView(root, "Board");
+    expect(await activeView(root)).toBe("Board");
     expect(blockProperty("query", "tine.view")).toBe("board");
-    expect(blockProperty("query", "tine.group-by")).toBe("state");
+    // The Board's default grouping is written under the QUERY-owned key, whose
+    // value is a canonical field id — so `state` here is the task marker and
+    // could not be mistaken for an ordinary property of the same name (P5B).
+    expect(blockProperty("query", "tine.group-field")).toBe("state");
+    expect(blockProperty("query", "tine.group-by")).toBeNull();
     undo();
     expect(blockProperty("query", "tine.view")).toBe("table");
-    expect(blockProperty("query", "tine.group-by")).toBeNull();
+    expect(blockProperty("query", "tine.group-field")).toBeNull();
 
-    clickView(root, "Board");
-    clickView(root, "List");
-    expect(activeView(root)).toBe("List");
+    await clickView(root, "Board");
+    await clickView(root, "List");
+    expect(await activeView(root)).toBe("List");
     expect(blockProperty("query", "tine.view")).toBeNull();
-    expect(blockProperty("query", "tine.group-by")).toBe("state");
+    expect(blockProperty("query", "tine.group-field")).toBe("state");
     undo();
     expect(blockProperty("query", "tine.view")).toBe("board");
-    expect(blockProperty("query", "tine.group-by")).toBe("state");
+    expect(blockProperty("query", "tine.group-field")).toBe("state");
 
+    dispose();
+  });
+
+  // Found by `scripts/e2e-query-display.mjs` on real WebKit, where a press is a
+  // POINTER sequence and not a bare `click()`: the panel is portalled to <body>,
+  // the sheet's outside-pointer check looked for an open popover UNDER its own
+  // element, and so every press in the panel read as a press outside the sheet.
+  // The sheet closed, the panel went with it, and the control's own click never
+  // landed — the whole panel was unusable with a real pointer while every
+  // `click()`-driven test passed.
+  it("holds the sheet still under a press inside the portalled Display panel", async () => {
+    loadQueryDoc("{{query (todo TODO)}}");
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="query" />
+        <ContextMenu />
+      </>
+    ));
+    await settleQuery();
+    const panel = await openDisplay(root);
+
+    const board = [...panel.querySelectorAll<HTMLButtonElement>(".qd-view")].find(
+      (el) => el.textContent?.trim() === "Board",
+    )!;
+    // The press first, exactly as a pointer delivers it, and only then the
+    // click: the bug was that nothing survived in between.
+    for (const type of ["pointerdown", "mousedown"] as const) {
+      board.dispatchEvent(new MouseEvent(type, { bubbles: true, composed: true }));
+    }
+    expect(document.querySelector(".qs-sheet")).not.toBeNull();
+    expect(document.querySelector(".qd-panel")).not.toBeNull();
+
+    board.click();
+    await vi.waitFor(() => expect(blockProperty("query", "tine.view")).toBe("board"));
     dispose();
   });
 
@@ -441,12 +518,196 @@ describe("QueryMacro sheet integration", () => {
     ));
     await settleQuery();
 
-    clickView(root, "Board");
+    await clickView(root, "Board");
 
     expect(blockProperty("query", "tine.view")).toBe("board");
-    expect(blockProperty("query", "tine.group-by")).toBe("tags");
+    // A legacy key that already answers is a STATEMENT, so the Board default
+    // does not speak over it — `state` is nowhere here.
+    //
+    // What the switch DOES do is pin the meaning the block had. A bare
+    // `tine.group-by:: tags` on a LIST is the ordinary property `tags`, which is
+    // what the list grouper has always read; the same token on a Board would be
+    // the tags facet. So the switch writes the list reading canonically and
+    // retires the ambiguous key, rather than letting the new view silently
+    // reinterpret it.
+    expect(blockProperty("query", "tine.group-field")).toBe("prop:tags");
+    expect(blockProperty("query", "tine.group-by")).toBeNull();
 
     dispose();
+  });
+
+  it("switching to Board leaves an explicit no-grouping alone", async () => {
+    // A PRESENT but empty `tine.group-field` is the user saying "no grouping".
+    // The Board default only fills the silence, so it must not speak over this.
+    loadQueryDoc("{{query (todo TODO)}}\ntine.group-field:: ");
+
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="query" />
+        <ContextMenu />
+      </>
+    ));
+    await settleQuery();
+
+    await clickView(root, "Board");
+
+    expect(blockProperty("query", "tine.view")).toBe("board");
+    expect(blockProperty("query", "tine.group-field")).toBe("");
+    dispose();
+  });
+
+  it("keeps the task-marker default on a board whose grouping nothing states", async () => {
+    // ADR 0030, kept alive across the P5B grouping split. A note authored as
+    // `tine.view:: board` with no grouping ANYWHERE has always shown a
+    // task-marker board — the default fills the silence. `unset` and an explicit
+    // clear are two different answers, and only the clear is one ungrouped
+    // column; collapsing them would silently un-group every existing board.
+    setDoc({
+      byId: {
+        query: node("query", "{{query (todo TODO)}}\ntine.view:: board", null),
+        todo: node("todo", "TODO From query\nowner:: Martin", null),
+      },
+      pages: [page(["query", "todo"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockResult(queryGroups(["todo"])));
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+
+      const headings = await vi.waitFor(() => {
+        const found = [...root.querySelectorAll(".sheet-board-header span:first-child")].map((el) =>
+          el.textContent?.trim(),
+        );
+        if (!found.length) throw new Error("the board never rendered");
+        return found;
+      });
+      expect(headings).toContain("TODO");
+      expect(headings).not.toContain("All results");
+      // Reading is not writing: the default is applied by the renderer, and the
+      // note gains no property from being looked at (I-4).
+      expect(blockProperty("query", "tine.group-field")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("opens Display without the filter sheet and reads its registry only on demand", async () => {
+    bumpGraphEpoch();
+    loadQueryDoc("{{query (todo TODO)}}");
+    const registry = vi.spyOn(backend(), "queryRegistry");
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      expect(document.querySelector('.qs-sheet[aria-label="Query filter"]')).toBeNull();
+      expect(registry).not.toHaveBeenCalled();
+      const trigger = root.querySelector<HTMLButtonElement>(".qd-trigger");
+      expect(trigger).not.toBeNull();
+      trigger!.click();
+      await vi.waitFor(() => expect(document.querySelector(".qd-panel")).not.toBeNull());
+      await vi.waitFor(() => expect(registry).toHaveBeenCalledTimes(1));
+      expect(document.querySelector('.qs-sheet[aria-label="Query filter"]')).toBeNull();
+    } finally { dispose(); }
+  });
+
+  it("does not undo a display edit with the next click made before the re-parse", async () => {
+    // FAIL-BEFORE (I-20): every display surface renders from the ENGINE's last
+    // reading, and the engine re-reads asynchronously. Two clicks inside one
+    // parse round-trip therefore both start from the reading that predates the
+    // first — and a write set computed against the block's properties from that
+    // stale reading restates the fact the first click just changed, undoing it.
+    //
+    // Here: clear the grouping, then switch to Board without waiting. The
+    // switch's untouched grouping is the pre-clear one, and the save baseline
+    // called that a disagreement with the empty `tine.group-field` and wrote the
+    // old grouping straight back.
+    loadQueryDoc("{{query (todo TODO)}}\ntine.group-by:: state");
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      const panel = await openDisplay(root);
+
+      const clear = [...panel.querySelectorAll<HTMLButtonElement>(".qd-row-btn")].find(
+        (button) => button.textContent?.trim() === "None",
+      )!;
+      const board = [...panel.querySelectorAll<HTMLButtonElement>(".qd-view")].find(
+        (button) => button.textContent?.trim() === "Board",
+      )!;
+      // Two clicks, no await between them — the parse cannot have answered.
+      clear.click();
+      board.click();
+
+      expect(blockProperty("query", "tine.view")).toBe("board");
+      // The explicit clear survives, and the ambiguous legacy key stays retired.
+      expect(blockProperty("query", "tine.group-field")).toBe("");
+      expect(blockProperty("query", "tine.group-by")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps both aggregate additions made before the re-parse", async () => {
+    loadQueryDoc("{{query (todo TODO)}}");
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      const panel = await openDisplay(root);
+      const add = [...panel.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "+ count",
+      )!;
+      add.click();
+      add.click();
+      expect(blockProperty("query", "tine.col-aggregates")).toBe("count;count");
+    } finally { dispose(); }
+  });
+
+  it("preserves a grouping clear when a sample save starts before the re-parse", async () => {
+    loadQueryDoc("{{query (todo TODO)}}\ntine.group-by:: state");
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    vi.spyOn(backend(), "printQuery").mockResolvedValue("(todo TODO)");
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      const panel = await openDisplay(root);
+      const clear = [...panel.querySelectorAll<HTMLButtonElement>(".qd-row-btn")].find(
+        (button) => button.textContent?.trim() === "None",
+      )!;
+      const sample = panel.querySelector<HTMLInputElement>(".qd-sample")!;
+      clear.click();
+      sample.value = "2";
+      sample.dispatchEvent(new Event("input", { bubbles: true }));
+      sample.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await vi.waitFor(() => expect(blockProperty("query", "tine.sample")).toBe("2"));
+      expect(blockProperty("query", "tine.group-field")).toBe("");
+      expect(blockProperty("query", "tine.group-by")).toBeNull();
+    } finally { dispose(); }
+  });
+
+  it.each(["property", "graph"])("does not overwrite a %s change while the printer is pending", async (change) => {
+    loadQueryDoc("{{query (todo TODO)}}");
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    let finish!: (text: string) => void;
+    const printed = new Promise<string>((resolve) => { finish = resolve; });
+    const printer = vi.spyOn(backend(), "printQuery").mockReturnValue(printed);
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      const panel = await openDisplay(root);
+      const sample = panel.querySelector<HTMLInputElement>(".qd-sample")!;
+      sample.value = "2";
+      sample.dispatchEvent(new Event("input", { bubbles: true }));
+      sample.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await vi.waitFor(() => expect(printer).toHaveBeenCalled());
+      if (change === "property") setBlockProperty("query", "owner", "Later edit");
+      else bumpGraphEpoch();
+      finish("(todo TODO)");
+      await vi.waitFor(() => expect(root.querySelector(".query-print-refused")?.textContent).toContain("changed while saving"));
+      if (change === "property") expect(blockProperty("query", "owner")).toBe("Later edit");
+      expect(blockProperty("query", "tine.sample")).toBeNull();
+    } finally { finish("(todo TODO)"); dispose(); }
   });
 
   it("collapses a query sheet face while keeping the query controls visible", async () => {
@@ -520,7 +781,7 @@ describe("QueryMacro sheet integration", () => {
     ));
     await settleQuery();
 
-    expect(activeView(root)).toBe("List");
+    expect(await activeView(root)).toBe("List");
     expect(blockProperty("query", "tine.view")).toBeNull();
     expect(root.querySelectorAll(".query-table")).toHaveLength(1);
     expect(root.querySelectorAll(".sheet-table")).toHaveLength(0);

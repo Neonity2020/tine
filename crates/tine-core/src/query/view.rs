@@ -11,6 +11,26 @@ use crate::query::ir::{AggFn, Field, SortDir, ViewKind, ViewSettings};
 /// The property namespace §7.6 persists the view under.
 const VIEW_PROPERTY_PREFIX: &str = "tine.";
 
+/// A `tine.<name>` property EXACTLY as it stands, first normalized occurrence
+/// wins. `Some("")` is a present-but-empty value and is deliberately distinct
+/// from `None`: an empty `tine.columns::`/`tine.group-field::` is an explicit
+/// statement, not a gap.
+fn raw_property<'a>(block_properties: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let wanted = format!("{VIEW_PROPERTY_PREFIX}{name}");
+    block_properties
+        .iter()
+        .find(|(key, _)| crate::doc::property_key_norm(key) == wanted)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The same read, trimmed, with a blank value treated as absent — the reading
+/// the fields that have no "explicit clear" spelling want.
+fn property_value<'a>(block_properties: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    raw_property(block_properties, name)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 /// **Which columns a query block SHOWS — the one resolver** (P5A).
 ///
 /// Visible columns and a typed sheet schema are two different questions that
@@ -82,13 +102,7 @@ fn column_list(value: &str) -> Option<Vec<Field>> {
 /// Nothing here writes: opening, parsing or rebuilding a graph never rewrites a
 /// note to move a legacy list (I-4).
 pub fn resolve_query_columns(block_properties: &[(String, String)]) -> QueryColumns {
-    let raw = |name: &str| -> Option<&str> {
-        let wanted = format!("{VIEW_PROPERTY_PREFIX}{name}");
-        block_properties
-            .iter()
-            .find(|(key, _)| crate::doc::property_key_norm(key) == wanted)
-            .map(|(_, value)| value.as_str())
-    };
+    let raw = |name: &str| raw_property(block_properties, name);
     if let Some(value) = raw("columns") {
         return match column_list(value) {
             Some(columns) if !columns.is_empty() => QueryColumns::Named(columns),
@@ -98,6 +112,170 @@ pub fn resolve_query_columns(block_properties: &[(String, String)]) -> QueryColu
     match raw("fields").and_then(column_list) {
         Some(columns) if !columns.is_empty() => QueryColumns::Named(columns),
         _ => QueryColumns::Unset,
+    }
+}
+
+/// **Which field a query block GROUPS BY — the one resolver** (P5B).
+///
+/// The legacy `tine.group-by::` token is ambiguous by construction: the board
+/// read a bare `state` as the TASK MARKER (`SheetBoard.tsx`'s `isFieldId`
+/// fallback) while the list grouper read it as an ordinary property named
+/// `state`. One bare string cannot mean both, and neither meaning may be taken
+/// away from the notes that already rely on it.
+///
+/// So grouping gets a query-owned key, `tine.group-field::`, whose value is a
+/// canonical **sheet `FieldId`** — the spelling `src/sheet/fields.ts` already
+/// uses: `state`/`priority`/`scheduled`/`deadline`/`tags`/`page` for the
+/// builtins, `prop:<exact property key>` for an ordinary property,
+/// `formula:<name>` for a formula. `prop:state` is therefore the ordinary
+/// property named `state`, bare `state` is the task marker, and
+/// `prop:prop:state` is a literal property named `prop:state`. No new predicate
+/// syntax, and nothing about sort or aggregate field names changes.
+///
+/// This is authored METADATA, not a database or authority migration: reading a
+/// legacy value never rewrites the note (I-4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryGrouping {
+    /// Group by this canonical `FieldId`.
+    Field(Field),
+    /// `tine.group-field::` is PRESENT and says nothing readable — empty, or a
+    /// token outside the canonical grammar. That is an explicit "no grouping":
+    /// it blocks the legacy key and the DSL directive behind it, so a Board
+    /// default cannot silently reinstate itself on the next view switch.
+    Cleared,
+    /// Nothing says anything about grouping. A Board may apply its own default
+    /// here (ADR 0030) — and only here.
+    Unset,
+}
+
+/// The six sheet builtins a canonical grouping `FieldId` can name.
+const GROUP_BUILTINS: [&str; 6] = ["state", "priority", "scheduled", "deadline", "tags", "page"];
+
+/// A token that could survive a property line at all. `;` is legal in a
+/// grouping value (it is a single field, not a list) but a NUL or a line break
+/// is not: it would not read back.
+fn group_token_serializable(token: &str) -> bool {
+    !token.contains(|c| matches!(c, '\0' | '\r' | '\n'))
+}
+
+/// The **new** key's grammar: exactly a builtin, or `prop:`/`formula:` with a
+/// nonempty suffix, after trimming. Anything else — including the empty value —
+/// is an explicit no-grouping statement rather than a value to guess at.
+pub fn canonical_group_field(value: &str) -> Option<Field> {
+    let token = value.trim();
+    if token.is_empty() || !group_token_serializable(token) {
+        return None;
+    }
+    if GROUP_BUILTINS.contains(&token) {
+        return Some(Field::new(token));
+    }
+    if let Some(rest) = token.strip_prefix("prop:") {
+        return (!rest.is_empty()).then(|| Field::new(token));
+    }
+    if let Some(rest) = token.strip_prefix("formula:") {
+        return (!rest.is_empty()).then(|| Field::new(token));
+    }
+    None
+}
+
+/// The **legacy** token's meaning, captured at the view the note is CURRENTLY
+/// persisted with — never at the view the user is switching to. That is the
+/// whole point: an existing list that groups by a property named `state` keeps
+/// grouping by that property through a view change, and an existing board that
+/// groups by the task marker keeps the task marker.
+///
+///  * board/table (a sheet face): the existing sheet spellings stand — a
+///    builtin, `prop:…`, `formula:…`, and `formula.<name>` (the app's alternate
+///    spelling, `SheetBoard.tsx`) are sheet fields. **Every other bare name now
+///    means an ordinary property**, which is the deliberate fix: `status` used
+///    to fall through `isFieldId` and silently become the task marker.
+///  * list/search: `page` is the source page; every other token is an EXACT
+///    property key, `state` and a literal `prop:` prefix included. That
+///    preserves what `queryAggregate.ts::groupRows` has always done.
+///
+/// Total by construction: a nonempty serializable token always names something.
+fn legacy_group_field(value: &str, sheet_face: bool) -> Option<Field> {
+    let token = value.trim();
+    if token.is_empty() || !group_token_serializable(token) {
+        return None;
+    }
+    if !sheet_face {
+        return Some(if token == "page" {
+            Field::new("page")
+        } else {
+            Field::new(format!("prop:{token}"))
+        });
+    }
+    if GROUP_BUILTINS.contains(&token) {
+        return Some(Field::new(token));
+    }
+    if token
+        .strip_prefix("prop:")
+        .is_some_and(|rest| !rest.is_empty())
+        || token
+            .strip_prefix("formula:")
+            .is_some_and(|rest| !rest.is_empty())
+    {
+        return Some(Field::new(token));
+    }
+    if let Some(rest) = token.strip_prefix("formula.") {
+        if !rest.is_empty() {
+            return Some(Field::new(format!("formula:{rest}")));
+        }
+    }
+    Some(Field::new(format!("prop:{token}")))
+}
+
+/// The view a legacy grouping token must be READ under: the block's own
+/// `tine.view::` when it is readable, otherwise whatever the query text asked
+/// for, otherwise the default list.
+fn effective_view_kind(block_properties: &[(String, String)], parsed: &ViewSettings) -> ViewKind {
+    property_value(block_properties, "view")
+        .and_then(parse_view_kind)
+        .or(parsed.view)
+        .unwrap_or(ViewKind::List)
+}
+
+/// SPEC §7.6 + P5B precedence for the grouping field of a query block.
+///
+///  1. `tine.group-field` **present** → its own answer, and nothing behind it
+///     (an unreadable or empty value is an explicit `Cleared`).
+///  2. otherwise a nonempty legacy `tine.group-by`, read at the CURRENT view.
+///  3. otherwise the `(group-by …)` directive the parser lifted, read the same
+///     way.
+///  4. otherwise `Unset`.
+///
+/// Called by `merge_block_property_view` here and by the query-backed publisher
+/// in `publish.rs`; `src/editor/queryViewProperties.ts::resolveQueryGrouping` is
+/// the TypeScript adapter, and the pair is pinned by
+/// `tests/fixtures/query-grouping/resolution.json`. Components never interpret
+/// the property themselves.
+pub fn resolve_query_grouping(
+    block_properties: &[(String, String)],
+    parsed: &ViewSettings,
+) -> QueryGrouping {
+    if let Some(value) = raw_property(block_properties, "group-field") {
+        return match canonical_group_field(value) {
+            Some(field) => QueryGrouping::Field(field),
+            None => QueryGrouping::Cleared,
+        };
+    }
+    let sheet_face = matches!(
+        effective_view_kind(block_properties, parsed),
+        ViewKind::Table | ViewKind::Board
+    );
+    if let Some(field) =
+        raw_property(block_properties, "group-by").and_then(|v| legacy_group_field(v, sheet_face))
+    {
+        return QueryGrouping::Field(field);
+    }
+    match parsed
+        .group_by
+        .as_ref()
+        .and_then(|field| legacy_group_field(field.as_str(), sheet_face))
+    {
+        Some(field) => QueryGrouping::Field(field),
+        None => QueryGrouping::Unset,
     }
 }
 
@@ -113,14 +291,7 @@ pub fn merge_block_property_view(
     parsed: &ViewSettings,
     block_properties: &[(String, String)],
 ) -> ViewSettings {
-    let property = |name: &str| -> Option<&str> {
-        let wanted = format!("{VIEW_PROPERTY_PREFIX}{name}");
-        block_properties
-            .iter()
-            .find(|(key, _)| crate::doc::property_key_norm(key) == wanted)
-            .map(|(_, value)| value.trim())
-            .filter(|value| !value.is_empty())
-    };
+    let property = |name: &str| property_value(block_properties, name);
 
     let mut merged = parsed.clone();
     if let Some(view) = property("view").and_then(parse_view_kind) {
@@ -131,9 +302,16 @@ pub fn merge_block_property_view(
             merged.sort = sort;
         }
     }
-    if let Some(group_by) = property("group-by") {
-        merged.group_by = Some(Field::new(group_by));
-    }
+    // **Grouping goes through the one resolver** (P5B). The wire shape is
+    // unchanged — `group_by` is still `Option<Field>` — but the value is now the
+    // canonical `FieldId` the resolver produced, and an explicit "no grouping"
+    // is spelled as the empty field. `None` therefore means "nothing anywhere
+    // said anything", which is the only state a Board default may fill.
+    merged.group_by = match resolve_query_grouping(block_properties, parsed) {
+        QueryGrouping::Field(field) => Some(field),
+        QueryGrouping::Cleared => Some(Field::new("")),
+        QueryGrouping::Unset => None,
+    };
     match resolve_query_columns(block_properties) {
         QueryColumns::Named(columns) => merged.columns = columns,
         // An explicit "no columns" clears whatever the text asked for; `Unset`
@@ -373,7 +551,10 @@ mod tests {
             ]),
         );
         assert_eq!(merged.view, Some(ViewKind::Board));
-        assert_eq!(merged.group_by, Some(Field::new("status")));
+        // P5B: the merge now returns the CANONICAL grouping FieldId. On a board
+        // face a bare `status` is an ordinary property — it used to fall through
+        // `isFieldId` in the renderer and silently become the task marker.
+        assert_eq!(merged.group_by, Some(Field::new("prop:status")));
         assert_eq!(
             merged.columns,
             vec![Field::new("page"), Field::new("status"), Field::new("cost")]
@@ -469,6 +650,53 @@ mod tests {
                 Field::new("Cost")
             ]),
         );
+    }
+
+    #[test]
+    fn the_merge_returns_the_canonical_grouping_field_id() {
+        // Both meanings of the same bare legacy token, at the two view families.
+        let board = merge_block_property_view(
+            &ViewSettings::default(),
+            &properties(&[("tine.view", "board"), ("tine.group-by", "state")]),
+        );
+        assert_eq!(board.group_by, Some(Field::new("state")), "task marker");
+        let list = merge_block_property_view(
+            &ViewSettings::default(),
+            &properties(&[("tine.group-by", "state")]),
+        );
+        assert_eq!(
+            list.group_by,
+            Some(Field::new("prop:state")),
+            "the list grouper has always read this as an ordinary property"
+        );
+    }
+
+    #[test]
+    fn the_new_group_key_wins_and_an_empty_one_is_an_explicit_clear() {
+        let explicit = merge_block_property_view(
+            &ViewSettings::default(),
+            &properties(&[
+                ("tine.view", "board"),
+                ("tine.group-field", "prop:state"),
+                ("tine.group-by", "state"),
+            ]),
+        );
+        assert_eq!(explicit.group_by, Some(Field::new("prop:state")));
+        // The empty field is the wire spelling of "explicitly no grouping". It
+        // is NOT `None`: `None` is the only state a Board default may fill.
+        let cleared = merge_block_property_view(
+            &ViewSettings {
+                group_by: Some(Field::new("status")),
+                ..ViewSettings::default()
+            },
+            &properties(&[("tine.group-field", ""), ("tine.group-by", "state")]),
+        );
+        assert_eq!(cleared.group_by, Some(Field::new("")));
+        let unset = merge_block_property_view(
+            &ViewSettings::default(),
+            &properties(&[("tine.view", "board")]),
+        );
+        assert_eq!(unset.group_by, None);
     }
 
     #[test]

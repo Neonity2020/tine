@@ -118,3 +118,51 @@ fn the_corpus_covers_every_frozen_branch() {
         );
     }
 }
+
+/// **Nothing behind an absent `tine.columns` can resurrect a cleared list.**
+///
+/// The one writer removes the key rather than emptying it, so a cleared
+/// selection resolves as `Unset` rather than `Cleared` — and those two differ in
+/// exactly one thing: `Unset` leaves `ViewSettings::columns` as the query TEXT
+/// left it. That is only a difference if the text can carry columns.
+///
+/// It cannot. No dialect parses a column set and no printer emits one
+/// (`query::print::og_view`), so every reading arrives with an empty list and
+/// the two states draw the same table. This pins the fact rather than the
+/// comment: if a future dialect ever lifts columns out of the text, the
+/// writer's removal becomes a resurrection and this test says so first.
+#[test]
+fn no_dialect_lifts_a_column_set_out_of_the_query_text() {
+    let registry = tine_core::query::registry::Registry::none();
+    let today = tine_core::date::JournalDate::today();
+    let cases: [(tine_core::query::QueryInput, &str); 5] = [
+        (
+            tine_core::query::QueryInput::Og,
+            "(and (todo TODO) (sort-by cost desc) (sample 5) (group-by status) (aggregate sum cost))",
+        ),
+        (
+            tine_core::query::QueryInput::Advanced,
+            "[:find (pull ?b [*]) :where [?b :block/marker \"TODO\"]]",
+        ),
+        (
+            tine_core::query::QueryInput::Tql,
+            "from blocks where todo = TODO order by cost desc limit 5",
+        ),
+        (
+            tine_core::query::QueryInput::MacroTql,
+            "from blocks where todo = TODO",
+        ),
+        (
+            tine_core::query::QueryInput::MacroQuery,
+            "(and (todo TODO) (sort-by cost desc) (group-by status)) {:title \"T\"}",
+        ),
+    ];
+    for (input, text) in cases {
+        let (_, view) = tine_core::query::parse_query_input(text, input, today, &registry);
+        assert!(
+            view.columns.is_empty(),
+            "{input:?} lifted columns out of {text:?}: {:?}",
+            view.columns
+        );
+    }
+}

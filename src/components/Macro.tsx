@@ -11,10 +11,17 @@ import { LiveRefGroup } from "./LiveRefGroup";
 import { CrossingNotice } from "./CrossingNotice";
 import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
 import { SearchResultRow } from "./SearchResultRow";
-import { foldAggregate, groupRows, type AggDirective } from "../editor/queryAggregate";
+import { querySummary, type QueryAggregateEntry, type QuerySummary } from "../editor/queryAggregate";
 import { quoteEdnString, unquoteEdnString } from "../editor/edn";
 import { queryMacroExtents, QUERY_MACRO_NAMES } from "../editor/queryMacro";
-import { queryViewPropertyPatch } from "../editor/queryViewProperties";
+import {
+  groupingFromViewValue,
+  queryDisplayPropertyWrites,
+  queryViewPropertyPatch,
+  serializeQuerySort,
+  viewAfterViewSwitch,
+  type QueryDisplayControl,
+} from "../editor/queryViewProperties";
 import {
   macroPrintDialect,
   macroTextDialect,
@@ -33,6 +40,20 @@ import {
 import { visibleBody } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { sheetConfig } from "../sheet/config";
+import {
+  boardGroupByOptions,
+  fieldIdsForRecords,
+  fieldLabel,
+  groupKeysForBlock,
+  isFieldId,
+  type FieldId,
+  type QueryGroupingControl,
+} from "../sheet/fields";
+import {
+  readFormulaRowField,
+  type FormulaEvalRow,
+} from "../sheet/formulaEval";
+import { formulasOf } from "../sheet/formulaFields";
 import { InlineText } from "../render/inline";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
@@ -273,13 +294,27 @@ export function QueryMacro(props: {
     name: macroName(),
     properties: blockDirectives(),
   }));
-  const [parsed] = createResource(parseRequest, (request) =>
-    backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
-  );
+  const [parsedSnapshot] = createResource(parseRequest, async (request) => ({
+    request,
+    reading: await backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+  }));
+  // Keep each reading paired with the exact inputs it describes. A displayed
+  // reading can intentionally lag a local edit while its replacement loads.
+  const parsed = { get latest() { return parsedSnapshot.latest?.reading; } };
   // `latest` rather than `parsed()`: a re-parse after an edit keeps the previous
   // reading visible instead of blanking the query for a frame.
   const source = (): Source | undefined => parsed.latest?.query.source;
   const view = (): ViewSettings => parsed.latest?.view ?? {};
+  const [displayCommit, setDisplayCommit] = createSignal<{ raw: string; epoch: number; view: ViewSettings }>();
+  const displayView = (): ViewSettings => {
+    const committed = displayCommit();
+    return committed && committed.epoch === graphEpoch() && committed.raw === doc.byId[props.blockId ?? ""]?.raw
+      ? committed.view : view();
+  };
+  const rememberDisplay = (settings: ViewSettings) => {
+    const raw = doc.byId[props.blockId ?? ""]?.raw;
+    if (raw !== undefined) setDisplayCommit({ raw, epoch: graphEpoch(), view: settings });
+  };
   const form = (): string => {
     const s = source();
     return (s ? sourceOriginal(s) : null) ?? "";
@@ -350,23 +385,12 @@ export function QueryMacro(props: {
   };
   const sheetFace = () => currentView() === "table" || currentView() === "board";
   const legacyTable = () => currentView() === "list" && tableViewOption();
+  /** The header's view switcher, for the hosts the inline Display panel is not
+   *  offered to. It goes through the SAME writer the panel does — the view is
+   *  one fact, and two surfaces writing it two ways is how they came apart. */
   const setQueryView = (next: QueryView) => {
-    const blockId = props.blockId;
-    if (!blockId) return;
-    const node = doc.byId[blockId];
-    if (!node) return;
-    const storedView = blockProperty(blockId, "tine.view");
-    if ((next === "list" && storedView === null) || (next !== "list" && storedView === next)) return;
-    withUndoUnit(`query:view:${next}`, [node.page], () => {
-      if (next === "list") {
-        setBlockProperty(blockId, "tine.view", null);
-        return;
-      }
-      setBlockProperty(blockId, "tine.view", next);
-      if (next === "board" && blockProperty(blockId, "tine.group-by") === null) {
-        setBlockProperty(blockId, "tine.group-by", "state");
-      }
-    });
+    if (!props.blockId) return;
+    void applyDisplay(viewAfterViewSwitch(displayView(), next === "list" ? undefined : next));
   };
 
   // Rewrite just THIS {{query ...}} macro inside the owning block, preserving the
@@ -417,6 +441,33 @@ export function QueryMacro(props: {
   // would re-parse without its sort, sample, grouping or aggregate.
   const applyEdit = async (next: BuilderSession) => {
     if (!props.blockId) return;
+    const rawAtStart = doc.byId[props.blockId]?.raw;
+    const epochAtStart = graphEpoch();
+    const request = parseRequest();
+    const baseline = parsedSnapshot.latest;
+    if (baseline && (baseline.request.argument !== request.argument || baseline.request.name !== request.name)) {
+      setPrintError("The query text changed. Wait for it to refresh, then try this edit again.");
+      return;
+    }
+    if (baseline && JSON.stringify(baseline.request.properties) !== JSON.stringify(request.properties)) {
+      // Rebase only because the reading predates a property edit. The ordinary
+      // save still materializes its full effective view, including text-only
+      // directives that a reprint would otherwise discard.
+      try {
+        const fresh = await backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties);
+        const rebased = { ...fresh.view };
+        for (const key of ["view", "sort", "group_by", "columns", "aggregates", "sample"] as const) {
+          const empty = key === "sort" || key === "columns" || key === "aggregates" ? [] : null;
+          if (JSON.stringify(baseline.reading.view[key] ?? empty) !== JSON.stringify(next.view[key] ?? empty)) {
+            Object.assign(rebased, { [key]: next.view[key] });
+          }
+        }
+        next = { ...next, view: rebased };
+      } catch (error) {
+        setPrintError(errorText(error));
+        return;
+      }
+    }
     const current = macroName();
     let expressible = false;
     try {
@@ -447,6 +498,10 @@ export function QueryMacro(props: {
         setPrintError(errorText(error));
         return;
       }
+    }
+    if (graphEpoch() !== epochAtStart || doc.byId[props.blockId]?.raw !== rawAtStart) {
+      setPrintError("The block changed while saving. Try this edit again.");
+      return;
     }
     setPrintError(null);
     // **What the notice can show comes from the ENGINE, or from nothing.**
@@ -482,6 +537,7 @@ export function QueryMacro(props: {
     // The notice is the user half of the crossing (§7.5): the bytes changed
     // under the user without asking, so say so and offer the way back.
     if (crossing && node) setCrossed(props.blockId, changed);
+    rememberDisplay(next.view);
   };
   /** **The view lives in the block's `tine.*` properties (§7.6), for BOTH macro
    *  names (§4.3 "Directive migration", Q15).**
@@ -516,15 +572,80 @@ export function QueryMacro(props: {
    *  unit as the save that replaces it. The mapping itself is pure and shared
    *  with the query table (`editor/queryViewProperties.ts`); the side effect
    *  stays here, on the store's one property writer (D-7). */
+  const blockPropertyPairs = () => {
+    const blockId = props.blockId;
+    const node = blockId ? doc.byId[blockId] : undefined;
+    return blockId && node ? facetsOf(node.raw, formatForBlock(blockId)).properties : null;
+  };
+  /** The write set of a DISPLAY edit: only the facts it changed.
+   *
+   *  A save reprints the query text and has to materialize whatever that
+   *  reprint would drop, so it uses the full patch. A display edit reprints
+   *  nothing — and `before` is the ENGINE's last reading, which a second edit
+   *  made inside one parse round-trip still carries, so restating the untouched
+   *  facts from it would undo the first edit. */
+  const displayPropertyWrites = (before: ViewSettings, view: ViewSettings) => {
+    const properties = blockPropertyPairs();
+    return properties ? queryDisplayPropertyWrites({ before, view, properties }) : [];
+  };
+  /** The property half of a SAVE, which reprints — so it keeps the WIDE
+   *  baseline: only the block's own properties can say which facts live solely
+   *  in the query text and are about to be dropped (P5A). */
   const writeViewProperties = (view: ViewSettings) => {
     const blockId = props.blockId;
-    if (!blockId) return;
-    const node = doc.byId[blockId];
-    if (!node) return;
-    const properties = facetsOf(node.raw, formatForBlock(blockId)).properties;
+    const properties = blockPropertyPairs();
+    if (!blockId || !properties) return;
     for (const [key, value] of queryViewPropertyPatch({ view, properties })) {
       setBlockProperty(blockId, key, value);
     }
+  };
+  /** **Apply a DISPLAY change** — view, grouping, columns, aggregates, sort or
+   *  sample — through the ONE audited write path (D-7).
+   *
+   *  Grouping, columns and aggregates have no home in the query TEXT at all:
+   *  `og_view` re-emits only `(sort-by …)` and `(sample …)`. So stating them is
+   *  a property write and nothing else — no printer round-trip, no macro
+   *  rewrite, and no way for a refused print to swallow a display change the
+   *  user just made.
+   *
+   *  Sort and sample DO print. `tine.*` outranks the text either way, so the
+   *  property write alone would already render correctly — but leaving the text
+   *  spelling a sort the block no longer uses is a second, contradictory home
+   *  for one fact, and it is the spelling an outside editor sees. Those two go
+   *  through the ordinary save, which reprints the macro in the same undo unit.
+   *
+   *  Either way the write set is the shared patch's, so nothing the block
+   *  already spells is rewritten and no key outside the six is touched. The
+   *  property-only path narrows it further, to the facts this edit CHANGED
+   *  (`queryDisplayPropertyWrites`): `before` is the engine's last reading and
+   *  the engine re-reads asynchronously, so a second edit made inside one parse
+   *  round-trip still carries the reading that predates the first — and
+   *  restating that reading's untouched facts would undo it (I-20). A save has
+   *  to keep the wide baseline, because its reprint drops text-only facts. */
+  const applyDisplay = async (next: ViewSettings) => {
+    const blockId = props.blockId;
+    if (!blockId) return;
+    const before = displayView();
+    const reprints =
+      serializeQuerySort(before.sort) !== serializeQuerySort(next.sort) ||
+      (before.sample ?? null) !== (next.sample ?? null);
+    const reading = parsed.latest;
+    if (reprints && reading) {
+      await applyEdit({ query: reading.query, view: next });
+      return;
+    }
+    const node = doc.byId[blockId];
+    if (!node) return;
+    const writes = displayPropertyWrites(before, next);
+    // Nothing to say is not an undo entry: re-picking the view a block already
+    // has must not leave a step the user has to take back.
+    if (writes.length === 0) return;
+    // ONE undo unit for the whole display change, so a grouping switch that also
+    // retires a legacy key is taken back as one step.
+    withUndoUnit(`query:display:${blockId}`, [node.page], () => {
+      for (const [key, value] of writes) setBlockProperty(blockId, key, value);
+    });
+    rememberDisplay(next);
   };
   // Edit the query's display title (:title "…" in the options map). Only offered
   // for a user-authored standalone query (blockId set, no app-supplied title).
@@ -835,12 +956,18 @@ export function QueryMacro(props: {
   // only when the run actually came back empty, so an ordinary query costs one
   // command as before.
   const [explainOpen, setExplainOpen] = createSignal(false);
-  const [explained] = createResource(
+  const explanationRequest = createMemo(
     () => {
       const reading = runnable();
-      if (!explainOpen() || !reading || total() > 0) return undefined;
-      return { reading, key: queryRequestKey() ?? "" };
+      const key = queryRequestKey();
+      if (!explainOpen() || !reading || !key || total() > 0) return undefined;
+      return { reading, key };
     },
+    undefined,
+    { equals: (before, after) => before?.key === after?.key },
+  );
+  const [explained] = createResource(
+    explanationRequest,
     ({ reading }) => {
       const page = executionPage();
       return backend().queryExplainEmpty(
@@ -910,44 +1037,96 @@ export function QueryMacro(props: {
   // them, so the math is computed HERE from the returned rows. Only the simple
   // DSL carries them (datalog aggregation is OG's :result-transform, which we
   // list as ignored).
-  const directives = createMemo<{ agg: AggDirective | null; group: string | null }>(() => {
-    if (isAdvanced()) return { agg: null, group: null };
-    const settings = view();
-    const [field, fn] = settings.aggregates?.[0] ?? [];
-    return {
-      agg: fn ? { agg: fn, field: field ?? null } : null,
-      group: settings.group_by ?? null,
-    };
+  // The block's own formula definitions — the same map `SheetBoard` builds for a
+  // query face (which is handed no schema page), so a `formula:` grouping reads
+  // identically in the summary and in the board beside it.
+  const queryFormulas = createMemo<ReadonlyMap<string, string>>(() => {
+    const blockId = props.blockId;
+    const owner = blockId ? doc.byId[blockId] : undefined;
+    return owner ? formulasOf(facetsOf(owner.raw, formatForBlock(blockId!)).properties) : new Map();
   });
-  const aggLabel = () => {
-    const a = directives().agg;
-    if (!a || a.agg === "count") return "Count";
-    return `${a.agg === "sum" ? "Sum" : "Avg"} of ${a.field}`;
-  };
-  type Summary =
-    | { kind: "single"; text: string; skipped: number }
-    | { kind: "grouped"; field: string; groups: { key: string; text: string; skipped: number }[] };
-  const summary = createMemo<Summary | null>(() => {
-    const d = directives();
-    if (!d.agg && !d.group) return null;
-    if (!d.group) return { kind: "single", ...foldAggregate(rows(), d.agg) };
-    return {
-      kind: "grouped",
-      field: d.group,
-      groups: Array.from(groupRows(rows(), d.group).entries()).map(([key, set]) => ({
-        key,
-        ...foldAggregate(set, d.agg),
-      })),
-    };
+  // The SAME records `SheetTable` and `SheetBoard` flatten out of this result, so
+  // the list summary and the board group ONE row set through ONE reader instead
+  // of a second property lookup that can disagree with the face beside it.
+  const queryRecords = createMemo<FormulaEvalRow[]>(() =>
+    (groups() ?? []).flatMap((g) =>
+      g.blocks.map((b): FormulaEvalRow => ({ id: b.id, page: g.page, kind: g.kind, dto: b }))
+    )
+  );
+  // **The grouping is the ENGINE's answer, not a second reading.** §4.1's merge
+  // already ran `query::view::resolve_query_grouping` over this block's `tine.*`
+  // properties and its query text, so `view().group_by` is the canonical field
+  // id — and the P5B wire spelling distinguishes the two empties that matter:
+  // absent is "nothing said" (a Board may default), `""` is the user's explicit
+  // "no grouping" (a Board may NOT).
+  const grouping = createMemo(() => groupingFromViewValue(view().group_by));
+  /** The field this result groups by, or `null` when it is ungrouped — which an
+   *  explicit clear and an absent setting both are, for a LIST. */
+  const groupingField = createMemo<FieldId | null>(() => {
+    const resolved = grouping();
+    return resolved.kind === "field" && isFieldId(resolved.field) ? resolved.field : null;
   });
-  const summarySingle = () => {
-    const s = summary();
-    return s && s.kind === "single" ? s : null;
-  };
-  const summaryGrouped = () => {
-    const s = summary();
-    return s && s.kind === "grouped" ? s : null;
-  };
+  // Aggregate keys name literal properties. Unlike grouping, this grammar has
+  // no FieldId prefix: a property named "prop:cost" must keep those exact bytes.
+  const aggregateValue = (row: FormulaEvalRow, name: string): string =>
+    name ? readFormulaRowField(row, `prop:${name}`)?.text ?? "" : "";
+  const aggregateEntries = createMemo<QueryAggregateEntry[]>(() => {
+    if (isAdvanced()) return [];
+    return (view().aggregates ?? []).map(([field, fn]): QueryAggregateEntry => [field ?? "", fn]);
+  });
+  /** The grouping vocabulary a QUERY board offers: the sheet builtins, the
+   *  properties its OWN result rows carry (a children board reads the owner's
+   *  children, which a query has none of), the source page, and the block's
+   *  formula fields. */
+  const queryFormulaNames = createMemo<string[]>(() => [...queryFormulas().keys()]);
+  const queryGroupOptions = createMemo<FieldId[]>(() => {
+    const formulaFields = [...queryFormulas().keys()].map((name): FieldId => `formula:${name}`);
+    return boardGroupByOptions(fieldIdsForRecords(queryRecords(), false), [
+      "page",
+      ...formulaFields,
+    ]);
+  });
+  /** The ONE writer every inline display change goes through: the Display panel,
+   *  the query table's header sorts, its column order and its aggregate footer,
+   *  and the board's grouping. */
+  const queryDisplayControl = createMemo<QueryDisplayControl>(() => ({
+    view: displayView(),
+    apply: (next) => void applyDisplay(next),
+  }));
+  /** The ONE writer a query board's grouping goes through, handed to both its
+   *  toolbar dropdown and its context menu.
+   *
+   *  `cleared` carries the half of the resolution a bare field cannot: an
+   *  explicit "no grouping" is one ungrouped column, while a grouping nothing
+   *  states is the silence the Board's task-marker default fills (ADR 0030).
+   *  Both arrive here as `field: null`, and a board that could not tell them
+   *  apart would un-group every existing `tine.view:: board` note. */
+  const queryGroupingControl = createMemo<QueryGroupingControl>(() => ({
+    field: groupingField(),
+    cleared: grouping().kind === "cleared",
+    options: queryGroupOptions(),
+    set: (field) => void applyDisplay({ ...displayView(), group_by: field ?? "" }),
+  }));
+  const summary = createMemo<QuerySummary | null>(() => {
+    if (isAdvanced()) return null;
+    const field = groupingField();
+    const entries = aggregateEntries();
+    // A grouping with no aggregate has always shown the per-group COUNT; that
+    // stays a caller's default rather than a rule hidden inside the summary.
+    const requested: QueryAggregateEntry[] =
+      entries.length || !field ? entries : [["", "count"]];
+    const formulas = queryFormulas();
+    const now = new Date();
+    return querySummary<FormulaEvalRow>({
+      rows: queryRecords(),
+      aggregates: requested,
+      groupKeys: field ? (row) => groupKeysForBlock(row, field, { formulas, now }) : null,
+      groupLabel: field ? fieldLabel(field) : null,
+      // Tags place one row in every tag's group, as the Board already does.
+      multiMembership: field === "tags",
+      value: aggregateValue,
+    });
+  });
 
   const sorted = createMemo(() => {
     const c = sortCol();
@@ -978,6 +1157,17 @@ export function QueryMacro(props: {
    *  result count lives beside the sentence when it is, and in the header when
    *  it is not (§7.2). */
   const showBuilder = () => !!props.blockId && !isAdvanced() && !!builderSession();
+  /** **Where the inline Display panel is offered** (P5B).
+   *
+   *  It needs a block to write `tine.*` to and a builder to host it — and it is
+   *  NOT offered for a friendly search, whose execution returns search hits
+   *  rather than the block result the six display facts describe. Offering a
+   *  column order and a grouping for a hit list would be six controls that
+   *  save and change nothing on screen.
+   *
+   *  The same condition removes the header's view switcher: the panel states
+   *  the view, and two controls for one enum is how they drift apart. */
+  const inlineDisplay = () => showBuilder() && friendlySearch() === null;
   const unsupportedAdvanced = () => isAdvanced() && advInfo() && (
     !advInfo()!.supported || (props.strictAdvanced === true && advInfo()!.ignored.length > 0)
   );
@@ -1074,7 +1264,7 @@ export function QueryMacro(props: {
               <Show when={!showBuilder()}>
                 <span class="query-count">{total()}</span>
               </Show>
-              <Show when={props.blockId}>
+              <Show when={props.blockId && !inlineDisplay()}>
                 <div class="query-view-switcher" role="group" aria-label="Query view" onClick={stop}>
                   <For each={QUERY_VIEWS}>
                     {(view) => (
@@ -1107,6 +1297,9 @@ export function QueryMacro(props: {
                 onStale={setPaneStale}
                 onOpenChange={setSheetOpen}
                 notice={showCrossingNotice() && sheetOpen() ? crossingNotice : undefined}
+                inlineDisplay={inlineDisplay()}
+                display={queryDisplayControl}
+                displayFormulas={queryFormulaNames}
               />
             </Show>
             {/* §7.5, N3: **one** notice with one state, in one of two places.
@@ -1234,44 +1427,75 @@ export function QueryMacro(props: {
                       </div>
                     </Show>
                     <Show when={currentView() !== "search"}>
-                    {/* Summary panel (1a): count/sum/avg overall, or a per-group breakdown.
-                        Rendered above the full result list, which stays grouped by page. */}
-                    <Show when={summarySingle()}>
+                    {/* Summary panel (1a): the view's aggregates overall, or a
+                        per-group breakdown. ALL requested aggregates render, in
+                        the order the view lists them — a view carries a LIST, and
+                        showing only its first entry dropped every other column
+                        its author asked for. Rendered above the full result list,
+                        which stays grouped by page. */}
+                    <Show when={summary()}>
                       {(s) => (
-                        <div class="query-summary" onClick={stop}>
-                          <span class="qs-label">{aggLabel()}:</span>{" "}
-                          <span class="qs-value">{s().text}</span>
-                          <Show when={s().skipped > 0}>
-                            <span class="qs-skip"> ({s().skipped} non-numeric skipped)</span>
-                          </Show>
-                        </div>
-                      )}
-                    </Show>
-                    <Show when={summaryGrouped()}>
-                      {(s) => (
-                        <table class="md-table query-summary-table" onClick={stop}>
-                          <thead>
-                            <tr>
-                              <th>{s().field}</th>
-                              <th>{aggLabel()}</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <For each={s().groups}>
-                              {(row) => (
-                                <tr>
-                                  <td>{row.key}</td>
-                                  <td>
-                                    {row.text}
-                                    <Show when={row.skipped > 0}>
-                                      <span class="qs-skip"> ({row.skipped} skipped)</span>
+                        <Show
+                          when={s().groups}
+                          fallback={
+                            <div class="query-summary" onClick={stop}>
+                              <For each={s().columns}>
+                                {(col, i) => (
+                                  <span class="qs-entry">
+                                    <span class="qs-label">{col.label}:</span>{" "}
+                                    <span class="qs-value">{s().overall[i()]?.text ?? ""}</span>
+                                    <Show when={(s().overall[i()]?.skipped ?? 0) > 0}>
+                                      <span class="qs-skip">
+                                        {" "}
+                                        ({s().overall[i()]!.skipped} non-numeric skipped)
+                                      </span>
                                     </Show>
-                                  </td>
-                                </tr>
-                              )}
-                            </For>
-                          </tbody>
-                        </table>
+                                  </span>
+                                )}
+                              </For>
+                            </div>
+                          }
+                        >
+                          {(rows) => (
+                            <>
+                              <table class="md-table query-summary-table" onClick={stop}>
+                                <thead>
+                                  <tr>
+                                    <th>{s().groupLabel}</th>
+                                    <For each={s().columns}>{(col) => <th>{col.label}</th>}</For>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  <For each={rows()}>
+                                    {(row) => (
+                                      <tr>
+                                        <td>{row.label}</td>
+                                        <For each={row.cells}>
+                                          {(cell) => (
+                                            <td>
+                                              {cell.text}
+                                              <Show when={cell.skipped > 0}>
+                                                <span class="qs-skip"> ({cell.skipped} skipped)</span>
+                                              </Show>
+                                            </td>
+                                          )}
+                                        </For>
+                                      </tr>
+                                    )}
+                                  </For>
+                                </tbody>
+                              </table>
+                              {/* Say the grouping is not a partition rather than
+                                  let the counts look like they should add up. */}
+                              <Show when={s().multiMembership}>
+                                <p class="query-summary-note" onClick={stop}>
+                                  A row with several tags appears in every matching group, so these
+                                  counts can add up to more than the result.
+                                </p>
+                              </Show>
+                            </>
+                          )}
+                        </Show>
                       )}
                     </Show>
                     {/* `@page`-anchored results are pages, not blocks (K16): they
@@ -1441,10 +1665,20 @@ export function QueryMacro(props: {
                     <SheetContainer>
                       <Switch>
                         <Match when={sheet()?.view === "table"}>
-                          <SheetTable ownerId={props.blockId!} rowSource="query" groups={groups() ?? []} />
+                          <SheetTable
+                            ownerId={props.blockId!}
+                            rowSource="query"
+                            groups={groups() ?? []}
+                            queryDisplay={queryDisplayControl()}
+                          />
                         </Match>
                         <Match when={sheet()?.view === "board"}>
-                          <SheetBoard ownerId={props.blockId!} rowSource="query" groupBy={sheet()?.groupBy} groups={groups() ?? []} />
+                          <SheetBoard
+                            ownerId={props.blockId!}
+                            rowSource="query"
+                            groups={groups() ?? []}
+                            queryGrouping={queryGroupingControl()}
+                          />
                         </Match>
                       </Switch>
                     </SheetContainer>
