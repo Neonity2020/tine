@@ -9,6 +9,10 @@ const MAX_RESOLVED_KEYS = 128;
 let currentScope = "";
 let scopeGeneration = 0;
 
+export function sharedQueryScope(root: string | undefined, epoch: number, binding: number): string {
+  return `${root ?? ""}\0${epoch}\0${binding}`;
+}
+
 function enterScope(scope: string): number {
   if (scope !== currentScope) {
     currentScope = scope;

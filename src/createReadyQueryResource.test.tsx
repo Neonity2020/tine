@@ -3,8 +3,45 @@ import { render } from "solid-js/web";
 import { afterEach, expect, it, vi } from "vitest";
 import { QueryNotReadyError } from "./backend";
 import { createReadyQueryResource } from "./createReadyQueryResource";
+import { setGraphMeta } from "./ui";
+import { notifyGraphRebound } from "./modeHooks";
+import { graphBinding } from "./persistence";
+import { resetSharedQueryResultsForTests, sharedQueryResult, sharedQueryScope } from "./queryResultCache";
 
-afterEach(() => { document.body.innerHTML = ""; vi.restoreAllMocks(); });
+afterEach(() => { resetSharedQueryResultsForTests(); setGraphMeta(null); document.body.innerHTML = ""; vi.restoreAllMocks(); });
+
+it("clears the old graph's rows while the new graph is pending", async () => {
+  setGraphMeta({ root: "first" } as never);
+  const load = vi.fn<() => Promise<string[]>>().mockResolvedValueOnce(["old graph"])
+    .mockRejectedValue(new QueryNotReadyError("indexing"));
+  const root = document.createElement("div");
+  const dispose = render(() => {
+    const [rows] = createReadyQueryResource(() => "same query", load);
+    return <span>{rows()?.join(",")}</span>;
+  }, root);
+  try {
+    await vi.waitFor(() => expect(root.textContent).toBe("old graph"));
+    setGraphMeta({ root: "second" } as never);
+    await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+    expect(root.textContent).not.toContain("old graph");
+  } finally { dispose(); }
+});
+
+it("restarts on a same-root binding replacement", async () => {
+  const load = vi.fn<() => Promise<string[]>>().mockResolvedValueOnce(["old binding"])
+    .mockResolvedValue(["new binding"]);
+  const root = document.createElement("div");
+  const dispose = render(() => {
+    const [rows] = createReadyQueryResource(() => "same query", key =>
+      sharedQueryResult(sharedQueryScope("root", 0, graphBinding()), key, load));
+    return <span>{rows()?.join(",")}</span>;
+  }, root);
+  try {
+    await vi.waitFor(() => expect(root.textContent).toBe("old binding"));
+    notifyGraphRebound();
+    await vi.waitFor(() => expect(root.textContent).toBe("new binding"));
+  } finally { dispose(); }
+});
 
 it("retries indexing automatically while retaining existing row DOM", async () => {
   const [key, setKey] = createSignal(1);

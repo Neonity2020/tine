@@ -41,6 +41,24 @@ function materializeDeps(overrides: Partial<MaterializeQueryDependencies> = {}):
 }
 
 describe("materializeQueryWorkspace", () => {
+  it("waits for query readiness before validating and saving", async () => {
+    const deps = materializeDeps();
+    vi.mocked(deps.runGraphSearch).mockRejectedValueOnce(new QueryNotReadyError("indexing"));
+    const result = await materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.runGraphSearch).toHaveBeenCalledTimes(2);
+    expect(deps.savePage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry or save a changed input while validation is pending", async () => {
+    let current = true;
+    const deps = materializeDeps({ runGraphSearch: vi.fn(async () => { current = false; throw new QueryNotReadyError("indexing"); }) });
+    const result = await materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps, () => current);
+    expect(result).toMatchObject({ ok: false, kind: "superseded" });
+    expect(deps.runGraphSearch).toHaveBeenCalledTimes(1);
+    expect(deps.savePage).not.toHaveBeenCalled();
+  });
+
   it.each(["diagnostic", "existing", "lookup-error"])("discards a stale %s response", async (stage) => {
     let current = true;
     const deps = materializeDeps({

@@ -53,7 +53,7 @@ rebuilt. Proof:
 **Item 3 — QueryBuilder registry.** Producer: the registry `createResource` in
 `src/components/QueryBuilder.tsx`, routed through `sharedQueryResult` under the
 `query-registry` key namespace. Trigger/key: the canonical graph scope
-`` `${graphMeta()?.root ?? ""}\0${graphEpoch()}` `` plus `dataRev()` and the
+`sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding())` plus `dataRev()` and the
 module-level declaration revision that `requestQueryRegistryRefresh()` bumps
 when a builder declares a property the snapshot cannot know about yet. Bound:
 `1` `query_registry` request per (graph scope, `dataRev`, declaration revision)

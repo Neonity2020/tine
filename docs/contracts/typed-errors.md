@@ -26,11 +26,23 @@ Existing successful rows remain mounted while availability is pending. Initial
 indexing is not presented as an empty result, and permanent errors are surfaced
 without throwing through the result renderer. Disabling/unmounting a resource
 aborts its retry owner. Component evidence lives in the corresponding Macro,
-Workspace, Page and resource tests.
+Workspace, Page and resource tests. A graph switch or binding replacement clears
+old rows instead of carrying them into another graph's pending state. The binding
+counter is observed through its rebind notification; display epochs only trigger
+a binding check. All shared result/registry cache scopes include that binding,
+so a same-root rebind cannot reuse a previous binding's cached answer.
+
+Workspace materialization also retries readiness during validation, with the
+captured save-input guard and a controller aborted by edits, graph rebinding or
+teardown. No write is retried, and a write already begun keeps its existing
+audited completion semantics. Export query expansion retries as one bounded
+batch; typed permanent availability errors reach the modal and prevent copying
+an incomplete rendered expansion. Literal fallback for other unsupported macro
+resolution is unchanged. Export ownership stops on teardown or graph rebinding.
 
 Campaign integration is still in progress: native availability producers,
-per-consumer native job cancellation, materialization/export selection and
-production traversal retirement remain required before RET2 acceptance.
+per-consumer native job cancellation and production traversal retirement remain
+required before RET2 acceptance.
 
 ## Command error boundary
 

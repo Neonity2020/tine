@@ -1,7 +1,10 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta, type ExportRequest } from "../ui";
+import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta, graphTransitioning, type ExportRequest } from "../ui";
 import { doc, exportNodesFor, formatForPage } from "../store";
-import { backend } from "../backend";
+import { backend, OperationCancelledError, QueryUnavailableError } from "../backend";
+import { graphBinding } from "../persistence";
+import { onGraphRebound } from "../modeHooks";
+import { runQueryWhenReady, type QueryReadinessOwner } from "../queryReadiness";
 import { writeClipboardText } from "../clipboard";
 import { resolveBlockBatched, resolvedBlockRefSync } from "../resolveBatch";
 import { expandTemplate } from "../render/inline";
@@ -318,6 +321,7 @@ async function warmQueryMacros(
   macros: { name: string; args: string[]; raw?: string }[],
   warmed: Map<string, WarmedMacro>,
   currentPage: string | undefined,
+  owner: QueryReadinessOwner,
 ): Promise<void> {
   if (!macros.length) return;
   // §7.1, I-12: Export no longer splits the options map and no longer decides
@@ -350,8 +354,9 @@ async function warmQueryMacros(
       current_page: currentPage,
     }];
   });
+  if (!specs.length) return;
   try {
-    const batch = await backend().exportQuerySubtrees(specs);
+    const batch = await runQueryWhenReady(() => backend().exportQuerySubtrees(specs), owner);
     const byKey = new Map(batch.results.map((result) => [result.key, result]));
     for (const spec of specs) {
       const result = byKey.get(spec.key);
@@ -376,7 +381,8 @@ async function warmQueryMacros(
             : undefined,
       });
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof OperationCancelledError || error instanceof QueryUnavailableError) throw error;
     // Leave the literal macro visible when native resolution rejects the bounded
     // request; never fall back to whole-page hydration in the WebView.
   }
@@ -386,11 +392,19 @@ export async function warmExportResolutions(
   nodes: ExportNode[],
   warmed: Map<string, WarmedMacro>,
   currentPage?: string,
+  owner: QueryReadinessOwner = {
+    signal: new AbortController().signal, isCurrent: () => true, onPending: () => {},
+  },
 ): Promise<void> {
+  const requireCurrent = () => {
+    if (owner.signal.aborted || !owner.isCurrent()) throw new OperationCancelledError();
+  };
+  requireCurrent();
   const targets: WarmTargets = { refs: new Set(), macros: new Map() };
   const pages: PageReadCache = new Map();
   collectNodeTargets(nodes, targets);
   await Promise.all([...targets.refs].map((uuid) => resolveBlockBatched(uuid).catch(() => null)));
+  requireCurrent();
   const macros = [...targets.macros.values()];
   // §7.9: BOTH macro names are queries. Filtering on the literal `"query"` is
   // exactly how a `{{tine-query …}}` block came to export as literal text.
@@ -398,7 +412,9 @@ export async function warmExportResolutions(
     macros.filter((macro) => isQueryMacroName(macro.name)),
     warmed,
     currentPage,
+    owner,
   );
+  requireCurrent();
   // Page embeds are intentionally whole-page exports, but run them after the
   // globally bounded query batch so their PageDto cache cannot overlap query
   // source-page hydration (which no longer uses getPage at all).
@@ -430,6 +446,7 @@ function Modal(props: { request: ExportRequest }): JSX.Element {
   const [format, setFormat] = createSignal<ExportFormat>("text");
   const [warmRev, setWarmRev] = createSignal(0);
   const [warming, setWarming] = createSignal(false);
+  const [warmError, setWarmError] = createSignal<string | null>(null);
   const warmedMacros = new Map<string, WarmedMacro>();
   const update = (patch: Partial<ExportOptions>) => {
     const next = { ...opts(), ...patch };
@@ -493,20 +510,32 @@ function Modal(props: { request: ExportRequest }): JSX.Element {
   });
 
   const copy = () => {
-    if (format() === "text" && opts().content === "rendered" && warming()) return;
+    if (format() === "text" && opts().content === "rendered" && (warming() || warmError())) return;
     void writeClipboardText(payload());
     pushToast("Copied to clipboard", "success");
     closeExportModal();
   };
 
   let disposed = false;
+  const queryController = new AbortController();
+  onCleanup(onGraphRebound(() => queryController.abort()));
+  const binding = graphBinding();
+  const graphRoot = graphMeta()?.root;
+  const current = () => !disposed && graphBinding() === binding
+    && graphMeta()?.root === graphRoot && !graphTransitioning();
+  createEffect(() => { if (!current()) queryController.abort(); });
   onCleanup(() => {
     disposed = true;
+    queryController.abort();
   });
 
   onMount(() => {
     setWarming(true);
-    void warmExportResolutions(nodes, warmedMacros, currentPage()).finally(() => {
+    void warmExportResolutions(nodes, warmedMacros, currentPage(), {
+      signal: queryController.signal, isCurrent: current, onPending: () => {},
+    }).catch(error => {
+      if (!disposed) setWarmError(error instanceof Error ? error.message : String(error));
+    }).finally(() => {
       if (disposed) return;
       setWarmRev(warmRev() + 1);
       setWarming(false);
@@ -634,11 +663,12 @@ function Modal(props: { request: ExportRequest }): JSX.Element {
           <button class="export-btn-secondary" onClick={closeExportModal}>Close</button>
           <button
             class="export-btn-primary"
-            disabled={format() === "text" && opts().content === "rendered" && warming()}
+            disabled={format() === "text" && opts().content === "rendered" && (warming() || !!warmError())}
             onClick={copy}
           >
             {format() === "text" && opts().content === "rendered" && warming() ? "Resolving..." : "Copy"}
           </button>
+          <Show when={warmError()}>{error => <span role="alert">{error()}</span>}</Show>
         </div>
       </div>
     </div>

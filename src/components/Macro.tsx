@@ -60,7 +60,8 @@ import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
 import { SheetContainer } from "./SheetContainer";
 import type { PageKind, RefGroup } from "../types";
-import { sharedQueryResult } from "../queryResultCache";
+import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
+import { graphBinding } from "../persistence";
 import { createReadyQueryResource } from "../createReadyQueryResource";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
@@ -847,7 +848,7 @@ export function QueryMacro(props: {
   const executionPage = () => (currentPageInput() ? focusedQueryPage() : currentPage());
   const fetchGroups = async (requestKey: string): Promise<RefGroup[]> => {
     {
-      const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
+      const scope = sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
       const searchSource = friendlySearch();
       if (searchSource !== null) {
         setAdvInfo(null);

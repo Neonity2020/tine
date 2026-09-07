@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { ExportModal } from "./ExportModal";
-import { backend } from "../backend";
+import { backend, QueryUnavailableError } from "../backend";
 import { initParser } from "../render/parse";
 import { resetStore, setDoc, type Node as StoreNode } from "../store";
 import { closeExportModal, openExportModal } from "../ui";
@@ -34,10 +34,31 @@ describe("ExportModal content choice (GH #352)", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     closeExportModal();
     clearTransientLayersForTest();
     resetStore();
     document.body.innerHTML = "";
+  });
+
+  it("blocks incomplete rendered copy and displays a permanent query failure", async () => {
+    setDoc({
+      byId: { root: node("root", "{{query (task TODO)}}", null) },
+      pages: [{ name: "P", kind: "page", title: "P", preBlock: null, roots: ["root"], format: "md", readOnly: false, guide: false }],
+      feed: ["P"], loaded: true,
+    });
+    vi.spyOn(backend(), "exportQuerySubtrees").mockRejectedValue(new QueryUnavailableError("projection.failed", "Index rebuild failed."));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <ExportModal />, root);
+    try {
+      openExportModal(["root"]);
+      await vi.waitFor(() => expect(root.querySelector('[role="alert"]')?.textContent).toContain("Index rebuild failed"));
+      const button = (label: string) => [...root.querySelectorAll<HTMLButtonElement>("button")].find(item => item.textContent?.trim() === label)!;
+      expect(button("Copy").disabled).toBe(true);
+      button("Markdown").click();
+      expect(button("Copy").disabled).toBe(false);
+    } finally { dispose(); }
   });
 
   it("offers an explicit preserve-Markdown choice next to the cleaned plain-text one", async () => {

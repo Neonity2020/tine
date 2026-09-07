@@ -39,6 +39,8 @@ import { blockDtoExternalId } from "../blockIdentity";
 import { isSaveConflictFailure } from "../persistence";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
 import { createReadyQueryResource } from "../createReadyQueryResource";
+import { runQueryWhenReady } from "../queryReadiness";
+import { onGraphRebound } from "../modeHooks";
 import { markdownRawWithProperty, orgRawWithProperty } from "../editor/properties";
 import { queryViewPropertyPatch } from "../editor/queryViewProperties";
 
@@ -152,7 +154,8 @@ function savedQueryRaw(
 export async function materializeQueryWorkspace(
   input: MaterializeQueryInput,
   deps: MaterializeQueryDependencies,
-  isCurrent: IsCurrentInput = () => true
+  isCurrent: IsCurrentInput = () => true,
+  signal: AbortSignal = new AbortController().signal,
 ): Promise<MaterializeQueryResult> {
   input = { ...input };
   const superseded = (): MaterializeQueryResult =>
@@ -167,7 +170,10 @@ export async function materializeQueryWorkspace(
   }
   if (input.sourceKind === "search") {
     try {
-      const execution = await deps.runGraphSearch(input.source.trim(), 0, 0, `query-workspace:${input.routeId}:materialize`, true);
+      const execution = await runQueryWhenReady(
+        () => deps.runGraphSearch(input.source.trim(), 0, 0, `query-workspace:${input.routeId}:materialize`, true),
+        { signal, isCurrent, onPending: () => {} },
+      );
       if (!isCurrent()) return superseded();
       if (execution.cancelled) return { ok: false, kind: "invalid-query", message: "Search validation was superseded. Try saving again." };
       if (execution.diagnostics.length) return { ok: false, kind: "invalid-query", message: execution.diagnostics.map((item) => item.message).join(" · ") };
@@ -690,6 +696,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   // anything — routing, error text, the notice, and `saving` itself.
   let alive = true;
   let saveToken = 0;
+  let saveController: AbortController | undefined;
   // A changed-and-restored value is still a newer edit. Include the route
   // object so its non-presentation Display draft participates in the revision.
   const inputRevision = createMemo((previous: number) => {
@@ -701,7 +708,12 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     graphMeta()?.preferred_format;
     return previous + 1;
   }, 0);
-  onCleanup(() => { alive = false; });
+  createEffect(() => {
+    inputRevision();
+    saveController?.abort();
+  });
+  onCleanup(onGraphRebound(() => saveController?.abort()));
+  onCleanup(() => { alive = false; saveController?.abort(); });
   let advancedButton!: HTMLButtonElement;
   const advancedLayerId = `query-advanced-${createUniqueId()}`;
   let sourceInput: HTMLInputElement | undefined;
@@ -840,6 +852,8 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     event.preventDefault();
     if (saving()) return;
     const captured = captureSave();
+    saveController?.abort();
+    saveController = new AbortController();
     setSaving(true);
     setSaveError(null);
     setSaveNotice(null);
@@ -851,7 +865,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         presentation: captured.presentation,
         routeId: captured.routeId,
         format: captured.format,
-      }, deps(), () => sameInput(captured));
+      }, deps(), () => sameInput(captured), saveController.signal);
       // Every branch below is about the LOCAL surface. A workspace that has
       // moved on gets nothing written into it: not a route replacement, not an
       // error, not a notice.

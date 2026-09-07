@@ -49,7 +49,8 @@ import {
   type AnchorPrompt,
   type RegistryAccess,
 } from "./QuerySheet";
-import { sharedQueryResult } from "../queryResultCache";
+import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
+import { graphBinding } from "../persistence";
 import { QueryDisplay } from "./QueryDisplay";
 import type { QueryDisplayControl } from "../editor/queryViewProperties";
 import { dataRev, graphEpoch, graphMeta, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
@@ -909,7 +910,7 @@ export function QueryBuilder(props: {
   //  - **Rows never cross a graph.** A reply for the previous graph may still
   //    settle; it can never be published, because what is exposed is gated on
   //    the scope the rows were fetched under.
-  const registryScope = () => `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
+  const registryScope = () => sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
   const registryKey = () =>
     sheetOpen() || displayOpen() ? `${dataRev()}\0${declarationRevision()}` : undefined;
   const [registrySnapshot] = createResource(

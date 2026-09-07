@@ -36,7 +36,7 @@ import { graphBinding } from "../persistence";
 import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
 import { selectedThemePresentation } from "../themeGallery";
 import { TodayTaskSummary } from "./TodayTaskSummary";
-import { sharedQueryResult } from "../queryResultCache";
+import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -1088,7 +1088,7 @@ function tagQuery(pageName: string): string {
 }
 
 function sharedTagQuery(pageName: string, requestKey: string): Promise<RefGroup[]> {
-  const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
+  const scope = sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
   return sharedQueryResult(scope, `page-tag\0${requestKey}`, () =>
     backend().runQuery(tagQuery(pageName))
   );
