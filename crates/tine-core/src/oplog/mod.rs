@@ -257,13 +257,11 @@ mod external_surface_tests {
         let digest = Sha256::digest(public_uses.join("\n").as_bytes());
         assert_eq!(
             format!("{digest:x}"),
-            // Re-pinned 2026-09-05 (query engine P1-a2): `MaterializedPlanning`
-            // joins the materialization re-export list. It is the block's
-            // `[#A]`/`SCHEDULED:`/`DEADLINE:` facet, carried independently of
-            // `MaterializedTask` (§3.2 M2). Derived by re-running this
-            // function's own extraction over `HEAD` and the working tree: one
-            // name added, none removed, still 20 declarations.
-            "22323e60fe472f16d8f78a7e617feba02c823b9fa2455307e1869e47be6c01df",
+            // Re-pinned for the approved retirable-document foundation:
+            // `DocumentKey` joins the identity re-exports. Extraction against
+            // the preceding foundation proves that this is the only added
+            // name, none are removed, and there are still 20 declarations.
+            "5c1ed5ffbbbf617aab3747c79d95f5677e2e137996539de4a5846d0e542e5d09",
             "the exact public oplog re-export surface changed"
         );
 
