@@ -2093,6 +2093,24 @@ proof, and merely opening a directory is not generation adoption. Collision,
 missing/corrupt record, no-follow, publication-fault and retry tests preserve
 predecessor roots. Complete generation commits and live cutover remain absent.
 
+The staged **document capsule roster** uses the same canonical authenticated map,
+keyed by document UUID. A map value addresses one canonical postcard record
+`{schema=1, dependencies: DocumentDependencies, checkpoint: BlobDescription}`.
+Descriptor and actual CRDT checkpoint blobs share the `capsule-v1-<digest>`
+content-addressed staging namespace and the same bounded publication machinery.
+The descriptor preserves exact accepted heads and counters; it contains no
+run-local cutoff digest. A changed document replaces only its roster search path;
+unchanged values remain shared. Catalog identity and roster completeness must still
+be bound and qualified by the enclosing complete generation.
+
+Point reopening checks canonical current descriptor encoding, digest, document
+identity, exact checkpoint length/digest, CRDT import completeness, schema/shape
+and version vector through the existing catalog/shard validators. It never
+reconstructs a CRDT from projected text. A forged in-memory cutoff cannot be
+serialized through this surface; producer input remains an engine-qualified compact
+document bound to the current cutoff. This is still staging, with no active marker
+or engine installation caller.
+
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
 Clean projection attach rebuilds an exact path-to-latest-batch map during

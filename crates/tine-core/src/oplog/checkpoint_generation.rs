@@ -14,10 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use super::hot_engine::{
     AcceptedBatchEvidence, AcceptedFrontierRoot, CleanCheckpointAcceptedRow,
-    CleanCheckpointCapture, ACCEPTED_EVIDENCE_SCHEMA_VERSION,
+    CleanCheckpointCapture, CompactAcceptedDocument, ACCEPTED_EVIDENCE_SCHEMA_VERSION,
 };
 use super::object_store::ObjectStore;
-use super::{BatchCausalDot, BatchId, CausalPeerId, ContentDigest, DeviceId};
+use super::{
+    BatchCausalDot, BatchId, BlobDescription, CausalPeerId, ContentDigest, DeviceId,
+    DocumentDependencies, DocumentId,
+};
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_DIRECTORY: &str = "clean-open-checkpoint-v1";
@@ -386,7 +389,24 @@ impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
         address: ContentDigest,
         bytes: &[u8],
     ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
-        use tine_storage::sealed_accepted_index::SealedAcceptedIndexError;
+        self.stage_named_bytes(
+            sealed_kind_code(kind),
+            address,
+            &sealed_staging_name(kind, address),
+            bytes,
+        )
+        .map_err(tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Store)
+    }
+}
+
+impl SealedGenerationStagingStore {
+    fn stage_named_bytes(
+        &mut self,
+        kind_code: u8,
+        address: ContentDigest,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         let result = (|| -> Result<(), String> {
             if self.failed {
                 return Err("sealed generation staging previously failed".into());
@@ -396,7 +416,7 @@ impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
                     "sealed construction record exceeds the current checkpoint record limit".into(),
                 );
             }
-            if let Some(existing) = self.pending.objects.get(&(sealed_kind_code(kind), address)) {
+            if let Some(existing) = self.pending.objects.get(&(kind_code, address)) {
                 if existing != bytes {
                     return Err("sealed staging address has different pending bytes".into());
                 }
@@ -411,15 +431,11 @@ impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
             self.publication
                 .as_mut()
                 .expect("publication opened")
-                .publish(
-                    &self.reader.directory,
-                    &sealed_staging_name(kind, address),
-                    bytes,
-                )
+                .publish(&self.reader.directory, name, bytes)
                 .map_err(|error| error.to_string())?;
             self.pending
-                .publish_sealed_accepted_object(kind, address, bytes)
-                .map_err(|error| error.to_string())?;
+                .objects
+                .insert((kind_code, address), bytes.to_vec());
             self.pending_bytes = self
                 .pending_bytes
                 .checked_add(bytes.len())
@@ -434,7 +450,161 @@ impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
         if result.is_err() {
             self.failed = true;
         }
-        result.map_err(SealedAcceptedIndexError::Store)
+        result
+    }
+
+    fn stage_capsule_blob(&mut self, bytes: &[u8]) -> Result<BlobDescription, String> {
+        let blob = BlobDescription::of(bytes);
+        // Zero is private construction bookkeeping; sealed-node kinds are 1..=5.
+        self.stage_named_bytes(
+            0,
+            ContentDigest::from_bytes(*blob.sha256()),
+            &capsule_blob_name(ContentDigest::from_bytes(*blob.sha256())),
+            bytes,
+        )?;
+        Ok(blob)
+    }
+}
+
+const CAPSULE_BLOB_PREFIX: &str = "capsule-v1";
+const DOCUMENT_CAPSULE_SCHEMA: u32 = 1;
+
+fn capsule_blob_name(digest: ContentDigest) -> String {
+    format!("{CAPSULE_BLOB_PREFIX}-{digest}")
+}
+
+fn verify_capsule_blob(expected: BlobDescription, bytes: &[u8]) -> Result<(), String> {
+    if BlobDescription::of(bytes) != expected {
+        return Err("generation capsule blob differs from its exact description".into());
+    }
+    Ok(())
+}
+
+impl SealedGenerationDirectory {
+    fn read_capsule_blob(&self, blob: BlobDescription) -> Result<Vec<u8>, String> {
+        if blob.byte_length() > MAX_CHECKPOINT_BYTES {
+            return Err(
+                "generation capsule blob exceeds the current checkpoint record limit".into(),
+            );
+        }
+        let bytes = tine_storage::read_optional_regular(
+            &self.directory,
+            &capsule_blob_name(ContentDigest::from_bytes(*blob.sha256())),
+            blob.byte_length(),
+            None,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("generation capsule blob is missing")?;
+        verify_capsule_blob(blob, &bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Per-document immutable roster value. The checkpoint digest binds actual CRDT
+/// bytes; dependencies retain stable document identity and accepted direct heads.
+/// No run-local cutoff digest is serialized, so unchanged values remain shared.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentCapsuleRecord {
+    schema: u32,
+    dependencies: DocumentDependencies,
+    checkpoint: BlobDescription,
+}
+
+impl DocumentCapsuleRecord {
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        postcard::to_stdvec(self).map_err(|error| error.to_string())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let (record, remaining): (Self, &[u8]) =
+            postcard::take_from_bytes(bytes).map_err(|error| error.to_string())?;
+        if record.schema != DOCUMENT_CAPSULE_SCHEMA
+            || !remaining.is_empty()
+            || record.encode()? != bytes
+        {
+            return Err("generation document capsule is not the current canonical record".into());
+        }
+        Ok(record)
+    }
+}
+
+/// An immutable document map candidate. The enclosing generation must separately
+/// prove the complete roster and bind workspace/catalog/cutoff/retention facts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SealedDocumentRoster {
+    root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
+}
+
+impl SealedDocumentRoster {
+    pub(crate) fn empty() -> Self {
+        Self {
+            root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty(),
+        }
+    }
+
+    pub(crate) fn with_document(
+        self,
+        store: &mut SealedGenerationStagingStore,
+        cutoff: &SealedAcceptedCutoff,
+        compact: &CompactAcceptedDocument,
+    ) -> Result<Self, String> {
+        use tine_storage::sealed_accepted_index::SealedAcceptedIndexWriter;
+        if compact.cutoff_state_digest() != cutoff.frontier().state_digest() {
+            return Err("generation capsule belongs to another accepted cutoff".into());
+        }
+        let checkpoint = store.stage_capsule_blob(compact.checkpoint())?;
+        let record = DocumentCapsuleRecord {
+            schema: DOCUMENT_CAPSULE_SCHEMA,
+            dependencies: compact.dependencies().clone(),
+            checkpoint,
+        };
+        let record_blob = store.stage_capsule_blob(&record.encode()?)?;
+        let root = SealedAcceptedIndexWriter::new(store)
+            .upsert_map(
+                self.root,
+                record.dependencies.document_id().as_uuid().into_bytes(),
+                ContentDigest::from_bytes(*record_blob.sha256()),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(Self { root })
+    }
+
+    pub(crate) fn load_document(
+        self,
+        store: &SealedGenerationDirectory,
+        catalog: DocumentId,
+        document: DocumentId,
+    ) -> Result<Option<(DocumentDependencies, loro::LoroDoc)>, String> {
+        use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
+        let Some(address) = SealedAcceptedIndexReader::new(store)
+            .map_value(self.root, document.as_uuid().into_bytes())
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        // The map value authenticates the descriptor bytes. Its encoded size is
+        // not stored in map nodes, so the existing per-record ceiling applies.
+        let bytes = tine_storage::read_optional_regular(
+            &store.directory,
+            &capsule_blob_name(address),
+            MAX_CHECKPOINT_BYTES,
+            None,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or("generation document descriptor is missing")?;
+        if ContentDigest::of(&bytes) != address {
+            return Err("generation document descriptor digest differs".into());
+        }
+        let record = DocumentCapsuleRecord::decode(&bytes)?;
+        if record.dependencies.document_id() != document {
+            return Err("generation document descriptor names another document".into());
+        }
+        let checkpoint = store.read_capsule_blob(record.checkpoint)?;
+        let restored =
+            super::hot_engine::qualify_compact_document(catalog, &record.dependencies, &checkpoint)
+                .map_err(|error| error.to_string())?;
+        Ok(Some((record.dependencies, restored)))
     }
 }
 
@@ -1730,6 +1900,12 @@ mod tests {
             .build_sealed_accepted_cutoff(&mut store, None)
             .unwrap();
         assert_eq!(cutoff.roots().sequence.len, 0);
+        let capsule_root = root.join("capsules");
+        std::fs::create_dir(&capsule_root).unwrap();
+        let capsule_dir =
+            cap_std::fs::Dir::open_ambient_dir(&capsule_root, cap_std::ambient_authority())
+                .unwrap();
+        let mut roster = SealedDocumentRoster::empty();
         for n in 1..=2 {
             let transaction = OperationTransaction::new(vec![
                 SemanticOperation::CreatePage {
@@ -1779,6 +1955,8 @@ mod tests {
                 .build_sealed_accepted_cutoff(&mut store, Some(&cutoff))
                 .unwrap();
             assert_eq!(cutoff.roots().sequence.len, n as u64);
+            let previous_roster = roster;
+            let mut capsule_store = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
             for id in [
                 catalog,
                 DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
@@ -1796,7 +1974,142 @@ mod tests {
                     .pending
                     .is_none());
                 assert!(!compact.checkpoint().is_empty());
+                roster = roster
+                    .with_document(&mut capsule_store, &cutoff, &compact)
+                    .unwrap();
+                let record = DocumentCapsuleRecord {
+                    schema: DOCUMENT_CAPSULE_SCHEMA,
+                    dependencies: compact.dependencies().clone(),
+                    checkpoint: BlobDescription::of(compact.checkpoint()),
+                };
+                let canonical = record.encode().unwrap();
+                assert_eq!(DocumentCapsuleRecord::decode(&canonical).unwrap(), record);
+                let mut trailing = canonical.clone();
+                trailing.push(0);
+                assert!(DocumentCapsuleRecord::decode(&trailing).is_err());
+                let mut wrong_schema = record;
+                wrong_schema.schema += 1;
+                assert!(DocumentCapsuleRecord::decode(&wrong_schema.encode().unwrap()).is_err());
             }
+            drop(capsule_store.finish().unwrap());
+            let reopened_capsules = SealedGenerationDirectory::open(&capsule_dir).unwrap();
+            for id in std::iter::once(catalog)
+                .chain((1..=n).map(|i| DocumentId::from_uuid(uuid::Uuid::from_u128(300 + i))))
+            {
+                let (dependencies, restored) = roster
+                    .load_document(&reopened_capsules, catalog, id)
+                    .unwrap()
+                    .unwrap();
+                let compact = engine.build_compact_accepted_document(&cutoff, id).unwrap();
+                let expected = super::super::hot_engine::qualify_compact_document(
+                    catalog,
+                    compact.dependencies(),
+                    &compact.checkpoint().to_vec(),
+                )
+                .unwrap();
+                assert_eq!(&dependencies, compact.dependencies());
+                assert_eq!(restored.get_deep_value(), expected.get_deep_value());
+                assert_eq!(restored.oplog_frontiers(), expected.oplog_frontiers());
+            }
+            assert_eq!(roster.root.count, n as u64 + 1);
+            if n == 2 {
+                let id = DocumentId::from_uuid(uuid::Uuid::from_u128(301));
+                let old = previous_roster
+                    .load_document(&reopened_capsules, catalog, id)
+                    .unwrap()
+                    .unwrap();
+                let new = roster
+                    .load_document(&reopened_capsules, catalog, id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(old.0, new.0);
+                assert_eq!(old.1.get_deep_value(), new.1.get_deep_value());
+            }
+            let address = SealedAcceptedIndexReader::new(&reopened_capsules)
+                .map_value(roster.root, catalog.as_uuid().into_bytes())
+                .unwrap()
+                .unwrap();
+            let path = capsule_root.join(capsule_blob_name(address));
+            let exact = std::fs::read(&path).unwrap();
+            let record = DocumentCapsuleRecord::decode(&exact).unwrap();
+            let checkpoint_path = capsule_root.join(capsule_blob_name(ContentDigest::from_bytes(
+                *record.checkpoint.sha256(),
+            )));
+            let exact_checkpoint = std::fs::read(&checkpoint_path).unwrap();
+            std::fs::write(&checkpoint_path, b"torn checkpoint").unwrap();
+            assert!(roster
+                .load_document(&reopened_capsules, catalog, catalog)
+                .is_err());
+            std::fs::write(&checkpoint_path, &exact_checkpoint).unwrap();
+            std::fs::write(&path, b"torn descriptor").unwrap();
+            assert!(roster
+                .load_document(&reopened_capsules, catalog, catalog)
+                .is_err());
+            std::fs::remove_file(&path).unwrap();
+            assert!(roster
+                .load_document(&reopened_capsules, catalog, catalog)
+                .is_err());
+            std::fs::write(&path, &exact).unwrap();
+            assert!(roster
+                .load_document(&reopened_capsules, catalog, catalog)
+                .unwrap()
+                .is_some());
+            // Validly addressed but semantically wrong bytes must not qualify.
+            let mut malformed = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
+            let bad_checkpoint = malformed
+                .stage_capsule_blob(b"not a CRDT checkpoint")
+                .unwrap();
+            let bad_record = DocumentCapsuleRecord {
+                checkpoint: bad_checkpoint,
+                ..record.clone()
+            };
+            let bad_blob = malformed
+                .stage_capsule_blob(&bad_record.encode().unwrap())
+                .unwrap();
+            let bad_root = SealedAcceptedIndexWriter::new(&mut malformed)
+                .upsert_map(
+                    roster.root,
+                    catalog.as_uuid().into_bytes(),
+                    ContentDigest::from_bytes(*bad_blob.sha256()),
+                )
+                .unwrap();
+            let mut wrong_vector = record.dependencies.peer_counters().to_vec();
+            wrong_vector.push(crate::oplog::CrdtPeerCounter::new(
+                CrdtPeerId::from_u64(999_999),
+                0,
+            ));
+            let wrong_dependencies = DocumentDependencies::new(
+                catalog,
+                wrong_vector,
+                record.dependencies.direct_dependency_heads().to_vec(),
+            )
+            .unwrap();
+            let wrong_record = DocumentCapsuleRecord {
+                dependencies: wrong_dependencies,
+                ..record.clone()
+            };
+            let wrong_blob = malformed
+                .stage_capsule_blob(&wrong_record.encode().unwrap())
+                .unwrap();
+            let wrong_root = SealedAcceptedIndexWriter::new(&mut malformed)
+                .upsert_map(
+                    roster.root,
+                    catalog.as_uuid().into_bytes(),
+                    ContentDigest::from_bytes(*wrong_blob.sha256()),
+                )
+                .unwrap();
+            drop(malformed.finish().unwrap());
+            assert!(SealedDocumentRoster { root: bad_root }
+                .load_document(&reopened_capsules, catalog, catalog)
+                .is_err());
+            assert!(SealedDocumentRoster { root: wrong_root }
+                .load_document(&reopened_capsules, catalog, catalog)
+                .is_err());
+            assert!(roster
+                .load_document(&reopened_capsules, catalog, catalog)
+                .unwrap()
+                .is_some());
+            drop(reopened_capsules);
             assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
             assert_eq!(archive.committed_manifest_names().unwrap(), manifests);
             assert_eq!(
@@ -1818,6 +2131,23 @@ mod tests {
             .unwrap();
         assert_eq!(cutoff.roots(), independent.roots());
         assert_eq!(cutoff.frontier(), independent.frontier());
+        let mut disk = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
+        let mut full_roster = SealedDocumentRoster::empty();
+        for id in [
+            catalog,
+            DocumentId::from_uuid(uuid::Uuid::from_u128(301)),
+            DocumentId::from_uuid(uuid::Uuid::from_u128(302)),
+        ] {
+            let compact = replay
+                .build_compact_accepted_document(&independent, id)
+                .unwrap();
+            full_roster = full_roster
+                .with_document(&mut disk, &independent, &compact)
+                .unwrap();
+        }
+        assert_eq!(full_roster.root, roster.root);
+        drop(disk.finish().unwrap());
+        drop(capsule_dir);
         drop(replay);
         drop(engine);
         drop(archive);
@@ -2761,6 +3091,7 @@ mod tests {
         }
         for caller in [engine, include_str!("../sync_runtime.rs")] {
             assert!(!caller.contains("SealedGenerationStagingStore"));
+            assert!(!caller.contains("SealedDocumentRoster"));
         }
         assert!(staging.contains("cfg!(target_os = \"linux\")"));
         assert!(staging.contains("Self::open_immediate(directory)"));
@@ -2774,6 +3105,11 @@ mod tests {
             SEALED_STAGING_BATCH_OBJECTS
         )));
         assert!(contract.contains("publish_new_exact_single_writer"));
+        assert!(contract.contains(&format!("{}-<digest>", CAPSULE_BLOB_PREFIX)));
+        assert!(contract.contains(&format!(
+            "schema={}, dependencies: DocumentDependencies",
+            DOCUMENT_CAPSULE_SCHEMA
+        )));
         assert!(contract.contains("no new on-disk format"));
     }
 

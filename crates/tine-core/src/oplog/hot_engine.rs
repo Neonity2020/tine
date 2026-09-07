@@ -7459,14 +7459,8 @@ impl ShardedHotEngine {
         let checkpoint = document
             .export(ExportMode::shallow_snapshot(&document.oplog_frontiers()))
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
-        let restored = LoroDoc::new();
-        import_complete(document_id, &restored, std::slice::from_ref(&checkpoint))?;
-        self.validate_lazy_genesis_document(document_id, &restored)?;
-        if canonical_peer_counters(&restored.oplog_vv())? != dependencies.peer_counters() {
-            return Err(EngineError::InvalidCrdt(
-                "compact accepted document changed version vector".into(),
-            ));
-        }
+        let restored =
+            qualify_compact_document(self.catalog_document_id, &dependencies, &checkpoint)?;
         if restored.oplog_frontiers() != document.oplog_frontiers() {
             return Err(EngineError::InvalidCrdt(
                 "compact accepted document changed oplog frontiers".into(),
@@ -24430,6 +24424,27 @@ fn validate_immutable_shard_identity(
         });
     }
     Ok(())
+}
+
+/// Independently open persisted compact bytes using the same semantic validators
+/// as accepted documents; no engine state or disposable checkpoint is consulted.
+pub(crate) fn qualify_compact_document(
+    catalog: DocumentId,
+    dependencies: &DocumentDependencies,
+    checkpoint: &Vec<u8>,
+) -> Result<LoroDoc, EngineError> {
+    let document_id = dependencies.document_id();
+    let restored = LoroDoc::new();
+    import_complete(document_id, &restored, std::slice::from_ref(checkpoint))?;
+    if document_id == catalog {
+        validate_catalog(catalog, &restored)?;
+    } else {
+        validate_shard(catalog, document_id, &restored)?;
+    }
+    if canonical_peer_counters(&restored.oplog_vv())? != dependencies.peer_counters() {
+        return Err(EngineError::FrontierVectorMismatch(document_id));
+    }
+    Ok(restored)
 }
 
 fn canonical_peer_counters(vv: &VersionVector) -> Result<Vec<CrdtPeerCounter>, EngineError> {

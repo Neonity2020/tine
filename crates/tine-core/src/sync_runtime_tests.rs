@@ -12942,7 +12942,7 @@ fn pending_generation_join_from_fixtures(
 #[ignore = "manual release gate: rebaselining foundations on an anonymized corpus copy"]
 fn rebaselining_foundations_real_corpus_gate() {
     use crate::oplog::checkpoint_generation::{
-        SealedGenerationStagingStore, TineAcceptedEvidenceDecoder,
+        SealedDocumentRoster, SealedGenerationStagingStore, TineAcceptedEvidenceDecoder,
     };
     use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
     assert!(!cfg!(debug_assertions), "release-only corpus gate");
@@ -13006,6 +13006,8 @@ fn rebaselining_foundations_real_corpus_gate() {
     }
     assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
     let compact_started = Instant::now();
+    let mut capsule_store = SealedGenerationStagingStore::open(&directory).unwrap();
+    let mut roster = SealedDocumentRoster::empty();
     let mut compact_bytes = 0usize;
     let mut compact_documents = 0usize;
     for document_id in std::iter::once(engine.catalog_document_id()).chain(
@@ -13022,14 +13024,37 @@ fn rebaselining_foundations_real_corpus_gate() {
             cutoff.frontier().state_digest()
         );
         assert_eq!(compact.dependencies().document_id(), document_id);
+        roster = roster
+            .with_document(&mut capsule_store, &cutoff, &compact)
+            .unwrap();
         compact_bytes += compact.checkpoint().len();
         compact_documents += 1;
     }
+    drop(capsule_store.finish().unwrap());
     let compact_ms = compact_started.elapsed().as_millis();
+    let capsule_started = Instant::now();
+    for document_id in std::iter::once(engine.catalog_document_id()).chain(
+        before
+            .pages
+            .iter()
+            .map(|(_, state)| state.home_document_id()),
+    ) {
+        let (dependencies, _) = roster
+            .load_document(&disk_nodes, engine.catalog_document_id(), document_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Some(dependencies),
+            engine
+                .accepted_frontier_document(cutoff.frontier(), document_id)
+                .unwrap()
+        );
+    }
+    let capsule_reopen_ms = capsule_started.elapsed().as_millis();
     assert_eq!(compact_documents, before.pages.len() + 1);
     assert_eq!(engine.canonical_snapshot().unwrap(), before);
     assert_eq!(user_graph_bytes(&joiner.graph_root), expected);
-    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms} compact_documents={compact_documents} compact_bytes={compact_bytes} compact_ms={compact_ms}",
+    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms} compact_documents={compact_documents} compact_bytes={compact_bytes} compact_ms={compact_ms} capsule_reopen_ms={capsule_reopen_ms}",
         expected.len(), before.pages.len(), before.blocks.len(), cutoff.roots().sequence.len);
 }
 

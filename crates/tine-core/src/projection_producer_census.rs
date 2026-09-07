@@ -2009,9 +2009,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // The latter uses the existing single-writer publication method outside
     // Linux. No new raw writes; the physical boundary table above adds those
     // two constructors. Remaining changes are shared store/error type paths.
+    // R1b/4: reviewed the document-roster delta. Two more shared bounded reads
+    // resolve descriptor and checkpoint blobs; shared map reader/writer imports
+    // and the empty root serve the roster. Staging error conversion moves into
+    // the shared named-bytes helper. No additional physical write constructor
+    // or raw mutation: capsules reuse the same bounded publication handle.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "08ecaece1e2cbca76e208706e9cbf5f883cfbf02d07811ae98e1b11eb14c2227",
+        "8b6b7f31cf8cf45c676eaa715c5a78482916651525ec5012fc9c45b089ac49e6",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
