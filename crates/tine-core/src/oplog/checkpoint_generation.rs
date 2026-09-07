@@ -1580,6 +1580,300 @@ mod tests {
     }
 
     #[test]
+    fn rebaselining_reconstructs_real_engine_ancestry_for_two_returning_peers() {
+        use crate::oplog::hot_engine::{LazyGenesisCheckpointBuilder, ShardedHotEngine};
+        use crate::oplog::lazy_genesis::LazyGenesisPackBuilder;
+        use crate::oplog::{
+            AuthorBatch, BatchDisposition, BlobDescription, BlockId, BlockLocation, CrdtPeerId,
+            DocumentId, LineageDigest, LogicalPageName, ManagedPath, ManagedTextKind,
+            OperationTransaction, PageId, SemanticOperation, SessionId, WorkspaceId,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "tine-rebaseline-returning-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(1101));
+        let lineage = LineageDigest::of(b"real-engine-returning-peers");
+        let catalog = DocumentId::from_uuid(uuid::Uuid::from_u128(1102));
+        let home = DocumentId::from_uuid(uuid::Uuid::from_u128(1103));
+        let page = PageId::from_uuid(uuid::Uuid::from_u128(1104));
+        let destination = PageId::from_uuid(uuid::Uuid::from_u128(1106));
+        let destination_home = DocumentId::from_uuid(uuid::Uuid::from_u128(1107));
+        let block = BlockLocation {
+            block_id: BlockId::from_uuid(uuid::Uuid::from_u128(1105)),
+            home_document_id: home,
+        };
+        let (bytes, dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let baseline = Arc::new(
+            LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog,
+                BlobDescription::of(b"empty source"),
+                &root,
+            )
+            .unwrap()
+            .finish(bytes, dependencies)
+            .unwrap(),
+        );
+        // One scratch archive collects the exact immutable bytes accepted by
+        // the simulated devices. No production inbound publication is implied.
+        let archive = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let fresh = || {
+            let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+            engine
+                .install_lazy_genesis_baseline(Arc::clone(&baseline))
+                .unwrap();
+            engine
+                .attach_clean_archive_store(archive.duplicate_retained_capability().unwrap())
+                .unwrap();
+            engine
+        };
+        let mut engine = fresh();
+        let claims = engine
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let author = |batch: u128, peer: u64| AuthorBatch {
+            batch_id: BatchId::from_uuid(uuid::Uuid::from_u128(batch)),
+            author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(peer as u128)),
+            author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(peer as u128 + 1)),
+            crdt_peer_id: CrdtPeerId::from_u64(peer),
+        };
+        let commit = |engine: &mut ShardedHotEngine, batch, peer, operations| {
+            let transaction = OperationTransaction::new(operations).unwrap();
+            let prepared = engine
+                .prepare_fixture_transaction(author(batch, peer), &transaction)
+                .unwrap();
+            let outcome = engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap();
+            assert!(
+                matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+                "{:?}",
+                outcome.disposition()
+            );
+        };
+        commit(
+            &mut engine,
+            1,
+            100,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id: page,
+                    home_document_id: home,
+                    name: LogicalPageName::parse("Recovery").unwrap(),
+                    path: ManagedPath::parse("pages/Recovery.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: destination,
+                    home_document_id: destination_home,
+                    name: LogicalPageName::parse("Destination").unwrap(),
+                    path: ManagedPath::parse("pages/Destination.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block,
+                    page_id: page,
+                    parent: None,
+                    order: "a".into(),
+                    content: "root".into(),
+                },
+            ],
+        );
+        let mut offline_a = fresh();
+        let mut offline_b = fresh();
+        for offline in [&mut offline_a, &mut offline_b] {
+            assert_eq!(
+                offline
+                    .replay_clean_committed_tail(claims.as_ref())
+                    .unwrap(),
+                1
+            );
+        }
+        commit(
+            &mut engine,
+            2,
+            100,
+            vec![
+                SemanticOperation::MoveSubtree {
+                    root: block,
+                    from_page_id: page,
+                    to_page_id: destination,
+                    parent: None,
+                    order: "a".into(),
+                },
+                SemanticOperation::EditBlockContent {
+                    block,
+                    content: "root MAIN".into(),
+                },
+            ],
+        );
+        let content = |engine: &ShardedHotEngine| {
+            engine
+                .canonical_snapshot()
+                .unwrap()
+                .blocks
+                .into_iter()
+                .find(|state| state.block_id == block.block_id)
+                .unwrap()
+                .content
+        };
+        let mut accepted = BTreeSet::from([author(1, 100).batch_id, author(2, 100).batch_id]);
+        for (round, offline, offline_peer, offline_label, tail_label) in [
+            (0, &mut offline_a, 200, "OFFLINE_A", "TAIL"),
+            (1, &mut offline_b, 300, "OFFLINE_B", "NEXT"),
+        ] {
+            let cutoff = engine
+                .build_sealed_accepted_cutoff(&mut SealedMemoryStore::default(), None)
+                .unwrap();
+            let compact = engine
+                .build_compact_accepted_document(&cutoff, home)
+                .unwrap();
+            let compact_bytes = compact.checkpoint().to_vec();
+            let tail_id = 3 + round * 2;
+            let incoming_id = tail_id + 1;
+            let updated = format!("{} {tail_label}", content(&engine));
+            commit(
+                &mut engine,
+                tail_id,
+                100,
+                vec![SemanticOperation::EditBlockContent {
+                    block,
+                    content: updated,
+                }],
+            );
+            accepted.insert(author(tail_id, 100).batch_id);
+            let acknowledged = engine.canonical_snapshot().unwrap();
+            let acknowledged_root = engine.accepted_frontier_root().unwrap();
+            commit(
+                offline,
+                incoming_id,
+                offline_peer,
+                vec![SemanticOperation::EditBlockContent {
+                    block,
+                    content: format!("root {offline_label}"),
+                }],
+            );
+
+            // Reconstruct *all* acknowledged ancestry in an isolated engine,
+            // including the tail accepted after C. Then use the production
+            // admission path for the returning batch, not a shallow import.
+            let mut recovered = fresh();
+            assert_eq!(
+                recovered
+                    .replay_clean_checkpoint_tail(&accepted, claims.as_ref())
+                    .unwrap(),
+                accepted.len()
+            );
+            assert_eq!(recovered.canonical_snapshot().unwrap(), acknowledged);
+            assert_eq!(
+                recovered.accepted_frontier_root().unwrap(),
+                acknowledged_root
+            );
+            let incoming = BTreeSet::from([author(incoming_id, offline_peer).batch_id]);
+            assert_eq!(
+                recovered
+                    .replay_clean_checkpoint_tail(&incoming, claims.as_ref())
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                engine.canonical_snapshot().unwrap(),
+                acknowledged,
+                "isolated recovery mutated live state"
+            );
+            assert_eq!(
+                compact.checkpoint(),
+                compact_bytes,
+                "old compact bytes changed"
+            );
+            for preserved in ["MAIN", "TAIL", offline_label] {
+                assert!(
+                    content(&recovered).contains(preserved),
+                    "recovery lost {preserved}"
+                );
+            }
+            if round == 1 {
+                assert!(content(&recovered).contains("OFFLINE_A"));
+                assert!(content(&recovered).contains("NEXT"));
+            }
+            let snapshot = recovered.canonical_snapshot().unwrap();
+            let membership = snapshot
+                .memberships
+                .iter()
+                .find(|entry| entry.block_id == block.block_id)
+                .unwrap();
+            assert_eq!(membership.page_id, destination);
+            assert_eq!(membership.home_document_id, home);
+            assert_eq!(
+                snapshot
+                    .blocks
+                    .iter()
+                    .find(|entry| entry.block_id == block.block_id)
+                    .unwrap()
+                    .home_document_id,
+                home
+            );
+
+            // Negative control: rebuilding only through C and then accepting
+            // the offline branch loses the acknowledged post-C tail. The
+            // recovery protocol must explicitly carry that tail forward.
+            let mut omitted_tail = fresh();
+            let mut incomplete = accepted.clone();
+            incomplete.remove(&author(tail_id, 100).batch_id);
+            omitted_tail
+                .replay_clean_checkpoint_tail(&incomplete, claims.as_ref())
+                .unwrap();
+            omitted_tail
+                .replay_clean_checkpoint_tail(&incoming, claims.as_ref())
+                .unwrap();
+            assert!(!content(&omitted_tail).contains(tail_label));
+            assert_ne!(omitted_tail.canonical_snapshot().unwrap(), snapshot);
+            accepted.extend(incoming);
+            let next = recovered
+                .build_sealed_accepted_cutoff(&mut SealedMemoryStore::default(), None)
+                .unwrap();
+            for id in [catalog, home, destination_home] {
+                let next_compact = recovered
+                    .build_compact_accepted_document(&next, id)
+                    .unwrap();
+                assert_eq!(next_compact.dependencies().document_id(), id);
+            }
+            assert_eq!(next.roots().sequence.len as usize, accepted.len());
+            // Only the test's engine handle moves here. Durable marker/actor
+            // installation remains a separate production qualification gate.
+            engine = recovered;
+        }
+        let mut oracle = fresh();
+        assert_eq!(
+            oracle.replay_clean_committed_tail(claims.as_ref()).unwrap(),
+            6
+        );
+        assert_eq!(
+            oracle.canonical_snapshot().unwrap(),
+            engine.canonical_snapshot().unwrap()
+        );
+        assert_eq!(
+            oracle.accepted_frontier_root().unwrap(),
+            engine.accepted_frontier_root().unwrap()
+        );
+        assert_eq!(archive.committed_manifest_names().unwrap(), accepted);
+        drop(oracle);
+        drop(offline_a);
+        drop(offline_b);
+        drop(engine);
+        drop(archive);
+        drop(baseline);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
     fn sealed_cutoff_incremental_build_matches_independent_full_rederivation() {
         let rows = generation_rows(65);
         let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();

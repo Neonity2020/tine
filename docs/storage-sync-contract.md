@@ -2055,6 +2055,13 @@ container IDs, map values and text deltas. Run-local Loro allocation slots are
 excluded from identity. It never recreates documents from visible page text. This
 synchronous staging proof has no installation path and makes no COW actor-budget
 claim; old concurrent branches still require full-ancestry recovery.
+The engine-level recovery fixture now reconstructs original accepted ancestry,
+includes acknowledged post-cutoff work, admits two independently returning peers
+through normal replay, and recompacts all affected documents. It covers a block
+moved to another page while retaining its original home shard. Its negative control
+omits the post-cutoff tail and detects the resulting lost edit. This proves the
+isolated engine recipe, not durable installation, missing-history recovery, actor
+concurrency, or shared retirement.
 This is not yet a complete durable
 generation: capsules, retention facts, independent disk qualification and the COW
 actor epoch remain prerequisites to enabling cutover. The physical layer has
