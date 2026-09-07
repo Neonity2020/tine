@@ -361,6 +361,8 @@ await withApp(0, async (browser) => {
   await browser.keys("Escape");
   await browser.$(".qs-sheet").waitForExist({ reverse: true, timeout: 5_000 });
   await openPage(browser, "Legacy");
+  // Navigation settles the page title; query results arrive asynchronously.
+  await browser.$(".sheet-board").waitForExist({ timeout: 20_000 });
   const legacyBoard = await browser.execute(() => ({
     columns: [...document.querySelectorAll(".sheet-board .sheet-board-header")].map((el) => el.textContent.trim()),
     boards: document.querySelectorAll(".sheet-board").length,
