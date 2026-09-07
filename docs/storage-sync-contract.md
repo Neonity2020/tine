@@ -192,9 +192,9 @@ interpret the mere presence of the directory as an opt-in marker.
 | `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |
 | `{inbox,outbox}/manifests/<batch>.manifest` | publishing device | peer ingress/replay | canonical batch manifest | append-only commit object |
 | `{inbox,outbox}/frontier-heads-v1/<device>-<digest>.head` | each device | peer discovery | canonical JSON frontier head v1 | immutable heads; newer generations supersede discovery relevance |
-| `{inbox,outbox}/publication-intents-v1/<digest>.intent` | publishing device | interrupted-publication recovery | canonical JSON intent v1 | immutable; retired only after covered publication is proven |
-| `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | publishing device | peer recovery | canonical JSON recovery link v1 | immutable |
-| `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | publishing device | peer recovery | exact manifest bytes | immutable; digest-addressed |
+| `{inbox,outbox}/publication-intents-v1/<digest>.intent` | none — write side retired 2026-08-20 (`2a578d87`, D-1); read-only tolerance at `sync_runtime.rs:9950-10069` pending reader deletion | interrupted-publication recovery | canonical JSON intent v1 | no writer; nothing publishes or retires an intent |
+| `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | none — write side retired 2026-08-20 (`2a578d87`, D-1); read-only tolerance at `sync_runtime.rs:9950-10069` pending reader deletion | peer recovery | canonical JSON recovery link v1 | no writer; never created |
+| `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | none — write side retired 2026-08-20 (`2a578d87`, D-1); read-only tolerance at `sync_runtime.rs:9950-10069` pending reader deletion | peer recovery | exact manifest bytes | no writer; never created |
 | `{inbox,outbox}/.part/` | provider transport | provider transport | temporary publication bytes | disposable after recovery |
 | `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit, and the evidence an exact repeat of a retired rename/remove settles from (§2.10c-i) | retired provider items | bounded cleanup evidence; retired against live journal state, not store lifetime (§2.10c-ii). `MAX_PROVIDER_RESIDUE_ENTRIES` remains the structural scan bound |
 | `{inbox,outbox}/rename-evidence/` | provider transport | provider recovery | interrupted-rename evidence | disposable after recovery |

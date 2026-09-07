@@ -587,6 +587,18 @@ fn concurrent_same_page_fallback_never_publishes_the_stale_local_draft_as_curren
     let local = fixture.prepare_transaction(&local_transaction, 0x1450, 0x1450);
     let local_batch = local.manifest().batch_id();
 
+    // Publish both prepared batches into the attached clean archive store
+    // before staging them. `accepted_author_projection_outcome` reads the
+    // author's manifest back from that store, so a batch staged straight from
+    // its in-memory `PreparedBatch` has no manifest to read.
+    {
+        let store = fixture
+            .engine
+            .archive_store()
+            .expect("the clean authority fixture attaches an archive store");
+        store.publish_prepared_fixture(&remote).unwrap();
+        store.publish_prepared_fixture(&local).unwrap();
+    }
     let mut session = fixture
         .engine
         .0
