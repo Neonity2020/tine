@@ -38,6 +38,7 @@ import { bumpPageInventoryRev, graphMeta } from "../ui";
 import { blockDtoExternalId } from "../blockIdentity";
 import { isSaveConflictFailure } from "../persistence";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
+import { createReadyQueryResource } from "../createReadyQueryResource";
 import { markdownRawWithProperty, orgRawWithProperty } from "../editor/properties";
 import { queryViewPropertyPatch } from "../editor/queryViewProperties";
 
@@ -729,7 +730,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     });
   });
 
-  const [execution] = createResource(
+  const [executionResource, executionPending] = createReadyQueryResource(
     () => ({
       id: props.route.id,
       source: source().trim(),
@@ -757,6 +758,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     }
   );
 
+  const execution = () => executionResource.error ? undefined : executionResource();
   const hits = () => execution()?.hits ?? [];
   const boardGroups = createMemo(() => {
     const grouped = new Map<string, QueryHit[]>();
@@ -966,14 +968,14 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
 
       <section class="query-workspace-status" aria-live="polite" aria-atomic="true">
         <Show when={!source().trim()}>{sourceKind() === "search" ? "Enter a search to begin." : "Enter a query to begin."}</Show>
-        <Show when={!!source().trim() && execution.loading}>Searching…</Show>
-        <Show when={!!source().trim() && !execution.loading && execution.error}>
-          Search failed: {execution.error instanceof Error ? execution.error.message : String(execution.error)}
+        <Show when={!!source().trim() && executionResource.loading}>{executionPending()?.message ?? "Searching…"}</Show>
+        <Show when={!!source().trim() && !executionResource.loading && executionResource.error}>
+          Search failed: {executionResource.error instanceof Error ? executionResource.error.message : String(executionResource.error)}
         </Show>
-        <Show when={!!source().trim() && !execution.loading && !execution.error && execution()?.cancelled}>
+        <Show when={!!source().trim() && !executionResource.loading && !executionResource.error && execution()?.cancelled}>
           Search superseded by a newer request.
         </Show>
-        <Show when={!!source().trim() && !execution.loading && !execution.error && execution() && !execution()?.cancelled}>
+        <Show when={!!source().trim() && !executionResource.loading && !executionResource.error && execution() && !execution()?.cancelled}>
           {hits().length} result{hits().length === 1 ? "" : "s"}
         </Show>
       </section>
@@ -993,7 +995,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         </section>
       </Show>
 
-      <Show when={!execution.loading && !execution.error && !hits().length && source().trim() && !execution()?.diagnostics.length}>
+      <Show when={!executionResource.loading && !executionResource.error && !hits().length && source().trim() && !execution()?.diagnostics.length}>
         <p class="query-workspace-empty">No matching pages or blocks.</p>
       </Show>
 

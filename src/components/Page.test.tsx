@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
-import { backend } from "../backend";
+import { backend, QueryNotReadyError } from "../backend";
 import { graphBinding, setBaseRev } from "../persistence";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { notifyGraphRebound } from "../modeHooks";
@@ -769,6 +769,18 @@ describe("Journals feed generation lifecycle", () => {
 });
 
 describe("tag-page table", () => {
+  it("retries pending tag results automatically", async () => {
+    setDoc({ byId: {}, pages: [page("Tag", "page", [])], feed: ["Tag"], loaded: true });
+    const run = vi.spyOn(backend(), "runQuery").mockRejectedValueOnce(new QueryNotReadyError("pending_edits"))
+      .mockResolvedValue([]);
+    const { root, dispose } = mount(() => <TagPageTable pageName="Tag" />);
+    try {
+      await vi.waitFor(() => expect(root.querySelector('[role="status"]')?.textContent).toContain("Updating"));
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(root.querySelector('[role="status"]')).toBeNull());
+    } finally { dispose(); }
+  });
+
   it("toggles a query-sourced table and adds new rows to today's journal", async () => {
     const todayName = journalTitle(new Date());
     setDoc({
@@ -814,20 +826,18 @@ describe("tag-page table", () => {
       </>
     ));
 
-    await tick();
+    await vi.waitFor(() => expect(root.querySelector(".tag-table-toggle")).not.toBeNull());
     const toggle = root.querySelector(".tag-table-toggle") as HTMLButtonElement | null;
     expect(toggle).not.toBeNull();
     toggle!.click();
     expect(readPageProperty("Tag", "tine.tag-table")).toBe("true");
 
-    await tick();
-    expect(root.textContent).toContain("Tagged row");
+    await vi.waitFor(() => expect(root.textContent).toContain("Tagged row"));
     expect(root.textContent).toContain("Martin");
     expect(runQuery).toHaveBeenCalledTimes(1);
 
     setDataRev((revision) => revision + 1);
-    await tick();
-    expect(runQuery).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(runQuery).toHaveBeenCalledTimes(2));
 
     (root.querySelector(".sheet-add-row-ghost") as HTMLButtonElement).click();
     await flushMicrotasks();
@@ -871,11 +881,15 @@ describe("tag-page table", () => {
     await tick();
     await flushMicrotasks();
     const samePerInvalidation: number[] = [];
+    // Finish the owned readiness promise chain before starting a measured
+    // revision; a fixed count of microtasks can include prior-revision work.
+    await new Promise(resolve => setTimeout(resolve, 0));
     for (let i = 0; i < INVALIDATIONS; i++) {
       runQuery.mockClear();
       setDataRev((revision) => revision + 1);
       await tick();
       await flushMicrotasks();
+      await new Promise(resolve => setTimeout(resolve, 0));
       samePerInvalidation.push(runQuery.mock.calls.length);
     }
     same.dispose();

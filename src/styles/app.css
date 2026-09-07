@@ -1938,6 +1938,8 @@ html[data-theme-journal-header="editorial"] .page-section.journal-today .page-ti
   color: var(--text-primary);
 }
 .tag-page-table {
+  position: relative;
+  min-height: 22px;
   margin: 8px 0 14px 28px;
   overflow-x: auto;
 }
@@ -8510,6 +8512,17 @@ img.emoji {
   margin: 0;
   background: transparent;
   transform: none;
+}
+
+/* Availability must not insert a row above an already-scrolled result list. */
+.query-readiness-status {
+  position: absolute;
+  inset-inline-end: 12px;
+  bottom: 2px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  pointer-events: none;
 }
 
 .agenda-block {

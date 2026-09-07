@@ -61,6 +61,7 @@ import { SheetBoard } from "./SheetBoard";
 import { SheetContainer } from "./SheetContainer";
 import type { PageKind, RefGroup } from "../types";
 import { sharedQueryResult } from "../queryResultCache";
+import { createReadyQueryResource } from "../createReadyQueryResource";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
@@ -919,12 +920,15 @@ export function QueryMacro(props: {
   // at 6e7afa8e: "exclude the current one, otherwise it'll loop forever"). Its
   // children are NOT removed; only the block itself. Applied once here, after
   // every fetch path, rather than in each of the three (GH #469).
-  const [groups] = createResource(
+  const [groupResource, groupsPending] = createReadyQueryResource(
     queryRequestKey,
     async (requestKey) => withoutHostBlock(await fetchGroups(requestKey), props.blockId),
   );
+  const groups = () => groupResource.error ? undefined : groupResource();
+  const emptyResultsMessage = () => groupsPending()?.message
+    ?? (groupResource.error ? "Query results unavailable" : groupResource.loading ? "Loading query results…" : "No results");
   const groupsError = () => {
-    const error = groups.error;
+    const error = groupResource.error;
     if (!error) return null;
     const message = error instanceof Error ? error.message : String(error);
     const oversized = message.startsWith("result-too-large:");
@@ -967,7 +971,7 @@ export function QueryMacro(props: {
     undefined,
     { equals: (before, after) => before?.key === after?.key },
   );
-  const [explained] = createResource(
+  const [explained, explanationPending] = createReadyQueryResource(
     explanationRequest,
     ({ reading }) => {
       const page = executionPage();
@@ -982,8 +986,10 @@ export function QueryMacro(props: {
    *  unsupported query has no counts to report, and an empty row list without
    *  its diagnostics would read as "every conjunct matches nothing" instead of
    *  "this query never ran" (I-9). */
-  const explainRows = (): EmptyExplanation[] => explained()?.rows ?? [];
+  const explainRows = (): EmptyExplanation[] => explained.error ? [] : explained()?.rows ?? [];
   const explainNotice = (): string | null => {
+    if (explanationPending()) return explanationPending()!.message;
+    if (explained.error) return explained.error instanceof Error ? explained.error.message : String(explained.error);
     const answer = explained();
     if (!answer) return null;
     const blocking = (answer.diagnostics ?? []).filter((d) => !d.disabled);
@@ -1329,6 +1335,9 @@ export function QueryMacro(props: {
                 </div>
               )}
             </Show>
+            <Show when={groupsPending() ?? explanationPending()}>
+              {(pending) => <span class="query-readiness-status" role="status">{pending().message}</span>}
+            </Show>
             {/* The run's OWN diagnostics. A query with an enabled diagnostic is
                 invalid and returns zero rows plus these (§3.5) — showing only
                 "No results" would report a broken query as an empty graph.
@@ -1427,7 +1436,7 @@ export function QueryMacro(props: {
                       <div class="query-search-results" role="list" aria-label="Search results" onClick={stop}>
                         <Show
                           when={searchPresentationHits().length > 0}
-                          fallback={<div class="query-empty">No results</div>}
+                          fallback={<div class="query-empty">{emptyResultsMessage()}</div>}
                         >
                           <For each={searchPresentationHits()}>
                             {(hit) => (
@@ -1545,13 +1554,14 @@ export function QueryMacro(props: {
                       fallback={
                         <Show when={!pageRows()?.length}>
                           <div class="query-empty">
-                            No results{" "}
+                            {emptyResultsMessage()}{" "}
                             {/* §7.5: zero results is the one moment a user most
                                 needs to know WHICH conjunct emptied the query,
                                 and the engine can already say. */}
                             <button
                               type="button"
                               class="query-why-empty"
+                              disabled={groupResource.loading || !!groupResource.error}
                               onClick={(e) => { e.stopPropagation(); setExplainOpen(!explainOpen()); }}
                             >
                               {explainOpen() ? "hide" : "why empty?"}
@@ -1667,7 +1677,7 @@ export function QueryMacro(props: {
                   </>
                 }
               >
-                <Show when={groups() && groups()!.length > 0} fallback={<div class="query-empty">No results</div>}>
+                <Show when={groups() && groups()!.length > 0} fallback={<div class="query-empty">{emptyResultsMessage()}</div>}>
                   <Show when={(sheet()?.view === "table" || sheet()?.view === "board") && props.blockId}>
                     <SheetContainer>
                       <Switch>

@@ -19,9 +19,18 @@ Wire classification, late answers, timer cleanup, source ABA, graph replacement,
 terminal failures and shared-consumer isolation are tested in
 `src/queryReadiness.test.ts`.
 
-Campaign integration is in progress: this primitive does not by itself wire
-native producers or UI query resources. RET2 must complete those consumers and
-remove production traversal before claiming readiness/recovery retirement.
+`createReadyQueryResource` binds that operation to Solid resource ownership,
+source revisions, `graphBinding`, graph root and graph transition state. Inline
+query results/Explain, workspace execution, and tag table/toggle reads use it.
+Existing successful rows remain mounted while availability is pending. Initial
+indexing is not presented as an empty result, and permanent errors are surfaced
+without throwing through the result renderer. Disabling/unmounting a resource
+aborts its retry owner. Component evidence lives in the corresponding Macro,
+Workspace, Page and resource tests.
+
+Campaign integration is still in progress: native availability producers,
+per-consumer native job cancellation, materialization/export selection and
+production traversal retirement remain required before RET2 acceptance.
 
 ## Command error boundary
 

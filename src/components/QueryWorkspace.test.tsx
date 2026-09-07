@@ -15,7 +15,7 @@ import {
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
 import { pageInventoryRev, setGraphMeta } from "../ui";
-import { backend, SaveConflictError } from "../backend";
+import { backend, QueryNotReadyError, QueryUnavailableError, SaveConflictError } from "../backend";
 
 afterEach(() => {
   clearTransientLayersForTest();
@@ -400,6 +400,21 @@ function text(root: HTMLElement, selector: string): string {
 }
 
 describe("QueryWorkspace", () => {
+  it("retries pending DSL queries automatically and surfaces permanent errors", async () => {
+    const route: QueryRoute = { kind: "query", id: "readiness", sourceKind: "dsl", source: "(task TODO)", presentation: "list" };
+    const deps = workspaceDeps();
+    vi.mocked(deps.runQuery).mockRejectedValueOnce(new QueryNotReadyError("indexing"))
+      .mockRejectedValue(new QueryUnavailableError("projection.failed", "The index could not be rebuilt."));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await vi.waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("Updating"));
+      await vi.waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("could not be rebuilt"));
+      expect(deps.runQuery).toHaveBeenCalledTimes(2);
+    } finally { dispose(); }
+  });
+
   it("peels a QueryBuilder child before its Advanced parent and preserves the draft", async () => {
     const route: QueryRoute = {
       kind: "query",

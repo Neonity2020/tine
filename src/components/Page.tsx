@@ -1,4 +1,5 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
+import { createReadyQueryResource } from "../createReadyQueryResource";
 import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, blockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
 import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, openInNewTab, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter, openRouteInOtherPane } from "../panes";
@@ -1098,18 +1099,18 @@ function taggedCount(groups: readonly RefGroup[] | undefined): number {
 }
 
 export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
-  const [groups] = createResource(
+  const [groups, pending] = createReadyQueryResource(
     () => (props.page.kind === "page" ? `${props.page.name}\0${dataRev()}` : null),
     (requestKey) => sharedTagQuery(props.page.name, requestKey)
   );
   const enabled = () => tagTableEnabled(props.page.name);
-  const visible = () => props.page.kind === "page" && (enabled() || taggedCount(groups()) > 0);
+  const visible = () => props.page.kind === "page" && (enabled() || pending() || groups.error || taggedCount(groups()) > 0);
   return (
     <Show when={visible()}>
       <button
         class="tag-table-toggle"
         classList={{ active: enabled() }}
-        title={enabled() ? "Hide tag table" : "Show tagged blocks as a table"}
+        title={groups.error ? String(groups.error) : pending()?.message ?? (enabled() ? "Hide tag table" : "Show tagged blocks as a table")}
         onClick={() => setPageProperty(props.page.name, TAG_TABLE_PROP, enabled() ? null : "true")}
       >
         ⊞ Table
@@ -1119,7 +1120,7 @@ export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
 }
 
 export function TagPageTable(props: { pageName: string }): JSX.Element {
-  const [groups] = createResource(
+  const [groups, pending] = createReadyQueryResource(
     () => `${props.pageName}\0${dataRev()}`,
     (requestKey) => sharedTagQuery(props.pageName, requestKey)
   );
@@ -1132,14 +1133,18 @@ export function TagPageTable(props: { pageName: string }): JSX.Element {
   };
   return (
     <div class="tag-page-table">
+      <Show when={pending()}>{error => <span class="query-readiness-status" role="status">{error().message}</span>}</Show>
+      <Show when={groups.error}>{error => <div role="alert">{String(error())}</div>}</Show>
+      <Show when={!groups.error && (!groups.loading || groups.latest)}>
       <SheetTable
         ownerId={`tag-page:${encodeURIComponent(props.pageName)}`}
         rowSource="query"
-        groups={groups() ?? []}
+        groups={groups.error ? [] : groups() ?? []}
         addRow={addRow}
         addRowLabel={`Add ${tagRef(props.pageName)} row`}
         schemaPage={props.pageName}
       />
+      </Show>
     </div>
   );
 }

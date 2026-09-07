@@ -21,7 +21,8 @@ import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { Block } from "./Block";
 import { initParser } from "../render/parse";
-import { backend, QueryPrintRefusedError } from "../backend";
+import { backend, QueryNotReadyError, QueryPrintRefusedError } from "../backend";
+import { setDataRev } from "../ui";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 import { blockProperty, doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import type { RefGroup } from "../types";
@@ -86,6 +87,44 @@ function load(raw: string, { readOnly = false }: { readOnly?: boolean } = {}): v
 const TQL_MACRO = "{{tine-query -- task TODO}}";
 
 describe("B1: a TQL block executes through query_run", () => {
+  it("automatically retries indexing without reporting an empty query", async () => {
+    load(TQL_MACRO);
+    let finish!: (value: ReturnType<typeof blockRunResult>) => void;
+    const answer = new Promise<ReturnType<typeof blockRunResult>>(resolve => { finish = resolve; });
+    const run = vi.spyOn(backend(), "queryRun")
+      .mockRejectedValueOnce(new QueryNotReadyError("indexing")).mockReturnValue(answer);
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(root.querySelector(".query-readiness-status")?.textContent).toContain("Updating"));
+      expect(root.querySelector(".query-empty")?.textContent).not.toContain("No results");
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+      finish(blockRunResult(groups()));
+      await vi.waitFor(() => expect(root.textContent).toContain("A tracked row"));
+      expect(root.querySelector(".query-readiness-status")).toBeNull();
+    } finally { dispose(); }
+  });
+
+  it("retains existing query group DOM during a pending refresh", async () => {
+    load(TQL_MACRO);
+    let finish!: (value: ReturnType<typeof blockRunResult>) => void;
+    const answer = new Promise<ReturnType<typeof blockRunResult>>(resolve => { finish = resolve; });
+    const run = vi.spyOn(backend(), "queryRun").mockResolvedValueOnce(blockRunResult(groups()))
+      .mockRejectedValueOnce(new QueryNotReadyError("pending_edits")).mockReturnValue(answer);
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(root.textContent).toContain("A tracked row"));
+      const group = root.querySelector(".query-group");
+      setDataRev(value => value + 1);
+      await vi.waitFor(() => expect(root.querySelector(".query-readiness-status")).not.toBeNull());
+      expect(root.querySelector(".query-group")).toBe(group);
+      expect(root.textContent).toContain("A tracked row");
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+      finish(blockRunResult(groups()));
+      await vi.waitFor(() => expect(root.querySelector(".query-readiness-status")).toBeNull());
+      expect(root.querySelector(".query-group")).toBe(group);
+    } finally { dispose(); }
+  });
+
   it("renders its rows, and hands the evaluator the IR rather than a printed string", async () => {
     load(TQL_MACRO);
     const run = vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
