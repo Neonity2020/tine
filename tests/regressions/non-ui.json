@@ -6656,5 +6656,206 @@
  },
  "notes": "Capability with a data-safety edge: a user who ticks `Don't show this again` on the query-crossing notice must not thereby write anything into the graph, and must not have the choice follow them to another device (I-18) -- while a second graph on the same device must still get its own answer. The dismissal set is stored in app-data as `sessions/<graph_storage_key>-notices.json`, keyed exactly the way `session_path`/`workspaces_path` key theirs (D-11), and written with `tine_core::model::atomic_write` rather than `fs::write` (D-7) -- the audited-write allowance in this file moves 3 -> 4 with the new save, which is the point of that allowance being a number. Three refusals are deliberate and each names an in-scope failure: a missing file, an unreadable file and a MALFORMED file all read as `{\"dismissed\":[]}` and write nothing back, so a truncated or externally corrupted device file costs the user a re-shown notice and never a refused save; the next ordinary dismissal repairs it. `load_workspaces_at`'s body is NOT reused (D-3/G2): it carries a migration this store has no history to migrate, and copying it would have imported a fallback that writes on read. The frontend reads the store at most once per graph epoch, so nothing here runs on a query or keystroke path (I-13), and a store that cannot be read leaves the notice SHOWING rather than silently suppressed."
 }
- ]
+ ,
+{
+   "id": "REG-HARVEST-RESIDUE-CAP-001",
+   "title": "The provider residue directory grew for the life of the graph and then refused the cleanup that wrote into it",
+   "family": "managed-storage-provider-transport",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest follow-up PVTI_lAHOAAbLVc4BhPsyzg47jbM, raised by wave-3 packet A2; invariants I-8, I-10, I-14, I-15"},
+   "platforms": ["all"],
+   "layer": "tine-core-provider-transport",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/wire.rs::tests::provider_removed_residue_retires_against_live_journal_state",
+     "crates/tine-core/src/oplog/wire.rs::tests::retired_provider_residue_still_reaches_the_same_outcome_for_an_exact_repeat",
+     "crates/tine-core/src/oplog/wire.rs::tests::a_crash_across_provider_residue_retirement_reopens_and_converges",
+     "crates/tine-core/src/oplog/wire.rs::tests::provider_residue_classification_covers_only_this_stores_own_diagnostics",
+     "crates/tine-core/src/oplog/wire.rs::tests::only_tests_can_write_a_provider_rename_retirement_diagnostic",
+     "crates/tine-core/src/oplog/wire.rs::tests::the_contract_carries_the_residue_bound_this_module_implements"
+    ],
+    "scenario": "managed-storage.provider-residue-bounded-by-live-journal-state",
+    "failBefore": "proven"
+   },
+   "notes": "`{inbox,outbox}/removed/` was capped at MAX_PROVIDER_RESIDUE_ENTRIES (512) and nothing ever retired an entry, so the cap was a bound on the LIFETIME of a shared, sync-replicated tree. The write that reached it first is the conflict-copy CLEANUP: remove_identical_generated_conflict writes one removed/retired-<operation id> diagnostic per sync-service conflict copy it cleans up, and Syncthing/Dropbox delivery produces those indefinitely on a busy multi-device graph, so past 512 cleanups the user kept every further conflict copy permanently with no way out from inside the app. removed/ is now bounded by live journal state the way the journal's own completed/ store is (docs/storage-sync-contract.md 2.10c-ii): before adding a diagnostic past PROVIDER_RESIDUE_COMPACTION_TRIGGER (128) the directory is swept, and an entry is retired when no journal record -- pending or completed -- still names its operation. The card blamed retire_frontier_head, which is #[cfg(test)] and cannot drive production growth; the mechanism was right and the exemplar was wrong. Second finding fixed in the same function: the capacity check walked the whole directory and per entry called open_provider_file_nofollow plus validate_provider_regular_file, up to 511 opens and 511 stats to answer 'is there room for one more' on a path the user waits on. Counting is now count-only and the no-follow regular-file check runs once per sweep instead. Fail-before: residue-cap-fail-before.log at b889fc08 with compaction disabled in reserve_provider_diagnostic_capacity -- 'cleanup 512 must never fail on residue capacity: provider rescan exceeded explicit bound'."
+  },
+{
+   "id": "REG-HARVEST-W5-CENSUS-001",
+   "title": "A Save the app reported successful left a store that refused to open on every later open",
+   "family": "managed-storage-local-drain-acceptance",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W5-census, queue card PVTI_lAHOAAbLVc4BhPsyzg48Dg8, raised by wave-3 packet A4; invariants I-8, I-10, I-11"},
+   "platforms": ["all"],
+   "layer": "tine-core-managed-local-drain",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::w5_census::w5_census_a_canonical_page_name_collision_is_settled_before_the_journal_append",
+     "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::w5_census::w5_census_an_undrained_local_burst_leaves_a_store_that_reopens_active",
+     "crates/tine-core/src/oplog/hot_engine.rs::validation_tests::w5_census_pins_every_acceptance_refusal_to_a_class"
+    ],
+    "scenario": "managed-storage.no-acceptance-only-refusal-for-a-drain-published-local-batch",
+    "failBefore": "necessity-census-1.txt at 37c9b22d (the fix backed out of prepare_page_name_updates)"
+   },
+   "notes": "The managed-local drain publishes a batch's manifest at stage ArchivePublication and only then offers it to the engine at EngineAcceptance, and replay treats a manifest-committed clean operation that does not validate as accepted as archive corruption. The run-local page-name ownership index was the one identity index the CommittedLocalOverlay did not carry -- portable paths and block claims were both layered over the accepted index, page names were not -- so a foreground draft evaluated page names against accepted history alone. Saving a page named \"Alpha\" and then, before the drain ran, a page named \"/Alpha\" (different exact name and different derived path, same canonical page-name key `alpha`) reported BOTH saves as Saved; the drain then met \"canonical page-name key is occupied at the declared dependency frontier\" after publishing the second manifest, the journal wedged at managed_local_pending=1, and every later open returned OpenRefused/clean_open.engine. Fixed by layering CommittedLocalOverlay::page_names under the accepted index inside the single producer (prepare_page_name_updates), exactly as portable_path_records_many already layers the overlay for portable paths, so the refusal is now raised at draft time before the journal append. The full class enumeration is the census table in the \"Acceptance-only refusals for drain-published local batches\" subsection of docs/storage-sync-contract.md; every other refusal on that path is U (a draft-time check is at least as strict) or S (an in-scope scenario the drain already recovers from)."
+  },
+{
+   "id": "REG-HARVEST-W5-SMALLS-ORPHAN-REFUSAL-001",
+   "title": "A stale orphan staging diagnostic refused the provider operation that owned it, forever",
+   "family": "managed-storage-provider-transport",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W5-smalls, from LANE-RESIDUE-receipt.md \u00a710 item 1; invariants I-8, I-10, I-14"},
+   "platforms": ["all"],
+   "layer": "tine-core-provider-transport",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/oplog/wire.rs::tests::a_stale_orphan_diagnostic_never_refuses_the_operation_that_owns_it",
+     "crates/tine-core/src/oplog/wire.rs::tests::an_orphan_diagnostic_leaked_by_the_cleanup_crash_window_is_retired_by_the_next_sweep",
+     "crates/tine-core/src/oplog/wire.rs::tests::reserving_removed_capacity_has_exactly_one_production_front_door",
+     "crates/tine-core/src/oplog/wire.rs::tests::only_tests_can_quarantine_a_raced_shared_provider_name"
+    ],
+    "scenario": "managed-storage.provider-orphan-diagnostic-never-refuses-its-own-operation",
+    "failBefore": "necessity-smalls-1.txt at 37c9b22d55d1a87bd0b2ea5b1cdc7f153a574a7a"
+   },
+   "notes": "quarantine_unowned_staging asked shared_diagnostic_name_is_taken whether removed/orphan-<operation id>-<generation> was occupied and returned UnsafeProviderEntry when a NON-EMPTY entry of that name existed. The name is built from the operation id whose transaction gate the caller holds, so the occupant is always named for the very operation being refused. Two honest ways it exists: a crash between the quarantine rename and cleanup_journal_staging's identity-matched delete, and an operation re-created from scratch at generation 0 while a stale generation-0 orphan was still in place. User outcome: a provider operation -- the shared-tree publish behind managed-storage sync -- refuses forever after a crash, or after a repeat, until an unrelated residue sweep happens to run past the trigger (128), which on a quiet removed/ may be never. This is the residue-cap defect's family one site over (REG-HARVEST-RESIDUE-CAP-001). The owner now retires its own stale entry through the same per-entry front door the sweep uses (retire_provider_residue_entry: no-follow regular validation, remove_file, directory fsync) and proceeds with the quarantine; the refusal branch was dead by construction of the name and is gone, so no refusal without a nameable in-scope scenario is left behind (I-8). Same packet: the retirement placeholder in reconcile_provider_retirement now reserves through the compacting front door reserve_provider_diagnostic_capacity instead of the non-compacting ensure_provider_diagnostic_capacity, guarded by a production source count, and the leak window the crash leaves is stated with its bound in docs/storage-sync-contract.md 2.10c-ii."
+  },
+{
+   "id": "REG-HARVEST-W6-EMPTY-GRAPH-ACTIVATION-001",
+   "title": "Turning on managed storage for a graph with no pages yet never finishes",
+   "family": "managed-storage-activation",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-11, I-12"},
+   "platforms": ["all"],
+   "layer": "tine-core-storage",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::managed_new_page_conflict_resolution_uses_the_identifiable_winner_path_and_revision",
+     "crates/tine-core/src/sync_runtime_tests.rs::concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantics",
+     "crates/tine-core/src/sync_runtime_tests.rs::concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions"
+    ]
+   },
+   "notes": "Measured on ab3de16d during the W6-red-corpus harvest. A graph that has logseq/config.edn and the ordinary directories but not one page file never leaves Retryable: SyncRuntimeHandle::activate_or_resume_local returns Retryable { durable_stage: Absent, detail: {\"kind\":\"clean-open\",\"reason_code\":\"clean_open.bootstrap_streaming_import\"} } and still returns it after 64 retries, which is the retry idiom the green w5_census fixtures use. The refusal is classified at crates/tine-core/src/sync_runtime.rs:1260 over crate::oplog::import::BootstrapStreamingImportError, so the real cause is in the bootstrap streaming import. Who reaches it, checked 2026-09-07: a graph CREATED inside Tine is not empty — src-tauri/src/graph.rs:1226 calls tine_core::onboarding::create_demo_graph, which writes logseq/config.edn, assets/quick-capture.png and 24 bundled guide pages, so the default first-run flow does NOT hit this. It is reached by a user who points Tine at an existing empty folder (the open path does no seeding) or by a user who has deleted every page. User outcome: that user switches on managed storage and sits on a retry that never completes; there is no error to act on because the state is Retryable, not Refused. Three convergence tests cannot even reach their scenario because their fixture never becomes LocalActive. Not fixed here: the fix is inside crates/tine-core/src/oplog/import.rs, outside this packet's write set."
+  },
+{
+   "id": "REG-HARVEST-W6-PROVIDER-PROJECTION-LIVENESS-001",
+   "title": "A page a peer created, edited, moved or deleted never appears in the receiving graph's Markdown",
+   "family": "managed-storage-provider-transport",
+   "sources": {"issues": [], "commits": ["9f24d985", "de7868c7"], "internal": "Harvest W6-red-corpus, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-11, I-12"},
+   "platforms": ["all"],
+   "layer": "tine-core-provider-transport",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::provider_create_projects_markdown_beside_a_concurrent_external_admission",
+     "crates/tine-core/src/sync_runtime_tests.rs::provider_edit_projects_markdown_beside_a_concurrent_external_admission",
+     "crates/tine-core/src/sync_runtime_tests.rs::provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_admission",
+     "crates/tine-core/src/sync_runtime_tests.rs::provider_delete_of_a_path_absent_from_the_receiver_converges",
+     "crates/tine-core/src/sync_runtime_tests.rs::foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement",
+     "crates/tine-core/src/sync_runtime_tests.rs::rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders",
+     "crates/tine-core/src/sync_runtime_tests.rs::two_offline_authors_union_frontier_heads_converge_without_return_first"
+    ]
+   },
+   "notes": "Measured on ab3de16d; causal chain verified 2026-09-07. Commit 9f24d985 (2026-08-31, \"retire detached bootstrap and Patricia stores\") deleted the reconciliation arm of Engine::validate_manifested_portable_path_binding (crates/tine-core/src/oplog/hot_engine.rs:15719-15761 today). Before it, a manifested portable-path index root that differed from the receiver’s candidate root was accepted when it could be reconstructed as \"accepted base + the publisher’s changes\" over the declared frontier bases. After it the function discards the frontier (let _ = frontier;) and returns EngineError::ProjectionManifest(\"projection intent portable-path index binding mismatch\") on ANY inequality. So a receiver whose portable-path index root has diverged from the publisher’s — through a concurrent external admission, an absent path, a rename referrer, or an offline branch — never projects that batch: every tick is RecoveryBlocked and the 1024-turn bounded budget is exhausted (I-10). These cases were added GREEN by de7868c7 (2026-08-18, \"always project an applied provider batch to Markdown\"), itself a durable data-visibility fix, with the binding check already present (0acfc0a7 / 33d8e67f, July), so this is that fix regressing. User outcome: a device that has edited a file the other device also touched stops receiving that page forever — the peer’s create, edit, move or delete is applied to the oplog but never written to the receiver’s Markdown, and the receiver spins doing provider work that never converges. The two-offline-authors case was probed on 2026-09-07: after both devices merge each other’s provider trees, BOTH tick RecoveryBlocked with the same detail and neither graph ever receives the other’s page. Not fixed here: what replaces the deleted Patricia reconstruction is a design question (D-14), and the fix is in crates/tine-core/src/oplog/hot_engine.rs, outside this packet’s write set."
+  },
+{
+   "id": "REG-HARVEST-W6-NEW-PAGE-NOT-LOADABLE-001",
+   "title": "A page that was just created cannot be opened",
+   "family": "managed-page-identity",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-11, I-12"},
+   "platforms": ["all"],
+   "layer": "tine-core-storage",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::new_markdown_and_org_pages_are_born_with_parsed_final_identity_at_selected_path"
+    ]
+   },
+   "notes": "Measured on ab3de16d. After creating a Markdown or Org page at a selected path, load_editor_page by page id fails with ActorRefusedAt(\"hot_source_path_missing\"): the runtime has the page id but cannot find the source path it just wrote. User outcome: the user creates a page and immediately cannot open it; the failure is a refusal, so the editor has an error rather than an empty page. Not fixed here: the fix is in the hot engine's source-path binding, crates/tine-core/src/oplog/hot_engine.rs and crates/tine-core/src/sync_runtime.rs, outside this packet's write set. Narrowed 2026-09-07: the failing scenarios all used a custom :pages-directory \"content/nested pages\" and :journals-directory \"diary\". Re-running the same helper with the DEFAULT layout (config {:preferred-format \"Markdown\"} only) reproduces the identical ActorRefusedAt(\"hot_source_path_missing\"), so this is NOT a custom-layout bug: a newly created page whose parsed identity moves it to a different final path cannot be opened by id afterwards in Managed mode, on any layout."
+  },
+{
+   "id": "REG-HARVEST-W6-DELETE-PAGE-REFUSED-001",
+   "title": "Deleting a page after resolving a conflict is refused",
+   "family": "managed-storage",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-11, I-12"},
+   "platforms": ["all"],
+   "layer": "tine-core-storage",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::managed_application_conflict_resolution_reauthors_retained_outline_at_one_observed_revision"
+    ]
+   },
+   "notes": "Measured on ab3de16d. Once a StaleBase application conflict has been resolved and the local drain has run, mutate_application_graph(DeletePage { name, page_kind, expected_path: Some(path) }) fails with ActorRefusedAt(\"delete_stale_page_target\"). The path passed as expected_path is the one the resolved page was just read back from. User outcome: after Tine resolves a save conflict for the user, deleting that page is refused, and the refusal names a stale target the user cannot see or clear. Not fixed here: the fix is in crates/tine-core/src/sync_runtime.rs, outside this packet's write set. Which side is stale, probed 2026-09-07: the NAME index. load_application_exact(path) returns the page with name \"Déjà 計画\", kind Page, path notes/層/žluťoučký/nested/Déjà 計画.md, while active_editor_name_state_for_format(\"Déjà 計画\", Page, preferred_format) at crates/tine-core/src/sync_runtime.rs:18403 answers EditorNameState::Missing for that same live page. With expected_path Some that lands on the delete_stale_page_target arm (sync_runtime.rs:18416). The same probe exposes a second facet: with expected_path None the request takes the \"retrying an already accepted unpinned delete is harmless\" arm (sync_runtime.rs:18413) and returns Ok(Applied) WITHOUT deleting the page — a delete that reports success and does nothing."
+  },
+{
+   "id": "REG-HARVEST-W6-FOREGROUND-MOVE-UNBOUNDED-001",
+   "title": "Moving a subtree to another page does graph-wide work on the caller's thread",
+   "family": "managed-storage-performance",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-11, I-12"},
+   "platforms": ["all"],
+   "layer": "tine-core-storage",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::foreground_cross_page_move_is_bounded_and_does_no_graph_wide_work"
+    ]
+   },
+   "notes": "Measured on ab3de16d. move_application_subtrees commits successfully, but the managed application save instrumentation records forbidden work performed between the pre-move and post-move reads: after.forbidden.since(before.forbidden) is not None. The contract is that a foreground cross-page move is bounded by the subtree and does no graph-wide commit work at all, because it runs on the caller. User outcome: dragging a subtree onto another page costs time proportional to the whole graph rather than to what moved, so the operation stalls visibly on a large graph. Not fixed here: the commit path is in crates/tine-core/src/sync_runtime.rs and crates/tine-core/src/managed_query.rs, outside this packet's write set. Which counter fires, probed 2026-09-07: archive_object_reads = 6. sqlite_drains, projection_receipt_loads, graph_wide_catalog_decodes, graph_wide_catalog_validations and application_page_loads are all 0. The counters are production instrumentation of the fast-commit invariant: crates/tine-core/src/fast_commit.rs:130 forbidden_commit_work() / :134 note_forbidden, incremented by note_archive_object_read()."
+  },
+{
+   "id": "REG-HARVEST-W6-PROVIDER-CONFLICT-COPY-WEDGE-001",
+   "title": "A sync service’s conflict copy of a frontier head wedges shared sync permanently",
+   "family": "managed-storage-provider-transport",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus round 2, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-10, I-11"},
+   "platforms": ["all"],
+   "layer": "tine-core-provider-transport",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::frontier_head_conflicts_fall_back_and_preserve_unreconciled_bytes"
+    ]
+   },
+   "notes": "Measured on ab3de16d, 2026-09-07. When a file-sync service (Dropbox, Syncthing, iCloud) delivers a conflict copy of a frontier head whose bytes DIFFER from the canonical head — the archetypal in-scope sync-delivery scenario — every subsequent tick returns RecoveryBlocked(\"sync actor refused request: provider conflict copy differs from canonical generated evidence at frontier-heads-v1/<device>-<digest>.sync-conflict-<stamp>.head\") and the runtime never settles again. The contract this test asserts is that the runtime falls back to a scan and PRESERVES the unreconciled bytes; the bytes are in fact preserved, because the refusal is raised before any mutation, so this is an availability loss and not a data loss. A byte-IDENTICAL conflict copy is still retired correctly (the first half of the same test passes), so the conflict lane itself is live and only the differing-bytes fallback is missing. Not fixed here: the fix is in crates/tine-core/src/sync_runtime.rs, outside this packet’s write set."
+  },
+{
+   "id": "REG-HARVEST-W6-OUTBOUND-PAST-LOST-PARENT-001",
+   "title": "A child batch publishes past a lost causal parent, so a peer receives a batch whose parent exists nowhere",
+   "family": "managed-storage-provider-transport",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus round 2, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-10, I-11"},
+   "platforms": ["all"],
+   "layer": "tine-core-provider-transport",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::outbound_child_blocks_when_ordinary_parent_is_lost"
+    ]
+   },
+   "notes": "Measured on ab3de16d, 2026-09-07, after removing the retired manifest-recovery steps from the fixture (2a578d87 retired those records, so their removal was a NotFound before this probe could run). With an ordinary parent batch’s manifest absent from BOTH the provider tree (inbox and outbox) and the local operation archive — ObjectStore::inspect_batch returns BatchInspection::Absent — the device still publishes the CHILD manifest into outbox/manifests and reaches Ok(Safe) on clean shutdown. Probe output: child_published=true, shutdown_err=false. Both halves of the scenario are in scope under the trust model: the provider-side loss is sync-service delivery or an external tool, the local-archive loss is a disk error. User outcome: a peer downloads a batch whose declared causal parent is on no device, so the peer’s replay of the shared graph is missing an ancestor it can never obtain. Not fixed here: the fix is in crates/tine-core/src/sync_runtime.rs, outside this packet’s write set."
+  },
+{
+   "id": "REG-HARVEST-W6-CLEAN-SHUTDOWN-PROVIDER-MUTATION-001",
+   "title": "Quitting right after a large sync delivery reports an unsafe shutdown even though nothing was lost",
+   "family": "managed-storage-shutdown",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus round 2, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-10, I-11"},
+   "platforms": ["all"],
+   "layer": "tine-core-storage",
+   "status": "reproduced",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/sync_runtime_tests.rs::oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it"
+    ]
+   },
+   "notes": "Measured on ab3de16d, 2026-09-07. After a provider callback larger than MAX_PROVIDER_EXACT_PATHS is rejected, the runtime correctly retains a rescan obligation, and clean shutdown DOES drain it — the probe confirms the delivered page is projected to the graph (page_projected=true). But clean_shutdown then returns Err(ActorRefused(\"clean shutdown received unexpected runtime progress: ProviderMutation { batch_id: ... }\")) instead of Ok(Safe). Cause: the drain loop at crates/tine-core/src/sync_runtime.rs:23286-23313 accepts only Idle, Recovering, AdmittedNoop, AdmittedComplete and two LocalMutation outcomes, and its catch-all arm refuses every other tick — including SyncRuntimeTick::ProviderMutation, the ordinary \"a remote batch applied\" tick that draining the retained scan is guaranteed to produce. User outcome: quitting Tine right after a large sync delivery records an unsafe shutdown, so the next launch pays an unsafe-reopen repair pass, even though every delivered page was applied. Not fixed here: the fix is in crates/tine-core/src/sync_runtime.rs, outside this packet’s write set."
+  },
+{
+   "id": "REG-HARVEST-W6-ACTIVATION-CAPTURE-RACE-BLOCKED-001",
+   "title": "A graph edited during managed activation is reported as unsafe input instead of retryable",
+   "family": "managed-storage-activation",
+   "sources": {"issues": [], "commits": [], "internal": "Harvest W6-red-corpus round 2, from RECEIPT.md bucket-C cards on base ab3de16d; invariants I-8, I-10, I-11"},
+   "platforms": ["all"],
+   "layer": "tine-core-storage",
+   "status": "reported",
+   "coverage": {"tests": []},
+   "notes": "Reported, not reproduced end-to-end: recorded 2026-09-07 while retiring the W6 red corpus, from source reading rather than a failing test (the tests that used to assert this contract were deleted — they asserted the pre-05db8c67 Direct-save admission walk, not this path). The two-pass initial shadow capture at crates/tine-core/src/model.rs:10593-10613 refuses with io::ErrorKind::Interrupted(\"managed inventory changed during initial shadow capture\") when its two passes disagree, which an external editor or a sync client writing into the graph can cause. On the DIRECT save path that refusal is retried four times and then surfaced as DirectSaveFailureCode::PrecheckInterrupted (model.rs:10643-10661), a retryable class. On the MANAGED activation path it is not: oplog::import::inventory_initial_shadow (crates/tine-core/src/oplog/import.rs:2230-2252) maps every io error that is not a \"bound exceeded\" InvalidData to InventoryError::UnsafeEntry, which becomes ImportBlockReason::UnsafeInput (import.rs:4749) and ImportPlanStatus::Blocked. So a transient two-pass disagreement is reported to the user as unsafe INPUT — a permanent-shaped block naming their graph as the problem — rather than as a retryable interruption. No test asserts either shape today. Needs a card and a reproducing test; the fix would be in crates/tine-core/src/oplog/import.rs, outside this packet’s write set."
+  }
+]
 }

@@ -68,11 +68,21 @@ thing on both sides of the boundary:
 The retained class (b) channels are named, and each is off unless its own flag
 is set: `TINE_PHASE_TRACE`, `TINE_CRDT_TRACE`, `TINE_ACTIVATION_TRACE`,
 `TINE_BATCH_TRACE`, `TINE_PUBLISH_TRACE`, `TINE_SEMANTIC_TRACE`,
-`TINE_TERMINAL_TRACE`, `TINE_TICK_TRACE`, `TINE_CLEAN_WATCHER_TRACE`, and the
+`TINE_TICK_TRACE`, `TINE_CLEAN_WATCHER_TRACE`, and the
 `TINE_DEBUG`/`--debug` opt-in behind `runtime_debug_diagnostics_enabled()` /
 `debug_enabled()`. `crates/tine-core/src/oplog/projection.rs` holds the one class
 (b) line that renders graph bytes; it is legal only because that trace is off by
 default and explicitly requested.
+
+This paragraph is pinned in both directions by
+`directed_trace_flags_are_the_same_set_in_the_contract_and_in_the_census` in
+`crates/tine-core/tests/content_out_of_logs.rs` (I-11): the `TINE_*_TRACE` names
+here must be exactly the set the class (b) `gate:` fields of that file's
+allowlist carry, and every `TINE_*_TRACE` environment read in compiled
+`crates/tine-core/src` production source must be one of them. A directed trace
+flag is a contract row, not a free-text gate. The scan is core-only; src-tauri's
+directed channel is `debug_enabled()` behind `TINE_DEBUG`, which is pinned
+separately by `exactly_one_function_reads_the_debug_diagnostics_flag`.
 
 Class (d) rows are always-on, so each one names why its payload cannot carry
 content. The recurring proof is that a `std::io::Error`'s `Display` never

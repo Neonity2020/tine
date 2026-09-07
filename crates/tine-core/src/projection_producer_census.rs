@@ -911,9 +911,9 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "fs.create_dir_all",
             1,
         ),
-        // 4 → 5: `8eb922d8` ("prune reclaims ledger entries whose blob is gone")
-        // added the deliberate unlink in `prune` and did not re-pin, leaving this
-        // guard red on master. The delta is intended; the pin was stale.
+        // 5 since 8eb922d8 ("prune reclaims ledger entries whose blob is
+        // gone"): prune now retires a dangling entry and a corrupt entry as
+        // two separate named cases beside the three prior removals.
         (
             "crates/tine-core/src/concord_ledger.rs",
             "fs.remove_file",
@@ -1162,7 +1162,9 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/oplog/sqlite.rs", "open.create", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "open.create_new", 1),
         ("crates/tine-core/src/oplog/wire.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/oplog/wire.rs", "cap.remove_file", 9),
+        // 10 since ca9bd718 (W5-smalls): `retire_provider_residue_entry` is
+        // the single validated front door for retiring one `removed/` entry.
+        ("crates/tine-core/src/oplog/wire.rs", "cap.remove_file", 10),
         ("crates/tine-core/src/oplog/wire.rs", "cap.rename", 8),
         ("crates/tine-core/src/oplog/wire.rs", "file.set_len", 1),
         ("crates/tine-core/src/oplog/wire.rs", "fs.create_dir_all", 2),
@@ -1391,7 +1393,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("stage_object_bytes", 1),
         ("stage_manifest_bytes", 1),
         ("stage", 6),
-        ("commit", 6),
+        // 7 since W5-census: the run-local page-name overlay commits its own
+        // in-memory point transition (`local_overlay.page_names.commit`)
+        // alongside `ephemeral_page_names.commit`. Name-shared with the
+        // durable choke helper; no new durable write path.
+        ("commit", 7),
         ("publish_immutable", 6),
         ("install_staged_artifact", 1),
         ("replace_head", 0),

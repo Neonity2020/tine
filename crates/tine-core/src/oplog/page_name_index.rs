@@ -581,8 +581,20 @@ trait PageNameTransitionAccess {
     ) -> Result<ExactLogicalPageNameRefV1, StoreError>;
 }
 
+/// Layered read over the run-local page-name ownership index.
+///
+/// `overlay` is the journal-durable-but-not-yet-accepted prefix and `state` is
+/// the accepted index. Reads take the overlay first, exactly as
+/// `ShardedHotEngine::portable_path_records_many` layers the managed-local
+/// overlay over `ephemeral_portable_paths`: a foreground draft must see the
+/// names its own already-committed saves acquired, or a save the app reported
+/// successful is refused later at acceptance, after the drain published its
+/// manifest (I-10/I-8; see the W5-census section of docs/storage-sync-contract.md).
+/// The overlay is empty on the acceptance path, so acceptance keeps evaluating
+/// against accepted history alone.
 struct EphemeralPageNameTransitionAccess<'a> {
     state: &'a EphemeralPageNameOwnershipStateV1,
+    overlay: &'a EphemeralPageNameOwnershipStateV1,
     staged_exact_names: std::cell::RefCell<
         BTreeMap<(PageNameKeyDigest, ExactLogicalPageNameRefV1), LogicalPageName>,
     >,
@@ -605,9 +617,10 @@ impl PageNameTransitionAccess for EphemeralPageNameTransitionAccess<'_> {
         Ok(keys
             .iter()
             .filter_map(|key| {
-                self.state
+                self.overlay
                     .records
                     .get(key)
+                    .or_else(|| self.state.records.get(key))
                     .cloned()
                     .map(|record| (*key, record))
             })
@@ -625,6 +638,7 @@ impl PageNameTransitionAccess for EphemeralPageNameTransitionAccess<'_> {
             .borrow()
             .get(&lookup_key)
             .cloned()
+            .or_else(|| self.overlay.exact_names.get(&lookup_key).cloned())
             .or_else(|| self.state.exact_names.get(&lookup_key).cloned())
             .ok_or(StoreError::MissingExactLogicalPageNameBlob(
                 name_ref.content_digest,
@@ -991,6 +1005,7 @@ fn prepare_page_name_transition_core(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_ephemeral_page_name_transition(
     state: &EphemeralPageNameOwnershipStateV1,
+    overlay: &EphemeralPageNameOwnershipStateV1,
     batch_id: BatchId,
     causal_dot: BatchCausalDot,
     declared_frontier: &FrontierV2,
@@ -1003,6 +1018,7 @@ pub(crate) fn prepare_ephemeral_page_name_transition(
 ) -> Result<PageNamePublicationCandidateV1, PageNameTransitionError> {
     let access = EphemeralPageNameTransitionAccess {
         state,
+        overlay,
         staged_exact_names: std::cell::RefCell::new(BTreeMap::new()),
     };
     let candidate = prepare_page_name_transition_core(
@@ -1040,6 +1056,7 @@ pub(crate) fn prepare_ephemeral_page_name_transition(
                 let name = staged
                     .get(&lookup_key)
                     .cloned()
+                    .or_else(|| overlay.exact_names.get(&lookup_key).cloned())
                     .or_else(|| state.exact_names.get(&lookup_key).cloned())
                     .ok_or(StoreError::MissingExactLogicalPageNameBlob(
                         lookup_key.1.content_digest,

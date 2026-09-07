@@ -5946,6 +5946,13 @@ struct CommittedLocalOverlay {
     /// visible before background accepted-history expansion catches up.
     portable_paths: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
     portable_path_root: PortablePathIndexRoot,
+    /// Point deltas for the same journal-durable prefix in the run-local
+    /// page-name ownership index. Without it a foreground draft evaluates page
+    /// names against accepted history alone and cannot see the names its own
+    /// already-committed saves acquired — the blind spot that let a Save the
+    /// app reported successful be refused later at acceptance, after the drain
+    /// had published its manifest (I-10/I-8). Mirrors `portable_paths`.
+    page_names: EphemeralPageNameOwnershipStateV1,
     commitment: ContentDigest,
     work: Cell<ManagedLocalWork>,
 }
@@ -5970,6 +5977,7 @@ impl Default for CommittedLocalOverlay {
             block_claims: AHashMap::new(),
             portable_paths: BTreeMap::new(),
             portable_path_root: PortablePathIndexRoot::empty(),
+            page_names: EphemeralPageNameOwnershipStateV1::default(),
             commitment: ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0"),
             work: Cell::new(ManagedLocalWork::default()),
         }
@@ -7789,6 +7797,16 @@ impl ShardedHotEngine {
     /// visible. This is the background half of the clean foreground commit:
     /// no manifest is published here, and no secondary physical-index runtime
     /// is required.
+    ///
+    /// The drain has ALREADY published this batch's immutable manifest when it
+    /// calls here, and replay treats a manifest-committed clean operation that
+    /// does not validate as accepted as archive corruption. A refusal an
+    /// honestly drafted local batch can meet only here therefore turns a Save
+    /// the app reported successful into a store that refuses to open. Before
+    /// adding one, classify it in the "Acceptance-only refusals for
+    /// drain-published local batches" census in
+    /// `docs/storage-sync-contract.md` — U, S, or fixed — or
+    /// `w5_census_pins_every_acceptance_refusal_to_a_class` fails (I-8/I-10).
     pub(crate) fn accept_clean_prepared_below_managed_local_overlay(
         &mut self,
         prepared: &PreparedBatch,
@@ -8606,6 +8624,7 @@ impl ShardedHotEngine {
             || !self.local_overlay.document_heads.is_empty()
             || !self.local_overlay.block_claims.is_empty()
             || !self.local_overlay.portable_paths.is_empty()
+            || self.local_overlay.page_names != EphemeralPageNameOwnershipStateV1::default()
         {
             return Err(ManagedLocalRecordError::OutOfOrder {
                 expected: self.local_overlay.next_sequence,
@@ -8756,6 +8775,7 @@ impl ShardedHotEngine {
         self.local_overlay.block_claims.clear();
         self.local_overlay.portable_paths.clear();
         self.local_overlay.portable_path_root = PortablePathIndexRoot::empty();
+        self.local_overlay.page_names = EphemeralPageNameOwnershipStateV1::default();
         self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
         self.advance_author_mutation_generation();
         Ok(removed)
@@ -11726,10 +11746,35 @@ impl ShardedHotEngine {
                 .or_default()
                 .insert(claim);
         }
+        // The same point transition for the run-local page-name index. The
+        // foreground draft already refused a page-name conflict against
+        // accepted history layered under this overlay
+        // (`prepare_transaction_core`), so this cannot fire for an honestly
+        // drafted save; it is the in-scope re-proof for the one caller that
+        // did not go through that draft — `replay_managed_local_record`,
+        // which re-applies a journal record recovered after a crash or torn
+        // shutdown. Refusing here leaves the record un-applied and the store
+        // openable; the alternative is publishing a manifest whose page-name
+        // transition acceptance will reject (I-10/I-8).
+        let page_names = self
+            .managed_local_page_name_candidate(&record)
+            .map_err(ManagedLocalRecordError::Engine)?;
+        if page_names
+            .as_ref()
+            .is_some_and(|candidate| !candidate.conflicts.is_empty())
+        {
+            return Err(ManagedLocalRecordError::Engine(EngineError::InvalidTransaction(
+                "managed-local record would create a page-name conflict against the journal-durable prefix"
+                    .into(),
+            )));
+        }
         self.local_overlay.portable_path_root = portable_paths.root;
         self.local_overlay
             .portable_paths
             .extend(portable_paths.changed);
+        if let Some(candidate) = page_names {
+            self.local_overlay.page_names.commit(candidate);
+        }
         let entry_index = self.local_overlay.entries.len();
         self.local_overlay.entries.push(CommittedLocalOverlayEntry {
             sequence: record.sequence,
@@ -11780,6 +11825,38 @@ impl ShardedHotEngine {
             batch_id: manifest.batch_id(),
             pages: candidate.pages,
         })
+    }
+
+    /// The run-local page-name point transition for one managed-local record,
+    /// evaluated exactly as the foreground draft and the acceptance path
+    /// evaluate it: one producer, `prepare_page_name_updates`.
+    fn managed_local_page_name_candidate(
+        &self,
+        record: &ManagedLocalRecord,
+    ) -> Result<Option<PageNamePublicationCandidateV1>, EngineError> {
+        let manifest = record.prepared_batch.manifest();
+        let effect = &record.semantic_effect;
+        if effect.pages().is_empty() {
+            return Ok(None);
+        }
+        // A managed-local record's declared before-state is the current state
+        // by construction: `validate_managed_local_overlay_candidate` has
+        // already proved the manifest frontier equals the current hot
+        // frontier, so `exact_before` and `current` are the same observation.
+        let exact_before_pages = extract_semantic_page_name_observations(effect.pages(), false)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let prospective_pages = extract_semantic_page_name_observations(effect.pages(), true)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.prepare_page_name_updates(
+            manifest.batch_id(),
+            manifest.causal_dot(),
+            manifest.causal_dependency_heads(),
+            manifest.dependency_frontier(),
+            effect,
+            &exact_before_pages,
+            &exact_before_pages,
+            &prospective_pages,
+        )
     }
 
     fn validate_managed_local_overlay_candidate(
@@ -19628,59 +19705,7 @@ impl ShardedHotEngine {
         };
         let candidate = prepare_ephemeral_page_name_transition(
             &self.ephemeral_page_names,
-            batch_id,
-            causal_dot,
-            frontier,
-            exact_before,
-            effect.pages(),
-            current_pages.entries(),
-            prospective_pages.entries(),
-            contains,
-            frontier_for_batch,
-        );
-        candidate.map(Some).map_err(|error| match error {
-            PageNameTransitionError::Store(error) => EngineError::Archive(error.to_string()),
-            PageNameTransitionError::MalformedBatch(reason) => {
-                EngineError::InvalidTransaction(reason.into())
-            }
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_authored_page_name_updates(
-        &mut self,
-        batch_id: BatchId,
-        causal_dot: BatchCausalDot,
-        causal_dependency_heads: &[BatchId],
-        frontier: &FrontierV2,
-        effect: &SemanticEffect,
-        exact_before: &AuthoritativeCatalogPageNameObservationsV1,
-        current_pages: &AuthoritativeCatalogPageNameObservationsV1,
-        prospective_pages: &AuthoritativeCatalogPageNameObservationsV1,
-    ) -> Result<Option<PageNamePublicationCandidateV1>, EngineError> {
-        if effect.pages().is_empty() {
-            return Ok(None);
-        }
-        let candidate_clock =
-            self.derive_inline_causal_clock(causal_dot, causal_dependency_heads)?;
-        let contains = |dot: BatchCausalDot, introducing_batch: BatchId| {
-            candidate_clock
-                .binary_search_by_key(&dot.peer_id(), |(peer, _)| *peer)
-                .ok()
-                .is_some_and(|index| candidate_clock[index].1 >= dot.counter())
-                || introducing_batch == batch_id
-        };
-        let frontier_for_batch = |introducing_batch: BatchId| {
-            if introducing_batch == batch_id {
-                Some(frontier.clone())
-            } else {
-                self.load_observed_manifest(introducing_batch)
-                    .ok()
-                    .map(|manifest| manifest.dependency_frontier().clone())
-            }
-        };
-        let candidate = prepare_ephemeral_page_name_transition(
-            &self.ephemeral_page_names,
+            &self.local_overlay.page_names,
             batch_id,
             causal_dot,
             frontier,
@@ -26281,6 +26306,134 @@ pub(crate) mod validation_tests {
 
     use super::*;
     use crate::oplog::lazy_genesis::LazyGenesisBlockInput;
+
+    /// I-11 / I-8 — the acceptance-only refusal census is enforced, not
+    /// asserted in prose.
+    ///
+    /// The managed-local drain publishes a batch's manifest before the engine
+    /// accepts it, so a refusal an honestly drafted local batch can meet only
+    /// at acceptance turns a reported Save into a store that refuses to open
+    /// (the A4 shape; see
+    /// `specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md`). The
+    /// "Acceptance-only refusals for drain-published local batches"
+    /// subsection of `docs/storage-sync-contract.md` classifies every refusal
+    /// on that path as U (unreachable — a draft-time check is at least as
+    /// strict), S (an in-scope scenario, already recovered), or R (reachable,
+    /// and fixed). This test pins the census in both directions.
+    #[test]
+    fn w5_census_pins_every_acceptance_refusal_to_a_class() {
+        const HEADING: &str = "#### Acceptance-only refusals for drain-published local batches";
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        let engine = include_str!("hot_engine.rs");
+        let page_names = include_str!("page_name_index.rs");
+        let production = engine
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
+            .next()
+            .expect("hot_engine.rs has a production prefix");
+
+        let census = contract
+            .split(HEADING)
+            .nth(1)
+            .unwrap_or_else(|| panic!("I-11: the census subsection {HEADING:?} is gone"));
+        let census = census
+            .split("\n### ")
+            .next()
+            .expect("the census subsection is bounded by the next heading");
+
+        // Direction 1: every census row names a stem that still exists in
+        // production, and carries a class letter.
+        let mut rows = Vec::new();
+        for line in census.lines() {
+            let line = line.trim();
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let mut cells = line.trim_matches('|').split('|');
+            let stem = cells
+                .next()
+                .expect("a census row has a stem cell")
+                .trim()
+                .trim_matches('`')
+                .to_owned();
+            let class = cells
+                .next()
+                .expect("a census row has a class cell")
+                .trim()
+                .trim_matches('*')
+                .to_owned();
+            assert!(
+                matches!(class.as_str(), "U" | "S" | "R → fixed"),
+                "I-8: census row `{stem}` has class {class:?}; every refusal on this \
+                 path is U (a draft-time check is at least as strict), S (an in-scope \
+                 scenario that is already recovered), or R (reachable for an honest \
+                 local batch — which must be fixed, not documented)"
+            );
+            assert!(
+                production.contains(&stem) || page_names.contains(&stem),
+                "I-11: census row `{stem}` names a refusal that no longer exists in \
+                 hot_engine.rs or page_name_index.rs. Update the census in the same \
+                 change that removes or renames a refusal."
+            );
+            rows.push(stem);
+        }
+        assert!(
+            rows.len() >= 25,
+            "the census lost rows: {} remain, and the enumerated path has not shrunk",
+            rows.len()
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|stem| stem.contains(concat!("MAX_", "EPHEMERAL"))
+                    || stem.contains("fixed capacity")),
+            "I-8/I-10: a run-local capacity refusal reappeared on the acceptance path \
+             (A4-fix-dossier.md removed four of them)"
+        );
+
+        // Direction 2: every typed refusal the enumerated production regions
+        // can raise has a census row. The regions are the acceptance entry
+        // point and everything the drain reaches through it.
+        for region_name in [
+            "    pub(crate) fn accept_clean_prepared_below_managed_local_overlay(",
+            "    fn stage_ready_internal(",
+            "    fn drain_staged(",
+            "    fn validate_and_apply(",
+        ] {
+            let start = production.find(region_name).unwrap_or_else(|| {
+                panic!("I-11: the census names a production region that is gone: {region_name}")
+            });
+            let region = &production[start..];
+            let end = ["\n    fn ", "\n    pub fn ", "\n    pub(crate) fn "]
+                .into_iter()
+                .filter_map(|next| region[region_name.len()..].find(next))
+                .min()
+                .map_or(region.len(), |offset| offset + region_name.len());
+            let region = &region[..end];
+            let mut cursor = 0;
+            while let Some(offset) = region[cursor..].find("EngineError::") {
+                let at = cursor + offset + "EngineError::".len();
+                let variant: String = region[at..]
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                cursor = at + variant.len().max(1);
+                if variant.is_empty() {
+                    continue;
+                }
+                let stem = format!("EngineError::{variant}");
+                assert!(
+                    rows.iter().any(|row| *row == stem),
+                    "I-8: `{stem}` can be raised inside `{}` for a drain-published local \
+                     batch and has no census row. Every refusal on this path must state \
+                     which draft-time check makes it unreachable (U), which in-scope \
+                     scenario reaches it (S), or be fixed (R). Add the row to the \
+                     \"Acceptance-only refusals for drain-published local batches\" \
+                     subsection of docs/storage-sync-contract.md in the same change.",
+                    region_name.trim()
+                );
+            }
+        }
+    }
 
     fn validated_transition(
         engine: &ShardedHotEngine,

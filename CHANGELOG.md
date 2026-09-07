@@ -266,6 +266,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   name of but not the value — could panic while Tine gathered the evidence
   behind a linked reference.
 
+- **Two pages whose names differ only by punctuation or case no longer wedge a
+  Managed Storage graph.** Creating a page and then, before the background
+  save-settling caught up, creating a second page whose name folds to the same
+  key (`Alpha` and `/Alpha`, or `Foo` and `foo` at a different file path)
+  reported both saves as successful — and then left the graph unopenable, with
+  every later open refusing. The second save is now refused up front, while
+  nothing has been written, the same way it already is once the first save has
+  settled.
+- **A Managed Storage sync operation no longer gets stuck behind its own
+  leftover crash evidence.** If Tine lost power midway through tidying up after
+  publishing a file to the shared sync folder, it left behind a small record
+  named for that exact operation — and the next time the same operation ran, it
+  refused to start because that name was taken. The refusal could only clear
+  when an unrelated periodic sweep happened to run, which on a quiet graph might
+  be never. An operation now clears its own leftover record and carries on.
+
+- **Managed Storage keeps cleaning up sync conflict copies for the life of the
+  graph.** When a file-sync service delivered a conflict copy of a shared
+  provider file, Tine cleaned it up and kept one small record of what it had
+  removed — and never retired those records. After 512 of them, the cleanup
+  itself started refusing, so a busy multi-device graph accumulated conflict
+  copies it could no longer clear from inside the app. Those records are now
+  retired as soon as the operation they belong to is finished and forgotten, so
+  the directory tracks the graph rather than its history. Checking there is
+  room for one more also no longer opens and inspects every record already
+  there, which took up to 511 file opens on a path a save waits on.
+
 - **On Android, dark mode no longer blanks the notification bar.** Since 0.6.981
   the strip behind the status bar has been painted by the app window rather than
   the page, and it followed the phone's light/dark setting while the clock and

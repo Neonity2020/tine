@@ -67,6 +67,43 @@ pub const MAX_PROVIDER_RESCAN_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROVIDER_RESCAN_DEPTH: usize = 16;
 pub(crate) const SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE: &str = "clean-baselines-v1";
 pub const MAX_PROVIDER_RESIDUE_ENTRIES: usize = 512;
+
+/// The `{inbox,outbox}/removed/` entry count at which a provider operation
+/// compacts the residue directory against live journal state before adding one
+/// more diagnostic.
+///
+/// `removed/` holds two kinds of residue, and neither is history. A
+/// `retired-{operation id}` entry holds the bytes ONE completed rename or
+/// remove retired; once that operation's completed journal record has been
+/// compacted away (`PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER`), it is what
+/// an exact repeat settles from. An `orphan-{operation id}-{generation}` entry
+/// is an abandoned staging copy whose authority is the private journal blob,
+/// and nothing reads it as authority for anything.
+///
+/// Before this change nothing retired either kind, so the directory grew for
+/// the lifetime of the graph and `ensure_provider_diagnostic_capacity` refused
+/// every further write past `MAX_PROVIDER_RESIDUE_ENTRIES`. The write it
+/// refused is the conflict-copy CLEANUP: a busy multi-device graph ends up
+/// with sync-service conflict copies it can no longer clean up, and no way out
+/// from inside the app (I-10, I-14).
+///
+/// What compaction retires is decided by live journal state, never by age or
+/// arrival order: these names are hashes over the operation and its bytes, so
+/// the directory has no chronology and a time or count window over it could
+/// suppress the wrong operation's evidence. The trigger sits above the
+/// journal's own completed-store trigger because the two stores compact in
+/// lockstep: a diagnostic becomes retirable exactly when the completed record
+/// naming it has been retired, so the residue steady state tracks the journal
+/// steady state rather than the store's lifetime.
+pub const PROVIDER_RESIDUE_COMPACTION_TRIGGER: usize = 128;
+const _: () = assert!(
+    PROVIDER_RESIDUE_COMPACTION_TRIGGER > PROVIDER_JOURNAL_COMPLETED_COMPACTION_TRIGGER,
+    "residue compaction must leave room for every diagnostic the journal still pins"
+);
+const _: () = assert!(
+    PROVIDER_RESIDUE_COMPACTION_TRIGGER < MAX_PROVIDER_RESIDUE_ENTRIES,
+    "residue compaction must trigger strictly before the structural scan bound"
+);
 pub const MAX_PROVIDER_PATH_BYTES: usize = 512;
 pub const MAX_PROVIDER_JOURNAL_PENDING: usize = 4;
 pub const MAX_PROVIDER_JOURNAL_COMPLETED: usize = 16_384;
@@ -203,6 +240,62 @@ impl ProviderJournalCompaction {
     fn retired(self) -> usize {
         self.reflected.saturating_add(self.moot)
     }
+}
+
+/// What one sweep of `{inbox,outbox}/removed/` retired.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProviderResidueCompaction {
+    /// `retired-{operation id}` diagnostics no journal record names any more.
+    retirements: usize,
+    /// `orphan-{operation id}-{generation}` staging quarantines no journal
+    /// record names any more.
+    orphans: usize,
+}
+
+impl ProviderResidueCompaction {
+    #[cfg(test)]
+    fn retired(self) -> usize {
+        self.retirements.saturating_add(self.orphans)
+    }
+}
+
+/// What one entry in `{inbox,outbox}/removed/` is, and which operation id it
+/// belongs to.
+///
+/// The two recognized shapes are the two this store writes. Anything else —
+/// including the `{prefix}-{digest}` quarantine of FOREIGN bytes that took a
+/// name this device expected to own — is left alone by every sweep: the graph
+/// is not the authority for those bytes, so they are not ours to retire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderResidueEntry {
+    /// The bytes one completed rename or remove retired, named by that
+    /// operation's id.
+    Retirement(String),
+    /// An abandoned staging copy, named by its operation id and the staging
+    /// generation that abandoned it.
+    Orphan(String),
+}
+
+impl ProviderResidueEntry {
+    fn operation_id(&self) -> &str {
+        match self {
+            Self::Retirement(operation_id) | Self::Orphan(operation_id) => operation_id,
+        }
+    }
+}
+
+/// Classify one `removed/` entry name, or answer `None` for a name this store
+/// did not write.
+fn provider_residue_entry(name: &str) -> Option<ProviderResidueEntry> {
+    if let Some(operation_id) = name.strip_prefix("retired-") {
+        return valid_provider_journal_id(operation_id)
+            .then(|| ProviderResidueEntry::Retirement(operation_id.into()));
+    }
+    let (operation_id, generation) = name.strip_prefix("orphan-")?.rsplit_once('-')?;
+    (valid_provider_journal_id(operation_id)
+        && !generation.is_empty()
+        && generation.bytes().all(|byte| byte.is_ascii_digit()))
+    .then(|| ProviderResidueEntry::Orphan(operation_id.into()))
 }
 
 /// Why a completed provider-journal record no longer needs to exist.
@@ -3319,6 +3412,128 @@ impl ProviderRetryJournal {
         Ok(compaction)
     }
 
+    /// Does any journal record — pending or completed — still name this
+    /// operation?
+    ///
+    /// This is the whole residue-retirement predicate, and it is answered from
+    /// live journal state rather than from age: while a record for the
+    /// operation exists, `reconcile_provider_retirement` and
+    /// `validate_retired_source` read the `removed/` diagnostic it names, and
+    /// `load` reads pending and completed records alike.
+    fn operation_is_journalled(
+        &self,
+        gate: &ProviderTransactionGate,
+        operation_id: &str,
+    ) -> Result<bool, ScenarioError> {
+        self.require_transaction_gate(gate)?;
+        let record_name = Self::record_name(operation_id);
+        for directory in [&self.records, &self.completed] {
+            if open_provider_regular_optional(
+                directory,
+                &record_name,
+                MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+                &record_name,
+            )
+            .map_err(|_| ScenarioError::UnsafeProviderJournal(record_name.clone()))?
+            .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Retire every `removed/` diagnostic no journal record still names, and
+    /// report what was retired.
+    ///
+    /// This is the `{inbox,outbox}/removed/` half of the bound §2.10c-i states
+    /// for the journal's completed store, and it has the same shape for the
+    /// same reasons. Each entry is INDEPENDENTLY retirable and its retirement
+    /// is idempotent — a `remove_file` and a directory `fsync` — so a crash
+    /// part-way through leaves a prefix retired and the rest untouched, a
+    /// state the next sweep reaches again by itself. There is no mixed
+    /// generation to publish atomically and so no generation directory or
+    /// commit pointer.
+    ///
+    /// **Why "no record names it" is the right question.** A retirement
+    /// diagnostic exists to answer one question: did THIS device already
+    /// perform THIS exact operation? While the operation is in flight or its
+    /// completed record is retained, the record is the authority and the
+    /// diagnostic is what validates it. Once the record has been compacted
+    /// against live provider state, the diagnostic is a shortcut: an exact
+    /// repeat of a REMOVE whose source came back settles from it instead of
+    /// removing the returned copy again. Retiring the diagnostic gives up the
+    /// shortcut, not the outcome — the repeat then performs the ordinary
+    /// authorized removal it would have performed had this device never run
+    /// the operation, which is the same end state and, for the conflict-copy
+    /// cleanup that is this store's only production remove, the state the
+    /// caller actually wants (I-10). With the source gone the diagnostic is
+    /// read by nobody: a `RequirePresent` caller gets `UnknownProviderPath`
+    /// and a `SettleIfAbsent` caller settles, with or without it.
+    ///
+    /// **The rename caveat.** A retired RENAME is the one operation whose
+    /// diagnostic stays load-bearing after its record is gone: an exact repeat
+    /// settles from it in both provider states, and without it the repeat
+    /// either reports an unknown source path or conflicts with the
+    /// destination it published itself. Nothing in a production build writes
+    /// one — `run_provider_rename_with` is `#[cfg(test)]`, which
+    /// `only_tests_can_write_a_provider_rename_retirement_diagnostic` pins —
+    /// so no production `removed/` entry is a rename diagnostic. A production
+    /// rename writer may not be added without giving its diagnostic a
+    /// retention rule here.
+    fn reconcile_residue_against_journal(
+        &self,
+        gate: &ProviderTransactionGate,
+        namespace: &str,
+        removed: &Dir,
+    ) -> Result<ProviderResidueCompaction, ScenarioError> {
+        self.require_transaction_gate(gate)?;
+        let mut names = Vec::new();
+        let mut scanned = 0_usize;
+        for entry in removed.entries()? {
+            let entry = entry?;
+            scanned = scanned
+                .checked_add(1)
+                .ok_or(ScenarioError::ProviderRescanLimit)?;
+            if scanned > MAX_PROVIDER_RESCAN_ENTRIES {
+                return Err(ScenarioError::ProviderRescanLimit);
+            }
+            let name = entry.file_name().into_string().map_err(|_| {
+                ScenarioError::UnsafeProviderEntry(format!("{namespace}/non-UTF-8"))
+            })?;
+            if !entry.file_type()?.is_file() {
+                return Err(ScenarioError::UnsafeProviderEntry(format!(
+                    "{namespace}/{name}"
+                )));
+            }
+            names.push(name);
+        }
+        names.sort();
+        let mut compaction = ProviderResidueCompaction::default();
+        for name in names {
+            let Some(residue) = provider_residue_entry(&name) else {
+                continue;
+            };
+            if self.operation_is_journalled(gate, residue.operation_id())? {
+                // The no-follow regular-file check the capacity walk used to
+                // run on EVERY diagnostic write still runs here, once per
+                // sweep, on every entry this store owns — pinned ones included.
+                validate_provider_residue_entry(removed, namespace, &name)?;
+                continue;
+            }
+            let counter = match residue {
+                ProviderResidueEntry::Retirement(_) => &mut compaction.retirements,
+                ProviderResidueEntry::Orphan(_) => &mut compaction.orphans,
+            };
+            *counter = counter
+                .checked_add(1)
+                .ok_or(ScenarioError::ProviderRescanLimit)?;
+            retire_provider_residue_entry(removed, namespace, &name)?;
+            provider_journal_boundary_hook(ProviderJournalBoundary::ResidueRetired)?;
+        }
+        Ok(compaction)
+    }
+
     /// The current `completed/` entry count, read from names alone.
     fn completed_record_count(
         &self,
@@ -4213,7 +4428,7 @@ fn run_provider_remove_with(
         return journal.complete(&gate, provider, &record);
     }
     if record.phase == ProviderJournalPhase::Prepared {
-        ensure_provider_diagnostic_capacity(&removed, PROVIDER_REMOVED_NAMESPACE, 1)?;
+        reserve_provider_diagnostic_capacity(journal, &gate, PROVIDER_REMOVED_NAMESPACE, &removed)?;
         record.diagnostic_path = Some(format!(
             "{PROVIDER_REMOVED_NAMESPACE}/retired-{}",
             record.operation_id
@@ -4450,8 +4665,7 @@ fn quarantine_provider_name(
     removed: &Dir,
     prefix: &str,
 ) -> Result<(), ScenarioError> {
-    journal.require_transaction_gate(gate)?;
-    ensure_provider_diagnostic_capacity(removed, PROVIDER_REMOVED_NAMESPACE, 1)?;
+    reserve_provider_diagnostic_capacity(journal, gate, PROVIDER_REMOVED_NAMESPACE, removed)?;
     let source = open_provider_regular_optional(
         source_dir,
         source_name,
@@ -4496,37 +4710,103 @@ fn provider_quarantine_diagnostic_name(prefix: &str, source_name: &str, bytes: &
     format!("{prefix}-{:x}", digest.finalize())
 }
 
-fn ensure_provider_diagnostic_capacity(
-    directory: &Dir,
-    namespace: &str,
-    additional_entries: usize,
-) -> Result<(), ScenarioError> {
+/// The current `removed/` entry count, read from names alone.
+///
+/// Counting is all the capacity question needs. It used to be fused with a
+/// per-entry `open_provider_file_nofollow` plus `validate_provider_regular_file`
+/// — up to 512 opens and 512 stats to answer "is there room for one more", on
+/// a path the user waits on (I-13, I-15) — and those two questions have
+/// different answers and different homes. The no-follow regular-file check is
+/// real work, and it now runs where it is used: once per sweep in
+/// `reconcile_residue_against_journal`, and on the exact entry every reader
+/// opens through `open_provider_regular_optional`. Validating 511 unrelated
+/// diagnostics tells the 512th write nothing, and the write itself is
+/// no-clobber, so a hostile sibling cannot be published over.
+fn provider_residue_entry_count(directory: &Dir) -> Result<usize, ScenarioError> {
     let mut entries = 0_usize;
     for entry in directory.entries()? {
-        let entry = entry?;
+        entry?;
         entries = entries
             .checked_add(1)
             .ok_or(ScenarioError::ProviderRescanLimit)?;
-        if entries
-            .checked_add(additional_entries)
-            .is_none_or(|entries| entries > MAX_PROVIDER_RESIDUE_ENTRIES)
-        {
+        // Bounded by the provider-tree scan bound, NOT by the residue cap: a
+        // directory that is already over the cap — left by a build that never
+        // swept, or grown by foreign delivery — must still be countable, or
+        // the sweep that would bring it back under could never run (I-10).
+        if entries > MAX_PROVIDER_RESCAN_ENTRIES {
             return Err(ScenarioError::ProviderRescanLimit);
         }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| ScenarioError::UnsafeProviderEntry(format!("{namespace}/non-UTF-8")))?;
-        if !entry.file_type()?.is_file() {
-            return Err(ScenarioError::UnsafeProviderEntry(format!(
-                "{namespace}/{name}"
-            )));
-        }
-        let file = open_provider_file_nofollow(directory, &name)
-            .map_err(|error| ScenarioError::UnsafeProviderEntry(error.to_string()))?;
-        validate_provider_regular_file(&file, &format!("{namespace}/{name}"))?;
+    }
+    Ok(entries)
+}
+
+/// The no-follow regular-file check every reader of one `removed/` entry pays.
+///
+/// One question, one implementation: a diagnostic this store owns is a regular
+/// file reached without following a link, and anything else is refused by name
+/// and path rather than silently swept.
+fn validate_provider_residue_entry(
+    removed: &Dir,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ScenarioError> {
+    let file = open_provider_file_nofollow(removed, name)
+        .map_err(|error| ScenarioError::UnsafeProviderEntry(error.to_string()))?;
+    validate_provider_regular_file(&file, &format!("{namespace}/{name}"))?;
+    Ok(())
+}
+
+/// Retire ONE `removed/` entry: validate it, remove it, fsync the directory.
+///
+/// The single front door for retiring residue (D-14). The sweep uses it per
+/// entry, and `quarantine_unowned_staging` uses it on the one entry an earlier
+/// incarnation of the very operation it holds the gate for left behind — so
+/// that retirement cannot drift into a second, differently-validated copy of
+/// this three-step sequence.
+fn retire_provider_residue_entry(
+    removed: &Dir,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ScenarioError> {
+    validate_provider_residue_entry(removed, namespace, name)?;
+    removed.remove_file(name)?;
+    sync_shared_provider_directory(removed)
+}
+
+fn ensure_provider_diagnostic_capacity(
+    directory: &Dir,
+    additional_entries: usize,
+) -> Result<(), ScenarioError> {
+    if provider_residue_entry_count(directory)?
+        .checked_add(additional_entries)
+        .is_none_or(|entries| entries > MAX_PROVIDER_RESIDUE_ENTRIES)
+    {
+        return Err(ScenarioError::ProviderRescanLimit);
     }
     Ok(())
+}
+
+/// Make room in `removed/` by re-observing journal state, then check capacity.
+///
+/// Compact before reserving room, never refuse for want of it. Every entry in
+/// `removed/` is evidence for ONE finished operation, and every one of them is
+/// retirable as soon as no journal record names it, so reaching the trigger is
+/// an instruction to re-observe the journal, not a reason to fail the user's
+/// next cleanup (I-10). This is the exact shape `ProviderRetryJournal::complete`
+/// already uses for the completed store (§2.10c-i).
+fn reserve_provider_diagnostic_capacity(
+    journal: &ProviderRetryJournal,
+    gate: &ProviderTransactionGate,
+    namespace: &str,
+    removed: &Dir,
+) -> Result<(), ScenarioError> {
+    journal.require_transaction_gate(gate)?;
+    if provider_residue_entry_count(removed)?.saturating_add(1)
+        > PROVIDER_RESIDUE_COMPACTION_TRIGGER
+    {
+        journal.reconcile_residue_against_journal(gate, namespace, removed)?;
+    }
+    ensure_provider_diagnostic_capacity(removed, 1)
 }
 
 fn reconcile_provider_retirement(
@@ -4626,7 +4906,12 @@ fn reconcile_provider_retirement(
                 {
                     return Err(ScenarioError::UnsafeProviderEntry(source_path.into()));
                 }
-                ensure_provider_diagnostic_capacity(removed, PROVIDER_REMOVED_NAMESPACE, 1)?;
+                reserve_provider_diagnostic_capacity(
+                    journal,
+                    gate,
+                    PROVIDER_REMOVED_NAMESPACE,
+                    removed,
+                )?;
                 let placeholder = create_provider_destination_exclusive(
                     removed,
                     diagnostic_name,
@@ -5908,6 +6193,7 @@ fn cleanup_journal_staging(
         &record.operation_id,
         record.staging_generation,
     )?;
+    provider_journal_boundary_hook(ProviderJournalBoundary::StagingQuarantined)?;
     let diagnostic_name = format!(
         "orphan-{}-{}",
         record.operation_id, record.staging_generation
@@ -5972,16 +6258,30 @@ fn quarantine_unowned_staging(
 ) -> Result<(), ScenarioError> {
     journal.require_transaction_gate(gate)?;
     let removed = open_provider_directory(tree, PROVIDER_REMOVED_NAMESPACE)?;
-    ensure_provider_diagnostic_capacity(&removed, PROVIDER_REMOVED_NAMESPACE, 1)?;
+    reserve_provider_diagnostic_capacity(journal, gate, PROVIDER_REMOVED_NAMESPACE, &removed)?;
     let diagnostic_name = format!("orphan-{operation_id}-{generation}");
     if shared_diagnostic_name_is_taken(
         &removed,
         &diagnostic_name,
         &format!("{PROVIDER_REMOVED_NAMESPACE}/{diagnostic_name}"),
     )? {
-        return Err(ScenarioError::UnsafeProviderEntry(format!(
-            "{PROVIDER_REMOVED_NAMESPACE}/{diagnostic_name}"
-        )));
+        // An occupant of THIS name is ours, by construction of the name: it
+        // embeds the operation id whose transaction gate this caller holds. So
+        // there is no foreign-entry case to refuse here, and refusing would
+        // wedge the operation that owns the entry until an unrelated sweep
+        // happened to run (I-10). Two honest ways the occupant exists: a crash
+        // between the quarantine rename below and `cleanup_journal_staging`'s
+        // identity-matched delete, and an operation re-created from scratch at
+        // generation 0 while a stale generation-0 orphan still sits here.
+        //
+        // Retiring it is safe for the same reason quarantining is: `orphan-…`
+        // is RECONSTRUCTIBLE residue whose authority is the private journal
+        // blob, nothing reads it as authority for anything, and the operation
+        // id is a hash over the operation, its binding, its provenance, the
+        // paths and the source length and digest — so an entry named for our
+        // operation names our bytes, which we still hold. Route it through the
+        // one retirement front door the sweep uses (D-14).
+        retire_provider_residue_entry(&removed, PROVIDER_REMOVED_NAMESPACE, &diagnostic_name)?;
     }
     // RECONSTRUCTIBLE. Abandoned staging is a second copy of bytes whose
     // authority is the private retry-journal blob, and every caller deletes this
@@ -6074,6 +6374,13 @@ enum ProviderJournalBoundary {
     OrphanOwnershipRechecked,
     OrphanRestored,
     OrphanPrivateDeleted,
+    /// This operation's own abandoned staging copy was quarantined into
+    /// `removed/orphan-<operation id>-<generation>`, before the
+    /// identity-matched delete that normally removes it again in the same
+    /// call. Cutting here is the one honest way to reach a `removed/` entry
+    /// named for a LIVE operation, which is what the owner-retires-its-own
+    /// rule and the residue leak bound are both about (§2.10c-ii).
+    StagingQuarantined,
     RetirementPlaceholderDurable,
     RetirementExchangeDurable,
     RetirementPlaceholderQuarantined,
@@ -6084,6 +6391,11 @@ enum ProviderJournalBoundary {
     /// per retirement is what lets a test cut the compaction sweep in half and
     /// prove that a partly-swept journal reopens and converges.
     CompletionRetired,
+    /// One `{inbox,outbox}/removed/` diagnostic was retired against live
+    /// journal state. Firing per retirement is what lets a test cut the
+    /// residue sweep in half and prove that a partly-swept directory reopens
+    /// and converges.
+    ResidueRetired,
     RecordRemoved,
 }
 
@@ -6817,6 +7129,12 @@ fn provider_retire_original_into_placeholder(
 /// operation forever. A NON-EMPTY occupant is reported as occupied and left
 /// untouched: that is either a real quarantine copy or a file a sync service
 /// delivered, and neither may be destroyed.
+///
+/// What the caller does with "occupied" is the caller's question. For the
+/// `<prefix>-<digest>` quarantine of FOREIGN bytes it is a refusal. For
+/// `orphan-<operation id>-<generation>` it is not: that name is derived from
+/// the operation whose gate the caller holds, so the occupant is that
+/// operation's own stale residue and the caller retires it (§2.10c-ii).
 fn shared_diagnostic_name_is_taken(
     directory: &Dir,
     name: &str,
@@ -9121,6 +9439,571 @@ mod tests {
         run_provider_remove(&device, 12, ProviderTree::Inbox, "objects/removed-source").unwrap();
         assert!(!inbox.join("objects/removed-source").exists());
         assert_eq!(retained_dir_count(&completed_root), 1);
+    }
+
+    /// `{inbox,outbox}/removed/` is bounded by live journal state, never by
+    /// the lifetime of the graph.
+    ///
+    /// Before this packet nothing retired a `removed/` diagnostic, so
+    /// `MAX_PROVIDER_RESIDUE_ENTRIES` (512) was a LIFETIME bound on a shared,
+    /// sync-replicated tree — and the write that reached it first is the
+    /// conflict-copy CLEANUP. Past 512 cleanups the user kept every further
+    /// sync-service conflict copy, permanently, with no way out from inside
+    /// the app (I-10, I-14).
+    ///
+    /// This drives the production writer — `run_provider_remove_with` under
+    /// the `RequirePresent` policy, which is what
+    /// `SharedProviderTransport::remove_identical_generated_conflict` runs —
+    /// well past the cap, so the old refusal would have fired many times over
+    /// rather than been skirted.
+    #[test]
+    fn provider_removed_residue_retires_against_live_journal_state() {
+        let operations = MAX_PROVIDER_RESIDUE_ENTRIES + 64;
+        let root = ScenarioRoot::new().unwrap();
+        let device = retained_provider_device(&root.0);
+        let inbox = root.0.join("provider/inbox");
+        let removed_root = inbox.join(PROVIDER_REMOVED_NAMESPACE);
+        let mut peak_residue = 0_usize;
+
+        for index in 0..operations {
+            let path = format!("objects/conflict-{index}");
+            std::fs::write(
+                inbox.join(&path),
+                format!("residue cap conflict copy {index}"),
+            )
+            .unwrap();
+            run_provider_remove(&device, 21, ProviderTree::Inbox, &path).unwrap_or_else(|error| {
+                panic!("cleanup {index} must never fail on residue capacity: {error}")
+            });
+            assert!(
+                !inbox.join(&path).exists(),
+                "cleanup {index} must actually remove the conflict copy"
+            );
+            peak_residue = peak_residue.max(retained_dir_count(&removed_root));
+        }
+
+        let residue = retained_dir_count(&removed_root);
+        eprintln!(
+            "residue cap gate: {operations} conflict cleanups, peak removed/ {peak_residue}, \
+             final removed/ {residue}, trigger {PROVIDER_RESIDUE_COMPACTION_TRIGGER}, \
+             structural bound {MAX_PROVIDER_RESIDUE_ENTRIES}"
+        );
+        assert!(
+            residue <= PROVIDER_RESIDUE_COMPACTION_TRIGGER,
+            "{operations} cleanups left {residue} diagnostics, which is lifetime growth, \
+             not a steady state"
+        );
+        assert!(
+            peak_residue <= PROVIDER_RESIDUE_COMPACTION_TRIGGER,
+            "removed/ peaked at {peak_residue} diagnostics"
+        );
+        // The sweep must have actually run: `operations` diagnostics could not
+        // otherwise fit under the trigger.
+        assert!(peak_residue > 0);
+
+        // A reopen revalidates the whole authenticated journal graph against a
+        // compacted residue directory.
+        let device = retained_provider_device(&root.0);
+        let path = "objects/conflict-after-reopen";
+        std::fs::write(inbox.join(path), b"residue cap after reopen").unwrap();
+        run_provider_remove(&device, 21, ProviderTree::Inbox, path).unwrap();
+        assert!(!inbox.join(path).exists());
+    }
+
+    /// I-10: a residue directory that is ALREADY over the cap must have a way
+    /// back under it.
+    ///
+    /// A store upgraded from a build that never swept arrives with up to
+    /// `MAX_PROVIDER_RESIDUE_ENTRIES` diagnostics, and a foreign writer can put
+    /// more there. Counting therefore refuses only past the provider-tree scan
+    /// bound, not at the residue cap — otherwise the sweep that would bring the
+    /// directory back under the cap could never read it, and the cap would stay
+    /// terminal for exactly the stores that reached it.
+    #[test]
+    fn an_already_over_cap_residue_directory_sweeps_back_under_the_cap() {
+        let root = ScenarioRoot::new().unwrap();
+        let device = retained_provider_device(&root.0);
+        let inbox = root.0.join("provider/inbox");
+        let removed = inbox.join(PROVIDER_REMOVED_NAMESPACE);
+        let stranded = MAX_PROVIDER_RESIDUE_ENTRIES + 50;
+        for index in 0..stranded {
+            std::fs::write(
+                removed.join(format!("retired-{index:064x}")),
+                format!("stranded diagnostic {index}"),
+            )
+            .unwrap();
+        }
+        assert_eq!(retained_dir_count(&removed), stranded);
+
+        std::fs::write(inbox.join("objects/over-cap"), b"over cap conflict copy").unwrap();
+        run_provider_remove(&device, 51, ProviderTree::Inbox, "objects/over-cap").unwrap();
+        assert!(!inbox.join("objects/over-cap").exists());
+        assert_eq!(
+            retained_dir_count(&removed),
+            1,
+            "the sweep must retire every stranded diagnostic no journal record names"
+        );
+    }
+
+    /// Retiring a `removed/` diagnostic must not cost an exact repeat its
+    /// outcome. The answer moves from this device's own retirement evidence to
+    /// live provider state; the end state does not change.
+    #[test]
+    fn retired_provider_residue_still_reaches_the_same_outcome_for_an_exact_repeat() {
+        let bytes: &[u8] = b"retired residue bytes";
+        let root = ScenarioRoot::new().unwrap();
+        let device = retained_provider_device(&root.0);
+        let inbox = root.0.join("provider/inbox");
+        let removed = inbox.join(PROVIDER_REMOVED_NAMESPACE);
+        let completed_root = root.0.join("provider-local-journal/completed");
+        let journal = device.provider_journal.as_ref().unwrap();
+
+        std::fs::write(inbox.join("objects/residue-source"), bytes).unwrap();
+        run_provider_remove(&device, 31, ProviderTree::Inbox, "objects/residue-source").unwrap();
+        assert_eq!(retained_dir_count(&removed), 1);
+
+        // While the completed record still names it, the diagnostic is pinned:
+        // the record is what `validate_retired_source` reads.
+        let pinned = {
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_residue_against_journal(
+                    &gate,
+                    PROVIDER_REMOVED_NAMESPACE,
+                    &open_provider_directory(
+                        device.provider.tree(ProviderTree::Inbox),
+                        PROVIDER_REMOVED_NAMESPACE,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        assert_eq!(pinned.retired(), 0);
+        assert_eq!(retained_dir_count(&removed), 1);
+
+        // Once the completed record has been compacted against live provider
+        // state, nothing names the diagnostic and the sweep retires it.
+        {
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_completed_against_provider(&gate, &device.provider)
+                .unwrap();
+        }
+        assert_eq!(retained_dir_count(&completed_root), 0);
+        let compaction = {
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_residue_against_journal(
+                    &gate,
+                    PROVIDER_REMOVED_NAMESPACE,
+                    &open_provider_directory(
+                        device.provider.tree(ProviderTree::Inbox),
+                        PROVIDER_REMOVED_NAMESPACE,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        assert_eq!(compaction.retirements, 1);
+        assert_eq!(compaction.orphans, 0);
+        assert_eq!(retained_dir_count(&removed), 0);
+
+        // Source gone: the answer was never the diagnostic's to give. A
+        // caller that requires the source present gets the same unknown-path
+        // answer that policy gives for any absent source, and a caller that
+        // tolerates absence still settles.
+        assert!(matches!(
+            run_provider_remove(&device, 31, ProviderTree::Inbox, "objects/residue-source"),
+            Err(ScenarioError::UnknownProviderPath(path)) if path == "objects/residue-source"
+        ));
+        run_provider_remove_with(
+            &device.provider,
+            journal,
+            &device.name,
+            31,
+            ProviderTree::Inbox,
+            "objects/residue-source",
+            None,
+            ProviderRemoveMissingSourcePolicy::SettleIfAbsent,
+        )
+        .unwrap();
+
+        // Source back: the settle shortcut is gone with the diagnostic, so the
+        // exact repeat performs the ordinary authorized removal it would have
+        // performed had this device never run the operation. Same end state,
+        // and the state the conflict-copy cleanup actually wants.
+        std::fs::write(inbox.join("objects/residue-source"), bytes).unwrap();
+        run_provider_remove(&device, 31, ProviderTree::Inbox, "objects/residue-source").unwrap();
+        assert!(!inbox.join("objects/residue-source").exists());
+        assert_eq!(retained_dir_count(&removed), 1);
+    }
+
+    /// The residue sweep needs no generation directory or commit pointer:
+    /// every entry is independently retirable and its retirement is
+    /// idempotent, so a crash part-way through leaves a prefix retired and the
+    /// rest untouched — a state the next sweep reaches again.
+    #[test]
+    fn a_crash_across_provider_residue_retirement_reopens_and_converges() {
+        let root = ScenarioRoot::new().unwrap();
+        let device = retained_provider_device(&root.0);
+        let inbox = root.0.join("provider/inbox");
+        let removed = inbox.join(PROVIDER_REMOVED_NAMESPACE);
+        let journal = device.provider_journal.as_ref().unwrap();
+
+        for index in 0..2 {
+            let path = format!("objects/crash-residue-{index}");
+            std::fs::write(inbox.join(&path), format!("crash residue {index}")).unwrap();
+            run_provider_remove(&device, 41, ProviderTree::Inbox, &path).unwrap();
+        }
+        {
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_completed_against_provider(&gate, &device.provider)
+                .unwrap();
+        }
+        assert_eq!(retained_dir_count(&removed), 2);
+
+        {
+            let _fault =
+                install_provider_retry_boundary_fault_for_test(ProviderRetryBoundary::Remove(
+                    ProviderRetryFault::AtJournalBoundary(ProviderJournalBoundary::ResidueRetired),
+                ));
+            let gate = journal.acquire_transaction_gate().unwrap();
+            assert!(matches!(
+                journal.reconcile_residue_against_journal(
+                    &gate,
+                    PROVIDER_REMOVED_NAMESPACE,
+                    &open_provider_directory(
+                        device.provider.tree(ProviderTree::Inbox),
+                        PROVIDER_REMOVED_NAMESPACE,
+                    )
+                    .unwrap(),
+                ),
+                Err(ScenarioError::Io(ErrorKind::Other))
+            ));
+        }
+        assert_eq!(
+            retained_dir_count(&removed),
+            1,
+            "the crash cut the sweep after exactly one retirement"
+        );
+
+        // Crash/power cut: all process state is lost and only the on-disk
+        // provider tree and private journal survive.
+        drop(device);
+        let device = retained_provider_device(&root.0);
+        let journal = device.provider_journal.as_ref().unwrap();
+        let compaction = {
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_residue_against_journal(
+                    &gate,
+                    PROVIDER_REMOVED_NAMESPACE,
+                    &open_provider_directory(
+                        device.provider.tree(ProviderTree::Inbox),
+                        PROVIDER_REMOVED_NAMESPACE,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        assert_eq!(compaction.retirements, 1);
+        assert_eq!(retained_dir_count(&removed), 0);
+    }
+
+    /// The sweep retires only the two residue shapes this store writes.
+    ///
+    /// The `{prefix}-{digest}` quarantine holds FOREIGN bytes that took a name
+    /// this device expected to own; the graph is not their authority, so they
+    /// are not ours to retire.
+    #[test]
+    fn provider_residue_classification_covers_only_this_stores_own_diagnostics() {
+        let operation_id = "0".repeat(64);
+        assert_eq!(
+            provider_residue_entry(&format!("retired-{operation_id}")),
+            Some(ProviderResidueEntry::Retirement(operation_id.clone()))
+        );
+        assert_eq!(
+            provider_residue_entry(&format!("orphan-{operation_id}-3")),
+            Some(ProviderResidueEntry::Orphan(operation_id.clone()))
+        );
+        assert_eq!(
+            provider_residue_entry(&format!("destination-mismatch-{operation_id}")),
+            None
+        );
+        assert_eq!(
+            provider_residue_entry(&format!("retired-{operation_id}x")),
+            None
+        );
+        assert_eq!(
+            provider_residue_entry(&format!("orphan-{operation_id}-x")),
+            None
+        );
+        assert_eq!(
+            provider_residue_entry(&format!("orphan-{operation_id}")),
+            None
+        );
+    }
+
+    /// I-11: the residue sweep retires a retirement diagnostic as soon as no
+    /// journal record names it, which is safe for a REMOVE in either provider
+    /// state and is NOT safe for a rename — an exact repeat of a retired
+    /// rename settles from its diagnostic in both states. The bound that makes
+    /// this sound is that no production code writes a rename retirement
+    /// diagnostic, and that is compile-time structure, not intent.
+    #[test]
+    fn only_tests_can_write_a_provider_rename_retirement_diagnostic() {
+        let source = include_str!("wire.rs");
+        assert!(
+            source.contains("#[cfg(test)]\nfn run_provider_rename_with("),
+            "run_provider_rename_with must stay #[cfg(test)]: the residue sweep in \
+             reconcile_residue_against_journal retires unreferenced retirement diagnostics, \
+             and a production rename writer would need a retention rule first \
+             (docs/storage-sync-contract.md 2.10c-ii)"
+        );
+    }
+
+    /// The two load-bearing residue numbers are pinned in the contract that
+    /// states the bound, so the prose cannot drift away from the code.
+    #[test]
+    fn the_contract_carries_the_residue_bound_this_module_implements() {
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        for sentence in [
+            "`PROVIDER_RESIDUE_COMPACTION_TRIGGER` (128)",
+            "`MAX_PROVIDER_RESIDUE_ENTRIES` (512)",
+            "### 2.10c-ii",
+        ] {
+            assert!(
+                contract.contains(sentence),
+                "docs/storage-sync-contract.md must carry the residue-bound text {sentence:?}"
+            );
+        }
+        assert_eq!(PROVIDER_RESIDUE_COMPACTION_TRIGGER, 128);
+        assert_eq!(MAX_PROVIDER_RESIDUE_ENTRIES, 512);
+        assert!(
+            !contract.contains("Known neighbouring bound, not addressed here"),
+            "the residue bound is addressed now; the placeholder paragraph must be gone"
+        );
+    }
+
+    /// I-10: a `removed/orphan-…` entry named for an operation must never
+    /// refuse the operation that owns it.
+    ///
+    /// The name embeds the operation id whose transaction gate the quarantine
+    /// holds, so an occupant of it is always ours; refusing it wedged the
+    /// operation until an unrelated sweep happened to run past the trigger
+    /// (128), which on a quiet `removed/` may be never. The journey is the
+    /// honest one, end to end: a crash between the staging quarantine and its
+    /// identity-matched delete leaves the entry behind, the operation
+    /// finishes, the sync service deletes the published object, the completed
+    /// record is compacted against that state, and the exact repeat then
+    /// stages at generation 0 again — onto the stale entry.
+    #[test]
+    fn a_stale_orphan_diagnostic_never_refuses_the_operation_that_owns_it() {
+        let bytes: &[u8] = b"stale orphan collision bytes";
+        let object_path = format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(bytes)
+        );
+        let operation_id = generated_put_operation_id(&object_path, bytes);
+        let diagnostic_name = format!("orphan-{operation_id}-0");
+
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let outbox = provider_root.join("outbox");
+        let removed = outbox.join(PROVIDER_REMOVED_NAMESPACE);
+
+        let mut transport = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        {
+            let _fault = install_provider_retry_boundary_fault_for_test(
+                ProviderRetryBoundary::Put(ProviderRetryFault::AtJournalBoundary(
+                    ProviderJournalBoundary::StagingQuarantined,
+                )),
+            );
+            assert!(matches!(
+                transport.publish_object_exact(ContentDigest::of(bytes), bytes),
+                Err(ScenarioError::Io(ErrorKind::Other))
+            ));
+        }
+        assert!(
+            removed.join(&diagnostic_name).exists(),
+            "the crash cut between the quarantine rename and its identity-matched delete"
+        );
+
+        // Crash/power cut: only the on-disk provider tree and private journal
+        // survive. The operation finishes, and its record is then compacted
+        // against a provider the sync service has since emptied.
+        drop(transport);
+        let mut transport = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        transport
+            .publish_object_exact(ContentDigest::of(bytes), bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(outbox.join(&object_path)).unwrap(), bytes);
+        assert!(
+            removed.join(&diagnostic_name).exists(),
+            "the leaked entry outlives the operation; only the sweep retires it"
+        );
+        std::fs::remove_file(outbox.join(&object_path)).unwrap();
+        {
+            let journal = &transport.journal;
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_completed_against_provider(&gate, &transport.runtime)
+                .unwrap();
+        }
+        assert_eq!(retained_dir_count(&journal_root.join("completed")), 0);
+
+        // The exact repeat: a fresh record at generation 0, staging at
+        // generation 0 again, and the stale generation-0 orphan still in
+        // place. Pre fix this refused `UnsafeProviderEntry`, and every later
+        // repeat refused again.
+        transport
+            .publish_object_exact(ContentDigest::of(bytes), bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(outbox.join(&object_path)).unwrap(), bytes);
+        assert_eq!(
+            retained_dir_count(&removed),
+            0,
+            "the owner retired its own stale entry, then removed the fresh one it wrote"
+        );
+    }
+
+    /// I-14: the put path's `orphan-` leak is BOUNDED, and the sweep is the
+    /// bound.
+    ///
+    /// One crash window leaks at most one entry per (operation, staging
+    /// generation) — the name is deterministic and the write is no-clobber —
+    /// and the entry becomes retirable as soon as the record naming it is
+    /// compacted. Nothing else retires it, which is acceptable only because
+    /// every production writer of `removed/` reserves through the compacting
+    /// front door, so the directory cannot grow past the trigger unswept.
+    #[test]
+    fn an_orphan_diagnostic_leaked_by_the_cleanup_crash_window_is_retired_by_the_next_sweep() {
+        let bytes: &[u8] = b"leaked orphan sweep bytes";
+        let object_path = format!(
+            "{PROVIDER_OBJECTS_NAMESPACE}/{}.object",
+            ContentDigest::of(bytes)
+        );
+        let operation_id = generated_put_operation_id(&object_path, bytes);
+        let diagnostic_name = format!("orphan-{operation_id}-0");
+
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let outbox = provider_root.join("outbox");
+        let removed = outbox.join(PROVIDER_REMOVED_NAMESPACE);
+
+        let mut transport = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        {
+            let _fault = install_provider_retry_boundary_fault_for_test(
+                ProviderRetryBoundary::Put(ProviderRetryFault::AtJournalBoundary(
+                    ProviderJournalBoundary::StagingQuarantined,
+                )),
+            );
+            assert!(matches!(
+                transport.publish_object_exact(ContentDigest::of(bytes), bytes),
+                Err(ScenarioError::Io(ErrorKind::Other))
+            ));
+        }
+        drop(transport);
+        let mut transport = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        transport
+            .publish_object_exact(ContentDigest::of(bytes), bytes)
+            .unwrap();
+        assert_eq!(retained_dir_count(&removed), 1);
+
+        let removed_dir = || {
+            open_provider_directory(
+                transport.runtime.tree(ProviderTree::Outbox),
+                PROVIDER_REMOVED_NAMESPACE,
+            )
+            .unwrap()
+        };
+        // While a record still names the operation the entry is pinned: the
+        // sweep's predicate is live journal state, not age.
+        let pinned = {
+            let journal = &transport.journal;
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_residue_against_journal(
+                    &gate,
+                    PROVIDER_REMOVED_NAMESPACE,
+                    &removed_dir(),
+                )
+                .unwrap()
+        };
+        assert_eq!(pinned.retired(), 0);
+        assert!(removed.join(&diagnostic_name).exists());
+
+        // Once the record is compacted away, the next sweep retires it.
+        std::fs::remove_file(outbox.join(&object_path)).unwrap();
+        {
+            let journal = &transport.journal;
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_completed_against_provider(&gate, &transport.runtime)
+                .unwrap();
+        }
+        let compaction = {
+            let journal = &transport.journal;
+            let gate = journal.acquire_transaction_gate().unwrap();
+            journal
+                .reconcile_residue_against_journal(
+                    &gate,
+                    PROVIDER_REMOVED_NAMESPACE,
+                    &removed_dir(),
+                )
+                .unwrap()
+        };
+        assert_eq!(compaction.orphans, 1);
+        assert_eq!(retained_dir_count(&removed), 0);
+    }
+
+    /// D-14/I-14: `removed/` capacity has ONE front door.
+    ///
+    /// `reserve_provider_diagnostic_capacity` compacts before it reserves;
+    /// `ensure_provider_diagnostic_capacity` only refuses. A production writer
+    /// that calls the second directly reintroduces the lifetime cap this
+    /// module removed, on that one path. The guard is a source count rather
+    /// than a behavioural test because "no OTHER caller exists" is the claim.
+    #[test]
+    fn reserving_removed_capacity_has_exactly_one_production_front_door() {
+        let source = include_str!("wire.rs");
+        // Production source only: this module's own `#[cfg(test)] mod tests`
+        // names both helpers in prose and in this assertion.
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(source, |(before, _)| before);
+        assert_eq!(
+            production
+                .matches("ensure_provider_diagnostic_capacity(")
+                .count(),
+            2,
+            "D-14/I-14: `removed/` capacity has one front door, \
+             `reserve_provider_diagnostic_capacity`, which compacts against live journal \
+             state before it reserves. `ensure_provider_diagnostic_capacity` only refuses, \
+             so a second production caller reintroduces the store-lifetime cap on that path \
+             (docs/storage-sync-contract.md 2.10c-ii). Expected exactly its definition plus \
+             the one call in the body of `reserve_provider_diagnostic_capacity`."
+        );
+    }
+
+    /// I-11: the `<prefix>-<digest>` quarantine class has no production
+    /// writer, and that is compile-time structure rather than intent.
+    ///
+    /// The sweep never retires that class — those are FOREIGN bytes the graph
+    /// is not the authority for — so it contributes nothing to growth only
+    /// while nothing in a shipped binary writes one (§2.10c-ii).
+    #[test]
+    fn only_tests_can_quarantine_a_raced_shared_provider_name() {
+        let source = include_str!("wire.rs");
+        assert!(
+            source.contains("#[cfg(test)]\nfn quarantine_provider_name("),
+            "quarantine_provider_name must stay #[cfg(test)]: the residue sweep never retires \
+             the `<prefix>-<digest>` quarantine class, so a production writer would grow \
+             `removed/` without a retention rule (docs/storage-sync-contract.md 2.10c-ii)"
+        );
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
