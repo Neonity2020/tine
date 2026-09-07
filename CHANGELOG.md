@@ -98,6 +98,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **A `{{query (property …)}}` on a Direct Files graph no longer re-reads every
+  page to work out what its values mean.** Deciding whether `rank:: 007` is a
+  number or a word is a whole-graph question, and Tine answered it by walking
+  every loaded document each time it needed an answer, even though the same
+  facts already sit in the projection it keeps beside the graph. Once that
+  projection is ready the answer is read straight out of it; while it is still
+  being built — the first open, or the moment after a save — the old walk still
+  answers, so nothing waits on it. The values a query matches are unchanged, and
+  proved so: all three sources now build a byte-identical table on the same
+  graph.
+
 - **Tine now says when a query stops being readable by Logseq.** Some things
   you can build — grouping, column totals, typed comparisons like `cost > 100` —
   have no `{{query}}` spelling at all, and saving one has always rewritten the
@@ -240,17 +251,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   above it. The menu item works on any bullet, at any depth (GH #480).
 
 ### Changed
-
-- **A `{{query (property …)}}` on a Direct Files graph no longer re-reads every
-  page to work out what its values mean.** Deciding whether `rank:: 007` is a
-  number or a word is a whole-graph question, and Tine answered it by walking
-  every loaded document each time it needed an answer, even though the same
-  facts already sit in the projection it keeps beside the graph. Once that
-  projection is ready the answer is read straight out of it; while it is still
-  being built — the first open, or the moment after a save — the old walk still
-  answers, so nothing waits on it. The values a query matches are unchanged, and
-  proved so: all three sources now build a byte-identical table on the same
-  graph.
 
 - **Managed and Direct reference and query reads now share one evaluator per
   question, and a Managed navigation request loads its pending overlay at most
