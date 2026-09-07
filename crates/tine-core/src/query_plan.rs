@@ -27,6 +27,9 @@ const MAX_EVIDENCE_SPANS: usize = 32;
 thread_local! {
     static BLOCK_EVIDENCE_EVALUATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    // Count at the span-producing matcher, not merely at a public wrapper.
+    static TEXT_EVIDENCE_EVALUATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -769,6 +772,8 @@ fn eval_expr_fast(
 }
 
 fn match_text(plan: &QueryPlan, pred: &TextPredicate, original: &str) -> Option<MatchEvidence> {
+    #[cfg(test)]
+    TEXT_EVIDENCE_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
     match pred.mode {
         TextMatchMode::Contains | TextMatchMode::Phrase => {
             let spans = casefold_substring_spans(original, &pred.value);
@@ -1047,6 +1052,141 @@ impl BlockRelevance {
             - length_penalty
             - occurrence_penalty
     }
+
+    /// Lossless lexicographic sort key. ASCENDING byte order is EXACTLY
+    /// [`Self::cmp_quality`] reversed, i.e. best first, so a database that can
+    /// only `ORDER BY <blob> ASC` reproduces this module's ranking without
+    /// re-implementing it.
+    ///
+    /// [`Self::score`] is deliberately NOT encoded: it saturates offsets,
+    /// lengths and occurrence counts into one display `i32`, so two distinct
+    /// tuples can collide there. `cmp_quality` is the ordering authority and
+    /// all five of its components are carried here, in its own precedence
+    /// order, each at fixed width so whole-key byte comparison equals
+    /// component-wise comparison.
+    ///
+    /// `positive` is not a `cmp_quality` component and is not encoded; it is a
+    /// membership detail of [`block_relevance`]'s neutral-negation arm.
+    fn order_key(&self) -> [u8; BLOCK_RANK_KEY_LEN] {
+        let mut key = [0u8; BLOCK_RANK_KEY_LEN];
+        // Higher class rank is better, so the i32 encoding is inverted.
+        key[0..4].copy_from_slice(&descending_i32_key(self.match_class.rank()));
+        // `true` (a word-boundary match) is better, so the flag is inverted.
+        key[4] = u8::from(!self.word_boundary);
+        // The remaining three are "smaller is better" in `cmp_quality`, which
+        // ascending unsigned order already gives. In particular the existing
+        // rule that FEWER occurrences win is preserved, not reversed.
+        key[5..13].copy_from_slice(&ascending_usize_key(self.first_offset));
+        key[13..21].copy_from_slice(&ascending_usize_key(self.text_len));
+        key[21..29].copy_from_slice(&ascending_usize_key(self.occurrences));
+        key
+    }
+}
+
+/// Width of [`BlockRelevance::order_key`]: `cmp_quality`'s five components at
+/// fixed width -- class rank, boundary, first offset, UTF-16 text length,
+/// occurrences.
+const BLOCK_RANK_KEY_LEN: usize = 4 + 1 + 8 + 8 + 8;
+
+/// The key widens `usize` into `u64`. Every shipped target is 32- or 64-bit, so
+/// that widening is exact; this assertion is what makes "no truncation" a build
+/// failure rather than a comment if a wider target ever appears.
+const _: () = assert!(usize::BITS <= u64::BITS);
+
+/// Order-preserving big-endian `i32` encoding whose ASCENDING byte order is
+/// DESCENDING numeric order. Biasing by the sign bit makes negative values sort
+/// below positive ones; complementing then reverses the whole order.
+fn descending_i32_key(value: i32) -> [u8; 4] {
+    (!((value as u32) ^ (1u32 << 31))).to_be_bytes()
+}
+
+/// Order-preserving big-endian `usize` encoding: ascending byte order is
+/// ascending numeric order, exactly, including `usize::MAX`.
+fn ascending_usize_key(value: usize) -> [u8; 8] {
+    (value as u64).to_be_bytes()
+}
+
+/// Text-only block rank for a consumer that holds a block's exact visible text
+/// but no `Graph`, `Document` or `DocBlock` -- the seam the forthcoming SQLite
+/// adapter binds its `ORDER BY` to.
+///
+/// D-14, the existing-primitive rule: this is NOT a second matcher, parser or
+/// regex grammar. The searched-for existing implementations ARE the
+/// implementation here -- [`canonical_fold`] for the folded text,
+/// [`block_relevance`] / [`text_predicate_relevance`] for the tuple, the plan's
+/// already-compiled `regexes` map for regex predicates, and
+/// [`eval_ranked_block_expr`] for evidence. The bridge only admits text and
+/// re-encodes the existing tuple; it decides nothing about matching.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BlockTextRank {
+    relevance: BlockRelevance,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl BlockTextRank {
+    /// The BLOB sort key. Bind it as-is and `ORDER BY key ASC` for best first.
+    pub(crate) fn order_key(&self) -> [u8; BLOCK_RANK_KEY_LEN] {
+        self.relevance.order_key()
+    }
+
+    /// The same display score existing block hits carry. Display only: it
+    /// saturates, so it must never be the `ORDER BY` term.
+    pub(crate) fn score(&self) -> i32 {
+        self.relevance.score()
+    }
+
+    /// The same primary relevance band existing block hits carry.
+    pub(crate) fn match_class(&self) -> ObjectiveMatchClass {
+        self.relevance.match_class
+    }
+}
+
+/// Rank one block's exact visible text against a block branch, with no graph,
+/// document, page or traversal input at all.
+///
+/// `None` means the branch does not admit this text -- the same Boolean
+/// membership [`block_relevance`] already decides, including a successful NOT
+/// admitting on a neutral tuple, AND combining its positive children, and OR
+/// taking its best branch.
+///
+/// Selection is rank-only: no [`MatchEvidence`] spans and no `BlockDto` are
+/// constructed here. Physical page path and traversal index remain the
+/// equal-rank tie breakers and are the SQL adapter's to supply; they are
+/// deliberately not encoded in this text-only key. Page-name/alias ranking is
+/// likewise not covered by these five components.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn rank_block_text(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    visible: &str,
+) -> Option<BlockTextRank> {
+    if branch.target != QueryTarget::Blocks {
+        return None;
+    }
+    let lower = canonical_fold(visible);
+    block_relevance(plan, &branch.predicate, visible, &lower)
+        .map(|relevance| BlockTextRank { relevance })
+}
+
+/// Optional companion to [`rank_block_text`] for a consumer that has already
+/// admitted a row and now wants the reason. It calls the existing
+/// [`eval_ranked_block_expr`] on the admitted text and returns its existing
+/// [`MatchEvidence`] values verbatim -- same spans, same UTF-16 offsets, same
+/// best-branch OR choice, same empty evidence for a satisfied negation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn admitted_block_evidence(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    visible: &str,
+) -> Option<Vec<MatchEvidence>> {
+    if branch.target != QueryTarget::Blocks {
+        return None;
+    }
+    let lower = canonical_fold(visible);
+    #[cfg(test)]
+    BLOCK_EVIDENCE_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    eval_ranked_block_expr(plan, &branch.predicate, visible, &lower).map(|matched| matched.evidence)
 }
 
 #[derive(Debug)]
@@ -2719,5 +2859,473 @@ mod tests {
         assert!(execution.cancelled);
         assert!(execution.hits.is_empty());
         crate::test_support::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Block text rank bridge: the text-only seam a SQLite adapter binds
+    // its ORDER BY to. Ranking authority stays here; the adapter only
+    // sorts the bytes and supplies the equal-rank tie breakers.
+    // -----------------------------------------------------------------
+
+    fn relevance(
+        match_class: ObjectiveMatchClass,
+        word_boundary: bool,
+        first_offset: usize,
+        text_len: usize,
+        occurrences: usize,
+    ) -> BlockRelevance {
+        BlockRelevance {
+            match_class,
+            word_boundary,
+            first_offset,
+            text_len,
+            occurrences,
+            positive: true,
+        }
+    }
+
+    fn block_branch(plan: &QueryPlan) -> Option<&QueryBranch> {
+        plan.branches
+            .iter()
+            .find(|branch| branch.target == QueryTarget::Blocks)
+    }
+
+    /// Read the five components back out of the key, proving the encoding is
+    /// lossless rather than a hash of the tuple.
+    fn decode_rank_key(key: &[u8; BLOCK_RANK_KEY_LEN]) -> (i32, bool, usize, usize, usize) {
+        let class_rank =
+            ((!u32::from_be_bytes(key[0..4].try_into().unwrap())) ^ (1u32 << 31)) as i32;
+        let number = |at: usize| {
+            usize::try_from(u64::from_be_bytes(key[at..at + 8].try_into().unwrap())).unwrap()
+        };
+        (class_rank, key[4] == 0, number(5), number(13), number(21))
+    }
+
+    /// Fail-before gate. `score()` saturates offsets, lengths and occurrence
+    /// counts, so two objectively UNEQUAL tuples collide on it; ordering by the
+    /// display score would make their order arbitrary. The BLOB key must still
+    /// separate them, in the direction `cmp_quality` chose.
+    #[test]
+    fn rank_blob_separates_large_tuples_whose_display_score_collides() {
+        let collisions = [
+            // Both offsets are past the 50_000 penalty clamp.
+            (
+                relevance(ObjectiveMatchClass::Exact, true, 60_000, 0, 1),
+                relevance(ObjectiveMatchClass::Exact, true, 70_000, 0, 1),
+            ),
+            // Both lengths are past the 40_000 clamp.
+            (
+                relevance(ObjectiveMatchClass::Substring, false, 7, 40_001, 3),
+                relevance(ObjectiveMatchClass::Substring, false, 7, 900_000, 3),
+            ),
+            // Both occurrence counts are past the 9_999 clamp, and the existing
+            // rule that FEWER occurrences win is preserved.
+            (
+                relevance(ObjectiveMatchClass::Prefix, true, 0, 10, 10_001),
+                relevance(ObjectiveMatchClass::Prefix, true, 0, 10, 25_000),
+            ),
+            // The extreme: every component of the worse tuple is `usize::MAX`
+            // and every one of them still collapses into the same clamp.
+            (
+                relevance(ObjectiveMatchClass::Fuzzy, true, 50_001, 40_001, 10_000),
+                relevance(
+                    ObjectiveMatchClass::Fuzzy,
+                    true,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                ),
+            ),
+        ];
+        for (better, worse) in collisions {
+            assert_eq!(
+                better.score(),
+                worse.score(),
+                "the display score must actually collide for this gate to mean anything"
+            );
+            assert_eq!(better.cmp_quality(&worse), Ordering::Greater);
+            assert!(
+                better.order_key() < worse.order_key(),
+                "ascending BLOB order must still put the better tuple first"
+            );
+        }
+
+        // Sorting by the key alone, with no access to the tuple, recovers the
+        // order `cmp_quality` intended.
+        for (better, worse) in collisions {
+            let mut keys = [worse.order_key(), better.order_key()];
+            keys.sort();
+            assert_eq!(keys, [better.order_key(), worse.order_key()]);
+        }
+    }
+
+    /// The BLOB order is EXACTLY `cmp_quality` reversed at every component
+    /// boundary -- both saturation cliffs and `usize::MAX` -- in both
+    /// directions and on equality.
+    #[test]
+    fn rank_blob_order_is_cmp_quality_reversed_at_every_component_boundary() {
+        let classes = [
+            ObjectiveMatchClass::Exact,
+            ObjectiveMatchClass::Prefix,
+            ObjectiveMatchClass::Substring,
+            ObjectiveMatchClass::Fuzzy,
+            ObjectiveMatchClass::BodyEvidence,
+        ];
+        let offsets = [0usize, 1, 50_000, 50_001, usize::MAX];
+        let lengths = [0usize, 1, 40_000, 40_001, usize::MAX];
+        let counts = [0usize, 1, 2, 9_999, 10_000, usize::MAX];
+        let mut tuples = Vec::new();
+        for class in classes {
+            for word_boundary in [false, true] {
+                for &first_offset in &offsets {
+                    for &text_len in &lengths {
+                        for &occurrences in &counts {
+                            tuples.push(relevance(
+                                class,
+                                word_boundary,
+                                first_offset,
+                                text_len,
+                                occurrences,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(tuples.len(), 5 * 2 * 5 * 5 * 6);
+        let keys = tuples
+            .iter()
+            .map(BlockRelevance::order_key)
+            .collect::<Vec<_>>();
+        for (left_at, left) in tuples.iter().enumerate() {
+            for (right_at, right) in tuples.iter().enumerate() {
+                assert_eq!(
+                    keys[left_at].cmp(&keys[right_at]),
+                    right.cmp_quality(left),
+                    "ascending key order must be cmp_quality reversed for {left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    /// The key carries every component losslessly, and carries nothing else:
+    /// `positive` is a membership detail, not a `cmp_quality` component.
+    #[test]
+    fn rank_blob_is_lossless_and_ignores_the_non_ordering_positive_flag() {
+        let sample = relevance(ObjectiveMatchClass::Substring, true, 12_345, usize::MAX, 7);
+        let key = sample.order_key();
+        assert_eq!(key.len(), 29);
+        assert_eq!(
+            decode_rank_key(&key),
+            (
+                ObjectiveMatchClass::Substring.rank(),
+                true,
+                12_345,
+                usize::MAX,
+                7
+            )
+        );
+
+        let unbounded = relevance(ObjectiveMatchClass::Substring, false, 12_345, usize::MAX, 7);
+        assert_eq!(unbounded.order_key()[4], 1);
+        assert!(key < unbounded.order_key(), "a boundary match sorts first");
+
+        let mut negated = sample;
+        negated.positive = false;
+        assert_eq!(negated.order_key(), key);
+        assert_eq!(negated.cmp_quality(&sample), Ordering::Equal);
+    }
+
+    /// The point of a BLOB key is that the DATABASE does the sort. This binds
+    /// real bridge keys and lets SQLite's own `ORDER BY ... ASC` produce the
+    /// order, then checks it against the independent `cmp_quality`.
+    #[test]
+    fn sqlite_order_by_bound_rank_blobs_reproduces_the_ranked_order() {
+        let plan = QueryPlan::friendly("ready", 8, 8);
+        let branch = block_branch(&plan).expect("a bare term plans a block branch");
+        let texts = [
+            "ready",
+            "ready only",
+            "not ready yet",
+            "alreadyx",
+            "ready ready ready",
+            "a rather long line that only mentions ready quite late in its text",
+        ];
+
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE ranked (label TEXT NOT NULL, rank_key BLOB NOT NULL)",
+                [],
+            )
+            .unwrap();
+        for text in texts {
+            let rank = rank_block_text(&plan, branch, text)
+                .unwrap_or_else(|| panic!("{text:?} must match"));
+            connection
+                .execute(
+                    "INSERT INTO ranked (label, rank_key) VALUES (?1, ?2)",
+                    rusqlite::params![text, rank.order_key().to_vec()],
+                )
+                .unwrap();
+        }
+        let mut statement = connection
+            .prepare("SELECT label FROM ranked ORDER BY rank_key ASC")
+            .unwrap();
+        let ordered = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let reference = |text: &str| {
+            block_relevance(&plan, &branch.predicate, text, &canonical_fold(text)).unwrap()
+        };
+        let mut expected = texts.to_vec();
+        expected.sort_by(|left, right| reference(right).cmp_quality(&reference(left)));
+        assert_eq!(ordered, expected);
+        // Pin the ends so an accidentally uniform key cannot pass vacuously.
+        assert_eq!(ordered.first().map(String::as_str), Some("ready"));
+        assert_eq!(ordered.last().map(String::as_str), Some("alreadyx"));
+    }
+
+    /// Every compiled predicate shape, driven through the bridge on text alone
+    /// and through the existing evaluator on the same text.
+    #[test]
+    fn rank_bridge_reproduces_block_relevance_for_every_compiled_shape() {
+        let texts = [
+            "ready",
+            "🧠 foo ready",
+            "foo draft",
+            "ready only",
+            "regex ABC",
+            "abc ready foo abc",
+            "unrelated",
+            "",
+        ];
+        let plans = [
+            QueryPlan::friendly("ready", 8, 8),         // literal contains
+            QueryPlan::friendly("\"foo ready\"", 8, 8), // phrase
+            QueryPlan::friendly("/A[BC]+/", 8, 8),      // compiled regex
+            QueryPlan::friendly("foo ready", 8, 8),     // AND
+            QueryPlan::friendly("zzz OR ready", 8, 8),  // OR
+            QueryPlan::friendly("foo -draft", 8, 8),    // AND with NOT
+            QueryPlan::block_search("ready", 8),        // block-only plan
+            QueryPlan::block_search_literal("rdy", 8),  // fuzzy subsequence
+        ];
+        for plan in &plans {
+            let branch = block_branch(plan).expect("every plan here has a block branch");
+            for text in texts {
+                let expected =
+                    block_relevance(plan, &branch.predicate, text, &canonical_fold(text));
+                let actual = rank_block_text(plan, branch, text);
+                assert_eq!(
+                    actual.is_some(),
+                    expected.is_some(),
+                    "membership must not change for {text:?}"
+                );
+                if let (Some(actual), Some(expected)) = (actual, expected) {
+                    assert_eq!(actual.order_key(), expected.order_key());
+                    assert_eq!(actual.score(), expected.score());
+                    assert_eq!(actual.match_class(), expected.match_class);
+                }
+            }
+        }
+    }
+
+    /// The stronger check: the bridge, holding nothing but visible text, agrees
+    /// with what real graph-backed execution ranked those very blocks at --
+    /// including that its own `canonical_fold` reproduces the projection's
+    /// cached `visible_lower`.
+    #[test]
+    fn rank_bridge_agrees_with_executed_block_hits_over_real_projected_text() {
+        let (dir, graph) = fixture();
+        for query in [
+            "ready",
+            "foo ready",
+            "zzz OR ready",
+            "foo -draft",
+            "/A[BC]+/",
+            "\"foo ready\"",
+        ] {
+            let plan = QueryPlan::friendly(query, 10, 10);
+            let branch = block_branch(&plan).expect("every query here plans a block branch");
+            let hits = plan
+                .execute(&graph, || false)
+                .hits
+                .into_iter()
+                .filter_map(|hit| match hit {
+                    QueryHit::Block {
+                        display_text,
+                        score,
+                        match_class,
+                        ..
+                    } => Some((display_text, score, match_class)),
+                    QueryHit::Page { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(!hits.is_empty(), "{query} matched no block");
+            let mut previous: Option<[u8; BLOCK_RANK_KEY_LEN]> = None;
+            for (display_text, score, match_class) in hits {
+                let rank = rank_block_text(&plan, branch, &display_text)
+                    .unwrap_or_else(|| panic!("{query}: bridge rejected executed hit"));
+                assert_eq!(rank.score(), score, "{query}: {display_text:?}");
+                assert_eq!(rank.match_class(), match_class, "{query}: {display_text:?}");
+                let key = rank.order_key();
+                if let Some(previous) = previous {
+                    assert!(
+                        previous <= key,
+                        "{query}: executed order must be non-decreasing in the BLOB key"
+                    );
+                }
+                previous = Some(key);
+            }
+        }
+        crate::test_support::remove_dir_all(dir);
+    }
+
+    /// Casefold + NFC + UTF-16 offsets, computed from visible text alone. The
+    /// leading musical symbol is two UTF-16 units but one scalar, so a
+    /// char-counting encoder would report offset 2 rather than 3.
+    #[test]
+    fn rank_bridge_folds_unicode_and_counts_utf16_units() {
+        // Decomposed "CAFE" + combining acute; the parsed needle is precomposed.
+        let text = "\u{1D11E} CAFE\u{301} note";
+        let plan = QueryPlan::friendly("caf\u{e9}", 8, 8);
+        let branch = block_branch(&plan).expect("a bare term plans a block branch");
+        let rank = rank_block_text(&plan, branch, text)
+            .expect("casefold + NFC must admit the decomposed block text");
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Substring);
+        assert_eq!(
+            decode_rank_key(&rank.order_key()),
+            (ObjectiveMatchClass::Substring.rank(), true, 3, 13, 1)
+        );
+        assert_eq!(
+            text.chars().count(),
+            12,
+            "UTF-16 length is not the char count"
+        );
+
+        // The precomposed spelling folds to the same needle position and class;
+        // only `text_len` differs, because UTF-16 length is measured on the
+        // ORIGINAL visible text, exactly as the existing evaluator measures it.
+        let precomposed = "\u{1D11E} CAF\u{c9} note";
+        let composed_rank = rank_block_text(&plan, branch, precomposed)
+            .expect("the precomposed spelling matches the same needle");
+        assert_eq!(
+            decode_rank_key(&composed_rank.order_key()),
+            (ObjectiveMatchClass::Substring.rank(), true, 3, 12, 1)
+        );
+        assert!(
+            composed_rank.order_key() < rank.order_key(),
+            "the shorter original text is the better tuple"
+        );
+        assert!(rank_block_text(&plan, branch, "\u{1D11E} cafe note").is_none());
+    }
+
+    /// Selection is rank-only: it constructs no match evidence. The optional
+    /// accessor reproduces the existing evaluator's spans exactly, including
+    /// its BEST-branch OR choice, which is not the membership evaluator's
+    /// first-branch choice.
+    #[test]
+    fn rank_only_selection_builds_no_evidence_while_the_accessor_reproduces_it() {
+        let plan = QueryPlan::friendly("zzz OR ready", 8, 8);
+        let branch = block_branch(&plan).expect("an OR query plans a block branch");
+        let text = "ready and zzz";
+
+        let _ = take_block_evidence_evaluations();
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| count.set(0));
+        let rank = rank_block_text(&plan, branch, text).expect("both OR arms match");
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| {
+            assert_eq!(count.get(), 0, "selection must not construct text evidence");
+        });
+        assert_eq!(
+            take_block_evidence_evaluations(),
+            0,
+            "rank-only selection must not run the evidence evaluator"
+        );
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Prefix);
+
+        let evidence =
+            admitted_block_evidence(&plan, branch, text).expect("the admitted row has a reason");
+        assert_eq!(take_block_evidence_evaluations(), 1);
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| {
+            assert!(
+                count.get() > 0,
+                "the evidence counter must observe the matcher"
+            );
+        });
+        let reference =
+            eval_ranked_block_expr(&plan, &branch.predicate, text, &canonical_fold(text)).unwrap();
+        assert_eq!(evidence, reference.evidence);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].spans, vec![MatchSpan { start: 0, end: 5 }]);
+        assert_eq!(evidence[0].mode, TextMatchMode::Contains);
+
+        // Best branch, not first branch.
+        let first_branch = eval_expr(&plan, &branch.predicate, TextField::VisibleContent, text)
+            .expect("membership evaluator also admits");
+        assert_ne!(evidence[0].clause_id, first_branch.evidence[0].clause_id);
+    }
+
+    /// Boolean membership is preserved verbatim, including a satisfied
+    /// negation admitting on the neutral tuple with no evidence at all. Page
+    /// branches are deliberately out of scope: page-name/alias ranking is not
+    /// covered by these five block components.
+    #[test]
+    fn rank_bridge_preserves_neutral_negation_and_stays_out_of_page_ranking() {
+        let plan = QueryPlan::friendly("draft", 8, 8);
+        let source = block_branch(&plan).expect("a bare term plans a block branch");
+        let negated = QueryBranch {
+            target: QueryTarget::Blocks,
+            predicate: QueryExpr::Not(Box::new(source.predicate.clone())),
+            limit: source.limit,
+        };
+        let rank = rank_block_text(&plan, &negated, "ship it").expect("a satisfied NOT admits");
+        assert_eq!(
+            decode_rank_key(&rank.order_key()),
+            (ObjectiveMatchClass::Exact.rank(), true, 0, 0, 0)
+        );
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Exact);
+        assert_eq!(
+            admitted_block_evidence(&plan, &negated, "ship it"),
+            Some(Vec::new()),
+            "a successful negation contributes no positive evidence"
+        );
+        assert!(rank_block_text(&plan, &negated, "draft one").is_none());
+
+        let pages = plan
+            .branches
+            .iter()
+            .find(|branch| branch.target == QueryTarget::Pages)
+            .expect("friendly plans a page branch");
+        assert!(rank_block_text(&plan, pages, "draft").is_none());
+        assert!(admitted_block_evidence(&plan, pages, "draft").is_none());
+    }
+
+    /// There is no second regex grammar and no literal fallback behind the
+    /// bridge: a clause the plan never compiled matches nothing, and an
+    /// unparseable regex never reaches a branch at all.
+    #[test]
+    fn rank_bridge_has_no_fallback_for_an_uncompiled_regex_clause() {
+        assert!(QueryPlan::friendly("/(unclosed/", 8, 8).branches.is_empty());
+        let plan = QueryPlan::friendly("/A[BC]+/", 8, 8);
+        let branch = block_branch(&plan).expect("a valid regex plans a block branch");
+        assert!(rank_block_text(&plan, branch, "regex ABC").is_some());
+
+        let pred = match &branch.predicate {
+            QueryExpr::Text(pred) => pred.clone(),
+            other => panic!("a single regex term compiles to one text clause, got {other:?}"),
+        };
+        let uncompiled = QueryBranch {
+            target: QueryTarget::Blocks,
+            predicate: QueryExpr::Text(TextPredicate {
+                clause_id: pred.clause_id.wrapping_add(1_000),
+                ..pred
+            }),
+            limit: branch.limit,
+        };
+        assert!(rank_block_text(&plan, &uncompiled, "regex ABC").is_none());
+        assert!(admitted_block_evidence(&plan, &uncompiled, "regex ABC").is_none());
     }
 }
