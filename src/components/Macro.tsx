@@ -846,7 +846,7 @@ export function QueryMacro(props: {
    *  [:current-page]` is a focused-pane binding; an advanced form without it
    *  retains the owner page for `:query-page` compatibility. */
   const executionPage = () => (currentPageInput() ? focusedQueryPage() : currentPage());
-  const fetchGroups = async (requestKey: string): Promise<RefGroup[]> => {
+  const fetchGroups = async (requestKey: string, signal: AbortSignal): Promise<RefGroup[]> => {
     {
       const scope = sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
       const searchSource = friendlySearch();
@@ -863,6 +863,7 @@ export function QueryMacro(props: {
             `inline-query:${props.blockId ?? currentPage() ?? "global"}`,
             false
           ),
+          signal,
         );
         if (queryRequestKey() !== requestKey) return [];
         // The Search presentation renders these hits directly rather than the
@@ -899,6 +900,7 @@ export function QueryMacro(props: {
         scope,
         `ir\0${page ?? ""}\0${requestKey}`,
         () => backend().queryRun(reading.query, reading.view, page ? { current_page: page } : undefined),
+        signal,
       );
       // I-20: the user has edited since this run started; its answer is about a
       // query that is no longer on screen.
@@ -923,7 +925,7 @@ export function QueryMacro(props: {
   // every fetch path, rather than in each of the three (GH #469).
   const [groupResource, groupsPending] = createReadyQueryResource(
     queryRequestKey,
-    async (requestKey) => withoutHostBlock(await fetchGroups(requestKey), props.blockId),
+    async (requestKey, signal) => withoutHostBlock(await fetchGroups(requestKey, signal), props.blockId),
   );
   const groups = () => groupResource.error ? undefined : groupResource();
   const emptyResultsMessage = () => groupsPending()?.message

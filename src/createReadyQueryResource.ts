@@ -9,7 +9,7 @@ import { runQueryWhenReady } from "./queryReadiness";
  * Solid retains the previous successful value while its replacement is pending. */
 export function createReadyQueryResource<K, T>(
   source: () => K | undefined | null | false,
-  load: (key: K) => Promise<T>,
+  load: (key: K, signal: AbortSignal) => Promise<T>,
 ): [Resource<T>, Accessor<QueryNotReadyError | null>] {
   const [pending, setPending] = createSignal<QueryNotReadyError | null>(null);
   const root = createMemo(() => graphMeta()?.root);
@@ -31,7 +31,7 @@ export function createReadyQueryResource<K, T>(
   });
   onCleanup(() => request()?.controller.abort());
   const [result, { mutate }] = createResource(request, (current) => runQueryWhenReady(
-    () => load(current.key),
+    () => load(current.key, current.controller.signal),
     {
       signal: current.controller.signal,
       isCurrent: () => request() === current && graphBinding() === current.binding

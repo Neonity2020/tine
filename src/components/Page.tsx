@@ -1087,11 +1087,10 @@ function tagQuery(pageName: string): string {
   return `(tag ${quoteQueryString(pageName)})`;
 }
 
-function sharedTagQuery(pageName: string, requestKey: string): Promise<RefGroup[]> {
+function sharedTagQuery(pageName: string, requestKey: string, signal: AbortSignal): Promise<RefGroup[]> {
   const scope = sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
   return sharedQueryResult(scope, `page-tag\0${requestKey}`, () =>
-    backend().runQuery(tagQuery(pageName))
-  );
+    backend().runQuery(tagQuery(pageName)), signal);
 }
 
 function taggedCount(groups: readonly RefGroup[] | undefined): number {
@@ -1101,7 +1100,7 @@ function taggedCount(groups: readonly RefGroup[] | undefined): number {
 export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
   const [groups, pending] = createReadyQueryResource(
     () => (props.page.kind === "page" ? `${props.page.name}\0${dataRev()}` : null),
-    (requestKey) => sharedTagQuery(props.page.name, requestKey)
+    (requestKey, signal) => sharedTagQuery(props.page.name, requestKey, signal)
   );
   const enabled = () => tagTableEnabled(props.page.name);
   const visible = () => props.page.kind === "page" && (enabled() || pending() || groups.error || taggedCount(groups()) > 0);
@@ -1122,7 +1121,7 @@ export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
 export function TagPageTable(props: { pageName: string }): JSX.Element {
   const [groups, pending] = createReadyQueryResource(
     () => `${props.pageName}\0${dataRev()}`,
-    (requestKey) => sharedTagQuery(props.pageName, requestKey)
+    (requestKey, signal) => sharedTagQuery(props.pageName, requestKey, signal)
   );
   const addRow = async () => {
     const ok = await appendToTodayJournal(`${tagRef(props.pageName)} `);

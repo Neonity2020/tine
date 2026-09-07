@@ -15,6 +15,14 @@ AbortSignal, a captured monotonic request/binding revision check, and a pending
 status callback. Attempts and answers check ownership; stale/aborted requests
 never change a successor's status. Leaving one consumer does not cancel another
 consumer's shared attempt. Native job cancellation remains a separate obligation.
+`sharedQueryResult` accepts an optional subscriber signal and gives its loader
+one shared attempt signal. Leaving a subscriber releases only that subscription;
+the last departing subscriber aborts the shared signal unless an existing
+unsignalled metadata consumer still owns the load. Abandoned late answers cannot
+populate the memo or remove a newer same-key attempt. Graph scope changes govern
+cache reuse; they do not revoke unrelated subscribers. Native transport must use
+the shared attempt signal, never the first subscriber's signal. Inline and tag
+queries pass their resource's subscriber signal to this boundary.
 Wire classification, late answers, timer cleanup, source ABA, graph replacement,
 terminal failures and shared-consumer isolation are tested in
 `src/queryReadiness.test.ts`.
