@@ -14,6 +14,7 @@ import { SearchResultRow } from "./SearchResultRow";
 import { foldAggregate, groupRows, type AggDirective } from "../editor/queryAggregate";
 import { quoteEdnString, unquoteEdnString } from "../editor/edn";
 import { queryMacroExtents, QUERY_MACRO_NAMES } from "../editor/queryMacro";
+import { queryViewPropertyPatch } from "../editor/queryViewProperties";
 import {
   macroPrintDialect,
   macroTextDialect,
@@ -489,35 +490,41 @@ export function QueryMacro(props: {
    *  the six — so before this the frontend wrote the properties on a crossing
    *  only, `og_view` re-emitted `(aggregate …)`/`(group-by …)` back into OG text
    *  (a second home for the same value, which then outlived its removal in the
-   *  builder), and `tine.fields::`/`tine.view::` were written by nobody and lost
-   *  on every save. All six are now written on every save, to their current
-   *  value or to `null`, which is the §7.6 grammar the engine reads back in
-   *  `query_parse`'s precedence merge (§4.1).
+   *  builder), and `tine.columns::`/`tine.view::` were written by nobody and
+   *  lost on every save.
+   *
+   *  **The baseline is what the block's properties currently SPELL, not which
+   *  control the user touched** (P5A). The two readings differ exactly where it
+   *  matters: `og_view` re-emits only `(sort-by …)` and `(sample …)`, so a
+   *  grouping or an aggregate authored in the query TEXT is dropped by the
+   *  reprint of an unrelated filter edit, and only a property write keeps it.
+   *  Comparing against the persisted value materializes precisely those facts —
+   *  and a crossing to TQL, where the text keeps nothing at all, materializes
+   *  the whole effective view for the same reason.
    *
    *  Clearing is not cosmetic: `tine.*` has ABSOLUTE precedence over the DSL
    *  text, so a stale `tine.sort::` line would put a removed sort straight back
    *  on the next parse. And clearing a property the block never had is the
    *  identity on its bytes (`markdownRawWithProperty(raw, k, null)`), so an
-   *  ordinary query block gains no property lines it has no view for (I-4). */
+   *  ordinary query block gains no property lines it has no view for (I-4).
+   *
+   *  What it must NOT do is rewrite the block's other metadata. `tine.fields::`
+   *  is a TYPED SHEET SCHEMA, not a column list: writing the view's columns into
+   *  it destroyed a declared schema on every filter save. Columns now live in
+   *  `tine.columns::`, and the only time this writer touches `tine.fields` is to
+   *  retire a value PROVEN to be a pre-split bare column list, in the same undo
+   *  unit as the save that replaces it. The mapping itself is pure and shared
+   *  with the query table (`editor/queryViewProperties.ts`); the side effect
+   *  stays here, on the store's one property writer (D-7). */
   const writeViewProperties = (view: ViewSettings) => {
     const blockId = props.blockId;
     if (!blockId) return;
-    const sort = (view.sort ?? [])
-      .map(([field, dir]) => `${field} ${dir}`)
-      .join("; ");
-    setBlockProperty(blockId, "tine.sort", sort || null);
-    setBlockProperty(blockId, "tine.sample", view.sample == null ? null : String(view.sample));
-    setBlockProperty(blockId, "tine.group-by", view.group_by || null);
-    const aggregates = (view.aggregates ?? [])
-      // `["", "count"]` is the whole-result count; the §7.6 grammar spells it as
-      // a bare `count` segment with no `=` (X3).
-      .map(([field, fn]) => (field ? `${field}=${fn}` : fn))
-      .join(";");
-    setBlockProperty(blockId, "tine.col-aggregates", aggregates || null);
-    // `view.rs::parse_fields` / `parse_view_kind` — the two the reader consumes
-    // and nothing wrote.
-    setBlockProperty(blockId, "tine.fields", (view.columns ?? []).join(";") || null);
-    setBlockProperty(blockId, "tine.view", view.view ?? null);
+    const node = doc.byId[blockId];
+    if (!node) return;
+    const properties = facetsOf(node.raw, formatForBlock(blockId)).properties;
+    for (const [key, value] of queryViewPropertyPatch({ view, properties })) {
+      setBlockProperty(blockId, key, value);
+    }
   };
   // Edit the query's display title (:title "…" in the options map). Only offered
   // for a user-authored standalone query (blockId set, no app-supplied title).

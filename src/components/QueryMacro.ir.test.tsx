@@ -542,9 +542,12 @@ describe("B6: directive migration for blocks that stay {{query}}", () => {
     try {
       await saveThroughPane(root, "-- task DONE");
       await vi.waitFor(() => expect(blockProperty("query", "tine.view")).toBe("table"));
-      // `tine.fields::` and `tine.view::` are the two the reader consumes and
+      // `tine.columns::` and `tine.view::` are the two the reader consumes and
       // nobody wrote: before T4 a saved column set or view kind was simply lost.
-      expect(blockProperty("query", "tine.fields")).toBe("a;b");
+      // P5A moved the column set off `tine.fields`, which is the TYPED SCHEMA
+      // and is never written by a query save.
+      expect(blockProperty("query", "tine.columns")).toBe("a;b");
+      expect(blockProperty("query", "tine.fields")).toBeNull();
       expect(blockProperty("query", "tine.sort")).toBe("a desc");
       expect(blockProperty("query", "tine.group-by")).toBe("status");
       expect(blockProperty("query", "tine.col-aggregates")).toBe("hours=sum");
@@ -554,7 +557,7 @@ describe("B6: directive migration for blocks that stay {{query}}", () => {
       const properties = vi.mocked(backend().parseQuery).mock.calls.at(-1)![2] ?? [];
       const asMap = Object.fromEntries(properties);
       expect(asMap["tine.view"]).toBe("table");
-      expect(asMap["tine.fields"]).toBe("a;b");
+      expect(asMap["tine.columns"]).toBe("a;b");
     } finally {
       dispose();
     }

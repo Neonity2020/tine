@@ -865,7 +865,12 @@ fn list_of(value: &Value) -> Option<Vec<String>> {
 }
 
 /// The view directives OG can carry, in `toDsl`'s order. `None` means the view
-/// has something OG cannot say — more than one sort key, or a column set.
+/// has something OG cannot say, which is exactly one thing: more than one sort
+/// key. A COLUMN SET was never part of that answer — the code below has only
+/// ever returned `None` for `view.sort.len() > 1`, and columns have no OG text
+/// spelling at all in either direction (nothing parses one, nothing prints
+/// one). They live only in block properties, which is why `tine.columns::` can
+/// be added without narrowing `og_expressible` (P5A, F1).
 fn og_view(view: &ViewSettings) -> Option<Vec<String>> {
     if view.sort.len() > 1 {
         return None;

@@ -29,6 +29,7 @@ icon:: ▦
 	- 5. Press **Tab** after editing a cell to commit its value and move to the next cell.
 	- 6. What you should see: each child bullet becomes a row, and properties become editable table columns.
 	- 7. Under the hood: the block carries `tine.view:: table` (with optional `tine.fields::` to type columns and `tine.col-aggregates:: prop:estimate=sum` to total a numeric column in the footer). The ghost buttons write these for you.
+	- 8. `tine.fields::` says what a column IS — its name and its type. On a query table, `tine.columns::` says which columns are SHOWN, and in what order. They are separate lines because they answer separate questions: hiding a column never deletes its type, and typing a column never changes which ones you see.
 - ## Typed reading list
   tine.view:: table
   tine.fields:: status=enum:todo,reading,done;rating=number;done=checkbox;owner=ref
@@ -57,6 +58,7 @@ icon:: ▦
 	- 2. Keep the query in one block, then run `/Table` or `/Board` on that same block to view the results.
 	- 3. For a board, pick the column axis with the **Group by** dropdown (described in the board steps below).
 	- 4. What you should see: query results rendered as a live sheet view — the same demo tasks as in the table above — without copying the source blocks.
+	- 5. To show only some columns, and in your own order, add `tine.columns:: owner;estimate` to the query block. Names are plain property names, plus the built-ins `state`, `priority`, `scheduled`, `deadline`, `tags` and `page`. A column no result carries still gets its (empty) place, and the same choice is used when the page is published. Remove the line to go back to every column. A `tine.columns::` line that is empty, or that contains an `=`, means *no chosen columns* rather than a broken one — so clearing it cannot bring an old list back.
 - ### Create one yourself — board
 	- 1. On a block, type `/Board` and pick **Board** (`/Kanban` finds it too).
 	- 2. Choose the column axis with the **Group by** dropdown in the board header, or right-click and use **Group by →** to pick State, Tags, Priority, or any field.

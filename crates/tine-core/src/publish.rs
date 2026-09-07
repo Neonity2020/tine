@@ -1563,6 +1563,12 @@ struct SheetConfig {
     declared: Vec<SheetDecl>,
     /// `(name, expression)` formula columns in declared order.
     formulas: Vec<(String, String)>,
+    /// Which of those columns a QUERY-backed face shows, resolved by the ONE
+    /// column resolver (`query::view::resolve_query_columns`) rather than by a
+    /// second precedence written here. A children-backed sheet ignores it:
+    /// selecting visible columns is a query-face question, and ordinary sheets
+    /// keep their existing behaviour exactly.
+    columns: crate::query::view::QueryColumns,
 }
 
 /// One `tine.fields` declaration: its column, whether cells render as
@@ -1653,6 +1659,7 @@ fn sheet_config(props: &[(String, String)]) -> Option<SheetConfig> {
         aggregates: Vec::new(),
         declared: Vec::new(),
         formulas: Vec::new(),
+        columns: crate::query::view::resolve_query_columns(props),
     };
     let mut seen_declared: HashSet<String> = HashSet::new();
     let mut view: Option<SheetView> = None;
@@ -2219,8 +2226,33 @@ fn sheet_observed_fields(
     out
 }
 
+/// One `tine.columns` token as a sheet column (P5A). The six sheet builtins
+/// keep their identity; every other string is an ordinary property name, so it
+/// maps to `prop:<name>` HERE, at the renderer — the property bytes stay the
+/// bare name the author wrote, in both formats and in both languages.
+fn sheet_field_for_column(name: &str) -> SheetField {
+    match name {
+        "state" => SheetField::State,
+        "priority" => SheetField::Priority,
+        "scheduled" => SheetField::Scheduled,
+        "deadline" => SheetField::Deadline,
+        "tags" => SheetField::Tags,
+        "page" => SheetField::Page,
+        _ => SheetField::Prop(name.into()),
+    }
+}
+
 /// The static `columns` memo: title (implicit) + declared fields + formula
 /// fields + observed fields not already present — in that order.
+///
+/// A QUERY-backed face then applies the block's `tine.columns` selection over
+/// that list — **after** the schema/type lookup, so a selected column keeps the
+/// checkbox rendering and enum order its `tine.fields` declaration gave it, and
+/// a field definition is never lost merely because its column is not shown. A
+/// selected column that no row carries is kept and renders empty cells; the
+/// implicit title column and the row anchors are outside the selection and stay
+/// reachable. No selection (absent, or an explicit empty/invalid one) leaves the
+/// default column set exactly as it is today.
 fn sheet_columns(
     cfg: &SheetConfig,
     rows: &[SheetRow],
@@ -2245,7 +2277,26 @@ fn sheet_columns(
             out.push((field, false));
         }
     }
-    out
+    if !query_backed {
+        return out;
+    }
+    let crate::query::view::QueryColumns::Named(selection) = &cfg.columns else {
+        return out;
+    };
+    let mut selected: Vec<(SheetField, bool)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for column in selection {
+        let field = sheet_field_for_column(column.as_str());
+        let id = field.id();
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        match out.iter().find(|(known, _)| known.id() == id) {
+            Some((known, checkbox)) => selected.push((known.clone(), *checkbox)),
+            None => selected.push((field, false)),
+        }
+    }
+    selected
 }
 
 /// Rendered cell for one row/field: header-facet chrome for state/priority,
@@ -6470,6 +6521,179 @@ mod tests {
         );
         assert_eq!(html.matches("Schema menu polish").count(), 1, "{html}");
         assert!(!html.contains("tine.view::"), "view prop hidden: {html}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **A query's visible-column choice reaches the published page** (P5A).
+    ///
+    /// The static publisher is the THIRD consumer of the display-settings model
+    /// (the §4.1 property merge and the app's query table are the other two).
+    /// Before this it read only `tine.fields`, `=` required, so a column
+    /// selection rendered in the app and not in the export — the same note
+    /// showing two different tables. It now calls the SAME resolver, so the
+    /// precedence cannot drift.
+    #[test]
+    fn publish_query_table_shows_the_selected_columns_in_the_selected_order() {
+        let (dir, outdir) = publish_sheet_fixture(
+            "query-columns",
+            "{:preferred-workflow :todo}\n",
+            &[
+                (
+                    "QueryColumns.md",
+                    "public:: true\n\
+                     - # Query column cases\n\
+                     - {{query (property owner Avery)}}\n  \
+                       tine.view:: table\n  \
+                       tine.columns:: owner;shipped;absent\n  \
+                       tine.fields:: shipped=checkbox;status=text\n",
+                ),
+                (
+                    "Tracker.md",
+                    "public:: true\n\
+                     - Refresh Guide examples\n  \
+                       status:: active\n  \
+                       owner:: Avery\n  \
+                       shipped:: false\n",
+                ),
+            ],
+        );
+        let html = read_out(&outdir, "querycolumns.html");
+        let head = html.split("<thead>").nth(1).unwrap_or("");
+        let head = head.split("</thead>").next().unwrap_or("");
+        // Exactly the selected columns, in the selected order — `status` is
+        // declared and observed, and is deliberately NOT shown.
+        assert_eq!(
+            head, "<tr><th></th><th>owner</th><th>shipped</th><th>absent</th></tr>",
+            "selected columns, in order, after the implicit title column: {html}"
+        );
+        // Selection runs AFTER the schema lookup, so the checkbox TYPE declared
+        // in `tine.fields` still decides how the cell renders. Losing that is
+        // the "columns are not schema" defect in its other direction.
+        assert!(
+            html.contains("<td><span class=\"task-checkbox\"></span></td>"),
+            "shipped=checkbox keeps its declared type rendering: {html}"
+        );
+        // A selected column no row carries renders an EMPTY cell rather than
+        // vanishing, shifting its neighbours, or dropping the whole selection.
+        let body = html.split("<tbody>").nth(1).unwrap_or("");
+        let body = body.split("</tbody>").next().unwrap_or("");
+        let cells: Vec<&str> = body.split("<td>").skip(1).collect();
+        assert_eq!(cells.len(), 4, "one row, four cells: {body}");
+        let last = cells[3].split("</td>").next().unwrap_or("");
+        let text: String = last
+            .split('>')
+            .skip(1)
+            .map(|part| part.split('<').next().unwrap_or(""))
+            .collect();
+        assert!(
+            text.trim().is_empty(),
+            "the absent column's cell carries no value: {last:?} in {body}"
+        );
+        assert!(!html.contains("tine.columns::"), "config is chrome: {html}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The legacy branch, in the publisher: a note authored before the split
+    /// carries its column list in a BARE `tine.fields`, and reading it must not
+    /// require rewriting the note.
+    #[test]
+    fn publish_query_table_reads_a_legacy_bare_field_list_as_columns() {
+        let (dir, outdir) = publish_sheet_fixture(
+            "query-legacy-columns",
+            "{:preferred-workflow :todo}\n",
+            &[
+                (
+                    "LegacyColumns.md",
+                    "public:: true\n\
+                     - {{query (property owner Avery)}}\n  \
+                       tine.view:: table\n  \
+                       tine.fields:: status;owner\n",
+                ),
+                (
+                    "Tracker.md",
+                    "public:: true\n\
+                     - Refresh Guide examples\n  \
+                       status:: active\n  \
+                       owner:: Avery\n  \
+                       extra:: noise\n",
+                ),
+            ],
+        );
+        let html = read_out(&outdir, "legacycolumns.html");
+        let head = html.split("<thead>").nth(1).unwrap_or("");
+        let head = head.split("</thead>").next().unwrap_or("");
+        assert_eq!(
+            head, "<tr><th></th><th>status</th><th>owner</th></tr>",
+            "the bare legacy list selects columns, in its own order: {html}"
+        );
+        // The note is not rewritten to publish it; the bytes on disk still
+        // carry the legacy spelling (I-4).
+        let source = fs::read_to_string(dir.join("pages").join("LegacyColumns.md")).unwrap();
+        assert!(source.contains("tine.fields:: status;owner"), "{source}");
+        assert!(!source.contains("tine.columns"), "{source}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A PRESENT but empty/invalid `tine.columns` is an explicit statement and
+    /// there is no legacy list behind it — the published table falls back to
+    /// the default columns, never to the retired list.
+    #[test]
+    fn publish_query_table_treats_a_present_empty_columns_list_as_no_selection() {
+        let (dir, outdir) = publish_sheet_fixture(
+            "query-cleared-columns",
+            "{:preferred-workflow :todo}\n",
+            &[
+                (
+                    "ClearedColumns.md",
+                    "public:: true\n\
+                     - {{query (property owner Avery)}}\n  \
+                       tine.view:: table\n  \
+                       tine.columns::\n  \
+                       tine.fields:: status\n",
+                ),
+                (
+                    "Tracker.md",
+                    "public:: true\n\
+                     - Refresh Guide examples\n  \
+                       status:: active\n  \
+                       owner:: Avery\n",
+                ),
+            ],
+        );
+        let html = read_out(&outdir, "clearedcolumns.html");
+        let head = html.split("<thead>").nth(1).unwrap_or("");
+        let head = head.split("</thead>").next().unwrap_or("");
+        assert!(
+            head.contains("<th>owner</th>") && head.contains("<th>status</th>"),
+            "cleared means the DEFAULT columns, not the legacy list: {html}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A children-backed sheet is not a query face: `tine.columns` is not its
+    /// question, and its published table is unchanged.
+    #[test]
+    fn publish_children_sheet_ignores_a_query_column_selection() {
+        let (dir, outdir) = publish_sheet_fixture(
+            "children-columns",
+            "{:preferred-workflow :todo}\n",
+            &[(
+                "ChildrenColumns.md",
+                "public:: true\n\
+                 - ## Children table\n  \
+                   tine.view:: table\n  \
+                   tine.columns:: owner\n\
+                 \t- A row\n\t  \
+                   owner:: Martin\n\t  \
+                   status:: active\n",
+            )],
+        );
+        let html = read_out(&outdir, "childrencolumns.html");
+        assert!(html.contains("<th>owner</th>"), "{html}");
+        assert!(
+            html.contains("<th>status</th>"),
+            "an ordinary children sheet keeps every observed column: {html}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

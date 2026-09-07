@@ -6655,6 +6655,74 @@
   "failBefore": "T3 in RECEIPT-p2.md: all eleven cases red at base, the store's entry point reported as `Error: loadNotices does not exist`."
  },
  "notes": "Capability with a data-safety edge: a user who ticks `Don't show this again` on the query-crossing notice must not thereby write anything into the graph, and must not have the choice follow them to another device (I-18) -- while a second graph on the same device must still get its own answer. The dismissal set is stored in app-data as `sessions/<graph_storage_key>-notices.json`, keyed exactly the way `session_path`/`workspaces_path` key theirs (D-11), and written with `tine_core::model::atomic_write` rather than `fs::write` (D-7) -- the audited-write allowance in this file moves 3 -> 4 with the new save, which is the point of that allowance being a number. Three refusals are deliberate and each names an in-scope failure: a missing file, an unreadable file and a MALFORMED file all read as `{\"dismissed\":[]}` and write nothing back, so a truncated or externally corrupted device file costs the user a re-shown notice and never a refused save; the next ordinary dismissal repairs it. `load_workspaces_at`'s body is NOT reused (D-3/G2): it carries a migration this store has no history to migrate, and copying it would have imported a fallback that writes on read. The frontend reads the store at most once per graph epoch, so nothing here runs on a query or keystroke path (I-13), and a store that cannot be read leaves the notice SHOWING rather than silently suppressed."
+},
+{
+ "id": "REG-QE-P5A-COLUMNS-ARE-NOT-SCHEMA",
+ "title": "A query block's visible columns and its typed sheet schema no longer share one property, so neither writer destroys the other's value",
+ "family": "persistence-correctness",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "2026-09 query-engine campaign, checkpoint P5A; SPEC 4.1/7.6; P5r-VERIFY N3; invariants I-4, I-12, D-4, D-12, D-14; docs/contracts/query-display.md"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend-render-and-publish-boundary",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/view.rs::tine_columns_owns_the_visible_columns_and_tine_fields_keeps_the_typed_schema",
+   "crates/tine-core/src/query/view.rs::a_typed_or_mixed_tine_fields_is_schema_and_never_columns",
+   "crates/tine-core/src/query/view.rs::a_present_but_empty_or_invalid_columns_list_clears_and_never_falls_back",
+   "crates/tine-core/src/query/view.rs::a_legacy_bare_tine_fields_list_still_names_columns_when_the_new_key_is_absent",
+   "crates/tine-core/tests/query_columns_resolution.rs::the_rust_column_resolver_matches_the_shared_fixtures",
+   "crates/tine-core/src/publish.rs::publish_query_table_shows_the_selected_columns_in_the_selected_order",
+   "crates/tine-core/src/publish.rs::publish_query_table_reads_a_legacy_bare_field_list_as_columns",
+   "crates/tine-core/src/publish.rs::publish_query_table_treats_a_present_empty_columns_list_as_no_selection",
+   "crates/tine-core/src/publish.rs::publish_children_sheet_ignores_a_query_column_selection",
+   "src/editor/queryViewProperties.test.ts::the shared visible-column resolver::matches the Rust resolver on every shared fixture",
+   "src/components/QueryColumns.test.tsx::keeps a declared tine.fields schema across an unrelated filter save",
+   "src/components/QueryColumns.test.tsx::rescues a legacy list into tine.columns when a schema is declared over it",
+   "src/components/QueryColumns.test.tsx::never overwrites a PRESENT columns property with a legacy rescue",
+   "src/components/QueryColumns.test.tsx::renders exactly the selected columns, in the selected order"
+  ],
+  "scenario": "query-engine.a-query-block-keeps-both-its-schema-and-its-columns",
+  "failBefore": "RECEIPT-p5a.md, evidence/qe/p5a/10-failbefore-publish.txt and 11-failbefore-ts-clobbers.txt: 13 of 19 TypeScript cases and 2 of 3 publisher cases red at e5ad911d."
+ },
+ "notes": "Two live producers wrote `tine.fields::` from opposite directions and each destroyed the other's value: `Macro.tsx::writeViewProperties` wrote `(view.columns ?? []).join(\";\")` into it on EVERY save, so any filter edit replaced or deleted a declared `cost=number` schema; `SheetTable.tsx::writeSchemaFields` wrote the declared schema into the same key from `declareField`/`reorderFieldHeader`, so declaring a schema deleted the column list. Visible columns now live in `tine.columns::` and the typed schema stays in `tine.fields::`. The precedence is frozen in docs/contracts/query-display.md and resolved by ONE Rust function (`query::view::resolve_query_columns`), which `publish.rs` CALLS rather than mirroring -- the published page and the app cannot disagree about which columns a note selects. `=`, NUL, CR or LF in one token invalidates the whole list; a PRESENT but empty/invalid value is an explicit statement with no legacy and no DSL fallback behind it, so clearing cannot resurrect an old list; `tine.fields` is read as a legacy column list only when absent AND every nonempty token is bare. That legacy branch is authored-note compatibility, not a D-1 private-format migration, and reading it never rewrites the note (I-4). The TypeScript adapter exists because rendering a table is a synchronous in-memory walk that cannot take an IPC round-trip per block; it is pinned to Rust by one shared corpus, crates/tine-core/tests/fixtures/query-columns/resolution.json."
+},
+{
+ "id": "REG-QE-P5A-VIEW-SAVE-PRESERVES-PERSISTED-FACTS",
+ "title": "A query save persists the display facts the reprint would drop, and rewrites nothing else on the block",
+ "family": "persistence-correctness",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "2026-09 query-engine campaign, checkpoint P5A; SPEC 4.3 Y2/7.6 Q15; P5r-VERIFY B1/N6; invariants I-4, I-9, D-7, D-14; docs/contracts/query-display.md"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend-store",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/editor/queryViewProperties.test.ts::the lossless query view-property patch::materializes an OG-only grouping and aggregate on a FILTER-only save",
+   "src/editor/queryViewProperties.test.ts::the lossless query view-property patch::never writes or deletes the typed schema, the widths, the filter, or an unknown key",
+   "src/editor/queryViewProperties.test.ts::the aggregate segment merge::edits recognized segments in place and keeps table-only ones verbatim",
+   "src/components/QueryColumns.test.tsx::persists an OG-only grouping and aggregate that the reprint is about to drop",
+   "src/components/QueryColumns.test.tsx::preserves widths, filter, formulas and unknown keys through a save",
+   "src/components/QueryColumns.test.tsx::writes nothing at all when every persisted fact already agrees",
+   "src/components/QueryColumns.test.tsx::keeps a query block's bytes identical in ORG too",
+   "src/components/QueryMacro.ir.test.tsx::persists all six §7.6 fields, so the block re-parses to the saved view",
+   "src/sheet/renameField.test.ts::carries a query aggregate configuration across a sheet field rename",
+   "src/sheet/renameField.test.ts::does not widen the sheet aggregate vocabulary to make avg renameable"
+  ],
+  "scenario": "query-engine.a-filter-edit-does-not-cost-the-block-its-view",
+  "failBefore": "RECEIPT-p5a.md, evidence/qe/p5a/11-failbefore-ts-clobbers.txt and 12-failbefore-rename.txt: the aggregate-preservation and byte-identity cases red at e5ad911d, and both new rename fixtures refused outright."
+ },
+ "notes": "The baseline for what a save writes is the block's currently PERSISTED property value, never a 'user touched this control' flag. `og_view` re-emits only `(sort-by ...)` and `(sample ...)`, so a grouping or an aggregate authored in the query text is dropped by the reprint of an unrelated FILTER edit -- only a property write keeps it, and a crossing to `{{tine-query}}` (whose text carries no directives at all) therefore materializes the whole effective view in the same undo unit. A fact the property already spells is not rewritten to reformat it. Everything outside the six display facts is left byte-identical: schema, widths, header, filter, formulas and unknown keys. `tine.col-aggregates` is shared ground between the query reader (bare `count`, `key=count|sum|avg`, an ordered LIST with meaningful repeats) and the sheet footer (a 17-name vocabulary in a `Map` that collapses repeats and has no keyless spelling), so a save MERGES: recognized segments replaced in place, surplus removed, remainder appended, unrecognized slots kept verbatim and in order. `avg` is recognized by the rename helper without being added to `AggregateFn`/`isAggregateFn`/`applyAggregate` -- a 'valid' sheet aggregate with no implementation is worse than an unrecognized one -- and the rename's preservation proof is now an ordered segment comparison admitting exactly the intended key substitution, replacing a `Map`-size check that proved nothing about the segments being renamed."
 }
  ]
 }

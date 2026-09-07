@@ -11,6 +11,96 @@ use crate::query::ir::{AggFn, Field, SortDir, ViewKind, ViewSettings};
 /// The property namespace §7.6 persists the view under.
 const VIEW_PROPERTY_PREFIX: &str = "tine.";
 
+/// **Which columns a query block SHOWS — the one resolver** (P5A).
+///
+/// Visible columns and a typed sheet schema are two different questions that
+/// used to share one property. `tine.columns::` owns the ordered list of
+/// query-visible field names; `tine.fields::` keeps the typed schema
+/// (`name=type`), and a value containing `=` is therefore never a column list.
+///
+/// Every consumer — `merge_block_property_view` here, and the static publisher
+/// in `publish.rs` — calls THIS function rather than re-deriving the
+/// precedence, so a published page cannot disagree with the app about which
+/// columns a query shows (D-4/D-12: one producer of one answer). The
+/// TypeScript half is `src/editor/queryViewProperties.ts`, and the two are
+/// pinned to one another by `tests/fixtures/query-columns/resolution.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryColumns {
+    /// A property named these columns, in this order. Token spelling is
+    /// retained; a renderer may deduplicate identical field ids without
+    /// rewriting the source.
+    Named(Vec<Field>),
+    /// `tine.columns::` is PRESENT and says nothing readable — empty, or a list
+    /// one token invalidated. That is an explicit statement, not a gap: there
+    /// is no legacy fallback and no DSL fallback behind it, so clearing the
+    /// property cannot resurrect an older list.
+    Cleared,
+    /// No property answers the question at all. Whatever the query text itself
+    /// carried stands.
+    Unset,
+}
+
+/// The column-list grammar, applied to a WHOLE property value (P5A):
+/// trim, split on `;`, trim each token, discard empty segments. One token
+/// containing `=`, NUL, CR or LF invalidates the ENTIRE list rather than just
+/// itself — a half-read column list is worse evidence than none, and `=`
+/// anywhere means the value is a schema or a mixed value, never columns.
+///
+/// `None` is "this value is not a column list"; `Some(vec![])` is "this value
+/// is a column list with nothing in it".
+///
+/// Deliberately no per-name length cap: these are property bytes an outside
+/// editor may have authored, and refusing a long but well-formed name would
+/// drop a column the author can see in their own file. Session/UI caps are a
+/// different boundary.
+fn column_list(value: &str) -> Option<Vec<Field>> {
+    let mut out = Vec::new();
+    for token in value.trim().split(';') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token.contains(|c| matches!(c, '=' | '\0' | '\r' | '\n')) {
+            return None;
+        }
+        out.push(Field::new(token));
+    }
+    Some(out)
+}
+
+/// SPEC §7.6 + P5A precedence for the visible columns of a query block, read
+/// from its normalized block properties (first occurrence of a key wins, as
+/// every other reader here does).
+///
+///  1. `tine.columns` PRESENT → its own answer, and nothing behind it.
+///  2. `tine.columns` ABSENT → `tine.fields` is read as a LEGACY column list,
+///     but only when every nonempty token passes the same grammar and at least
+///     one exists. This is compatibility for notes authored before the split,
+///     not private-state migration (D-1 is not engaged).
+///  3. Neither → `Unset`.
+///
+/// Nothing here writes: opening, parsing or rebuilding a graph never rewrites a
+/// note to move a legacy list (I-4).
+pub fn resolve_query_columns(block_properties: &[(String, String)]) -> QueryColumns {
+    let raw = |name: &str| -> Option<&str> {
+        let wanted = format!("{VIEW_PROPERTY_PREFIX}{name}");
+        block_properties
+            .iter()
+            .find(|(key, _)| crate::doc::property_key_norm(key) == wanted)
+            .map(|(_, value)| value.as_str())
+    };
+    if let Some(value) = raw("columns") {
+        return match column_list(value) {
+            Some(columns) if !columns.is_empty() => QueryColumns::Named(columns),
+            _ => QueryColumns::Cleared,
+        };
+    }
+    match raw("fields").and_then(column_list) {
+        Some(columns) if !columns.is_empty() => QueryColumns::Named(columns),
+        _ => QueryColumns::Unset,
+    }
+}
+
 /// SPEC §4.1 precedence (N17, M14): **for each view field**, a `tine.*` block
 /// property wins; the DSL directive the parser lifted is read only when the
 /// property is absent. The merge happens in exactly one place, this function,
@@ -44,10 +134,12 @@ pub fn merge_block_property_view(
     if let Some(group_by) = property("group-by") {
         merged.group_by = Some(Field::new(group_by));
     }
-    if let Some(fields) = property("fields").map(parse_fields) {
-        if !fields.is_empty() {
-            merged.columns = fields;
-        }
+    match resolve_query_columns(block_properties) {
+        QueryColumns::Named(columns) => merged.columns = columns,
+        // An explicit "no columns" clears whatever the text asked for; `Unset`
+        // leaves the author's own directive standing.
+        QueryColumns::Cleared => merged.columns.clear(),
+        QueryColumns::Unset => {}
     }
     if let Some(aggregates) = property("col-aggregates").map(parse_col_aggregates) {
         if !aggregates.is_empty() {
@@ -87,15 +179,6 @@ fn parse_sort(value: &str) -> Vec<(Field, SortDir)> {
             };
             (!name.is_empty()).then(|| (Field::new(name), direction))
         })
-        .collect()
-}
-
-fn parse_fields(value: &str) -> Vec<Field> {
-    value
-        .split(';')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(Field::new)
         .collect()
 }
 
@@ -311,6 +394,81 @@ mod tests {
             ]
         );
         assert_eq!(merged.sample, Some(25));
+    }
+
+    #[test]
+    fn tine_columns_owns_the_visible_columns_and_tine_fields_keeps_the_typed_schema() {
+        // The clobber this split exists to end: a block can carry BOTH a typed
+        // sheet schema and a column selection, and neither erases the other.
+        let merged = merge_block_property_view(
+            &ViewSettings::default(),
+            &properties(&[
+                ("tine.columns", "page; cost"),
+                ("tine.fields", "cost=number;severity=text"),
+            ]),
+        );
+        assert_eq!(merged.columns, vec![Field::new("page"), Field::new("cost")]);
+    }
+
+    #[test]
+    fn a_typed_or_mixed_tine_fields_is_schema_and_never_columns() {
+        for value in ["cost=number;severity=text", "page;cost=number"] {
+            let merged = merge_block_property_view(
+                &ViewSettings::default(),
+                &properties(&[("tine.fields", value)]),
+            );
+            assert!(
+                merged.columns.is_empty(),
+                "`=` anywhere means schema or mixed, never columns: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_but_empty_or_invalid_columns_list_clears_and_never_falls_back() {
+        for value in ["", "   ", "a;cost=number", "a;b\rc"] {
+            let merged = merge_block_property_view(
+                &ViewSettings::default(),
+                &properties(&[("tine.columns", value), ("tine.fields", "a;b")]),
+            );
+            assert!(
+                merged.columns.is_empty(),
+                "a PRESENT tine.columns is an explicit statement; clearing cannot \
+                 resurrect the legacy list: {value:?}"
+            );
+            assert_eq!(
+                resolve_query_columns(&properties(&[("tine.columns", value)])),
+                QueryColumns::Cleared
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_bare_tine_fields_list_still_names_columns_when_the_new_key_is_absent() {
+        assert_eq!(
+            resolve_query_columns(&properties(&[("tine.fields", "page; status; cost")])),
+            QueryColumns::Named(vec![
+                Field::new("page"),
+                Field::new("status"),
+                Field::new("cost")
+            ]),
+        );
+        // Nothing here writes: reading a legacy list never rewrites the note
+        // (I-4). This is authored-note compatibility, not a D-1 private-format
+        // migration.
+        assert_eq!(resolve_query_columns(&properties(&[])), QueryColumns::Unset);
+    }
+
+    #[test]
+    fn duplicate_column_names_are_retained_verbatim_for_the_renderer_to_decide() {
+        assert_eq!(
+            resolve_query_columns(&properties(&[("tine.columns", "cost;cost;Cost")])),
+            QueryColumns::Named(vec![
+                Field::new("cost"),
+                Field::new("cost"),
+                Field::new("Cost")
+            ]),
+        );
     }
 
     #[test]

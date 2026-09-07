@@ -51,6 +51,7 @@ import {
   fieldLabel,
   formulaReferenceName,
   isFormulaField,
+  queryColumnFieldId,
   readField,
   recordFacets,
   rowRaw,
@@ -71,6 +72,7 @@ import {
   type FieldType,
 } from "../sheet/config";
 import { planSheetFieldRename } from "../sheet/renameField";
+import { isLegacyBareColumnList, selectedQueryColumns } from "../editor/queryViewProperties";
 import { formulaFieldId, formulaNameFromField, formulasOf, mergeFormulas } from "../sheet/formulaFields";
 import {
   createFormulaFilterMemo,
@@ -224,14 +226,28 @@ export function SheetTable(props: {
       else setPageProperty(home.name, "tine.table-widths", value);
     });
   };
+  /** **A pre-split bare column list is not a declared schema** (P5A).
+   *
+   *  `tine.fields::` used to carry two unrelated things: a typed sheet schema
+   *  (`name=type`) and, on query blocks, the list of columns to show. A value
+   *  with no `=` anywhere is the second one, and reading it as a schema made
+   *  `schemaHome` non-null over an EMPTY parse — which marked every column a
+   *  stray, disabled header reordering, and let the next schema write silently
+   *  replace the column list. Such a value is now treated exactly as if the
+   *  property were absent, which also preserves page-vs-block schema ownership:
+   *  the page's declared schema governs when the block carries no schema. */
   const schemaHome = createMemo<SchemaHome | null>(() => {
     if (doc.byId[props.ownerId]) {
       const value = blockProperty(props.ownerId, "tine.fields");
-      if (value !== null) return { kind: "block", id: props.ownerId, value };
+      if (value !== null && (props.rowSource !== "query" || !isLegacyBareColumnList(value))) {
+        return { kind: "block", id: props.ownerId, value };
+      }
     }
     if (props.schemaPage) {
       const value = readPageProperty(props.schemaPage, "tine.fields");
-      if (value !== null) return { kind: "page", name: props.schemaPage, value };
+      if (value !== null && (props.rowSource !== "query" || !isLegacyBareColumnList(value))) {
+        return { kind: "page", name: props.schemaPage, value };
+      }
     }
     return null;
   });
@@ -297,7 +313,10 @@ export function SheetTable(props: {
     return isFormulaField(field) ? formulaValueToFieldValue(formulaValue(row, field)) : readFormulaRowField(row, field);
   };
 
-  const fields = createMemo<FieldId[]>(() => {
+  /** Every field this table KNOWS: declared schema first, then formulas, then
+   *  whatever the rows carry. Independent of which columns are shown — a field
+   *  definition is not lost because its column is hidden. */
+  const allFields = createMemo<FieldId[]>(() => {
     const loadedIds = rows().filter((r) => liveFormulaRowNode(r)).map((r) => r.id);
     const observed = loadedIds.length === rows().length
       ? fieldIdsForBlocks(loadedIds, { includePage: props.rowSource === "query" })
@@ -316,10 +335,41 @@ export function SheetTable(props: {
       ...inferred.filter((f) => !declaredSet.has(f) && !formulasSet.has(f)),
     ];
   });
+  /** **The columns this table SHOWS** (P5A).
+   *
+   *  A query block's `tine.columns::` selects, in order, which of the known
+   *  fields are visible; the selection is applied AFTER the schema/type lookup
+   *  above, so a shown column keeps the type its `tine.fields::` declaration
+   *  gave it and a hidden one keeps its definition. A selected column no row
+   *  carries is still a column: it renders empty cells rather than shifting its
+   *  neighbours. No selection (absent, or an explicit empty/invalid one) leaves
+   *  the default column set exactly as it was. The title column and the action
+   *  column are outside the selection and stay reachable.
+   *
+   *  Children-backed sheets are not a query face and ignore the property. */
+  const fields = createMemo<FieldId[]>(() => {
+    const known = allFields();
+    if (props.rowSource !== "query") return known;
+    const owner = doc.byId[props.ownerId];
+    if (!owner) return known;
+    const selection = selectedQueryColumns(
+      facetsOf(owner.raw, formatForBlock(props.ownerId)).properties,
+    );
+    if (!selection) return known;
+    const seen = new Set<FieldId>();
+    const out: FieldId[] = [];
+    for (const name of selection) {
+      const field = queryColumnFieldId(name);
+      if (seen.has(field)) continue;
+      seen.add(field);
+      out.push(field);
+    }
+    return out;
+  });
   const formulaHintFields = createMemo(() => {
     const out: string[] = [];
     const seen = new Set<string>();
-    for (const field of fields()) {
+    for (const field of allFields()) {
       const name = formulaReferenceName(field);
       if (!name || seen.has(name)) continue;
       seen.add(name);
@@ -616,12 +666,40 @@ export function SheetTable(props: {
     if (home.kind === "block") return !blockPageReadOnly(home.id);
     return !(pageByName(home.name)?.readOnly ?? false);
   };
+  /** A pre-split bare column list about to be overwritten by a declared schema,
+   *  and the block it lives on — or `null` when there is nothing to rescue.
+   *
+   *  Declaring a schema writes `tine.fields`, which on a query block may still
+   *  be holding the note's column list. That list is the user's visible choice,
+   *  so it moves to `tine.columns` in the SAME undo unit as the schema write.
+   *  It moves only when `tine.columns` is ABSENT: a present value — including a
+   *  present empty or invalid one — is an explicit statement, and its presence
+   *  wins over a rescue. Only a QUERY face has columns to rescue; an ordinary
+   *  children sheet's inert bare list is not a column choice. */
+  const legacyColumnRescue = (): { id: string; value: string } | null => {
+    if (props.rowSource !== "query") return null;
+    const owner = doc.byId[props.ownerId];
+    if (!owner) return null;
+    if (blockProperty(props.ownerId, "tine.columns") !== null) return null;
+    const legacy = blockProperty(props.ownerId, "tine.fields");
+    if (!isLegacyBareColumnList(legacy)) return null;
+    const columns = selectedQueryColumns(facetsOf(owner.raw, formatForBlock(props.ownerId)).properties);
+    return columns && columns.length > 0 ? { id: props.ownerId, value: columns.join(";") } : null;
+  };
   const writeSchemaFields = (next: readonly FieldSpec[]) => {
     const home = schemaHome() ?? createSchemaHome();
     if (!home || !schemaWriteAllowed()) return;
     const value = serializeFields(next);
-    if (home.kind === "block") setBlockProperty(home.id, "tine.fields", value || null);
-    else setPageProperty(home.name, "tine.fields", value || null);
+    const rescue = legacyColumnRescue();
+    const page = home.kind === "block" ? doc.byId[home.id]?.page : home.name;
+    // ONE undo unit: the rescue and the declaration are a single user action,
+    // and each `setBlockProperty` would otherwise push its own entry.
+    const affected = [...new Set([page, rescue ? doc.byId[rescue.id]?.page : undefined].filter((name): name is string => !!name))];
+    withUndoUnit("sheet:schema-fields", affected, () => {
+      if (rescue) setBlockProperty(rescue.id, "tine.columns", rescue.value);
+      if (home.kind === "block") setBlockProperty(home.id, "tine.fields", value || null);
+      else setPageProperty(home.name, "tine.fields", value || null);
+    });
   };
   const formulaWriteAllowed = (home: FormulaHome | null) => {
     if (!home) return false;
@@ -662,7 +740,9 @@ export function SheetTable(props: {
     writeSchemaFields([...schemaFields(), spec]);
   };
   const declareFreshSchema = () => {
-    const specs = fields().map((field) => specForField(field)).filter((spec): spec is FieldSpec => !!spec);
+    // Every field the table knows, not only the shown ones: declaring a schema
+    // must not silently drop the definition of a column a selection hides.
+    const specs = allFields().map((field) => specForField(field)).filter((spec): spec is FieldSpec => !!spec);
     writeSchemaFields(specs);
   };
   const canDragFieldHeader = (field: FieldId) =>
@@ -676,6 +756,17 @@ export function SheetTable(props: {
     return schemaHome() ? schemaFieldSet().has(field) : !!specForField(field);
   };
   const reorderFieldHeader = (field: FieldId, drop: FieldHeaderDrop) => {
+    const owner = doc.byId[props.ownerId];
+    const page = owner?.page ?? props.schemaPage;
+    // A reorder that has to declare a schema first is still ONE user action, so
+    // the freshly declared schema and the reordered one share an undo entry
+    // (nested `withUndoUnit`s collapse into the outermost).
+    const home = schemaHome();
+    const schemaPage = home?.kind === "page" ? home.name : home ? doc.byId[home.id]?.page : undefined;
+    const affected = [...new Set([page, schemaPage].filter((name): name is string => !!name))];
+    withUndoUnit("sheet:schema-reorder", affected, () => reorderFieldHeaderIn(field, drop));
+  };
+  const reorderFieldHeaderIn = (field: FieldId, drop: FieldHeaderDrop) => {
     if (!schemaHome()) declareFreshSchema();
     const next = [...schemaFields()];
     const from = next.findIndex((spec) => spec.field === field);

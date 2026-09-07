@@ -52,6 +52,28 @@ export function isFormulaField(field: FieldId): field is `formula:${string}` {
   return field.startsWith("formula:");
 }
 
+/** One `tine.columns` token as a field identity (P5A).
+ *
+ *  The six builtins keep their own identity; every other string is an ordinary
+ *  property name and becomes `prop:<name>` HERE, at the renderer — the property
+ *  bytes stay the bare name the author wrote, in both formats and in both
+ *  languages. The Rust mirror is `publish.rs::sheet_field_for_column`, and the
+ *  shared corpus `crates/tine-core/tests/fixtures/query-columns/resolution.json`
+ *  pins the RESOLUTION the two of them then map. */
+export function queryColumnFieldId(name: string): FieldId {
+  switch (name) {
+    case "state":
+    case "priority":
+    case "scheduled":
+    case "deadline":
+    case "tags":
+    case "page":
+      return name;
+    default:
+      return `prop:${name}`;
+  }
+}
+
 function facetsForBlock(id: string): Facets | null {
   const n = doc.byId[id];
   return n ? facetsOf(n.raw, formatForBlock(id)) : null;

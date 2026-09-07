@@ -128,6 +128,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Which columns a query table shows, and what its columns ARE, are two
+  different lines now — and neither erases the other.** A query block used to
+  keep both in `tine.fields::`, so the two halves of Tine that write it took
+  turns destroying each other's work: editing the query's conditions replaced a
+  table's declared column types with a bare list of names, and declaring a column
+  type deleted the list of columns you had chosen to see. `tine.fields::` is now
+  only the column *types*; a new `tine.columns::` line holds the columns a query
+  table shows, and their order. Editing a query leaves your types, widths,
+  filter, formulas and any other property on the block exactly as they were, and
+  declaring a type on a query table carries your existing column choice across
+  in one step you can undo in one go.
+
+  Notes written before this keep working with no migration and without being
+  rewritten: a `tine.fields::` line holding only plain names is still read as a
+  column list until something replaces it. Published pages now show the same
+  columns, in the same order, with the same types as the app — they used to
+  ignore the choice entirely. A column you asked for that no result carries
+  still gets its place, empty, instead of shifting the rest.
+
+- **Editing a query's conditions no longer costs it its grouping or its
+  totals.** Saving a change to what a query selects rewrites the query's text,
+  and that text has no room for grouping or aggregates — so a `(group-by …)` or
+  `(aggregate …)` written in the query itself simply vanished on the next save,
+  along with everything else the rewritten text could not carry. Tine now writes
+  down whatever the block does not already record before rewriting it, so a
+  filter edit keeps the view you had. Column totals a query does not recognize
+  — the sheet's own `median`, `stddev` and the rest — survive the save untouched
+  instead of being dropped, and renaming a field carries a query's totals across
+  intact, repeated columns and all.
+
 - **A query written in the middle of a line now shows its title.** A
   `{{query …}}` with a title or other display options — anything in the trailing
   `{…}` — was read back from a truncated copy of your text whenever it sat
