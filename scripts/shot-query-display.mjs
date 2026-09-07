@@ -84,9 +84,9 @@ try {
   await sleep(300);
   // The panel is a capability the host turns on once its reading of the query
   // has landed, so WAIT for it rather than sampling the footer mid-resolution.
-  const trigger = page.locator(".qd-trigger").first();
+  const trigger = page.locator(".qs-sheet .qd-trigger").first();
   try {
-    await page.waitForSelector(".qd-trigger", { timeout: 10000 });
+    await page.waitForSelector(".qs-sheet .qd-trigger", { timeout: 10000 });
   } catch {
     /* fall through to the proof below */
   }
@@ -181,7 +181,7 @@ try {
     await page.waitForSelector(".qs-sheet", { timeout: 6000 });
     await sleep(300);
   }
-  await page.locator(".qd-trigger").first().dispatchEvent("click");
+  await page.locator(".qs-sheet .qd-trigger").first().dispatchEvent("click");
   await page.waitForSelector(".qd-panel", { timeout: 6000 });
   await sleep(400);
   const docked = await page.evaluate(() => {
@@ -204,7 +204,18 @@ try {
 
   console.log("DONE");
 } catch (e) {
-  console.log("ERROR:", String(e).split("\n").slice(0, 8).join(" | "));
+  console.log("ERROR:", String(e));
+  const failedPage = browser?.contexts()[0]?.pages()[0];
+  if (failedPage) {
+    await failedPage.screenshot({ path: `${OUT}/query-display-failure.png` }).catch(() => {});
+    console.log("failure geometry:", JSON.stringify(await failedPage.evaluate(() =>
+      [...document.querySelectorAll(".qd-trigger")].map((el) => {
+        const rect = el.getBoundingClientRect();
+        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        return { parent: el.parentElement?.className, rect: rect.toJSON(), hit: hit?.outerHTML.slice(0, 400) };
+      })
+    ).catch(() => null)));
+  }
   process.exitCode = 2;
 } finally {
   try {
