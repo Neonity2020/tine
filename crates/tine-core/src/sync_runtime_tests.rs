@@ -12889,7 +12889,20 @@ fn pending_generation_join_fixture(
     SyncSharedEnrollmentDescriptor,
 ) {
     let initiator = make_shared_fixture(&format!("{label}-initiator"), seed);
-    let mut joiner = make_shared_fixture(&format!("{label}-joiner"), seed);
+    let joiner = make_shared_fixture(&format!("{label}-joiner"), seed);
+    pending_generation_join_from_fixtures(initiator, joiner, seed)
+}
+
+fn pending_generation_join_from_fixtures(
+    initiator: ActivationFixture,
+    mut joiner: ActivationFixture,
+    seed: u128,
+) -> (
+    ActivationFixture,
+    ActivationFixture,
+    SyncRuntimeHandle,
+    SyncSharedEnrollmentDescriptor,
+) {
     joiner.request.identities.endpoint_id =
         ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
     joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
@@ -12923,6 +12936,84 @@ fn pending_generation_join_fixture(
     let handle = active.handle.expect("generation-cut joiner LocalActive");
     drive_initial_feed(&handle);
     (initiator, joiner, handle, descriptor)
+}
+
+#[test]
+#[ignore = "manual release gate: rebaselining foundations on an anonymized corpus copy"]
+fn rebaselining_foundations_real_corpus_gate() {
+    use tine_storage::sealed_accepted_index::{
+        SealedAcceptedIndexError, SealedAcceptedIndexObjectStore, SealedAcceptedObjectKind,
+    };
+    assert!(!cfg!(debug_assertions), "release-only corpus gate");
+    let source = real_graph_copy_source_from_env("TINE_REBASELINING_GRAPH_COPY");
+    let seed = 0xc200_0000;
+    let initiator = ActivationFixture::copied_graph("rebaseline-corpus-initiator", seed, &source);
+    let joiner = ActivationFixture::copied_graph("rebaseline-corpus-joiner", seed, &source);
+    let (initiator, joiner, handle, descriptor) =
+        pending_generation_join_from_fixtures(initiator, joiner, seed);
+    let expected = user_graph_bytes(&initiator.graph_root);
+    let started = Instant::now();
+    handle
+        .join_shared(descriptor)
+        .expect("corpus join installs complete authority");
+    let join_ms = started.elapsed().as_millis();
+    assert_eq!(user_graph_bytes(&joiner.graph_root), expected);
+    assert_eq!(
+        read_activation_marker(&joiner.request.enrollment_root)
+            .unwrap()
+            .unwrap()
+            .generation(),
+        1
+    );
+    assert!(matches!(
+        handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(handle);
+    let reopened = open_clean_runtime_resources(&reopen_request(&joiner.request))
+        .unwrap()
+        .unwrap();
+    let engine = reopened.runtime.engine();
+    let before = engine.canonical_snapshot().unwrap();
+    #[derive(Default)]
+    struct ScratchNodes(BTreeMap<(String, ContentDigest), Vec<u8>>);
+    impl SealedAcceptedIndexObjectStore for ScratchNodes {
+        fn read_sealed_accepted_object(
+            &self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
+            Ok(self.0.get(&(kind.to_string(), address)).cloned())
+        }
+        fn publish_sealed_accepted_object(
+            &mut self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+            bytes: &[u8],
+        ) -> Result<(), SealedAcceptedIndexError> {
+            let key = (kind.to_string(), address);
+            if let Some(prior) = self.0.get(&key) {
+                if prior != bytes {
+                    return Err(SealedAcceptedIndexError::Store(
+                        "scratch immutable collision".into(),
+                    ));
+                }
+            }
+            self.0.insert(key, bytes.to_vec());
+            Ok(())
+        }
+    }
+    let started = Instant::now();
+    let mut nodes = ScratchNodes::default();
+    let cutoff = engine
+        .build_sealed_accepted_cutoff(&mut nodes, None)
+        .unwrap();
+    let cutoff_ms = started.elapsed().as_millis();
+    assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
+    assert_eq!(engine.canonical_snapshot().unwrap(), before);
+    assert_eq!(user_graph_bytes(&joiner.graph_root), expected);
+    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms}",
+        expected.len(), before.pages.len(), before.blocks.len(), cutoff.roots().sequence.len);
 }
 
 #[test]

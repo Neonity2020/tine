@@ -1655,49 +1655,33 @@ pub(crate) fn publish_activation_marker(
 }
 
 /// Replace one already-authoritative local marker during a semantically
-/// verified shared join. The prior marker is retained until the replacement
-/// entry and its parent directory are durable; a failed rename restores it.
+/// verified shared join. The caller holds the workspace's sole writer lease
+/// throughout. The shared durable replacement primitive keeps the old name
+/// visible until its single replacement commit point; it never moves authority
+/// aside. A retry after an uncertain result accepts the exact replacement.
 pub(crate) fn replace_activation_marker_for_join(
     enrollment_root: &Path,
     expected_prior: LazyGenesisActivationMarkerV1,
     replacement: LazyGenesisActivationMarkerV1,
 ) -> io::Result<()> {
-    if read_activation_marker(enrollment_root)? != Some(expected_prior) {
+    let observed = read_activation_marker(enrollment_root)?;
+    if observed != Some(expected_prior) && observed != Some(replacement) {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "clean activation marker changed before shared join installation",
         ));
     }
-    let destination = enrollment_root.join(LAZY_GENESIS_ACTIVATION_MARKER_FILE);
-    let nonce = Uuid::new_v4().simple().to_string();
-    let temporary = enrollment_root.join(format!(
-        ".{LAZY_GENESIS_ACTIVATION_MARKER_FILE}.{nonce}.join"
-    ));
-    let backup = enrollment_root.join(format!(
-        ".{LAZY_GENESIS_ACTIVATION_MARKER_FILE}.{nonce}.prior"
-    ));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    file.write_all(&replacement.encode()?)?;
-    crate::durability_counters::sync_file(&file)?;
-    drop(file);
-    fs::rename(&destination, &backup)?;
-    if let Err(error) = fs::rename(&temporary, &destination) {
-        let _ = fs::rename(&backup, &destination);
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) =
-        crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
-    {
-        // The replacement may already be visible. Retain the prior marker as
-        // recovery evidence rather than pretending the transition settled.
-        return Err(error);
-    }
-    fs::remove_file(&backup)?;
-    crate::filesystem_durability::sync_reconstructible_directory_path(enrollment_root)
+    let directory =
+        cap_std::fs::Dir::open_ambient_dir(enrollment_root, cap_std::ambient_authority())?;
+    tine_storage::DurableDirectoryPublication::open(&directory)
+        .and_then(|publication| {
+            publication.replace_exact(
+                LAZY_GENESIS_ACTIVATION_MARKER_FILE,
+                &expected_prior.encode()?,
+                &replacement.encode()?,
+            )
+        })
+        .map_err(io::Error::other)
 }
 
 pub(crate) fn read_clean_shared_state(
@@ -2272,6 +2256,101 @@ mod tests {
         .unwrap();
         builder.push(page(2, "pages/b.md", 0)).unwrap();
         assert!(builder.push(page(1, "pages/a.md", 0)).is_err());
+    }
+
+    #[test]
+    fn join_marker_replacement_is_exact_retryable_and_never_removes_authority() {
+        let root = std::env::temp_dir().join(format!("tine-marker-replace-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let marker = |generation| {
+            LazyGenesisActivationMarkerV1::new_for_generation(
+                WorkspaceId::from_uuid(Uuid::from_u128(1)),
+                LineageDigest::of(b"marker replacement"),
+                generation,
+                ContentDigest::of(b"baseline"),
+                BlobDescription::of(b"source"),
+                ContentDigest::of(b"frontier"),
+                9,
+            )
+            .unwrap()
+        };
+        let prior = marker(0);
+        let replacement = marker(1);
+        assert!(replace_activation_marker_for_join(root.as_path(), prior, replacement).is_err());
+        publish_activation_marker(root.as_path(), prior).unwrap();
+        assert!(
+            replace_activation_marker_for_join(root.as_path(), marker(2), replacement).is_err()
+        );
+        assert_eq!(read_activation_marker(root.as_path()).unwrap(), Some(prior));
+
+        // An independent reader observes the actual authority name during
+        // repeated durable replacements. Every complete read must be one of
+        // the two valid records, never NotFound or partially written bytes.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let observations = std::sync::Arc::new(AtomicUsize::new(0));
+        let reader = {
+            let path = root.as_path().to_path_buf();
+            let stop = stop.clone();
+            let observations = observations.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let observed = read_activation_marker(&path).unwrap();
+                    assert!(observed == Some(prior) || observed == Some(replacement));
+                    observations.fetch_add(1, Ordering::Release);
+                }
+            })
+        };
+        while observations.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        for _ in 0..32 {
+            replace_activation_marker_for_join(root.as_path(), prior, replacement).unwrap();
+            // This models a retry after losing the success response.
+            replace_activation_marker_for_join(root.as_path(), prior, replacement).unwrap();
+            replace_activation_marker_for_join(root.as_path(), replacement, prior).unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap();
+        assert!(observations.load(Ordering::Acquire) > 0);
+        assert_eq!(read_activation_marker(root.as_path()).unwrap(), Some(prior));
+        assert_eq!(std::fs::read_dir(root.as_path()).unwrap().count(), 1);
+
+        std::fs::write(
+            root.as_path().join(LAZY_GENESIS_ACTIVATION_MARKER_FILE),
+            b"damaged",
+        )
+        .unwrap();
+        assert!(replace_activation_marker_for_join(root.as_path(), prior, replacement).is_err());
+        assert_eq!(
+            std::fs::read(root.as_path().join(LAZY_GENESIS_ACTIVATION_MARKER_FILE)).unwrap(),
+            b"damaged"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn join_marker_uses_the_shared_durable_replacement_boundary() {
+        let source = include_str!("lazy_genesis.rs");
+        let body = source
+            .split_once("pub(crate) fn replace_activation_marker_for_join(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn read_clean_shared_state(")
+            .unwrap()
+            .0;
+        assert!(body.contains("DurableDirectoryPublication::open"));
+        assert!(body.contains("publication.replace_exact("));
+        for forbidden in [
+            "fs::rename",
+            "fs::remove_file",
+            "OpenOptions",
+            "sync_reconstructible",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "marker replacement bypasses shared durability: {forbidden}"
+            );
+        }
     }
 
     #[test]

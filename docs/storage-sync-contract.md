@@ -3647,3 +3647,14 @@ blob was removed from outside the ledger — antivirus quarantine, a disk
 cleaner, a partial restore. Such an entry is dead metadata whose lookups
 already answer `None`; reclaiming it is hygiene, and the ledger never warns,
 refuses, or reports a missing blob to the user.
+
+### Join activation marker replacement
+
+A semantically verified shared join holds the workspace writer lease and replaces
+its activation marker through `tine-storage::DurableDirectoryPublication::replace_exact`.
+The old marker remains named until the atomic replacement; there is no intermediate
+rename to a `.prior` name. Exact replacement bytes permit an idempotent retry after
+an uncertain outcome. Missing, malformed or unrelated markers fail closed. The
+old authority generation remains available before the commit point, and installed
+replacement authority is reopened after it. This fixes the existing join path; it
+does not enable archive rebaselining or prove its future retention closure.

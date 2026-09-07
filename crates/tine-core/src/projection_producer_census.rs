@@ -1048,13 +1048,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/lazy_genesis.rs",
             "fs.remove_file",
-            4,
+            2,
         ),
-        ("crates/tine-core/src/oplog/lazy_genesis.rs", "fs.rename", 6),
+        // Join marker replacement now crosses the shared durable boundary.
+        ("crates/tine-core/src/oplog/lazy_genesis.rs", "fs.rename", 3),
         (
             "crates/tine-core/src/oplog/lazy_genesis.rs",
             "open.create_new",
-            6,
+            5,
         ),
         (
             "crates/tine-core/src/oplog/local_completion_index.rs",
@@ -1606,6 +1607,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             "journal.managed_append",
             1,
         ),
+        // The join marker uses the shared exact atomic replacement primitive.
+        (
+            "crates/tine-core/src/oplog/lazy_genesis.rs",
+            "durable_directory.open",
+            1,
+        ),
         (
             "crates/tine-core/src/oplog/local_journal_v2_anchor.rs",
             "journal.fast_append",
@@ -1986,9 +1993,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // with the inert cutoff builder; empty roots and point membership readers
     // qualify each delta. Imports move with that extraction. No physical write
     // boundary changes: the independently pinned table above still matches.
+    // Join marker fix adds exactly one fully qualified shared publication open
+    // in lazy_genesis.rs. Its replace_exact method replaces the removed private
+    // two-rename protocol; g_a pins the removed raw mutation sites separately.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "000b7495d67c7d0da1a9ac7cbcb8b0b3342aa6496562911b6e520567141af529",
+        "71f5483895629518c64d5f65fd52fdb4ec724a1f0c618dbe24d019dd5679308c",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
