@@ -97,9 +97,9 @@ use plugins::{
 };
 use settings::{
     forget_known_graph, get_app_bool, get_app_string, get_capture_enter_files,
-    get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, reveal_known_graph,
-    save_session, set_app_bool, set_app_string, set_capture_enter_files, set_link_first_match,
-    set_smooth_scroll,
+    get_link_first_match, get_smooth_scroll, list_known_graphs, load_notices, load_session,
+    reveal_known_graph, save_notices, save_session, set_app_bool, set_app_string,
+    set_capture_enter_files, set_link_first_match, set_smooth_scroll,
 };
 use spellcheck::{
     apply_spellcheck, apply_spellcheck_all, list_spellcheck_dictionaries, parse_spellcheck_langs,
@@ -940,6 +940,8 @@ pub fn run() {
             save_session,
             load_workspaces,
             save_workspaces,
+            load_notices,
+            save_notices,
             list_known_graphs,
             forget_known_graph,
             reveal_known_graph,

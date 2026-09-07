@@ -6602,5 +6602,59 @@
    },
    "notes": "mldoc/lsdoc splits a macro's arguments on commas and stops before the first `}`, so name+args cannot rebuild a query carrying a trailing options map or a literal comma inside a string. Rendering and publishing both consumed that reconstruction: an inline {{query (task TODO) {:title \"T\"}}} lost the map's closing brace, so the title was dropped and publishing emitted a stray } as visible text beside results computed from a truncated query. Both sides now recover the exact source slice with the shared raw-extent reader, pinned on both sides by one corpus (crates/tine-core/tests/fixtures/query-macro/extents.json). The renderer's join is the subtle half: lsdoc reports UTF-8 byte offsets into the re-bulleted parse input (\"- \" + raw.trimStart()), so anchoring by the span as if it indexed raw never matched and always fell back to the lossy reconstruction; queryMacroExtentAtSpan does the same span[0] - 2 + leadBytes mapping render/facets.ts already used, and anchors exactly so a span measured against some other string finds nothing rather than the wrong macro."
   }
+,
+{
+ "id": "REG-QE-P2-DIRECTIVE-MIGRATION-BYTE-STABILITY",
+ "title": "A view directive removed in the builder came back on reparse, because the OG text and the block properties both claimed to own it",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "2026-09 query-engine campaign, packet P2; SPEC 4.3 directive migration (Q15) and 7.6; invariants I-4, I-12"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core-query-printer",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/print.rs::the_og_printer_leaves_aggregates_and_group_by_out_of_the_text",
+   "crates/tine-core/src/query/print.rs::every_typed_property_operator_the_builder_offers_round_trips",
+   "src/components/QueryMacro.ir.test.tsx::B6: directive migration for blocks that stay {{query}}",
+   "src/components/QueryMacro.ir.test.tsx::leaves an untouched block byte-identical (no save, no property lines)"
+  ],
+  "scenario": "query-engine.a-view-directive-has-exactly-one-home",
+  "failBefore": "T4 in RECEIPT-p2.md: the OG printer re-emitted `(aggregate count) (aggregate sum hours) (group-by status)` after the same view had been written to `tine.col-aggregates::`/`tine.group-by::`; four `B6` cases read `null` where a `tine.*` line was required."
+ },
+ "notes": "User outcome: aggregates and grouping lived in TWO places on a block that stayed a `{{query}}` -- in the macro text, printed by the OG printer, and in the `tine.col-aggregates::`/`tine.group-by::` block properties, which `view.rs::merge_block_property_view` reads with absolute precedence. Removing a column total or a grouping in the builder cleared the properties but reprinted the directive into the text, so the next parse restored what the user had just deleted; and because precedence is unconditional, a stale text copy could also outlive a change made anywhere else. Classification: exact safety/interoperability -- the disagreement is about what the file MEANS. One question, one answer (I-12): `og_view` no longer emits `aggregate` or `group-by` at all, while `sort-by` and `sample` keep their text form because OG itself reads those, and every save now writes all SIX SPEC 7.6 view properties (`tine.view`, `tine.sort`, `tine.group-by`, `tine.fields`, `tine.col-aggregates`, `tine.sample`) under both macro names -- writing `null` for the absent ones, so a removal is persisted as an absence rather than left behind. `og_expressible` is deliberately unchanged: a query with aggregates is still OG-expressible and still stays a `{{query}}`. Byte stability is the other half (I-4): `markdownRawWithProperty(raw, key, null)` is the identity when the key is absent, so an ordinary block that is opened and closed without an edit is written not at all, and a saved block gains only the property lines its view actually needs."
+},
+{
+ "id": "REG-QE-P2-NOTICE-DISMISSAL-DEVICE-LOCAL",
+ "title": "The `don't show this again` choice for the query-crossing notice is device-local and graph-keyed, and never enters the graph",
+ "family": "app-private-data-safety",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "2026-09 query-engine campaign, packet P2; SPEC 4.3/7.5; invariants I-18, D-3, D-7, D-11, G2"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "tauri-storage",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/settings.rs::notice_dismissals_live_beside_the_session_file_and_are_graph_keyed",
+   "src-tauri/src/settings.rs::a_dismissed_notice_round_trips_and_survives_a_reopen",
+   "src-tauri/src/settings.rs::a_malformed_notices_file_reads_as_empty_and_the_next_save_repairs_it",
+   "src-tauri/src/settings.rs::saving_notices_leaves_the_graph_bytes_untouched",
+   "src/components/QueryCrossingNotice.test.tsx::C3: [Keep it] and the device-local dismissal"
+  ],
+  "scenario": "query-engine.dismissing-a-notice-is-device-local-state",
+  "failBefore": "T3 in RECEIPT-p2.md: all eleven cases red at base, the store's entry point reported as `Error: loadNotices does not exist`."
+ },
+ "notes": "Capability with a data-safety edge: a user who ticks `Don't show this again` on the query-crossing notice must not thereby write anything into the graph, and must not have the choice follow them to another device (I-18) -- while a second graph on the same device must still get its own answer. The dismissal set is stored in app-data as `sessions/<graph_storage_key>-notices.json`, keyed exactly the way `session_path`/`workspaces_path` key theirs (D-11), and written with `tine_core::model::atomic_write` rather than `fs::write` (D-7) -- the audited-write allowance in this file moves 3 -> 4 with the new save, which is the point of that allowance being a number. Three refusals are deliberate and each names an in-scope failure: a missing file, an unreadable file and a MALFORMED file all read as `{\"dismissed\":[]}` and write nothing back, so a truncated or externally corrupted device file costs the user a re-shown notice and never a refused save; the next ordinary dismissal repairs it. `load_workspaces_at`'s body is NOT reused (D-3/G2): it carries a migration this store has no history to migrate, and copying it would have imported a fallback that writes on read. The frontend reads the store at most once per graph epoch, so nothing here runs on a query or keystroke path (I-13), and a store that cannot be read leaves the notice SHOWING rather than silently suppressed."
+}
  ]
 }

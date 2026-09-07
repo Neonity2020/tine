@@ -33,10 +33,12 @@ import { MARKERS as TASK_MARKERS } from "../markers";
 import type {
   AggFn,
   Attr,
+  Cardinality,
   CmpOp,
   Field,
   Filter,
   Leaf,
+  ObservedType,
   Rel,
   SortDir,
   Value,
@@ -129,20 +131,177 @@ export function priorityFilter(levels: string[]): Filter {
   return attr("priority", "in", textList(levels.length ? levels : [...PRIORITIES]));
 }
 
+/** A typed comparison on a property's VALUE, chosen by {@link operatorsFor} from
+ *  the registry's effective type for the key. The plain-string form below is the
+ *  untyped `= '<text>'` this builder could always say; this is the durable half
+ *  P3 inherits, which is why the operator travels with its operand rather than
+ *  being reconstructed from the text at every call site. */
+export interface PropertyValueTest {
+  op: CmpOp;
+  operand: Value;
+}
+
 /** `(property k)` / `(property k v)` — `og.rs::property_leaf`, the one shape
- *  §3.3 defines. */
-export function propertyFilter(key: string, value: string | null): Filter {
+ *  §3.3 defines.
+ *
+ *  `value` is the whole value predicate:
+ *   - `null` or `""` → the bare key test, the picker's `(any value)` row and
+ *     OG's one-argument `(property k)`, i.e. `is_set` semantics. Unchanged, and
+ *     offered by every type family (§9 P2);
+ *   - a string → `value = '<text>'`, the untyped equality;
+ *   - a {@link PropertyValueTest} → `value <op> <operand>` for the typed
+ *     operators. */
+export function propertyFilter(
+  key: string,
+  value: string | PropertyValueTest | null,
+): Filter {
   const keyTest = attr("key", "eq", { kind: "text", text: key });
-  const pred: Filter =
+  const valueTest: Filter | null =
     value == null || value === ""
-      ? keyTest
-      : { kind: "and", items: [keyTest, attr("value", "eq", { kind: "text", text: value })] };
+      ? null
+      : typeof value === "string"
+        ? attr("value", "eq", { kind: "text", text: value })
+        : attr("value", value.op, value.operand);
+  const pred: Filter = valueTest ? { kind: "and", items: [keyTest, valueTest] } : keyTest;
   return rel("props", pred);
 }
 
 /** `(page-property …)` — the same predicate read through the page. */
-export function pagePropertyFilter(key: string, value: string | null): Filter {
+export function pagePropertyFilter(
+  key: string,
+  value: string | PropertyValueTest | null,
+): Filter {
   return throughPage(propertyFilter(key, value));
+}
+
+// ---------------------------------------------------------------------------
+// Typed operators (SPEC §7.4, §9 P2)
+// ---------------------------------------------------------------------------
+
+/** One offered comparison for a property key of a known type. */
+export interface TypedOperator {
+  /** An operator the IR ALREADY has. This helper chooses among `CmpOp`s and
+   *  builds the matching `Value`; it never invents either (P0 owns the IR). */
+  op: CmpOp;
+  /** The words the row shows. Plain English, not the operator's spelling. */
+  label: string;
+  /** How many text inputs the value editor collects. Two only for `between`. */
+  arity: 1 | 2;
+  /** The IR operand for what the user typed, or `null` when the text is not a
+   *  value of this type — a non-numeric "number" is a typo, not a filter, and
+   *  committing it as text would silently produce a leaf that matches nothing. */
+  operand: (texts: string[]) => Value | null;
+}
+
+const one = (texts: string[]): string => (texts[0] ?? "").trim();
+
+const textOperand = (texts: string[]): Value | null => {
+  const text = one(texts);
+  return text ? { kind: "text", text } : null;
+};
+
+const numberOperand = (texts: string[]): Value | null => {
+  const text = one(texts);
+  if (!text) return null;
+  const number = Number(text);
+  return Number.isFinite(number) ? { kind: "number", number } : null;
+};
+
+/** §4.2.3/A6: a date operand is the LITERAL the author typed (`today`, `-30d`,
+ *  `2026-01-01`, a journal title). Resolution is the engine's, at execution, so
+ *  a saved query means the same thing tomorrow as `dateExpr.ts` previews today. */
+const dateOperand = (texts: string[]): Value | null => {
+  const literal = one(texts);
+  return literal ? { kind: "date", literal } : null;
+};
+
+const dateRangeOperand = (texts: string[]): Value | null => {
+  const low = dateOperand([texts[0] ?? ""]);
+  const high = dateOperand([texts[1] ?? ""]);
+  return low && high ? { kind: "list", items: [low, high] } : null;
+};
+
+const boolOperand = (texts: string[]): Value | null => {
+  const text = one(texts).toLowerCase();
+  if (["true", "yes", "y", "1", "done", "checked"].includes(text)) {
+    return { kind: "bool", bool: true };
+  }
+  if (["false", "no", "n", "0", "unchecked"].includes(text)) {
+    return { kind: "bool", bool: false };
+  }
+  return null;
+};
+
+/** "contains" is a `like` PATTERN, not a substring: the user's `%`, `_` and `\`
+ *  are data (`escapeLike`), exactly as `contentFilter` builds it. */
+const containsOperand = (texts: string[]): Value | null => {
+  const text = one(texts);
+  return text ? { kind: "text", text: `%${escapeLike(text)}%` } : null;
+};
+
+/**
+ * **The comparisons offered for a property key, from the registry's effective
+ * type (SPEC §7.4 "Operators and value editor by registry type", §9 P2).**
+ *
+ * Pure, and deliberately so: it maps a type to a menu, and it is the same menu
+ * whether the caller is today's chip bar or P3's row. Three rules it encodes:
+ *
+ *  - **It chooses among operators the IR already has.** `CmpOp` and `Value` are
+ *    P0's; nothing here widens either. A type that offered an operator the
+ *    lowering cannot answer would be a builder that writes queries the engine
+ *    silently drops.
+ *  - **The presence row is NOT here.** `(any value)` — the bare key test, `is_set`
+ *    semantics — is offered by every family and is built by
+ *    {@link propertyFilter} with a `null` value, unchanged. It is a different
+ *    question ("does this key exist here?") from every row below.
+ *  - **`many` changes the words, not the operator.** For a key whose owners hold
+ *    several atoms, `value = 'x'` already means "one of this key's values is x",
+ *    so the operator is right and only the label was lying. There is no
+ *    `any-of`/`none-of` in P2: `in`/`not_in` are list membership, not
+ *    quantifiers, and the real quantifiers (`every`/`none`) are §7.4 work.
+ */
+export function operatorsFor(effective: {
+  type: ObservedType;
+  cardinality: Cardinality;
+}): TypedOperator[] {
+  const many = effective.cardinality === "many";
+  const is = many ? "contains this value" : "is";
+  const isNot = many ? "does not contain this value" : "is not";
+  switch (effective.type) {
+    case "number":
+      return [
+        { op: "eq", label: is, arity: 1, operand: numberOperand },
+        { op: "not_eq", label: isNot, arity: 1, operand: numberOperand },
+        { op: "lt", label: "is less than", arity: 1, operand: numberOperand },
+        { op: "le", label: "is at most", arity: 1, operand: numberOperand },
+        { op: "gt", label: "is more than", arity: 1, operand: numberOperand },
+        { op: "ge", label: "is at least", arity: 1, operand: numberOperand },
+      ];
+    case "date":
+      return [
+        { op: "eq", label: is, arity: 1, operand: dateOperand },
+        { op: "lt", label: "before", arity: 1, operand: dateOperand },
+        { op: "gt", label: "after", arity: 1, operand: dateOperand },
+        { op: "between", label: "between", arity: 2, operand: dateRangeOperand },
+      ];
+    case "checkbox":
+      return [
+        { op: "eq", label: "is", arity: 1, operand: boolOperand },
+        { op: "not_eq", label: "is not", arity: 1, operand: boolOperand },
+      ];
+    case "ref":
+      return [
+        { op: "eq", label: is, arity: 1, operand: textOperand },
+        { op: "not_eq", label: isNot, arity: 1, operand: textOperand },
+      ];
+    case "text":
+      return [
+        { op: "eq", label: is, arity: 1, operand: textOperand },
+        { op: "not_eq", label: isNot, arity: 1, operand: textOperand },
+        { op: "like", label: "contains", arity: 1, operand: containsOperand },
+        { op: "starts_with", label: "starts with", arity: 1, operand: textOperand },
+      ];
+  }
 }
 
 /** `(page-tags …)` — `og.rs` `"page-tags" | "tags"`: the page's `tags` property
@@ -276,6 +435,20 @@ function propsParts(pred: Filter): { key: string; atom: Filter | null } | null {
     atom = item;
   }
   return key == null ? null : { key, atom };
+}
+
+/** The property key a `props`/`page_prop` leaf tests, or `null` for any other
+ *  shape. Read by the type surface (§6.3) so a chip's own menu can say what the
+ *  key's type is; it deliberately does NOT require the value test to be a shape
+ *  the pickers can re-collect, because a key's type is worth knowing for a
+ *  typed comparison too. */
+export function propertyLeafKey(filter: Filter): string | null {
+  const page = asRelLeaf(filter, "page");
+  if (page) return propertyLeafKey(page.pred);
+  const props = asRelLeaf(filter, "props");
+  if (!props) return null;
+  const parts = propsParts(props.pred);
+  return parts && parts.key !== "tags" ? parts.key : null;
 }
 
 /** Which builder shape this filter is, or `null` for anything the pickers cannot

@@ -1,0 +1,97 @@
+import { Show, createSignal, createUniqueId, onMount, type JSX } from "solid-js";
+
+/** **The user half of the persisted-form crossing (SPEC §4.3 "Notice", §7.5).**
+ *
+ *  The mechanical half already shipped: an edit the OG DSL cannot express turns
+ *  a `{{query …}}` block into `{{tine-query …}}` on save. That is the right
+ *  behaviour — the alternative is dropping the user's edit — but it changes what
+ *  the block looks like *in Logseq*, silently, as a side effect of an ordinary
+ *  edit. So it is said out loud, with the way back attached.
+ *
+ *  Three deliberate shapes:
+ *
+ *  1. **Not a toast.** P4 hosts this same component inside the query pane it
+ *     builds, so it is an inline region that takes its position from its host.
+ *     A toast would also be gone before a reader who looked away came back.
+ *  2. **The feature is NOT named in P2.** The engine's answer here is a bare
+ *     `og_expressible` bool, and the OG printer's refusal says only "this
+ *     filter" / "this view". Re-deriving OG-expressibility over the TypeScript
+ *     IR mirror to produce a name would be a second producer of a question Rust
+ *     owns (D-14) — the exact class of twin this campaign deleted. `feature` is
+ *     the seam P4 fills from the pane's diagnostics without the text moving.
+ *  3. **Undo is the ordinary undo**, gated on the ordinary undo actually being
+ *     this change (`canUndo`). There is no targeted-inverse mechanism: an undo
+ *     that reached past a later edit to reverse an older one would be a new and
+ *     much more dangerous kind of undo.
+ */
+export function CrossingNotice(props: {
+  /** Whether the change this notice offers to take back is still the change the
+   *  ordinary Undo would take back. When false the button says so and is
+   *  disabled — a button that quietly undid something else would be worse than
+   *  no button. */
+  canUndo: boolean;
+  /** Filled by P4 from the pane's diagnostics; absent in P2. When set it is
+   *  rendered as the parenthetical the spec's wording carries. */
+  feature?: string;
+  onUndo: () => void;
+  onKeep: () => void;
+  /** Called at most once, on close, when "Don't show this again" is ticked. */
+  onDontShowAgain: () => void;
+}): JSX.Element {
+  const [dontShow, setDontShow] = createSignal(false);
+  const checkboxId = `crossing-notice-dont-show-${createUniqueId()}`;
+  let region: HTMLDivElement | undefined;
+
+  // The bytes already changed; a notice the user's eyes never reach is the same
+  // as no notice. Focus is moved to the region itself (not to a button) so a
+  // screen reader announces the whole message before the choices, and so Enter
+  // does not fire a destructive default.
+  onMount(() => region?.focus());
+
+  const close = (act: () => void) => {
+    if (dontShow()) props.onDontShowAgain();
+    act();
+  };
+
+  return (
+    <div
+      ref={region}
+      class="query-crossing-notice"
+      role="status"
+      tabindex="-1"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <p class="query-crossing-notice-text">
+        This query now uses Tine features Logseq can't read
+        <Show when={props.feature}>{(feature) => <> (<code>{feature()}</code>)</>}</Show>. Logseq
+        will show the block as plain text.
+      </p>
+      <div class="query-crossing-notice-actions">
+        <button
+          class="query-crossing-notice-undo"
+          disabled={!props.canUndo}
+          title={
+            props.canUndo
+              ? "Put the query back the way it was"
+              : "Something else was changed since; use the ordinary Undo to step back to it"
+          }
+          onClick={() => close(props.onUndo)}
+        >
+          {props.canUndo ? "Undo that change" : "Undo (use Ctrl+Z)"}
+        </button>
+        <button class="query-crossing-notice-keep" onClick={() => close(props.onKeep)}>
+          Keep it
+        </button>
+        <label class="query-crossing-notice-dismiss" for={checkboxId}>
+          <input
+            id={checkboxId}
+            type="checkbox"
+            checked={dontShow()}
+            onChange={(e) => setDontShow(e.currentTarget.checked)}
+          />
+          Don't show this again
+        </label>
+      </div>
+    </div>
+  );
+}

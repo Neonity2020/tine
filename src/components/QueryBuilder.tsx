@@ -7,6 +7,7 @@ import {
   createSignal,
   createUniqueId,
   onCleanup,
+  onMount,
   type Accessor,
   type JSX,
 } from "solid-js";
@@ -25,6 +26,8 @@ import {
   journalFilter,
   namespaceFilter,
   onPageFilter,
+  operatorsFor,
+  propertyLeafKey,
   pagePropertyFilter,
   pageRefFilter,
   pageTagsFilter,
@@ -50,9 +53,19 @@ import {
   type AggState,
   type BetweenField,
   type BuilderLeafKind,
+  type PropertyValueTest,
   type SortPreset,
+  type TypedOperator,
 } from "../editor/queryBuilder";
-import type { AggFn, Filter, Query, QueryPrintDialect, ViewSettings } from "../editor/queryIr";
+import type {
+  AggFn,
+  Filter,
+  Query,
+  QueryPrintDialect,
+  RegistryRow,
+  ViewSettings,
+} from "../editor/queryIr";
+import { PropertyType, effectiveTypeOf, registryRowFor } from "./PropertyType";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
 import { sharedQueryResult } from "../queryResultCache";
 import { dataRev, graphEpoch, graphMeta, queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
@@ -73,6 +86,19 @@ const stop = (e: MouseEvent) => e.stopPropagation();
 
 type QueryFacets = [string, string[]][];
 type QueryFacetsAccessor = Accessor<QueryFacets | undefined>;
+
+/** **The property registry, read exactly twice (§6.4, I-13).**
+ *
+ *  The registry is a graph-level table. Asking for it on a keystroke, or once
+ *  per rendered chip, is the shape this campaign exists to delete — so the
+ *  builder holds ONE read and hands it down. `request()` is called when a
+ *  property picker opens and again after a declaration is written, and on
+ *  nothing else in P2: the projection exposes no generation signal to
+ *  TypeScript, so there is no third moment to invent one for. */
+export interface RegistryAccess {
+  rows: Accessor<RegistryRow[] | undefined>;
+  request: () => void;
+}
 const locKey = (l: number[]) => l.join(".");
 
 /** The pair an edit session holds (§4.3.1). `query` carries the anchor, the
@@ -590,6 +616,21 @@ export function QueryBuilder(props: {
         () => backend().queryFacets(),
       ),
   );
+  // **The ONE registry read (§6.4, K20, I-13).** `query_registry` is a
+  // graph-level table; P0 computes it, and until this packet no UI had ever
+  // asked for it. It is fetched when a property picker opens and again after a
+  // declaration is written — never on a keystroke, never per chip. There is no
+  // generation signal from the projection to TypeScript, so there is deliberately
+  // no third trigger.
+  const [registryRequests, setRegistryRequests] = createSignal(0);
+  const [registrySnapshot] = createResource(
+    () => (registryRequests() > 0 ? `${graphEpoch()}\0${registryRequests()}` : undefined),
+    () => backend().queryRegistry(),
+  );
+  const registry: RegistryAccess = {
+    rows: () => registrySnapshot.latest?.rows,
+    request: () => setRegistryRequests((n) => n + 1),
+  };
   // Which popover is open, by op/clause loc + purpose. Only one at a time.
   const [openMenu, setOpenMenu] = createSignal<string | null>(null);
   // Open the root add-picker immediately when this block was just created via
@@ -633,6 +674,7 @@ export function QueryBuilder(props: {
     <Show when={session()}>
       <div class="qb-bar" classList={{ "qb-bar-stale": stale() }} onClick={stop}>
         <Node clause={root()} loc={[]} isRoot tree={root} apply={apply} facets={facets}
+          registry={registry}
           openMenu={openMenu} setOpenMenu={setOpenMenu} adding={adding} setAdding={setAdding}
           parentTransientId={props.parentTransientId} />
         <SortControl view={view} apply={applyView} parentTransientId={props.parentTransientId} />
@@ -661,6 +703,7 @@ interface NodeCtx {
   tree: () => Filter;
   apply: (next: Filter) => void;
   facets: QueryFacetsAccessor;
+  registry: RegistryAccess;
   openMenu: () => string | null;
   setOpenMenu: (k: string | null) => void;
   adding: () => string | null;
@@ -790,11 +833,28 @@ function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.
     return kind != null && kind !== "scheduled" && kind !== "deadline" && kind !== "journal";
   };
 
+  // The key this chip tests, when it tests one. A property chip is where a user
+  // most often asks "what IS this key?", so the same §6.3 surface the picker
+  // shows lives here — badge, mismatch, and "declare type…".
+  const propertyKey = () => (isOpKey() ? null : propertyLeafKey(props.clause));
+  createEffect(() => {
+    if (open() && propertyKey()) props.registry.request();
+  });
+
   return (
     <Show when={open()}>
       <div ref={menuEl} class="qb-menu" onClick={stop}>
         <Show when={editing()} fallback={
           <>
+            <Show when={propertyKey()}>
+              {(key) => (
+                <PropertyType
+                  propertyKey={key()}
+                  rows={props.registry.rows}
+                  onDeclarationWritten={props.registry.request}
+                />
+              )}
+            </Show>
             <Show when={canEdit()}>
               <button class="qb-menu-item" onClick={() => setEditing(true)}>Edit…</button>
             </Show>
@@ -810,7 +870,7 @@ function ChipMenu(props: NodeCtx & { trigger?: () => HTMLElement | null }): JSX.
           </>
         }>
           <div class="qb-picker-title">Edit value</div>
-          <ValuePicker facets={props.facets} kind={editKind()!} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
+          <ValuePicker facets={props.facets} registry={props.registry} kind={editKind()!} onCommit={(c) => props.apply(replaceAt(props.tree(), props.loc, c))} />
         </Show>
       </div>
     </Show>
@@ -850,6 +910,7 @@ function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
       <Show when={open()}>
         <AddPicker
           facets={props.facets}
+          registry={props.registry}
           rootRef={(element) => { pickerEl = element; }}
           onCommit={(c) => props.apply(addChild(props.tree(), props.loc, c))}
           onSetOp={(op) => props.apply(setOp(props.tree(), props.loc, op))}
@@ -881,6 +942,7 @@ const FILTER_TYPES: { kind: BuilderLeafKind; label: string }[] = [
 
 function AddPicker(props: {
   facets: QueryFacetsAccessor;
+  registry: RegistryAccess;
   onCommit: (c: Filter) => void;
   onSetOp: (op: "and" | "or") => void;
   rootRef?: (element: HTMLDivElement) => void;
@@ -917,7 +979,7 @@ function AddPicker(props: {
         </For>
       </Show>
       <Show when={step() !== "type"}>
-        <ValuePicker facets={props.facets} kind={step() as BuilderLeafKind} onCommit={commit} />
+        <ValuePicker facets={props.facets} registry={props.registry} kind={step() as BuilderLeafKind} onCommit={commit} />
       </Show>
     </div>
   );
@@ -926,7 +988,12 @@ function AddPicker(props: {
 // Renders the value collector for a given filter kind, and commits the IR leaf
 // `og.rs` builds for the same intent. Shared by the add-filter picker and the
 // in-place "Edit value" flow.
-function ValuePicker(props: { facets: QueryFacetsAccessor; kind: BuilderLeafKind; onCommit: (c: Filter) => void }): JSX.Element {
+function ValuePicker(props: {
+  facets: QueryFacetsAccessor;
+  registry: RegistryAccess;
+  kind: BuilderLeafKind;
+  onCommit: (c: Filter) => void;
+}): JSX.Element {
   return (
     <>
       <Show when={props.kind === "page"}>
@@ -939,7 +1006,7 @@ function ValuePicker(props: { facets: QueryFacetsAccessor; kind: BuilderLeafKind
         <MultiPick options={PRIORITIES} onCommit={(levels) => props.onCommit(priorityFilter(levels))} />
       </Show>
       <Show when={props.kind === "property"}>
-        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit(propertyFilter(key, value))} />
+        <PropertyPick facets={props.facets} registry={props.registry} onCommit={(key, value) => props.onCommit(propertyFilter(key, value))} />
       </Show>
       <Show when={props.kind === "between"}>
         <BetweenPick onCommit={(field, start, end) => props.onCommit(betweenFilter(field, start, end))} />
@@ -951,7 +1018,7 @@ function ValuePicker(props: { facets: QueryFacetsAccessor; kind: BuilderLeafKind
         <PageInput placeholder="Namespace (parent page)" onCommit={(ns) => props.onCommit(namespaceFilter(ns))} />
       </Show>
       <Show when={props.kind === "pageProperty"}>
-        <PropertyPick facets={props.facets} onCommit={(key, value) => props.onCommit(pagePropertyFilter(key, value))} />
+        <PropertyPick facets={props.facets} registry={props.registry} onCommit={(key, value) => props.onCommit(pagePropertyFilter(key, value))} />
       </Show>
       <Show when={props.kind === "content"}>
         <TextInput placeholder="Text to search for" onCommit={(text) => props.onCommit(contentFilter(text))} />
@@ -1043,14 +1110,49 @@ function MultiPick(props: { options: string[]; onCommit: (picked: string[]) => v
   );
 }
 
-// Property: choose a key (autocompleted from used properties), then a value
-// (from that key's known values, "any", or free text).
-function PropertyPick(props: { facets: QueryFacetsAccessor; onCommit: (key: string, value: string | null) => void }): JSX.Element {
+// Property: choose a key (autocompleted from used properties), then a value.
+//
+// The chosen-key panel is where §6.3 and §9 P2 meet the user: it shows what the
+// registry says the key's type IS, offers the comparison family for that type
+// (§7.4), and hosts the one action that declares a type. The chip bar around it
+// is P3's to delete — `PropertyType` and `operatorsFor` are deliberately not
+// coupled to it.
+function PropertyPick(props: {
+  facets: QueryFacetsAccessor;
+  registry: RegistryAccess;
+  onCommit: (key: string, value: string | PropertyValueTest | null) => void;
+}): JSX.Element {
   const [key, setKey] = createSignal("");
   const [chosen, setChosen] = createSignal<string | null>(null);
   const keys = () => (props.facets() ?? []).map(([k]) => k);
   const valuesFor = (k: string) => (props.facets() ?? []).find(([kk]) => kk === k)?.[1] ?? [];
-  const [val, setVal] = createSignal("");
+  const [low, setLow] = createSignal("");
+  const [high, setHigh] = createSignal("");
+  const [opIndex, setOpIndex] = createSignal(0);
+
+  // One read, taken when this picker opens (§6.4, I-13).
+  onMount(() => props.registry.request());
+
+  /** The comparison family for the chosen key's EFFECTIVE type — declared if the
+   *  user declared one, else observed. An unknown key gets the text family,
+   *  which is the untyped `= '<text>'` the builder could always say. */
+  const operators = (): TypedOperator[] => {
+    const name = chosen();
+    const row = name ? registryRowFor(props.registry.rows(), name) : undefined;
+    return operatorsFor(row ? effectiveTypeOf(row) : { type: "text", cardinality: "one" });
+  };
+  const operator = () => operators()[opIndex()] ?? operators()[0];
+  const pending = (): PropertyValueTest | null => {
+    const chosenOp = operator();
+    if (!chosenOp) return null;
+    const operand = chosenOp.operand(chosenOp.arity === 2 ? [low(), high()] : [low()]);
+    return operand ? { op: chosenOp.op, operand } : null;
+  };
+  const commitTyped = () => {
+    const test = pending();
+    const name = chosen();
+    if (test && name) props.onCommit(name, test);
+  };
 
   return (
     <div class="qb-value">
@@ -1079,9 +1181,19 @@ function PropertyPick(props: { facets: QueryFacetsAccessor; onCommit: (key: stri
         }
       >
         <div class="qb-picker-title">{chosen()}</div>
-        <button class="qb-menu-item" onClick={() => props.onCommit(chosen()!, null)}>
+        <PropertyType
+          propertyKey={chosen()!}
+          rows={props.registry.rows}
+          onDeclarationWritten={props.registry.request}
+        />
+        {/* The presence row. Every type family keeps it, and it is the same bare
+            key test it has always been (§9 P2). */}
+        <button class="qb-menu-item qb-prop-any" onClick={() => props.onCommit(chosen()!, null)}>
           (any value)
         </button>
+        {/* A known value commits the untyped `value = '<text>'`, exactly as
+            before — one click must not quietly cross an OG-expressible block
+            over to the Tine macro name (§4.3 Q3). */}
         <For each={valuesFor(chosen()!)}>
           {(v) => (
             <button class="qb-menu-item" onClick={() => props.onCommit(chosen()!, v)}>
@@ -1089,15 +1201,41 @@ function PropertyPick(props: { facets: QueryFacetsAccessor; onCommit: (key: stri
             </button>
           )}
         </For>
-        <input
-          class="qb-input"
-          placeholder="Custom value"
-          value={val()}
-          onInput={(e) => setVal(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") props.onCommit(chosen()!, val().trim() || null);
-          }}
-        />
+        <div class="qb-prop-compare">
+          <select
+            class="qb-prop-op"
+            aria-label="Comparison"
+            value={String(opIndex())}
+            onChange={(e) => setOpIndex(Number(e.currentTarget.value))}
+          >
+            <For each={operators()}>
+              {(o, index) => <option value={String(index())}>{o.label}</option>}
+            </For>
+          </select>
+          <input
+            class="qb-input"
+            placeholder={operator()?.arity === 2 ? "From" : "Value"}
+            value={low()}
+            onInput={(e) => setLow(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitTyped();
+            }}
+          />
+          <Show when={operator()?.arity === 2}>
+            <input
+              class="qb-input"
+              placeholder="To"
+              value={high()}
+              onInput={(e) => setHigh(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitTyped();
+              }}
+            />
+          </Show>
+          <button class="qb-prop-add" disabled={!pending()} onClick={commitTyped}>
+            Add
+          </button>
+        </div>
       </Show>
     </div>
   );

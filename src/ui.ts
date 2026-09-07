@@ -985,6 +985,82 @@ export function bumpGraphEpoch() {
   setGraphEpoch((n) => n + 1);
 }
 
+// --------------------------------------------------------------------------
+// One-time notices, dismissed per DEVICE and per graph (§4.3 "Notice", I-18)
+// --------------------------------------------------------------------------
+
+/** The §7.5 crossing notice — the only key today. */
+export const CROSSING_NOTICE = "query-crossing";
+
+/** Read ONCE per graph open, not per block render.
+ *
+ *  A `{{query}}` block that crossed to `{{tine-query}}` asks "has this device
+ *  been told not to show this?" while it is rendering, and a page can hold many
+ *  query blocks. Answering that with an IPC per block per render would put a
+ *  graph-scoped question on a render path (I-13), so the answer is one shared
+ *  read per `graphEpoch`. `undefined` until it resolves — a notice waits for the
+ *  answer rather than flashing and retracting.
+ *
+ *  The store is device-local by decision (D-11): "don't show me this again" is a
+ *  statement about this device's user, so it never enters the graph. */
+const [dismissedNotices, setDismissedNotices] = createSignal<Set<string> | null>(null);
+let dismissedNoticesEpoch = -1;
+
+/** Start the one read for the open graph, if it has not started already.
+ *
+ *  Kept separate from {@link noticeDismissed} so the READ is a plain read: a
+ *  component may ask "is this dismissed?" from inside a tracked computation
+ *  without that question writing a signal underneath it. */
+export function primeNoticeDismissals(): void {
+  const epoch = graphEpoch();
+  if (dismissedNoticesEpoch === epoch) return;
+  dismissedNoticesEpoch = epoch;
+  setDismissedNotices(null);
+  void backend()
+    .loadNotices()
+    .then((raw) => {
+      if (dismissedNoticesEpoch !== epoch) return; // a later graph won the race
+      const parsed: unknown = JSON.parse(raw);
+      const raw_list = (parsed as { dismissed?: unknown } | null)?.dismissed;
+      const list: string[] = Array.isArray(raw_list)
+        ? raw_list.filter((key): key is string => typeof key === "string")
+        : [];
+      setDismissedNotices(new Set(list));
+    })
+    .catch(() => {
+      // Recovery over refusal (D-3/G2): an unreadable record costs one extra
+      // notice, never the graph.
+      if (dismissedNoticesEpoch === epoch) setDismissedNotices(new Set<string>());
+    });
+}
+
+/** Whether `key` has been dismissed on this device for the open graph.
+ *  `undefined` while the answer is still loading. */
+export function noticeDismissed(key: string): boolean | undefined {
+  const set = dismissedNotices();
+  return set ? set.has(key) : undefined;
+}
+
+/** Record "don't show this again" for the open graph, on this device only. */
+export function dismissNotice(key: string): void {
+  const next = new Set<string>(dismissedNotices() ?? []);
+  if (next.has(key)) return;
+  next.add(key);
+  setDismissedNotices(next);
+  void backend()
+    .saveNotices(JSON.stringify({ dismissed: [...next] }))
+    .catch(() => {
+      // The checkbox is a preference, not content: a failed write means the
+      // notice appears once more, which is not worth a toast.
+    });
+}
+
+/** Tests open several graphs in one process; the read is module state. */
+export function resetDismissedNoticesForTests(): void {
+  dismissedNoticesEpoch = -1;
+  setDismissedNotices(null);
+}
+
 // Bumped after a save batch lands (the Rust cache now reflects the edit), so
 // derived whole-graph views — {{query}} results, backlinks — can recompute.
 // This is Tine's stand-in for OG's reactive-DB query invalidation.

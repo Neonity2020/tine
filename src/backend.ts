@@ -1161,6 +1161,14 @@ export interface Backend {
   loadWorkspaces(): Promise<string>;
   /** Atomically persist the current graph's complete named-workspace registry. */
   saveWorkspaces(data: string): Promise<void>;
+  /** The one-time notices this DEVICE has been told not to show again for the
+   *  current graph, as `{"dismissed": string[]}` (§4.3 "Notice", D-11, I-18).
+   *  Never travels with the graph: it says something about this device's user,
+   *  not about the graph's content. A missing or damaged record reads as
+   *  "nothing dismissed" rather than failing (D-3/G2). */
+  loadNotices(): Promise<string>;
+  /** Persist the complete dismissed-notice set for the current graph. */
+  saveNotices(data: string): Promise<void>;
   /** True exactly ONCE if this launch migrated the app-data dir left by the
    *  desktop identifier rename chain dev.tine.app / page.tine.app ->
    *  page.tine.Tine (so the UI can explain that some app-level prefs may need
@@ -2284,6 +2292,12 @@ class TauriBackend implements Backend {
   }
   saveWorkspaces(data: string) {
     return this.call<void>("save_workspaces", { data });
+  }
+  loadNotices() {
+    return this.call<string>("load_notices");
+  }
+  saveNotices(data: string) {
+    return this.call<void>("save_notices", { data });
   }
   takeIdentifierMigrationNotice() {
     return this.call<boolean>("take_identifier_migration_notice");

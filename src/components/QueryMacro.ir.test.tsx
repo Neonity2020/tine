@@ -25,7 +25,7 @@ import { backend, QueryPrintRefusedError } from "../backend";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 import { blockProperty, doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import type { RefGroup } from "../types";
-import type { ExplainEmptyResult, ParsedQuery, Query } from "../editor/queryIr";
+import type { ExplainEmptyResult, ParsedQuery, Query, ViewSettings } from "../editor/queryIr";
 import { blockRunResult } from "../queryReadingsTestkit";
 
 beforeAll(async () => {
@@ -54,10 +54,10 @@ async function settle(): Promise<void> {
   await tick();
 }
 
-function page(roots: string[]): FeedPage {
+function page(roots: string[], readOnly = false): FeedPage {
   return {
     name: "Sheet", kind: "page", title: "Sheet", preBlock: null,
-    roots, format: "md", readOnly: false, guide: false,
+    roots, format: "md", readOnly, guide: false,
   };
 }
 
@@ -73,10 +73,10 @@ function groups(): RefGroup[] {
   }];
 }
 
-function load(raw: string): void {
+function load(raw: string, { readOnly = false }: { readOnly?: boolean } = {}): void {
   setDoc({
     byId: { query: node("query", raw), todo: node("todo", "TODO A tracked row") },
-    pages: [page(["query", "todo"])],
+    pages: [page(["query", "todo"], readOnly)],
     feed: ["Sheet"],
     loaded: true,
   });
@@ -312,7 +312,7 @@ async function saveThroughPane(root: HTMLElement, text: string): Promise<void> {
 }
 
 describe("B5: the save path chooses the name and answers NotApplicable", () => {
-  it("keeps {{query}} for an OG-expressible edit and writes no view properties", async () => {
+  it("keeps {{query}} for an OG-expressible edit, and an empty view adds no property line", async () => {
     load('{{query (task TODO)}}');
     vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
     vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
@@ -323,8 +323,9 @@ describe("B5: the save path chooses the name and answers NotApplicable", () => {
       await saveThroughPane(root, "-- task DONE");
       expect(doc.byId.query.raw).toBe("{{query (task DONE)}}");
       expect(savePrintDialects(print)).toEqual(["og"]);
-      // OG text carries its own view directives; Y2 properties are for a block
-      // that CROSSED to TQL.
+      // Every save now writes the six §7.6 view properties (T4) — but clearing a
+      // property a block never had is the identity, so a view with nothing in it
+      // still leaves the block's bytes as the macro line and nothing else.
       expect(doc.byId.query.raw).not.toContain("tine.");
     } finally {
       dispose();
@@ -421,6 +422,168 @@ describe("B5: the save path chooses the name and answers NotApplicable", () => {
       });
       expect(refusal.getAttribute("role")).toBe("alert");
       expect(refusal.textContent).toContain("a `}}` in the query would end the macro");
+    } finally {
+      dispose();
+    }
+  });
+});
+
+/** §4.3 "Directive migration" (Q15, T4).
+ *
+ *  A block that STAYS `{{query}}` used to lose every view edit that OG cannot
+ *  say and silently duplicate the ones it can: `writeViewProperties` fired only
+ *  on the crossing to `{{tine-query}}`, and the OG printer re-emitted
+ *  `(aggregate …)`/`(group-by …)` into the text. Now every save writes all six
+ *  §7.6 properties for both macro names, aggregates and grouping leave the DSL
+ *  text, and `sort-by`/`sample` stay in the text as well as in the properties
+ *  because OG itself reads those.
+ */
+describe("B6: directive migration for blocks that stay {{query}}", () => {
+  /** A parse whose view is `view`, so a save has something to persist. */
+  function parseWithView(view: ViewSettings): void {
+    vi.spyOn(backend(), "parseQuery").mockImplementation(async (text: string) => ({
+      query: parsedAs(text).query,
+      view,
+    }));
+  }
+
+  it("writes tine.col-aggregates on a NON-crossing save and leaves (aggregate …) out of the text", async () => {
+    load('{{query (task TODO)}}');
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    vi.spyOn(backend(), "printQuery").mockResolvedValue("(task DONE)");
+    parseWithView({ aggregates: [["", "count"], ["hours", "sum"]], group_by: "status" });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await saveThroughPane(root, "-- task DONE");
+      await vi.waitFor(() =>
+        expect(blockProperty("query", "tine.col-aggregates")).toBe("count;hours=sum"),
+      );
+      expect(blockProperty("query", "tine.group-by")).toBe("status");
+      // The block stayed `{{query}}` — the migration is about WHERE the view
+      // lives, not about the macro name.
+      expect(doc.byId.query.raw).toContain("{{query (task DONE)}}");
+      expect(doc.byId.query.raw).not.toContain("(aggregate");
+      expect(doc.byId.query.raw).not.toContain("(group-by");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps (sort-by a desc) in the OG text AND gains tine.sort:: a desc", async () => {
+    load('{{query (task TODO) (sort-by a desc)}}');
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    vi.spyOn(backend(), "printQuery").mockResolvedValue("(task TODO) (sort-by a desc)");
+    parseWithView({ sort: [["a", "desc"]] });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await saveThroughPane(root, "-- task TODO");
+      await vi.waitFor(() => expect(blockProperty("query", "tine.sort")).toBe("a desc"));
+      // Q15: OG reads `sort-by`, so it is re-emitted as well as persisted.
+      expect(doc.byId.query.raw).toContain("(sort-by a desc)");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("drops tine.sort when the sort is removed, so the removal survives a reparse", async () => {
+    load('{{query (task TODO)}}\ntine.sort:: a desc');
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    vi.spyOn(backend(), "printQuery").mockResolvedValue("(task DONE)");
+    // The builder removed the sort: the session's view no longer carries one.
+    parseWithView({});
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      expect(blockProperty("query", "tine.sort")).toBe("a desc");
+      await saveThroughPane(root, "-- task DONE");
+      // `tine.*` has ABSOLUTE precedence over the DSL text, so a stale property
+      // line would put the removed sort straight back on the next parse.
+      await vi.waitFor(() => expect(blockProperty("query", "tine.sort")).toBeNull());
+      expect(doc.byId.query.raw).not.toContain("tine.sort");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("persists all six §7.6 fields, so the block re-parses to the saved view", async () => {
+    load('{{query (task TODO)}}');
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    vi.spyOn(backend(), "printQuery").mockResolvedValue("(task DONE)");
+    const saved: ViewSettings = {
+      view: "table",
+      sort: [["a", "desc"]],
+      group_by: "status",
+      columns: ["a", "b"],
+      aggregates: [["hours", "sum"]],
+      sample: 20,
+    };
+    parseWithView(saved);
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await saveThroughPane(root, "-- task DONE");
+      await vi.waitFor(() => expect(blockProperty("query", "tine.view")).toBe("table"));
+      // `tine.fields::` and `tine.view::` are the two the reader consumes and
+      // nobody wrote: before T4 a saved column set or view kind was simply lost.
+      expect(blockProperty("query", "tine.fields")).toBe("a;b");
+      expect(blockProperty("query", "tine.sort")).toBe("a desc");
+      expect(blockProperty("query", "tine.group-by")).toBe("status");
+      expect(blockProperty("query", "tine.col-aggregates")).toBe("hours=sum");
+      expect(blockProperty("query", "tine.sample")).toBe("20");
+      // The properties the block now carries are exactly the ones the engine is
+      // handed back on the next parse (§4.1 precedence merge).
+      const properties = vi.mocked(backend().parseQuery).mock.calls.at(-1)![2] ?? [];
+      const asMap = Object.fromEntries(properties);
+      expect(asMap["tine.view"]).toBe("table");
+      expect(asMap["tine.fields"]).toBe("a;b");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("leaves an untouched block byte-identical (no save, no property lines)", async () => {
+    load('{{query (task TODO)}}');
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    vi.spyOn(backend(), "printQuery").mockResolvedValue("(task TODO)");
+    parseWithView({ sort: [["a", "desc"]], aggregates: [["", "count"]] });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      const before = doc.byId.query.raw;
+      await vi.waitFor(() => expect(root.querySelector(".query-block")).not.toBeNull());
+      await settle();
+      // I-4: rendering a query is not editing it. Nothing is written until the
+      // user saves.
+      expect(doc.byId.query.raw).toBe(before);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("writes nothing at all when the page is not writable", async () => {
+    load('{{query (task TODO)}}', { readOnly: true });
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
+    vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);
+    vi.spyOn(backend(), "printQuery").mockResolvedValue("(task DONE)");
+    parseWithView({ sort: [["a", "desc"]] });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      const before = doc.byId.query.raw;
+      await saveThroughPane(root, "-- task DONE").catch(() => undefined);
+      await settle();
+      // The whole save is one undo unit now, and `withUndoUnit` returns without
+      // running its body on a non-writable page — so the macro rewrite and the
+      // property writes are refused TOGETHER rather than half-applied.
+      expect(doc.byId.query.raw).toBe(before);
+      expect(blockProperty("query", "tine.sort")).toBeNull();
     } finally {
       dispose();
     }

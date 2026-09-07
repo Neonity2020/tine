@@ -28,8 +28,8 @@
 //! this printer, and it is asserted below over every shape the parsers build.
 
 use crate::query::ir::{
-    AggFn, Anchor, Attr, CmpOp, Diagnostic, DiagnosticKind, Field, Filter, Leaf, Quant, Query, Rel,
-    SortDir, Source, Value, ViewSettings,
+    Anchor, Attr, CmpOp, Diagnostic, DiagnosticKind, Filter, Leaf, Quant, Query, Rel, SortDir,
+    Source, Value, ViewSettings,
 };
 use crate::query::macro_text::{self, FormFamily};
 
@@ -881,30 +881,23 @@ fn og_view(view: &ViewSettings) -> Option<Vec<String>> {
     if let Some(sample) = view.sample {
         out.push(format!("(sample {sample})"));
     }
-    // Until P2 the aggregate/group-by directives still live in the DSL text
-    // (M15) rather than in `tine.col-aggregates::` / `tine.group-by::`.
-    for (field, agg) in &view.aggregates {
-        out.push(og_aggregate(field, *agg));
-    }
-    if let Some(field) = &view.group_by {
-        out.push(format!("(group-by {})", word(field.as_str())));
-    }
+    // **Aggregates and `group-by` are NOT re-emitted (§4.3 "Directive migration",
+    // Q15).** They live in `tine.col-aggregates::` / `tine.group-by::`, which
+    // `merge_block_property_view` reads with absolute precedence over the DSL
+    // text. Printing them here as well would put the same view in two places and
+    // let the text copy outlive a removal made in the builder. `sort-by` and
+    // `sample` keep their text form, because OG itself reads those.
+    //
+    // This does not narrow `og_view`'s `None` (still only a multi-key sort), so
+    // `og_expressible` is unchanged: a query with aggregates stays expressible.
     Some(out)
-}
-
-fn og_aggregate(field: &Field, agg: AggFn) -> String {
-    let name = match agg {
-        AggFn::Count => return "(aggregate count)".to_string(),
-        AggFn::Sum => "sum",
-        AggFn::Avg => "avg",
-    };
-    format!("(aggregate {name} {})", word(field.as_str()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::date::JournalDate;
+    use crate::query::ir::{AggFn, Field};
     use crate::query::{parse_query_text, tql::parse_tql};
 
     fn tql(source: &str) -> Query {
@@ -1217,6 +1210,143 @@ mod tests {
         let (query, view) = og("(task TODO) (sort-by page asc) {:title \"T\"}");
         let printed = query_print(&query, &view, PrintDialect::Og, false).expect("printable");
         assert_eq!(printed, "(task TODO) (sort-by page asc) {:title \"T\"}");
+    }
+
+    /// **Directive migration (§4.3, Q15, P2).** `aggregate` and `group-by` have
+    /// no OG reader worth preserving — Logseq ignores both — and Tine now keeps
+    /// them in `tine.col-aggregates::` / `tine.group-by::`, which the reader's
+    /// precedence merge already consumes. So the OG printer must NOT re-emit
+    /// them: a block that stays `{{query}}` would otherwise carry the same view
+    /// twice, and the copy in the text would silently outlive a removal made in
+    /// the builder. `sort-by` and `sample` stay in the text (Q15).
+    #[test]
+    fn the_og_printer_leaves_aggregates_and_group_by_out_of_the_text() {
+        let (query, mut view) = og("(task TODO) (sort-by page asc) (sample 5)");
+        view.aggregates = vec![
+            (Field::new(""), AggFn::Count),
+            (Field::new("hours"), AggFn::Sum),
+        ];
+        view.group_by = Some(Field::new("status"));
+        assert!(
+            og_expressible(&query, &view),
+            "aggregates and a group-by do not make a query inexpressible"
+        );
+        let printed = query_print(&query, &view, PrintDialect::Og, false).expect("printable");
+        assert_eq!(printed, "(task TODO) (sort-by page asc) (sample 5)");
+        assert!(!printed.contains("aggregate"), "printed as {printed}");
+        assert!(!printed.contains("group-by"), "printed as {printed}");
+    }
+
+    /// **The builder's typed operators are IR the engine already reads back
+    /// (SPEC §7.4, §9 P2 "typed operators"; T2).**
+    ///
+    /// `operatorsFor` in `src/editor/queryBuilder.ts` maps a registry type to a
+    /// comparison family and constructs the matching `Value`. It chooses among
+    /// `CmpOp`s that already exist — but "already exists in the enum" is not the
+    /// same as "prints and parses back". This pins the second: every
+    /// `(op, operand)` pair that helper can emit, on the property-value shape it
+    /// emits it in, survives `query_print(tql_macro)` + a re-parse unchanged.
+    /// A pair that did not would be a builder writing chips the next open
+    /// silently rereads as something else.
+    #[test]
+    fn every_typed_property_operator_the_builder_offers_round_trips() {
+        let key = || {
+            Filter::leaf(Leaf::Attr {
+                attr: Attr::Key,
+                op: CmpOp::Eq,
+                value: Value::text("cost"),
+            })
+        };
+        let cases: Vec<(CmpOp, Value)> = vec![
+            // number
+            (CmpOp::Eq, Value::Number { number: 100.0 }),
+            (CmpOp::NotEq, Value::Number { number: 100.0 }),
+            (CmpOp::Lt, Value::Number { number: 100.0 }),
+            (CmpOp::Le, Value::Number { number: 100.0 }),
+            (CmpOp::Gt, Value::Number { number: 100.0 }),
+            (CmpOp::Ge, Value::Number { number: 100.0 }),
+            // date (the operand is the unresolved literal, A6)
+            (
+                CmpOp::Eq,
+                Value::Date {
+                    literal: "today".to_string(),
+                },
+            ),
+            (
+                CmpOp::Lt,
+                Value::Date {
+                    literal: "2026-01-01".to_string(),
+                },
+            ),
+            (
+                CmpOp::Gt,
+                Value::Date {
+                    literal: "-30d".to_string(),
+                },
+            ),
+            (
+                CmpOp::Between,
+                Value::List {
+                    items: vec![
+                        Value::Date {
+                            literal: "today".to_string(),
+                        },
+                        Value::Date {
+                            literal: "+7d".to_string(),
+                        },
+                    ],
+                },
+            ),
+            // checkbox
+            (CmpOp::Eq, Value::Bool { value: true }),
+            (CmpOp::NotEq, Value::Bool { value: false }),
+            // text and ref
+            (CmpOp::Eq, Value::text("book")),
+            (CmpOp::NotEq, Value::text("book")),
+            (CmpOp::Like, Value::text("%50\\%%")),
+            (CmpOp::StartsWith, Value::text("Proj")),
+        ];
+        for (op, value) in cases {
+            let filter = Filter::leaf(Leaf::Rel {
+                rel: Rel::Props,
+                quant: Quant::Any,
+                pred: Box::new(Filter::And {
+                    items: vec![
+                        key(),
+                        Filter::leaf(Leaf::Attr {
+                            attr: Attr::Value,
+                            op,
+                            value: value.clone(),
+                        }),
+                    ],
+                }),
+            });
+            let query = Query {
+                anchor: Anchor::Block,
+                filter,
+                diagnostics: Vec::new(),
+                source: Source::Builder,
+            };
+            let view = ViewSettings::default();
+            let printed = query_print(&query, &view, PrintDialect::TqlMacro, false)
+                .unwrap_or_else(|d| panic!("{op:?} {value:?} refused: {d:?}"));
+            let (again, _) = crate::query::parse_query_input(
+                &printed,
+                crate::query::QueryInput::MacroTql,
+                JournalDate::from_ordinal(20260904),
+                &crate::query::registry::Registry::none(),
+            );
+            assert!(
+                !again.is_invalid(),
+                "{printed} did not parse: {:?}",
+                again.diagnostics
+            );
+            assert_eq!(
+                again.normalized().filter,
+                query.normalized().filter,
+                "{op:?} {value:?} printed as {printed}"
+            );
+        }
     }
 
     #[test]

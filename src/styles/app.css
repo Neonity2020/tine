@@ -8965,6 +8965,38 @@ img.emoji {
   font-size: 13px;
   color: var(--text-muted);
 }
+/* The §7.5 crossing notice: an inline region under the block (P4 hosts the same
+   component inside its pane), not a toast — the bytes already changed and the
+   way back must still be there when the reader looks up. */
+.query-crossing-notice {
+  margin: 4px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary, var(--bg));
+  font-size: 13px;
+}
+.query-crossing-notice:focus-visible {
+  outline: 2px solid var(--accent, #4a90d9);
+  outline-offset: 1px;
+}
+.query-crossing-notice-text {
+  margin: 0 0 6px;
+  color: var(--text);
+}
+.query-crossing-notice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.query-crossing-notice-dismiss {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
 .link-depth-warning {
   margin: 2px 0;
   font-size: 13px;

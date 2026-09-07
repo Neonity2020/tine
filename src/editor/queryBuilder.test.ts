@@ -31,6 +31,7 @@ import {
   planningFilter,
   plainLikeSubstring,
   priorityFilter,
+  operatorsFor,
   propertyFilter,
   removeAt,
   replaceAt,
@@ -44,7 +45,14 @@ import {
   withSort,
   wrapAt,
 } from "./queryBuilder";
-import { forEachFilter, type Filter, type ViewSettings } from "./queryIr";
+import {
+  forEachFilter,
+  type Cardinality,
+  type CmpOp,
+  type Filter,
+  type ObservedType,
+  type ViewSettings,
+} from "./queryIr";
 
 const A = pageRefFilter("A");
 const B = pageRefFilter("B");
@@ -466,5 +474,115 @@ describe("view settings edits", () => {
   it("sortLabel prefers a preset's words", () => {
     expect(sortLabel("modified", "desc")).toBe("newest first");
     expect(sortLabel("rating", "desc")).toBe("rating ↓");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Typed operators over the registry type (SPEC §7.4, §9 P2; T2)
+// ---------------------------------------------------------------------------
+
+describe("operatorsFor: the comparison family for a registry type", () => {
+  const ops = (type: ObservedType, cardinality: Cardinality = "one") =>
+    operatorsFor({ type, cardinality }).map((o) => o.op);
+
+  /** The operand a row builds for `texts`, or null. */
+  const operandOf = (
+    type: ObservedType,
+    op: CmpOp,
+    texts: string[],
+    cardinality: Cardinality = "one",
+  ) => operatorsFor({ type, cardinality }).find((o) => o.op === op)!.operand(texts);
+
+  it("offers exactly the §9 P2 table, operator for operator", () => {
+    expect(ops("number")).toEqual(["eq", "not_eq", "lt", "le", "gt", "ge"]);
+    expect(ops("date")).toEqual(["eq", "lt", "gt", "between"]);
+    expect(ops("checkbox")).toEqual(["eq", "not_eq"]);
+    expect(ops("text")).toEqual(["eq", "not_eq", "like", "starts_with"]);
+    expect(ops("ref")).toEqual(["eq", "not_eq"]);
+  });
+
+  it("builds the operand KIND the type calls for, not a string for everything", () => {
+    expect(operandOf("number", "gt", ["3"])).toEqual({ kind: "number", number: 3 });
+    // A6/§4.2.3: the date operand is the unresolved literal. Resolving it here
+    // would freeze "today" to the day the chip was added.
+    expect(operandOf("date", "lt", ["today"])).toEqual({ kind: "date", literal: "today" });
+    expect(operandOf("date", "between", ["today", "+7d"])).toEqual({
+      kind: "list",
+      items: [
+        { kind: "date", literal: "today" },
+        { kind: "date", literal: "+7d" },
+      ],
+    });
+    expect(operandOf("checkbox", "eq", ["true"])).toEqual({ kind: "bool", bool: true });
+    expect(operandOf("checkbox", "eq", ["no"])).toEqual({ kind: "bool", bool: false });
+    expect(operandOf("text", "eq", ["book"])).toEqual({ kind: "text", text: "book" });
+    expect(operandOf("ref", "eq", ["Alpha"])).toEqual({ kind: "text", text: "Alpha" });
+  });
+
+  it("makes `contains` a like PATTERN whose %, _ and \\ are the user's data", () => {
+    expect(operandOf("text", "like", ["50%"])).toEqual({ kind: "text", text: "%50\\%%" });
+    expect(operandOf("text", "starts_with", ["Proj"])).toEqual({ kind: "text", text: "Proj" });
+  });
+
+  it("refuses text that is not a value of the type, instead of filtering for nothing", () => {
+    expect(operandOf("number", "eq", ["not a number"])).toBeNull();
+    expect(operandOf("number", "eq", [""])).toBeNull();
+    expect(operandOf("checkbox", "eq", ["maybe"])).toBeNull();
+    // A half-filled range is not a range.
+    expect(operandOf("date", "between", ["today", ""])).toBeNull();
+  });
+
+  it("says `contains this value` for a many-valued key, keeping the same operator", () => {
+    const many = operatorsFor({ type: "text", cardinality: "many" });
+    expect(many.find((o) => o.op === "eq")!.label).toBe("contains this value");
+    // `value = 'x'` on a many-valued key ALREADY means "one of its values is x".
+    // Only the words were wrong; there is no new operator and no quantifier.
+    expect(many.map((o) => o.op)).toEqual(["eq", "not_eq", "like", "starts_with"]);
+    expect(operatorsFor({ type: "text", cardinality: "one" }).find((o) => o.op === "eq")!.label)
+      .toBe("is");
+  });
+
+  it("puts the typed comparison on the VALUE attribute, leaving the key test alone", () => {
+    const filter = propertyFilter("cost", { op: "gt", operand: { kind: "number", number: 100 } });
+    expect(filter).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel",
+        rel: "props",
+        quant: "any",
+        pred: {
+          kind: "and",
+          items: [
+            { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "cost" } } },
+            { kind: "leaf", leaf: { kind: "attr", attr: "value", op: "gt", value: { kind: "number", number: 100 } } },
+          ],
+        },
+      },
+    });
+    expect(pagePropertyFilter("cost", { op: "gt", operand: { kind: "number", number: 100 } })).toEqual({
+      kind: "leaf",
+      leaf: { kind: "rel", rel: "page", quant: "any", pred: filter },
+    });
+  });
+
+  it("leaves `(any value)` exactly as it was — every family still offers it", () => {
+    // The presence row is NOT one of the typed operators: it asks a different
+    // question, and it is the ONE row a key of any type always has.
+    expect(propertyFilter("public", null)).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel",
+        rel: "props",
+        quant: "any",
+        pred: { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "public" } } },
+      },
+    });
+    expect(propertyFilter("public", "")).toEqual(propertyFilter("public", null));
+    expect(propertyFilter("type", "book")).toEqual(
+      propertyFilter("type", { op: "eq", operand: { kind: "text", text: "book" } }),
+    );
+    for (const type of ["text", "number", "date", "checkbox", "ref"] as ObservedType[]) {
+      expect(operatorsFor({ type, cardinality: "one" }).some((o) => o.op === "is_set")).toBe(false);
+    }
   });
 });

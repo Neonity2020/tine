@@ -1254,7 +1254,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("src-tauri/src/migrate_identifier.rs", "fs.rename", 4),
         // Packet B5p moved every plugin-package mutation behind tine-storage's
         // package protocol (see g_d); `plugins.rs` has no raw primitive left.
-        ("src-tauri/src/settings.rs", "fs.create_dir_all", 3),
+        // +1 from packet P2 (query engine): `save_notices_at` creates the
+        // `sessions/` directory before publishing the device-local notice
+        // dismissals, exactly as the session and workspace publishers do.
+        ("src-tauri/src/settings.rs", "fs.create_dir_all", 4),
         // Packet B5s collapses the settings, workspace, and session publishers
         // onto the shared atomic writer. Only the audited legacy-session move
         // still needs a raw rename in this file.
@@ -1355,7 +1358,9 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         // +1 from `src-tauri/src/conflict_capsule.rs` (packet B3): the
         // app-private live-save conflict envelope is replaced whole through
         // the same named audited protocol.
-        ("atomic_write", 13),
+        // +1 from `settings.rs` (packet P2): the device-local notice
+        // dismissals are published through that same named audited protocol.
+        ("atomic_write", 14),
         ("atomic_write_new", 11),
         ("atomic_replace_expected_with_hooks", 1),
         ("atomic_copy", 0),

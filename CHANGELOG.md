@@ -30,6 +30,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   dropped if you bind Redo to something of your own. Not on macOS, where Ctrl+Y
   is the system's yank inside every text field (GH #491).
 
+- **You can tell Tine what a property is, and then compare by it.** Open a
+  property in the visual query builder and it now names the property's type —
+  `text`, `number`, `date`, `checkbox` or a page link — and whether that type was
+  observed from your own values or declared. Choose **declare type…** to state it
+  yourself, with a **list of** box for keys that hold several values; Tine writes
+  an ordinary `tine.type::` line on the page named after the key, and
+  **remove declaration** takes it away again. Declaring one is what makes real
+  comparisons available: `before` / `after` / `between` for dates, `<` `≤` `>` `≥`
+  for numbers, `contains` and `starts with` for text. Once a type is declared,
+  Tine also tells you how many blocks disagree with it, which is usually a
+  typo you wanted to find.
+
 ### Fixed
 
 - **A query written in the middle of a line now shows its title.** A
@@ -85,6 +97,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   left alone when you edit a neighbour.
 
 ### Changed
+
+- **Tine now says when a query stops being readable by Logseq.** Some things
+  you can build — grouping, column totals, typed comparisons like `cost > 100` —
+  have no `{{query}}` spelling at all, and saving one has always rewritten the
+  block into Tine's own `{{tine-query}}` form, which Logseq shows as plain text.
+  It did that silently. A notice now appears under the query the moment it
+  happens, with **Undo that change** — the ordinary undo, so Ctrl+Z does the same
+  thing — and **Keep it**. **Don't show this again** is remembered per graph on
+  that device only; the choice is never written into your graph and never syncs.
+- **A view directive you remove now stays removed.** Column totals and grouping
+  were written both into the query text and into the block's `tine.*` properties,
+  and the properties win — so deleting a total or a grouping in the builder left
+  the old copy in the text, and the next time the block was read it came back.
+  Those two directives now live in the block's properties alone; `sort-by` and
+  `sample` keep their place in the query text, because Logseq reads those too. A
+  block you open and close without editing is still not written at all.
 
 - **Reopening an unchanged Direct Files graph no longer re-parses it.** Tine
   now checks the graph's files against the query projection it keeps beside

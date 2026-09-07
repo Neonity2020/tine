@@ -2,12 +2,13 @@ import { For, Show, Switch, Match, createEffect, createMemo, createResource, cre
 import { backend, QueryPrintRefusedError } from "../backend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
-import { openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
-import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
+import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
+import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, undo, undoTopTag, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
+import { CrossingNotice } from "./CrossingNotice";
 import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
 import { SearchResultRow } from "./SearchResultRow";
 import { foldAggregate, groupRows, type AggDirective } from "../editor/queryAggregate";
@@ -436,14 +437,39 @@ export function QueryMacro(props: {
     const node = doc.byId[props.blockId];
     const write = () => {
       rewriteMacro(`{{${name} ${argument}}}`);
-      if (name.toLowerCase() === "tine-query") writeViewProperties(next.view);
+      writeViewProperties(next.view);
     };
-    if (crossing && node) withUndoUnit(`query:cross:${props.blockId}`, [node.page], write);
-    else write();
+    // ONE undo unit for the whole save, under both macro names (§4.3 directive
+    // migration). The tag is what the §7.5 notice's [Undo that change] button
+    // recognises, so only a CROSSING save carries the crossing tag.
+    if (node) {
+      withUndoUnit(
+        crossing ? `query:cross:${props.blockId}` : `query:save:${props.blockId}`,
+        [node.page],
+        write,
+      );
+    } else write();
+    // The notice is the user half of the crossing (§7.5): the bytes changed
+    // under the user without asking, so say so and offer the way back.
+    if (crossing && node) setCrossed(props.blockId);
   };
-  /** §4.3 Y2: TQL text carries no view directives, so a crossed block keeps them
-   *  in its own `tine.*` properties — the §7.6 grammar the engine already reads
-   *  back in `query_parse`'s precedence merge (§4.1). */
+  /** **The view lives in the block's `tine.*` properties (§7.6), for BOTH macro
+   *  names (§4.3 "Directive migration", Q15).**
+   *
+   *  TQL text carries no view directives at all, and OG text carries only two of
+   *  the six — so before this the frontend wrote the properties on a crossing
+   *  only, `og_view` re-emitted `(aggregate …)`/`(group-by …)` back into OG text
+   *  (a second home for the same value, which then outlived its removal in the
+   *  builder), and `tine.fields::`/`tine.view::` were written by nobody and lost
+   *  on every save. All six are now written on every save, to their current
+   *  value or to `null`, which is the §7.6 grammar the engine reads back in
+   *  `query_parse`'s precedence merge (§4.1).
+   *
+   *  Clearing is not cosmetic: `tine.*` has ABSOLUTE precedence over the DSL
+   *  text, so a stale `tine.sort::` line would put a removed sort straight back
+   *  on the next parse. And clearing a property the block never had is the
+   *  identity on its bytes (`markdownRawWithProperty(raw, k, null)`), so an
+   *  ordinary query block gains no property lines it has no view for (I-4). */
   const writeViewProperties = (view: ViewSettings) => {
     const blockId = props.blockId;
     if (!blockId) return;
@@ -459,6 +485,10 @@ export function QueryMacro(props: {
       .map(([field, fn]) => (field ? `${field}=${fn}` : fn))
       .join(";");
     setBlockProperty(blockId, "tine.col-aggregates", aggregates || null);
+    // `view.rs::parse_fields` / `parse_view_kind` — the two the reader consumes
+    // and nothing wrote.
+    setBlockProperty(blockId, "tine.fields", (view.columns ?? []).join(";") || null);
+    setBlockProperty(blockId, "tine.view", view.view ?? null);
   };
   // Edit the query's display title (:title "…" in the options map). Only offered
   // for a user-authored standalone query (blockId set, no app-supplied title).
@@ -505,6 +535,29 @@ export function QueryMacro(props: {
     }
   };
   const [printError, setPrintError] = createSignal<string | null>(null);
+  /** The undo tag of the crossing save this block's notice is offering to take
+   *  back, or null when no notice is showing (§7.5). Holding the TAG rather than
+   *  a bare flag is what lets the button know whether Undo would still reverse
+   *  THIS change. */
+  const [crossedTag, setCrossedTag] = createSignal<string | null>(null);
+  const setCrossed = (blockId: string) => {
+    // One read per graph, shared by every query block (I-13) — never a lookup
+    // per block per render.
+    primeNoticeDismissals();
+    setCrossedTag(`query:cross:${blockId}`);
+  };
+  /** The notice shows only once this device's answer is KNOWN and is "not
+   *  dismissed". `undefined` (still reading) renders nothing rather than a
+   *  banner that appears and then retracts itself. */
+  const showCrossingNotice = () =>
+    !!crossedTag() && noticeDismissed(CROSSING_NOTICE) === false;
+  /** Undo is offered only while the entry `undo()` would take back IS the
+   *  crossing save. Any later edit — including one on another page, in page-only
+   *  history mode — makes this false, and the button says to use Ctrl+Z. */
+  const crossingIsStillUndoable = () => {
+    const tag = crossedTag();
+    return !!tag && undoTopTag() === tag;
+  };
   /** What the builder edits: the AUTHORING reading, never the execution's
    *  dyvar-substituted one — editing a chip must not bake the page you happen to
    *  be looking at into the saved query. */
@@ -965,6 +1018,20 @@ export function QueryMacro(props: {
                 paneDialect="tql"
                 blockId={props.blockId}
                 onStale={setPaneStale}
+              />
+            </Show>
+            {/* §7.5: hosted inline under the block. P4 renders the SAME
+                component inside its pane — the notice owns its logic, its host
+                owns only its position. */}
+            <Show when={showCrossingNotice()}>
+              <CrossingNotice
+                canUndo={crossingIsStillUndoable()}
+                onUndo={() => {
+                  undo();
+                  setCrossedTag(null);
+                }}
+                onKeep={() => setCrossedTag(null)}
+                onDontShowAgain={() => dismissNotice(CROSSING_NOTICE)}
               />
             </Show>
             <Show when={printError()}>

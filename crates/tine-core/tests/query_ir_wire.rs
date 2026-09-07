@@ -464,3 +464,104 @@ fn the_ir_names_its_typescript_mirror() {
         path.display()
     );
 }
+
+/// **T1's binding half, driven through the real registry producer.**
+///
+/// The picker declares a type by writing `tine.type::` on the page whose name
+/// is the row's `normalized_name` **verbatim** — no key normalizer on the
+/// TypeScript side (D-14). That contract is only sound if the registry binds
+/// declarations exactly the way the UI spells them, so this pins both
+/// directions of the one interesting case: a property authored with a SPACE.
+///
+/// `property_key_norm` folds `due date` to `due-date`, and `build_registry`
+/// looks the declaration up under `refs::page_key(normalized_name)`. So the
+/// page that binds is `due-date`; a page literally named `due date` is a
+/// different page and must not bind, which is exactly why the UI is forbidden
+/// to "helpfully" write the declaration on the key as the source spelled it.
+#[test]
+fn a_declaration_binds_on_the_normalized_key_page_not_the_authored_spelling() {
+    use tine_core::config::ParseConfig;
+    use tine_core::query::atom::AtomFormat;
+    use tine_core::query::registry::{build_registry, OwnerRow, OwnerType, PageMeta};
+
+    // The block spells the key `due date`; the registry row is `due-date`.
+    let authored = OwnerRow {
+        owner_type: OwnerType::Block,
+        owner_id: "b1".into(),
+        page_id: "notes".into(),
+        source_name: "due date".into(),
+        normalized_name: "due-date".into(),
+        ordinal: 0,
+        value: "not a number".into(),
+    };
+    let declaration = |page_id: &str| OwnerRow {
+        owner_type: OwnerType::Page,
+        owner_id: page_id.into(),
+        page_id: page_id.into(),
+        source_name: "tine.type".into(),
+        normalized_name: "tine.type".into(),
+        ordinal: 0,
+        value: "number".into(),
+    };
+    let pages = |page_id: &str| {
+        Some(PageMeta {
+            format: AtomFormat::Markdown,
+            // The page id IS the page name here, so the fixture says out loud
+            // which spelling each declaration page carries.
+            name: page_id.to_string(),
+        })
+    };
+
+    // The key page — `due-date` — binds.
+    let bound = build_registry(
+        vec![authored.clone(), declaration("due-date")].into_iter(),
+        &pages,
+        &ParseConfig::default(),
+    )
+    .expect("registry builds");
+    let snapshot: RegistrySnapshot = bound.snapshot();
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|row| row.normalized_name == "due-date")
+        .expect("the authored `due date` key is registered as `due-date`");
+    assert_eq!(
+        row.declared,
+        Some((ObservedType::Number, Cardinality::One)),
+        "a declaration on the page named `due-date` binds to the row the picker \
+         would have written it from"
+    );
+    assert_eq!(
+        row.observed_type,
+        ObservedType::Text,
+        "the observed type is untouched by the declaration"
+    );
+    assert_eq!(
+        row.mismatch_count, 1,
+        "the one text value now mismatches the declared number"
+    );
+
+    // The authored spelling — `due date` — does not.
+    let unbound = build_registry(
+        vec![authored, declaration("due date")].into_iter(),
+        &pages,
+        &ParseConfig::default(),
+    )
+    .expect("registry builds");
+    let row = unbound
+        .snapshot()
+        .rows
+        .iter()
+        .find(|row| row.normalized_name == "due-date")
+        .cloned()
+        .expect("the row is present either way");
+    assert_eq!(
+        row.declared, None,
+        "a page named with the authored spelling is a different page and must \
+         not bind — writing the declaration there would silently do nothing"
+    );
+    assert_eq!(
+        row.mismatch_count, 0,
+        "with no declaration there is nothing to mismatch"
+    );
+}

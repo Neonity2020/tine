@@ -10119,8 +10119,8 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::closes each popover on an outside mousedown without changing the DSL",
-          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::closes each popover on an outside pointerdown without changing the DSL",
+          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::closes each popover on an outside mousedown without changing the query",
+          "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::closes each popover on an outside pointerdown without changing the query",
           "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::keeps a popover open when the press lands inside it",
           "src/components/QueryBuilder.transient.test.tsx::GH #472: every Query Builder popover closes on an outside press::lets the trigger of an open popover toggle it shut instead of reopening it",
           "src/frontendTwins.guard.test.ts::frontend twin ownership guards::keeps 'the user pressed outside' on its one owner"
@@ -10450,6 +10450,56 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: a page showed the conflict banner, its panel stayed on `Reading both versions...` forever, and the page body stayed blank -- the page could not be used at all. Classification: blocking core operation. One mechanism produces both symptoms, and all three of its steps are verified in this worktree's own solid-js build rather than inferred: reading an errored Solid resource THROWS (`read()`, solid.js:318-322); `grep -rn 'ErrorBoundary|catchError' src/` excluding tests returns zero hits, so Tine registers no boundary anywhere; and `runUpdates`' catch (solid.js:819-823) sets `Effects = null` before rehandling. So when the diff resource rejected, `<Show when={diff()}>` threw inside the batch the resource's own completion started, and the discarded Effects queue contained BOTH the effect that swaps this panel's fallback text off `Reading both versions...` AND the page body's `<For each={rootsToRender()}>`. The `Couldn't read this conflict.` branch was dead code for every rejection. Fix: all six reads of the resource go through `diffValue()`, which consults `diff.error` first and never calls the throwing accessor -- including the two `createMemo`s that would otherwise have thrown on recompute -- and the fallback now names the backend's reason instead of a bare apology. NOT fixed here: which rejection the reporter hit. The likely trigger is a restored Direct capsule with no `disk_rev` replaying a session-scoped observation epoch that died with the previous process (`src-tauri/src/commands.rs:4243-4258`, refused at `crates/tine-core/src/model.rs:12864-12869`); the analysis, and why the obvious frontend guard for it is wrong for Managed, are in `tine-agents/specs/notes/2026-09-05-gh490-conflict-hang.md`. Necessity gate: both assertions fail against pre-fix ConflictResolution.tsx, the panel still reading `Reading both versions...` after the rejection."
+    },
+    {
+      "id": "UI-QUERY-PROPERTY-TYPE-DECLARATION-001",
+      "title": "A property's type could be observed but not stated, so the query builder offered text equality for numbers and dates",
+      "family": "query-engine",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/PropertyType.test.tsx::A1: the badge distinguishes what was DECLARED from what was observed",
+          "src/components/PropertyType.test.tsx::A3: declaring writes tine.type:: on the key page, through the ordinary page path::declares on the row's normalized_name, which is the page the engine binds",
+          "src/components/PropertyType.test.tsx::A4: the registry is read on picker open and after a declaration — and nowhere else (I-13)",
+          "src/editor/queryBuilder.test.ts::operatorsFor: the comparison family for a registry type",
+          "crates/tine-core/tests/query_ir_wire.rs::a_declaration_binds_on_the_normalized_key_page_not_the_authored_spelling"
+        ],
+        "scenario": "query-engine.declare-a-property-type-and-compare-by-it",
+        "failBefore": "proven"
+      },
+      "notes": "User capability: filtering on a property whose values are numbers or dates offered only text equality, and there was no way to tell Tine that an empty or mis-observed key IS a number -- so `cost > 100` could not be expressed at all, and a key with no values yet had no type to offer. Classification: blocking stateful UX. The property picker now names the key's type and where it came from (observed across the graph, or declared), spells a many-valued key `list of ...`, and offers `declare type...` (text/number/date/checkbox/ref, each with a `list of` toggle, plus `remove declaration`). Operators follow that type: before/after/between for a date, the four inequalities for a number, contains/starts with for text, is/is not for a checkbox or a ref; on a many-valued key `eq` reads `contains this value`. Two details are load-bearing and are pinned rather than assumed. (1) The declaration is written on the row's `normalized_name` VERBATIM through the ordinary page path (`store.ts::ensurePagePropertyOnKeyPage`), because the engine binds `tine.type::` under `refs::page_key(normalized_name)`: a key authored `due date` must declare on the page `due-date`, and the Rust row above proves that a page named with the AUTHORED spelling binds nothing at all. No key normalizer was written in TypeScript for this (D-14) -- the registry row already carries the normalized key. (2) The registry is fetched exactly twice per interaction, once when a property picker opens and once after a declaration lands, and never on a keystroke (I-13). Necessity gate: mutating the write from `current.normalized_name` to the picker's own key reddens exactly the binding test and leaves the other twelve green."
+    },
+    {
+      "id": "UI-QUERY-CROSSING-NOTICE-UNDO-001",
+      "title": "Saving a query with Tine-only features silently rewrote the block into a form Logseq shows as plain text",
+      "family": "query-engine",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryCrossingNotice.test.tsx::C1: a crossing says so",
+          "src/components/QueryCrossingNotice.test.tsx::C2: [Undo that change] is the ordinary undo, and knows when it is not",
+          "src/components/QueryCrossingNotice.test.tsx::C4: a save that does not cross says nothing"
+        ],
+        "scenario": "query-engine.crossing-to-the-tine-macro-is-announced-and-undoable",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: an edit the OG query language cannot express -- a group-by, a column total, a typed comparison -- rewrote the block from `{{query ...}}` to `{{tine-query ...}}` on save with no word about it. In Logseq the same bullet then rendered as plain text, and the user had no way to learn which edit did it or to take it back. Classification: blocking stateful UX; the interoperability loss is the harm, but nothing on disk is lost or corrupted. A `role=\"status\"` notice now appears under the query in the SPEC 7.5 words -- `This query now uses Tine features Logseq can't read. Logseq will show the block as plain text.` -- takes focus when it appears, and offers [Undo that change], [Keep it], and `Don't show this again`. The undo is the ORDINARY undo rather than a second mechanism: the whole save (macro rewrite plus all six `tine.*` view properties) is one undo unit carrying a `query:cross:<blockId>` tag, and the button disables itself, pointing at Ctrl+Z, the moment a later edit owns the top of the history. That is checked in BOTH history modes, because page-only history pops the newest entry FOR THE PAGE rather than the newest entry, so `undoTopTag()` has to ask the same question the pop will. A save that stays OG-expressible, and a re-edit of a block that is already `{{tine-query}}`, say nothing."
     }
   ]
 }

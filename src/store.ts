@@ -2760,6 +2760,8 @@ export function reportManagedBulkInsertionRefusal(toast: string): void {
 // an op that can't declare its scope).
 interface SnapEntry {
   kind: "snap";
+  /** {@link UndoEntry}'s optional tag: the name `pushUndo` was called with. */
+  tag?: string;
   pages: string[] | null; // affected page names (null = whole working set)
   pageObjs: FeedPage[]; // snapshot of those pages' FeedPage objects
   nodes: Record<string, Node>; // snapshot of nodes living on those pages
@@ -2772,6 +2774,7 @@ interface SnapEntry {
 }
 interface RawEntry {
   kind: "raw";
+  tag?: string;
   id: string;
   raw: string; // the block's text to restore
   page: string;
@@ -2796,9 +2799,15 @@ interface ManagedMoveHistorySpec {
 }
 interface ManagedMoveEntry extends ManagedMoveHistorySpec {
   kind: "managed-move";
+  tag?: string;
   context: HistoryContext;
   instances: Record<string, number>;
 }
+/** **The tag is on the ENTRY, not in a module global.** `lastUndoTag` is a
+ *  typing-coalesce marker that any unrelated event resets, so it cannot answer
+ *  "is the change Undo would take back the one I am offering to take back?" —
+ *  the question the §7.5 crossing notice has to ask before it enables its
+ *  button. {@link undoTopTag} answers it off the entry itself. */
 type UndoEntry = SnapEntry | RawEntry | ManagedMoveEntry;
 const undoStack: UndoEntry[] = [];
 let redoStack: UndoEntry[] = [];
@@ -2834,8 +2843,31 @@ function endMoveSelectionBurst(): void {
   moveSelectionBurst = null;
 }
 
+/** Bumped on every mutation of the undo/redo stacks (and on the mode toggle,
+ *  which changes WHICH entry a pop would select). {@link undoTopTag} reads it so
+ *  an affordance that offers to undo one specific change re-renders the moment
+ *  that stops being true. The stacks themselves are plain arrays on purpose —
+ *  making them reactive would put a proxy on the editor's hottest path. */
+const [historyRev, setHistoryRev] = createSignal(0);
+let historyRevScheduled = false;
+/** **Deferred by one microtask, deliberately.** `advanceHistoryEpoch` runs
+ *  BEFORE its caller mutates a stack — `pushUndo` pushes after it,
+ *  `performUndo` pops after it, `invalidateUndoForPage` splices after it — so a
+ *  synchronous notification would hand every reader the stack as it was, which
+ *  is exactly the wrong answer. One microtask later every one of those
+ *  mutations has landed, and a burst collapses into a single notification. */
+function bumpHistoryRev(): void {
+  if (historyRevScheduled) return;
+  historyRevScheduled = true;
+  queueMicrotask(() => {
+    historyRevScheduled = false;
+    setHistoryRev((n) => n + 1);
+  });
+}
+
 function advanceHistoryEpoch(): void {
   historyEpoch++;
+  bumpHistoryRev();
 }
 
 function armMoveSelectionBurstIdleTimer(burst: MoveSelectionBurst): void {
@@ -2916,6 +2948,7 @@ export function historyPageOnlyMode(): boolean {
 
 export function toggleUndoRedoMode(): "Page only" | "Global" {
   pageOnlyHistoryMode = !pageOnlyHistoryMode;
+  bumpHistoryRev();
   return pageOnlyHistoryMode ? "Page only" : "Global";
 }
 
@@ -3028,22 +3061,41 @@ function activeHistoryPage(): string | null {
   return route?.kind === "page" ? route.name : null;
 }
 
-/** Remove the newest matching entry in place while retaining every other entry
- * in its original order. This transcribes OG's filtered stack removal at
+/** The index of the entry a pop would take: the stack top in global mode, and
+ * in page-only mode the NEWEST entry touching the active page — which is
+ * generally not the top. Transcribes OG's filtered stack removal at
  * `src/main/frontend/modules/editor/undo_redo.cljs:81-106,132-156`
- * (OG commit 6e7afa8eb). */
-function popNewestEntryForPage(stack: UndoEntry[], page: string): UndoEntry | undefined {
+ * (OG commit 6e7afa8eb). `-1` when nothing would be taken.
+ *
+ * Selection and removal are one function so a caller that only wants to LOOK at
+ * the next entry ({@link undoTopTag}) cannot drift from the one that pops it. */
+function newestHistoryIndex(stack: UndoEntry[]): number {
+  if (!stack.length) return -1;
+  if (!pageOnlyHistoryMode) return stack.length - 1;
+  const page = activeHistoryPage();
+  if (!page) return stack.length - 1;
   for (let i = stack.length - 1; i >= 0; i--) {
-    if (entryTouchesPage(stack[i], page)) return stack.splice(i, 1)[0];
+    if (entryTouchesPage(stack[i], page)) return i;
   }
-  return undefined;
+  return -1;
 }
 
 function popHistoryEntry(stack: UndoEntry[]): UndoEntry | undefined {
-  if (!stack.length) return undefined;
-  if (!pageOnlyHistoryMode) return stack.pop();
-  const page = activeHistoryPage();
-  return page ? popNewestEntryForPage(stack, page) : stack.pop();
+  const index = newestHistoryIndex(stack);
+  return index < 0 ? undefined : stack.splice(index, 1)[0];
+}
+
+/** The tag of the entry {@link undo} would take back next, or null.
+ *
+ *  Used by an affordance that offers to undo ONE specific change it just made
+ *  (the §7.5 crossing notice): if the answer is not that change's tag, the user
+ *  has done something since, and pressing the button would take back the wrong
+ *  edit. It reads the same entry `popHistoryEntry` would select, in both history
+ *  modes, without popping it. */
+export function undoTopTag(): string | null {
+  historyRev();
+  const index = newestHistoryIndex(undoStack);
+  return index < 0 ? null : (undoStack[index].tag ?? null);
 }
 
 /** Drop undo/redo entries that reference `name`. Called when a page's on-disk
@@ -3145,7 +3197,7 @@ function pushUndo(
   if (undoSuppressionDepth > 0) return;
   if (!opts.keepMoveSelectionBurst) endMoveSelectionBurst();
   advanceHistoryEpoch();
-  undoStack.push(snapEntry(affected, preservedIds));
+  undoStack.push({ ...snapEntry(affected, preservedIds), tag });
   if (undoStack.length > 200) undoStack.shift();
   redoStack = [];
   lastUndoTag = tag;
@@ -4493,6 +4545,47 @@ export function setPageProperty(pageName: string, key: string, value: string | n
   }
   setDoc("pages", idx, "preBlock", upsertPropertyLine(doc.pages[idx].preBlock, key, value));
   markDirty(pageName);
+}
+
+/** Write (or clear, with `null`) a page property on the page named `pageName`,
+ *  CREATING that page first if the graph has none — the §6.3 "declare type…"
+ *  action's one write.
+ *
+ *  A property key's declaration lives on the page whose name IS the key, and
+ *  most keys have no page yet. There is no `create_page` command and inventing
+ *  one would be a second write path (I-1, D-14): a page is created exactly as
+ *  {@link captureToPage} creates one, by loading the backend's answer for the
+ *  name — or a synthetic empty DTO when there is none — and letting the ordinary
+ *  dirty/save path write the file. So the bytes that land on disk are an
+ *  ordinary Logseq page with an ordinary `key:: value` line (I-4).
+ *
+ *  The load is async and {@link withUndoUnit} is not, which is why they are not
+ *  combined: creation completes FIRST, and the one undo entry is the property
+ *  write, which {@link setPageProperty} already pushes.
+ *
+ *  Returns whether the property was written. Clearing a declaration on a page
+ *  that does not exist is a no-op, not a page creation. */
+export async function ensurePagePropertyOnKeyPage(
+  pageName: string,
+  prop: string,
+  value: string | null,
+): Promise<boolean> {
+  const name = pageName.trim();
+  if (!name) return false;
+  if (!pageByName(name)) {
+    if (value === null) return false;
+    const binding = graphBinding();
+    const dto: PageDto =
+      (await backend().getPage(name, "page"))
+      ?? { name, kind: "page", title: name, pre_block: null, blocks: [], rev: null };
+    // A refusal means the name slot now holds a DIFFERENT page than the one this
+    // request was made against; writing into it would put the declaration on the
+    // wrong page (the `captureOutlineInto` rule, GH #254).
+    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding })) return false;
+  }
+  if (!pageByName(name) || !pageWritable(name)) return false;
+  setPageProperty(name, prop, value);
+  return true;
 }
 
 /** Materialize an existing canonical Markdown page header as Tine's ordinary

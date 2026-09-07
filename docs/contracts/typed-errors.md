@@ -243,6 +243,15 @@ retained, reintroduced, or converted back from a typed variant; the retirement
 owners below are unchanged. A future growth entry belongs in this paragraph with
 the same three facts: which commands, which arms, and what did *not* regress.
 
+116 → 119 (2026-09-07, P2, the §4.3 device-local notice store): `load_notices`
+and `save_notices` each carry the `"no app-data dir"` literal their
+`load_session`/`save_session` exemplars already carry, and `save_notices_at`
+carries the `"notices file has no parent"` literal `save_session_at` already
+carries. All three are local availability predicates over an app-data path, with
+no source error to type. No legacy prose site was retained, reintroduced, or
+converted back from a typed variant, and the settings retirement owner below is
+unchanged.
+
 | File | Enclosing symbols | Legacy template | Why no typed source exists | Retirement owner |
 | --- | --- | --- | --- | --- |
 | `state.rs` | `require_legacy_authority`, `legacy_graph`, `wait_for_legacy_drain`, `bind`, `replace_if_current` | authority/lease/binding literal or bounded contextual message | local state predicate, not a source error | typed state domain follow-up |
@@ -263,7 +272,7 @@ the same three facts: which commands, which arms, and what did *not* regress.
 | `android_media.rs` | `$name` in the non-Android `android_media_command` template | unsupported-platform literal | cfg-split macro command has no source error | platform outcome taxonomy follow-up |
 | `platform.rs` | `external_open_plan`, `open_external`, `reveal_page_source` | unsupported URL/platform/path literal | local validation branch | platform outcome taxonomy follow-up |
 | `plugins.rs` | `install_plugin`, `install_plugin_package_at`, `manifest_identity`, `package_dir`, `plugins_dir`, `read_plugin_entry`, `set_plugin_enabled`, `set_plugin_enabled_at`, `store_plugin_registry_cache`, `store_plugin_registry_cache_at`, `uninstall_package`, `validate_uninstall_target`, `verify_plugin_registry` | plugin identity/bounds/availability literal | local validation branch, not a source error | plugin outcome taxonomy follow-up |
-| `settings.rs` | `atomic_write_workspaces`, `load_session`, `load_workspaces`, `managed_sync_device_id`, `managed_sync_device_id_at`, `migrate_legacy_session_at`, `reveal_known_graph`, `save_session`, `save_session_at`, `save_workspaces`, `update_settings`, `validate_workspaces_json` | settings shape/availability literal | local validation branch, not a source error | settings outcome taxonomy follow-up |
+| `settings.rs` | `atomic_write_workspaces`, `load_notices`, `load_session`, `load_workspaces`, `managed_sync_device_id`, `managed_sync_device_id_at`, `migrate_legacy_session_at`, `reveal_known_graph`, `save_notices`, `save_notices_at`, `save_session`, `save_session_at`, `save_workspaces`, `update_settings`, `validate_workspaces_json` | settings shape/availability literal | local validation branch, not a source error | settings outcome taxonomy follow-up |
 | `storage_mode_supervisor.rs` | `commit_if_current` | superseded-transition literal | local state predicate | transition outcome taxonomy follow-up |
 | `sync_runtime.rs` | `activate_sparse_v2`, `activate_sparse_v2_blocking`, `adopt_sparse_v2_shared_blocking`, `archive_graph_provider_namespace_with`, `archive_private_root`, `blank_slate_recovery_key`, `cancel_sparse_v2_at_paths_with_archive_and_publish`, `cancel_sparse_v2_blocking`, `cancel_sparse_v2_cold`, `join_runtime_failure`, `join_sparse_v2_shared_blocking`, `move_recovery_result`, `prepare_sparse_v2_activation`, `prepare_sparse_v2_share_blocking`, `prove_managed_application_ready`, `recover_managed_application_subtrees_with`, `replace_failed_blank_slate_candidate`, `run_android_managed_return_to_direct_files`, `set_aside_managed_history_for_adoption`, `validate_for` | managed lifecycle/state literal | local predicate or enum outcome without a source error | managed outcome taxonomy follow-up |
 

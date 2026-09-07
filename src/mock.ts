@@ -547,6 +547,9 @@ const mockHighlights: Record<string, { label: string; highlights: Highlight[]; p
 // In-memory UI session for the browser mock (no backend file).
 let mockSession: string | null = null;
 let mockWorkspaces: string | null = null;
+/** The dev preview has no app-data dir, so "dismissed" lives for the session —
+ *  which is the honest device-local answer for a browser preview. */
+let mockNotices = '{"dismissed":[]}';
 let mockLinkFirstMatch = false;
 let mockGuideAnnounced = false;
 const mockAssets: Record<string, Uint8Array> = {};
@@ -2309,6 +2312,12 @@ export function mockBackend(): Backend {
     },
     async saveWorkspaces(data: string): Promise<void> {
       mockWorkspaces = data;
+    },
+    async loadNotices(): Promise<string> {
+      return mockNotices;
+    },
+    async saveNotices(data: string): Promise<void> {
+      mockNotices = data;
     },
     async takeIdentifierMigrationNotice(): Promise<boolean> {
       return false;

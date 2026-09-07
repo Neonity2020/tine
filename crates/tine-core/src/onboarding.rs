@@ -1047,6 +1047,27 @@ mod tests {
             .markdown
             .contains("Name this search to save it as a page"));
         assert!(page.markdown.contains("What you should see"));
+        // The two P2 sections. A declared property type is only actionable if
+        // the page the declaration must live on is named: the engine binds
+        // `tine.type::` by the NORMALIZED key, so a reader who authors the line
+        // by hand on the page they spelled the property with declares nothing.
+        assert!(page.markdown.contains("declare type…"));
+        assert!(page.markdown.contains("`tine.type:: number`"));
+        assert!(page
+            .markdown
+            .contains("a property written `due date::` declares on the page `due-date`"));
+        // The crossing sentences are the SAME sentences the notice shows
+        // (`src/components/CrossingNotice.tsx`, §7.5). A reader who met the
+        // notice and then came here must not have to decide whether two
+        // differently-worded promises are the same promise.
+        assert!(page
+            .markdown
+            .contains("This query now uses Tine features Logseq can't read."));
+        assert!(page
+            .markdown
+            .contains("Logseq will show the block as plain text."));
+        assert!(page.markdown.contains("**Undo that change**"));
+        assert!(page.markdown.contains("**Don't show this again**"));
         assert!(page
             .markdown
             .contains("[[Reference/Pages, links, references, and search]]"));
