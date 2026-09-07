@@ -1600,6 +1600,11 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         (
             "crates/tine-core/src/oplog/checkpoint_generation.rs",
             "durable_directory.open",
+            2,
+        ),
+        (
+            "crates/tine-core/src/oplog/checkpoint_generation.rs",
+            "immutable.batch",
             1,
         ),
         (
@@ -1999,9 +2004,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // R1b/2 adds the shared CausalTipRecordV2 constructor and one qualified
     // SealedAcceptedIndexWriter::new call for the per-peer map. Both are in
     // checkpoint_generation.rs; no physical write boundary changes.
+    // R1b/3 reviewed staging diff: one shared bounded regular point read,
+    // one immutable batch constructor and one retained private-directory open.
+    // The latter uses the existing single-writer publication method outside
+    // Linux. No new raw writes; the physical boundary table above adds those
+    // two constructors. Remaining changes are shared store/error type paths.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "2b18e1455e978713619f9cab60c6f20146702c8069732d88af16bfe3b5a07878",
+        "08ecaece1e2cbca76e208706e9cbf5f883cfbf02d07811ae98e1b11eb14c2227",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

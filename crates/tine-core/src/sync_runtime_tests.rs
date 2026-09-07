@@ -12941,9 +12941,10 @@ fn pending_generation_join_from_fixtures(
 #[test]
 #[ignore = "manual release gate: rebaselining foundations on an anonymized corpus copy"]
 fn rebaselining_foundations_real_corpus_gate() {
-    use tine_storage::sealed_accepted_index::{
-        SealedAcceptedIndexError, SealedAcceptedIndexObjectStore, SealedAcceptedObjectKind,
+    use crate::oplog::checkpoint_generation::{
+        SealedGenerationStagingStore, TineAcceptedEvidenceDecoder,
     };
+    use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
     assert!(!cfg!(debug_assertions), "release-only corpus gate");
     let source = real_graph_copy_source_from_env("TINE_REBASELINING_GRAPH_COPY");
     let seed = 0xc200_0000;
@@ -12975,40 +12976,34 @@ fn rebaselining_foundations_real_corpus_gate() {
         .unwrap();
     let engine = reopened.runtime.engine();
     let before = engine.canonical_snapshot().unwrap();
-    #[derive(Default)]
-    struct ScratchNodes(BTreeMap<(String, ContentDigest), Vec<u8>>);
-    impl SealedAcceptedIndexObjectStore for ScratchNodes {
-        fn read_sealed_accepted_object(
-            &self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
-            Ok(self.0.get(&(kind.to_string(), address)).cloned())
-        }
-        fn publish_sealed_accepted_object(
-            &mut self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-            bytes: &[u8],
-        ) -> Result<(), SealedAcceptedIndexError> {
-            let key = (kind.to_string(), address);
-            if let Some(prior) = self.0.get(&key) {
-                if prior != bytes {
-                    return Err(SealedAcceptedIndexError::Store(
-                        "scratch immutable collision".into(),
-                    ));
-                }
-            }
-            self.0.insert(key, bytes.to_vec());
-            Ok(())
-        }
-    }
+    let staging_root = joiner.root.join("sealed-generation-staging");
+    fs::create_dir_all(&staging_root).unwrap();
+    let directory =
+        cap_std::fs::Dir::open_ambient_dir(&staging_root, cap_std::ambient_authority()).unwrap();
     let started = Instant::now();
-    let mut nodes = ScratchNodes::default();
+    let mut nodes = SealedGenerationStagingStore::open(&directory).unwrap();
     let cutoff = engine
         .build_sealed_accepted_cutoff(&mut nodes, None)
         .unwrap();
+    let disk_nodes = nodes.finish().unwrap();
     let cutoff_ms = started.elapsed().as_millis();
+    let reader = SealedAcceptedIndexReader::new(&disk_nodes);
+    for sequence in 1..=cutoff.roots().sequence.len {
+        let (batch_id, evidence) = engine.accepted_batch_entry_at(sequence).unwrap().unwrap();
+        let proof = reader
+            .prove_membership(
+                cutoff.roots(),
+                sequence,
+                batch_id.as_uuid().into_bytes(),
+                &TineAcceptedEvidenceDecoder,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proof.status.exact_evidence_bytes,
+            evidence.unwrap().encode_canonical().unwrap()
+        );
+    }
     assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
     let compact_started = Instant::now();
     let mut compact_bytes = 0usize;

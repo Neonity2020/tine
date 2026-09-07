@@ -2071,6 +2071,28 @@ reader. It has no prior-schema enum, reader, compatibility fixture, or
 migration path. An unrecognized pre-0.7 private store is preserved as a backup
 and rebuilt from the untouched Markdown/Org tree by Tine.
 
+The **sealed generation staging directory** now persists the existing canonical
+node/record bytes as `sealed-v2-<kind>-<digest>` files under a caller-owned private
+directory capability. The numeric kinds are the same five codes used by A5's
+adapter; there is no second node codec. Its point reader does not enumerate the
+directory. Reads reject non-regular/symlink entries through the shared reader and
+retain the current checkpoint's 512-MiB per-record read ceiling. This is staging
+layout, not the complete authoritative generation format.
+
+Construction reuses `ExactImmutablePublicationBatch` on Linux. Windows, macOS,
+iOS, Android and other targets use retained `DurableDirectoryPublication` with
+`publish_new_exact_single_writer`; this preserves Windows write-through and
+Android private-directory rename fallback. Pending bytes use the existing memory
+adapter. It flushes at 8 MiB or 64 objects, bounding both payload
+memory and retained directory capabilities. A larger legal single record flushes
+alone; these batch budgets do not cap graph size or total history. Failed writes
+poison the construction handle; dropping it never installs a generation marker.
+Successful finish completes the shared durability protocol. Fresh canonical
+membership qualification still follows: a durability receipt is not an integrity
+proof, and merely opening a directory is not generation adoption. Collision,
+missing/corrupt record, no-follow, publication-fault and retry tests preserve
+predecessor roots. Complete generation commits and live cutover remain absent.
+
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
 Clean projection attach rebuilds an exact path-to-latest-batch map during

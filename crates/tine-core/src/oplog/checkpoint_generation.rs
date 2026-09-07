@@ -193,6 +193,251 @@ impl CheckpointSealedStore {
     }
 }
 
+// This is a construction working-set budget, not a graph/history occupancy
+// limit. A single larger legal record is published and flushed on its own.
+const SEALED_STAGING_BATCH_BYTES: usize = 8 * 1024 * 1024;
+// The shared batch retains a directory capability per publication. Bound that
+// resource as well as payload bytes; flushing never refuses more history.
+const SEALED_STAGING_BATCH_OBJECTS: usize = 64;
+const SEALED_STAGING_FILE_PREFIX: &str = "sealed-v2";
+
+fn sealed_staging_name(
+    kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+    address: ContentDigest,
+) -> String {
+    format!(
+        "{SEALED_STAGING_FILE_PREFIX}-{}-{address}",
+        sealed_kind_code(kind)
+    )
+}
+
+/// Read-only point access to exact sealed objects. This carries no generation
+/// authority: only a later qualified generation commit can name its roots.
+pub(crate) struct SealedGenerationDirectory {
+    directory: cap_std::fs::Dir,
+}
+
+impl SealedGenerationDirectory {
+    pub(crate) fn open(directory: &cap_std::fs::Dir) -> Result<Self, String> {
+        Ok(Self {
+            directory: directory.try_clone().map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
+    for SealedGenerationDirectory
+{
+    fn read_sealed_accepted_object(
+        &self,
+        kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        address: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
+    {
+        tine_storage::read_optional_regular(
+            &self.directory,
+            &sealed_staging_name(kind, address),
+            MAX_CHECKPOINT_BYTES,
+            None,
+        )
+        .map_err(|error| {
+            tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Store(error.to_string())
+        })
+    }
+
+    fn publish_sealed_accepted_object(
+        &mut self,
+        _kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        _address: ContentDigest,
+        _bytes: &[u8],
+    ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
+        Err(
+            tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Store(
+                "sealed generation directory is read-only".into(),
+            ),
+        )
+    }
+}
+
+// Linux can batch data and name barriers. Every other target uses the
+// retained private-directory primitive: Android needs its single-writer rename
+// fallback, and Windows needs its write-through publication protocol.
+enum SealedStagingPublication {
+    Batch(tine_storage::ExactImmutablePublicationBatch),
+    Immediate(tine_storage::DurableDirectoryPublication),
+}
+
+impl SealedStagingPublication {
+    fn open(directory: &cap_std::fs::Dir) -> Result<Self, String> {
+        if cfg!(target_os = "linux") {
+            tine_storage::ExactImmutablePublicationBatch::new(directory)
+                .map(Self::Batch)
+                .map_err(|error| error.to_string())
+        } else {
+            Self::open_immediate(directory)
+        }
+    }
+
+    fn open_immediate(directory: &cap_std::fs::Dir) -> Result<Self, String> {
+        tine_storage::DurableDirectoryPublication::open(directory)
+            .map(Self::Immediate)
+            .map_err(|error| error.to_string())
+    }
+
+    fn publish(
+        &mut self,
+        directory: &cap_std::fs::Dir,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        match self {
+            Self::Batch(batch) => batch.publish(directory, name, bytes),
+            Self::Immediate(directory) => directory.publish_new_exact_single_writer(name, bytes),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn finish(self) -> Result<(), String> {
+        match self {
+            Self::Batch(batch) => batch
+                .finish()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            // Each immediate publication already completed its barrier.
+            Self::Immediate(_) => Ok(()),
+        }
+    }
+}
+
+/// A caller-owned, sole-writer staging directory. Canonical node encoding and
+/// address validation remain in the shared writer/reader. Reuse A5's memory
+/// adapter only for the bounded unfinished publication batch, never as authority.
+/// Drop abandons unfinished publication; successful finish returns point access
+/// only after the shared durability primitive has completed.
+pub(crate) struct SealedGenerationStagingStore {
+    reader: SealedGenerationDirectory,
+    publication: Option<SealedStagingPublication>,
+    pending: CheckpointSealedStore,
+    pending_bytes: usize,
+    batch_byte_budget: usize,
+    batch_object_budget: usize,
+    failed: bool,
+}
+
+impl SealedGenerationStagingStore {
+    pub(crate) fn open(directory: &cap_std::fs::Dir) -> Result<Self, String> {
+        Ok(Self {
+            reader: SealedGenerationDirectory::open(directory)?,
+            publication: None,
+            pending: CheckpointSealedStore::default(),
+            pending_bytes: 0,
+            batch_byte_budget: SEALED_STAGING_BATCH_BYTES,
+            batch_object_budget: SEALED_STAGING_BATCH_OBJECTS,
+            failed: false,
+        })
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.failed {
+            return Err("sealed generation staging previously failed".into());
+        }
+        if let Some(publication) = self.publication.take() {
+            if let Err(error) = publication.finish() {
+                self.failed = true;
+                return Err(error.to_string());
+            }
+            self.pending.objects.clear();
+            self.pending_bytes = 0;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<SealedGenerationDirectory, String> {
+        self.flush()?;
+        Ok(self.reader)
+    }
+}
+
+impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
+    for SealedGenerationStagingStore
+{
+    fn read_sealed_accepted_object(
+        &self,
+        kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        address: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
+    {
+        if self.failed {
+            return Err(
+                tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Store(
+                    "sealed generation staging previously failed".into(),
+                ),
+            );
+        }
+        if let Some(bytes) = self.pending.read_sealed_accepted_object(kind, address)? {
+            return Ok(Some(bytes));
+        }
+        self.reader.read_sealed_accepted_object(kind, address)
+    }
+
+    fn publish_sealed_accepted_object(
+        &mut self,
+        kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        address: ContentDigest,
+        bytes: &[u8],
+    ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
+        use tine_storage::sealed_accepted_index::SealedAcceptedIndexError;
+        let result = (|| -> Result<(), String> {
+            if self.failed {
+                return Err("sealed generation staging previously failed".into());
+            }
+            if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
+                return Err(
+                    "sealed construction record exceeds the current checkpoint record limit".into(),
+                );
+            }
+            if let Some(existing) = self.pending.objects.get(&(sealed_kind_code(kind), address)) {
+                if existing != bytes {
+                    return Err("sealed staging address has different pending bytes".into());
+                }
+                return Ok(());
+            }
+            if self.pending_bytes.saturating_add(bytes.len()) > self.batch_byte_budget {
+                self.flush()?;
+            }
+            if self.publication.is_none() {
+                self.publication = Some(SealedStagingPublication::open(&self.reader.directory)?);
+            }
+            self.publication
+                .as_mut()
+                .expect("publication opened")
+                .publish(
+                    &self.reader.directory,
+                    &sealed_staging_name(kind, address),
+                    bytes,
+                )
+                .map_err(|error| error.to_string())?;
+            self.pending
+                .publish_sealed_accepted_object(kind, address, bytes)
+                .map_err(|error| error.to_string())?;
+            self.pending_bytes = self
+                .pending_bytes
+                .checked_add(bytes.len())
+                .ok_or("sealed staging byte count overflowed")?;
+            if self.pending_bytes >= self.batch_byte_budget
+                || self.pending.objects.len() >= self.batch_object_budget
+            {
+                self.flush()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result.map_err(SealedAcceptedIndexError::Store)
+    }
+}
+
 struct RecordingCheckpointSealedStore<'a> {
     inner: &'a CheckpointSealedStore,
     reads: RefCell<BTreeSet<(u8, ContentDigest)>>,
@@ -1874,6 +2119,303 @@ mod tests {
     }
 
     #[test]
+    fn sealed_directory_roundtrip_and_incremental_roots_match_memory_oracle() {
+        let root =
+            std::env::temp_dir().join(format!("tine-sealed-directory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let rows = generation_rows(17);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut staging = SealedGenerationStagingStore::open(&directory).unwrap();
+        staging.batch_byte_budget = 4096;
+        staging.batch_object_budget = 8;
+        let mut cutoff = empty.clone();
+        for row in &rows[..16] {
+            let mut builder = cutoff.builder(&mut staging);
+            builder.append(row).unwrap();
+            cutoff = builder.finish(row.evidence.post_frontier_root()).unwrap();
+            assert!(staging.pending_bytes < staging.batch_byte_budget);
+            assert!(staging.pending.objects.len() < staging.batch_object_budget);
+        }
+        let prefix = cutoff.clone();
+        drop(staging.finish().unwrap());
+        let reopened = SealedGenerationDirectory::open(&directory).unwrap();
+        let reader = SealedAcceptedIndexReader::new(&reopened);
+        for row in &rows[..16] {
+            let proof = reader
+                .prove_membership(
+                    prefix.roots(),
+                    row.evidence.acceptance_sequence(),
+                    row.evidence.batch_id().as_uuid().into_bytes(),
+                    &TineAcceptedEvidenceDecoder,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof.status.no_op, row.no_op);
+            assert_eq!(
+                proof.status.exact_evidence_bytes,
+                row.evidence.encode_canonical().unwrap()
+            );
+        }
+        let mut extension = SealedGenerationStagingStore::open(&directory).unwrap();
+        let mut builder = prefix.builder(&mut extension);
+        builder.append(&rows[16]).unwrap();
+        let complete = builder
+            .finish(rows[16].evidence.post_frontier_root())
+            .unwrap();
+        drop(extension.finish().unwrap());
+        let mut memory = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut memory);
+        for row in &rows {
+            builder.append(row).unwrap();
+        }
+        let expected = builder
+            .finish(rows[16].evidence.post_frontier_root())
+            .unwrap();
+        assert_eq!(complete.roots(), expected.roots());
+        assert_eq!(complete.causal_tip_root(), expected.causal_tip_root());
+        // The same pre-existing reader can still resolve immutable predecessor
+        // roots after a later generation adds nodes in the same object store.
+        assert!(reader
+            .prove_membership(
+                prefix.roots(),
+                16,
+                16u128.to_be_bytes(),
+                &TineAcceptedEvidenceDecoder
+            )
+            .unwrap()
+            .is_some());
+        assert!(reader
+            .prove_membership(
+                complete.roots(),
+                17,
+                17u128.to_be_bytes(),
+                &TineAcceptedEvidenceDecoder
+            )
+            .unwrap()
+            .is_some());
+        // Exercise the immediate backend on the Linux host as well. Native
+        // Windows/Android barriers still require their platform qualification.
+        let immediate_root = root.join("immediate");
+        std::fs::create_dir(&immediate_root).unwrap();
+        let immediate_dir =
+            cap_std::fs::Dir::open_ambient_dir(&immediate_root, cap_std::ambient_authority())
+                .unwrap();
+        let mut immediate = SealedGenerationStagingStore::open(&immediate_dir).unwrap();
+        immediate.publication =
+            Some(SealedStagingPublication::open_immediate(&immediate_dir).unwrap());
+        immediate.batch_byte_budget = usize::MAX;
+        immediate.batch_object_budget = usize::MAX;
+        let mut builder = empty.builder(&mut immediate);
+        for row in &rows {
+            builder.append(row).unwrap();
+        }
+        let actual = builder
+            .finish(rows[16].evidence.post_frontier_root())
+            .unwrap();
+        assert_eq!(actual.roots(), expected.roots());
+        assert_eq!(actual.causal_tip_root(), expected.causal_tip_root());
+        let immediate = immediate.finish().unwrap();
+        for row in &rows {
+            assert!(SealedAcceptedIndexReader::new(&immediate)
+                .prove_membership(
+                    actual.roots(),
+                    row.evidence.acceptance_sequence(),
+                    row.evidence.batch_id().as_uuid().into_bytes(),
+                    &TineAcceptedEvidenceDecoder,
+                )
+                .unwrap()
+                .is_some());
+        }
+        let mut publication = SealedStagingPublication::open_immediate(&immediate_dir).unwrap();
+        publication
+            .publish(&immediate_dir, "collision", b"original")
+            .unwrap();
+        assert!(publication
+            .publish(&immediate_dir, "collision", b"different")
+            .is_err());
+        assert_eq!(
+            std::fs::read(immediate_root.join("collision")).unwrap(),
+            b"original"
+        );
+        drop(publication);
+        drop(immediate);
+        drop(immediate_dir);
+        drop(reopened);
+        drop(directory);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sealed_directory_collision_or_corruption_never_changes_predecessor_authority() {
+        use tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore;
+        let root =
+            std::env::temp_dir().join(format!("tine-sealed-damage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let row = generation_rows(1).remove(0);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut staging = SealedGenerationStagingStore::open(&directory).unwrap();
+        let mut builder = empty.builder(&mut staging);
+        builder.append(&row).unwrap();
+        let cutoff = builder.finish(row.evidence.post_frontier_root()).unwrap();
+        let mut reopened = staging.finish().unwrap();
+        let address = cutoff.roots().batch_map.root.unwrap().digest;
+        let kind = SealedAcceptedObjectKind::MapNode;
+        let original = reopened
+            .read_sealed_accepted_object(kind, address)
+            .unwrap()
+            .unwrap();
+        assert!(reopened
+            .publish_sealed_accepted_object(kind, address, b"wrong")
+            .is_err());
+        let mut collision = SealedGenerationStagingStore::open(&directory).unwrap();
+        assert!(collision
+            .publish_sealed_accepted_object(kind, address, b"wrong")
+            .is_err());
+        assert!(collision.finish().is_err());
+        assert_eq!(
+            reopened
+                .read_sealed_accepted_object(kind, address)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        let name = sealed_staging_name(kind, address);
+        std::fs::write(root.join(&name), b"torn node").unwrap();
+        assert!(SealedAcceptedIndexReader::new(&reopened)
+            .prove_membership(
+                cutoff.roots(),
+                1,
+                1u128.to_be_bytes(),
+                &TineAcceptedEvidenceDecoder
+            )
+            .is_err());
+        std::fs::remove_file(root.join(&name)).unwrap();
+        assert!(reopened
+            .read_sealed_accepted_object(kind, address)
+            .unwrap()
+            .is_none());
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside-node");
+            std::fs::write(&outside, &original).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join(&name)).unwrap();
+            assert!(reopened.read_sealed_accepted_object(kind, address).is_err());
+            std::fs::remove_file(root.join(&name)).unwrap();
+            std::fs::remove_file(outside).unwrap();
+        }
+        std::fs::write(root.join(&name), original).unwrap();
+        assert!(SealedAcceptedIndexReader::new(&reopened)
+            .prove_membership(
+                cutoff.roots(),
+                1,
+                1u128.to_be_bytes(),
+                &TineAcceptedEvidenceDecoder
+            )
+            .unwrap()
+            .is_some());
+        drop(reopened);
+        drop(directory);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sealed_directory_publication_fault_can_retry_without_replacing_predecessor() {
+        let root = std::env::temp_dir().join(format!("tine-sealed-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        let rows = generation_rows(2);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut first = SealedGenerationStagingStore::open(&directory).unwrap();
+        let mut builder = empty.builder(&mut first);
+        builder.append(&rows[0]).unwrap();
+        let prefix = builder
+            .finish(rows[0].evidence.post_frontier_root())
+            .unwrap();
+        let predecessor_reader = first.finish().unwrap();
+        let mut interrupted = SealedGenerationStagingStore::open(&directory).unwrap();
+        let mut builder = prefix.builder(&mut interrupted);
+        builder.append(&rows[1]).unwrap();
+        let candidate = builder
+            .finish(rows[1].evidence.post_frontier_root())
+            .unwrap();
+        let ((kind, address), original) = interrupted
+            .pending
+            .objects
+            .iter()
+            .find(|((kind, _), _)| {
+                *kind == sealed_kind_code(SealedAcceptedObjectKind::StatusRecord)
+            })
+            .expect("the extension has a new status record");
+        let original = original.clone();
+        let collision = root.join(sealed_staging_name(
+            sealed_kind_from_code(*kind).unwrap(),
+            *address,
+        ));
+        let installed_during_publish = collision.exists();
+        std::fs::write(&collision, b"torn publication").unwrap();
+        let finished = interrupted.finish();
+        if installed_during_publish {
+            // Some platforms install each immutable file during publish. A
+            // later disk fault is detected by fresh canonical qualification,
+            // not by treating the batch's durability receipt as integrity.
+            if let Ok(reader) = finished {
+                assert!(SealedAcceptedIndexReader::new(&reader)
+                    .prove_membership(
+                        candidate.roots(),
+                        2,
+                        2u128.to_be_bytes(),
+                        &TineAcceptedEvidenceDecoder
+                    )
+                    .is_err());
+            }
+            std::fs::write(&collision, original).unwrap();
+        } else {
+            assert!(
+                finished.is_err(),
+                "a different exact-byte winner must refuse deferred installation"
+            );
+            std::fs::remove_file(collision).unwrap();
+        }
+        let reader = SealedAcceptedIndexReader::new(&predecessor_reader);
+        assert!(reader
+            .prove_membership(
+                prefix.roots(),
+                1,
+                1u128.to_be_bytes(),
+                &TineAcceptedEvidenceDecoder
+            )
+            .unwrap()
+            .is_some());
+        let mut retry = SealedGenerationStagingStore::open(&directory).unwrap();
+        let mut builder = prefix.builder(&mut retry);
+        builder.append(&rows[1]).unwrap();
+        let retried = builder
+            .finish(rows[1].evidence.post_frontier_root())
+            .unwrap();
+        let complete = retry.finish().unwrap();
+        assert_eq!(retried.roots(), candidate.roots());
+        assert_eq!(retried.causal_tip_root(), candidate.causal_tip_root());
+        assert!(SealedAcceptedIndexReader::new(&complete)
+            .prove_membership(
+                retried.roots(),
+                2,
+                2u128.to_be_bytes(),
+                &TineAcceptedEvidenceDecoder
+            )
+            .unwrap()
+            .is_some());
+        drop(complete);
+        drop(predecessor_reader);
+        drop(directory);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
     fn sealed_cutoff_incremental_build_matches_independent_full_rederivation() {
         let rows = generation_rows(65);
         let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
@@ -2197,8 +2739,41 @@ mod tests {
             );
         }
         assert!(!include_str!("../sync_runtime.rs").contains("build_sealed_accepted_cutoff"));
+        let production = include_str!("checkpoint_generation.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let staging = production
+            .split("const SEALED_STAGING_BATCH_BYTES")
+            .nth(1)
+            .unwrap()
+            .split("struct RecordingCheckpointSealedStore")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "fs::write",
+            "fs::rename",
+            "read_dir(",
+            "replace_activation_marker",
+            "publish_activation_marker",
+        ] {
+            assert!(!staging.contains(forbidden), "staging acquired {forbidden}");
+        }
+        for caller in [engine, include_str!("../sync_runtime.rs")] {
+            assert!(!caller.contains("SealedGenerationStagingStore"));
+        }
+        assert!(staging.contains("cfg!(target_os = \"linux\")"));
+        assert!(staging.contains("Self::open_immediate(directory)"));
+        assert!(staging.contains("publish_new_exact_single_writer(name, bytes)"));
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
         assert!(contract.contains("R1b accepted-cutoff builder"));
+        assert!(contract.contains(&format!("{}-<kind>-<digest>", SEALED_STAGING_FILE_PREFIX)));
+        assert!(contract.contains(&format!(
+            "{} MiB or {} objects",
+            SEALED_STAGING_BATCH_BYTES / (1024 * 1024),
+            SEALED_STAGING_BATCH_OBJECTS
+        )));
+        assert!(contract.contains("publish_new_exact_single_writer"));
         assert!(contract.contains("no new on-disk format"));
     }
 
