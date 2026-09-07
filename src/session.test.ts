@@ -227,6 +227,125 @@ describe("persisted split session", () => {
     expect(JSON.stringify(parsed)).not.toContain("results");
   });
 
+  it("round-trips a query workspace display draft through restore and serialization", () => {
+    const display = {
+      sort: [["priority", "asc"]],
+      group_by: "prop:state",
+      columns: ["state", "prop:owner"],
+      aggregates: [["", "count"]],
+      sample: 25,
+    };
+    const route = {
+      kind: "query", id: "query-display", sourceKind: "search",
+      source: "alpha", presentation: "table", display,
+    };
+    const raw = JSON.stringify({
+      tabs: [{ history: [route], pos: 0, pinned: false }],
+      activeIndex: 0,
+    });
+
+    const restored = parsePersistedSession(raw)!;
+    expect(restored.snapshots.get("main")?.tabs[0].history[0]).toEqual(route);
+
+    resetPaneLayoutToSingle(restored.snapshots.get("main")!);
+    const again = parsePersistedSession(JSON.stringify(buildPersistedSession()))!;
+    expect(again.snapshots.get("main")?.tabs[0].history[0]).toEqual(route);
+  });
+
+  it("keeps a cleared display draft distinct from no draft at all", () => {
+    const withRoute = (display?: unknown) => JSON.stringify({
+      tabs: [{
+        history: [{
+          kind: "query", id: "query-1", sourceKind: "search",
+          source: "alpha", presentation: "table",
+          ...(display === undefined ? {} : { display }),
+        }],
+        pos: 0, pinned: false,
+      }],
+      activeIndex: 0,
+    });
+
+    const cleared = parsePersistedSession(withRoute({}))!
+      .snapshots.get("main")!.tabs[0].history[0];
+    expect(cleared).toMatchObject({ display: {} });
+
+    const absent = parsePersistedSession(withRoute())!
+      .snapshots.get("main")!.tabs[0].history[0];
+    expect(Object.hasOwn(absent, "display")).toBe(false);
+  });
+
+  it("drops only a malformed display and keeps the rest of the query route", () => {
+    const restore = (display: unknown) => parsePersistedSession(JSON.stringify({
+      tabs: [{
+        history: [{
+          kind: "query", id: "query-1", sourceKind: "search",
+          source: "alpha", presentation: "table", display,
+        }],
+        pos: 0, pinned: true,
+      }],
+      activeIndex: 0,
+    }))!.snapshots.get("main")!.tabs[0];
+
+    for (const bad of [
+      { columns: ["bad;name"] }, { sort: [["priority", "sideways"]] },
+      { sample: -1 }, { group_by: "status" }, { aggregates: [["", "avg"]] },
+      "not-an-object", 3, null, [],
+    ]) {
+      const tab = restore(bad);
+      expect(tab.pinned).toBe(true);
+      expect(tab.history[0]).toEqual({
+        kind: "query", id: "query-1", sourceKind: "search",
+        source: "alpha", presentation: "table",
+      });
+    }
+  });
+
+  it("strips unsupported keys out of a persisted draft rather than restoring them", () => {
+    const parsed = parsePersistedSession(JSON.stringify({
+      tabs: [{
+        history: [{
+          kind: "query", id: "query-1", sourceKind: "search",
+          source: "alpha", presentation: "table",
+          display: { columns: ["state"], view: "board", results: [{ id: "b1" }] },
+        }],
+        pos: 0, pinned: false,
+      }],
+      activeIndex: 0,
+    }))!;
+    expect(parsed.snapshots.get("main")?.tabs[0].history[0]).toEqual({
+      kind: "query", id: "query-1", sourceKind: "search",
+      source: "alpha", presentation: "table", display: { columns: ["state"] },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("results");
+  });
+
+  it("persists a copy of the draft, not the live route's own lists", () => {
+    const display = {
+      columns: ["prop:a"],
+      sort: [["priority", "asc"]] as [string, "asc" | "desc"][],
+    };
+    resetPaneLayoutToSingle({
+      tabs: [{
+        history: [{
+          kind: "query", id: "query-1", sourceKind: "search",
+          source: "alpha", presentation: "table", display,
+        }],
+        pos: 0, pinned: false,
+      }],
+      activeIndex: 0,
+    });
+
+    const persisted = buildPersistedSession();
+    const written = persisted.tabs[0].history[0] as { display: typeof display };
+    expect(written.display).toEqual(display);
+    expect(written.display.columns).not.toBe(display.columns);
+    expect(written.display.sort[0]).not.toBe(display.sort[0]);
+
+    display.columns.push("prop:b");
+    display.sort[0][1] = "desc";
+    expect(written.display).toEqual({ columns: ["prop:a"], sort: [["priority", "asc"]] });
+  });
+
   it("round-trips graph-scoped Favorites and Recent disclosure state and defaults legacy sessions open", () => {
     setRecentPages([{ name: "Twin", kind: "page", path: "pages/client-b/Twin.md" }]);
     setFavoritesSectionExpanded(false);

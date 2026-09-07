@@ -1,5 +1,6 @@
 import { backend } from "./backend";
 import { isSinglePaneShell } from "./nativeChrome";
+import { normalizeQueryDisplayDraft, type QueryDisplayDraft } from "./editor/queryDisplayDraft";
 import {
   installSessionPersistence,
   mintPdfViewId,
@@ -69,6 +70,25 @@ function invalidPersistedPdf(message: string): Route {
   return { kind: "invalid", title: "Unavailable PDF", message };
 }
 
+/** The display draft of a query route, in the ONE form both directions of the
+ *  session agree on (P5C).
+ *
+ *  Read and write share this helper deliberately. Restoring runs it over
+ *  whatever the session document happened to contain, and serializing runs it
+ *  again over the live route — so a draft that cannot be read back is dropped
+ *  before it is ever written, and the fresh copy `normalizeQueryDisplayDraft`
+ *  returns also means a persisted snapshot never aliases a live route's arrays.
+ *
+ *  An unreadable draft costs ONLY the draft. The workspace is still a valid
+ *  route with a valid source and presentation, and losing a tab (or a whole
+ *  pane's layout) over a display choice would be the disproportionate refusal
+ *  D-3 rules out — a draft is disposable, the route is not. */
+function persistableQueryDisplay(display: unknown): { display?: QueryDisplayDraft } {
+  if (display === undefined) return {};
+  const normalized = normalizeQueryDisplayDraft(display);
+  return normalized ? { display: normalized } : {};
+}
+
 function validRoute(r: unknown, seenViewIds: Set<string>): Route | null {
   if (!r || typeof r !== "object") return null;
   const o = r as Record<string, unknown>;
@@ -79,7 +99,11 @@ function validRoute(r: unknown, seenViewIds: Set<string>): Route | null {
       && typeof o.source === "string" && o.source.length <= 65_536
       && (o.presentation === "search" || o.presentation === "list"
         || o.presentation === "table" || o.presentation === "board"))) return null;
-    return { kind: "query", id: o.id, sourceKind: o.sourceKind, source: o.source, presentation: o.presentation };
+    return {
+      kind: "query", id: o.id, sourceKind: o.sourceKind,
+      source: o.source, presentation: o.presentation,
+      ...persistableQueryDisplay(o.display),
+    };
   }
   if (o.kind === "invalid") {
     if (typeof o.title !== "string" || !o.title || o.title.length > 256
@@ -220,6 +244,7 @@ function serializeRoute(route: Route): Route {
     return {
       kind: "query", id: route.id, sourceKind: route.sourceKind,
       source: route.source, presentation: route.presentation,
+      ...persistableQueryDisplay(route.display),
     };
   }
   if (route.kind === "pdf") {

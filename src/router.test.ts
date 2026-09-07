@@ -113,6 +113,116 @@ describe("independent empty query workspaces (GH #172)", () => {
   });
 });
 
+describe("query workspace display draft (P5C)", () => {
+  const queryRoute = () => {
+    const r = route();
+    if (r.kind !== "query") throw new Error("expected a query route");
+    return r;
+  };
+
+  it("starts with no draft, so the workspace inherits what the query text states", () => {
+    openQueryInNewTab("alpha", "search", true);
+    expect(Object.hasOwn(queryRoute(), "display")).toBe(false);
+  });
+
+  it("stores a normalized snapshot and keeps an empty draft distinct from none", () => {
+    openQueryInNewTab("alpha", "table", true);
+    updateActiveQuery({
+      display: {
+        sort: [["priority", "asc"]],
+        group_by: "prop:state",
+        columns: ["state", "prop:owner"],
+        aggregates: [["", "count"]],
+        sample: 25,
+        view: "board",
+        results: [1, 2],
+      } as never,
+    });
+    // The view is the route's presentation, and an unknown key is not carried.
+    expect(queryRoute().display).toEqual({
+      sort: [["priority", "asc"]],
+      group_by: "prop:state",
+      columns: ["state", "prop:owner"],
+      aggregates: [["", "count"]],
+      sample: 25,
+    });
+
+    updateActiveQuery({ display: {} });
+    expect(queryRoute().display).toEqual({});
+    expect(Object.hasOwn(queryRoute(), "display")).toBe(true);
+  });
+
+  it("keeps the existing snapshot through a source-only or presentation-only edit", () => {
+    openQueryInNewTab("alpha", "table", true);
+    updateActiveQuery({ display: { columns: ["state"] } });
+    updateActiveQuery({ source: "alpha -draft", sourceKind: "dsl" });
+    updateActiveQuery({ presentation: "board" });
+    expect(queryRoute()).toMatchObject({
+      source: "alpha -draft", sourceKind: "dsl", presentation: "board",
+      display: { columns: ["state"] },
+    });
+
+    // …including the empty draft, which is a choice and not an absence.
+    updateActiveQuery({ display: {} });
+    updateActiveQuery({ presentation: "list" });
+    expect(queryRoute().display).toEqual({});
+  });
+
+  it("clears the draft back to inheriting on an explicit undefined", () => {
+    openQueryInNewTab("alpha", "table", true);
+    updateActiveQuery({ display: { columns: ["state"] } });
+    updateActiveQuery({ display: undefined });
+    expect(Object.hasOwn(queryRoute(), "display")).toBe(false);
+  });
+
+  it("retains the previous route entirely when an update carries an unreadable draft", () => {
+    openQueryInNewTab("alpha", "table", true);
+    updateActiveQuery({ display: { columns: ["state"] } });
+    const before = queryRoute();
+
+    updateActiveQuery({ source: "beta", presentation: "board", display: { columns: ["bad;name"] } });
+    // Not even the source and presentation in the same patch are applied.
+    expect(queryRoute()).toEqual(before);
+
+    for (const bad of [
+      { sample: -1 }, { sample: 1.5 }, { sort: [["priority", "sideways"]] },
+      { aggregates: [["", "sum"]] }, { group_by: "status" }, { columns: [" padded"] },
+    ]) {
+      updateActiveQuery({ display: bad as never });
+      expect(queryRoute()).toEqual(before);
+    }
+    expect(activeTab().history).toHaveLength(1);
+  });
+
+  it("cannot be reached through the array the caller passed in", () => {
+    openQueryInNewTab("alpha", "table", true);
+    const columns = ["prop:a"];
+    const sort: [string, string][] = [["priority", "asc"]];
+    updateActiveQuery({ display: { columns, sort } as never });
+
+    columns.push("prop:b");
+    sort[0][1] = "desc";
+
+    expect(queryRoute().display).toEqual({ columns: ["prop:a"], sort: [["priority", "asc"]] });
+  });
+
+  it("writes each update as a new route, so a captured snapshot is never rewritten", () => {
+    openQueryInNewTab("alpha", "table", true);
+    updateActiveQuery({ display: { columns: ["state"] } });
+    const captured = queryRoute();
+
+    updateActiveQuery({ display: { columns: ["prop:owner"], sample: 4 } });
+    expect(captured.display).toEqual({ columns: ["state"] });
+    expect(queryRoute().display).toEqual({ columns: ["prop:owner"], sample: 4 });
+
+    // The draft rides the history entry, so navigating away leaves it intact.
+    openPage("Notes");
+    expect(activeTab().history[0]).toMatchObject({
+      kind: "query", display: { columns: ["prop:owner"], sample: 4 },
+    });
+  });
+});
+
 describe("reuse already-open tabs on user navigation", () => {
   it("edits a virtual query in one stable history entry and can materialize it in place", () => {
     openQueryInNewTab("alpha", "search", true);

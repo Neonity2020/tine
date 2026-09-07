@@ -19,6 +19,7 @@ import {
   type HistoryRouteContext,
 } from "./store";
 import { backend } from "./backend";
+import { normalizeQueryDisplayDraft, type QueryDisplayDraft } from "./editor/queryDisplayDraft";
 import { renderedBlocks } from "./lazyObserve";
 import { navReuseTabs } from "./navSettings";
 import { isMobilePlatform } from "./nativeChrome";
@@ -109,6 +110,21 @@ export interface QueryRoute {
   sourceKind: "search" | "dsl";
   source: string;
   presentation: QueryPresentation;
+  /** The workspace's own display choices, as a complete snapshot of the
+   *  non-view half of `ViewSettings` (P5C).
+   *
+   *  A workspace has no block to hang `tine.*` properties on, so the draft lives
+   *  here. Three states, all meaningful:
+   *
+   *   * ABSENT — nothing chosen; the workspace inherits whatever the query text
+   *     already states.
+   *   * `{}` — every non-view setting explicitly cleared.
+   *   * populated — exactly these settings, and only these.
+   *
+   *  `presentation` above stays the only authority for the view, which is why
+   *  `QueryDisplayDraft` cannot carry one. Every value here has been through
+   *  `normalizeQueryDisplayDraft`. */
+  display?: QueryDisplayDraft;
 }
 
 export interface Tab {
@@ -161,7 +177,7 @@ export interface PaneRouter {
   updateActivePdfViewState(state: { page?: number; scale?: number }): void;
   closePdf(): Promise<boolean>;
   openQueryInNewTab(source: string, presentation?: QueryPresentation, foreground?: boolean): QueryRoute;
-  updateActiveQuery(patch: Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation">>): void;
+  updateActiveQuery(patch: QueryRoutePatch): void;
   replaceActiveRoute(route: Route): void;
   resetTabsToJournals(): void;
   openFile(
@@ -252,6 +268,39 @@ export function makeQueryRoute(
     source,
     presentation,
   };
+}
+
+/** What one edit to the active query workspace may change.
+ *
+ *  `display` distinguishes three cases, and the distinction is the point:
+ *
+ *   * the key is ABSENT from the patch — a source-only or presentation-only
+ *     edit, which keeps whatever snapshot the route already had, `{}` included;
+ *   * `display: undefined` — an explicit clear of the DRAFT, dropping the route
+ *     back to inheriting the parsed query's settings;
+ *   * `display: {...}` — the new snapshot, which must normalize. */
+export type QueryRoutePatch =
+  Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation" | "display">>;
+
+/** The pure half of `updateActiveQuery`: the next route, or `null` when the
+ *  patch carries a display this build cannot read and the whole edit must be
+ *  refused. Exported so the future display panel can prevalidate exactly the
+ *  edit it is about to submit. */
+export function applyQueryRoutePatch(
+  current: QueryRoute,
+  patch: QueryRoutePatch,
+): QueryRoute | null {
+  const { display: _drop, ...rest } = patch;
+  const next: QueryRoute = { ...current, ...rest };
+  if (!Object.hasOwn(patch, "display")) return next;
+  if (patch.display === undefined) {
+    delete next.display;
+    return next;
+  }
+  const display = normalizeQueryDisplayDraft(patch.display);
+  if (!display) return null;
+  next.display = display;
+  return next;
 }
 
 export function mintPdfViewId(used: ReadonlySet<string> = new Set()): string {
@@ -625,12 +674,15 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     return queryRoute;
   }
 
-  function updateActiveQuery(
-    patch: Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation">>
-  ) {
+  function updateActiveQuery(patch: QueryRoutePatch) {
     const current = route();
     if (current.kind !== "query") return;
-    const next = { ...current, ...patch };
+    const next = applyQueryRoutePatch(current, patch);
+    // An unreadable display leaves the route ENTIRELY untouched — the source and
+    // presentation in the same patch included. A half-applied edit would be a
+    // silent partial success, and the display panel that will own this seam
+    // prevalidates with `normalizeQueryDisplayDraft` so it can say so visibly.
+    if (!next) return;
     setTabs(tabs().map((tab) => {
       if (tab.id !== activeId()) return tab;
       const history = [...tab.history];
@@ -1216,9 +1268,7 @@ export function openQueryInNewTab(
   return focusedRouterInstance().openQueryInNewTab(source, presentation, foreground);
 }
 
-export function updateActiveQuery(
-  patch: Partial<Pick<QueryRoute, "source" | "sourceKind" | "presentation">>
-) {
+export function updateActiveQuery(patch: QueryRoutePatch) {
   focusedRouterInstance().updateActiveQuery(patch);
 }
 

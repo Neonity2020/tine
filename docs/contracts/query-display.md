@@ -9,8 +9,9 @@ succeeds for the property grammar without replacing its historical decision.
 P5A settled the property grammar and the column resolution. P5B settled the
 grouping identity, the inline Display panel, the one summary behind every
 grouped face, and the query table's own header/footer/drag surfaces; they are
-documented here together rather than in a second file. What remains open is
-listed in the last section.
+documented here together rather than in a second file. §11 adds the one surface
+with no block to carry properties at all — the virtual query workspace, whose
+display draft lives on its route. What remains open is listed in §10.
 
 Implementation:
 
@@ -30,6 +31,8 @@ Implementation:
 - `src/sheet/fields.ts` — the field-identity helpers those share
   (`queryColumnName`, `querySortFieldName`, `boardGroupByOptions`,
   `groupKeysForBlock`).
+- `src/editor/queryDisplayDraft.ts` — the workspace draft's ONE normalizer
+  (§11), shared by `router.ts`'s mutation and by `session.ts`'s two directions.
 
 ## 1. The six display facts, and the one that is not
 
@@ -588,7 +591,8 @@ Tests: `crates/tine-core/src/publish.rs`
 
 Deliberately open, and owned by the next package rather than guessed forward:
 
-- the workspace draft's presentation and its format-aware materialization;
+- the workspace draft's EXECUTION and its format-aware materialization. Where
+  the draft lives, and what it may contain, is settled in §11;
 - session/UI caps on a column selection;
 - a saved sort by title, `state`, `tags` or a formula: that needs an engine sort
   vocabulary, not a frontend replacement sorter, and P5B deliberately shows the
@@ -612,3 +616,118 @@ ordinary children tables keep their existing schema interpretation. A schema
 write that also rescues query columns captures both the schema page and query
 page in the same undo unit, including an enclosing header reorder. Tests:
 `QueryColumns.test.tsx` ordinary-children and cross-page-undo cases.
+
+## 11. The query workspace's display draft — the session foundation
+
+A **query workspace** (ADR 0042) is a virtual, graph-scoped, device-local route
+that persists its source expression rather than a result snapshot. It has no
+block, so it has nowhere to put the `tine.*` properties §1 describes, and until
+P5C its display was simply not a thing that could exist: `QueryRoute` carried an
+id, a source, a `sourceKind` and a `presentation`, and a session round trip threw
+away anything else.
+
+This section settles where a workspace's display choices live and what they may
+contain. It settles **no execution and no UI**: nothing here renders a face,
+runs a query, or materializes one into a page. Those are the next package's.
+
+### 11.1 One optional member, three meanings
+
+`QueryRoute.display` is an optional `QueryDisplayDraft`, defined as
+`Omit<ViewSettings, 'view'>` — a **complete snapshot** of the non-presentation
+half of §1's facts, never a patch:
+
+| State | Meaning |
+| --- | --- |
+| absent | nothing chosen; the workspace inherits what the parsed query already states |
+| `{}` | every non-view setting explicitly cleared |
+| populated | exactly these settings, and only these |
+
+`presentation` remains the sole authority for the view (§1's `tine.view`
+equivalent for a workspace). That is enforced by the TYPE, not by convention: a
+draft has no `view` member to disagree with, and an incoming `view` key is
+dropped like any other unrecognized one. The distinction between absent and `{}`
+is the same distinction §2 draws between an absent `tine.columns` and a
+present-but-empty one, for the same reason: "I said nothing" and "I said none"
+are different statements, and collapsing them is how a cleared selection
+resurrects an old one.
+
+A draft holds **no result data**. It is display facts only, exactly as §1 lists
+them.
+
+### 11.2 One normalizer, three callers
+
+`src/editor/queryDisplayDraft.ts::normalizeQueryDisplayDraft` is the only place a
+draft is validated. The router's mutation, the session serializer, and the
+session restorer all call it, so a draft that survives a save is exactly a draft
+the router would have accepted. It is pure: no store, no DOM, no backend, and
+**no query language** — a draft is the already-lifted view half, and the backend
+stays the only producer of query text (§1, ADR 0042).
+
+`queryDisplaySettings(draft, parsed, presentation)` is the optional companion
+that hands a renderer the `ViewSettings` to use. It takes the view from
+`presentation` always, inherits the parsed settings when the draft is absent, and
+otherwise replaces that half wholesale. It parses nothing.
+
+**What normalization does.** Unrecognized keys are dropped; a member present as
+`undefined` is treated as absent; every list and tuple is deep-copied, so a
+caller that keeps mutating the array it passed in cannot reach back into a route
+or a history entry that has already been recorded.
+
+**What it refuses**, and refusal is all-or-nothing — one bad entry rejects the
+whole draft. A partially applied draft would show a display nobody chose, and a
+truncated list is indistinguishable from a deliberately short one:
+
+- each of `sort`, `columns`, `aggregates`: at most 64 entries;
+- each field: 1–512 UTF-16 units;
+- the whole normalized draft: at most 65 536 UTF-16 units of JSON. The bound is
+  asked of the recognized display data only — the route's id, source and
+  presentation keep their own existing bounds;
+- `sort` directions are exactly `asc`/`desc`; aggregate functions are exactly
+  `count`/`sum`/`avg`;
+- `sample` is a safe integer in `0 ..= 4294967295` (the bridge's `u32`); null,
+  non-finite, fractional and overflowing values are refused;
+- a field in a LIST member must be nonempty, free of `;` `=` CR LF NUL, and
+  free of outer padding — the §5 grammar's own punctuation, plus the trim its
+  reader performs, so a padded name would come back naming a different field.
+
+Two exceptions, both from elsewhere in this contract:
+
+- `["", "count"]` is the fieldless whole-result count (§5, X3). An empty field
+  with `sum` or `avg` names nothing to add up and is refused;
+- `group_by: ""` is the explicit clear (§3), the one non-canonical grouping
+  value accepted.
+
+**Grouping uses §3's canonical helper, not the legacy reader.**
+`canonicalGroupField` is what reads a draft's `group_by`, so `prop:state` is the
+ordinary property and a bare `state` is the task marker — a bare `status` is
+refused rather than guessed into `prop:status` the way `legacyGroupField` must
+guess for pre-P5B bytes. Because a grouping value is ONE field and not a list,
+`;` and `=` are ordinary bytes inside a canonical `prop:`/`formula:` name there;
+the list rule above must not leak across. The B helper still refuses CR/LF/NUL,
+and the 512-unit bound still applies.
+
+### 11.3 What each seam does with a bad draft
+
+The two seams fail in deliberately different directions, because the cost of
+being wrong differs:
+
+- **A router update** (`updateActiveQuery`) carrying an unreadable draft retains
+  the previous route **entirely** — the source and presentation in the same
+  patch included. A half-applied edit would be a silent partial success. The
+  display panel that will own this seam prevalidates with the same function, so
+  it can report the refusal visibly rather than discovering it here.
+- **A session restore or serialization** drops **only** the draft and keeps the
+  otherwise valid route. Losing a tab, or a pane's whole layout, over a display
+  choice would be the disproportionate refusal D-3 rules out: a draft is
+  disposable, the workspace is not. The workspace reopens inheriting what its
+  query text says.
+
+A patch that does not mention `display` keeps whatever the route had, `{}`
+included; `display: undefined` is the explicit way to clear the draft back to
+inheriting.
+
+Tests: `src/editor/queryDisplayDraft.test.ts` for the normalizer and the
+combining helper; `src/router.test.ts` (`query workspace display draft (P5C)`)
+for the mutation seam; `src/session.test.ts` for the round trip, the absent-
+versus-`{}` distinction, the malformed-draft drop, and the copy that keeps a
+persisted snapshot from aliasing a live route.
