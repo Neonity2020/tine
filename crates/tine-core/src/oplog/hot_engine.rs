@@ -7432,6 +7432,106 @@ impl ShardedHotEngine {
             .map_err(EngineError::Archive)
     }
 
+    /// Explicit full-roster construction over the current accepted document set.
+    /// This background-candidate seam is synchronous until R1c supplies actor COW.
+    /// An inherited descriptor with identical dependencies avoids CRDT loading and
+    /// publication. The predecessor's immutable nodes must be present in `store`.
+    pub(crate) fn build_compact_document_roster(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        store: &mut super::checkpoint_generation::SealedGenerationStagingStore,
+        predecessor: Option<super::checkpoint_generation::SealedDocumentRoster>,
+    ) -> Result<(super::checkpoint_generation::SealedDocumentRoster, u64), EngineError> {
+        use super::checkpoint_generation::SealedDocumentRoster;
+        self.require_complete_document_cutoff(cutoff)?;
+        let mut roster = predecessor.unwrap_or_else(SealedDocumentRoster::empty);
+        let mut written = 0;
+        for dependencies in self.accepted_frontier.values() {
+            if let Some(previous) = predecessor {
+                if previous
+                    .inherited_dependencies(store, dependencies.document_id())
+                    .map_err(EngineError::Archive)?
+                    .as_ref()
+                    == Some(dependencies)
+                {
+                    continue;
+                }
+            }
+            let compact =
+                self.build_compact_accepted_document(cutoff, dependencies.document_id())?;
+            roster = roster
+                .with_document(store, cutoff, &compact)
+                .map_err(EngineError::Archive)?;
+            written += 1;
+        }
+        if roster.document_count() != cutoff.frontier().document_count() {
+            return Err(EngineError::Archive(
+                "generation roster has extra or missing documents".into(),
+            ));
+        }
+        Ok((roster, written))
+    }
+
+    fn require_complete_document_cutoff(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+    ) -> Result<(), EngineError> {
+        if cutoff.frontier() != &self.accepted_frontier_root {
+            return Err(EngineError::Archive(
+                "document roster cutoff is no longer current".into(),
+            ));
+        }
+        self.authenticate_accepted_frontier_root(cutoff.frontier())?;
+        if self.accepted_frontier.len() as u64 != cutoff.frontier().document_count()
+            || (!self.accepted_frontier.is_empty()
+                && !self
+                    .accepted_frontier
+                    .contains_key(&self.catalog_document_id))
+        {
+            return Err(EngineError::Archive(
+                "accepted document roster is incomplete".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Full bootstrap/repair oracle: every accepted document must reopen from
+    /// the roster and match the engine's exact accepted dependency and CRDT state.
+    /// This intentionally reads all documents and is not an ordinary-open gate.
+    pub(crate) fn qualify_full_document_roster(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        roster: super::checkpoint_generation::SealedDocumentRoster,
+        store: &super::checkpoint_generation::SealedGenerationDirectory,
+    ) -> Result<(), EngineError> {
+        self.require_complete_document_cutoff(cutoff)?;
+        if roster.document_count() != self.accepted_frontier.len() as u64 {
+            return Err(EngineError::Archive(
+                "generation roster count differs from accepted documents".into(),
+            ));
+        }
+        roster
+            .qualify_complete_keys(store, self.accepted_frontier.keys().copied())
+            .map_err(EngineError::Archive)?;
+        for (document_id, expected) in &self.accepted_frontier {
+            let (dependencies, restored) = roster
+                .load_document(store, self.catalog_document_id, *document_id)
+                .map_err(EngineError::Archive)?
+                .ok_or(EngineError::MissingDocument(*document_id))?;
+            if &dependencies != expected {
+                return Err(EngineError::FrontierVectorMismatch(*document_id));
+            }
+            let original = self
+                .load_document_at_accepted_frontier(cutoff.frontier(), *document_id)?
+                .ok_or(EngineError::MissingDocument(*document_id))?;
+            // The validators materialize optional empty root maps. Normalize
+            // both source and restored documents through that same existing path.
+            self.validate_lazy_genesis_document(*document_id, &original)?;
+            verify_compact_document_equivalence(&original, &restored)?;
+        }
+        Ok(())
+    }
+
     /// Reconstruct one accepted document using the existing loader, compact it
     /// without reauthoring any identities, and qualify it through a fresh import.
     /// This is synchronous staging/qualification, not a live actor capture path.
@@ -7461,53 +7561,7 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
         let restored =
             qualify_compact_document(self.catalog_document_id, &dependencies, &checkpoint)?;
-        if restored.oplog_frontiers() != document.oplog_frontiers() {
-            return Err(EngineError::InvalidCrdt(
-                "compact accepted document changed oplog frontiers".into(),
-            ));
-        }
-        if restored.get_value() != document.get_value() {
-            return Err(EngineError::InvalidCrdt(
-                "compact accepted document changed state or root container identity".into(),
-            ));
-        }
-        // Tine's validated documents consist of root maps and optional text
-        // leaves. Compare their actual ContainerIDs, never Loro's diagnostic
-        // get_deep_value_with_id(), which also includes run-local arena slots.
-        let LoroValue::Map(roots) = document.get_value() else {
-            unreachable!("validated root map")
-        };
-        for name in roots.keys() {
-            let original_map = document.get_map(name.as_str());
-            let restored_map = restored.get_map(name.as_str());
-            let original_values = original_map.get_value();
-            if original_values != restored_map.get_value() {
-                return Err(EngineError::InvalidCrdt(
-                    "compact accepted document changed nested container identity".into(),
-                ));
-            }
-            for (_, value) in original_values.as_map().expect("map value").iter() {
-                if let LoroValue::Container(id) = value {
-                    let (
-                        Some(Container::Text(original_text)),
-                        Some(Container::Text(restored_text)),
-                    ) = (
-                        document.get_container(id.clone()),
-                        restored.get_container(id.clone()),
-                    )
-                    else {
-                        return Err(EngineError::InvalidCrdt(
-                            "compact qualification encountered a non-text nested container".into(),
-                        ));
-                    };
-                    if original_text.to_delta() != restored_text.to_delta() {
-                        return Err(EngineError::InvalidCrdt(
-                            "compact accepted document changed text attributes".into(),
-                        ));
-                    }
-                }
-            }
-        }
+        verify_compact_document_equivalence(&document, &restored)?;
         Ok(CompactAcceptedDocument {
             cutoff_state_digest: cutoff.frontier().state_digest(),
             dependencies,
@@ -24422,6 +24476,56 @@ fn validate_immutable_shard_identity(
             expected,
             found: replacement_page_id,
         });
+    }
+    Ok(())
+}
+
+fn verify_compact_document_equivalence(
+    document: &LoroDoc,
+    restored: &LoroDoc,
+) -> Result<(), EngineError> {
+    if restored.oplog_frontiers() != document.oplog_frontiers() {
+        return Err(EngineError::InvalidCrdt(
+            "compact accepted document changed oplog frontiers".into(),
+        ));
+    }
+    if restored.get_value() != document.get_value() {
+        return Err(EngineError::InvalidCrdt(
+            "compact accepted document changed state or root container identity".into(),
+        ));
+    }
+    // Tine's validated documents consist of root maps and optional text
+    // leaves. Compare their actual ContainerIDs, never Loro's diagnostic
+    // get_deep_value_with_id(), which also includes run-local arena slots.
+    let LoroValue::Map(roots) = document.get_value() else {
+        unreachable!("validated root map")
+    };
+    for name in roots.keys() {
+        let original_map = document.get_map(name.as_str());
+        let restored_map = restored.get_map(name.as_str());
+        let original_values = original_map.get_value();
+        if original_values != restored_map.get_value() {
+            return Err(EngineError::InvalidCrdt(
+                "compact accepted document changed nested container identity".into(),
+            ));
+        }
+        for (_, value) in original_values.as_map().expect("map value").iter() {
+            if let LoroValue::Container(id) = value {
+                let (Some(Container::Text(original_text)), Some(Container::Text(restored_text))) = (
+                    document.get_container(id.clone()),
+                    restored.get_container(id.clone()),
+                ) else {
+                    return Err(EngineError::InvalidCrdt(
+                        "compact qualification encountered a non-text nested container".into(),
+                    ));
+                };
+                if original_text.to_delta() != restored_text.to_delta() {
+                    return Err(EngineError::InvalidCrdt(
+                        "compact accepted document changed text attributes".into(),
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -13051,10 +13051,26 @@ fn rebaselining_foundations_real_corpus_gate() {
         );
     }
     let capsule_reopen_ms = capsule_started.elapsed().as_millis();
+    let inherited_started = Instant::now();
+    let mut unchanged_store = SealedGenerationStagingStore::open(&directory).unwrap();
+    let (unchanged, written) = engine
+        .build_compact_document_roster(&cutoff, &mut unchanged_store, Some(roster))
+        .unwrap();
+    assert_eq!(
+        written, 0,
+        "unchanged corpus must not recompact any document"
+    );
+    drop(unchanged_store.finish().unwrap());
+    let inherited_roster_ms = inherited_started.elapsed().as_millis();
+    let full_oracle_started = Instant::now();
+    engine
+        .qualify_full_document_roster(&cutoff, unchanged, &disk_nodes)
+        .unwrap();
+    let full_roster_oracle_ms = full_oracle_started.elapsed().as_millis();
     assert_eq!(compact_documents, before.pages.len() + 1);
     assert_eq!(engine.canonical_snapshot().unwrap(), before);
     assert_eq!(user_graph_bytes(&joiner.graph_root), expected);
-    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms} compact_documents={compact_documents} compact_bytes={compact_bytes} compact_ms={compact_ms} capsule_reopen_ms={capsule_reopen_ms}",
+    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms} compact_documents={compact_documents} compact_bytes={compact_bytes} compact_ms={compact_ms} capsule_reopen_ms={capsule_reopen_ms} inherited_roster_ms={inherited_roster_ms} full_roster_oracle_ms={full_roster_oracle_ms}",
         expected.len(), before.pages.len(), before.blocks.len(), cutoff.roots().sequence.len);
 }
 

@@ -2111,6 +2111,25 @@ serialized through this surface; producer input remains an engine-qualified comp
 document bound to the current cutoff. This is still staging, with no active marker
 or engine installation caller.
 
+The explicit full-roster builder enumerates the engine's complete accepted
+document set, including the catalog and retained home shards that need not appear
+as live pages. It checks the current accepted cutoff and exact document count. An empty
+accepted set keeps the existing implicit empty catalog; a nonempty set must
+contain the catalog.
+An inherited descriptor with identical canonical dependencies avoids CRDT loading
+and republishing; changed documents update the existing roster paths. This initial
+builder still enumerates O(documents) metadata and is not the R1c bounded actor COW
+capture or the later delta-only qualification path.
+
+The full bootstrap/repair oracle independently derives the canonical roster root
+from the exact accepted document keys, so extra entries cannot hide behind a forged
+count. Each persisted document must then match accepted dependencies and the
+source CRDT's stable container identities, frontiers, map values and text deltas.
+Both the per-document compact producer and full-roster oracle reuse one equivalence
+checker. These are explicit construction/repair operations, with no live runtime
+caller or generation installation capability. Complete generation binding and
+retention closure remain prerequisites for adoption.
+
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
 Clean projection attach rebuilds an exact path-to-latest-batch map during

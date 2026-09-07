@@ -576,6 +576,61 @@ impl SealedDocumentRoster {
         catalog: DocumentId,
         document: DocumentId,
     ) -> Result<Option<(DocumentDependencies, loro::LoroDoc)>, String> {
+        let Some(record) = self.document_record(store, document)? else {
+            return Ok(None);
+        };
+        let checkpoint = store.read_capsule_blob(record.checkpoint)?;
+        let restored =
+            super::hot_engine::qualify_compact_document(catalog, &record.dependencies, &checkpoint)
+                .map_err(|error| error.to_string())?;
+        Ok(Some((record.dependencies, restored)))
+    }
+    pub(crate) fn qualify_complete_keys(
+        self,
+        store: &SealedGenerationDirectory,
+        documents: impl Iterator<Item = DocumentId>,
+    ) -> Result<(), String> {
+        use tine_storage::sealed_accepted_index::{
+            authenticated_map_root, SealedAcceptedIndexReader,
+        };
+        let reader = SealedAcceptedIndexReader::new(store);
+        let mut entries = Vec::new();
+        for document in documents {
+            let key = document.as_uuid().into_bytes();
+            let value = reader
+                .map_value(self.root, key)
+                .map_err(|error| error.to_string())?
+                .ok_or("generation roster omits an accepted document")?;
+            entries.push((key, value));
+        }
+        if authenticated_map_root(&entries).map_err(|error| error.to_string())? != self.root {
+            return Err("generation roster is not exactly the accepted document key set".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn document_count(self) -> u64 {
+        self.root.count
+    }
+
+    pub(crate) fn inherited_dependencies(
+        self,
+        store: &SealedGenerationStagingStore,
+        document: DocumentId,
+    ) -> Result<Option<DocumentDependencies>, String> {
+        if store.failed {
+            return Err("sealed generation staging previously failed".into());
+        }
+        Ok(self
+            .document_record(&store.reader, document)?
+            .map(|record| record.dependencies))
+    }
+
+    fn document_record(
+        self,
+        store: &SealedGenerationDirectory,
+        document: DocumentId,
+    ) -> Result<Option<DocumentCapsuleRecord>, String> {
         use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
         let Some(address) = SealedAcceptedIndexReader::new(store)
             .map_value(self.root, document.as_uuid().into_bytes())
@@ -600,11 +655,7 @@ impl SealedDocumentRoster {
         if record.dependencies.document_id() != document {
             return Err("generation document descriptor names another document".into());
         }
-        let checkpoint = store.read_capsule_blob(record.checkpoint)?;
-        let restored =
-            super::hot_engine::qualify_compact_document(catalog, &record.dependencies, &checkpoint)
-                .map_err(|error| error.to_string())?;
-        Ok(Some((record.dependencies, restored)))
+        Ok(Some(record))
     }
 }
 
@@ -1906,6 +1957,17 @@ mod tests {
             cap_std::fs::Dir::open_ambient_dir(&capsule_root, cap_std::ambient_authority())
                 .unwrap();
         let mut roster = SealedDocumentRoster::empty();
+        let mut empty_store = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
+        let (empty_roster, empty_written) = engine
+            .build_compact_document_roster(&cutoff, &mut empty_store, None)
+            .unwrap();
+        assert_eq!(empty_written, cutoff.frontier().document_count());
+        let empty_disk = empty_store.finish().unwrap();
+        engine
+            .qualify_full_document_roster(&cutoff, empty_roster, &empty_disk)
+            .unwrap();
+        drop(empty_disk);
+
         for n in 1..=2 {
             let transaction = OperationTransaction::new(vec![
                 SemanticOperation::CreatePage {
@@ -2025,12 +2087,62 @@ mod tests {
                 assert_eq!(old.0, new.0);
                 assert_eq!(old.1.get_deep_value(), new.1.get_deep_value());
             }
+            let mut complete_store = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
+            let (automatic, written) = engine
+                .build_compact_document_roster(
+                    &cutoff,
+                    &mut complete_store,
+                    if n == 1 { None } else { Some(previous_roster) },
+                )
+                .unwrap();
+            assert_eq!(written, 2, "only catalog plus new page need compaction");
+            assert_eq!(automatic.root, roster.root);
+            drop(complete_store.finish().unwrap());
+            engine
+                .qualify_full_document_roster(&cutoff, automatic, &reopened_capsules)
+                .unwrap();
+            assert!(engine
+                .qualify_full_document_roster(
+                    &cutoff,
+                    SealedDocumentRoster::empty(),
+                    &reopened_capsules
+                )
+                .is_err());
+            let mut unchanged = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
+            let (same, written) = engine
+                .build_compact_document_roster(&cutoff, &mut unchanged, Some(automatic))
+                .unwrap();
+            assert_eq!(written, 0);
+            assert_eq!(same.root, automatic.root);
+            assert!(unchanged.publication.is_none());
+            assert!(unchanged.pending.objects.is_empty());
+            unchanged.failed = true;
+            assert!(engine
+                .build_compact_document_roster(&cutoff, &mut unchanged, Some(automatic))
+                .is_err());
+            assert!(unchanged.finish().is_err());
+
             let address = SealedAcceptedIndexReader::new(&reopened_capsules)
                 .map_value(roster.root, catalog.as_uuid().into_bytes())
                 .unwrap()
                 .unwrap();
             let path = capsule_root.join(capsule_blob_name(address));
             let exact = std::fs::read(&path).unwrap();
+            let mut extra_store = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
+            let extra_id = DocumentId::from_uuid(uuid::Uuid::from_u128(888_888));
+            let mut extra_root = SealedAcceptedIndexWriter::new(&mut extra_store)
+                .upsert_map(roster.root, extra_id.as_uuid().into_bytes(), address)
+                .unwrap();
+            drop(extra_store.finish().unwrap());
+            extra_root.count = roster.root.count; // count alone must not certify completeness
+            assert!(engine
+                .qualify_full_document_roster(
+                    &cutoff,
+                    SealedDocumentRoster { root: extra_root },
+                    &reopened_capsules
+                )
+                .is_err());
+
             let record = DocumentCapsuleRecord::decode(&exact).unwrap();
             let checkpoint_path = capsule_root.join(capsule_blob_name(ContentDigest::from_bytes(
                 *record.checkpoint.sha256(),
@@ -2439,6 +2551,54 @@ mod tests {
             engine.accepted_frontier_root().unwrap()
         );
         assert_eq!(archive.committed_manifest_names().unwrap(), accepted);
+        // Delete the now-empty original page. Its immutable home still owns
+        // the moved block and must survive even though it is not a live page.
+        commit(
+            &mut engine,
+            7,
+            100,
+            vec![SemanticOperation::DeletePage { page_id: page }],
+        );
+        assert_eq!(engine.canonical_snapshot().unwrap().pages.len(), 1);
+        assert!(content(&engine).contains("OFFLINE_A"));
+        assert!(content(&engine).contains("OFFLINE_B"));
+        let final_cutoff = engine
+            .build_sealed_accepted_cutoff(&mut SealedMemoryStore::default(), None)
+            .unwrap();
+        let capsule_root = root.join("retained-home-capsules");
+        std::fs::create_dir(&capsule_root).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&capsule_root, cap_std::ambient_authority())
+                .unwrap();
+        let mut staging = SealedGenerationStagingStore::open(&directory).unwrap();
+        let (complete, written) = engine
+            .build_compact_document_roster(&final_cutoff, &mut staging, None)
+            .unwrap();
+        assert_eq!(written, 3);
+        let disk = staging.finish().unwrap();
+        engine
+            .qualify_full_document_roster(&final_cutoff, complete, &disk)
+            .unwrap();
+        assert!(complete
+            .load_document(&disk, catalog, home)
+            .unwrap()
+            .is_some());
+        let mut incomplete_store = SealedGenerationStagingStore::open(&directory).unwrap();
+        let mut visible_only = SealedDocumentRoster::empty();
+        for id in [catalog, destination_home] {
+            let compact = engine
+                .build_compact_accepted_document(&final_cutoff, id)
+                .unwrap();
+            visible_only = visible_only
+                .with_document(&mut incomplete_store, &final_cutoff, &compact)
+                .unwrap();
+        }
+        drop(incomplete_store.finish().unwrap());
+        assert!(engine
+            .qualify_full_document_roster(&final_cutoff, visible_only, &disk)
+            .is_err());
+        drop(disk);
+        drop(directory);
         drop(oracle);
         drop(offline_a);
         drop(offline_b);
@@ -3030,7 +3190,7 @@ mod tests {
             .split("pub(crate) fn build_sealed_accepted_cutoff<Store>(")
             .nth(1)
             .unwrap()
-            .split("/// Reconstruct one accepted document using the existing loader")
+            .split("/// Explicit full-roster construction over the current accepted document set.")
             .next()
             .unwrap();
         for forbidden in [
@@ -3047,7 +3207,17 @@ mod tests {
             );
         }
         assert!(!engine.contains(".build_sealed_accepted_cutoff("));
-        assert!(!engine.contains(".build_compact_accepted_document("));
+        assert_eq!(
+            engine.matches(".build_compact_accepted_document(").count(),
+            1
+        );
+        for function in [
+            "build_compact_document_roster",
+            "qualify_full_document_roster",
+        ] {
+            assert!(!engine.contains(&format!(".{function}(")));
+            assert!(!include_str!("../sync_runtime.rs").contains(function));
+        }
         assert!(!include_str!("../sync_runtime.rs").contains("build_compact_accepted_document"));
         let compact = engine
             .split("pub(crate) fn build_compact_accepted_document(")
@@ -3089,7 +3259,7 @@ mod tests {
         ] {
             assert!(!staging.contains(forbidden), "staging acquired {forbidden}");
         }
-        for caller in [engine, include_str!("../sync_runtime.rs")] {
+        for caller in [include_str!("../sync_runtime.rs")] {
             assert!(!caller.contains("SealedGenerationStagingStore"));
             assert!(!caller.contains("SealedDocumentRoster"));
         }

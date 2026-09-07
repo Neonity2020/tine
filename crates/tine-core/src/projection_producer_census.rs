@@ -2014,9 +2014,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // and the empty root serve the roster. Staging error conversion moves into
     // the shared named-bytes helper. No additional physical write constructor
     // or raw mutation: capsules reuse the same bounded publication handle.
+    // R1b/5: the full document-key oracle imports the existing shared
+    // authenticated_map_root and point reader, deriving the root from exactly
+    // the accepted keys. Descriptor reading moved into one reuse helper.
+    // Reviewed source adds no write boundary, raw mutation or alternate codec.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "8b6b7f31cf8cf45c676eaa715c5a78482916651525ec5012fc9c45b089ac49e6",
+        "c0ccd31a949c7960bb2df360c8ccf0eae6a399e6e0d22c7ec45fb5cb6baf3dff",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
