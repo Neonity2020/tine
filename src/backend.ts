@@ -227,12 +227,14 @@ export type BackendErrorKind =
   | "asset-too-large"
   | "operation-cancelled"
   | "managed-actor-refusal"
+  | "query-not-ready"
+  | "query-unavailable"
   | "query-print-refused";
 
 const BACKEND_ERROR_MESSAGES: Record<
   Exclude<
     BackendErrorKind,
-    "save-conflict" | "direct-save-failure" | "managed-actor-refusal" | "query-print-refused"
+    "save-conflict" | "direct-save-failure" | "managed-actor-refusal" | "query-print-refused" | "query-not-ready" | "query-unavailable"
   >,
   string
 > = {
@@ -358,6 +360,22 @@ export class OperationCancelledError extends BackendError {
   constructor() {
     super("operation-cancelled", BACKEND_ERROR_MESSAGES["operation-cancelled"]);
     this.name = "OperationCancelledError";
+  }
+}
+
+export type QueryReadinessReason = "indexing" | "recovering" | "pending_edits" | "busy";
+
+export class QueryNotReadyError extends BackendError {
+  constructor(readonly reasonCode: QueryReadinessReason) {
+    super("query-not-ready", reasonCode === "recovering" ? "Rebuilding the query index…" : "Updating query results…");
+    this.name = "QueryNotReadyError";
+  }
+}
+
+export class QueryUnavailableError extends BackendError {
+  constructor(readonly reasonCode: string, message: string) {
+    super("query-unavailable", message);
+    this.name = "QueryUnavailableError";
   }
 }
 
@@ -538,6 +556,19 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
       return new AssetTooLargeError();
     case "operation-cancelled":
       return new OperationCancelledError();
+    case "query-not-ready":
+      return payload.reason_code === "indexing" || payload.reason_code === "recovering"
+        || payload.reason_code === "pending_edits" || payload.reason_code === "busy"
+        ? new QueryNotReadyError(payload.reason_code)
+        : null;
+    case "query-unavailable": {
+      const detail = payload.detail && typeof payload.detail === "object"
+        ? (payload.detail as Record<string, unknown>).message : undefined;
+      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
+        && typeof detail === "string" && detail.trim().length > 0
+        ? new QueryUnavailableError(payload.reason_code, detail)
+        : null;
+    }
     case "managed-actor-refusal":
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         ? new ManagedActorRefusalError(payload.reason_code)

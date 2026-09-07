@@ -1,5 +1,30 @@
 # Typed backend errors
 
+## Query availability adapter
+
+The frontend classifier accepts `query-not-ready` with the closed reason set
+`indexing`, `recovering`, `pending_edits`, `busy` as `QueryNotReadyError`.
+`query-unavailable` requires a valid dotted reason code and nonempty
+`detail.message`, producing `QueryUnavailableError`. Cancellation uses the
+existing `OperationCancelledError`. Unknown or malformed payloads remain
+unclassified; matching prose never makes an error retryable.
+
+`runQueryWhenReady` is the consumer-owned retry primitive: only the typed pending
+error retries, using 100/200/400/800ms delays capped at 800ms. Its owner supplies an
+AbortSignal, a captured monotonic request/binding revision check, and a pending
+status callback. Attempts and answers check ownership; stale/aborted requests
+never change a successor's status. Leaving one consumer does not cancel another
+consumer's shared attempt. Native job cancellation remains a separate obligation.
+Wire classification, late answers, timer cleanup, source ABA, graph replacement,
+terminal failures and shared-consumer isolation are tested in
+`src/queryReadiness.test.ts`.
+
+Campaign integration is in progress: this primitive does not by itself wire
+native producers or UI query resources. RET2 must complete those consumers and
+remove production traversal before claiming readiness/recovery retirement.
+
+## Command error boundary
+
 Every Tauri command and helper under `src-tauri/src` now rejects with
 `CommandError`; the phase-B migration removed the remaining `String` error
 boundaries. `CommandError` deliberately serializes as the same JSON string
