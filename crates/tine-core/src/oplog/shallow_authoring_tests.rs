@@ -67,3 +67,49 @@ fn author_clone_of_detached_source_keeps_latest_oplog_as_before() {
     assert_eq!(cloned.oplog_frontiers(), latest);
     assert_eq!(original.get_text("text").to_string(), "before");
 }
+
+#[test]
+fn owned_peer_continues_counters_through_repeated_shallow_reopens() {
+    let peer = 301;
+    let mut document = LoroDoc::new();
+    document.set_peer_id(peer).unwrap();
+    document
+        .get_text("text")
+        .insert(0, "unchanged text")
+        .unwrap();
+    document.commit();
+    let text_id = document.get_text("text").id();
+    let mut compact_sizes = Vec::new();
+    for change in 0..2048 {
+        let previous_counter = document.oplog_vv().get(&peer).copied().unwrap();
+        document.get_map("meta").insert("owner", change).unwrap();
+        document.commit();
+        assert!(document.oplog_vv().get(&peer).copied().unwrap() > previous_counter);
+        if change % 32 == 31 {
+            // Maintenance itself uses the owned lane; no peer-per-seal growth.
+            document
+                .get_map("meta")
+                .insert("checkpoint", change)
+                .unwrap();
+            document.commit();
+            let vv = document.oplog_vv();
+            let bytes = document
+                .export(ExportMode::shallow_snapshot(&document.oplog_frontiers()))
+                .unwrap();
+            compact_sizes.push(bytes.len());
+            let reopened = LoroDoc::new();
+            assert!(reopened.import(&bytes).unwrap().pending.is_none());
+            document = clone_doc(&reopened, peer).unwrap();
+            assert_eq!(document.oplog_vv(), vv);
+            assert_eq!(document.oplog_vv().len(), 1);
+            assert_eq!(document.get_text("text").id(), text_id);
+            assert_eq!(document.get_text("text").to_string(), "unchanged text");
+        }
+    }
+    let first = compact_sizes[0];
+    let largest = *compact_sizes.iter().max().unwrap();
+    assert!(
+        largest <= first + 64,
+        "fixed live state grew: {compact_sizes:?}"
+    );
+}

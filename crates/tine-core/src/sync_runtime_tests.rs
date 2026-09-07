@@ -34432,3 +34432,6 @@ fn r5c_the_worst_case_patch_is_measured() {
         SyncShutdownOutcome::Safe(_)
     ));
 }
+
+#[path = "rebaselining_layout_tests.rs"]
+mod rebaselining_layout;
