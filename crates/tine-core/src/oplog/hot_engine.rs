@@ -24696,8 +24696,11 @@ fn canonical_peer_counters(vv: &VersionVector) -> Result<Vec<CrdtPeerCounter>, E
 }
 
 fn clone_doc(document: &LoroDoc, peer: u64) -> Result<LoroDoc, EngineError> {
+    // An update stream excludes the retained state below a shallow floor.
+    // Use Loro's complete snapshot encoding for both full and shallow inputs;
+    // otherwise an authoring clone silently loses its compacted predecessor.
     let bytes = document
-        .export(ExportMode::all_updates())
+        .export(ExportMode::Snapshot)
         .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
     let clone = LoroDoc::new();
     if !bytes.is_empty() {
@@ -32013,3 +32016,7 @@ pub(crate) fn probe_pruned_checkpoint_bytes(
         .map(|bytes| bytes.len())
         .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
 }
+
+#[cfg(test)]
+#[path = "shallow_authoring_tests.rs"]
+mod shallow_authoring_tests;
