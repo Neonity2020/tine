@@ -33,6 +33,12 @@ Implementation:
   `groupKeysForBlock`).
 - `src/editor/queryDisplayDraft.ts` — the workspace draft's ONE normalizer
   (§11), shared by `router.ts`'s mutation and by `session.ts`'s two directions.
+- `src/components/QueryWorkspace.tsx` — `materializeQueryWorkspace`, the
+  workspace's one publication path, and the captured-input guard around it
+  (§13).
+- `src/editor/properties.ts` — `markdownRawWithProperty` / `orgRawWithProperty`,
+  the two pure raw-property writers `store.ts::setBlockProperty` already uses
+  and the placement rule §13.2 applies to a block that has no store yet.
 
 ## 1. The six display facts, and the one that is not
 
@@ -750,3 +756,94 @@ document is loaded. Work scales with admitted rows and requested clauses.
 Tests: query.rs ordered_view_sort_uses_secondary_direction_before_sample_and_keeps_ties
 and ordered_view_sort_secondary_recency_requires_construction_axis; existing
 query tests retain single-sort/sample behavior.
+
+## 13. Materializing a workspace: revision safety and format (P5C2A)
+
+A workspace has no block, so making one is a **publication**: it creates a page
+that did not exist. `materializeQueryWorkspace` is that one path, and this
+section settles what it is allowed to publish and when. It settles **no**
+execution, no result rendering, no Display UI and no effective-view
+materialization — the workspace still writes exactly the one `tine.view`
+property §1 gives it, and complete effective-view materialization is the next
+package's.
+
+### 13.1 A save publishes the input it captured, or nothing
+
+Publication is asynchronous — Rust friendly-search validation, a title lookup,
+then the write — and the workspace underneath it is not frozen. The user can
+retype the search, switch the view, rename the page, change tab or switch graph
+in the middle. **Route id is not an input**: two attempts under the same route
+id can be publishing different searches, different views or different titles,
+and the second is not the first.
+
+So a save captures everything it is publishing at submit — source, `sourceKind`,
+presentation, title, graph format, route id and the graph scope — and the
+component supplies an `isCurrent` callback that answers whether that capture is
+still what the user is looking at. `materializeQueryWorkspace` checks it before
+any work, after the Rust validation, and immediately before `savePage`. A
+capture that has gone stale returns `{ ok: false, kind: "superseded" }` — a
+**local** refusal with retry text — and `savePage` is never called.
+
+Two guards, deliberately distinct:
+
+- **`sameWorkspace`** — same live component (not unmounted), same graph
+  (`captureGraphScope`/`isScopeCurrent`: the graph BINDING, per I-20, never the
+  render epoch), and the ACTIVE route is still this workspace's route. It is
+  what decides whether a completion may touch the local surface at all.
+- **`sameInput`** — `sameWorkspace`, and the source, kind, presentation, title
+  and graph format all still equal the capture. A monotonic input revision also
+  includes the route Display draft and rejects edits that restore an earlier
+  value; equal text after a newer edit is not the original submission.
+
+`isCurrent` is optional. A direct caller that passes none is unguarded, exactly
+as before this section existed.
+
+### 13.2 What is authoritative, and what only committed
+
+The audited no-baseline save `savePage(page, null, false)` remains the
+authority on whether the page may be created. The title lookup in front of it
+is a friendly preflight and nothing more; a collision reaching the save is still
+a `conflict` refusal, and the workspace stays virtual. Nothing here ever forces
+a save.
+
+The captured-input guard is a **local** guard on top of that, and it stops at
+`savePage`. Once the write has begun the page may legitimately land despite a
+later edit or navigation, and then:
+
+- the page exists. It is never described as undone and never deleted;
+- `bumpPageInventoryRev()` has run, so every inventory reader sees it;
+- but the route is **not** replaced, and no error is written into a workspace
+  that has moved on. When the workspace is still the live one, the commit is
+  acknowledged in its own non-error notice; when the user has changed tab or
+  graph, the completion is silent there;
+- and the publication is never retried under the changed input. Saving again is
+  the user's call.
+
+The captured token guards the shared `saving` flag on the same principle: a
+superseded attempt may not re-enable a control a newer one is still using.
+
+### 13.3 The property goes where the graph's format reads it
+
+**What** to write is `queryViewPropertyPatch` (§4) — the same view→property map
+every other query save runs through, never a second serializer. An absent
+`tine.view` IS the default list view, which is how §4 spells it and how the
+inline panel switches to it, so a list workspace still materializes a bare
+`{{query …}}` block in both formats.
+
+**Where** it goes is the graph's preferred format, captured at submit and set
+explicitly on the published `PageDto.format`. Markdown gets a `tine.view:: …`
+line in the canonical head region; org gets a `:PROPERTIES:` drawer. A markdown
+property line written into an org file renders as visible body text and is never
+read back as a property (the GH #25 class), so this is correctness, not
+formatting. Both writers are `store.ts::setBlockProperty`'s own — moved
+unchanged into `src/editor/properties.ts` so a block being built before it
+belongs to any store uses the same placement rule. An absent format means `md`.
+
+A format change mid-flight is a **stale capture**, not a cross-format publish:
+the block raw and the page format must agree, so the attempt refuses and the
+user saves again.
+
+Tests: `src/components/QueryWorkspace.test.tsx` — the materializer's three
+guard points, the org drawer and markdown line forms, and the component
+fixtures that hold one real await open while the source, view, title, graph
+format, graph root or active route changes underneath it.

@@ -21,6 +21,7 @@ import {
 import type { PaneRouter, QueryPresentation, QueryRoute } from "../router";
 import type {
   AdvancedQueryResult,
+  Format,
   MatchSpan,
   PageDto,
   QueryDiagnostic,
@@ -33,9 +34,12 @@ import type {
 import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
 import { SearchResultRow, buildSearchExcerpt } from "./SearchResultRow";
 import { registerTransientLayer } from "../transientLayers";
-import { bumpPageInventoryRev } from "../ui";
+import { bumpPageInventoryRev, graphMeta } from "../ui";
 import { blockDtoExternalId } from "../blockIdentity";
 import { isSaveConflictFailure } from "../persistence";
+import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
+import { markdownRawWithProperty, orgRawWithProperty } from "../editor/properties";
+import { queryViewPropertyPatch } from "../editor/queryViewProperties";
 
 const PAGE_LIMIT = 40;
 const BLOCK_LIMIT = 100;
@@ -48,7 +52,18 @@ export interface MaterializeQueryInput {
   presentation: QueryPresentation;
   /** Stable workspace identity: also bounds the native validation cancellation lane. */
   routeId: string;
+  /** The graph's preferred on-disk format, captured at submit. A property line
+   *  belongs in a different place in each format, so the format has to travel
+   *  with the input rather than be read at completion time. Absent means `md`,
+   *  which keeps every dependency-injected caller on the behavior it had. */
+  format?: Format;
 }
+
+/** Is the state this attempt captured still the state the user is looking at?
+ *
+ *  Supplied by the component that owns the workspace; absent for a direct
+ *  caller, which is then unguarded exactly as before. */
+export type IsCurrentInput = () => boolean;
 
 export interface MaterializeQueryDependencies {
   getPage(name: string, kind: "page"): Promise<PageDto | null>;
@@ -61,9 +76,16 @@ export type MaterializeQueryResult =
   | { ok: true; name: string; page: PageDto; rev: string }
   | {
       ok: false;
-      kind: "invalid-name" | "empty-query" | "invalid-query" | "exists" | "conflict" | "error";
+      /** `superseded` is a LOCAL refusal: nothing was written, nothing was
+       *  undone, and the user is asked to save again. */
+      kind: "invalid-name" | "empty-query" | "invalid-query" | "exists" | "conflict" | "error" | "superseded";
       message: string;
     };
+
+/** The one wording for a local pre-save refusal, so every stale lane says the
+ *  same true thing: no write happened, and saving again is the whole remedy. */
+const SUPERSEDED_MESSAGE =
+  "This workspace changed while it was being saved, so nothing was written. Try saving again.";
 
 export interface QueryWorkspaceDependencies extends MaterializeQueryDependencies {
   runQuery(source: string): Promise<RefGroup[]>;
@@ -78,7 +100,9 @@ export interface QueryWorkspaceProps {
   focusSource?: boolean;
 }
 
-function savedQueryRaw(input: Pick<MaterializeQueryInput, "source" | "sourceKind" | "presentation">): string {
+function savedQueryRaw(
+  input: Pick<MaterializeQueryInput, "source" | "sourceKind" | "presentation" | "format">
+): string {
   const source = input.source.trim();
   const dsl = input.sourceKind === "search" ? friendlySearchToSavedDsl(source) : source;
   // §7.9: the macro name comes from the shared list. The workspace always
@@ -87,21 +111,52 @@ function savedQueryRaw(input: Pick<MaterializeQueryInput, "source" | "sourceKind
   // not by spelling it inline, so promoting a workspace to TQL later is one
   // change here rather than a grep across the app.
   const query = `{{${QUERY_MACRO_NAMES[0]} ${dsl}}}`;
-  return input.presentation === "list" ? query : `${query}\ntine.view:: ${input.presentation}`;
+  // WHAT to write is `queryViewPropertyPatch`'s answer — the same view→property
+  // map every other query save runs through (§7.6), never a second serializer.
+  // An absent `tine.view` IS the default list view (the patch spells it that
+  // way too), so a list workspace still materializes a bare query block.
+  //
+  // This packet materializes only the one property the workspace has always
+  // written; C2B owns complete effective-view materialization, so any other
+  // write the map would produce belongs to that packet, not this one.
+  const writes = queryViewPropertyPatch({
+    view: { view: input.presentation === "list" ? undefined : input.presentation },
+    properties: [],
+  }).filter(([key]) => key === "tine.view");
+  // WHERE it goes is the format's own rule, and the two pure writers the store
+  // already uses are the rule. Writing markdown `key:: value` into an org file
+  // produces visible body text that is never read back as a property (GH #25).
+  const withProperty = input.format === "org" ? orgRawWithProperty : markdownRawWithProperty;
+  return writes.reduce((raw, [key, value]) => withProperty(raw, key, value), query);
 }
 
 /**
  * Materialize a virtual workspace as exactly one ordinary query block.
  *
  * The preflight existence check provides a friendly error. The authoritative
- * race guard is the audited no-baseline save (`null`, never force): if another
- * writer creates the page between the two calls, the backend rejects it as a
- * conflict and this workspace remains virtual.
+ * race guard for CONTENT is the audited no-baseline save (`null`, never force):
+ * if another writer creates the page between the two calls, the backend rejects
+ * it as a conflict and this workspace remains virtual. A title lookup is only a
+ * friendly preflight; the save conflict stays the final authority.
+ *
+ * `isCurrent` is the separate, LOCAL guard: it answers "is the input this
+ * attempt captured still the one the user is looking at?". It is checked before
+ * any work, after each await that can outlive an edit (Rust validation, the
+ * title lookup) and immediately before the write — so a save the user has
+ * already moved on from refuses locally instead of publishing an obsolete
+ * draft. Once `savePage` has begun there is no going back: the page may
+ * legitimately commit, and this function reports that honestly rather than
+ * pretending it was undone.
  */
 export async function materializeQueryWorkspace(
   input: MaterializeQueryInput,
-  deps: MaterializeQueryDependencies
+  deps: MaterializeQueryDependencies,
+  isCurrent: IsCurrentInput = () => true
 ): Promise<MaterializeQueryResult> {
+  input = { ...input };
+  const superseded = (): MaterializeQueryResult =>
+    ({ ok: false, kind: "superseded", message: SUPERSEDED_MESSAGE });
+  if (!isCurrent()) return superseded();
   const name = input.title.trim();
   if (!name) {
     return { ok: false, kind: "invalid-name", message: "Enter a page title before saving." };
@@ -112,17 +167,24 @@ export async function materializeQueryWorkspace(
   if (input.sourceKind === "search") {
     try {
       const execution = await deps.runGraphSearch(input.source.trim(), 0, 0, `query-workspace:${input.routeId}:materialize`, true);
+      if (!isCurrent()) return superseded();
       if (execution.cancelled) return { ok: false, kind: "invalid-query", message: "Search validation was superseded. Try saving again." };
       if (execution.diagnostics.length) return { ok: false, kind: "invalid-query", message: execution.diagnostics.map((item) => item.message).join(" · ") };
       if (!execution.explanation.branches.length) return { ok: false, kind: "empty-query", message: "Enter a search with at least one included term before saving." };
     } catch (error) {
+      if (!isCurrent()) return superseded();
       const detail = error instanceof Error ? error.message : String(error);
       return { ok: false, kind: "invalid-query", message: detail ? `Could not validate this search: ${detail}` : "Could not validate this search." };
     }
+    // Rust answered about the source that was submitted. If the workspace has
+    // moved on since, that answer no longer licenses a write.
+    if (!isCurrent()) return superseded();
   }
 
   try {
-    if (await deps.getPage(name, "page")) {
+    const existing = await deps.getPage(name, "page");
+    if (!isCurrent()) return superseded();
+    if (existing) {
       return {
         ok: false,
         kind: "exists",
@@ -130,11 +192,17 @@ export async function materializeQueryWorkspace(
       };
     }
 
+    // The lookup is an await too, and the last one before the graph is written.
+    if (!isCurrent()) return superseded();
+
     const page: PageDto = {
       name,
       kind: "page",
       title: name,
       pre_block: null,
+      // The format the block was WRITTEN for travels with the page, so the
+      // backend stores it in the same dialect the property placement assumed.
+      format: input.format ?? "md",
       blocks: [{
         id: "",
         raw: savedQueryRaw(input),
@@ -147,6 +215,7 @@ export async function materializeQueryWorkspace(
     bumpPageInventoryRev();
     return { ok: true, name, page, rev };
   } catch (error) {
+    if (!isCurrent()) return superseded();
     const detail = error instanceof Error ? error.message : String(error);
     if (isSaveConflictFailure(error)) {
       return {
@@ -583,6 +652,23 @@ function AdvancedModal(props: {
   );
 }
 
+/** Everything one save attempt publishes, frozen at submit.
+ *
+ *  A workspace edit replaces the whole route object and every local signal, so
+ *  an attempt that read them at completion time would publish (and route to)
+ *  whatever the user happened to be looking at by then. */
+interface CapturedSave {
+  token: number;
+  inputRevision: number;
+  routeId: string;
+  title: string;
+  source: string;
+  sourceKind: QueryRoute["sourceKind"];
+  presentation: QueryPresentation;
+  format: Format;
+  scope: GraphScope | null;
+}
+
 export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   const deps = () => props.deps ?? defaultDependencies();
   const [source, setSource] = createSignal(props.route.source);
@@ -592,7 +678,29 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   const [advancedOpen, setAdvancedOpen] = createSignal(false);
   const [title, setTitle] = createSignal("");
   const [saveError, setSaveError] = createSignal<string | null>(null);
+  /** A stale save that COMMITTED. Not an error: the page exists, and saying so
+   *  is the only honest thing left once the write has landed. */
+  const [saveNotice, setSaveNotice] = createSignal<string | null>(null);
   const [saving, setSaving] = createSignal(false);
+  // A save is asynchronous, and the workspace under it is not frozen: the user
+  // can retype the search, switch the view, rename it, change tab or switch
+  // graph while validation, the title lookup or the write is still in flight.
+  // These two are what every completion has to get past before it may touch
+  // anything — routing, error text, the notice, and `saving` itself.
+  let alive = true;
+  let saveToken = 0;
+  // A changed-and-restored value is still a newer edit. Include the route
+  // object so its non-presentation Display draft participates in the revision.
+  const inputRevision = createMemo((previous: number) => {
+    props.route;
+    source();
+    sourceKind();
+    presentation();
+    title();
+    graphMeta()?.preferred_format;
+    return previous + 1;
+  }, 0);
+  onCleanup(() => { alive = false; });
   let advancedButton!: HTMLButtonElement;
   const advancedLayerId = `query-advanced-${createUniqueId()}`;
   let sourceInput: HTMLInputElement | undefined;
@@ -692,26 +800,77 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   };
   const hitSurfaceId = (hit: QueryHit) =>
     `query:${props.route.id}:${hit.entity}:${hit.entity === "page" ? hit.page.name : hit.block.id}`;
+  const captureSave = (): CapturedSave => ({
+    token: ++saveToken,
+    inputRevision: inputRevision(),
+    routeId: props.route.id,
+    title: title(),
+    source: source(),
+    sourceKind: sourceKind(),
+    presentation: presentation(),
+    // The graph's format decides WHERE the view property goes, so it is part of
+    // what this attempt publishes, not something to re-read at completion.
+    format: graphMeta()?.preferred_format ?? "md",
+    scope: captureGraphScope(),
+  });
+  /** Is this attempt's workspace still the live one? Same component, same graph
+   *  binding (I-20 — the binding, never the render epoch), same ACTIVE route.
+   *  Only the newest attempt owns the shared `saving` flag. */
+  const sameWorkspace = (captured: CapturedSave): boolean => {
+    if (!alive || captured.token !== saveToken) return false;
+    if (!isScopeCurrent(captured.scope)) return false;
+    const active = props.router.route?.();
+    if (active && (active.kind !== "query" || active.id !== captured.routeId)) return false;
+    return props.route.id === captured.routeId;
+  };
+  /** …and does it still say what this attempt captured? A route id is not an
+   *  input: a source, view, title or graph-format edit under the SAME id is a
+   *  different publication, and publishing the captured one would be wrong. */
+  const sameInput = (captured: CapturedSave): boolean =>
+    sameWorkspace(captured)
+    && inputRevision() === captured.inputRevision
+    && title() === captured.title
+    && source() === captured.source
+    && sourceKind() === captured.sourceKind
+    && presentation() === captured.presentation
+    && (graphMeta()?.preferred_format ?? "md") === captured.format;
   const save = async (event: SubmitEvent) => {
     event.preventDefault();
     if (saving()) return;
+    const captured = captureSave();
     setSaving(true);
     setSaveError(null);
+    setSaveNotice(null);
     try {
       const result = await materializeQueryWorkspace({
-        title: title(),
-        sourceKind: sourceKind(),
-        source: source(),
-        presentation: presentation(),
-        routeId: props.route.id,
-      }, deps());
+        title: captured.title,
+        sourceKind: captured.sourceKind,
+        source: captured.source,
+        presentation: captured.presentation,
+        routeId: captured.routeId,
+        format: captured.format,
+      }, deps(), () => sameInput(captured));
+      // Every branch below is about the LOCAL surface. A workspace that has
+      // moved on gets nothing written into it: not a route replacement, not an
+      // error, not a notice.
+      if (!sameWorkspace(captured)) return;
       if (!result.ok) {
         setSaveError(result.message);
         return;
       }
+      if (!sameInput(captured)) {
+        // `savePage` had already begun when the input changed, so the page is
+        // real and `bumpPageInventoryRev` has already run. It was not undone
+        // and must not be deleted — but it is no longer what this workspace
+        // shows, so the route stays where the user put it.
+        setSaveNotice(`“${result.name}” was saved from the earlier search, so this workspace was left as it is.`);
+        return;
+      }
       props.router.replaceActiveRoute({ kind: "page", name: result.name, pageKind: "page" });
     } finally {
-      setSaving(false);
+      // The captured token guards the shared flag too: a superseded attempt may
+      // not re-enable a button a newer one is still using.
+      if (alive && captured.token === saveToken) setSaving(false);
     }
   };
 
@@ -790,7 +949,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
             <span class="sr-only">Page title</span>
             <input
               value={title()}
-              onInput={(event) => { setTitle(event.currentTarget.value); setSaveError(null); }}
+              onInput={(event) => { setTitle(event.currentTarget.value); setSaveError(null); setSaveNotice(null); }}
               placeholder="Name this search to save it as a page"
               aria-invalid={!!saveError()}
             />
@@ -799,6 +958,9 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         </form>
         <Show when={saveError()}>
           <p class="query-workspace-save-error" role="alert">{saveError()}</p>
+        </Show>
+        <Show when={saveNotice()}>
+          <p class="query-workspace-save-notice" role="status">{saveNotice()}</p>
         </Show>
       </header>
 

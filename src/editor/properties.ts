@@ -414,3 +414,93 @@ export const PAGE_PROP_SPECS: PagePropSpec[] = [
   { key: "icon", label: "Icon", hint: "An emoji/character shown with the title", kind: "text" },
   { key: "public", label: "Public", hint: "Include this page when exporting/publishing public pages", kind: "bool" },
 ];
+
+// --------------------------------------------------------------------------
+// Raw block-property writers (one per on-disk format)
+// --------------------------------------------------------------------------
+//
+// These are the store's own placement rules, lifted here UNCHANGED so that a
+// caller that builds a block's raw text before it belongs to any store — the
+// query workspace materializing its first `{{query …}}` block — writes a
+// property exactly where `setBlockProperty` would. A markdown `key:: value`
+// line written into an org file renders as visible body text and is never read
+// back as a property (the GH #25 class), so the format is the writer's choice,
+// not a formatting detail.
+
+/** Pure Markdown property rewrite for one compound store mutation. It scans only
+ * the canonical head (title, planning, contiguous properties) plus the legacy
+ * trailing property block, so a `key::` lookalike in body text or a code fence is
+ * never touched or reordered. Existing property order is retained. */
+export function markdownRawWithProperty(raw: string, key: string, value: string | null): string {
+  const lines = raw.split("\n");
+  const first = lines[0] ?? "";
+  const PLANNING_LINE = /^\s*(SCHEDULED|DEADLINE):\s*</;
+  let i = 1;
+  while (i < lines.length && PLANNING_LINE.test(lines[i])) i++;
+  const planningEnd = i;
+  while (i < lines.length && PROP_LINE.test(lines[i])) i++;
+  const propsEnd = i;
+  let j = lines.length;
+  while (j > propsEnd && PROP_LINE.test(lines[j - 1] ?? "")) j--;
+  const notKey = (l: string) => PROP_LINE.exec(l)?.[1] !== key;
+  const props = lines.slice(planningEnd, propsEnd);
+  const at = props.findIndex((l) => PROP_LINE.exec(l)?.[1] === key);
+  if (value !== null) {
+    const line = `${key}:: ${value}`;
+    if (at >= 0) props[at] = line;
+    else props.push(line);
+  } else if (at >= 0) {
+    props.splice(at, 1);
+  }
+  return [
+    first,
+    ...lines.slice(1, planningEnd),
+    ...props,
+    ...lines.slice(propsEnd, j),
+    ...lines.slice(j).filter(notKey),
+  ].join("\n");
+}
+
+/** `raw` with an org drawer property set/updated/removed. Operates ONLY on the
+ *  first `:PROPERTIES:` drawer in the canonical head region (title, planning,
+ *  drawer, body — the same placement rawWithBlockId uses); body text and code
+ *  blocks are never scanned. Removing the last property removes the drawer. */
+export function orgRawWithProperty(raw: string, key: string, value: string | null): string {
+  const lines = raw.split("\n");
+  const start = lines.findIndex((l) => l.trim().toUpperCase() === ":PROPERTIES:");
+  const end =
+    start >= 0 ? lines.findIndex((l, i) => i > start && l.trim().toUpperCase() === ":END:") : -1;
+  const keyRe = new RegExp(`^:${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\s*`, "i");
+  if (start >= 0 && end > start) {
+    // Update in place so an existing drawer key keeps its position (GH #216);
+    // only a new key appends.
+    const inner = lines.slice(start + 1, end);
+    const at = inner.findIndex((l) => keyRe.test(l.trim()));
+    if (value !== null) {
+      const line = `:${key}: ${value}`;
+      if (at >= 0) inner[at] = line;
+      else inner.push(line);
+    } else if (at >= 0) {
+      inner.splice(at, 1);
+    }
+    if (inner.length === 0) {
+      // Drawer emptied: drop it entirely.
+      return [...lines.slice(0, start), ...lines.slice(end + 1)].join("\n");
+    }
+    return [...lines.slice(0, start + 1), ...inner, ...lines.slice(end)].join("\n");
+  }
+  if (value === null) return raw; // nothing to remove
+  // No drawer yet: title, SCHEDULED*, DEADLINE*, drawer, rest (rawWithBlockId's rule).
+  const [title, ...rest] = lines;
+  const isPlan = (l: string) => l.startsWith("SCHEDULED") || l.startsWith("DEADLINE");
+  let planEnd = 0;
+  while (planEnd < rest.length && isPlan(rest[planEnd])) planEnd++;
+  return [
+    title,
+    ...rest.slice(0, planEnd),
+    ":PROPERTIES:",
+    `:${key}: ${value}`,
+    ":END:",
+    ...rest.slice(planEnd),
+  ].join("\n");
+}

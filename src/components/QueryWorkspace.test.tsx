@@ -14,13 +14,22 @@ import {
   type MaterializeQueryDependencies,
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
-import { pageInventoryRev } from "../ui";
+import { pageInventoryRev, setGraphMeta } from "../ui";
 import { backend, SaveConflictError } from "../backend";
 
 afterEach(() => {
   clearTransientLayersForTest();
+  setGraphMeta(null);
   document.body.innerHTML = "";
 });
+
+/** A promise the test releases by hand, so a real await can be held open across
+ *  a user edit instead of being simulated by a callback. */
+function gate(): { wait: Promise<void>; open: () => void } {
+  let open!: () => void;
+  const wait = new Promise<void>((resolve) => { open = resolve; });
+  return { wait, open };
+}
 
 function materializeDeps(overrides: Partial<MaterializeQueryDependencies> = {}): MaterializeQueryDependencies {
   return {
@@ -32,6 +41,39 @@ function materializeDeps(overrides: Partial<MaterializeQueryDependencies> = {}):
 }
 
 describe("materializeQueryWorkspace", () => {
+  it.each(["diagnostic", "existing", "lookup-error"])("discards a stale %s response", async (stage) => {
+    let current = true;
+    const deps = materializeDeps({
+      runGraphSearch: vi.fn(async () => {
+        if (stage === "diagnostic") current = false;
+        return { hits: [], diagnostics: stage === "diagnostic" ? [{ code: "invalid_regex", message: "old diagnostic" }] : [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false };
+      }),
+      getPage: vi.fn(async () => {
+        current = false;
+        if (stage === "lookup-error") throw new Error("old lookup error");
+        return { name: "Saved", title: "Saved", kind: "page", pre_block: null, blocks: [] } satisfies PageDto;
+      }),
+    });
+    const result = await materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps, () => current);
+    expect(result).toMatchObject({ ok: false, kind: "superseded" });
+    expect(deps.savePage).not.toHaveBeenCalled();
+  });
+
+  it.each(["validation", "lookup"])("refuses stale input after %s", async (stage) => {
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let current = true;
+    const deps = materializeDeps(stage === "validation" ? {
+      runGraphSearch: vi.fn(async () => { await barrier; return { hits: [], diagnostics: [], explanation: { branches: [{ description: "valid", children: [] }] }, cancelled: false }; }),
+    } : { getPage: vi.fn(async () => { await barrier; return null; }) });
+    const pending = materializeQueryWorkspace({ title: "Saved", sourceKind: "search", source: "alpha", presentation: "list", routeId: "q" }, deps, () => current);
+    await Promise.resolve();
+    current = false;
+    release();
+    expect(await pending).toMatchObject({ ok: false, kind: "superseded" });
+    expect(deps.savePage).not.toHaveBeenCalled();
+  });
+
   it("rejects empty, exclusion-only, and Rust-diagnostic friendly searches before any graph write", async () => {
     for (const source of ["   ", "-draft", "/(a)\\1/"]) {
       const deps = materializeDeps({ runGraphSearch: vi.fn(async () => source === "-draft"
@@ -90,6 +132,7 @@ describe("materializeQueryWorkspace", () => {
       kind: "page",
       title: "Project dashboard",
       pre_block: null,
+      format: "md",
       blocks: [{
         id: "",
         raw: '{{query (search "alpha -draft")}}\ntine.view:: search',
@@ -125,6 +168,48 @@ describe("materializeQueryWorkspace", () => {
     }, tableDeps);
     expect(table.ok && table.page.blocks).toHaveLength(1);
     expect(table.ok && table.page.blocks[0].raw).toBe("{{query (todo TODO)}}\ntine.view:: table");
+  });
+
+  it("places the view property where the captured graph format reads it back", async () => {
+    const orgDeps = materializeDeps();
+    const org = await materializeQueryWorkspace({
+      title: "Org board",
+      sourceKind: "dsl",
+      source: "(todo TODO)",
+      presentation: "board",
+      routeId: "query-org-board",
+      format: "org",
+    }, orgDeps);
+    expect(org.ok).toBe(true);
+    if (!org.ok) throw new Error(org.message);
+    // An org block carries properties in a drawer; a markdown `key:: value` line
+    // here would render as body text and never read back as a property.
+    expect(org.page.blocks[0].raw).toBe("{{query (todo TODO)}}\n:PROPERTIES:\n:tine.view: board\n:END:");
+    expect(org.page.format).toBe("org");
+    expect(orgDeps.savePage).toHaveBeenCalledWith(org.page, null, false);
+
+    // The default list view is spelled as an ABSENT property in both formats,
+    // so an org list workspace materializes a bare query block with no drawer.
+    const orgList = await materializeQueryWorkspace({
+      title: "Org list",
+      sourceKind: "dsl",
+      source: "(todo TODO)",
+      presentation: "list",
+      routeId: "query-org-list",
+      format: "org",
+    }, materializeDeps());
+    expect(orgList.ok && orgList.page.blocks[0].raw).toBe("{{query (todo TODO)}}");
+
+    // An absent format keeps every dependency-injected caller on markdown.
+    const md = await materializeQueryWorkspace({
+      title: "Md board",
+      sourceKind: "dsl",
+      source: "(todo TODO)",
+      presentation: "board",
+      routeId: "query-md-board",
+    }, materializeDeps());
+    expect(md.ok && md.page.blocks[0].raw).toBe("{{query (todo TODO)}}\ntine.view:: board");
+    expect(md.ok && md.page.format).toBe("md");
   });
 
   it("refuses an existing page without attempting a write", async () => {
@@ -257,6 +342,61 @@ function workspaceDeps(): QueryWorkspaceDependencies {
 
 async function waitFor(check: () => void): Promise<void> {
   await vi.waitFor(check, { timeout: 1_000, interval: 5 });
+}
+
+/** A workspace only ever exists with a graph open, and the graph is what says
+ *  which on-disk format a new page is written in. */
+function openGraph(root: string, format: "md" | "org" = "md"): void {
+  setGraphMeta({ root, preferred_format: format } as never);
+}
+
+/** Hold ONE real await of the save lifecycle open, so the fixture races the
+ *  component's own routing rather than a stand-in callback. */
+function gatedDeps(stage: "validation" | "lookup" | "save"): {
+  deps: QueryWorkspaceDependencies;
+  open: () => void;
+} {
+  const { wait, open } = gate();
+  const deps = workspaceDeps();
+  if (stage === "validation") {
+    const live = deps.runGraphSearch;
+    // Only the zero-limit materialize lane waits: the pane's own live search
+    // has to keep answering, or the workspace under test would never render.
+    deps.runGraphSearch = vi.fn(async (source, pageLimit, blockLimit, lane, explain) => {
+      if (pageLimit === 0 && blockLimit === 0) await wait;
+      return live(source, pageLimit, blockLimit, lane, explain);
+    });
+  } else if (stage === "lookup") {
+    deps.getPage = vi.fn(async () => { await wait; return null; });
+  } else {
+    const live = deps.savePage;
+    deps.savePage = vi.fn(async (page, baseRev, force) => { await wait; return live(page, baseRev, force); });
+  }
+  return { deps, open };
+}
+
+function typeInto(input: HTMLInputElement, value: string): void {
+  input.value = value;
+  input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+}
+
+function submitSave(root: HTMLElement, name: string): void {
+  typeInto(root.querySelector<HTMLInputElement>(".query-workspace-save input")!, name);
+  (root.querySelector(".query-workspace-save") as HTMLFormElement)
+    .dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+}
+
+function clickPresentation(root: HTMLElement, label: string): void {
+  [...root.querySelectorAll<HTMLButtonElement>(".query-presentations button")]
+    .find((candidate) => candidate.textContent === label)!.click();
+}
+
+function saveButton(root: HTMLElement): HTMLButtonElement {
+  return root.querySelector<HTMLButtonElement>(".query-workspace-save button")!;
+}
+
+function text(root: HTMLElement, selector: string): string {
+  return root.querySelector(selector)?.textContent ?? "";
 }
 
 describe("QueryWorkspace", () => {
@@ -439,6 +579,7 @@ describe("QueryWorkspace", () => {
   });
 
   it("saves by naming and replaces the virtual route only after the guarded write succeeds", async () => {
+    openGraph("/graphs/A");
     const route: QueryRoute = {
       kind: "query",
       id: "query-save",
@@ -446,18 +587,17 @@ describe("QueryWorkspace", () => {
       source: "alpha OR beta",
       presentation: "board",
     };
-    const router = routerMock();
+    // The ACTIVE route is this workspace's own route: the save guard compares
+    // route identity, so a mock that claims some other tab is active would be
+    // testing a refusal, not a save.
+    const router = routerMock(route);
     const deps = workspaceDeps();
     const root = document.createElement("div");
     document.body.append(root);
     const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
     await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
 
-    const title = root.querySelector<HTMLInputElement>('.query-workspace-save input')!;
-    title.value = "Saved search";
-    title.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    (root.querySelector(".query-workspace-save") as HTMLFormElement)
-      .dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+    submitSave(root, "Saved search");
 
     await waitFor(() => expect(router.replaceActiveRoute).toHaveBeenCalledWith({
       kind: "page",
@@ -467,9 +607,207 @@ describe("QueryWorkspace", () => {
     const saved = vi.mocked(deps.savePage).mock.calls[0][0];
     expect(saved.blocks).toHaveLength(1);
     expect(saved.blocks[0].raw).toBe('{{query (search "alpha OR beta")}}\ntine.view:: board');
+    expect(saved.format).toBe("md");
     expect(deps.savePage).toHaveBeenCalledWith(saved, null, false);
+    expect(text(root, ".query-workspace-save-error")).toBe("");
+    expect(text(root, ".query-workspace-save-notice")).toBe("");
 
     dispose();
+  });
+
+  it("writes the org drawer form when the open graph prefers org", async () => {
+    openGraph("/graphs/Org", "org");
+    const route: QueryRoute = {
+      kind: "query",
+      id: "query-org-save",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "table",
+    };
+    const router = routerMock(route);
+    const deps = workspaceDeps();
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+    submitSave(root, "Org search");
+    await waitFor(() => expect(deps.savePage).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(deps.savePage).mock.calls[0][0];
+    expect(saved.format).toBe("org");
+    expect(saved.blocks[0].raw).toBe('{{query (search "alpha")}}\n:PROPERTIES:\n:tine.view: table\n:END:');
+
+    dispose();
+  });
+
+  it("refuses a save whose collision the backend reports, without ever forcing it", async () => {
+    openGraph("/graphs/A");
+    const route: QueryRoute = {
+      kind: "query",
+      id: "query-collision",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "list",
+    };
+    const router = routerMock(route);
+    const deps = workspaceDeps();
+    vi.mocked(deps.savePage).mockRejectedValue(new SaveConflictError(9));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+    submitSave(root, "Raced");
+    await waitFor(() => expect(text(root, ".query-workspace-save-error")).toContain("has not been overwritten"));
+    expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+    expect(deps.savePage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.savePage).mock.calls[0].slice(1)).toEqual([null, false]);
+    expect(saveButton(root).disabled).toBe(false);
+
+    dispose();
+  });
+
+  const staleEdits = [
+    { edit: "source", local: true },
+    { edit: "display", local: true },
+    { edit: "display-draft", local: true },
+    { edit: "source-reverted", local: true },
+    { edit: "title", local: true },
+    { edit: "format", local: true },
+    { edit: "graph", local: false },
+    { edit: "route", local: false },
+  ] as const;
+  const staleCases = staleEdits.flatMap((entry) =>
+    (["validation", "lookup"] as const).map((stage) => ({ ...entry, stage })));
+
+  it.each(staleCases)(
+    "writes no page when the $edit changes while the $stage is still in flight",
+    async ({ edit, local, stage }) => {
+      openGraph("/graphs/A");
+      const route: QueryRoute = {
+        kind: "query",
+        id: "query-stale",
+        sourceKind: "search",
+        source: "alpha",
+        presentation: "board",
+      };
+      const [activeRoute, setActiveRoute] = createSignal<QueryRoute>(route);
+      const { deps, open } = gatedDeps(stage);
+      const router = routerMock(route);
+      vi.mocked(router.route).mockImplementation(activeRoute);
+      const root = document.createElement("div");
+      document.body.append(root);
+      const dispose = render(
+        () => <QueryWorkspace route={activeRoute()} router={router} deps={deps} />, root);
+      await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+      submitSave(root, "Saved search");
+      await waitFor(() => expect(saveButton(root).disabled).toBe(true));
+
+      // The user moves on while the attempt is parked on its await.
+      if (edit === "source") typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "beta");
+      else if (edit === "display") clickPresentation(root, "Table");
+      else if (edit === "display-draft") setActiveRoute({ ...route, display: { sample: 0 } });
+      else if (edit === "source-reverted") {
+        typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "beta");
+        typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "alpha");
+      }
+      else if (edit === "title") typeInto(root.querySelector<HTMLInputElement>(".query-workspace-save input")!, "Renamed");
+      else if (edit === "format") openGraph("/graphs/A", "org");
+      else if (edit === "graph") openGraph("/graphs/B");
+      else setActiveRoute({ ...route, id: "query-other-tab" });
+      open();
+
+      await waitFor(() => expect(saveButton(root).disabled).toBe(false));
+      expect(deps.savePage).not.toHaveBeenCalled();
+      expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+      expect(text(root, ".query-workspace-save-notice")).toBe("");
+      if (local) {
+        // Still this workspace, so it says — truthfully — that nothing was
+        // written and the remedy is to save again.
+        expect(text(root, ".query-workspace-save-error")).toContain("Try saving again");
+      } else {
+        // A different tab or a different graph: a refusal of THIS attempt has
+        // no business appearing there.
+        expect(text(root, ".query-workspace-save-error")).toBe("");
+      }
+
+      dispose();
+    });
+
+  it.each(["source", "route"] as const)(
+    "keeps a page that committed before the $0 changed, without hijacking the route",
+    async (edit) => {
+      openGraph("/graphs/A");
+      const route: QueryRoute = {
+        kind: "query",
+        id: "query-committed",
+        sourceKind: "search",
+        source: "alpha",
+        presentation: "board",
+      };
+      const [activeRoute, setActiveRoute] = createSignal<QueryRoute>(route);
+      const { deps, open } = gatedDeps("save");
+      const router = routerMock(route);
+      vi.mocked(router.route).mockImplementation(activeRoute);
+      const root = document.createElement("div");
+      document.body.append(root);
+      const dispose = render(
+        () => <QueryWorkspace route={activeRoute()} router={router} deps={deps} />, root);
+      await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+      const beforeInventory = pageInventoryRev();
+      submitSave(root, "Saved search");
+      // `savePage` has already begun: from here the page may legitimately land.
+      await waitFor(() => expect(deps.savePage).toHaveBeenCalledTimes(1));
+      if (edit === "source") typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "beta");
+      else setActiveRoute({ ...route, id: "query-other-tab" });
+      open();
+
+      await waitFor(() => expect(saveButton(root).disabled).toBe(false));
+      // The write landed under the input it captured, was never retried under
+      // the new one, and the page inventory knows about it.
+      expect(deps.savePage).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deps.savePage).mock.calls[0][0].blocks[0].raw)
+        .toBe('{{query (search "alpha")}}\ntine.view:: board');
+      expect(pageInventoryRev()).toBeGreaterThan(beforeInventory);
+      expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+      expect(text(root, ".query-workspace-save-error")).toBe("");
+      if (edit === "source") {
+        // Same workspace: acknowledge the page rather than claim it was undone.
+        expect(text(root, ".query-workspace-save-notice")).toContain("Saved search");
+        expect(text(root, ".query-workspace-save-notice")).toContain("was saved");
+      } else {
+        expect(text(root, ".query-workspace-save-notice")).toBe("");
+      }
+
+      dispose();
+    });
+
+  it("lets a save land after the workspace is unmounted without routing anything", async () => {
+    openGraph("/graphs/A");
+    const route: QueryRoute = {
+      kind: "query",
+      id: "query-unmounted",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "list",
+    };
+    const { deps, open } = gatedDeps("save");
+    const router = routerMock(route);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+
+    submitSave(root, "Saved search");
+    await waitFor(() => expect(deps.savePage).toHaveBeenCalledTimes(1));
+    dispose();
+    open();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(deps.savePage).toHaveBeenCalledTimes(1);
+    expect(router.replaceActiveRoute).not.toHaveBeenCalled();
   });
 
   it("opens a focus-managed modal and preserves an untouched OR search exactly", async () => {
