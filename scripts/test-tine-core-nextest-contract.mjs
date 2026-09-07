@@ -5,8 +5,8 @@ import {
   LINUX_CORE_RELEASE_FILTERSET,
   LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
   LINUX_TINE_CORE_SHARD_COUNT,
-  KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
-  KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES,
+  KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES,
+  KNOWN_RED_TINE_CORE_FAILURE_FAMILIES,
   WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
   WINDOWS_CORE_EXACT_TEST_NAMES,
   WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
@@ -113,23 +113,33 @@ assert.throws(
   ),
   /Linux release exclusion contract changed.*model::tests::ordinary_semantic_contract/
 );
-const familyNames = Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES).flat();
-assert.deepEqual([...familyNames].sort(), KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES);
-assert.deepEqual(Object.keys(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES), [
-  "activationAndEnrollment",
-  "applicationAndSemanticConvergence",
-  "providerRecoveryAndPublication",
-  "boundedDiscoveryAndTraversal",
+const familyNames = Object.values(KNOWN_RED_TINE_CORE_FAILURE_FAMILIES).flat();
+assert.deepEqual([...familyNames].sort(), KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES);
+assert.deepEqual(Object.keys(KNOWN_RED_TINE_CORE_FAILURE_FAMILIES), [
+  "cleanActivationOfAnEmptyGraph",
+  "providerProjectionLiveness",
+  "applicationFrontDoorRefusals",
+  "foregroundMoveDoesForbiddenCommitWork",
+  "providerConflictCopyWedgesTheDevice",
+  "outboundPublicationPastALostParent",
+  "cleanShutdownRefusesOnAppliedProviderBatch",
+  "crossTestFaultRegistryIsolation",
 ]);
-for (const names of Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES)) {
+for (const names of Object.values(KNOWN_RED_TINE_CORE_FAILURE_FAMILIES)) {
   assert.ok(names.length > 0);
 }
-for (const name of KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES) {
+// Round 2 of the W6-red-corpus harvest re-bucketed the `model::tests::`
+// admission family: its subject -- the Direct-save whole-graph, parser-owned
+// admission walk -- was cut on purpose by 05db8c67 (program D1 of the Direct
+// Files program), so those tests were deleted rather than carded. The residual
+// corpus is therefore `sync_runtime::tests::` only again, and every remaining
+// name is a live clean-runtime defect.
+for (const name of KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES) {
   assert.match(name, /^sync_runtime::tests::/);
 }
 assert.equal(
-  new Set(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES).size,
-  KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
+  new Set(KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES).size,
+  KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES.length
 );
 
 assert.equal(PROJECT_VERSION, ONE_RELEASE_CI_EXCEPTION_VERSION);
@@ -144,15 +154,15 @@ assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "managed-journal-f
 assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "some-other-scenario"), false);
 assert.deepEqual(
   LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
-  linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES)
+  linuxReleaseExcludedTestNames(KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES)
 );
 assert.equal(
   LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES.length,
-  KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES.length
+  KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES.length
     + ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames.length
 );
 assert.deepEqual(
-  linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, NEXT_RELEASE_VERSION),
+  linuxReleaseExcludedTestNames(KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES, NEXT_RELEASE_VERSION),
   []
 );
 assert.equal(linuxCoreReleaseFilterset(NEXT_RELEASE_VERSION), "all()");
@@ -166,12 +176,12 @@ assert.throws(
   () => verifyLinuxReleaseSelection(
     listedInventory("tine-core", [
       ...releaseSelectedNames,
-      ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+      ...KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES,
       releaseWaivedOnlyRed,
     ]),
     listedInventory("tine-core", [
       ...releaseSelectedNames,
-      ...KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES,
+      ...KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES,
     ]),
     NEXT_RELEASE_VERSION
   ),

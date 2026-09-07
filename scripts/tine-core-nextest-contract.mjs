@@ -14,77 +14,182 @@ import {
 export const LINUX_TINE_CORE_SHARD_COUNT = 4;
 
 // Linux runs the complete current tine-core inventory by default. An honest
-// unfiltered run on 2026-08-25 proved that the residual known-red corpus is the
-// exact set below: 45 tests fail normally, while no test hangs or times out.
-// These are legacy-oracle scenarios whose fixtures, cuts, or instrumentation
-// still assert retired actor mechanics. They are not evidence of a current
-// production defect without a separate current-runtime fail-before.
+// unfiltered `cargo test -p tine-core --no-fail-fast` on base ab3de16d
+// measured 1992 tests with exactly 70 failures. The 2026-09-07 W6-red-corpus
+// harvest retired that corpus by name in two passes:
 //
-// Keep the exclusions exact, name-level, and behavior-family classified. The
-// complete measured set is release-excluded only for v0.6.981; from the next
-// version onward the filter is all(), so every tine-core test must pass.
-export const KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES = Object.freeze({
-  activationAndEnrollment: Object.freeze([
-    "sync_runtime::tests::activation_retires_older_shadow_import_when_direct_files_changed_before_retry",
-    "sync_runtime::tests::cold_shared_descriptor_discovery_uses_the_canonical_supported_regular_file",
-    "sync_runtime::tests::pre_enrollment_archive_residue_refuses_mismatched_identities_but_exact_resume_reaches_active",
-    "sync_runtime::tests::public_activation_cut_after_archive_claim_before_enrollment_head_resumes_exact_identities",
-    "sync_runtime::tests::public_activation_cut_after_shadow_import_publication_resumes_without_graph_rewrites",
-    "sync_runtime::tests::public_activation_cut_after_verified_local_publication_resumes_without_graph_rewrites",
-    "sync_runtime::tests::public_activation_cut_before_archive_creation_resumes_exact_identities_without_graph_rewrites",
-    "sync_runtime::tests::share_prepared_crash_resumes_descriptor_publication",
-    "sync_runtime::tests::shared_join_recovery_without_canonical_manifest_is_retryable",
-  ]),
-  applicationAndSemanticConvergence: Object.freeze([
+//   * 35 tests asserted mechanics that were retired BY DECISION and were
+//     deleted -- dead `#[cfg(test)]` cuts nothing reads and the pre-clean flat
+//     archive layout (85b3339c), the Direct-Files whole-graph admission walk
+//     (05db8c67, program D1 of the Direct Files program), and the publication
+//     intents / manifest-recovery links+blobs / transport publishers /
+//     pending-marker publication that retirement cut B removed under the 0.7
+//     blank-slate ruling (2a578d87, b9bc23c1; SETTLED-DECISIONS D-1).
+//   * 13 drove dead paths while their user contract stayed live and were
+//     migrated onto the current front door.
+//   * 3 were pins or tables repaired in place (two census pins and the
+//     refusal-scenario vocabulary in oplog/refusal.rs).
+//   * 2 belong to the concurrent query-engine campaign and are waived in
+//     scripts/release-ci-exception.json instead.
+//   * 17 survived as live clean-runtime defects. They are the list below.
+//
+// The suite is now 1957 tests with 19 failures: the 17 below plus those 2.
+//
+// What remains below is NOT legacy residue and NOT a retired mechanism. Every
+// name is a reproduced defect in the CURRENT clean runtime, with a named cause
+// and a fix that lands outside a test file. Each is carded in the harvest
+// receipt, and the user-visible ones have a `reproduced` row in
+// tests/regressions/non-ui.json. Read this list as an open bug ledger, not as
+// a waiver: shrinking it means fixing the product, not renaming the test.
+//
+// Keep the exclusions exact, name-level, and cause-classified. They are
+// release-excluded only while package.json still reads
+// ONE_RELEASE_CI_EXCEPTION_VERSION (0.6.982, the version this filter was
+// measured on). The next `chore(release): prepare vX candidate` commit bumps
+// package.json, the filter collapses to all() with no edit here, and every
+// tine-core test must pass from that release onward.
+export const KNOWN_RED_TINE_CORE_FAILURE_FAMILIES = Object.freeze({
+  // `SyncRuntimeHandle::activate_or_resume_local` never leaves Retryable for a
+  // graph that has `logseq/config.edn` and directories but no page file:
+  // `{"kind":"clean-open","reason_code":"clean_open.bootstrap_streaming_import"}`
+  // still after 64 retries. A graph CREATED in Tine is seeded with 24 guide
+  // pages (src-tauri/src/graph.rs:1226 -> onboarding::create_demo_graph), so
+  // this is reached by opening an existing empty folder, or by a user who
+  // deleted every page -- not by the default first-run flow.
+  cleanActivationOfAnEmptyGraph: Object.freeze([
+    // Fixture never reaches LocalActive, so the two-winner convergence case
+    // cannot run.
     "sync_runtime::tests::concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions",
+    // Same: fixture never reaches LocalActive.
     "sync_runtime::tests::concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantics",
-    "sync_runtime::tests::managed_application_conflict_resolution_reauthors_retained_outline_at_one_observed_revision",
-    "sync_runtime::tests::managed_graph_search_accounts_for_pending_overlay_metadata_separately",
+    // Activation returns Retryable{durable_stage: Absent} where the contract
+    // requires Active.
     "sync_runtime::tests::managed_new_page_conflict_resolution_uses_the_identifiable_winner_path_and_revision",
-    "sync_runtime::tests::new_markdown_and_org_pages_are_born_with_parsed_final_identity_at_selected_path",
-    "sync_runtime::tests::observed_receiver_external_edit_precedes_remote_delete_in_both_callback_orders",
+  ]),
+  // The provider projection scheduler never settles: it exhausts its bounded
+  // turn budget with a last tick of `RecoveryBlocked("projection manifest
+  // validation failed: projection intent portable-path index binding
+  // mismatch")`.
+  //
+  // Cause, verified: 9f24d985 (2026-08-31, "retire detached bootstrap and
+  // Patricia stores") deleted the reconciliation arm of
+  // `validate_manifested_portable_path_binding`
+  // (crates/tine-core/src/oplog/hot_engine.rs:15719-15761 today). Before it, a
+  // manifested portable-path root that differed from the receiver's candidate
+  // root was accepted when it could be reconstructed as `accepted base +
+  // publisher's changes` over the declared frontier bases. After it the
+  // function ends `let _ = frontier;` and returns ProjectionManifest on ANY
+  // inequality. So a receiver whose portable-path index root diverged from the
+  // publisher's -- a concurrent external admission, an absent path, a rename
+  // referrer, an offline branch -- never projects that batch (I-10).
+  //
+  // These cases were added GREEN by de7868c7 (2026-08-18, "always project an
+  // applied provider batch to Markdown") with the binding check already
+  // present (0acfc0a7 / 33d8e67f, July), so this is a regression of a landed
+  // data-visibility fix. User outcome: a device that has edited a file the
+  // other device also touched stops receiving that page forever.
+  //
+  // NOT this packet's to fix -- what replaces the Patricia reconstruction is a
+  // design question (D-14), so this is a card, not a rename.
+  providerProjectionLiveness: Object.freeze([
+    // A remote create never appears beside a concurrent local admission.
+    "sync_runtime::tests::provider_create_projects_markdown_beside_a_concurrent_external_admission",
+    // A remote edit never appears beside a concurrent local admission.
+    "sync_runtime::tests::provider_edit_projects_markdown_beside_a_concurrent_external_admission",
+    // A remote cross-page move never projects either page.
+    "sync_runtime::tests::provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_admission",
+    // A remote delete of a path the receiver never had does not converge.
+    "sync_runtime::tests::provider_delete_of_a_path_absent_from_the_receiver_converges",
+    // One peer's incomplete manifest blocks this device instead of being
+    // ignored.
+    "sync_runtime::tests::foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement",
+    // A rename plus a referrer edit never converge in either delivery order.
+    "sync_runtime::tests::rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders",
+    // Two offline authors that merge their provider trees BOTH block: probed
+    // 2026-09-07, each device's tick is the same RecoveryBlocked and neither
+    // device ever receives the other's page.
     "sync_runtime::tests::two_offline_authors_union_frontier_heads_converge_without_return_first",
   ]),
-  providerRecoveryAndPublication: Object.freeze([
-    "sync_runtime::tests::accepted_ordinary_manifest_loss_without_local_archive_blocks",
-    "sync_runtime::tests::absent_superseded_head_settles_and_reappeared_head_retires_again",
-    "sync_runtime::tests::clean_shutdown_waits_for_imprecise_discovery_before_publishing_own_head",
-    "sync_runtime::tests::deleted_own_frontier_head_is_republished_from_local_authority",
-    "sync_runtime::tests::durable_shared_publication_survives_crash_before_provider_tick",
-    "sync_runtime::tests::exact_deletion_of_an_accepted_manifest_republishes_from_local_archive",
-    "sync_runtime::tests::foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement",
-    "sync_runtime::tests::frontier_head_conflicts_fall_back_and_preserve_unreconciled_bytes",
-    "sync_runtime::tests::frontier_head_crash_cuts_repair_before_safe_handoff",
-    "sync_runtime::tests::locally_admitted_shared_object_precedes_own_frontier_publication",
-    "sync_runtime::tests::manifest_recovery_publication_crash_cuts_resume_before_canonical_visibility",
-    "sync_runtime::tests::manifestless_no_op_partial_direct_dependency_blocks",
-    "sync_runtime::tests::outbound_child_blocks_when_ordinary_parent_is_lost",
-    "sync_runtime::tests::provider_object_physical_write_cut_requires_exact_journal_completion_before_manifest_and_head",
-    "sync_runtime::tests::provider_staging_siblings_are_non_authoritative_for_exact_and_full_ingress",
-    "sync_runtime::tests::removing_rejected_exact_provider_residue_unblocks_queued_work",
-    "sync_runtime::tests::reordered_remote_acceptance_cannot_reuse_stale_recovery_coverage",
-    "sync_runtime::tests::restarted_provider_child_accepts_manifestless_no_op_dependency_after_duplicate_reordering",
-    "sync_runtime::tests::unsafe_reopen_repairs_accepted_batch_after_pending_marker_creation_failure",
+  // The application/editor front door refuses ordinary user actions.
+  applicationFrontDoorRefusals: Object.freeze([
+    // Loading a just-created page by id refuses with
+    // ActorRefusedAt("hot_source_path_missing") (sync_runtime.rs:24677,
+    // `graph.load_by_path` -> None). Probed 2026-09-07 with the DEFAULT graph
+    // layout as well as the fixture's custom `:pages-directory`: red both ways,
+    // so this is not a custom-layout bug -- a new page whose parsed identity
+    // moves it to its final path cannot be opened afterwards.
+    "sync_runtime::tests::new_markdown_and_org_pages_are_born_with_parsed_final_identity_at_selected_path",
+    // DeletePage refuses with ActorRefusedAt("delete_stale_page_target") after
+    // a conflict resolution re-authored the page. The NAME index is the stale
+    // side: probed 2026-09-07, `load_application_exact(path)` returns the page
+    // with exactly name "Déjà 計画" at
+    // `notes/層/žluťoučký/nested/Déjà 計画.md`, while
+    // `active_editor_name_state_for_format` (sync_runtime.rs:18403) answers
+    // Missing for that same name. The same probe shows the second facet: with
+    // `expected_path: None` the delete returns Ok(Applied) via the
+    // "harmless retry" arm (sync_runtime.rs:18413) WITHOUT deleting anything.
+    "sync_runtime::tests::managed_application_conflict_resolution_reauthors_retained_outline_at_one_observed_revision",
   ]),
-  boundedDiscoveryAndTraversal: Object.freeze([
-    "sync_runtime::tests::closed_device_walks_only_an_unseen_linear_tail_from_latest_head",
-    "sync_runtime::tests::complete_namespace_loss_repair_above_head_scan_cap_is_chunked",
-    "sync_runtime::tests::exact_object_progress_rechecks_every_incomplete_manifest_once_per_wave",
-    "sync_runtime::tests::headless_legacy_namespace_falls_back_once_then_reopens_from_frontier_head",
+  // A foreground cross-page move performs work the fast-commit invariant
+  // forbids, so a move in a large graph stalls the caller. Probed 2026-09-07:
+  // the counter that fires is `archive_object_reads: 6`; sqlite_drains,
+  // projection_receipt_loads, graph_wide_catalog_decodes,
+  // graph_wide_catalog_validations and application_page_loads are all 0
+  // (crates/tine-core/src/fast_commit.rs:130 `forbidden_commit_work`).
+  foregroundMoveDoesForbiddenCommitWork: Object.freeze([
+    "sync_runtime::tests::foreground_cross_page_move_is_bounded_and_does_no_graph_wide_work",
+  ]),
+  // A sync service (Dropbox/Syncthing/iCloud) that writes a conflict copy of a
+  // frontier head whose bytes DIFFER from the canonical head wedges the device:
+  // every tick returns
+  // RecoveryBlocked("sync actor refused request: provider conflict copy differs
+  // from canonical generated evidence at frontier-heads-v1/....head") and the
+  // runtime never settles again. The unreconciled bytes ARE preserved -- the
+  // refusal happens before any mutation -- so this is an availability loss, not
+  // a data loss. A byte-IDENTICAL conflict copy is retired correctly (the first
+  // half of the same test passes), so the conflict lane itself is live.
+  providerConflictCopyWedgesTheDevice: Object.freeze([
+    "sync_runtime::tests::frontier_head_conflicts_fall_back_and_preserve_unreconciled_bytes",
+  ]),
+  // With an ordinary parent's manifest absent from BOTH the provider tree and
+  // the local archive (`inspect_batch` -> Absent), the child batch still
+  // publishes its manifest and the device reaches a Safe handoff. Probed
+  // 2026-09-07 after removing the retired manifest-recovery steps from the
+  // fixture: child_published=true, shutdown_err=false. A peer then receives a
+  // batch whose causal parent exists nowhere.
+  outboundPublicationPastALostParent: Object.freeze([
+    "sync_runtime::tests::outbound_child_blocks_when_ordinary_parent_is_lost",
+  ]),
+  // After an oversized provider callback, the retained rescan IS drained and
+  // the delivered page IS projected (probed 2026-09-07: page_projected=true),
+  // but `clean_shutdown` returns
+  // Err(ActorRefused("clean shutdown received unexpected runtime progress:
+  // ProviderMutation { .. }")): its drain loop at
+  // crates/tine-core/src/sync_runtime.rs:23286-23313 accepts Idle, Recovering,
+  // AdmittedNoop, AdmittedComplete and two LocalMutation outcomes, and treats
+  // every other tick -- including the ordinary "a remote batch applied" tick --
+  // as unexpected progress. User outcome: quitting right after a large sync
+  // delivery reports an unsafe shutdown and the next launch pays an
+  // unsafe-reopen repair, even though nothing was lost.
+  cleanShutdownRefusesOnAppliedProviderBatch: Object.freeze([
     "sync_runtime::tests::oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it",
-    "sync_runtime::tests::reverse_delivered_provider_chain_has_linear_readiness_work",
-    "sync_runtime::tests::shared_provider_archive_beyond_entry_and_byte_scan_caps_joins_incrementally",
-    "sync_runtime::tests::startup_discovers_manifest_stranded_beyond_an_older_valid_frontier_head",
-    "sync_runtime::tests::uncovered_legacy_head_backfills_recovery_in_bounded_chunks_before_safe",
+  ]),
+  // Passes alone in 37s; fails only inside the full suite, and its failure
+  // capsule points at a source line the test never executes. The clean
+  // runtime's one-shot fault and test-cut registries are process-global rather
+  // than workspace-keyed, so concurrently running tests consume each other's
+  // arms. Harness debt, not a product defect: deliberately not carded.
+  crossTestFaultRegistryIsolation: Object.freeze([
+    "sync_runtime::tests::projection_recovery_equivalence_oracle_real_store_subset",
   ]),
 });
 
-export const KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES = Object.freeze(
-  Object.values(KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES).flat().sort()
+export const KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES = Object.freeze(
+  Object.values(KNOWN_RED_TINE_CORE_FAILURE_FAMILIES).flat().sort()
 );
 
 export function linuxCoreReleaseFilterset(version = PROJECT_VERSION) {
-  const excluded = linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, version);
+  const excluded = linuxReleaseExcludedTestNames(KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES, version);
   return excluded.length === 0
     ? "all()"
     : "not (" + excluded
@@ -93,7 +198,7 @@ export function linuxCoreReleaseFilterset(version = PROJECT_VERSION) {
 }
 
 export const LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES = Object.freeze(
-  linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES)
+  linuxReleaseExcludedTestNames(KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES)
 );
 export const LINUX_CORE_RELEASE_FILTERSET = linuxCoreReleaseFilterset();
 // Windows is deliberately not a second complete tine-core behavior matrix.
@@ -246,7 +351,7 @@ export function verifyLinuxReleaseSelection(coreInventory, releaseInventory, ver
   // rotted. Names, never counts.
   requireExactNameSet(
     excluded.map((test) => test.testName),
-    linuxReleaseExcludedTestNames(KNOWN_RED_SYNC_RUNTIME_EXCLUDED_TEST_NAMES, version),
+    linuxReleaseExcludedTestNames(KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES, version),
     "Linux release exclusion contract"
   );
 

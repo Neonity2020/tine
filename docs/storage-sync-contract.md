@@ -192,11 +192,11 @@ interpret the mere presence of the directory as an opt-in marker.
 | `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |
 | `{inbox,outbox}/manifests/<batch>.manifest` | publishing device | peer ingress/replay | canonical batch manifest | append-only commit object |
 | `{inbox,outbox}/frontier-heads-v1/<device>-<digest>.head` | each device | peer discovery | canonical JSON frontier head v1 | immutable heads; newer generations supersede discovery relevance |
-| `{inbox,outbox}/publication-intents-v1/<digest>.intent` | publishing device | interrupted-publication recovery | canonical JSON intent v1 | immutable; retired only after covered publication is proven |
-| `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | publishing device | peer recovery | canonical JSON recovery link v1 | immutable |
-| `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | publishing device | peer recovery | exact manifest bytes | immutable; digest-addressed |
+| `{inbox,outbox}/publication-intents-v1/<digest>.intent` | none — write side retired 2026-08-20 (`2a578d87`, D-1); read-only tolerance at `sync_runtime.rs:9950-10069` pending reader deletion | interrupted-publication recovery | canonical JSON intent v1 | no writer; nothing publishes or retires an intent |
+| `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | none — write side retired 2026-08-20 (`2a578d87`, D-1); read-only tolerance at `sync_runtime.rs:9950-10069` pending reader deletion | peer recovery | canonical JSON recovery link v1 | no writer; never created |
+| `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | none — write side retired 2026-08-20 (`2a578d87`, D-1); read-only tolerance at `sync_runtime.rs:9950-10069` pending reader deletion | peer recovery | exact manifest bytes | no writer; never created |
 | `{inbox,outbox}/.part/` | provider transport | provider transport | temporary publication bytes | disposable after recovery |
-| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit, and the evidence an exact repeat of a retired rename/remove settles from (§2.10c-i) | retired provider items | bounded cleanup evidence, capped at `MAX_PROVIDER_RESIDUE_ENTRIES` |
+| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit, and the evidence an exact repeat of a retired rename/remove settles from (§2.10c-i) | retired provider items | bounded cleanup evidence; retired against live journal state, not store lifetime (§2.10c-ii). `MAX_PROVIDER_RESIDUE_ENTRIES` remains the structural scan bound |
 | `{inbox,outbox}/rename-evidence/` | provider transport | provider recovery | interrupted-rename evidence | disposable after recovery |
 
 The device-private provider journal also has `pending-publication-v1/` and
@@ -1768,6 +1768,91 @@ collapse of the named-stage inventory. This closes the gap that left the
 Android post-activation save reporting `debug_detail="none"` with no stage — a
 refusal that could have come from any of 131 unnamed sites.
 
+#### Acceptance-only refusals for drain-published local batches
+
+The managed-local drain publishes a batch's immutable manifest at stage
+`ArchivePublication` and only then offers it to the hot engine at stage
+`EngineAcceptance` (`oplog/local_journal_drain.rs`). Replay treats a
+manifest-committed clean operation that does not validate as accepted as
+archive corruption, not as an alternative status
+(`hot_engine::replay_clean_committed_batch_ids`: "manifest-committed clean
+operation ... did not validate as accepted"). A refusal an honestly drafted
+LOCAL batch can meet **only** at acceptance therefore converts a Save the app
+reported successful into a store that refuses to open on every later open. That
+is the shape A4 removed for the four run-local capacity caps; this census
+enumerates the rest of the class.
+
+Scope: every refusal reachable from
+`ShardedHotEngine::accept_clean_prepared_below_managed_local_overlay` for a
+batch whose origin is `BatchOrigin::LocalMutation` — its own preconditions,
+`stage_ready_internal`/`drain_staged`, everything `validate_and_apply` calls,
+the quarantine dispositions, and the `accepted_exactly_once` fall-through.
+
+Classes:
+
+- **U** — unreachable for an honestly drafted, drain-published local batch,
+  because a draft-time check that is at least as strict runs BEFORE the journal
+  append, or because the value is fixed by construction. The draft path is
+  `trusted_local_commit::commit_compound` →
+  `ShardedHotEngine::prepare_managed_local_record` →
+  `validate_managed_local_candidate`, preceded by
+  `prepare_transaction_core`, which runs the same page-name and portable-path
+  producers the acceptance path runs.
+- **S** — reachable only through an in-scope scenario from the table above, and
+  the current outcome is already correct: the drain maps it to `recovery`, the
+  store stays openable, and the record is retried.
+- **R** — reachable for an honest local batch. Fixed; class size is zero.
+
+No row needs a new `MS-REF-*` identifier. The R row no longer reaches any
+public boundary (it is now refused at Save, before the journal append). Every S
+row reaches the public open/activation boundary only as an already-classified
+durable refusal — `MS-REF-DISK-CORRUPT` for a damaged immutable object or
+run-local index, `MS-REF-CRASH-TRUNCATED` for a torn record, and
+`MS-REF-STALE-GENERATION` for an honest concurrent advance — so §3.1 above is
+already complete for this class.
+
+| Refusal stem | Class | Draft-time check (U), in-scope scenario (S), or fix (R) |
+| --- | --- | --- |
+| `clean foreground acceptance requires an index-free baseline runtime` | U | The drain calls this entry point only on the managed-local clean runtime, and `validate_managed_local_overlay_candidate` refuses a non-`LocalMutation` origin before the journal append ("only trusted local-mutation batches enter the managed-local prefix"). |
+| `clean runtime has no operation archive` | U | The drain resolved and duplicated the archive capability at its `Authenticate` stage, before publishing anything. |
+| `is not manifest-committed` | U | The drain published the manifest and re-proved it with `exact_archive_batch` in the same call, immediately before this stage. |
+| `differs from its retained manifest` | U | Byte equality against the manifest the drain itself just wrote. |
+| `did not validate as one accepted operation` | S | Fall-through for `Quarantined`/`IncompleteStaged`; the underlying dispositions are the quarantine rows below. |
+| `EngineError::WorkspaceMismatch` | U | Same comparison in `validate_managed_local_candidate` before the append. |
+| `EngineError::LineageMismatch` | U | Same comparison in `validate_managed_local_candidate` before the append. |
+| `EngineError::BatchCollision` | U | The batch id is minted per draft; a collision needs a second batch with the same id and a different fingerprint. |
+| `EngineError::SelfDependency` | U | The frontier is the pre-batch frontier the draft built, and `validate_managed_local_overlay_candidate` re-proves `actual_pre == manifest.dependency_frontier()` before the append. |
+| `EngineError::RejectedDependency` | U | Every dependency of a local batch is an accepted batch or an earlier record of the same journal-durable prefix. |
+| `EngineError::DuplicateDocumentUpdate` | U | `updates` is a map built by the foreground; the draft validates the same object set. |
+| `EngineError::MissingDocument` | U | A non-empty page effect puts the catalog in `updates` by construction; `affected_projection_pages` equality is proven at draft. |
+| `EngineError::CrdtUpdateBaseMismatch` | U | `validate_update_base` runs at draft and maps this exact error to `ManagedLocalRecordError::StaleBase` before the append. |
+| `EngineError::BlockAlreadyExists` | U | The draft checks accepted claims **and** `local_overlay.block_claims`, so it already sees claims introduced by journal-durable records. |
+| `EngineError::MalformedDocument` | U | Document-shape checks over documents the draft built and already validated with `validate_shard` / `validate_immutable_shard_identity`. |
+| `EngineError::ProjectionManifest` | U | `validate_managed_local_projection_candidate` re-renders every intent deterministically and compares target bytes and annotations before the append. |
+| `EngineError::ProjectionClaimEvidenceMismatch` | U | The claim evidence is recomputed from the same accepted catalog the intent was drafted against; at `EngineAcceptance` for record N the SQLite claim source reflects exactly records 1..N-1. |
+| `EngineError::InvalidCrdt` | S | `MS-REF-CRASH-TRUNCATED` / `MS-REF-DISK-CORRUPT`: a torn or damaged update payload. Drain maps it to `recovery`. |
+| `EngineError::Archive` | S | `MS-REF-DISK-CORRUPT`: archive read/encode failure. Drain maps it to `recovery`; the store stays openable. |
+| `EngineError::ProjectionWork` | S | `MS-REF-DISK-CORRUPT`: raised by `refresh_clean_projection_head_for_batch` AFTER the batch is accepted, so the drain maps it to `recovery` and retries; acceptance itself already stands. |
+| `history_failure` | S | `MS-REF-DISK-CORRUPT`: an earlier publication failure in the same run already made the workspace terminal. |
+| `canonical page-name key is occupied at the declared dependency frontier` | **R → fixed** | Was the one acceptance-only refusal reachable from ordinary editing: the run-local page-name index was blind to journal-durable-but-unaccepted records, so two pages whose exact names differ but whose canonical keys are equal ("Alpha" and "/Alpha") both passed the draft and the second was refused at acceptance after its manifest was published. Fixed by layering `CommittedLocalOverlay::page_names` under the accepted index in the single producer (`prepare_page_name_updates`), exactly as `portable_path_records_many` already layers the overlay for portable paths. The refusal is now raised at draft time, before the journal append. Guarded by `w5_census_a_canonical_page_name_collision_is_settled_before_the_journal_append`. |
+| `two PageIds acquire one canonical page-name key in the same batch` | U | Same producer, same effect, at draft. |
+| `page-name transition observations are incomplete or non-unique` | U | Same producer, same effect, at draft. |
+| `page-name transition disagrees with the authenticated dependency catalog` | U | `exact_before` is derived from the effect itself in both calls. |
+| `conflicts at the declared dependency frontier` | U | Portable paths: `portable_path_records_many` layers `local_overlay.portable_paths` over `ephemeral_portable_paths`, so the draft already sees paths acquired by journal-durable records. This is the shape the page-name fix above copied. |
+| `PageNamePointBatchTooLarge` | U | `MAX_PAGE_NAME_POINT_BATCH` is charged against the same delta count at draft and at acceptance, so it can only ever refuse at Save. |
+| `MalformedPageNameIndex` | S | `MS-REF-DISK-CORRUPT`: the run-local index or its checkpoint is damaged. It is disposable derived state and is rebuilt from the accepted tail on the next open. |
+| `MissingExactLogicalPageNameBlob` | S | `MS-REF-DISK-CORRUPT`: as above. |
+| `portable_path_blocked` | S | `MS-REF-SYNC-CONFLICT`: a non-ancestor concurrent acquisition of the same portable path. Quarantine retains the batch as validated-unpublished evidence rather than losing it. |
+| `page_name_blocked` | S | `MS-REF-SYNC-CONFLICT`: a non-ancestor concurrent acquisition of the same canonical page-name key. Same quarantine treatment. |
+| `identity.blocked` | S | `MS-REF-SYNC-CONFLICT`: an immutable block-home claim conflict delivered by a peer. |
+| `is_blocked()` | S | The workspace already carries terminal conflict evidence from one of the rows above; batches offered afterwards are deliberately retained, not discarded. |
+| `allow_publication` | U | `drain_staged` always passes `true`; only `drain_blocked_evidence` passes `false`, and it runs only when the workspace is already blocked. |
+
+The census is pinned by
+`hot_engine::validation_tests::w5_census_pins_every_acceptance_refusal_to_a_class`:
+a new refusal in this path with no row here, or a row whose stem no longer
+exists in production, fails that test.
+
 ### 3.1a The private receipt-store claim, and when it is checked
 
 `receipts/projection-receipts.claim` identifies the one implemented private
@@ -3178,12 +3263,150 @@ prove exact idempotency after retirement, and that the settle is bound to this
 device's evidence for that exact operation rather than to a destination that
 merely exists.
 
-**Known neighbouring bound, not addressed here.** `{inbox,outbox}/removed/` is
-capped at `MAX_PROVIDER_RESIDUE_ENTRIES` (512) by
-`ensure_provider_diagnostic_capacity`, which refuses beyond it, and nothing
-retires those diagnostics. That is a separate lifetime-growth bound in the
-provider tree rather than in the journal; it is recorded here so the next
-reader does not mistake this section's guarantee for covering it.
+### 2.10c-ii The provider residue directory is bounded by live journal state
+
+`{inbox,outbox}/removed/` is the shared-tree half of the bound §2.10c-i states
+for the journal. It holds two kinds of residue this store writes, and neither
+is history:
+
+* `removed/retired-<operation id>` — the exact bytes ONE completed rename or
+  remove retired. While that operation's journal record exists,
+  `reconcile_provider_retirement` and `validate_retired_source` read it; once
+  the completed record has been compacted away (§2.10c-i), it is what an exact
+  repeat settles from.
+* `removed/orphan-<operation id>-<generation>` — an abandoned staging copy
+  whose authority is the private journal blob. Nothing reads it as authority
+  for anything; the publish path quarantines it so a foreign or crash-left
+  staging file is preserved rather than destroyed.
+
+**An operation retires its own stale orphan rather than refusing over it.**
+`quarantine_unowned_staging` builds `orphan-<operation id>-<generation>` from
+the operation id whose transaction gate it holds, so an occupant of that exact
+name is always named for the operation doing the writing — there is no
+foreign-entry case to refuse, and the refusal that used to be there wedged the
+operation until an unrelated sweep happened to run past the trigger (I-10). Two
+honest ways an occupant exists: a crash between the quarantine rename and the
+identity-matched delete in `cleanup_journal_staging`, and an operation
+re-created from scratch at generation 0 while a stale generation-0 orphan is
+still in place. The owner now retires it — through the same per-entry front
+door the sweep uses, `retire_provider_residue_entry`: validate the entry
+no-follow-regular, `remove_file`, `fsync` the directory — and proceeds with the
+quarantine. This destroys at most the one entry the sweep is already licensed
+to retire once this operation finishes, and its bytes are reconstructible from
+the private journal blob, which is the same reason the quarantine itself is a
+RECONSTRUCTIBLE move. A NON-EMPTY occupant of any OTHER diagnostic name is
+still reported as occupied and left untouched: `shared_diagnostic_name_is_taken`
+keeps that answer for the `<prefix>-<digest>` quarantine, whose bytes are
+foreign.
+`oplog::wire::tests::a_stale_orphan_diagnostic_never_refuses_the_operation_that_owns_it`
+drives the whole journey — crash, completion, provider deletion, record
+compaction, exact repeat.
+
+**The put path's `orphan-` leak window, and its bound.** The crash between the
+quarantine rename and the identity-matched delete leaks one entry that outlives
+its operation's record compaction. It is bounded, not absent: the name is
+deterministic and the write is no-clobber, so at most ONE entry exists per
+(operation, staging generation), and the sweep is what retires it — once the
+record naming the operation has been compacted (§2.10c-i), the next sweep takes
+it. The sweep is the only bound, and it is a real one because every production
+writer of `removed/` reserves through the compacting front door
+`reserve_provider_diagnostic_capacity`, so the directory cannot grow past the
+trigger unswept (I-14).
+`oplog::wire::tests::an_orphan_diagnostic_leaked_by_the_cleanup_crash_window_is_retired_by_the_next_sweep`
+plants the crash-window entry, proves it is pinned while a record names it, and
+proves the sweep retires it once none does.
+
+A third shape, `removed/<prefix>-<digest>`, quarantines FOREIGN bytes that took
+a name this device expected to own. The graph is not their authority, so no
+sweep retires them. Nothing in a production build writes one
+(`quarantine_provider_name` is `#[cfg(test)]`).
+
+**The defect this replaces.** `ensure_provider_diagnostic_capacity` refused any
+write that would exceed `MAX_PROVIDER_RESIDUE_ENTRIES` (512), and nothing ever
+retired an entry. The cap was therefore a bound on the LIFETIME of a shared,
+sync-replicated tree, and the write it refused first is the conflict-copy
+CLEANUP (`remove_identical_generated_conflict`, one entry per sync-service
+conflict copy cleaned up, on a boundary that produces them indefinitely). Past
+512 cleanups the user kept every further conflict copy, permanently, with no
+way out from inside the app (I-10, I-14).
+
+**Retention bound.** `removed/` is bounded by *live journal state*, never by
+the lifetime of the store. Before an operation adds a diagnostic, if the
+directory holds `PROVIDER_RESIDUE_COMPACTION_TRIGGER` (128) entries or more it
+is first swept against the journal (`reconcile_residue_against_journal`).
+`reserve_provider_diagnostic_capacity` is the ONE front door every production
+writer of `removed/` goes through, including the retirement placeholder in
+`reconcile_provider_retirement`; the non-compacting
+`ensure_provider_diagnostic_capacity` only refuses, so a second production
+caller of it would reintroduce the store-lifetime cap on that one path (D-14).
+`oplog::wire::tests::reserving_removed_capacity_has_exactly_one_production_front_door`
+counts its callers in production source.
+`MAX_PROVIDER_RESIDUE_ENTRIES` (512) remains the structural scan bound, and the
+sweep keeps the directory well below it. The trigger sits above the journal's
+own completed-store trigger (64) because the two stores compact in lockstep: a
+diagnostic becomes retirable exactly when the completed record naming it has
+been retired, so the residue steady state tracks the journal steady state.
+Reaching the trigger is an instruction to re-observe the journal, **not** a
+reason to fail the user's next cleanup.
+
+**What the sweep retires, and why each is safe.** The predicate is one
+question — *does any journal record, pending or completed, still name this
+operation?* — and it never consults age or arrival order: these names are
+hashes over the operation and its bytes, so the directory has no chronology and
+a time or count window over it could suppress the wrong operation's evidence.
+
+| Entry | Retired when | Why an exact repeat still reaches the same outcome |
+| --- | --- | --- |
+| `retired-<operation id>` of a **remove** | No record in `records/` or `completed/` names the operation | Source gone: the diagnostic was read by nobody — a `RequirePresent` caller gets `UnknownProviderPath` and a `SettleIfAbsent` caller settles, with or without it (see the §3.1 row). Source back: the settle shortcut goes with the diagnostic, so the repeat performs the ordinary authorized removal it would have performed had this device never run the operation. Same end state — and for the conflict-copy cleanup that is this store's only production remove, the state the caller actually wants, because the settle shortcut left the redelivered copy in place (I-10). |
+| `orphan-<operation id>-<generation>` | No record in `records/` or `completed/` names the operation | Nothing reads it as authority. Retiring it also frees the name, which the no-clobber reservation in `quarantine_unowned_staging` would otherwise refuse on a repeat of the same staging generation. |
+| `<prefix>-<digest>` quarantine | Never | These are foreign bytes the graph is not the authority for. No production writer exists, so the class contributes nothing to growth — `quarantine_provider_name` is `#[cfg(test)]`, which `oplog::wire::tests::only_tests_can_quarantine_a_raced_shared_provider_name` pins as compile-time structure rather than intent. |
+
+**The rename caveat, stated rather than assumed.** A retired RENAME is the one
+operation whose diagnostic stays load-bearing after its record is gone: an
+exact repeat settles from it with the source gone (the destination holds the
+retired bytes) *and* with the source back, and without it the repeat either
+reports an unknown source path or conflicts with the destination it published
+itself. The sweep cannot tell a rename diagnostic from a remove diagnostic —
+both are `retired-<operation id>`, and the operation id is a hash that does not
+carry the operation's paths back. What makes the sweep sound is that **no
+production code writes a rename retirement diagnostic**:
+`run_provider_rename_with` is `#[cfg(test)]`, which
+`oplog::wire::tests::only_tests_can_write_a_provider_rename_retirement_diagnostic`
+pins as compile-time structure rather than intent. A production rename writer
+may not be added without giving its diagnostic a retention rule here.
+
+**The sweep commits per entry, and needs no generation pointer.** Each entry is
+*independently* retirable and its retirement is idempotent, so a crash part-way
+through leaves a prefix retired and the rest untouched — a state the next sweep
+reaches again by itself. There is no mixed generation to publish atomically.
+Every individual removal is a `remove_file` followed by a directory `fsync`.
+
+**Capacity and validation are two questions, not one.** The capacity check used
+to answer "is there room for one more" by walking the whole directory and, per
+entry, calling `open_provider_file_nofollow` and `validate_provider_regular_file`
+— up to 512 opens and 512 stats on a path the user waits on, to answer a
+question that needs only a count (I-13, I-15). Counting is now count-only. The
+no-follow regular-file check is real work and it runs where it is used: once
+per sweep, and on the exact entry every reader opens through
+`open_provider_regular_optional`. Validating 511 unrelated diagnostics told the
+512th write nothing, and that write is no-clobber, so a hostile sibling cannot
+be published over.
+
+**Proof.**
+`oplog::wire::tests::provider_removed_residue_retires_against_live_journal_state`
+drives `MAX_PROVIDER_RESIDUE_ENTRIES + 64` conflict cleanups through the
+production writer — past the cap, where the old refusal fired — and asserts no
+cleanup fails and that the steady-state and peak `removed/` counts stay at or
+below the trigger.
+`…::retired_provider_residue_still_reaches_the_same_outcome_for_an_exact_repeat`
+proves the diagnostic is pinned while a record names it, retired once none
+does, and that both exact repeats — source gone and source back — reach the
+same end state afterwards.
+`…::a_crash_across_provider_residue_retirement_reopens_and_converges` cuts a
+sweep at the `ResidueRetired` boundary, reopens, and proves the next sweep
+converges.
+`…::provider_residue_classification_covers_only_this_stores_own_diagnostics`
+pins that a foreign-bytes quarantine is not classified as this store's residue.
 
 ### 2.10d When the graph filesystem folds two page names into one file
 

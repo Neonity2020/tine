@@ -51,15 +51,15 @@ const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "crates/tine-core/src/oplog/batch.rs", lines: &[205], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "batch composition contains public enum kinds and numeric sizes only", gate: "TINE_BATCH_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", lines: &[999], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "checkpoint writer thread spawn carries only a std::io::Error", gate: "always-on reviewed failure" },
     AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", lines: &[1046], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "publish_capture's error is a bounded literal or an object-store error over digest-named private blobs", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", lines: &[8811], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "validate_and_apply phase timing contains a phase index and a duration", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", lines: &[10864, 14409, 15425, 15453, 15632, 18174, 18203, 18237, 18269, 19126, 19152, 19290, 19309, 21695, 24353], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", lines: &[8831], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "validate_and_apply phase timing contains a phase index and a duration", gate: "TINE_PHASE_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", lines: &[10884, 14486, 15502, 15530, 15709, 18251, 18280, 18314, 18346, 19203, 19229, 19367, 19386, 21720, 24378], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/import.rs", lines: &[1727, 1739], macro_name: "eprintln", bucket: "a", class: "fixed-debug", why: "clean-genesis recovery reports one of two fixed states", gate: "runtime_debug_diagnostics_enabled" },
     AllowedSite { file: "crates/tine-core/src/oplog/local_journal_drain.rs", lines: &[846, 873, 889, 914], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "managed-local drain timings contain fixed labels and durations", gate: "TINE_PHASE_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/object_store.rs", lines: &[1888], macro_name: "eprintln", bucket: "b", class: "enum-trace", why: "immutable publication reports only a fixed artifact class", gate: "TINE_PUBLISH_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2870, 3165, 3209], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "projection diagnostics are available only for an explicitly directed phase trace", gate: "TINE_PHASE_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2975], macro_name: "eprintln", bucket: "b", class: "directed-core-content", why: "this one DOES render target bytes as lossy UTF-8; it is graph content and stays behind the directed trace", gate: "TINE_PHASE_TRACE" },
     AllowedSite { file: "crates/tine-core/src/oplog/semantic.rs", lines: &[935], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "semantic snapshot diagnostic contains counts and encoded byte sizes", gate: "TINE_SEMANTIC_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", lines: &[1942, 4636, 4640, 4647, 4660, 4672, 4680, 4692, 5454], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_TERMINAL_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", lines: &[1942, 4636, 4640, 4647, 4660, 4672, 4680, 4692, 5454], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
     AllowedSite { file: "crates/tine-core/src/publish.rs", lines: &[4644, 4674], macro_name: "eprintln", bucket: "a", class: "content-free-debug", why: "publication refusals report only a fixed shape or collision count", gate: "runtime_debug_diagnostics_enabled" },
     AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[6418], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "watcher trace is explicitly enabled for a directed investigation", gate: "TINE_CLEAN_WATCHER_TRACE" },
     AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[7188, 7206], macro_name: "eprintln", bucket: "a", class: "numeric-debug", why: "clean-open stage and counter reports contain fixed names and numeric measurements", gate: "runtime_debug_diagnostics_enabled" },
@@ -318,4 +318,85 @@ fn real_corpus_open_save_publish_emits_no_page_name_with_debug_disabled() {
         matches, 0,
         "captured stderr contained {matches} corpus page-name matches"
     );
+}
+
+/// I-11: a directed trace flag is a contract row, not a free-text gate.
+///
+/// The class-(b) `gate:` fields above and the class-(b) paragraph of
+/// `docs/contracts/diagnostics.md` named the same flags in two places with
+/// nothing comparing them, so either could drift silently — a flag could be
+/// retired from the contract and still gate a live print site, or a new
+/// `TINE_*_TRACE` channel could be added with no contract row at all. Both
+/// directions are pinned here.
+///
+/// `docs/contracts/diagnostics.md` is the exemplar to follow when adding a
+/// channel: name the flag in that paragraph first, then classify the site.
+///
+/// Scope: `crates/tine-core/src` only. src-tauri's directed channel is
+/// `debug_enabled()` behind `TINE_DEBUG`, which has its own producer pin in
+/// `exactly_one_function_reads_the_debug_diagnostics_flag`; it reads no
+/// `_TRACE` flag, and this packet does not touch that tree.
+#[test]
+fn directed_trace_flags_are_the_same_set_in_the_contract_and_in_the_census() {
+    let repair = "I-11: a directed trace flag is a contract row, not a free-text gate. \
+         Every `TINE_*_TRACE` channel is named in the class (b) paragraph of \
+         `docs/contracts/diagnostics.md` (the exemplar) AND appears in the `gate:` field of \
+         the class (b) ALLOWLIST row for the site it gates. Add the contract row first.";
+    let flag = Regex::new(r"TINE_[A-Z0-9_]*_TRACE").unwrap();
+
+    let contract = fs::read_to_string(repo_root().join("docs/contracts/diagnostics.md")).unwrap();
+    let paragraph = contract
+        .split_once("The retained class (b) channels are named")
+        .expect("diagnostics.md must carry the class (b) channel paragraph")
+        .1
+        .split_once("\n\n")
+        .expect("the class (b) channel paragraph must end")
+        .0;
+    let mut contract_flags = flag
+        .find_iter(paragraph)
+        .map(|found| found.as_str().to_owned())
+        .collect::<Vec<_>>();
+    contract_flags.sort();
+    contract_flags.dedup();
+    assert!(
+        paragraph.contains("TINE_DEBUG"),
+        "{repair} The process-level `TINE_DEBUG` opt-in stays named in the same paragraph; \
+         it is not a directed trace channel and has its own producer pin."
+    );
+
+    let mut census_flags = ALLOWLIST
+        .iter()
+        .filter(|entry| entry.bucket == "b")
+        .flat_map(|entry| {
+            flag.find_iter(entry.gate)
+                .map(|found| found.as_str().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    census_flags.sort();
+    census_flags.dedup();
+    assert_eq!(census_flags, contract_flags, "{repair}");
+
+    let root = repo_root();
+    let core = root.join("crates/tine-core/src");
+    let read = Regex::new(r#"env::var(?:_os)?\s*\(\s*"(TINE_[A-Z0-9_]+)""#).unwrap();
+    let mut unpinned = Vec::new();
+    for file in production_source_files() {
+        if !file.starts_with(&core) {
+            continue;
+        }
+        let source = compiled_source(&file);
+        for found in read.captures_iter(&source) {
+            let name = found[1].to_string();
+            if !name.ends_with("_TRACE") || contract_flags.contains(&name) {
+                continue;
+            }
+            unpinned.push(format!(
+                "{}:{} {name}",
+                relative_path(&root, &file),
+                line_of(&source, found.get(0).unwrap().start())
+            ));
+        }
+    }
+    assert!(unpinned.is_empty(), "{repair} Unpinned: {unpinned:?}");
 }

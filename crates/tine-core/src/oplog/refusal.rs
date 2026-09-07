@@ -62,37 +62,17 @@ impl ManagedStorageRefusalScenario {
 /// Complete vocabulary of blocked reason codes emitted by production managed
 /// storage. Keep this table data-shaped so the source guard can compare it to
 /// every literal at the two construction boundaries.
-pub(crate) const BLOCKED_REASON_SCENARIOS: [(&str, ManagedStorageRefusalScenario); 8] = [
-    (
-        "explicit_identity_binding_mismatch",
-        ManagedStorageRefusalScenario::SyncConflict,
-    ),
-    (
-        "shared.descriptor-conflict",
-        ManagedStorageRefusalScenario::SyncConflict,
-    ),
-    (
-        "shared.dirty-unique-tail",
-        ManagedStorageRefusalScenario::SyncConflict,
-    ),
-    (
-        "shared.incompatible-descriptor",
-        ManagedStorageRefusalScenario::ProtocolIncompatible,
-    ),
-    (
-        "shared.local-proof-mismatch",
-        ManagedStorageRefusalScenario::DiskCorrupt,
-    ),
-    (
-        "shared.projection-base-mismatch",
-        ManagedStorageRefusalScenario::SyncConflict,
-    ),
-    (
-        "shared.unsafe-handoff",
-        ManagedStorageRefusalScenario::StaleGeneration,
-    ),
-    ("proof.failed", ManagedStorageRefusalScenario::DiskCorrupt),
-];
+///
+/// Seven `shared.*` / `proof.failed` codes were removed on 2026-09-07: nothing
+/// in production constructs a `BlockedV1` record with them (the shared-
+/// enrollment write side was retired by `2a578d87`, D-1), so registering them
+/// was a lying doc in table form (I-11). An unrecognised durable code read back
+/// from disk is still handled: `blocked_reason_scenario` maps it to
+/// `ProtocolIncompatible` rather than guessing a recovery.
+pub(crate) const BLOCKED_REASON_SCENARIOS: [(&str, ManagedStorageRefusalScenario); 1] = [(
+    "explicit_identity_binding_mismatch",
+    ManagedStorageRefusalScenario::SyncConflict,
+)];
 
 impl fmt::Display for ManagedStorageRefusalScenario {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

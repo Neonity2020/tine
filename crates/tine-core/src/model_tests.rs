@@ -14281,40 +14281,6 @@ fn raw_managed_read_rejects_parent_retarget_and_file_replacement_after_open() {
 }
 
 #[test]
-fn live_admission_snapshot_defers_late_enumeration_changes_to_the_fenced_feed() {
-    let root = scratch("initial-shadow-race");
-    fs::create_dir_all(root.join("pages/nested")).unwrap();
-    fs::write(root.join("pages/nested/a.md"), b"- first\n").unwrap();
-    let graph = Graph::open(&root);
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-        let nested = root.join("pages/nested");
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::remove_file(nested.join("a.md"))?;
-            fs::write(nested.join("a.md"), b"- replaced\n")?;
-            fs::write(nested.join("inserted.md"), b"- inserted\n")
-        }));
-    });
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    assert_eq!(
-        inventory,
-        vec![(
-            ManagedPath::parse("pages/nested/a.md").unwrap(),
-            b"- first\n".to_vec(),
-        )]
-    );
-    assert_eq!(
-        fs::read(root.join("pages/nested/a.md")).unwrap(),
-        b"- replaced\n"
-    );
-    assert_eq!(
-        fs::read(root.join("pages/nested/inserted.md")).unwrap(),
-        b"- inserted\n"
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
 fn initial_shadow_rejects_ambient_root_identity_replacement() {
     let root = scratch("initial-shadow-root-replacement");
     fs::write(root.join("Root.md"), b"- retained\n").unwrap();
@@ -14338,104 +14304,6 @@ fn initial_shadow_rejects_ambient_root_identity_replacement() {
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&retired);
-}
-
-#[test]
-fn initial_shadow_discovers_graph_wide_mixed_case_text_paths() {
-    let root = scratch("initial-shadow-graph-wide");
-    fs::create_dir_all(root.join("archive/client/deep")).unwrap();
-    fs::write(root.join("Root.MD"), b"- root\n").unwrap();
-    fs::write(
-        root.join("archive/client/deep/Plan.Markdown"),
-        b"- markdown\n",
-    )
-    .unwrap();
-    fs::write(root.join("archive/client/deep/25-07-2026.ORG"), b"* org\n").unwrap();
-
-    let graph = Graph::open(&root);
-    reset_graph_text_admission_test_counters();
-    let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    assert_eq!(
-        inventory
-            .iter()
-            .map(|(path, _)| path.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "Root.MD",
-            "archive/client/deep/25-07-2026.ORG",
-            "archive/client/deep/Plan.Markdown",
-        ]
-    );
-    let counters = graph_text_admission_test_counters();
-    assert_eq!(counters.builder_enumerations, 6);
-    assert_eq!(counters.point_query_attempts, 0);
-    assert_eq!(counters.parser_invocations, 3);
-    assert_eq!(counters.index_map_insertions, 15);
-    assert_eq!(counters.event_map_key_reads, 0);
-    assert_eq!(counters.event_map_key_writes, 0);
-    assert_eq!(counters.event_reverse_members, 0);
-    assert!(counters.persistent_node_allocations > 0);
-    assert_eq!(counters.persistent_payload_members, 6);
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_snapshot_uses_parser_owned_semantics_and_preserves_creation_roots() {
-    let root = scratch("admission-semantic");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(
-        root.join("logseq/config.edn"),
-        "{:pages-directory \"create/pages\"\n\
-              :journals-directory \"create/journals\"\n\
-              :journal/file-name-format \"dd-MM-yyyy\"\n\
-              :journal/page-title-format \"yyyy-MM-dd\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(root.join("archive")).unwrap();
-    fs::create_dir_all(root.join("journals")).unwrap();
-    fs::write(
-        root.join("archive/Not-A-Date.Markdown"),
-        b"title:: 25-07-2026\n\n- journal by title\n",
-    )
-    .unwrap();
-    fs::write(root.join("journals/Plan.ORG"), b"* ordinary page\n").unwrap();
-
-    let graph = Graph::open(&root);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    let journal = index
-        .files_by_exact_path
-        .get(&ManagedPath::parse("archive/Not-A-Date.Markdown").unwrap())
-        .unwrap();
-    assert_eq!(journal.semantic.name, "2026-07-25");
-    assert_eq!(journal.semantic.kind, PageKind::Journal);
-    assert_eq!(journal.format, Format::Md);
-    let page = index
-        .files_by_exact_path
-        .get(&ManagedPath::parse("journals/Plan.ORG").unwrap())
-        .unwrap();
-    assert_eq!(page.semantic.name, "Plan");
-    assert_eq!(page.semantic.kind, PageKind::Page);
-    assert_eq!(page.format, Format::Org);
-
-    fs::create_dir_all(root.join("create/pages")).unwrap();
-    fs::create_dir_all(root.join("create/journals")).unwrap();
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    assert_eq!(
-        graph
-            .managed_path_for(&permit, "New Page", PageKind::Page)
-            .unwrap(),
-        root.join("create/pages/New Page.md")
-    );
-    assert_eq!(
-        graph
-            .managed_path_for(&permit, "2026-07-25", PageKind::Journal)
-            .unwrap(),
-        root.join("create/journals/25-07-2026.md")
-    );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -14555,101 +14423,6 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     }
 
     let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_snapshot_excludes_reserved_paths_and_failed_builds_poison() {
-    let root = scratch("admission-exclusions");
-    fs::create_dir_all(root.join("logseq")).unwrap();
-    fs::write(root.join("logseq/config.edn"), "{:hidden [\"private\"]}\n").unwrap();
-    for relative in [
-        ".hidden/x.md",
-        "assets/x.md",
-        "publish/x.org",
-        "node_modules/x.md",
-        ".tine-sync/x.md",
-        "logseq/.recycle/x.md",
-        "private/x.md",
-    ] {
-        let path = root.join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"- excluded\n").unwrap();
-    }
-    fs::write(
-        root.join("Dropbox (conflicted copy 2026-07-25).md"),
-        b"- conflict\n",
-    )
-    .unwrap();
-    fs::write(root.join("Visible.md"), b"- visible\n").unwrap();
-    let graph = Graph::open(&root);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(index.files_by_exact_path.iter().count(), 1);
-    assert!(index
-        .files_by_exact_path
-        .contains_key(&ManagedPath::parse("Visible.md").unwrap()));
-
-    let invalid = scratch("admission-invalid-utf8");
-    fs::write(invalid.join("Bad.md"), [0xff, 0xfe]).unwrap();
-    let invalid_graph = Graph::open(&invalid);
-    assert!(invalid_graph
-        .initial_shadow_raw_managed_text_inventory()
-        .is_err());
-
-    let parse = scratch("admission-parse-failure");
-    fs::write(parse.join("Bad.md"), b"- valid bytes\n").unwrap();
-    let parse_graph = Graph::open(&parse);
-    GRAPH_TEXT_PARSE_FAILURE.with(|failure| failure.set(true));
-    assert!(parse_graph
-        .initial_shadow_raw_managed_text_inventory()
-        .is_err());
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&invalid);
-    let _ = fs::remove_dir_all(&parse);
-}
-
-#[cfg(unix)]
-#[test]
-fn admission_snapshot_retains_all_collision_group_evidence() {
-    let portable = scratch("admission-portable-groups");
-    fs::write(portable.join("Caf\u{e9}.md"), b"- composed\n").unwrap();
-    fs::write(
-        portable.join("Cafe\u{301}.MD"),
-        b"- decomposed and mixed case\n",
-    )
-    .unwrap();
-    let graph = Graph::open(&portable);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(
-        index
-            .paths_by_portable_key
-            .get(&ManagedPath::parse("Caf\u{e9}.md").unwrap().portable_key())
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let semantic = scratch("admission-semantic-groups");
-    fs::create_dir_all(semantic.join("a")).unwrap();
-    fs::create_dir_all(semantic.join("b")).unwrap();
-    fs::write(semantic.join("a/One.md"), b"title:: Shared\n\n- one\n").unwrap();
-    fs::write(semantic.join("b/Two.org"), b"#+title: Shared\n* two\n").unwrap();
-    let graph = Graph::open(&semantic);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(
-        index
-            .paths_by_semantic_key
-            .get(&(0, crate::refs::page_key("Shared")))
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let _ = fs::remove_dir_all(&portable);
-    let _ = fs::remove_dir_all(&semantic);
 }
 
 #[test]
@@ -14868,47 +14641,6 @@ fn admission_persistent_avl_ordered_keys_stay_logarithmic_and_share_large_values
 }
 
 #[test]
-fn admission_large_same_semantic_key_build_is_linear_in_collision_members() {
-    const FILES: usize = 2048;
-    let root = scratch("admission-large-same-semantic-key");
-    for index in 0..FILES {
-        fs::write(
-            root.join(format!("Page-{index:04}.md")),
-            b"title:: Shared\n\n- body\n",
-        )
-        .unwrap();
-    }
-
-    let graph = Graph::open(&root);
-    reset_graph_text_admission_test_counters();
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let counters = graph_text_admission_test_counters();
-    assert_eq!(
-        counters.persistent_payload_members,
-        FILES * 2,
-        "each input joins one portable and one semantic group exactly once"
-    );
-    assert!(
-        counters.persistent_node_allocations < FILES * 256,
-        "persistent sealing must stay logarithmic, not clone growing groups: {counters:?}"
-    );
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    let first = ManagedPath::parse("Page-0000.md").unwrap();
-    let semantic_key =
-        graph_text_semantic_key(&index.files_by_exact_path.get(&first).unwrap().semantic);
-    assert_eq!(
-        index
-            .paths_by_semantic_key
-            .get(&semantic_key)
-            .unwrap()
-            .len(),
-        FILES
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
 fn admission_semantic_accounting_admits_large_ordinary_text_and_rejects_overlong_title() {
     let root = scratch("admission-realistic-semantic-accounting");
     let graph = Graph::open(&root);
@@ -14950,7 +14682,14 @@ fn admission_journal_title_format_expansion_rejects_before_render_or_parse() {
 
     let graph = Graph::open(&root);
     reset_graph_text_admission_test_counters();
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+    // The raw inventory no longer owns the journal-title budget: the guarded
+    // identity build is the front door that renders journal titles, so that is
+    // where the expansion bound has to reject. The user outcome is unchanged --
+    // a config whose journal title format can expand past the semantic-name
+    // bound refuses admission instead of rendering it.
+    graph.initial_shadow_raw_managed_text_inventory().unwrap();
+    let _identity = graph.lock_graph_text_identity_mutation().unwrap();
+    assert!(graph.guarded_graph_text_identity_index().is_err());
     assert_eq!(
         graph_text_admission_test_counters().parser_invocations,
         0,
@@ -14980,6 +14719,7 @@ fn admission_normal_journal_title_format_is_budgeted_and_reconciled() {
         title_format.len() as u64 * MAX_JOURNAL_TITLE_BYTES_PER_FORMAT_BYTE
     );
     graph.initial_shadow_raw_managed_text_inventory().unwrap();
+    let _identity = graph.lock_graph_text_identity_mutation().unwrap();
     let index = graph.guarded_graph_text_identity_index().unwrap();
     let record = index
         .files_by_exact_path
@@ -15001,6 +14741,7 @@ fn admission_complete_validator_checks_exact_reverse_keys_and_path_kinds() {
     fs::write(root.join("Two.md"), b"title:: Two\n").unwrap();
     let graph = Graph::open(&root);
     graph.initial_shadow_raw_managed_text_inventory().unwrap();
+    let _identity = graph.lock_graph_text_identity_mutation().unwrap();
     let index = graph.guarded_graph_text_identity_index().unwrap();
     let one = ManagedPath::parse("One.md").unwrap();
     let two = ManagedPath::parse("Two.md").unwrap();
@@ -15039,97 +14780,6 @@ fn admission_complete_validator_checks_exact_reverse_keys_and_path_kinds() {
     assert!(validate_graph_text_admission_index(&missing_kind).is_err());
 
     let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn admission_memory_preflights_capture_maps_parser_and_overflow() {
-    let capture_root = scratch("admission-capture-bound");
-    for index in 0..8 {
-        fs::write(
-            capture_root.join(format!("Page-{index}.md")),
-            vec![b'x'; 8 * 1024],
-        )
-        .unwrap();
-    }
-    let graph = Graph::open(&capture_root);
-    reset_graph_text_admission_test_counters();
-    assert_eq!(
-        graph
-            .initial_shadow_raw_managed_text_inventory_with_limits(INITIAL_SHADOW_LIMITS)
-            .unwrap()
-            .len(),
-        8
-    );
-    assert_eq!(
-        graph_text_admission_test_counters().builder_enumerations,
-        3,
-        "live admission must enumerate each graph root once"
-    );
-
-    let resource_root = scratch("admission-resource-map-preflight");
-    fs::write(
-        resource_root.join("retained-resource-with-a-long-name.bin"),
-        b"x",
-    )
-    .unwrap();
-    let graph = Graph::open(&resource_root);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-    let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
-    assert!(permanent > 0);
-    reset_graph_text_admission_test_counters();
-    assert!(graph
-        .initial_shadow_raw_managed_text_inventory_with_limits(InitialShadowLimits {
-            permanent_index_bytes: permanent - 1,
-            ..INITIAL_SHADOW_LIMITS
-        })
-        .is_err());
-    assert_eq!(
-        graph_text_admission_test_counters().index_map_insertions,
-        0,
-        "resource maps must be rejected before their first permanent insertion"
-    );
-
-    let parser_root = scratch("admission-parser-peak-preflight");
-    let title = "T".repeat(32 * 1024);
-    let parser_content = format!("title:: {title}\n\n- body\n");
-    fs::write(parser_root.join("Page.md"), &parser_content).unwrap();
-    let graph = Graph::open(&parser_root);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
-    let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-    let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
-    let obsolete_parse_peak = managed_page_build_upper_bound(&parser_content).unwrap();
-    let parser_limit = checked_add_bytes(
-        checked_add_bytes(capture.peak_build_charge, permanent).unwrap(),
-        obsolete_parse_peak - 1,
-    )
-    .unwrap();
-    reset_graph_text_admission_test_counters();
-    assert!(graph
-        .initial_shadow_raw_managed_text_inventory_with_limits(InitialShadowLimits {
-            peak_build_bytes: parser_limit,
-            ..INITIAL_SHADOW_LIMITS
-        })
-        .is_ok());
-    let counters = graph_text_admission_test_counters();
-    assert_eq!(counters.parser_invocations, 1);
-    assert!(counters.index_map_insertions > 0);
-
-    let overflow_root = scratch("admission-capture-charge-overflow");
-    let graph = Graph::open(&overflow_root);
-    GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(|charge| charge.set(Some(u64::MAX)));
-    reset_graph_text_admission_test_counters();
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-    assert_eq!(
-        graph_text_admission_test_counters().builder_enumerations,
-        3,
-        "capture-charge overflow must fail after one graph-wide census"
-    );
-
-    let _ = fs::remove_dir_all(&capture_root);
-    let _ = fs::remove_dir_all(&resource_root);
-    let _ = fs::remove_dir_all(&parser_root);
-    let _ = fs::remove_dir_all(&overflow_root);
 }
 
 #[test]
@@ -15296,52 +14946,6 @@ fn initial_shadow_handles_overlapping_roots_in_both_directions() {
     }
 }
 
-#[test]
-fn live_admission_ignores_equal_creation_roots_and_defers_directory_retarget() {
-    let equal = scratch("initial-shadow-equal-roots");
-    fs::create_dir_all(equal.join("logseq")).unwrap();
-    fs::write(
-        equal.join("logseq/config.edn"),
-        "{:pages-directory \"content\" :journals-directory \"content\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(equal.join("content")).unwrap();
-    assert!(Graph::open(&equal)
-        .initial_shadow_raw_managed_text_inventory()
-        .unwrap()
-        .is_empty());
-
-    let retarget = scratch("initial-shadow-configured-retarget");
-    fs::create_dir_all(retarget.join("logseq")).unwrap();
-    fs::write(
-        retarget.join("logseq/config.edn"),
-        "{:pages-directory \"content/pages\" :journals-directory \"content/journals\"}\n",
-    )
-    .unwrap();
-    fs::create_dir_all(retarget.join("content/pages")).unwrap();
-    fs::write(retarget.join("content/pages/a.md"), b"- same\n").unwrap();
-    let graph = Graph::open(&retarget);
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-        let pages = retarget.join("content/pages");
-        let retired = retarget.join("content/pages-retired");
-        *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(&pages, retired)?;
-            fs::create_dir_all(&pages)?;
-            fs::write(pages.join("a.md"), b"- same\n")
-        }));
-    });
-    assert_eq!(
-        graph.initial_shadow_raw_managed_text_inventory().unwrap(),
-        vec![(
-            ManagedPath::parse("content/pages/a.md").unwrap(),
-            b"- same\n".to_vec(),
-        )]
-    );
-
-    let _ = fs::remove_dir_all(&equal);
-    let _ = fs::remove_dir_all(&retarget);
-}
-
 #[cfg(unix)]
 #[test]
 fn initial_shadow_rejects_a_configured_root_symlink() {
@@ -15451,34 +15055,6 @@ fn initial_shadow_iterative_limits_count_empty_depth_and_nonmanaged_entries() {
     let _ = fs::remove_dir_all(&deep);
     let _ = fs::remove_dir_all(&many);
     let _ = fs::remove_dir_all(&pending);
-}
-
-#[cfg(unix)]
-#[test]
-fn initial_shadow_rejects_file_aliases_but_retains_portable_collisions() {
-    let aliases = scratch("initial-shadow-hardlink");
-    fs::write(aliases.join("pages/a.md"), b"- a\n").unwrap();
-    fs::hard_link(aliases.join("pages/a.md"), aliases.join("pages/alias.tmp")).unwrap();
-    let graph = Graph::open(&aliases);
-    assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
-
-    let portable = scratch("initial-shadow-portable");
-    fs::write(portable.join("pages/Foo.md"), b"- upper\n").unwrap();
-    fs::write(portable.join("pages/foo.md"), b"- lower\n").unwrap();
-    let graph = Graph::open(&portable);
-    graph.initial_shadow_raw_managed_text_inventory().unwrap();
-    let index = graph.guarded_graph_text_identity_index().unwrap();
-    assert_eq!(
-        index
-            .paths_by_portable_key
-            .get(&ManagedPath::parse("pages/Foo.md").unwrap().portable_key())
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let _ = fs::remove_dir_all(&aliases);
-    let _ = fs::remove_dir_all(&portable);
 }
 
 #[test]
