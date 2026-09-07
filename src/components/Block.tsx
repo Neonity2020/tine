@@ -2401,7 +2401,8 @@ export function Editor(props: { id: string }): JSX.Element {
       case "query-builder": {
         // Insert an empty query, commit it, and drop straight to the rendered
         // view so the visual builder appears — then flag this block so the
-        // builder opens its add-filter picker on mount.
+        // builder opens its SHEET with the field chooser focused on mount
+        // (SPEC §7.3; `/query` is one command).
         const r = applyCompletion(ref.value, t.start, t.end, QUERY_MACRO_SCAFFOLD);
         commit(r.raw);
         closeAc();

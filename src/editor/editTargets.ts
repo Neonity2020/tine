@@ -36,6 +36,15 @@ export const FORBID_EDIT_SELECTOR = [
 
 export function forbidsEditEntry(e: MouseEvent): boolean {
   const target = e.target as Element | null;
+  const host = e.currentTarget as Element;
+  // A press that is not in this host's DOM at all still arrives here: Solid
+  // delegates `mousedown` and walks a portal's `_$host`, so anything a block
+  // renders through `<Portal>` — the query sheet floats over the page in one,
+  // because `.query-block`'s `translateZ(0)` would trap a fixed child — is
+  // delivered to the block that owns it logically. That press landed on the
+  // floating surface, never on this block's text, and entering the editor
+  // would unmount the surface before its own click could reach it.
+  if (target && !host.contains(target)) return true;
   const hit = target?.closest?.(FORBID_EDIT_SELECTOR);
-  return !!hit && (e.currentTarget as Element).contains(hit);
+  return !!hit && host.contains(hit);
 }

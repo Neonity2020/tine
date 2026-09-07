@@ -898,6 +898,10 @@ export function QueryMacro(props: {
   // The query text pane holds text that does not parse: the rows below are the
   // last reading that RAN, so they are greyed rather than blanked (§4.3.1).
   const [paneStale, setPaneStale] = createSignal(false);
+  /** Whether the sentence-and-sheet builder is hosted for this block. The
+   *  result count lives beside the sentence when it is, and in the header when
+   *  it is not (§7.2). */
+  const showBuilder = () => !!props.blockId && !isAdvanced() && !!builderSession();
   const unsupportedAdvanced = () => isAdvanced() && advInfo() && (
     !advInfo()!.supported || (props.strictAdvanced === true && advInfo()!.ignored.length > 0)
   );
@@ -987,7 +991,13 @@ export function QueryMacro(props: {
                   );
                 })()}
               </Show>{" "}
-              <span class="query-count">{total()}</span>
+              {/* §7.2 moves the count beside the resting SENTENCE, where the
+                  builder renders it. It stays here for the queries that have no
+                  builder — an authored advanced query, or a block whose reading
+                  has not landed yet — so the count never disappears. */}
+              <Show when={!showBuilder()}>
+                <span class="query-count">{total()}</span>
+              </Show>
               <Show when={props.blockId}>
                 <div class="query-view-switcher" role="group" aria-label="Query view" onClick={stop}>
                   <For each={QUERY_VIEWS}>
@@ -1009,14 +1019,15 @@ export function QueryMacro(props: {
             </div>
             {/* The builder edits a FILTER. An authored advanced (datalog) query
                 keeps its own editing path — converting one into a filter is out
-                of scope (§4.3.1, Q13) — so the chip bar stays hidden for it and
-                the ran/ignored note above says which clauses took. */}
-            <Show when={props.blockId && !isAdvanced() && builderSession()}>
+                of scope (§4.3.1, Q13) — so the sentence and sheet stay hidden
+                for it and the ran/ignored note above says which clauses took. */}
+            <Show when={showBuilder()}>
               <QueryBuilder
                 session={builderSession}
                 onChange={(next) => void applyEdit(next)}
                 paneDialect="tql"
                 blockId={props.blockId}
+                total={<span class="query-count">{total()}</span>}
                 onStale={setPaneStale}
               />
             </Show>

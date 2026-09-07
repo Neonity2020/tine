@@ -104,16 +104,34 @@ function parsedAs(text: string): ParsedQuery {
   };
 }
 
+/** The text pane lives in the SHEET's footer now, and the sheet is portalled to
+ *  <body> (`.query-block`'s own compositing layer would otherwise trap it), so
+ *  the pane is reached by opening the sheet and querying the document. */
+async function openSheet(root: HTMLElement): Promise<HTMLElement> {
+  const gear = await vi.waitFor(() => {
+    const found = root.querySelector<HTMLButtonElement>(".qs-gear");
+    if (!found) throw new Error("the query sentence never appeared");
+    return found;
+  });
+  if (!document.querySelector(".qs-sheet")) gear.click();
+  return await vi.waitFor(() => {
+    const sheet = document.querySelector<HTMLElement>(".qs-sheet");
+    if (!sheet) throw new Error("the sheet never opened");
+    return sheet;
+  });
+}
+
 async function openPane(root: HTMLElement): Promise<HTMLTextAreaElement> {
+  const sheet = await openSheet(root);
   const details = await vi.waitFor(() => {
-    const found = root.querySelector<HTMLDetailsElement>(".query-text-pane-details");
+    const found = sheet.querySelector<HTMLDetailsElement>(".query-text-pane-details");
     if (!found) throw new Error("the query text pane never appeared");
     return found;
   });
   details.open = true;
   details.dispatchEvent(new Event("toggle"));
   return await vi.waitFor(() => {
-    const input = root.querySelector<HTMLTextAreaElement>(".query-text-pane-input");
+    const input = sheet.querySelector<HTMLTextAreaElement>(".query-text-pane-input");
     if (!input) throw new Error("the pane has no input");
     return input;
   });
@@ -125,7 +143,7 @@ async function saveThroughPane(root: HTMLElement, text: string): Promise<void> {
   input.value = text;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   const save = await vi.waitFor(() => {
-    const button = root.querySelector<HTMLButtonElement>(".query-text-pane-save");
+    const button = document.querySelector<HTMLButtonElement>(".query-text-pane-save");
     if (!button || button.disabled) throw new Error("save is not enabled yet");
     return button;
   });

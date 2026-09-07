@@ -182,8 +182,15 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   with a field selector, `(sort-by …)`. Results render as a list or a sortable
   **table** or board. Search, list, table, and board are presentations of one result
   membership rather than separate query implementations. ⊕ A friendly search-text
-  surface, a Gmail-style filter dialog, the interactive **visual query builder**
-  (chip/clause bar), and the raw DSL all compile to the same query plan. Explanations
+  surface, a Gmail-style filter dialog, the interactive **visual query builder**,
+  and the raw DSL all compile to the same query plan. The builder has two states:
+  at rest a query block is ONE plain-English sentence — *Blocks where task: TODO
+  and page: Roadmap* — with its result count and a ⚙; clicking it opens a **sheet**
+  over the blocks below, with `Find blocks ▾ where …` on top and one
+  `field ▾ | operator ▾ | value | ⋮ | ×` row per condition, groupable as
+  *all of* / *any of* / *none of*. Changing what a query selects re-reads it
+  first and says how many conditions stop applying rather than dropping them.
+  Below ~600px the sheet becomes a bottom sheet. Explanations
   show what Tine understood and diagnostics identify unsupported or invalid parts.
   Nested query matches follow Logseq's exact top-level-result rule: a match is
   suppressed only when its immediate parent is also a match, so a valid match
@@ -715,5 +722,5 @@ within a column; merged cells are still v2+.
 <p align="center">
   <img src="img/dim.png" alt="Dim inactive blocks — spotlight the one you're working on" width="32%">
   <img src="img/carry.png" alt="Carry unfinished tasks forward to today" width="32%">
-  <img src="img/query.png" alt="Query results + the visual query builder chip bar" width="32%">
+  <img src="img/query.png" alt="Query results + the visual query builder: a resting sentence over a sheet of condition rows" width="32%">
 </p>

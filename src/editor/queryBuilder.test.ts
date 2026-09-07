@@ -12,6 +12,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ADVANCED_PHRASE,
+  MAX_QUERY_BUILDER_DEPTH,
   addChild,
   betweenFilter,
   builderLeafKind,
@@ -20,8 +22,12 @@ import {
   currentAgg,
   currentGroup,
   currentSort,
+  encodePropertyLeaf,
   escapeLike,
   filterLabel,
+  filterValueLabel,
+  filterPhrase,
+  groupWithPrevious,
   journalFilter,
   namespaceFilter,
   onPageFilter,
@@ -31,8 +37,13 @@ import {
   planningFilter,
   plainLikeSubstring,
   priorityFilter,
-  operatorsFor,
   propertyFilter,
+  propertyLeafTest,
+  propertyOperatorArity,
+  propertyOperatorLabel,
+  propertyOperators,
+  querySentence,
+  readLikePattern,
   removeAt,
   replaceAt,
   searchFilter,
@@ -44,11 +55,11 @@ import {
   withGroup,
   withSort,
   wrapAt,
+  type PropertyOperatorId,
 } from "./queryBuilder";
 import {
   forEachFilter,
   type Cardinality,
-  type CmpOp,
   type Filter,
   type ObservedType,
   type ViewSettings,
@@ -307,6 +318,38 @@ describe("builderLeafKind", () => {
 // builder, invalid ones included". The golden wire fixture is the widest IR the
 // two sides agree on, so labelling every node of it is the strongest cheap
 // statement of totality available here.
+describe("filterValueLabel: the row's value cell holds VALUES", () => {
+  // The row names its field and its operator in two cells of its own, so the
+  // third must not say them a third time: `Task marker ▾ | is any of ▾ | task:
+  // TODO | DOING` is what the sentence says, not what a value cell says.
+  it("drops the prose and keeps the operands", () => {
+    expect(filterValueLabel(taskFilter(["NOW", "LATER"]))).toBe("NOW | LATER");
+    expect(filterValueLabel(propertyFilter("type", "book"))).toBe("book");
+    expect(filterValueLabel(onPageFilter("Alpha"))).toBe("Alpha");
+    expect(filterValueLabel(namespaceFilter("Projects"))).toBe("Projects");
+    expect(filterValueLabel(pageRefFilter("Foo"))).toBe("Foo");
+    expect(filterValueLabel(contentFilter("100% done"))).toBe("100% done");
+    expect(filterValueLabel(betweenFilter("scheduled", "-7d", "+7d"))).toBe("-7d ~ +7d");
+  });
+
+  it("keeps the whole phrase when a condition compares against nothing", () => {
+    // An empty cell would be nothing to read and nothing to click.
+    expect(filterValueLabel(journalFilter())).toBe("on journal page");
+  });
+
+  it("never says more than the sentence does", () => {
+    for (const filter of [
+      taskFilter(["NOW"]),
+      propertyFilter("type", "book"),
+      pageTagsFilter(["a", "b"]),
+      pagePropertyFilter("fach", "x"),
+      journalFilter(),
+    ]) {
+      expect(filterLabel(filter).length).toBeGreaterThanOrEqual(filterValueLabel(filter).length);
+    }
+  });
+});
+
 describe("filterLabel is total over the IR", () => {
   const fixture = JSON.parse(
     readFileSync(
@@ -478,111 +521,360 @@ describe("view settings edits", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Typed operators over the registry type (SPEC §7.4, §9 P2; T2)
+// Operator identities over the registry type (SPEC §7.4, design §2.4; P3 T3)
 // ---------------------------------------------------------------------------
 
-describe("operatorsFor: the comparison family for a registry type", () => {
-  const ops = (type: ObservedType, cardinality: Cardinality = "one") =>
-    operatorsFor({ type, cardinality }).map((o) => o.op);
+describe("propertyOperators: the identity menu for a registry type", () => {
+  const ids = (type: ObservedType, cardinality: Cardinality = "one") =>
+    propertyOperators({ type, cardinality }).map((o) => o.id);
 
-  /** The operand a row builds for `texts`, or null. */
-  const operandOf = (
-    type: ObservedType,
-    op: CmpOp,
-    texts: string[],
-    cardinality: Cardinality = "one",
-  ) => operatorsFor({ type, cardinality }).find((o) => o.op === op)!.operand(texts);
+  it("offers exactly the §7.4 table, identity for identity", () => {
+    expect(ids("number")).toEqual([
+      "is", "is_not", "gt", "ge", "lt", "le", "between", "is_set", "is_not_set", "is_blank",
+    ]);
+    // A date atom has no honest negation short of `not(…)`, so no "is not".
+    expect(ids("date")).toEqual([
+      "is", "before", "on_or_before", "after", "on_or_after", "between", "is_set", "is_not_set",
+    ]);
+    expect(ids("text")).toEqual([
+      "contains", "does_not_contain", "is", "is_not", "starts_with", "ends_with",
+      "is_set", "is_not_set", "is_blank",
+    ]);
+    expect(ids("ref")).toEqual(["references", "does_not_reference"]);
+    expect(ids("checkbox")).toEqual(["is_checked", "is_unchecked", "is_not_set"]);
+  });
 
-  it("offers exactly the §9 P2 table, operator for operator", () => {
-    expect(ops("number")).toEqual(["eq", "not_eq", "lt", "le", "gt", "ge"]);
-    expect(ops("date")).toEqual(["eq", "lt", "gt", "between"]);
-    expect(ops("checkbox")).toEqual(["eq", "not_eq"]);
-    expect(ops("text")).toEqual(["eq", "not_eq", "like", "starts_with"]);
-    expect(ops("ref")).toEqual(["eq", "not_eq"]);
+  it("never offers P2's atom-level `!=` in the menu", () => {
+    for (const type of ["text", "number", "date", "checkbox", "ref"] as ObservedType[]) {
+      expect(ids(type)).not.toContain("has_other_value");
+    }
+  });
+
+  it("gives the presence and checkbox identities no value cell", () => {
+    for (const id of ["is_set", "is_not_set", "is_blank", "is_checked", "is_unchecked"] as const) {
+      expect(propertyOperatorArity(id)).toBe(0);
+    }
+    expect(propertyOperatorArity("between")).toBe(2);
+    expect(propertyOperatorArity("is")).toBe(1);
+  });
+
+  it("says `contains this value` for a many-valued key, keeping the same encoding", () => {
+    expect(propertyOperatorLabel("is", "many")).toBe("contains this value");
+    expect(propertyOperatorLabel("is_not", "many")).toBe("does not contain this value");
+    expect(propertyOperatorLabel("is", "one")).toBe("is");
+    // Only the words change: `value = 'x'` on a many-valued key ALREADY means
+    // "one of this key's values is x".
+    expect(encodePropertyLeaf({ id: "is", key: "tags", values: ["x"] })).toEqual(
+      propertyFilter("tags", { op: "eq", operand: { kind: "text", text: "x" } }),
+    );
   });
 
   it("builds the operand KIND the type calls for, not a string for everything", () => {
-    expect(operandOf("number", "gt", ["3"])).toEqual({ kind: "number", number: 3 });
+    const atomOf = (filter: Filter | null) =>
+      ((filter as { leaf: { pred: { items: Filter[] } } }).leaf.pred.items[1] as {
+        leaf: { value: unknown };
+      }).leaf.value;
+    expect(atomOf(encodePropertyLeaf({ id: "gt", key: "cost", values: ["3"], type: "number" })))
+      .toEqual({ kind: "number", number: 3 });
     // A6/§4.2.3: the date operand is the unresolved literal. Resolving it here
-    // would freeze "today" to the day the chip was added.
-    expect(operandOf("date", "lt", ["today"])).toEqual({ kind: "date", literal: "today" });
-    expect(operandOf("date", "between", ["today", "+7d"])).toEqual({
-      kind: "list",
-      items: [
-        { kind: "date", literal: "today" },
-        { kind: "date", literal: "+7d" },
-      ],
-    });
-    expect(operandOf("checkbox", "eq", ["true"])).toEqual({ kind: "bool", bool: true });
-    expect(operandOf("checkbox", "eq", ["no"])).toEqual({ kind: "bool", bool: false });
-    expect(operandOf("text", "eq", ["book"])).toEqual({ kind: "text", text: "book" });
-    expect(operandOf("ref", "eq", ["Alpha"])).toEqual({ kind: "text", text: "Alpha" });
-  });
-
-  it("makes `contains` a like PATTERN whose %, _ and \\ are the user's data", () => {
-    expect(operandOf("text", "like", ["50%"])).toEqual({ kind: "text", text: "%50\\%%" });
-    expect(operandOf("text", "starts_with", ["Proj"])).toEqual({ kind: "text", text: "Proj" });
+    // would freeze "today" to the day the row was added.
+    expect(atomOf(encodePropertyLeaf({ id: "before", key: "due", values: ["today"], type: "date" })))
+      .toEqual({ kind: "date", literal: "today" });
+    expect(atomOf(encodePropertyLeaf({ id: "between", key: "due", values: ["today", "+7d"], type: "date" })))
+      .toEqual({
+        kind: "list",
+        items: [{ kind: "date", literal: "today" }, { kind: "date", literal: "+7d" }],
+      });
+    expect(atomOf(encodePropertyLeaf({ id: "is_checked", key: "done" })))
+      .toEqual({ kind: "bool", bool: true });
+    expect(atomOf(encodePropertyLeaf({ id: "is_unchecked", key: "done" })))
+      .toEqual({ kind: "bool", bool: false });
+    expect(atomOf(encodePropertyLeaf({ id: "is", key: "type", values: ["book"] })))
+      .toEqual({ kind: "text", text: "book" });
   });
 
   it("refuses text that is not a value of the type, instead of filtering for nothing", () => {
-    expect(operandOf("number", "eq", ["not a number"])).toBeNull();
-    expect(operandOf("number", "eq", [""])).toBeNull();
-    expect(operandOf("checkbox", "eq", ["maybe"])).toBeNull();
+    expect(encodePropertyLeaf({ id: "is", key: "cost", values: ["not a number"], type: "number" })).toBeNull();
+    expect(encodePropertyLeaf({ id: "is", key: "cost", values: [""], type: "number" })).toBeNull();
+    expect(encodePropertyLeaf({ id: "is_checked", key: "" })).toBeNull();
     // A half-filled range is not a range.
-    expect(operandOf("date", "between", ["today", ""])).toBeNull();
-  });
-
-  it("says `contains this value` for a many-valued key, keeping the same operator", () => {
-    const many = operatorsFor({ type: "text", cardinality: "many" });
-    expect(many.find((o) => o.op === "eq")!.label).toBe("contains this value");
-    // `value = 'x'` on a many-valued key ALREADY means "one of its values is x".
-    // Only the words were wrong; there is no new operator and no quantifier.
-    expect(many.map((o) => o.op)).toEqual(["eq", "not_eq", "like", "starts_with"]);
-    expect(operatorsFor({ type: "text", cardinality: "one" }).find((o) => o.op === "eq")!.label)
-      .toBe("is");
+    expect(encodePropertyLeaf({ id: "between", key: "due", values: ["today", ""], type: "date" })).toBeNull();
   });
 
   it("puts the typed comparison on the VALUE attribute, leaving the key test alone", () => {
     const filter = propertyFilter("cost", { op: "gt", operand: { kind: "number", number: 100 } });
-    expect(filter).toEqual({
+    expect(encodePropertyLeaf({ id: "gt", key: "cost", values: ["100"], type: "number" })).toEqual(filter);
+    expect(encodePropertyLeaf({ id: "gt", key: "cost", values: ["100"], type: "number", throughPage: true }))
+      .toEqual({ kind: "leaf", leaf: { kind: "rel", rel: "page", quant: "any", pred: filter } });
+  });
+
+  it("spells the three §3.3 presence shapes as three different leaves", () => {
+    // is set: the bare key test, exactly what `(any value)` always built.
+    expect(encodePropertyLeaf({ id: "is_set", key: "public" })).toEqual(propertyFilter("public", null));
+    // is not set: the SAME predicate under the `none` quantifier.
+    expect(encodePropertyLeaf({ id: "is_not_set", key: "public" })).toEqual({
       kind: "leaf",
       leaf: {
-        kind: "rel",
-        rel: "props",
-        quant: "any",
+        kind: "rel", rel: "props", quant: "none",
+        pred: { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "public" } } },
+      },
+    });
+    // is blank: present, with no atoms.
+    expect(encodePropertyLeaf({ id: "is_blank", key: "public" })).toEqual({
+      kind: "leaf",
+      leaf: {
+        kind: "rel", rel: "props", quant: "any",
         pred: {
           kind: "and",
           items: [
-            { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "cost" } } },
-            { kind: "leaf", leaf: { kind: "attr", attr: "value", op: "gt", value: { kind: "number", number: 100 } } },
+            { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "public" } } },
+            { kind: "leaf", leaf: { kind: "attr", attr: "atom_count", op: "eq", value: { kind: "number", number: 0 } } },
           ],
         },
       },
     });
-    expect(pagePropertyFilter("cost", { op: "gt", operand: { kind: "number", number: 100 } })).toEqual({
-      kind: "leaf",
-      leaf: { kind: "rel", rel: "page", quant: "any", pred: filter },
+  });
+
+  it("wraps every negative identity around the POSITIVE leaf (§3.3)", () => {
+    // The builder's *is not* is `not(prop('k') = v)`, which is TRUE for an owner
+    // that has no such property at all. P2's atom-level `!=` is a different
+    // predicate that is false for that owner, so it is no longer offered.
+    expect(encodePropertyLeaf({ id: "is_not", key: "type", values: ["book"] })).toEqual({
+      kind: "not",
+      inner: propertyFilter("type", { op: "eq", operand: { kind: "text", text: "book" } }),
+    });
+    expect(encodePropertyLeaf({ id: "has_other_value", key: "type", values: ["book"] })).toEqual(
+      propertyFilter("type", { op: "not_eq", operand: { kind: "text", text: "book" } }),
+    );
+    expect(encodePropertyLeaf({ id: "is_not", key: "type", values: ["book"] })).not.toEqual(
+      encodePropertyLeaf({ id: "has_other_value", key: "type", values: ["book"] }),
+    );
+    expect(encodePropertyLeaf({ id: "does_not_reference", key: "owner", values: ["Avery"] })).toEqual({
+      kind: "not",
+      inner: propertyFilter("owner", { op: "eq", operand: { kind: "text", text: "Avery" } }),
+    });
+    expect(encodePropertyLeaf({ id: "does_not_contain", key: "note", values: ["x"] })).toEqual({
+      kind: "not",
+      inner: propertyFilter("note", { op: "like", operand: { kind: "text", text: "%x%" } }),
+    });
+  });
+});
+
+describe("propertyLeafTest: every property leaf reopens with its operator", () => {
+  /** Each row of the §7.4 table, with the type its identity belongs to. */
+  const TABLE: { id: PropertyOperatorId; type: ObservedType; values: string[] }[] = [
+    { id: "is", type: "number", values: ["100"] },
+    { id: "is_not", type: "number", values: ["100"] },
+    { id: "gt", type: "number", values: ["100"] },
+    { id: "ge", type: "number", values: ["100"] },
+    { id: "lt", type: "number", values: ["100"] },
+    { id: "le", type: "number", values: ["100"] },
+    { id: "between", type: "number", values: ["1", "9"] },
+    { id: "is_set", type: "number", values: [] },
+    { id: "is_not_set", type: "number", values: [] },
+    { id: "is_blank", type: "number", values: [] },
+    { id: "is", type: "date", values: ["today"] },
+    { id: "before", type: "date", values: ["today"] },
+    { id: "on_or_before", type: "date", values: ["today"] },
+    { id: "after", type: "date", values: ["today"] },
+    { id: "on_or_after", type: "date", values: ["today"] },
+    { id: "between", type: "date", values: ["-7d", "today"] },
+    { id: "contains", type: "text", values: ["book"] },
+    { id: "does_not_contain", type: "text", values: ["book"] },
+    { id: "is", type: "text", values: ["book"] },
+    { id: "is_not", type: "text", values: ["book"] },
+    { id: "starts_with", type: "text", values: ["Proj"] },
+    { id: "ends_with", type: "text", values: ["ing"] },
+    { id: "references", type: "ref", values: ["Avery"] },
+    { id: "does_not_reference", type: "ref", values: ["Avery"] },
+    { id: "is_checked", type: "checkbox", values: [] },
+    { id: "is_unchecked", type: "checkbox", values: [] },
+    { id: "has_other_value", type: "text", values: ["book"] },
+  ];
+
+  it("is the exact inverse of encodePropertyLeaf on every row of the table", () => {
+    for (const row of TABLE) {
+      const filter = encodePropertyLeaf({ id: row.id, key: "k", values: row.values, type: row.type });
+      expect(filter, `${row.id}/${row.type} must encode`).not.toBeNull();
+      expect(propertyLeafTest(filter!, { type: row.type }), `${row.id}/${row.type}`).toEqual({
+        id: row.id,
+        key: "k",
+        values: row.values,
+        throughPage: false,
+      });
+    }
+  });
+
+  it("reads a page-property row back through its page hop", () => {
+    const filter = encodePropertyLeaf({ id: "is", key: "fach", values: ["x"], throughPage: true })!;
+    expect(propertyLeafTest(filter)).toEqual({ id: "is", key: "fach", values: ["x"], throughPage: true });
+  });
+
+  it("tells contains and ends-with apart, and keeps escaped %, _ and \\ as data", () => {
+    const tricky = "50%_a\\b";
+    const contains = encodePropertyLeaf({ id: "contains", key: "note", values: [tricky] })!;
+    const endsWith = encodePropertyLeaf({ id: "ends_with", key: "note", values: [tricky] })!;
+    expect(contains).not.toEqual(endsWith);
+    expect(propertyLeafTest(contains)).toEqual({ id: "contains", key: "note", values: [tricky], throughPage: false });
+    expect(propertyLeafTest(endsWith)).toEqual({ id: "ends_with", key: "note", values: [tricky], throughPage: false });
+    expect(readLikePattern("%50\\%%")).toEqual({ shape: "contains", text: "50%" });
+    expect(readLikePattern("%50\\%")).toEqual({ shape: "ends_with", text: "50%" });
+    expect(readLikePattern("Proj%")).toEqual({ shape: "starts_with", text: "Proj" });
+    // A pattern with an unescaped wildcard in the MIDDLE is not one this
+    // builder wrote, and there is no identity that honestly re-collects it.
+    expect(readLikePattern("%a%b%")).toBeNull();
+  });
+
+  it("decodes a `not(like)` as `does not contain`, never as a bare contains", () => {
+    const filter: Filter = {
+      kind: "not",
+      inner: propertyFilter("note", { op: "like", operand: { kind: "text", text: "%x%" } }),
+    };
+    expect(propertyLeafTest(filter)?.id).toBe("does_not_contain");
+  });
+
+  it("reads `prop = 'x'` as `references` only for a ref key", () => {
+    const filter = propertyFilter("owner", { op: "eq", operand: { kind: "text", text: "Avery" } });
+    expect(propertyLeafTest(filter, { type: "ref" })?.id).toBe("references");
+    expect(propertyLeafTest(filter, { type: "text" })?.id).toBe("is");
+    expect(propertyLeafTest(filter)?.id).toBe("is");
+  });
+
+  it("reopens P2's atom-level `!=` without dropping its operator", () => {
+    // P2 could construct this and P2's chip had no Edit affordance for it, so
+    // reopening it dropped the operator. It is not offered any more, but it
+    // must still come back as what it is.
+    const inherited = propertyFilter("type", { op: "not_eq", operand: { kind: "text", text: "book" } });
+    expect(propertyLeafTest(inherited)).toEqual({
+      id: "has_other_value", key: "type", values: ["book"], throughPage: false,
+    });
+    expect(propertyOperatorLabel("has_other_value")).toBe("has a value other than");
+  });
+
+  it("says nothing about a leaf that is not a property test", () => {
+    expect(propertyLeafTest(pageRefFilter("Foo"))).toBeNull();
+    expect(propertyLeafTest(taskFilter(["TODO"]))).toBeNull();
+    expect(propertyLeafTest(pageTagsFilter(["a"]))).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The resting sentence and the depth cap (SPEC §7.2, §7.4; P3 T1/T3)
+// ---------------------------------------------------------------------------
+
+describe("filterPhrase / querySentence", () => {
+  const said = (segments: { text: string }[]) => segments.map((s) => s.text).join("");
+
+  it("is what filterLabel joins, segment for segment", () => {
+    for (const filter of [
+      pageRefFilter("Foo"),
+      taskFilter(["NOW", "LATER"]),
+      propertyFilter("type", "book"),
+      contentFilter("100% done"),
+      { kind: "off", inner: pageRefFilter("A") } as Filter,
+      { kind: "raw", text: "(frobnicate x)", diagnostic_kind: "unknown_head" } as Filter,
+    ]) {
+      expect(said(filterPhrase(filter))).toBe(filterLabel(filter));
+    }
+  });
+
+  it("marks values as chips and field names as fields", () => {
+    expect(filterPhrase(pageRefFilter("Project X"))).toEqual([
+      { kind: "value", text: "Project X" },
+    ]);
+    expect(filterPhrase(propertyFilter("type", "book"))).toEqual([
+      { kind: "field", text: "type" },
+      { kind: "text", text: ": " },
+      { kind: "value", text: "book" },
+    ]);
+  });
+
+  it("phrases a typed property leaf in the row's own words", () => {
+    const filter = encodePropertyLeaf({ id: "gt", key: "cost", values: ["100"], type: "number" })!;
+    expect(filterLabel(filter)).toBe("cost is more than 100");
+  });
+
+  it("reads an empty query as `All blocks` / `All pages`", () => {
+    expect(said(querySentence({ anchor: "block", filter: { kind: "and", items: [] } })))
+      .toBe("All blocks");
+    expect(said(querySentence({ anchor: "page", filter: { kind: "true" } }))).toBe("All pages");
+  });
+
+  it("reads a filter as one sentence whose subject is the anchor", () => {
+    const filter: Filter = {
+      kind: "and",
+      items: [taskFilter(["TODO"]), pageRefFilter("Project X"), { kind: "not", inner: pageRefFilter("archive") }],
+    };
+    expect(said(querySentence({ anchor: "block", filter })))
+      .toBe("Blocks where task: TODO, Project X, and not archive");
+    expect(said(querySentence({ anchor: "page", filter: pageRefFilter("Alpha") })))
+      .toBe("Pages where Alpha");
+  });
+
+  it("says `or` between the operands of an or group", () => {
+    const filter: Filter = { kind: "or", items: [taskFilter(["TODO"]), taskFilter(["DONE"])] };
+    expect(said(querySentence({ anchor: "block", filter })))
+      .toBe("Blocks where task: TODO or task: DONE");
+  });
+
+  it("bounds a 64-deep hostile query to a short sentence (I-22)", () => {
+    let deep: Filter = pageRefFilter("bottom");
+    for (let i = 0; i < 64; i++) deep = { kind: "and", items: [pageRefFilter(`level${i}`), deep] };
+    const sentence = querySentence({ anchor: "block", filter: deep });
+    expect(sentence.length).toBeLessThan(24);
+    expect(said(sentence)).toContain(ADVANCED_PHRASE);
+    expect(said(sentence).length).toBeLessThan(240);
+
+    // Relation predicates are levels too, so a deep `any(children, …)` chain
+    // cannot recurse without bound either.
+    let rel: Filter = pageRefFilter("bottom");
+    for (let i = 0; i < 64; i++) {
+      rel = { kind: "leaf", leaf: { kind: "rel", rel: "children", quant: "any", pred: rel } };
+    }
+    expect(filterLabel(rel).length).toBeLessThan(120);
+    expect(filterLabel(rel)).toContain(ADVANCED_PHRASE);
+
+    // And so is `off`.
+    let off: Filter = pageRefFilter("bottom");
+    for (let i = 0; i < 64; i++) off = { kind: "off", inner: off };
+    expect(filterLabel(off).length).toBeLessThan(120);
+  });
+
+  it("caps the RENDERING at three levels while the language keeps 64", () => {
+    expect(MAX_QUERY_BUILDER_DEPTH).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// groupWithPrevious (SPEC §7.4, design §2.5; P3 T3)
+// ---------------------------------------------------------------------------
+
+describe("groupWithPrevious", () => {
+  it("wraps a row and the sibling above it into one and-group, in place", () => {
+    const root: Filter = { kind: "and", items: [A, B, C] };
+    expect(groupWithPrevious(root, [2])).toEqual({
+      kind: "and",
+      items: [A, { kind: "and", items: [B, C] }],
     });
   });
 
-  it("leaves `(any value)` exactly as it was — every family still offers it", () => {
-    // The presence row is NOT one of the typed operators: it asks a different
-    // question, and it is the ONE row a key of any type always has.
-    expect(propertyFilter("public", null)).toEqual({
-      kind: "leaf",
-      leaf: {
-        kind: "rel",
-        rel: "props",
-        quant: "any",
-        pred: { kind: "leaf", leaf: { kind: "attr", attr: "key", op: "eq", value: { kind: "text", text: "public" } } },
-      },
+  it("is a no-op on the first row, which has nothing above it", () => {
+    const root: Filter = { kind: "and", items: [A, B] };
+    expect(groupWithPrevious(root, [0])).toEqual(root);
+    expect(groupWithPrevious(root, [])).toEqual(root);
+  });
+
+  it("is a no-op for a stale loc, exactly like every other edit here", () => {
+    const root: Filter = { kind: "and", items: [A, B] };
+    expect(groupWithPrevious(root, [7])).toEqual(root);
+    expect(groupWithPrevious(root, [0, 3])).toEqual(root);
+  });
+
+  it("groups inside a nested group, not at the root", () => {
+    const root: Filter = { kind: "and", items: [A, { kind: "or", items: [B, C, A] }] };
+    expect(groupWithPrevious(root, [1, 2])).toEqual({
+      kind: "and",
+      items: [A, { kind: "or", items: [B, { kind: "and", items: [C, A] }] }],
     });
-    expect(propertyFilter("public", "")).toEqual(propertyFilter("public", null));
-    expect(propertyFilter("type", "book")).toEqual(
-      propertyFilter("type", { op: "eq", operand: { kind: "text", text: "book" } }),
-    );
-    for (const type of ["text", "number", "date", "checkbox", "ref"] as ObservedType[]) {
-      expect(operatorsFor({ type, cardinality: "one" }).some((o) => o.op === "is_set")).toBe(false);
-    }
   });
 });

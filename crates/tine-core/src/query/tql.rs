@@ -17,8 +17,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator,
-    Value as SqlValue, Visit, Visitor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Spanned as _,
+    UnaryOperator, Value as SqlValue, Visit, Visitor,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -72,6 +72,10 @@ pub(crate) fn parse_tql_with_options(
                     diagnostics: &mut diagnostics,
                     registry,
                     disabled_depth: 0,
+                    original: text,
+                    source: &pre.sql,
+                    source_offset: pre.offset,
+                    not_applicable: None,
                 };
                 let scope = match pre.anchor {
                     Anchor::Block => Scope::Block,
@@ -106,6 +110,17 @@ struct PrePass {
     anchor: Anchor,
     /// The anchor token was the whole query: every row of the anchor.
     empty: bool,
+    /// Where `sql` starts inside the ORIGINAL text — `Some` only when the
+    /// pre-pass rewrote NOTHING, so a byte offset into `sql` is also a byte
+    /// offset into text the author actually typed.
+    ///
+    /// §4.3.2 makes spans presentation metadata, and §7.4's retained
+    /// wrong-anchor leaf carries one. A span into desugared or run-lifted text
+    /// would point at characters the user never wrote, so when the pre-pass
+    /// rewrote anything this is `None` and the retained leaf is simply
+    /// unspanned. Nothing downstream depends on the span: the frontend finds
+    /// the retained leaves by walking the tree.
+    offset: Option<usize>,
 }
 
 /// Byte ranges of every `'…'` string literal, quotes included, with SQL's `''`
@@ -157,6 +172,7 @@ fn pre_pass(text: &str, diagnostics: &mut Vec<Diagnostic>) -> PrePass {
             sql: "true".to_string(),
             anchor,
             empty: true,
+            offset: None,
         };
     }
     // **Disabled runs are isolated FIRST (§4.2.1, §4.3.2 R4).** A run's payload
@@ -166,10 +182,12 @@ fn pre_pass(text: &str, diagnostics: &mut Vec<Diagnostic>) -> PrePass {
     // Each run's payload is desugared in isolation with this same scanner.
     let lifted = lift_disabled_runs(&rest, diagnostics);
     let sql = desugar(&lifted, diagnostics);
+    let unchanged = sql == rest;
     PrePass {
         sql,
         anchor,
         empty: false,
+        offset: unchanged.then_some(offset),
     }
 }
 
@@ -641,6 +659,24 @@ struct Lower<'a> {
     /// message and does NOT invalidate the query (§3.5). Disabled state is
     /// DERIVED from the current tree, never stored on the node (§4.3.2).
     disabled_depth: usize,
+    /// The text the author typed, for `Span::from_byte_range`.
+    original: &'a str,
+    /// The text the PARSER saw — `pre.sql`, after `lift_disabled_runs` and
+    /// `desugar`. sqlparser's spans index into this, so a retained payload is
+    /// sliced from here (§7.4).
+    source: &'a str,
+    /// `original` byte offset of `source[0]`, or `None` when the pre-pass
+    /// rewrote something and the two no longer line up.
+    source_offset: Option<usize>,
+    /// **The one deferred rejection (§7.4).** A name that resolves on the OTHER
+    /// row is not unknown — it does not APPLY here — and §7.4 requires the
+    /// author's leaf to stay in the tree instead of collapsing to `False`. The
+    /// resolver cannot build that leaf: it only sees the identifier, not the
+    /// comparison or quantifier that encloses it. So it parks the message here
+    /// and [`Lower::leaf`], which does hold the whole expression, turns it into
+    /// the retained `Raw` capsule. Always consumed by the enclosing `leaf`
+    /// call, so it never leaks across siblings.
+    not_applicable: Option<(String, Vec<String>)>,
 }
 
 impl Lower<'_> {
@@ -666,13 +702,79 @@ impl Lower<'_> {
                 op: UnaryOperator::Not,
                 expr,
             } => Filter::not(self.filter(expr, scope)),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => Filter::and(vec![self.filter(left, scope), self.filter(right, scope)]),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => Filter::or(vec![self.filter(left, scope), self.filter(right, scope)]),
+            // Everything else is ONE condition of the author's, which is the
+            // unit §7.4 retains when it does not apply to the anchor.
+            leaf => self.leaf(leaf, scope),
+        }
+    }
+
+    /// One condition, plus the §7.4 wrong-anchor retention.
+    ///
+    /// The IDENTIFIER is what resolves wrongly, but the LEAF is what the author
+    /// wrote and what has to survive the anchor switch, so the check lands
+    /// here: lower the condition, and if the resolver parked a "does not apply"
+    /// on the way through, discard the `False` it produced and keep the exact
+    /// source text of this condition as a `Raw` capsule instead.
+    fn leaf(&mut self, expr: &Expr, scope: Scope) -> Filter {
+        let filter = self.condition(expr, scope);
+        let Some((message, suggestions)) = self.not_applicable.take() else {
+            return filter;
+        };
+        let (text, span) = self.retained_slice(expr);
+        let mut diagnostic =
+            Diagnostic::new(DiagnosticKind::NotApplicable, message).with_span(span);
+        diagnostic.suggestions = suggestions;
+        self.diagnose(diagnostic);
+        Filter::Raw {
+            text,
+            kind: DiagnosticKind::NotApplicable,
+            span,
+        }
+    }
+
+    /// The exact source text of `expr`, and its span in the ORIGINAL when the
+    /// two texts line up.
+    ///
+    /// The bytes the author typed are preferred; `Display` of the rebuilt AST
+    /// is the fallback for an expression whose span sqlparser leaves empty. It
+    /// is lossless in meaning (that is what the canonical printer is), it is
+    /// just not the author's spelling — so it is unspanned, because there is
+    /// nothing honest to point at.
+    fn retained_slice(&self, expr: &Expr) -> (String, Option<Span>) {
+        // sqlparser 0.62's `Spanned for Function` unions the name and the
+        // ARGUMENT spans and never the parentheses, so `any(children, true)`
+        // reports through `true` and stops. Measured, not assumed — the
+        // `any`/`blocks` cases below pin it. Closing what the span left open is
+        // a lexical repair of the span, not a second parser.
+
+        let span = expr.span();
+        let range = byte_offset(self.source, span.start)
+            .zip(byte_offset(self.source, span.end))
+            .filter(|(start, end)| start < end);
+        let Some((start, end)) = range else {
+            return (expr.to_string(), None);
+        };
+        let end = balanced_end(self.source, start, end);
+        let text = self.source[start..end].to_string();
+        let span = self
+            .source_offset
+            .map(|offset| Span::from_byte_range(self.original, offset + start, offset + end));
+        (text, span)
+    }
+
+    fn condition(&mut self, expr: &Expr, scope: Scope) -> Filter {
+        match expr {
             Expr::BinaryOp { left, op, right } => match op {
-                BinaryOperator::And => {
-                    Filter::and(vec![self.filter(left, scope), self.filter(right, scope)])
-                }
-                BinaryOperator::Or => {
-                    Filter::or(vec![self.filter(left, scope), self.filter(right, scope)])
-                }
                 BinaryOperator::Regexp => self.regexp(left, right, scope),
                 _ => match binary_cmp(op) {
                     Some(op) => self.compare(left, op, right, scope),
@@ -934,7 +1036,7 @@ impl Lower<'_> {
                         ty,
                     }),
                 };
-                if resolved.is_none() {
+                if resolved.is_none() && !self.wrong_row_ident(&name, scope) {
                     self.unknown_ident(&ident.value);
                 }
                 resolved
@@ -985,6 +1087,36 @@ impl Lower<'_> {
                 None
             }
         }
+    }
+
+    /// **The anchor mismatch, §3.5's own diagnostic source (§7.4).**
+    ///
+    /// `task` at `@page` is not an unknown name: it is a perfectly good block
+    /// field asked of a page row. Saying "is not a field of this query" sends
+    /// the author looking for a typo, and collapsing the leaf to `False`
+    /// throws away the condition they wrote — which is exactly what an anchor
+    /// switch must not do, because switching back has to bring it home.
+    ///
+    /// Returns whether the name belongs to the OTHER row; when it does, the
+    /// message is parked for [`Lower::leaf`] to attach to the retained capsule.
+    fn wrong_row_ident(&mut self, name: &str, scope: Scope) -> bool {
+        let suggestions = match scope {
+            // A page field asked of a block row has an honest spelling that
+            // works: the explicit hop.
+            Scope::Block if page_attr(name).is_some() => vec![format!("page.{name}")],
+            Scope::Page if block_attr(name).is_some() => Vec::new(),
+            _ => return false,
+        };
+        self.park_not_applicable(name, scope, suggestions);
+        true
+    }
+
+    fn park_not_applicable(&mut self, name: &str, scope: Scope, suggestions: Vec<String>) {
+        let row = match scope {
+            Scope::Page => "pages",
+            _ => "blocks",
+        };
+        self.not_applicable = Some((format!("`{name}` does not apply to {row}"), suggestions));
     }
 
     /// SPEC §4.2.2 guard 2. Suggestions are the registry's nearest keys —
@@ -1235,6 +1367,11 @@ impl Lower<'_> {
                 let pred = self.filter(pred, Scope::Block);
                 Filter::rel(Rel::Blocks, quant, pred)
             }
+            // The relation exists — on the other row (§7.4).
+            (name @ "children", Scope::Page) | (name @ "blocks", Scope::Block) => {
+                self.park_not_applicable(name, scope, Vec::new());
+                Filter::False
+            }
             (name, _) => self.reject_ident(name, format!("`{name}` is not a relation of this row")),
         }
     }
@@ -1257,6 +1394,66 @@ fn retained_message(kind: DiagnosticKind, text: &str) -> String {
         DiagnosticKind::Syntax => "does not parse",
     };
     format!("`{text}` {what}")
+}
+
+/// A sqlparser `Location` (1-based line, 1-based CHARACTER column) as a byte
+/// offset into the text it was measured on. `None` for the empty location
+/// sqlparser uses when a node has no span.
+/// Extend `end` forward over whatever closes the parentheses `text[start..end]`
+/// left open, so a partial function span still yields the author's whole call.
+/// String literals (with SQL's `''` doubling) are skipped, never counted.
+fn balanced_end(text: &str, start: usize, end: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut literal = false;
+    let mut i = start;
+    let mut close_at = None;
+    while i < bytes.len() {
+        if i >= end && depth <= 0 {
+            break;
+        }
+        match bytes[i] {
+            b'\'' if literal => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                literal = false;
+            }
+            b'\'' => literal = true,
+            b'(' if !literal => depth += 1,
+            b')' if !literal => {
+                depth -= 1;
+                if depth == 0 && i >= end {
+                    close_at = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    close_at.unwrap_or(end)
+}
+
+fn byte_offset(text: &str, location: sqlparser::tokenizer::Location) -> Option<usize> {
+    if location.line == 0 || location.column == 0 {
+        return None;
+    }
+    let mut line = 1u64;
+    let mut column = 1u64;
+    for (index, ch) in text.char_indices() {
+        if line == location.line && column == location.column {
+            return Some(index);
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line == location.line && column == location.column).then_some(text.len())
 }
 
 fn block_attr(name: &str) -> Option<(Attr, ValueType)> {
@@ -1830,6 +2027,138 @@ mod tests {
         assert!(diagnostics
             .iter()
             .any(|d| d.message == "the anchor goes first"));
+    }
+
+    // -- §7.4 / §3.5: the anchor mismatch is its own diagnostic, and the
+    // author's leaf is RETAINED rather than dropped ------------------------
+
+    /// The one enabled `NotApplicable` diagnostic of a query, or a panic.
+    fn not_applicable_of(query: &Query) -> &Diagnostic {
+        query
+            .diagnostics
+            .iter()
+            .find(|d| d.kind == DiagnosticKind::NotApplicable)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a NotApplicable diagnostic, got {:?}",
+                    query.diagnostics
+                )
+            })
+    }
+
+    fn retained_raw(filter: &Filter) -> (&str, DiagnosticKind, Option<Span>) {
+        match filter {
+            Filter::Raw { text, kind, span } => (text.as_str(), *kind, *span),
+            other => panic!("expected a retained Raw leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_block_attribute_at_the_page_anchor_is_retained_as_not_applicable() {
+        let query = parse("@page and task = 'TODO'");
+        let diagnostic = not_applicable_of(&query);
+        assert_eq!(diagnostic.message, "`task` does not apply to pages");
+        assert!(!diagnostic.disabled);
+        // These four plain inputs are pre-pass-unchanged, so the span points
+        // into the text the author actually typed.
+        assert!(
+            diagnostic.span.is_some(),
+            "a pre-pass-unchanged input is spanned"
+        );
+        let (text, kind, span) = retained_raw(&query.filter);
+        assert_eq!(text, "task = 'TODO'");
+        assert_eq!(kind, DiagnosticKind::NotApplicable);
+        assert!(span.is_some());
+    }
+
+    #[test]
+    fn a_block_relation_at_the_page_anchor_is_retained_as_not_applicable() {
+        let query = parse("@page and any(children, true)");
+        assert_eq!(
+            not_applicable_of(&query).message,
+            "`children` does not apply to pages"
+        );
+        let (text, kind, span) = retained_raw(&query.filter);
+        assert_eq!(text, "any(children, true)");
+        assert_eq!(kind, DiagnosticKind::NotApplicable);
+        assert!(span.is_some());
+    }
+
+    #[test]
+    fn a_page_relation_at_the_block_anchor_is_retained_as_not_applicable() {
+        let query = parse("@block and any(blocks, true)");
+        assert_eq!(
+            not_applicable_of(&query).message,
+            "`blocks` does not apply to blocks"
+        );
+        let (text, kind, _) = retained_raw(&query.filter);
+        assert_eq!(text, "any(blocks, true)");
+        assert_eq!(kind, DiagnosticKind::NotApplicable);
+    }
+
+    #[test]
+    fn a_bare_page_attribute_at_the_block_anchor_suggests_the_page_hop() {
+        let query = parse("@block and journal = true");
+        let diagnostic = not_applicable_of(&query);
+        assert_eq!(diagnostic.message, "`journal` does not apply to blocks");
+        assert_eq!(diagnostic.suggestions, vec!["page.journal".to_string()]);
+        let (text, kind, _) = retained_raw(&query.filter);
+        assert_eq!(text, "journal = true");
+        assert_eq!(kind, DiagnosticKind::NotApplicable);
+    }
+
+    #[test]
+    fn a_not_applicable_leaf_keeps_its_place_among_its_siblings() {
+        let query = parse("@page and name = 'x' and task = 'TODO'");
+        let Filter::And { items } = &query.filter else {
+            panic!("expected the surrounding and, got {:?}", query.filter);
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0],
+            Filter::attr(Attr::Name, CmpOp::Eq, Value::text("x"))
+        );
+        assert_eq!(retained_raw(&items[1]).0, "task = 'TODO'");
+    }
+
+    #[test]
+    fn a_genuinely_unknown_name_is_still_an_unknown_identifier() {
+        let query = parse("@page and nonsense = 1");
+        assert!(query
+            .diagnostics
+            .iter()
+            .all(|d| d.kind != DiagnosticKind::NotApplicable));
+        assert!(query
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::UnknownIdent));
+        assert_eq!(query.filter, Filter::False);
+    }
+
+    #[test]
+    fn a_disabled_wrong_row_leaf_carries_a_disabled_diagnostic() {
+        let query = parse("@page and off(task = 'TODO')");
+        let diagnostic = not_applicable_of(&query);
+        assert!(diagnostic.disabled);
+        assert!(!query.is_invalid());
+        let Filter::Off { inner } = &query.filter else {
+            panic!("expected an off wrapper, got {:?}", query.filter);
+        };
+        assert_eq!(retained_raw(inner).0, "task = 'TODO'");
+    }
+
+    #[test]
+    fn a_retained_wrong_row_leaf_survives_print_and_reparse() {
+        let query = parse("@page and task = 'TODO'");
+        let printed = crate::query::print::print_tql(&query);
+        let reparsed = parse(&printed);
+        let (text, kind, _) = retained_raw(&reparsed.filter);
+        assert_eq!(text, "task = 'TODO'");
+        assert_eq!(kind, DiagnosticKind::NotApplicable);
+        assert_eq!(
+            not_applicable_of(&reparsed).message,
+            "`task = 'TODO'` does not apply to this row"
+        );
     }
 
     #[test]

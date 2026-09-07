@@ -8467,8 +8467,11 @@ img.emoji {
      recomposite) — a visible flicker of the collapsed builders. A persistent
      layer means the compositor re-composites the existing texture instead of
      re-rasterizing, killing the flash. Safe: translateZ(0) doesn't clip (the
-     chip dropdowns anchor to their own .qb-chip-wrap, not this box) and is a
-     no-op on layout. Disappears entirely under TINE_GPU=0 (software path). */
+     in-flow pickers anchor to their own relatively-positioned wrapper, not this
+     box) and is a no-op on layout. It DOES make this box a containing block for
+     `position: fixed` descendants, which is why the editing sheet is portalled
+     to <body> rather than rendered here (.qs-sheet-anchor below).
+     Disappears entirely under TINE_GPU=0 (software path). */
   transform: translateZ(0);
   /* translateZ(0) makes this box its own stacking context, which would otherwise
      TRAP the builder dropdowns' z-index:60 inside it — so the later-in-DOM
@@ -8607,23 +8610,6 @@ img.emoji {
   padding-bottom: 6px;
   border-bottom: 1px solid var(--border-color);
 }
-.qb-group {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 6px;
-}
-.qb-bracket {
-  color: var(--text-muted);
-  font-size: 16px;
-  line-height: 1;
-}
-.qb-op-not {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 6px;
-}
 .qb-op {
   border: none;
   background: var(--bg-tertiary);
@@ -8638,7 +8624,6 @@ img.emoji {
 .qb-op:hover {
   color: var(--link-color);
 }
-.qb-chip-wrap,
 .qb-add-wrap {
   position: relative;
   display: inline-flex;
@@ -8719,18 +8704,6 @@ img.emoji {
 .query-simple-toggle:disabled {
   pointer-events: none;
 }
-/* Empty-query call-to-action: a labelled pill instead of a bare round "+". */
-.qb-add-prominent {
-  width: auto;
-  height: auto;
-  border-radius: 6px;
-  padding: 3px 10px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--link-color);
-  border-style: solid;
-  border-color: var(--link-color);
-}
 .qb-menu,
 .qb-picker {
   position: absolute;
@@ -8795,12 +8768,6 @@ img.emoji {
 .qb-menu-item:hover {
   background: var(--bg-tertiary);
 }
-.qb-value {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 2px;
-}
 .qb-input {
   border: 1px solid var(--border-color);
   background: var(--bg-primary);
@@ -8813,14 +8780,6 @@ img.emoji {
 .qb-input:focus {
   outline: none;
   border-color: var(--link-color);
-}
-.qb-check {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
-  font-size: 13px;
-  cursor: pointer;
 }
 .qb-commit {
   margin-top: 4px;
@@ -8835,57 +8794,6 @@ img.emoji {
 .qb-commit:disabled {
   opacity: 0.5;
   cursor: default;
-}
-
-/* Date-range picker: field selector + relative presets + previewed inputs. */
-.qb-between {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 4px;
-  min-width: 260px;
-}
-.qb-between-field,
-.qb-between-presets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-/* The field selector's active state means "selected", not "exclude" — use the
-   accent rather than the red NOT colour. */
-.qb-between-field .qb-conn {
-  flex: 1 1 auto;
-}
-.qb-between-field .qb-conn.active {
-  background: var(--link-color);
-  color: #fff;
-  border-color: var(--link-color);
-}
-.qb-preset {
-  border: 1px solid var(--border-color);
-  background: var(--bg-primary);
-  color: var(--text-secondary);
-  border-radius: 999px;
-  padding: 2px 10px;
-  font-size: 11px;
-  cursor: pointer;
-}
-.qb-preset:hover {
-  border-color: var(--link-color);
-  color: var(--text-primary);
-}
-.qb-bound {
-  display: flex;
-  flex-direction: column;
-}
-.qb-bound .qb-input {
-  margin-bottom: 0;
-}
-.qb-bound-preview {
-  min-height: 14px;
-  padding: 0 2px;
-  font-size: 11px;
-  color: var(--text-secondary);
 }
 
 /* Sort picker: a grid of one-click presets (the common cases — no typing) over a
@@ -8943,6 +8851,589 @@ img.emoji {
 .qb-sort-clear:hover {
   border-color: #b91c1c;
   color: #b91c1c;
+}
+
+/* ------------------------------------------- query sheet (sentence ↔ rows)
+   The two states of the visual builder (SPEC §7.2–§7.4). At rest: ONE line of
+   plain English with the result count and a ⚙. While editing: a sheet of rows,
+   portalled over the following blocks because `.query-block`'s translateZ(0)
+   makes it a containing block for fixed descendants (see the comment there). */
+.qs-builder {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* --- resting sentence --- */
+.qs-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  min-width: 0;
+}
+.qs-sentence {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* Bounded on purpose: outside content picks the query's length, not us
+     (I-22). The depth cap bounds the phrase; this bounds the line. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 2px;
+}
+.qs-sentence:hover,
+.qs-sentence:focus-visible {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  outline: none;
+}
+.qs-seg-field {
+  color: var(--text-secondary);
+}
+.qs-seg-value {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.qs-seg-advanced {
+  font-family: var(--ls-font-mono);
+  color: var(--text-muted);
+  border-bottom: 1px dotted var(--border-color);
+}
+.qs-count-slot {
+  flex: 0 0 auto;
+}
+.qs-gear {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.qs-gear:hover,
+.qs-gear[aria-expanded="true"] {
+  color: var(--link-color);
+  background: var(--bg-tertiary);
+}
+.qs-preview-error {
+  font-size: 12px;
+  color: var(--danger-color, #c0392b);
+}
+
+/* --- the editing sheet --- */
+.qs-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: rgba(0, 0, 0, 0.08);
+}
+.qs-sheet-anchor {
+  position: fixed;
+  z-index: 71;
+  min-width: 320px;
+}
+.qs-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.22);
+  padding: 10px 12px;
+  font-size: 13px;
+}
+/* Deliberately NOT a scroll container on the wide layout: the row menus are
+   absolutely positioned children and a scrolling ancestor would clip them. */
+.qs-sheet-stale {
+  opacity: 0.55;
+}
+
+/* --- anchor line --- */
+.qs-anchor {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+.qs-anchor-lead,
+.qs-anchor-tail {
+  color: var(--text-muted);
+}
+.qs-anchor-wrap,
+.qs-menu-wrap,
+.qs-add-wrap,
+.qs-cell {
+  position: relative;
+  display: inline-flex;
+}
+.qs-anchor-button {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.qs-anchor-button:hover {
+  border-color: var(--link-color);
+}
+.qs-anchor-prompt {
+  border: 1px solid var(--link-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.qs-anchor-prompt:focus {
+  outline: none;
+}
+.qs-anchor-prompt-text {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.qs-anchor-prompt-text code {
+  font-family: var(--ls-font-mono);
+  font-size: 11px;
+}
+.qs-anchor-prompt-actions {
+  display: flex;
+  gap: 6px;
+}
+.qs-anchor-prompt-actions .qs-commit,
+.qs-anchor-prompt-actions .qs-conn {
+  margin-top: 0;
+  flex: 0 0 auto;
+}
+
+/* --- rows and groups --- */
+.qs-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.qs-listitem {
+  display: block;
+}
+.qs-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 0;
+}
+.qs-cell-value {
+  flex: 1 1 8em;
+  min-width: 0;
+}
+/* The property row carries a type badge and a value input in one cell, and both
+   want to be wide. They wrap INSIDE the cell; letting them push the row's own
+   wrap instead put that row's ⋮ and × on a line of their own, which reads as an
+   empty fourth condition. */
+.qs-property-value .qs-input {
+  flex: 1 1 8em;
+  width: auto;
+  min-width: 5em;
+}
+.qs-field,
+.qs-op,
+.qs-value {
+  border: 1px solid transparent;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.qs-field {
+  color: var(--text-secondary);
+  min-width: 6em;
+}
+.qs-op {
+  color: var(--text-secondary);
+}
+.qs-value {
+  background: var(--bg-primary);
+  border-color: var(--border-color);
+  width: 100%;
+}
+.qs-field:hover,
+.qs-op:hover,
+.qs-value:hover {
+  border-color: var(--link-color);
+}
+.qs-field:disabled,
+.qs-op:disabled,
+.qs-value:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.qs-property-value {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  min-width: 0;
+  /* Wrap INSIDE the value cell. Letting the cell push the row's own wrap put a
+     row's ⋮ and × on a line of their own, which reads as a second row. */
+  flex: 1 1 auto;
+}
+.qs-property-key {
+  font-family: var(--ls-font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.qs-row-menu,
+.qs-row-remove {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.qs-row-menu:hover {
+  color: var(--link-color);
+  background: var(--bg-tertiary);
+}
+.qs-row-remove:hover {
+  color: #b91c1c;
+  background: var(--bg-tertiary);
+}
+/* A retained leaf the builder cannot draw as a row: its own text, red, with the
+   diagnostic beside it. Greyed instead of red when disabled — a disabled broken
+   condition does not invalidate the query (§3.5). */
+.qs-row-raw .qs-raw-text {
+  font-family: var(--ls-font-mono);
+  font-size: 12px;
+  color: #b91c1c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+.qs-raw-message {
+  font-size: 11px;
+  color: #b91c1c;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.qs-off {
+  opacity: 0.5;
+}
+.qs-off .qs-raw-text,
+.qs-off .qs-raw-message {
+  color: var(--text-muted);
+}
+.qs-off-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.qs-row-advanced .qs-advanced {
+  font-family: var(--ls-font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qs-group {
+  border-left: 2px solid var(--border-color);
+  padding-left: 8px;
+  margin-left: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.qs-group-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.qs-group-op {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.qs-group-op:hover {
+  color: var(--link-color);
+  background: var(--bg-tertiary);
+}
+
+/* --- add a condition --- */
+.qs-add {
+  border: 1px dashed var(--border-color);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.qs-add:hover {
+  color: var(--link-color);
+  border-color: var(--link-color);
+}
+.qs-try {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+}
+.qs-try-label {
+  color: var(--text-muted);
+}
+.qs-try-item {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-family: var(--ls-font-mono);
+  cursor: pointer;
+}
+.qs-try-item:hover {
+  border-color: var(--link-color);
+  color: var(--text-primary);
+}
+.qs-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--border-color);
+  padding-top: 8px;
+}
+
+/* --- menus (one listbox pattern, QuickSwitcher's) --- */
+.qs-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 60;
+  min-width: 200px;
+  max-width: 320px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.qs-menu-title {
+  padding: 2px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.qs-menu-filter,
+.qs-input {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 13px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.qs-menu-filter:focus,
+.qs-input:focus {
+  outline: none;
+  border-color: var(--link-color);
+}
+.qs-options {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.qs-option {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  padding: 5px 10px;
+  border-radius: 5px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.qs-option:hover,
+.qs-option.active {
+  background: var(--bg-tertiary);
+}
+.qs-option.current {
+  font-weight: 700;
+}
+.qs-option-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* --- value editors --- */
+.qs-value-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px;
+  min-width: 0;
+}
+.qs-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.qs-commit {
+  margin-top: 2px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.qs-commit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.qs-conn {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.qs-conn:hover {
+  border-color: var(--link-color);
+}
+.qs-conn.active {
+  background: var(--link-color);
+  color: #fff;
+  border-color: var(--link-color);
+}
+.qs-between {
+  min-width: 260px;
+}
+.qs-between-field,
+.qs-between-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.qs-between-field .qs-conn {
+  flex: 1 1 auto;
+}
+.qs-preset {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.qs-preset:hover {
+  border-color: var(--link-color);
+  color: var(--text-primary);
+}
+.qs-bound {
+  display: flex;
+  flex-direction: column;
+}
+.qs-bound-preview {
+  min-height: 14px;
+  padding: 0 2px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* --- narrow screens: the sheet is a bottom sheet (§7.7) --------------------
+   Below ~600px there is no room beside the block for a popover anchored to the
+   sentence, so the sheet leaves the sentence's rect entirely and docks to the
+   bottom edge — the same move the absence-sweep dock makes at 620px. The
+   inline `top`/`left`/`width` the host sets are overridden here, so the sheet
+   does not have to know which layout it is in. */
+@media (max-width: 600px) {
+  .qs-overlay {
+    background: rgba(0, 0, 0, 0.28);
+  }
+  .qs-sheet-anchor {
+    top: auto !important;
+    left: 0 !important;
+    right: 0;
+    bottom: 0;
+    width: auto !important;
+    min-width: 0;
+  }
+  .qs-sheet {
+    border-radius: 12px 12px 0 0;
+    border-bottom: none;
+    /* One system token, never `env()` at the call site (mobileSafeArea). */
+    padding: 12px 14px calc(12px + var(--overlay-inset-bottom));
+    /* A bottom sheet is expected to scroll; menus inside it scroll with it. */
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+  .qs-menu {
+    max-width: none;
+    right: 0;
+  }
 }
 
 .query-table th {
@@ -9050,11 +9541,6 @@ img.emoji {
 .query-text-pane-pending {
   color: var(--text-muted);
   font-size: 12px;
-}
-.qb-bar-stale .qb-chip,
-.qb-bar-stale .qb-conn,
-.qb-bar-stale .qb-sort {
-  opacity: 0.55;
 }
 .query-stale .query-group,
 .query-stale .query-search-results,

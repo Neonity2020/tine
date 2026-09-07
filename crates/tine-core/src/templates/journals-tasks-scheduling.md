@@ -12,7 +12,7 @@ icon:: 📅
   - Settings → **Journals** → **Task workflow** chooses between two cycling lanes, TODO / DOING and NOW / LATER (`:preferred-workflow`, traveling with the graph); NOW / LATER is the default.
   - Click the marker chip for Logseq's two-state progress toggle: TODO ↔ DOING or LATER ↔ NOW. Click the checkbox to finish as DONE (and again to reopen). **Ctrl+Enter** (Cmd on Mac) uses the full keyboard cycle TODO → DOING → DONE → none, or LATER → NOW → DONE → none, applied to every selected task when several blocks are selected.
   - Every task also shows a checkbox in front of it: click to mark DONE, click again to reopen to the workflow's open marker (TODO or LATER). `DONE` shows a checked box; `CANCELED`/`CANCELLED` show none. Checkboxes appear read-only inside query results, linked references, and embeds.
-  - Queries filter on markers with a task clause, e.g. `(task TODO DOING)` in `{{query }}` or in the visual query builder.
+  - Queries filter on markers with a task clause, e.g. `(task TODO DOING)` in `{{query }}`, or as a **Task** condition in the visual query builder.
 - ## Priorities
   - `[#A]`, `[#B]`, `[#C]` sit directly after the task marker; a block without a task marker can carry one too. Type slash, choose **Priority A** (or B, C), and the chip updates in place.
   - Priorities are queryable and sortable in the visual builder too, and they render like any other header facet — the [[Feature showcase]] has them all.

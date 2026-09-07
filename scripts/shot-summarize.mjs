@@ -35,10 +35,16 @@ try {
   await page.waitForSelector(".page-title", { timeout: 8000 });
   await sleep(500);
 
-  // The first builder bar's summarize pill (label flips "+ summarize" → "∑ …"
-  // once active, so match either). Only this query gets a summary, so read the
-  // summary elements globally; screenshot the query block that owns the summary.
-  const pill = () => page.locator(".qb-sort").filter({ hasText: /summarize|∑/ }).first();
+  // Summarize lives in the SHEET's footer, so open the first query's sheet from
+  // its resting sentence and keep it open for the whole run.
+  await page.locator(".qs-gear").first().scrollIntoViewIfNeeded();
+  await page.locator(".qs-gear").first().click();
+  await page.waitForSelector(".qs-sheet", { timeout: 6000 });
+
+  // The sheet's summarize pill (label flips "+ summarize" → "∑ …" once active,
+  // so match either). Only this query gets a summary, so read the summary
+  // elements globally; screenshot the query block that owns the summary.
+  const pill = () => page.locator(".qs-sheet .qb-sort").filter({ hasText: /summarize|∑/ }).first();
   const summaryBlock = () =>
     page.locator(".query-block").filter({ has: page.locator(".query-summary, .query-summary-table") }).first();
 

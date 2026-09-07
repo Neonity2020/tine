@@ -1047,6 +1047,19 @@ mod tests {
             .markdown
             .contains("Name this search to save it as a page"));
         assert!(page.markdown.contains("What you should see"));
+        // The P3 section. The builder has two states and the Guide has to name
+        // both, because a reader who only sees the sentence has no reason to
+        // suspect there is anything to click. The anchor-switch prompt is
+        // promised in the same words the prompt itself uses.
+        assert!(page.markdown.contains("- ## Read a query, then edit it"));
+        assert!(page.markdown.contains("**Find blocks ▾ where …**"));
+        assert!(page.markdown.contains("**+ Add condition**"));
+        assert!(page.markdown.contains("**Remove them**"));
+        assert!(page
+            .markdown
+            .contains("**all of** / **any of** / **none of**"));
+        assert!(page.markdown.contains("`⟨advanced⟩`"));
+
         // The two P2 sections. A declared property type is only actionable if
         // the page the declaration must live on is named: the engine binds
         // `tine.type::` by the NORMALIZED key, so a reader who authors the line

@@ -37,6 +37,49 @@ function mockPrintRefusal(reasonCode: "not_applicable" | "syntax", message: stri
   }));
 }
 
+/**
+ * **The one data-only fixture seam for the query commands (P3, T2 step 2).**
+ *
+ * The mock deliberately refuses to print or parse a query — a parser here would
+ * be the frontend twin this campaign deleted (I-12, D-14). But the anchor-switch
+ * preview in the sheet *is* a print-then-parse round trip through the engine, so
+ * a jsdom test and the screenshot harness need the engine's ANSWERS without the
+ * engine.
+ *
+ * So this takes canned VALUES — a printed string, a `ParsedQuery` with `raw`
+ * leaves, a registry list, a result — and never callbacks. It cannot compute
+ * anything, cannot become a parser, and answers the same bytes no matter what it
+ * is asked. The engine's semantics are proven by the Rust cases in
+ * `crates/tine-core/src/query/tql.rs` and by the native journey
+ * `scripts/e2e-query-sheet.mjs`, never by this double.
+ *
+ * It is mock-only by construction: `src/mockQueryFixture.guard.test.ts` asserts
+ * that no production module under `src/` imports it. `shot-query-sheet.mjs`
+ * installs it through `page.addInitScript` on
+ * `globalThis.__tineMockQueryFixture`, which is read here for the same reason.
+ */
+export interface MockQueryFixture {
+  parse?: ParsedQuery;
+  print?: string;
+  registry?: RegistrySnapshot;
+  run?: QueryResult;
+}
+
+let installedQueryFixture: MockQueryFixture | null = null;
+
+/** Install (or, with `null`, clear) the canned query answers. Reset between
+ *  tests; without one the mock keeps its ordinary refusal. */
+export function installMockQueryFixture(fixture: MockQueryFixture | null): void {
+  installedQueryFixture = fixture;
+}
+
+function queryFixture(): MockQueryFixture | null {
+  if (installedQueryFixture) return installedQueryFixture;
+  const injected = (globalThis as { __tineMockQueryFixture?: MockQueryFixture })
+    .__tineMockQueryFixture;
+  return injected ?? null;
+}
+
 /** The `tine.*` view properties a host block carries, as `ViewSettings` (§4.1).
  *  The real command merges these OVER the directives lifted from the query text;
  *  the mock has no directives to merge with, so the properties are the whole
@@ -1344,6 +1387,9 @@ export function mockBackend(): Backend {
       // still cannot corrupt the author's query — it simply cannot separate the
       // title out to edit it, which is the honest capability of a backend with
       // no parser.
+      // A canned answer, when a test or the screenshot harness installed one.
+      const canned = queryFixture()?.parse;
+      if (canned) return { query: canned.query, view: { ...canned.view } };
       const original = text;
       const ogOptions = "";
       const kind: Source["kind"] =
@@ -1382,6 +1428,8 @@ export function mockBackend(): Backend {
       // Source-preserving printing is byte transport, not lowering, so the mock
       // gets it exactly right (§4.3.1): the original form plus the options map,
       // once.
+      const canned = queryFixture()?.print;
+      if (canned != null && !preserveForm) return canned;
       const original = sourceOriginal(query.source);
       if (preserveForm) {
         if (original === null) {
@@ -1411,9 +1459,11 @@ export function mockBackend(): Backend {
       return false;
     },
     async queryRegistry(): Promise<RegistrySnapshot> {
-      return { rows: [], generation: 0 };
+      return queryFixture()?.registry ?? { rows: [], generation: 0 };
     },
     async queryRun(query: Query): Promise<QueryResult> {
+      const canned = queryFixture()?.run;
+      if (canned) return canned;
       // An invalid query returns zero rows plus its diagnostics (§3.5) — which is
       // precisely the mock's situation, so this arm is the contract, not a stub.
       return {

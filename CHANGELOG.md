@@ -10,6 +10,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **A query block now reads as a sentence, and edits as a sheet.** The row of
+  chips over every `{{query}}` is gone. At rest a query is one line of plain
+  English — *Blocks where task: TODO and page: Project/Roadmap* — with the number
+  of results beside it and a ⚙ to open it. Click either and a sheet opens over
+  the blocks below: **Find blocks ▾ where …** on top, then one row per condition,
+  each of them `field ▾ | operator ▾ | value` with a ⋮ for the rest and an × to
+  remove it. **+ Add condition** adds one. Conditions can be grouped as *all of*,
+  *any of*, *none of* or *not all of* when a query needs a branch. Escape, Back,
+  or a click anywhere else closes the sheet and leaves the sentence. On a
+  phone-width screen the sheet docks to the bottom of the window instead of
+  hanging off the side of the block.
+
+  A condition Tine cannot draw as a row is still shown — in red, with the reason,
+  and removable — rather than hidden behind raw text, and a query nested far
+  deeper than anyone means to read folds into one `⟨advanced⟩` row that is still
+  saved, still run, and still removable. Nothing about the file changes: the
+  block stays an ordinary `{{query}}` bullet, and the query text is still there
+  under the sheet to read or edit directly.
+
+- **Changing what a query selects tells you what it will cost.** Switching a
+  query between *blocks* and *pages* used to silently drop the conditions that
+  stopped applying — `task` means nothing for a page — so a click could delete
+  half a query without saying so. Tine now re-reads the whole query first and
+  says exactly what happened: *Switching to pages — 1 of your 3 conditions don't
+  apply to pages (`task = 'TODO'`)*, with **Remove them**, **Keep anyway** and
+  **Cancel**. Kept conditions stay visible as red rows with their reason, so
+  nothing disappears behind your back.
+
+- **A typed condition reopens as the comparison that wrote it.** `cost > 100`,
+  `due before 2026-01-01` and `name starts with proj` could be built but not read
+  back: reopening one showed a bare equality, and editing it destroyed the
+  comparison. Every comparison the builder offers now survives the round trip, so
+  a query you built last month opens with the operator you chose.
+
+- **One `/query` command.** The slash menu had **Query** and **Query (visual
+  builder)** as separate commands that made the same block. There is one now, and
+  it opens the new sheet with the field chooser already up.
+
 - **`{{query (all-page-tags)}}` works.** Logseq has this filter — every page
   that carries at least one `tags::` value — and Tine did not know it, so a
   graph written in Logseq that used it showed nothing. It now selects the same

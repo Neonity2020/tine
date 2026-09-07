@@ -21,7 +21,7 @@ blocks every other explicit scheme. Relative and hash links remain internal.
 | Consumer | Bound | Result at the bound |
 | --- | ---: | --- |
 | Formula evaluation | 128 AST levels (`MAX_FORMULA_EVAL_DEPTH`) | formula error |
-| Visual query parsing/rendering | 64 levels (`MAX_QUERY_BUILDER_DEPTH`) | raw/truncated fallback |
+| Visual query parsing/rendering | 64 parse levels (`QUERY_NESTING_MAX`), 3 rendered levels (`MAX_QUERY_BUILDER_DEPTH`) | raw fallback / `⟨advanced⟩` chip |
 | PeekPopup block copying | 64 levels (`MAX_PEEK_BLOCK_DEPTH`) | truncated count |
 | Managed backlink-filter trees | 128 levels (`MAX_MANAGED_BLOCK_DEPTH`) | truncated filter entry |
 | Hiccup | 64 KiB, depth 64, 2,048 nodes | bounded fallback |

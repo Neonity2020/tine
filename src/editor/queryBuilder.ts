@@ -32,6 +32,7 @@
 import { MARKERS as TASK_MARKERS } from "../markers";
 import type {
   AggFn,
+  Anchor,
   Attr,
   Cardinality,
   CmpOp,
@@ -39,6 +40,7 @@ import type {
   Filter,
   Leaf,
   ObservedType,
+  Quant,
   Rel,
   SortDir,
   Value,
@@ -59,11 +61,21 @@ export const BETWEEN_FIELDS: BetweenField[] = ["journal", "scheduled", "deadline
 export const MARKERS: string[] = [...TASK_MARKERS];
 export const PRIORITIES = ["A", "B", "C"];
 
-/** The builder renders a tree this deep and then says so rather than recursing
- *  without bound. §7.4 retunes this to the presentation cap of 3 in P3; until
- *  then it stays where it has always been, so no currently-rendering query
- *  starts truncating. */
-export const MAX_QUERY_BUILDER_DEPTH = 64;
+/** **How many levels of the tree the builder RENDERS (SPEC §7.4).**
+ *
+ *  This is a presentation cap, not a language limit: the parser's
+ *  `QUERY_NESTING_MAX` is still 64 and a deeper query still parses, still
+ *  round-trips and still runs. What changes at this depth is only how it is
+ *  DRAWN — one `⟨advanced⟩` chip whose text is the subtree's phrase, edited in
+ *  the query text pane below.
+ *
+ *  Three, because the indented-rule rendering costs horizontal width per level
+ *  and the sheet has to survive a 360 px phone. And the bound covers EVERY
+ *  rendering of the tree, not only the rows: {@link filterPhrase} (and so
+ *  {@link filterLabel} and the chip's own text) stops here too, so a 64-deep
+ *  hostile query produces a short bounded sentence rather than a recursive dump
+ *  (I-22). Relation predicates and `off` count as levels exactly as rows do. */
+export const MAX_QUERY_BUILDER_DEPTH = 3;
 
 /** The filter shapes the add-picker can build and the edit popover can re-collect.
  *  A NAME for a leaf shape, not a second IR: every one maps onto the `og.rs`
@@ -131,8 +143,8 @@ export function priorityFilter(levels: string[]): Filter {
   return attr("priority", "in", textList(levels.length ? levels : [...PRIORITIES]));
 }
 
-/** A typed comparison on a property's VALUE, chosen by {@link operatorsFor} from
- *  the registry's effective type for the key. The plain-string form below is the
+/** A typed comparison on a property's VALUE, chosen by {@link propertyOperators}
+ *  from the registry's effective type for the key. The plain-string form below is the
  *  untyped `= '<text>'` this builder could always say; this is the durable half
  *  P3 inherits, which is why the operator travels with its operand rather than
  *  being reconstructed from the text at every call site. */
@@ -178,19 +190,57 @@ export function pagePropertyFilter(
 // Typed operators (SPEC §7.4, §9 P2)
 // ---------------------------------------------------------------------------
 
-/** One offered comparison for a property key of a known type. */
-export interface TypedOperator {
-  /** An operator the IR ALREADY has. This helper chooses among `CmpOp`s and
-   *  builds the matching `Value`; it never invents either (P0 owns the IR). */
-  op: CmpOp;
-  /** The words the row shows. Plain English, not the operator's spelling. */
+/** **A UI operator IDENTITY — not a `CmpOp` (SPEC §7.4, design §2.4).**
+ *
+ *  The row's `operator ▾` offers plain-English identities: *is more than*,
+ *  *does not contain*, *is not set*. Several of them are not operators at all
+ *  in the IR — *is not* is `not(prop('k') = v)`, *is blank* is a test on the
+ *  atom count, *is checked* is a fixed boolean — so an identity cannot be a
+ *  `CmpOp` and this union is deliberately its own vocabulary. Each identity has
+ *  an ENCODER ({@link encodePropertyLeaf}) and a DECODER
+ *  ({@link propertyLeafTest}), and the two are inverse; nothing here widens the
+ *  IR, because every encoding composes `CmpOp`s, `Value`s and `Rel` shapes P0
+ *  already has.
+ *
+ *  `has_other_value` is REOPEN-ONLY: it is P2's atom-level `!=`, which the menu
+ *  no longer offers because §3.3 makes it a different predicate from *is not*
+ *  (an owner WITHOUT the property matches *is not* and does not match `!=`). A
+ *  leaf that still carries it — reopened from P2 text, or typed in the pane —
+ *  must still reopen with its operator intact rather than be silently
+ *  rewritten, so it decodes to an identity with an honest label. */
+export type PropertyOperatorId =
+  | "is"
+  | "is_not"
+  | "gt"
+  | "ge"
+  | "lt"
+  | "le"
+  | "between"
+  | "before"
+  | "on_or_before"
+  | "after"
+  | "on_or_after"
+  | "contains"
+  | "does_not_contain"
+  | "starts_with"
+  | "ends_with"
+  | "references"
+  | "does_not_reference"
+  | "is_checked"
+  | "is_unchecked"
+  | "is_set"
+  | "is_not_set"
+  | "is_blank"
+  | "has_other_value";
+
+/** One row of the `operator ▾` menu. */
+export interface PropertyOperator {
+  id: PropertyOperatorId;
+  /** The words the row shows. Plain English, never the operator's spelling. */
   label: string;
-  /** How many text inputs the value editor collects. Two only for `between`. */
-  arity: 1 | 2;
-  /** The IR operand for what the user typed, or `null` when the text is not a
-   *  value of this type — a non-numeric "number" is a typo, not a filter, and
-   *  committing it as text would silently produce a leaf that matches nothing. */
-  operand: (texts: string[]) => Value | null;
+  /** How many value inputs the row collects. `0` for the presence identities
+   *  and for the two checkbox identities, whose value is fixed. */
+  arity: 0 | 1 | 2;
 }
 
 const one = (texts: string[]): string => (texts[0] ?? "").trim();
@@ -215,12 +265,6 @@ const dateOperand = (texts: string[]): Value | null => {
   return literal ? { kind: "date", literal } : null;
 };
 
-const dateRangeOperand = (texts: string[]): Value | null => {
-  const low = dateOperand([texts[0] ?? ""]);
-  const high = dateOperand([texts[1] ?? ""]);
-  return low && high ? { kind: "list", items: [low, high] } : null;
-};
-
 const boolOperand = (texts: string[]): Value | null => {
   const text = one(texts).toLowerCase();
   if (["true", "yes", "y", "1", "done", "checked"].includes(text)) {
@@ -232,6 +276,28 @@ const boolOperand = (texts: string[]): Value | null => {
   return null;
 };
 
+/** The scalar operand for a key of this effective type. A non-numeric "number"
+ *  is a typo, not a filter, and committing it as text would silently produce a
+ *  leaf that matches nothing — so it is `null` and the row does not commit. */
+function scalarOperand(texts: string[], type: ObservedType): Value | null {
+  switch (type) {
+    case "number":
+      return numberOperand(texts);
+    case "date":
+      return dateOperand(texts);
+    case "checkbox":
+      return boolOperand(texts);
+    default:
+      return textOperand(texts);
+  }
+}
+
+function rangeOperand(texts: string[], type: ObservedType): Value | null {
+  const low = scalarOperand([texts[0] ?? ""], type);
+  const high = scalarOperand([texts[1] ?? ""], type);
+  return low && high ? { kind: "list", items: [low, high] } : null;
+}
+
 /** "contains" is a `like` PATTERN, not a substring: the user's `%`, `_` and `\`
  *  are data (`escapeLike`), exactly as `contentFilter` builds it. */
 const containsOperand = (texts: string[]): Value | null => {
@@ -239,68 +305,387 @@ const containsOperand = (texts: string[]): Value | null => {
   return text ? { kind: "text", text: `%${escapeLike(text)}%` } : null;
 };
 
+const endsWithOperand = (texts: string[]): Value | null => {
+  const text = one(texts);
+  return text ? { kind: "text", text: `%${escapeLike(text)}` } : null;
+};
+
+/** How one identity is spelled in the IR. `negate` wraps the POSITIVE leaf in
+ *  `not(…)` (§3.3): the builder's *is not* is true for an owner WITHOUT the
+ *  property, which an atom-level `!=` is not. */
+interface Encoding {
+  op: CmpOp;
+  arity: 0 | 1 | 2;
+  operand: (texts: string[], type: ObservedType) => Value | null;
+  negate?: boolean;
+}
+
+const COMPARISONS: Partial<Record<PropertyOperatorId, Encoding>> = {
+  is: { op: "eq", arity: 1, operand: scalarOperand },
+  is_not: { op: "eq", arity: 1, operand: scalarOperand, negate: true },
+  references: { op: "eq", arity: 1, operand: textOperand },
+  does_not_reference: { op: "eq", arity: 1, operand: textOperand, negate: true },
+  gt: { op: "gt", arity: 1, operand: scalarOperand },
+  ge: { op: "ge", arity: 1, operand: scalarOperand },
+  lt: { op: "lt", arity: 1, operand: scalarOperand },
+  le: { op: "le", arity: 1, operand: scalarOperand },
+  after: { op: "gt", arity: 1, operand: dateOperand },
+  on_or_after: { op: "ge", arity: 1, operand: dateOperand },
+  before: { op: "lt", arity: 1, operand: dateOperand },
+  on_or_before: { op: "le", arity: 1, operand: dateOperand },
+  between: { op: "between", arity: 2, operand: rangeOperand },
+  contains: { op: "like", arity: 1, operand: containsOperand },
+  does_not_contain: { op: "like", arity: 1, operand: containsOperand, negate: true },
+  starts_with: { op: "starts_with", arity: 1, operand: textOperand },
+  ends_with: { op: "like", arity: 1, operand: endsWithOperand },
+  has_other_value: { op: "not_eq", arity: 1, operand: scalarOperand },
+};
+
+/** The identities with no value cell at all. */
+const NULLARY: Partial<Record<PropertyOperatorId, true>> = {
+  is_set: true,
+  is_not_set: true,
+  is_blank: true,
+  is_checked: true,
+  is_unchecked: true,
+};
+
+/** The words each identity shows. `many` changes only the wording of the
+ *  equality identity: `value = 'x'` on a many-valued key already means "one of
+ *  this key's values is x", so the operator was right and only the label lied
+ *  (§9 P2). */
+export function propertyOperatorLabel(
+  id: PropertyOperatorId,
+  cardinality: Cardinality = "one",
+): string {
+  const many = cardinality === "many";
+  switch (id) {
+    case "is":
+      return many ? "contains this value" : "is";
+    case "is_not":
+      return many ? "does not contain this value" : "is not";
+    case "gt":
+      return "is more than";
+    case "ge":
+      return "is at least";
+    case "lt":
+      return "is less than";
+    case "le":
+      return "is at most";
+    case "between":
+      return "is between";
+    case "before":
+      return "before";
+    case "on_or_before":
+      return "on or before";
+    case "after":
+      return "after";
+    case "on_or_after":
+      return "on or after";
+    case "contains":
+      return "contains";
+    case "does_not_contain":
+      return "does not contain";
+    case "starts_with":
+      return "starts with";
+    case "ends_with":
+      return "ends with";
+    case "references":
+      return "references";
+    case "does_not_reference":
+      return "does not reference";
+    case "is_checked":
+      return "is checked";
+    case "is_unchecked":
+      return "is unchecked";
+    case "is_set":
+      return "is set";
+    case "is_not_set":
+      return "is not set";
+    case "is_blank":
+      return "is blank";
+    case "has_other_value":
+      return "has a value other than";
+  }
+}
+
+/** The number of value inputs an identity collects. */
+export function propertyOperatorArity(id: PropertyOperatorId): 0 | 1 | 2 {
+  if (NULLARY[id]) return 0;
+  return COMPARISONS[id]?.arity ?? 1;
+}
+
+const IDENTITIES: Record<ObservedType, PropertyOperatorId[]> = {
+  number: ["is", "is_not", "gt", "ge", "lt", "le", "between", "is_set", "is_not_set", "is_blank"],
+  // No "is not": a date atom has no honest negation short of `not(…)`, which
+  // the design table does not list (§7.4, design §2.4).
+  date: ["is", "before", "on_or_before", "after", "on_or_after", "between", "is_set", "is_not_set"],
+  text: [
+    "contains",
+    "does_not_contain",
+    "is",
+    "is_not",
+    "starts_with",
+    "ends_with",
+    "is_set",
+    "is_not_set",
+    "is_blank",
+  ],
+  ref: ["references", "does_not_reference"],
+  checkbox: ["is_checked", "is_unchecked", "is_not_set"],
+};
+
 /**
- * **The comparisons offered for a property key, from the registry's effective
- * type (SPEC §7.4 "Operators and value editor by registry type", §9 P2).**
+ * **The operator menu for a property key, from the registry's effective type
+ * (SPEC §7.4, design §2.4).**
  *
- * Pure, and deliberately so: it maps a type to a menu, and it is the same menu
- * whether the caller is today's chip bar or P3's row. Three rules it encodes:
+ * Pure, and the ONE producer of this question: the row renders exactly this
+ * list. Three rules it encodes:
  *
- *  - **It chooses among operators the IR already has.** `CmpOp` and `Value` are
- *    P0's; nothing here widens either. A type that offered an operator the
- *    lowering cannot answer would be a builder that writes queries the engine
- *    silently drops.
- *  - **The presence row is NOT here.** `(any value)` — the bare key test, `is_set`
- *    semantics — is offered by every family and is built by
- *    {@link propertyFilter} with a `null` value, unchanged. It is a different
- *    question ("does this key exist here?") from every row below.
- *  - **`many` changes the words, not the operator.** For a key whose owners hold
- *    several atoms, `value = 'x'` already means "one of this key's values is x",
- *    so the operator is right and only the label was lying. There is no
- *    `any-of`/`none-of` in P2: `in`/`not_in` are list membership, not
- *    quantifiers, and the real quantifiers (`every`/`none`) are §7.4 work.
+ *  - **It chooses among operators the IR already has.** `CmpOp`, `Value` and
+ *    the three §3.3 presence shapes are P0's; nothing here widens any of them.
+ *  - **`is set` / `is not set` / `is blank` are three different identities**,
+ *    because conflating them is a bug users report: absent, present-with-no-
+ *    value and present-with-any-value are three different questions, and the
+ *    registry knows which is which.
+ *  - **Every negative identity wraps the POSITIVE leaf in `not(…)`** (§3.3), so
+ *    an owner that lacks the property matches *is not*. The atom-level `!=` is
+ *    a different predicate and is no longer offered.
+ *
+ * The design table's `enum` row (≤ N distinct values) is deliberately absent:
+ * the registry has no enum type, so there is nothing to read it from.
  */
-export function operatorsFor(effective: {
+export function propertyOperators(effective: {
   type: ObservedType;
   cardinality: Cardinality;
-}): TypedOperator[] {
-  const many = effective.cardinality === "many";
-  const is = many ? "contains this value" : "is";
-  const isNot = many ? "does not contain this value" : "is not";
-  switch (effective.type) {
-    case "number":
-      return [
-        { op: "eq", label: is, arity: 1, operand: numberOperand },
-        { op: "not_eq", label: isNot, arity: 1, operand: numberOperand },
-        { op: "lt", label: "is less than", arity: 1, operand: numberOperand },
-        { op: "le", label: "is at most", arity: 1, operand: numberOperand },
-        { op: "gt", label: "is more than", arity: 1, operand: numberOperand },
-        { op: "ge", label: "is at least", arity: 1, operand: numberOperand },
-      ];
-    case "date":
-      return [
-        { op: "eq", label: is, arity: 1, operand: dateOperand },
-        { op: "lt", label: "before", arity: 1, operand: dateOperand },
-        { op: "gt", label: "after", arity: 1, operand: dateOperand },
-        { op: "between", label: "between", arity: 2, operand: dateRangeOperand },
-      ];
-    case "checkbox":
-      return [
-        { op: "eq", label: "is", arity: 1, operand: boolOperand },
-        { op: "not_eq", label: "is not", arity: 1, operand: boolOperand },
-      ];
-    case "ref":
-      return [
-        { op: "eq", label: is, arity: 1, operand: textOperand },
-        { op: "not_eq", label: isNot, arity: 1, operand: textOperand },
-      ];
+}): PropertyOperator[] {
+  return IDENTITIES[effective.type].map((id) => ({
+    id,
+    label: propertyOperatorLabel(id, effective.cardinality),
+    arity: propertyOperatorArity(id),
+  }));
+}
+
+const propsLeaf = (key: string, quant: Quant, atom: Filter | null): Filter => {
+  const keyTest = attr("key", "eq", { kind: "text", text: key });
+  return {
+    kind: "leaf",
+    leaf: {
+      kind: "rel",
+      rel: "props",
+      quant,
+      pred: atom ? { kind: "and", items: [keyTest, atom] } : keyTest,
+    },
+  };
+};
+
+/** What a row of the sheet holds: the identity, the key it tests, and the text
+ *  in its value inputs. */
+export interface PropertyLeafTest {
+  id: PropertyOperatorId;
+  key: string;
+  /** One entry per value input, as typed. Empty for a nullary identity. */
+  values: string[];
+  /** A `page-property` row: the same predicate read through the owning page. */
+  throughPage: boolean;
+}
+
+/**
+ * **An identity → the IR leaf it means.** The inverse of
+ * {@link propertyLeafTest} on every row of the §7.4 table.
+ *
+ * `null` when the text in the value inputs is not a value of this type — the
+ * row simply does not commit, rather than saving a leaf that matches nothing.
+ */
+export function encodePropertyLeaf(spec: {
+  id: PropertyOperatorId;
+  key: string;
+  values?: string[];
+  /** The key's effective type, which decides the operand KIND. */
+  type?: ObservedType;
+  throughPage?: boolean;
+}): Filter | null {
+  const { id, key, values = [], type = "text", throughPage: viaPage = false } = spec;
+  if (!key) return null;
+  const hop = (filter: Filter): Filter => (viaPage ? throughPage(filter) : filter);
+  switch (id) {
+    // The three §3.3 presence shapes, and nothing else may spell them.
+    case "is_set":
+      return hop(propsLeaf(key, "any", null));
+    case "is_not_set":
+      return hop(propsLeaf(key, "none", null));
+    case "is_blank":
+      return hop(propsLeaf(key, "any", attr("atom_count", "eq", { kind: "number", number: 0 })));
+    case "is_checked":
+      return hop(propsLeaf(key, "any", attr("value", "eq", { kind: "bool", bool: true })));
+    case "is_unchecked":
+      return hop(propsLeaf(key, "any", attr("value", "eq", { kind: "bool", bool: false })));
+    default:
+      break;
+  }
+  const encoding = COMPARISONS[id];
+  if (!encoding) return null;
+  const operand = encoding.operand(values, type);
+  if (!operand) return null;
+  const positive = hop(propsLeaf(key, "any", attr("value", encoding.op, operand)));
+  return encoding.negate ? { kind: "not", inner: positive } : positive;
+}
+
+/** Every literal in a value, as the row's inputs hold it. */
+function valueTexts(value: Value): string[] {
+  switch (value.kind) {
     case "text":
-      return [
-        { op: "eq", label: is, arity: 1, operand: textOperand },
-        { op: "not_eq", label: isNot, arity: 1, operand: textOperand },
-        { op: "like", label: "contains", arity: 1, operand: containsOperand },
-        { op: "starts_with", label: "starts with", arity: 1, operand: textOperand },
-      ];
+      return [value.text];
+    case "number":
+      return [String(value.number)];
+    case "date":
+      return [value.literal];
+    case "bool":
+      return [String(value.bool)];
+    case "list":
+      return value.items.flatMap(valueTexts);
+    case "none":
+      return [];
+  }
+}
+
+/** One token of a `like` pattern: a literal character or a wildcard. */
+type LikeToken = { kind: "lit"; ch: string } | { kind: "any" } | { kind: "one" };
+
+function likeTokens(pattern: string): LikeToken[] | null {
+  const out: LikeToken[] = [];
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\") {
+      i += 1;
+      if (i >= pattern.length) return null;
+      out.push({ kind: "lit", ch: pattern[i] });
+      continue;
+    }
+    if (ch === "%") out.push({ kind: "any" });
+    else if (ch === "_") out.push({ kind: "one" });
+    else out.push({ kind: "lit", ch });
+  }
+  return out;
+}
+
+/**
+ * **The inverse of {@link escapeLike}, told apart by SHAPE.**
+ *
+ * `%x%` is *contains*, `%x` is *ends with* and `x%` is *starts with* — three
+ * different identities, so reading a pattern back has to distinguish them
+ * rather than answer "some substring". The literal body is unescaped, so a
+ * value the user typed with `%`, `_` or `\` in it round-trips; an escaped
+ * wildcard is data, while an unescaped one in the middle is a pattern this
+ * builder did not write and has no identity for.
+ */
+export function readLikePattern(
+  pattern: string,
+): { shape: "contains" | "ends_with" | "starts_with" | "exact"; text: string } | null {
+  const tokens = likeTokens(pattern);
+  if (!tokens) return null;
+  const lead = tokens[0]?.kind === "any";
+  const trail = tokens.length > (lead ? 1 : 0) && tokens[tokens.length - 1].kind === "any";
+  const body = tokens.slice(lead ? 1 : 0, trail ? tokens.length - 1 : tokens.length);
+  if (body.some((token) => token.kind !== "lit")) return null;
+  const text = body.map((token) => (token.kind === "lit" ? token.ch : "")).join("");
+  if (!text) return null;
+  if (lead && trail) return { shape: "contains", text };
+  if (lead) return { shape: "ends_with", text };
+  if (trail) return { shape: "starts_with", text };
+  return { shape: "exact", text };
+}
+
+/**
+ * **An IR leaf → the row that edits it.** The inverse of
+ * {@link encodePropertyLeaf}, reading the WHOLE filter including a `not(…)`
+ * wrapper, so every property leaf the builder can construct reopens with its
+ * operator instead of silently losing it (the P2 follow-up this closes).
+ *
+ * `effective` disambiguates the ONE pair of identities with the same IR
+ * spelling: `prop('k') = 'x'` is *is* for a text key and *references* for a ref
+ * key. Everything else is told apart by the operator and the operand's kind.
+ */
+export function propertyLeafTest(
+  filter: Filter,
+  effective?: { type: ObservedType; cardinality?: Cardinality },
+): PropertyLeafTest | null {
+  let node = filter;
+  let negated = false;
+  if (node.kind === "not") {
+    negated = true;
+    node = node.inner;
+  }
+  let viaPage = false;
+  const page = asRelLeaf(node, "page");
+  if (page) {
+    viaPage = true;
+    node = page.pred;
+  }
+  const props = asRelLeaf(node, "props");
+  if (!props) return null;
+  const parts = propsParts(props.pred);
+  if (!parts || parts.key === "tags") return null;
+  const done = (id: PropertyOperatorId, values: string[] = []): PropertyLeafTest => ({
+    id,
+    key: parts.key,
+    values,
+    throughPage: viaPage,
+  });
+  if (!parts.atom) {
+    if (negated) return null;
+    if (props.quant === "any") return done("is_set");
+    if (props.quant === "none") return done("is_not_set");
+    return null;
+  }
+  if (props.quant !== "any") return null;
+  const atom = asAttrLeaf(parts.atom);
+  if (!atom) return null;
+  if (atom.attr === "atom_count") {
+    return !negated && atom.op === "eq" && atom.value.kind === "number" && atom.value.number === 0
+      ? done("is_blank")
+      : null;
+  }
+  if (atom.attr !== "value") return null;
+  const texts = valueTexts(atom.value);
+  const isRef = effective?.type === "ref";
+  switch (atom.op) {
+    case "eq":
+      if (atom.value.kind === "bool") {
+        return negated ? null : done(atom.value.bool ? "is_checked" : "is_unchecked");
+      }
+      if (atom.value.kind === "list") return null;
+      if (isRef && atom.value.kind === "text") {
+        return done(negated ? "does_not_reference" : "references", texts);
+      }
+      return done(negated ? "is_not" : "is", texts);
+    case "not_eq":
+      return negated ? null : done("has_other_value", texts);
+    case "lt":
+      return negated ? null : done(atom.value.kind === "date" ? "before" : "lt", texts);
+    case "le":
+      return negated ? null : done(atom.value.kind === "date" ? "on_or_before" : "le", texts);
+    case "gt":
+      return negated ? null : done(atom.value.kind === "date" ? "after" : "gt", texts);
+    case "ge":
+      return negated ? null : done(atom.value.kind === "date" ? "on_or_after" : "ge", texts);
+    case "between":
+      return negated || texts.length !== 2 ? null : done("between", texts);
+    case "starts_with":
+      return negated || atom.value.kind !== "text" ? null : done("starts_with", texts);
+    case "like": {
+      if (atom.value.kind !== "text") return null;
+      const read = readLikePattern(atom.value.text);
+      if (!read) return null;
+      if (read.shape === "contains") {
+        return done(negated ? "does_not_contain" : "contains", [read.text]);
+      }
+      if (read.shape === "ends_with") return negated ? null : done("ends_with", [read.text]);
+      if (read.shape === "starts_with") return negated ? null : done("starts_with", [read.text]);
+      return null;
+    }
+    default:
+      return null;
   }
 }
 
@@ -559,92 +944,258 @@ function betweenPhrase(value: Value): string {
   return `${dateOf(value.items[0]) ?? valuePhrase(value.items[0])} ~ ${dateOf(value.items[1]) ?? valuePhrase(value.items[1])}`;
 }
 
-/** The phrase for one filter node. §7.2's per-leaf phrase function in its P0
- *  form: friendly where the shape is one the pickers know, and an honest
- *  generic rendering everywhere else.
+/** One piece of a rendered phrase (SPEC §7.2).
+ *
+ *  The resting sentence is typography, not a control panel, so the only thing
+ *  the renderer needs to know about a piece of it is whether it is ordinary
+ *  prose, a VALUE (drawn as a soft chip), a FIELD name, or the one bounded
+ *  `advanced` segment that stands for a subtree too deep to draw. `title` is the
+ *  hover text a retained `Raw` leaf carries — its diagnostic message — because
+ *  the decoded payload is what the user reads and the message is why it is red. */
+export interface PhraseSegment {
+  kind: "text" | "value" | "field" | "advanced";
+  text: string;
+  title?: string;
+}
+
+const seg = (kind: PhraseSegment["kind"], text: string, title?: string): PhraseSegment =>
+  title ? { kind, text, title } : { kind, text };
+const words = (text: string): PhraseSegment => seg("text", text);
+const chip = (text: string, title?: string): PhraseSegment => seg("value", text, title);
+const named = (text: string): PhraseSegment => seg("field", text);
+
+/** The one bounded segment a subtree past {@link MAX_QUERY_BUILDER_DEPTH}
+ *  collapses to. A 64-deep hostile query must produce a short sentence and a
+ *  short sheet, never a recursive dump (I-22). */
+export const ADVANCED_PHRASE = "⟨advanced⟩";
+
+/** **The phrase for one filter node — the ONE producer (§7.2).**
+ *
+ *  `filterLabel` is exactly this, joined; the sentence, the row and the
+ *  `⟨advanced⟩` chip all read the same segments. Splitting the phrase into
+ *  segments rather than a string is what lets the sentence draw values as chips
+ *  without a second phrasing function that would drift from this one (I-12).
  *
  *  **Total by construction (the anti-Jira property, §7.5):** every query the
  *  parser accepts renders in the builder, invalid ones included — so this never
- *  returns "unsupported" and never throws. */
-export function filterLabel(filter: Filter): string {
+ *  returns "unsupported" and never throws. **Bounded by construction (I-22):**
+ *  relation predicates and `off` are levels, and past the cap the answer is one
+ *  `advanced` segment. */
+export function filterPhrase(filter: Filter, depth = 0): PhraseSegment[] {
+  if (depth >= MAX_QUERY_BUILDER_DEPTH) return [seg("advanced", ADVANCED_PHRASE)];
   switch (filter.kind) {
     case "and":
     case "or":
-      return filter.kind.toUpperCase();
+      return [words(filter.kind.toUpperCase())];
     case "not":
-      return "NOT";
+      return [words("NOT")];
     case "off":
-      return `${filterLabel(filter.inner)} (off)`;
+      return [...filterPhrase(filter.inner, depth + 1), words(" (off)")];
     case "raw":
-      return filter.text;
+      return [chip(filter.text)];
     case "true":
-      return "everything";
+      return [words("everything")];
     case "false":
-      return "nothing";
+      return [words("nothing")];
     case "leaf":
-      return leafLabel(filter, filter.leaf);
+      return leafPhrase(filter, filter.leaf, depth);
   }
 }
 
-function leafLabel(filter: Filter, leaf: Leaf): string {
+/** The phrase for one filter node, as a plain string.
+ *
+ *  Kept as its own export because it is what a chip's text, a `title` and every
+ *  existing assertion are: `filterPhrase` joined, and nothing else. */
+export function filterLabel(filter: Filter): string {
+  return filterPhrase(filter)
+    .map((segment) => segment.text)
+    .join("");
+}
+
+/** **What the row's VALUE cell says: the operands, without the prose.**
+ *
+ *  A row already names its field and its operator in its own two cells, so the
+ *  value cell must not repeat them — `Task marker ▾ | is any of ▾ | task: TODO
+ *  | DOING` says "task" three times. This is not a second labeller (D-14): it
+ *  is the SAME {@link filterPhrase} segments with the prose dropped, so a value
+ *  can never drift from the sentence that quotes it. A leaf with no operands at
+ *  all (`on journal page`) keeps its whole phrase, because an empty cell would
+ *  be nothing to click. */
+export function filterValueLabel(filter: Filter): string {
+  const segments = filterPhrase(filter);
+  const values = segments.filter((segment) => segment.kind === "value");
+  return values.length ? values.map((segment) => segment.text).join(" ") : filterLabel(filter);
+}
+
+function leafPhrase(filter: Filter, leaf: Leaf, depth: number): PhraseSegment[] {
   const kind = builderLeafKind(filter);
   if (leaf.kind === "rel") {
     const inner = asAttrLeaf(leaf.pred);
     const innerText = inner ? (textOf(inner.value) ?? "") : "";
     switch (kind) {
       case "page":
-        return innerText;
+        return [chip(innerText)];
       case "onPage":
-        return `page: ${innerText}`;
+        return [words("page: "), chip(innerText)];
       case "namespace":
-        return `namespace: ${innerText.replace(/\/$/, "")}`;
+        return [words("namespace: "), chip(innerText.replace(/\/$/, ""))];
       case "journal":
-        return "on journal page";
+        return [words("on journal page")];
       default:
         break;
     }
     if (leaf.rel === "page") {
-      const inner = filterLabel(leaf.pred);
-      return kind === "pageProperty" ? `page ${inner}` : inner;
+      const inner = filterPhrase(leaf.pred, depth + 1);
+      return kind === "pageProperty" ? [words("page "), ...inner] : inner;
     }
     if (leaf.rel === "props") {
       const parts = propsParts(leaf.pred);
       if (parts) {
         const atom = parts.atom ? asAttrLeaf(parts.atom) : null;
         if (parts.key === "tags" && atom?.op === "in") {
-          return `page tags: ${(listOf(atom.value) ?? []).join(" | ")}`;
+          return [words("page tags: "), chip((listOf(atom.value) ?? []).join(" | "))];
         }
-        if (!parts.atom) return `${parts.key}: any`;
-        if (atom?.op === "eq") return `${parts.key}: ${valuePhrase(atom.value)}`;
+        if (!parts.atom) return [named(parts.key), words(": any")];
+        if (atom?.op === "eq") {
+          return [named(parts.key), words(": "), chip(valuePhrase(atom.value))];
+        }
       }
+      // A typed comparison. Reading it back through the same decoder the row
+      // uses keeps the sentence and the row saying the same thing; the generic
+      // `any props: AND` this used to fall through to said nothing at all.
+      const test = propertyLeafTest(filter);
+      if (test) return propertyTestPhrase(test);
     }
-    return `${leaf.quant} ${leaf.rel}: ${filterLabel(leaf.pred)}`;
+    return [words(`${leaf.quant} ${leaf.rel}: `), ...filterPhrase(leaf.pred, depth + 1)];
   }
   // An attribute leaf.
   switch (kind) {
     case "task":
-      return `task: ${(listOf(leaf.value) ?? []).join(" | ") || "any"}`;
+      return [words("task: "), chip((listOf(leaf.value) ?? []).join(" | ") || "any")];
     case "priority":
-      return `priority: ${(listOf(leaf.value) ?? []).join(" | ") || "any"}`;
+      return [words("priority: "), chip((listOf(leaf.value) ?? []).join(" | ") || "any")];
     case "scheduled":
-      return "scheduled";
+      return [words("scheduled")];
     case "deadline":
-      return "deadline";
+      return [words("deadline")];
     case "content":
-      return `text: "${plainLikeSubstring(textOf(leaf.value) ?? "") ?? valuePhrase(leaf.value)}"`;
+      return [
+        words('text: "'),
+        chip(plainLikeSubstring(textOf(leaf.value) ?? "") ?? valuePhrase(leaf.value)),
+        words('"'),
+      ];
     case "search":
-      return `search: ${valuePhrase(leaf.value)}`;
+      return [words("search: "), chip(valuePhrase(leaf.value))];
     default:
       break;
   }
   if (leaf.op === "between") {
     const field = leaf.attr === "day" ? "" : `${ATTR_PHRASE[leaf.attr]} `;
-    return `${field}between: ${betweenPhrase(leaf.value)}`;
+    return [words(`${field}between: `), chip(betweenPhrase(leaf.value))];
   }
   if (leaf.op === "is_set" || leaf.op === "is_not_set" || leaf.op === "is_blank") {
-    return `${ATTR_PHRASE[leaf.attr]} ${OP_PHRASE[leaf.op]}`;
+    return [named(ATTR_PHRASE[leaf.attr]), words(` ${OP_PHRASE[leaf.op]}`)];
   }
-  return `${ATTR_PHRASE[leaf.attr]} ${OP_PHRASE[leaf.op]} ${valuePhrase(leaf.value)}`;
+  return [
+    named(ATTR_PHRASE[leaf.attr]),
+    words(` ${OP_PHRASE[leaf.op]} `),
+    chip(valuePhrase(leaf.value)),
+  ];
+}
+
+/** `cost is more than 100` — the row's own words, in the sentence. */
+function propertyTestPhrase(test: PropertyLeafTest): PhraseSegment[] {
+  const label = propertyOperatorLabel(test.id);
+  if (!test.values.length) return [named(test.key), words(` ${label}`)];
+  return [named(test.key), words(` ${label} `), chip(test.values.join(" ~ "))];
+}
+
+/** Whether a node is a single condition rather than a group — the unit that
+ *  renders as ONE row, and the unit a `not`/`off` wrapper can decorate without
+ *  costing a level of indentation. */
+function isLeafLike(filter: Filter): boolean {
+  return (
+    filter.kind === "leaf" ||
+    filter.kind === "raw" ||
+    filter.kind === "true" ||
+    filter.kind === "false"
+  );
+}
+
+/** Whether a filter says nothing — the empty query, whose sentence is
+ *  "All blocks" rather than "Blocks where …". */
+export function isEmptyFilter(filter: Filter): boolean {
+  if (filter.kind === "true") return true;
+  return (filter.kind === "and" || filter.kind === "or") && filter.items.length === 0;
+}
+
+function joinPhrases(parts: PhraseSegment[][], connector: "and" | "or"): PhraseSegment[] {
+  if (parts.length === 0) return [];
+  if (parts.length === 1) return parts[0];
+  const out: PhraseSegment[] = [];
+  parts.forEach((part, index) => {
+    if (index > 0) {
+      const last = index === parts.length - 1;
+      // A list reads as a list: "a, b, and c" — commas between, the connector
+      // once, before the last. Two operands need no comma.
+      if (connector === "and") out.push(words(last ? (parts.length > 2 ? ", and " : " and ") : ", "));
+      else out.push(words(last ? " or " : ", "));
+    }
+    out.push(...part);
+  });
+  return out;
+}
+
+function clausePhrase(filter: Filter, depth: number, isRoot: boolean): PhraseSegment[] {
+  if (depth >= MAX_QUERY_BUILDER_DEPTH) return [seg("advanced", ADVANCED_PHRASE)];
+  switch (filter.kind) {
+    case "and":
+    case "or": {
+      if (filter.items.length === 0) return filterPhrase(filter, depth);
+      // A one-item group needs no parentheses, but it is still a LEVEL: a chain
+      // of them is exactly what a hostile 64-deep query is, and descending it
+      // for free would make the sentence as deep as the tree (I-22).
+      if (filter.items.length === 1) return clausePhrase(filter.items[0], depth + 1, isRoot);
+      const parts = filter.items.map((item) => clausePhrase(item, depth + 1, false));
+      const joined = joinPhrases(parts, filter.kind === "or" ? "or" : "and");
+      return isRoot ? joined : [words("("), ...joined, words(")")];
+    }
+    case "not": {
+      const inner = isLeafLike(filter.inner)
+        ? clausePhrase(filter.inner, depth, false)
+        : clausePhrase(filter.inner, depth + 1, false);
+      return [words("not "), ...inner];
+    }
+    case "off": {
+      const inner = isLeafLike(filter.inner)
+        ? clausePhrase(filter.inner, depth, false)
+        : clausePhrase(filter.inner, depth + 1, false);
+      return [...inner, words(" (off)")];
+    }
+    default:
+      return filterPhrase(filter, depth);
+  }
+}
+
+/**
+ * **The resting sentence for a whole query (SPEC §7.2, design §2.1).**
+ *
+ * One plain-English line whose subject is the anchor — "Blocks where …" /
+ * "Pages where …" — and whose predicate is the filter read as prose, values as
+ * soft chips. It says "where" because the sheet's anchor line says "Find
+ * blocks where …": the resting line and the editing line are one sentence.
+ * An empty filter reads "All blocks" / "All pages": the honest
+ * answer, and not a menu.
+ *
+ * It composes {@link filterPhrase} rather than re-phrasing anything, so the row
+ * a user edits and the sentence they read are the same words, and it is bounded
+ * by the same cap (I-22).
+ */
+export function querySentence(query: { anchor: Anchor; filter: Filter }): PhraseSegment[] {
+  const plural = query.anchor === "page" ? "pages" : "blocks";
+  if (isEmptyFilter(query.filter)) return [words("All "), named(plural)];
+  const subject = plural === "pages" ? "Pages" : "Blocks";
+  return [named(subject), words(" where "), ...clausePhrase(query.filter, 0, true)];
 }
 
 /** The inverse of {@link escapeLike} for a pattern that is exactly `%<literal>%`
@@ -897,6 +1448,24 @@ export function wrapAt(root: Filter, loc: number[], op: "and" | "or" | "not"): F
     if (!at || !current) return false;
     at.children[at.idx] =
       op === "not" ? { kind: "not", inner: current } : { kind: op, items: [current] };
+    return true;
+  });
+}
+
+/** **"Group with the row above" (§7.4, design §2.5).**
+ *
+ *  Wraps the addressed row and the sibling immediately before it into one `and`
+ *  group, in place. The first row of a group has nothing above it, so it is a
+ *  no-op — as is a stale `loc` from a menu that outlived its tree, exactly like
+ *  every other edit here. */
+export function groupWithPrevious(root: Filter, loc: number[]): Filter {
+  return edit(root, (draft) => {
+    const at = locate(draft, loc);
+    if (!at || at.idx === 0) return false;
+    const current = at.children[at.idx];
+    const previous = at.children[at.idx - 1];
+    if (!current || !previous) return false;
+    at.children.splice(at.idx - 1, 2, { kind: "and", items: [previous, current] });
     return true;
   });
 }

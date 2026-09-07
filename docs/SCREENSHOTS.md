@@ -30,6 +30,7 @@ node scripts/shot-readme.mjs # → screenshots/rm-tabs.png, rm-focus-dim.png, rm
 node scripts/shot-capture.mjs# → screenshots/rm-quick-capture.png (better: slash menu + window frame)
 node scripts/screenshot.mjs  # → screenshots/journals-light.png, pdf-notes-light.png, … (the review set)
 node scripts/shot-improve.mjs# → screenshots/improve-{empty,report,findings}.png (Help improve Tine diff panel; uses __tineDiffFixture)
+node scripts/shot-query-sheet.mjs # → screenshots/query-{sentence,sheet,sheet-narrow}.png (the query builder's two states, wide and phone-width)
 ```
 
 Scripts write to the gitignored `screenshots/` dir; the README set is then
@@ -44,7 +45,7 @@ Scripts write to the gitignored `screenshots/` dir; the README set is then
 | `focus-dim.png`      | Focus mode + dim-inactive-blocks                   | `shot-readme.mjs` → `rm-focus-dim.png`           | focus/dim behavior or chrome changes |
 | `dim.png`            | Dim-inactive-blocks (one block spotlit)            | `shot-features.mjs` → `feat-dim.png`             | dim behavior changes |
 | `carry.png`          | Carry-unfinished-tasks buttons on a journal        | `shot-features.mjs` → `feat-carry.png` (clipped) | carry UI/buttons change |
-| `query.png`          | Query results + visual query-builder chip bar      | `shot-features.mjs` → `feat-query.png`           | query rendering or the builder bar changes |
+| `query.png`          | The query sheet open over a query block            | `shot-query-sheet.mjs` → `query-sheet.png`       | the resting sentence, the anchor line, or the sheet's rows change |
 | `sheets.png`         | Sheets grid/table/board composite                  | `shot-sheets.mjs` → `shot-sheets.png`            | sheet schema table, formula columns/filter chip, tag board, grid/table/board rendering, or controls change |
 | _(probe only)_       | Grid hover-`+` edge affordances + board Group-by toolbar | `shot-chunk2.mjs` → `/tmp/shot-chunk2-{grid,board}.png` | grid edge-grow affordances or board group-by picker change (verification probe, not a curated README image) |
 | `quick-capture.png`  | Quick-capture mini-window with slash menu open     | `shot-capture.mjs` → `rm-quick-capture.png`      | capture window, slash menu, or editor-parity changes |
@@ -55,6 +56,16 @@ Scripts write to the gitignored `screenshots/` dir; the README set is then
 | `waveform.png`       | Audio waveform overlay player (decoded waveform)   | `shot-media.mjs` → `audio-overlay.png`           | audio overlay / waveform rendering changes (shot synthesizes a real WAV so the waveform draws) |
 
 ## Known limitations / honest caveats
+
+- **The browser mock cannot run a query.** Execution goes through the Rust
+  engine now, so under `vite preview` every `{{query}}` answers zero results —
+  `query.png` therefore shows the builder, not a populated result list, and the
+  count pill beside the sentence reads `0`. `shot-query-sheet.mjs` installs a
+  canned PARSE through the mock-only `__tineMockQueryFixture` seam so the
+  sentence and the rows are real renderings of a real query IR; it deliberately
+  does not fake RESULTS, because inventing rows for a README image would be
+  showing something the product did not compute. The real end-to-end behaviour
+  is proven by `scripts/e2e-query-sheet.mjs` against the built binary.
 
 - **Quick-capture is a frameless OS window.** The mock can only render its web
   content (a bare editor on white), so `shot-capture.mjs` adds the drop-shadow +

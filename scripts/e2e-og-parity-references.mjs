@@ -455,7 +455,7 @@ try {
     A: await slashSentinel("A", "Priority A", ["Priority A"]),
     priority: await slashSentinel("priority", "Priority A", ["Priority A", "Priority B", "Priority C"]),
     kanban: await slashSentinel("kanban", "Board", ["Board"]),
-    query: await slashSentinel("query", "Query", ["Query", "Query (visual builder)"]),
+    query: await slashSentinel("query", "Query", ["Query"]),
   };
   await clearActiveEditor(browser);
   await browser.keys(["Escape"]);

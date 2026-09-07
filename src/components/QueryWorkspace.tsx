@@ -520,6 +520,7 @@ function AdvancedModal(props: {
               onChange={(next) => void applyBuilderEdit(next)}
               paneDialect="og"
               paneAlwaysOpen
+              sheetAlwaysOpen
               parentTransientId={props.layerId}
             />
             <p class="query-advanced-note">Switching back to friendly fields is offered only when it can be lossless.</p>

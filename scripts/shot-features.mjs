@@ -107,13 +107,14 @@ try {
     const n = await blocks.count();
     if (n) await blocks.nth(n - 1).click();
     await sleep(150);
-    await page.keyboard.type("/query (visual");
+    // One /query command now, and it opens the SHEET with the field chooser up.
+    await page.keyboard.type("/query");
     await sleep(300);
     const item = page.locator(".ac-item").first();
     if (await item.count()) await item.click();
     await sleep(400);
-    const bar = page.locator(".qb-bar").first();
-    if (await bar.count()) await bar.scrollIntoViewIfNeeded();
+    const sheet = page.locator(".qs-sheet").first();
+    if (await sheet.count()) await sheet.scrollIntoViewIfNeeded();
     await sleep(300);
   });
 

@@ -681,6 +681,28 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-query-sheet.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A query block rests as one plain-English sentence with its result count, expands into a sheet of editable rows over the blocks below it, and what the sheet writes reopens as the same sentence after a restart while an untouched query block stays byte-identical.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Escape peels exactly one layer at a time (the sheet's own open menu, then the sheet), the sheet stays inside the viewport at the narrowest window the app allows, and a deeply nested query still opens as a short sentence and a small sheet rather than growing with its nesting.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The wording of the sentence, the row labels and the field vocabulary may evolve while the query the sheet writes stays the same.",
+    "Sheet padding, shadow and the exact scrim opacity may change, as may where the sheet is placed relative to the sentence, as long as it stays on screen."
+   ],
+   "nonRequirements": [
+    "Pixel geometry of the sheet on a wide screen, animation, or the order of the rows within one group."
+   ],
+   "stability": "burn-in"
+  },
   "scripts/e2e-query-workspace.mjs": {
    "contracts": [
     {

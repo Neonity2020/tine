@@ -24,7 +24,7 @@ icon:: 🧱
 	- 4. What you should see: the same child bullets appear as editable table rows or status columns. Move a board card to change that block's grouping field; return to the outline and the change is there too.
 - ## Find and reuse the same kind of block
 	- 1. Press **Ctrl+K**, then search for `Refresh Guide examples`. The friendly search surface finds that tracker block without needing a query expression.
-	- 2. Choose **Open search tab**. There, choose **Filters / Advanced**, then **Edit as visual query**. In the chip bar, use **➕ Add filter** → **Property** to choose Owner and the value Avery.
+	- 2. Choose **Open search tab**. There, choose **Filters / Advanced**, then **Edit as visual query**. The query reads as one sentence — *Blocks where …* — over a sheet of conditions; use **+ Add condition** → **Property** to choose Owner and the value Avery.
 	- 3. Choose **Table** or **Board** in the result presentation controls. The selection answers *which blocks* to show; the view answers *how* to show them, so you can change the presentation without remaking the selection.
 	- 4. What you should see: a reusable selection of matching tracker blocks, first as search results and then as the table or board you chose.
 - ### Query-backed board of the same tracker

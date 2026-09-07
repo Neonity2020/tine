@@ -266,8 +266,11 @@ describe("QueryMacro sheet integration", () => {
     await settleQuery();
 
     expect(activeView(root)).toBe("Search");
-    expect(root.querySelector(".qb-chip")?.textContent).toBe("search: alpha beta");
-    expect(root.querySelector(".qb-chip-raw")).toBeNull();
+    // The resting SENTENCE says it, and says it as words plus one soft value —
+    // not as the DSL text the block happens to hold.
+    expect(root.querySelector(".qs-sentence")?.textContent).toBe("Blocks where search: alpha beta");
+    expect(root.querySelector(".qs-seg-value")?.textContent).toBe("alpha beta");
+    expect(root.querySelector(".qs-seg-advanced")).toBeNull();
     expect([...root.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["alpha", "beta"]);
     expect(graphSearch).toHaveBeenCalledWith("alpha beta", 500, 5_000, "inline-query:query", false);
     root.querySelector<HTMLButtonElement>(".query-search-hit")!.click();
@@ -328,8 +331,12 @@ describe("QueryMacro sheet integration", () => {
     await settleQuery();
 
     expect(root.querySelector(".query-header")).not.toBeNull();
-    expect(root.querySelector(".qb-bar")).not.toBeNull();
-    expect(root.querySelector(".qb-chip")).not.toBeNull();
+    expect(root.querySelector(".qs-line")).not.toBeNull();
+    // This block's text is mocked as unparsed, so the sentence reads it back as
+    // the retained leaf it is — still one line, still not a chip bar.
+    expect(root.querySelector(".qs-sentence")?.textContent).toBe("Blocks where (todo TODO)");
+    // Exactly once: one sentence, one gear, one count — not one per face.
+    expect(root.querySelectorAll(".qs-sentence")).toHaveLength(1);
     expect(root.querySelectorAll(".sheet-table")).toHaveLength(1);
     expect(root.querySelectorAll(".query-table")).toHaveLength(0);
     expect(root.textContent).toContain("From query");
@@ -457,7 +464,7 @@ describe("QueryMacro sheet integration", () => {
     (root.querySelector(".query-collapse") as HTMLElement).click();
 
     expect(root.querySelector(".query-header")).not.toBeNull();
-    expect(root.querySelector(".qb-bar")).not.toBeNull();
+    expect(root.querySelector(".qs-line")).not.toBeNull();
     expect(root.querySelectorAll(".sheet-table")).toHaveLength(0);
 
     dispose();
@@ -538,7 +545,11 @@ describe("QueryMacro sheet integration", () => {
     await settleQuery();
 
     await vi.waitFor(() => expect(root.querySelector(".query-adv-note")?.textContent ?? "").toContain("ran: task"));
-    expect(root.querySelector(".qb-bar")).toBeNull();
+    // An advanced (datalog) query has no sentence and no sheet to offer.
+    expect(root.querySelector(".qs-line")).toBeNull();
+    expect(root.querySelector(".qs-sheet")).toBeNull();
+    // …and the count stays in the header, where it has always been.
+    expect(root.querySelector(".query-header .query-count")).not.toBeNull();
     expect([...root.querySelectorAll("button")].some((el) => el.textContent?.trim() === "← Simple")).toBe(false);
 
     dispose();

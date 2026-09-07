@@ -138,17 +138,36 @@ describe("B1: a TQL block executes through query_run", () => {
   });
 });
 
-/** Open the collapsed text pane, as a user clicking its disclosure does. */
+/** Open the editing sheet, as a user clicking the resting sentence's ⚙ does.
+ *  The sheet is portalled to <body>, so its contents are queried from the
+ *  document rather than from the block's own element. */
+async function openSheet(root: HTMLElement): Promise<HTMLElement> {
+  const gear = await vi.waitFor(() => {
+    const found = root.querySelector<HTMLButtonElement>(".qs-gear");
+    if (!found) throw new Error("the query sentence never appeared");
+    return found;
+  });
+  if (!document.querySelector(".qs-sheet")) gear.click();
+  return await vi.waitFor(() => {
+    const sheet = document.querySelector<HTMLElement>(".qs-sheet");
+    if (!sheet) throw new Error("the sheet never opened");
+    return sheet;
+  });
+}
+
+/** Open the collapsed text pane in the sheet's footer, as a user clicking its
+ *  disclosure does. */
 async function openPane(root: HTMLElement): Promise<HTMLTextAreaElement> {
+  const sheet = await openSheet(root);
   const details = await vi.waitFor(() => {
-    const found = root.querySelector<HTMLDetailsElement>(".query-text-pane-details");
+    const found = sheet.querySelector<HTMLDetailsElement>(".query-text-pane-details");
     if (!found) throw new Error("the query text pane never appeared");
     return found;
   });
   details.open = true;
   details.dispatchEvent(new Event("toggle"));
   return await vi.waitFor(() => {
-    const input = root.querySelector<HTMLTextAreaElement>(".query-text-pane-input");
+    const input = sheet.querySelector<HTMLTextAreaElement>(".query-text-pane-input");
     if (!input) throw new Error("the pane has no input");
     return input;
   });
@@ -226,9 +245,9 @@ describe("B4: the query text pane", () => {
       settlers.get("-- task OLD")!.fail(new Error("unbalanced parenthesis at 1:9"));
       await settle();
 
-      expect(root.querySelector(".query-text-pane-error")).toBeNull();
+      expect(document.querySelector(".query-text-pane-error")).toBeNull();
       expect(root.querySelector(".query-block")?.classList.contains("query-stale")).toBe(false);
-      expect(root.querySelector<HTMLButtonElement>(".query-text-pane-save")!.disabled).toBe(false);
+      expect(document.querySelector<HTMLButtonElement>(".query-text-pane-save")!.disabled).toBe(false);
     } finally {
       dispose();
     }
@@ -248,7 +267,7 @@ describe("B4: the query text pane", () => {
 
       type(input, "-- task ");
       await vi.waitFor(() =>
-        expect(root.querySelector(".query-text-pane-error")?.textContent)
+        expect(document.querySelector(".query-text-pane-error")?.textContent)
           .toBe("expected a comparison after `where`"),
       );
 
@@ -256,9 +275,9 @@ describe("B4: the query text pane", () => {
       expect(root.textContent).toContain("A tracked row");
       expect(root.querySelector(".query-block")?.classList.contains("query-stale")).toBe(true);
       // …and no spinner outliving the response.
-      expect(root.querySelector(".query-text-pane-pending")).toBeNull();
-      expect(root.querySelector<HTMLButtonElement>(".query-text-pane-save")!.disabled).toBe(true);
-      expect(root.querySelector(".query-text-pane-error")?.getAttribute("role")).toBe("alert");
+      expect(document.querySelector(".query-text-pane-pending")).toBeNull();
+      expect(document.querySelector<HTMLButtonElement>(".query-text-pane-save")!.disabled).toBe(true);
+      expect(document.querySelector(".query-text-pane-error")?.getAttribute("role")).toBe("alert");
     } finally {
       dispose();
     }
@@ -278,7 +297,7 @@ describe("B4: the query text pane", () => {
       type(input, '-- task TODO {:title "Open"}');
       await wait(250);
 
-      expect(root.querySelector(".query-text-pane-error")?.textContent).toContain("options map");
+      expect(document.querySelector(".query-text-pane-error")?.textContent).toContain("options map");
       // Splitting a macro argument is Rust's job and only Rust's — the pane makes
       // no claim about where the map starts, and asks nothing.
       expect(parse.mock.calls.filter(([, dialect]) => dialect === "tql")).toHaveLength(0);
@@ -303,7 +322,7 @@ async function saveThroughPane(root: HTMLElement, text: string): Promise<void> {
   vi.spyOn(backend(), "parseQuery").mockImplementation(async (source: string) => parsedAs(source));
   type(input, text);
   const save = await vi.waitFor(() => {
-    const button = root.querySelector<HTMLButtonElement>(".query-text-pane-save");
+    const button = document.querySelector<HTMLButtonElement>(".query-text-pane-save");
     if (!button || button.disabled) throw new Error("save is not enabled yet");
     return button;
   });
@@ -388,7 +407,7 @@ describe("B5: the save path chooses the name and answers NotApplicable", () => {
       expect(savePrintDialects(print)).toEqual(["og", "tql_macro"]);
       // The user is never shown a refusal for a query Tine can perfectly well
       // store.
-      expect(root.querySelector(".query-print-refused")).toBeNull();
+      expect(document.querySelector(".query-print-refused")).toBeNull();
     } finally {
       dispose();
     }
@@ -416,7 +435,7 @@ describe("B5: the save path chooses the name and answers NotApplicable", () => {
       await saveThroughPane(root, "-- content = '}}'");
       expect(doc.byId.query.raw).toBe(before);
       const refusal = await vi.waitFor(() => {
-        const found = root.querySelector(".query-print-refused");
+        const found = document.querySelector(".query-print-refused");
         if (!found) throw new Error("no refusal was shown");
         return found;
       });

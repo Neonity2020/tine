@@ -340,7 +340,7 @@ const EMPTY_SESSION: BuilderSession = {
 };
 
 describe("A4: the registry is read on picker open and after a declaration — and nowhere else (I-13)", () => {
-  it("asks once when a property picker opens, and once more when a declaration lands", async () => {
+  it("asks once when the sheet opens, and once more when a declaration lands", async () => {
     setDoc({ byId: {}, pages: [builderPage()], feed: ["Sheet"], loaded: true });
     const rows = [row({ normalized_name: "cost", observed_type: "number" })];
     const registry = vi
@@ -355,13 +355,23 @@ describe("A4: the registry is read on picker open and after a declaration — an
     ));
     try {
       await settle();
-      // Rendering the bar asks NOTHING: the registry is a graph-level table, and
-      // a query block that is merely on screen has no reason to want it.
+      // Rendering the resting SENTENCE asks NOTHING: the registry is a
+      // graph-level table, and a query block that is merely on screen has no
+      // reason to want it (I-13). A page of query blocks costs zero reads.
       expect(registry).not.toHaveBeenCalled();
 
-      root.querySelector<HTMLButtonElement>(".qb-add")!.click();
+      // Opening the sheet is the ONE read. It is needed there: every property
+      // row's operator label is the key's effective type, so the sheet cannot
+      // draw itself without it — and it must not ask again per row or per key.
+      root.querySelector<HTMLButtonElement>(".qs-gear")!.click();
       await settle();
-      [...root.querySelectorAll<HTMLButtonElement>(".qb-menu-item")]
+      expect(registry).toHaveBeenCalledTimes(1);
+
+      // The sheet is portalled to <body>, so everything below is queried from
+      // the document rather than from the host element.
+      document.querySelector<HTMLButtonElement>(".qs-add")!.click();
+      await settle();
+      [...document.querySelectorAll<HTMLButtonElement>(".qs-option")]
         .find((b) => b.textContent === "Property")!
         .click();
       await settle();
@@ -370,7 +380,7 @@ describe("A4: the registry is read on picker open and after a declaration — an
       // Typing a key filters the list from the facets already in hand. It must
       // not ask again — that is the per-keystroke whole-graph question I-13
       // exists to forbid.
-      const input = root.querySelector<HTMLInputElement>(".qb-value .qb-input")!;
+      const input = document.querySelector<HTMLInputElement>(".qs-value-editor .qs-input")!;
       for (const text of ["c", "co", "cos", "cost"]) {
         input.value = text;
         input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -378,16 +388,16 @@ describe("A4: the registry is read on picker open and after a declaration — an
       await settle();
       expect(registry).toHaveBeenCalledTimes(1);
 
-      [...root.querySelectorAll<HTMLButtonElement>(".qb-value .qb-menu-item")]
+      [...document.querySelectorAll<HTMLButtonElement>(".qs-value-editor .qs-option")]
         .find((b) => b.textContent === "cost")!
         .click();
       await settle();
       expect(registry).toHaveBeenCalledTimes(1);
-      expect(root.querySelector(".qb-prop-type-badge")!.textContent).toContain("number");
+      expect(document.querySelector(".qb-prop-type-badge")!.textContent).toContain("number");
 
-      root.querySelector<HTMLButtonElement>(".qb-prop-type-declare")!.click();
+      document.querySelector<HTMLButtonElement>(".qb-prop-type-declare")!.click();
       await settle();
-      optionNamed(root, "text").click();
+      optionNamed(document.body, "text").click();
       await settle();
       // The row the badge reads is now stale, so exactly one more read.
       expect(registry).toHaveBeenCalledTimes(2);

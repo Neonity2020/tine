@@ -283,24 +283,29 @@ describe("QueryWorkspace", () => {
       const dialog = root.querySelector<HTMLElement>(".query-advanced-modal")!;
       expect(dialog).not.toBeNull();
 
-      // The bar is over the IR now, so it appears once the ENGINE has read the
-      // route's text — there is no frontend parser left to do it synchronously.
-      await waitFor(() => expect(root.querySelector(".qb-chip")).not.toBeNull());
-      root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
-      expect(root.querySelector(".qb-menu")).not.toBeNull();
+      // The sheet is over the IR now, so its rows appear once the ENGINE has
+      // read the route's text — there is no frontend parser left to do it
+      // synchronously. In the workspace the sheet is always open and NOT
+      // portalled: it is inside the Advanced modal, so the modal's Tab trap
+      // keeps containing it.
+      // The dev-preview backend has no parser, so this route's text comes back
+      // as ONE retained row — which still has its own ⋮ popover to peel.
+      await waitFor(() => expect(root.querySelector(".qs-row .qs-row-menu")).not.toBeNull());
+      root.querySelector<HTMLButtonElement>(".qs-row .qs-row-menu")!.click();
+      expect(root.querySelector(".qs-menu")).not.toBeNull();
 
       // Rung one: Escape peels the child popover and leaves the modal standing.
       expect(dismissTopTransient("escape")).toBe(true);
-      expect(root.querySelector(".qb-menu")).toBeNull();
+      expect(root.querySelector(".qs-menu")).toBeNull();
       expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
 
       // Same rung by pointer (GH #472): a press on the modal's own header is an
-      // outside press for the clause menu, so the menu closes and only the menu.
-      root.querySelector<HTMLButtonElement>(".qb-chip")!.click();
-      expect(root.querySelector(".qb-menu")).not.toBeNull();
+      // outside press for the row menu, so the menu closes and only the menu.
+      root.querySelector<HTMLButtonElement>(".qs-row .qs-row-menu")!.click();
+      expect(root.querySelector(".qs-menu")).not.toBeNull();
       dialog.querySelector(".query-advanced-header")!
         .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
-      expect(root.querySelector(".qb-menu")).toBeNull();
+      expect(root.querySelector(".qs-menu")).toBeNull();
       expect(root.querySelector(".query-advanced-modal")).not.toBeNull();
       await waitFor(() =>
         expect(root.querySelector<HTMLTextAreaElement>(".query-text-pane-input")?.value).toBe(route.source),

@@ -884,9 +884,10 @@ export function agendaQuery(): string {
   return `query (and ${window} (not (task DONE CANCELED CANCELLED)))`;
 }
 
-// When a query block is created via the "/Query (visual builder)" command, hold
-// its block id so the freshly-rendered QueryBuilder opens its add-filter picker
-// immediately (the block id, consumed once on mount, then cleared).
+// When a query block is created via `/query` — one command since SPEC §7.3 —
+// hold its block id so the freshly-rendered QueryBuilder opens its SHEET with
+// the field chooser focused (the block id, consumed once on mount, then
+// cleared).
 export const [queryBuilderAutoOpen, setQueryBuilderAutoOpen] = createSignal<string | null>(null);
 
 // Page-properties panel (alias / public / tags / icon / title), opened from the
