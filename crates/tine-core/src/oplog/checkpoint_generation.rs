@@ -1903,6 +1903,216 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual architecture census: fixed live graph with increasing create/delete history"]
+    fn rebaselining_constant_live_churn_census() {
+        use crate::oplog::hot_engine::{LazyGenesisCheckpointBuilder, ShardedHotEngine};
+        use crate::oplog::lazy_genesis::LazyGenesisPackBuilder;
+        use crate::oplog::{
+            AuthorBatch, BatchDisposition, BlobDescription, BlockId, BlockLocation, CrdtPeerId,
+            DocumentId, LineageDigest, LogicalPageName, ManagedPath, ManagedTextKind,
+            OperationTransaction, PageId, SemanticOperation, SessionId, WorkspaceId,
+        };
+        let root = std::env::temp_dir().join(format!("tine-churn-census-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(101));
+        let lineage = LineageDigest::of(b"sealed-cutoff-engine");
+        let catalog = DocumentId::from_uuid(uuid::Uuid::from_u128(102));
+        let (checkpoint, dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let baseline = Arc::new(
+            LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog,
+                BlobDescription::of(b"empty source"),
+                &root,
+            )
+            .unwrap()
+            .finish(checkpoint, dependencies)
+            .unwrap(),
+        );
+        let archive = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        engine
+            .install_lazy_genesis_baseline(Arc::clone(&baseline))
+            .unwrap();
+        engine
+            .attach_clean_archive_store(archive.duplicate_retained_capability().unwrap())
+            .unwrap();
+        let claims = engine
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let commit = |engine: &mut ShardedHotEngine, sequence: u128, operations| {
+            let transaction = OperationTransaction::new(operations).unwrap();
+            let prepared = engine
+                .prepare_fixture_transaction(
+                    AuthorBatch {
+                        batch_id: BatchId::from_uuid(uuid::Uuid::from_u128(100_000 + sequence)),
+                        author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(500)),
+                        author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(501)),
+                        crdt_peer_id: CrdtPeerId::from_u64(502),
+                    },
+                    &transaction,
+                )
+                .unwrap();
+            let result = engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap();
+            assert!(
+                matches!(result.disposition(), BatchDisposition::Accepted { .. }),
+                "{:?}",
+                result.disposition()
+            );
+        };
+        let create = |n: u128| {
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(uuid::Uuid::from_u128(200_000 + n)),
+                    home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300_000 + n)),
+                    name: LogicalPageName::parse(format!("Churn {n}")).unwrap(),
+                    path: ManagedPath::parse(format!("pages/Churn{n}.md")).unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: BlockId::from_uuid(uuid::Uuid::from_u128(400_000 + n)),
+                        home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300_000 + n)),
+                    },
+                    page_id: PageId::from_uuid(uuid::Uuid::from_u128(200_000 + n)),
+                    parent: None,
+                    order: "a".into(),
+                    content: "Stable probe content".repeat(8),
+                },
+            ]
+        };
+        commit(&mut engine, 1, create(0));
+        let live = engine.canonical_snapshot().unwrap();
+        assert_eq!(live.pages.len(), 1);
+        assert_eq!(live.blocks.len(), 1);
+        let mut nodes = SealedMemoryStore::default();
+        let mut cutoff = None;
+        let capsule_root = root.join("live-closure-capsules");
+        std::fs::create_dir(&capsule_root).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&capsule_root, cap_std::ambient_authority())
+                .unwrap();
+        let mut previous_closure = None;
+
+        for n in 1..=128_u128 {
+            commit(&mut engine, 2 * n, create(n));
+            commit(
+                &mut engine,
+                2 * n + 1,
+                vec![SemanticOperation::DeletePage {
+                    page_id: PageId::from_uuid(uuid::Uuid::from_u128(200_000 + n)),
+                }],
+            );
+            if [8, 32, 128].contains(&n) {
+                assert_eq!(engine.canonical_snapshot().unwrap(), live);
+                let current = engine
+                    .build_sealed_accepted_cutoff(&mut nodes, cutoff.as_ref())
+                    .unwrap();
+                let compact = engine
+                    .build_compact_accepted_document(&current, catalog)
+                    .unwrap();
+                let pruned_bytes = crate::oplog::hot_engine::probe_pruned_checkpoint_bytes(
+                    catalog,
+                    compact.dependencies(),
+                    &compact.checkpoint().to_vec(),
+                )
+                .unwrap();
+                let closure = engine
+                    .capture_live_graph_document_closure(&current)
+                    .unwrap();
+                assert_eq!(closure.document_count(), 2);
+                assert!(closure.contains(catalog));
+                assert!(closure.contains(DocumentId::from_uuid(uuid::Uuid::from_u128(300_000))));
+                let mut staging = SealedGenerationStagingStore::open(&directory).unwrap();
+                if let Some(previous) = &previous_closure {
+                    assert!(engine
+                        .build_live_graph_document_roster(&current, &mut staging, previous)
+                        .is_err());
+                }
+                let active = engine
+                    .build_live_graph_document_roster(&current, &mut staging, &closure)
+                    .unwrap();
+                assert_eq!(active.document_count(), 2);
+                let disk = staging.finish().unwrap();
+                engine
+                    .qualify_live_graph_document_roster(&current, active, &disk, &closure)
+                    .unwrap();
+                assert!(engine
+                    .qualify_full_document_roster(&current, active, &disk)
+                    .is_err());
+                drop(disk);
+                eprintln!("rebaselining_churn cycles={n} live_pages=1 live_blocks=1 accepted={} accepted_documents={} compact_catalog_bytes={} live_capsules=2 experimental_pruned_bytes={pruned_bytes}",
+                    current.frontier().acceptance_sequence(), current.frontier().document_count(), compact.checkpoint().len());
+                previous_closure = Some(closure);
+                cutoff = Some(current);
+            }
+        }
+        // A bounded document count is insufficient too: churn inside one
+        // still-live home shard can retain deleted block state and text.
+        let page = PageId::from_uuid(uuid::Uuid::from_u128(200_000));
+        let home = DocumentId::from_uuid(uuid::Uuid::from_u128(300_000));
+        for n in 1..=128_u128 {
+            let block_id = BlockId::from_uuid(uuid::Uuid::from_u128(500_000 + n));
+            commit(
+                &mut engine,
+                1_000 + 2 * n,
+                vec![SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: home,
+                    },
+                    page_id: page,
+                    parent: None,
+                    order: "b".into(),
+                    content: "Deleted block probe content".repeat(8),
+                }],
+            );
+            commit(
+                &mut engine,
+                1_001 + 2 * n,
+                vec![SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id: page,
+                }],
+            );
+            if [8, 32, 128].contains(&n) {
+                assert_eq!(engine.canonical_snapshot().unwrap(), live);
+                let current = engine
+                    .build_sealed_accepted_cutoff(&mut nodes, cutoff.as_ref())
+                    .unwrap();
+                let compact = engine
+                    .build_compact_accepted_document(&current, home)
+                    .unwrap();
+                let pruned_bytes = crate::oplog::hot_engine::probe_pruned_checkpoint_bytes(
+                    catalog,
+                    compact.dependencies(),
+                    &compact.checkpoint().to_vec(),
+                )
+                .unwrap();
+                let closure = engine
+                    .capture_live_graph_document_closure(&current)
+                    .unwrap();
+                assert_eq!(closure.document_count(), 2);
+                eprintln!("rebaselining_block_churn cycles={n} live_pages=1 live_blocks=1 accepted={} accepted_documents={} compact_home_bytes={} live_capsules=2 experimental_pruned_bytes={pruned_bytes}",
+                    current.frontier().acceptance_sequence(), current.frontier().document_count(), compact.checkpoint().len());
+                cutoff = Some(current);
+            }
+        }
+        drop(directory);
+        drop(engine);
+        drop(archive);
+        drop(baseline);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
     fn sealed_cutoff_streams_real_engine_evidence_and_matches_clean_replay() {
         use crate::oplog::hot_engine::{LazyGenesisCheckpointBuilder, ShardedHotEngine};
         use crate::oplog::lazy_genesis::LazyGenesisPackBuilder;
@@ -2583,6 +2793,19 @@ mod tests {
             .load_document(&disk, catalog, home)
             .unwrap()
             .is_some());
+        let closure = engine
+            .capture_live_graph_document_closure(&final_cutoff)
+            .unwrap();
+        assert_eq!(closure.document_count(), 3);
+        assert!(closure.contains(home));
+        let mut live_store = SealedGenerationStagingStore::open(&directory).unwrap();
+        let live_roster = engine
+            .build_live_graph_document_roster(&final_cutoff, &mut live_store, &closure)
+            .unwrap();
+        drop(live_store.finish().unwrap());
+        engine
+            .qualify_live_graph_document_roster(&final_cutoff, live_roster, &disk, &closure)
+            .unwrap();
         let mut incomplete_store = SealedGenerationStagingStore::open(&directory).unwrap();
         let mut visible_only = SealedDocumentRoster::empty();
         for id in [catalog, destination_home] {
@@ -3214,6 +3437,9 @@ mod tests {
         for function in [
             "build_compact_document_roster",
             "qualify_full_document_roster",
+            "capture_live_graph_document_closure",
+            "build_live_graph_document_roster",
+            "qualify_live_graph_document_roster",
         ] {
             assert!(!engine.contains(&format!(".{function}(")));
             assert!(!include_str!("../sync_runtime.rs").contains(function));

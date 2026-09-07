@@ -6300,6 +6300,23 @@ impl CompactAcceptedDocument {
     }
 }
 
+/// Exact live graph document closure at one accepted cutoff. Historical-only
+/// documents and Restore pins are separate archive obligations, not eager graph
+/// loads. This capture is a bootstrap seam, not a live actor COW implementation.
+pub(crate) struct LiveGraphDocumentClosure {
+    cutoff_state_digest: ContentDigest,
+    documents: BTreeSet<DocumentId>,
+}
+
+impl LiveGraphDocumentClosure {
+    pub(crate) fn document_count(&self) -> usize {
+        self.documents.len()
+    }
+    pub(crate) fn contains(&self, document: DocumentId) -> bool {
+        self.documents.contains(&document)
+    }
+}
+
 pub(crate) struct CleanCheckpointCapture {
     pub(crate) base_sequence: u64,
     pub(crate) target_sequence: u64,
@@ -7442,11 +7459,92 @@ impl ShardedHotEngine {
         store: &mut super::checkpoint_generation::SealedGenerationStagingStore,
         predecessor: Option<super::checkpoint_generation::SealedDocumentRoster>,
     ) -> Result<(super::checkpoint_generation::SealedDocumentRoster, u64), EngineError> {
+        self.build_document_roster_entries(
+            cutoff,
+            store,
+            predecessor,
+            self.accepted_frontier.values(),
+        )
+    }
+
+    pub(crate) fn capture_live_graph_document_closure(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+    ) -> Result<LiveGraphDocumentClosure, EngineError> {
+        self.require_complete_document_cutoff(cutoff)?;
+        let graph = self.canonical_snapshot()?;
+        let mut documents = BTreeSet::new();
+        if self
+            .accepted_frontier
+            .contains_key(&self.catalog_document_id)
+        {
+            documents.insert(self.catalog_document_id);
+        }
+        documents.extend(graph.pages.iter().map(|(_, page)| page.home_document_id()));
+        documents.extend(graph.blocks.iter().map(|block| block.home_document_id));
+        documents.extend(
+            graph
+                .memberships
+                .iter()
+                .map(|member| member.home_document_id),
+        );
+        for id in &documents {
+            if !self.accepted_frontier.contains_key(id) {
+                return Err(EngineError::MissingDocument(*id));
+            }
+        }
+        Ok(LiveGraphDocumentClosure {
+            cutoff_state_digest: cutoff.frontier().state_digest(),
+            documents,
+        })
+    }
+
+    pub(crate) fn build_live_graph_document_roster(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        store: &mut super::checkpoint_generation::SealedGenerationStagingStore,
+        closure: &LiveGraphDocumentClosure,
+    ) -> Result<super::checkpoint_generation::SealedDocumentRoster, EngineError> {
+        self.require_live_graph_closure(cutoff, closure)?;
+        let (roster, _) = self.build_document_roster_entries(
+            cutoff,
+            store,
+            None,
+            closure
+                .documents
+                .iter()
+                .map(|id| &self.accepted_frontier[id]),
+        )?;
+        Ok(roster)
+    }
+
+    fn require_live_graph_closure(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        closure: &LiveGraphDocumentClosure,
+    ) -> Result<(), EngineError> {
+        self.require_complete_document_cutoff(cutoff)?;
+        if closure.cutoff_state_digest != cutoff.frontier().state_digest() {
+            return Err(EngineError::Archive(
+                "live graph document closure belongs to another cutoff".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn build_document_roster_entries<'a>(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        store: &mut super::checkpoint_generation::SealedGenerationStagingStore,
+        predecessor: Option<super::checkpoint_generation::SealedDocumentRoster>,
+        documents: impl ExactSizeIterator<Item = &'a DocumentDependencies>,
+    ) -> Result<(super::checkpoint_generation::SealedDocumentRoster, u64), EngineError> {
         use super::checkpoint_generation::SealedDocumentRoster;
         self.require_complete_document_cutoff(cutoff)?;
+        let expected_count = documents.len() as u64;
         let mut roster = predecessor.unwrap_or_else(SealedDocumentRoster::empty);
         let mut written = 0;
-        for dependencies in self.accepted_frontier.values() {
+        for dependencies in documents {
             if let Some(previous) = predecessor {
                 if previous
                     .inherited_dependencies(store, dependencies.document_id())
@@ -7464,7 +7562,7 @@ impl ShardedHotEngine {
                 .map_err(EngineError::Archive)?;
             written += 1;
         }
-        if roster.document_count() != cutoff.frontier().document_count() {
+        if roster.document_count() != expected_count {
             return Err(EngineError::Archive(
                 "generation roster has extra or missing documents".into(),
             ));
@@ -7504,16 +7602,45 @@ impl ShardedHotEngine {
         roster: super::checkpoint_generation::SealedDocumentRoster,
         store: &super::checkpoint_generation::SealedGenerationDirectory,
     ) -> Result<(), EngineError> {
+        self.qualify_document_roster_entries(cutoff, roster, store, self.accepted_frontier.iter())
+    }
+
+    pub(crate) fn qualify_live_graph_document_roster(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        roster: super::checkpoint_generation::SealedDocumentRoster,
+        store: &super::checkpoint_generation::SealedGenerationDirectory,
+        closure: &LiveGraphDocumentClosure,
+    ) -> Result<(), EngineError> {
+        self.require_live_graph_closure(cutoff, closure)?;
+        self.qualify_document_roster_entries(
+            cutoff,
+            roster,
+            store,
+            closure
+                .documents
+                .iter()
+                .map(|id| (id, &self.accepted_frontier[id])),
+        )
+    }
+
+    fn qualify_document_roster_entries<'a>(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        roster: super::checkpoint_generation::SealedDocumentRoster,
+        store: &super::checkpoint_generation::SealedGenerationDirectory,
+        documents: impl Clone + ExactSizeIterator<Item = (&'a DocumentId, &'a DocumentDependencies)>,
+    ) -> Result<(), EngineError> {
         self.require_complete_document_cutoff(cutoff)?;
-        if roster.document_count() != self.accepted_frontier.len() as u64 {
+        if roster.document_count() != documents.len() as u64 {
             return Err(EngineError::Archive(
                 "generation roster count differs from accepted documents".into(),
             ));
         }
         roster
-            .qualify_complete_keys(store, self.accepted_frontier.keys().copied())
+            .qualify_complete_keys(store, documents.clone().map(|(id, _)| *id))
             .map_err(EngineError::Archive)?;
-        for (document_id, expected) in &self.accepted_frontier {
+        for (document_id, expected) in documents {
             let (dependencies, restored) = roster
                 .load_document(store, self.catalog_document_id, *document_id)
                 .map_err(EngineError::Archive)?
@@ -31840,4 +31967,49 @@ mod replay_benchmark {
         );
         assert_eq!(restored.get_deep_value(), expected.get_deep_value());
     }
+}
+
+/// Isolated primitive feasibility only: no engine, accepted batch or durable
+/// generation is mutated. A legal retirement protocol is a separate requirement.
+#[cfg(test)]
+pub(crate) fn probe_pruned_checkpoint_bytes(
+    catalog: DocumentId,
+    dependencies: &DocumentDependencies,
+    checkpoint: &Vec<u8>,
+) -> Result<usize, EngineError> {
+    let document = qualify_compact_document(catalog, dependencies, checkpoint)?;
+    document.set_peer_id(999_998).map_err(loro_error)?;
+    if dependencies.document_id() == catalog {
+        for (page, state) in read_all_pages(&document)? {
+            if matches!(state, PageState::Tombstone { .. }) {
+                document
+                    .get_map(CATALOG_PAGES)
+                    .delete(&page.to_string())
+                    .map_err(loro_error)?;
+            }
+        }
+        validate_catalog(catalog, &document)?;
+    } else {
+        for (block, state) in read_all_blocks(dependencies.document_id(), &document)? {
+            if state.owner == BlockOwner::Tombstone {
+                for root in [
+                    SHARD_OWNERS,
+                    SHARD_CONTENT,
+                    SHARD_LOGSEQ_UUIDS,
+                    SHARD_LOGSEQ_IDENTITY_ORIGINS,
+                ] {
+                    document
+                        .get_map(root)
+                        .delete(&block.to_string())
+                        .map_err(loro_error)?;
+                }
+            }
+        }
+        validate_shard(catalog, dependencies.document_id(), &document)?;
+    }
+    document.commit();
+    document
+        .export(ExportMode::shallow_snapshot(&document.oplog_frontiers()))
+        .map(|bytes| bytes.len())
+        .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
 }

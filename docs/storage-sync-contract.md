@@ -2130,6 +2130,23 @@ checker. These are explicit construction/repair operations, with no live runtime
 caller or generation installation capability. Complete generation binding and
 retention closure remain prerequisites for adoption.
 
+The separate **live graph document closure** is captured at an exact accepted
+cutoff from the existing canonical graph view: catalog (when accepted), live page
+homes, and every visible block/membership's immutable home. Deleted page homes
+remain live when they own moved blocks. Fully historical shards are excluded from
+this eager graph closure while their archive/history obligations remain intact.
+Stale closures are refused. Full-history and live-closure roster construction and
+qualification share the same entry writer and equivalence checker; the selected
+key set is explicit and cannot substitute for full accepted-history completeness.
+
+This capture still uses the current canonical graph view and is a bootstrap seam,
+not bounded ordinary maintenance. A fixed-live create/delete probe demonstrates
+that the current catalog's application tombstone values survive shallow snapshots.
+The live capsule count can be bounded while that one catalog capsule still grows.
+Historical catalog representation, retention roots and incremental capture must be
+resolved before this closure is used for live adoption or portable join; no ordinary
+runtime caller exists yet.
+
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
 Clean projection attach rebuilds an exact path-to-latest-batch map during
