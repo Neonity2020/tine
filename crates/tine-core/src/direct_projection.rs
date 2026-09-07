@@ -113,7 +113,7 @@ enum PageDelta {
 /// replacement's runtime ids came from decides whether the page joins or
 /// leaves `ProjectionShared::session_pages`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeltaIdentity {
+pub(crate) enum DeltaIdentity {
     /// The document is this process's live one (a save, or a parsed-cache
     /// snapshot that may carry preserved ids): the stored `result_id`s ARE the
     /// public ids, so the page is added.
@@ -173,6 +173,7 @@ pub(crate) enum WarmStreamItem {
         entry: PageEntry,
         document: Arc<Document>,
         revision: String,
+        identity: DeltaIdentity,
     },
     Delete {
         entry: PageEntry,
@@ -583,8 +584,8 @@ impl DirectProjection {
         }
     }
 
-    /// Queue one parsed batch of the warm stream (R6). Every replacement is a
-    /// fresh parse, so its identity is `Structural`; a page that failed to
+    /// Queue one parsed batch of the warm stream. The session identity owner
+    /// marks exact-revision restored IDs as Live, fresh IDs as Structural. A page that failed to
     /// parse is deleted from the projection. `false` means the batch was
     /// refused: a newer mutation outranks this generation, a full snapshot
     /// superseded the stream, or the worker failed — the caller abandons.
@@ -608,13 +609,14 @@ impl DirectProjection {
                     entry,
                     document,
                     revision,
+                    identity,
                 } => PageDelta::Replace {
                     entry,
                     document,
                     revision,
                     parse_config: Arc::clone(&parse_config),
                     query_page_order: None,
-                    identity: DeltaIdentity::Structural,
+                    identity,
                 },
                 WarmStreamItem::Delete { entry } => PageDelta::Delete { entry },
             };
@@ -713,16 +715,6 @@ impl DirectProjection {
         )
         .ok()?;
         self.ready_at(cache_generation).then_some(rows)
-    }
-
-    /// R6 identity rule: dropping the parsed cache drops every live-id claim.
-    /// A page's fresh parse carries structural ids, which is what the derived
-    /// public id already is, so "no entry" is the correct mapping afterwards.
-    pub(crate) fn forget_session_identities(&self) {
-        let mut current = self.shared.session_pages.lock().unwrap();
-        if !current.is_empty() {
-            *current = Arc::new(HashSet::new());
-        }
     }
 
     /// Bounded wait for readiness at `generation` (R6): the whole-graph derived
@@ -4949,13 +4941,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 
-    /// **R6 §3.** A page saved live carries preserved runtime ids into its
-    /// rows and joins the session set. Dropping the parsed cache drops that
-    /// claim: the frontend's next load is a fresh parse with structural ids,
-    /// so the projection must answer with the derived structural id too —
-    /// which it only does once the page has left the set.
     #[test]
-    fn session_identity_is_dropped_when_the_parsed_page_is_evicted() {
+    fn edited_page_reload_and_sql_keep_the_same_session_ids() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("edited-session-reload");
+        let database = scratch("edited-session-reload-db").join("projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "one")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        let kept = page.blocks[0].clone();
+        let mut inserted = kept.clone();
+        inserted.id = Uuid::new_v4().to_string();
+        inserted.raw = "TODO inserted first".into();
+        page.blocks.insert(0, inserted);
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        assert!(!graph.has_parsed_cache_test());
+        let live = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let query_id = &live
+            .groups
+            .iter()
+            .flat_map(|group| &group.blocks)
+            .find(|block| block.raw == kept.raw)
+            .unwrap()
+            .id;
+        assert_eq!(query_id, &kept.id);
+        let reloaded = graph.load_by_path(&entry.rel_path).unwrap().unwrap();
+        let reloaded_id = &reloaded
+            .blocks
+            .iter()
+            .find(|block| block.raw == kept.raw)
+            .unwrap()
+            .id;
+        assert_eq!(
+            reloaded_id, query_id,
+            "reloading an unchanged edited page must retain the IDs SQLite exposes"
+        );
+
+        // An incompatible external revision must use that revision's parser
+        // identities, even if it happens to have the same tree shape.
+        let changed = std::fs::read_to_string(&entry.path)
+            .unwrap()
+            .replace("inserted first", "external first");
+        std::fs::write(&entry.path, changed).unwrap();
+        graph.sync_file_checked(&entry.path).unwrap();
+        // sync_file's parsed-cache adapter is a no-op without that cache;
+        // streamed reconciliation owns the absent-cache path.
+        graph.invalidate_cache();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let external = graph.load_by_path(&entry.rel_path).unwrap().unwrap();
+        let external_id = &external
+            .blocks
+            .iter()
+            .find(|block| block.raw == kept.raw)
+            .unwrap()
+            .id;
+        assert_ne!(
+            external_id, &kept.id,
+            "incompatible source does not reuse the old map"
+        );
+        let sql = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert_eq!(
+            &sql.groups
+                .iter()
+                .flat_map(|group| &group.blocks)
+                .find(|block| block.raw == kept.raw)
+                .unwrap()
+                .id,
+            external_id
+        );
+    }
+
+    /// Cache eviction does not change an unchanged page's session identities.
+    /// The compact session owner survives without retaining parsed documents.
+    #[test]
+    fn session_identity_survives_parsed_page_eviction() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = r6_graph("identity-eviction");
         let database = scratch("identity-eviction-db").join("projection.sqlite");
@@ -4994,26 +5063,39 @@ mod tests {
             "a live save answers with the preserved id"
         );
 
+        // Losing this disposable source stamp forces a streamed replacement
+        // from unchanged bytes, exercising recovery's identity provenance.
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            writer
+                .execute(
+                    "DELETE FROM direct_source_revisions WHERE page_id = ?1",
+                    rusqlite::params![one.as_slice()]
+                )
+                .unwrap(),
+            1
+        );
+        drop(writer);
+        let parses = graph.warm_stream_parses_test();
         graph.invalidate_cache();
         assert!(
-            !projection.session_pages_test().contains(&one),
-            "dropping the parsed cache must drop the live-id claim"
+            projection.session_pages_test().contains(&one),
+            "dropping the parsed cache must retain compatible live IDs"
         );
         graph.warm_cache();
         wait_ready(&graph);
+        assert_eq!(graph.warm_stream_parses_test(), parses + 1);
+        assert!(!graph.has_parsed_cache_test());
         let statements = graph.direct_projection_statement_reads_test();
         let after = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
         assert_eq!(
             graph.direct_projection_statement_reads_test(),
             statements + 1
         );
-        let oracle = Graph::open(&root);
         assert_eq!(
             signature(&after.groups),
-            signature(
-                &crate::query::run_query_bounded(&oracle, "(task TODO)", 100, 1_000_000).groups
-            ),
-            "after eviction the projection answers with the fresh parse's structural ids"
+            signature(&live.groups),
+            "cache eviction preserves the same session's complete result"
         );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(database.parent().unwrap());

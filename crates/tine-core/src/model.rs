@@ -2817,6 +2817,10 @@ pub struct Graph {
     // `Arc<Document>` so a cache snapshot or a save's scoped-invalidation copy is
     // an O(1) refcount bump, not a deep clone of the whole page (see cache_upsert).
     cache: RwLock<Option<Arc<Vec<(PageEntry, Arc<Document>)>>>>,
+    /// Compact runtime IDs for exact revisions published during this session.
+    /// Page loading and disposable projection recovery share this owner; neither
+    /// needs to retain a Document or trust a damaged database to recover IDs.
+    session_page_ids: RwLock<std::collections::HashMap<PathBuf, SessionPageIds>>,
     /// Graph-relative paths of pages skipped by the latest whole-graph cache
     /// build because their parse/projection panicked. Kept retrievable so an
     /// lsdoc ownership gap can never degrade search completeness invisibly.
@@ -6076,6 +6080,7 @@ impl Graph {
             }),
             journal_format,
             cache: RwLock::new(None),
+            session_page_ids: RwLock::new(std::collections::HashMap::new()),
             page_index_failures: RwLock::new(Vec::new()),
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
@@ -6228,6 +6233,7 @@ impl Graph {
     }
 
     fn direct_projection_enqueue_delete(&self, generation: u64, entry: PageEntry) {
+        self.session_page_ids.write().unwrap().remove(&entry.path);
         if let Some(projection) = self
             .direct_projection
             .lock()
@@ -6249,18 +6255,6 @@ impl Graph {
             .map(Arc::clone)
         {
             projection.mark_stale();
-        }
-    }
-
-    fn direct_projection_forget_session_identities(&self) {
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
-            projection.forget_session_identities();
         }
     }
 
@@ -6323,7 +6317,7 @@ impl Graph {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (effective, document, _) =
                 isolate_page_parse(entry, &self.journal_format, |entry| {
-                    Some(parse_page_content(entry, &content))
+                    Some(self.parse_session_page_content(entry, &content))
                 })
                 .ok()??;
             pages.push((effective, Arc::new(document)));
@@ -15404,7 +15398,7 @@ impl Graph {
             .parses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         isolate_page_parse(entry, &self.journal_format, |entry| {
-            Some(parse_page_content(entry, &content))
+            Some(self.parse_session_page_content(entry, &content))
         })
     }
 
@@ -15795,11 +15789,23 @@ impl Graph {
                     match isolate_page_parse(entry, &self.journal_format, |entry| {
                         Some(parse_page_content(entry, &content))
                     }) {
-                        Ok(Some((effective, document, revision))) => WarmStreamItem::Replace {
-                            entry: effective,
-                            document: Arc::new(document),
-                            revision,
-                        },
+                        Ok(Some((effective, mut document, revision))) => {
+                            let identity = if self.restore_session_page_ids(
+                                &effective,
+                                &revision,
+                                &mut document,
+                            ) {
+                                crate::direct_projection::DeltaIdentity::Live
+                            } else {
+                                crate::direct_projection::DeltaIdentity::Structural
+                            };
+                            WarmStreamItem::Replace {
+                                entry: effective,
+                                document: Arc::new(document),
+                                revision,
+                                identity,
+                            }
+                        }
                         Ok(None) | Err(_) => {
                             failures.push(fallback.rel_path.clone());
                             WarmStreamItem::Delete { entry: fallback }
@@ -15899,7 +15905,7 @@ impl Graph {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let indexed =
                         built.collect(isolate_page_parse(e, &self.journal_format, |entry| {
-                            Some(parse_page_content(entry, &content))
+                            Some(self.parse_session_page_content(entry, &content))
                         }));
                     if indexed {
                         baselines.push((path, identity, revision));
@@ -15976,10 +15982,8 @@ impl Graph {
 
     fn invalidate_cache_after_tine_mutation(&self) {
         self.direct_projection_mark_stale();
-        // R6 identity rule: the parsed documents whose live ids the session set
-        // vouched for are gone; their fresh parses carry structural ids, which
-        // the derived public id already is.
-        self.direct_projection_forget_session_identities();
+        // Compatible IDs are owned by session_page_ids, independently of the
+        // parsed cache. Reconciliation invalidates incompatible source revisions.
         let mut guard = self.cache.write().unwrap();
         *guard = None;
         self.page_index_failures.write().unwrap().clear();
@@ -16037,6 +16041,14 @@ impl Graph {
         let mut identity_changed = false;
         let mut guard = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
+        self.session_page_ids.write().unwrap().insert(
+            evict_entry.path.clone(),
+            SessionPageIds::capture(
+                &projection_revision,
+                self.config.parse_config().digest(),
+                &evict_doc,
+            ),
+        );
         let mut resulting_failures = failures_guard.clone();
         resulting_failures.retain(|failure| failure != &evict_entry.rel_path);
         let failures_changed = resulting_failures != *failures_guard;
@@ -24072,9 +24084,84 @@ fn validate_highlight_edn(raw: &str) -> io::Result<()> {
     }
 }
 
-/// Parse one page under a page-sized unwind boundary. lsdoc deliberately panics
-/// when its v2 parser does not own an input shape; isolating here preserves that
-/// loud guard while limiting the search-cache blast radius to this page.
+/// Runtime identities for one exact page revision, independent of its parsed
+/// document and SQLite projection. Child counts describe the complete preorder
+/// shape so restoration never applies only a prefix of an incompatible tree.
+struct SessionPageIds {
+    revision: String,
+    config: crate::oplog::ContentDigest,
+    preorder: Vec<(String, usize)>,
+}
+
+impl SessionPageIds {
+    fn capture(revision: &str, config: crate::oplog::ContentDigest, doc: &Document) -> Self {
+        let mut pending: Vec<_> = doc.roots.iter().rev().collect();
+        let mut preorder = Vec::new();
+        while let Some(block) = pending.pop() {
+            preorder.push((block.uuid.clone(), block.children.len()));
+            pending.extend(block.children.iter().rev());
+        }
+        Self {
+            revision: revision.to_owned(),
+            config,
+            preorder,
+        }
+    }
+
+    fn restore(&self, doc: &mut Document) -> bool {
+        // Check the entire tree before changing any ID. Exact source bytes and
+        // config should imply this shape; a parser discrepancy must not apply a
+        // prefix of one tree's identities to another tree.
+        let mut pending: Vec<_> = doc.roots.iter().rev().collect();
+        let mut count = 0;
+        while let Some(block) = pending.pop() {
+            if self
+                .preorder
+                .get(count)
+                .is_none_or(|(_, children)| *children != block.children.len())
+            {
+                return false;
+            }
+            count += 1;
+            pending.extend(block.children.iter().rev());
+        }
+        if count != self.preorder.len() {
+            return false;
+        }
+        let mut pending: Vec<_> = doc.roots.iter_mut().rev().collect();
+        let mut ids = self.preorder.iter();
+        while let Some(block) = pending.pop() {
+            block
+                .uuid
+                .clone_from(&ids.next().expect("complete shape checked").0);
+            pending.extend(block.children.iter_mut().rev());
+        }
+        true
+    }
+}
+
+impl Graph {
+    fn restore_session_page_ids(
+        &self,
+        entry: &PageEntry,
+        revision: &str,
+        doc: &mut Document,
+    ) -> bool {
+        let config = self.config.parse_config().digest();
+        self.session_page_ids
+            .read()
+            .unwrap()
+            .get(&entry.path)
+            .is_some_and(|ids| ids.revision == revision && ids.config == config && ids.restore(doc))
+    }
+
+    fn parse_session_page_content(&self, entry: &PageEntry, content: &str) -> (Document, String) {
+        let (mut document, revision) = parse_page_content(entry, content);
+        self.restore_session_page_ids(entry, &revision, &mut document);
+        (document, revision)
+    }
+}
+
 fn parse_page_content(e: &PageEntry, content: &str) -> (Document, String) {
     #[cfg(test)]
     GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
@@ -24212,6 +24299,7 @@ fn parse_external_document(
             panic!("deterministic test sentinel for a page projection panic");
         }
         assign_doc_runtime_ids(&mut parsed.document.roots, &fallback.rel_path);
+        graph.restore_session_page_ids(&fallback, &content_rev(content), &mut parsed.document);
         let explicit_title = parsed_page_title(&parsed.document, format);
         let effective = effective_page_entry(&graph.journal_format, &fallback, &parsed.document);
         ParsedExternalDocument {
