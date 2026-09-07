@@ -309,6 +309,13 @@ export interface QueryDisplayControl {
   view: ViewSettings;
   /** Route a display change through the query's one save path. */
   apply: (next: ViewSettings) => void;
+  /** The `tine.col-aggregates` segments the host's block carries that this
+   *  query's grammar does not own (`retainedQueryAggregateSegments`). They are
+   *  preserved by every save and editable by none of these surfaces, so a
+   *  surface that lists aggregates states them as retained rather than letting
+   *  the author read their absence as loss. Absent where the host has no block
+   *  properties to read. */
+  retainedAggregates?: readonly string[];
 }
 
 // --------------------------------------------------------------------------
@@ -375,6 +382,27 @@ function parseQueryAggregateSegment(segment: string): [Field, AggFn] | null {
   const fn = text.slice(eq + 1).trim().toLowerCase();
   if (fn !== "count" && fn !== "sum" && fn !== "avg") return null;
   return [key, fn as AggFn];
+}
+
+/** **The `tine.col-aggregates` segments this writer keeps but does not own.**
+ *
+ *  The merge preserves a table-only `estimate=median` byte for byte
+ *  (`mergeQueryAggregateValue`), which is right — and invisible. A panel that
+ *  lists only the entries the query reader understands tells the author their
+ *  note carries two aggregates when it carries three, so the surface reads the
+ *  SAME segments through the SAME parser and states them as retained. There is
+ *  no second grammar here: a segment is retained exactly when
+ *  `parseQueryAggregateSegment` declines it, which is exactly when the merge
+ *  copies it through untouched.
+ *
+ *  Trimmed for display; the stored bytes are never touched by reading them. */
+export function retainedQueryAggregateSegments(props: PropertyPairs): string[] {
+  const raw = firstProperty(props, "tine.col-aggregates");
+  if (raw === undefined) return [];
+  return raw
+    .split(";")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment !== "" && parseQueryAggregateSegment(segment) === null);
 }
 
 // --------------------------------------------------------------------------

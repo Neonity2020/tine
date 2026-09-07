@@ -418,10 +418,13 @@ await withApp(1, async (browser) => {
   await browser.$(".sheet-board").waitForExist({ timeout: 20_000 });
   const reopened = await browser.execute(() => ({
     columns: [...document.querySelectorAll(".sheet-board .sheet-board-header")].map((el) => el.textContent.trim()),
-    summary: document.querySelector(".query-summary")?.textContent?.trim() ?? null,
+    summaryHeaders: [...document.querySelectorAll(".query-summary-table thead th")].map((cell) => cell.textContent.trim()),
   }));
   if (!reopened.columns.some((c) => /Ada/.test(c)) || !reopened.columns.some((c) => /Bo/.test(c))) {
     fail(`the saved grouping did not come back: ${JSON.stringify(reopened)}`);
+  }
+  if (reopened.summaryHeaders.length !== 3 || !/count/i.test(reopened.summaryHeaders[1]) || !/sum/i.test(reopened.summaryHeaders[2])) {
+    fail(`the complete saved aggregate summary did not come back: ${JSON.stringify(reopened)}`);
   }
   console.log(`reopened: ${JSON.stringify(reopened)}`);
 });

@@ -342,6 +342,31 @@ Therefore:
   the publisher's `SHEET_AGGREGATE_FNS`. The sheet has no implementation for it,
   and a "valid" sheet aggregate with no implementation is worse than an
   unrecognized one.
+- **The key grammar is its own** (`sheet/fields.ts::queryAggregateFieldName`),
+  and it is deliberately not the columns grammar. An aggregate key is a LITERAL
+  property name: `prop:` and `formula:` are ordinary characters there, and a
+  property named `state`, `page` or `tags` is an ordinary thing to count or sum.
+  `tine.columns` reserves those six names because a bare token there selects the
+  builtin; nothing in this property does, because no builtin has a key here at
+  all. What is refused is the grammar's own punctuation — `;`, `=`, CR/LF/NUL —
+  plus an empty key (which already means the keyless whole-result count) and a
+  padded key, which the reader's `trim` would hand back as another property's
+  name. Only ordinary properties have a key: builtins and formulas carry none,
+  so those columns show no footer aggregate rather than a segment whose meaning
+  depends on who reads it. Every surface that offers or reads a key — the
+  panel's `+ property` vocabulary and the query table's footer — asks this one
+  function; before it, both asked `queryColumnName`, and a note saying
+  `state=count` about an ordinary property named `state` was rendered by nothing
+  and editable by no one.
+- **What the merge keeps, the editor shows.** `retainedQueryAggregateSegments`
+  lists the segments the query reader does not own, through the SAME
+  `parseQueryAggregateSegment` the merge uses — a segment is retained exactly
+  when the merge copies it through, so the two cannot drift and there is no
+  second parser. They reach the panel as `QueryDisplayControl.retainedAggregates`
+  (read from the block's own property bytes by the host, since the engine's
+  reading never carries them), and Summarize states them read-only: *"Kept from
+  the table, not editable here: estimate=median"*. Preservation the author
+  cannot see is indistinguishable from loss.
 
 **Field rename** (`renameField.ts::rewriteAggregateValue`) renames only an exact
 `prop:<oldName>` key — bare query keys and `formula:` keys are outside the
@@ -356,9 +381,19 @@ segments the rename actually touches. Native query-result rename remains out of
 scope: `planSheetFieldRename` still refuses `rowSource !== "children"`.
 
 Tests: `src/sheet/renameField.test.ts`,
-`src/editor/queryViewProperties.test.ts` (`the aggregate segment merge`).
+`src/editor/queryViewProperties.test.ts` (`the aggregate segment merge`, `the
+segments the panel reports as retained`), `src/sheet/fields.test.ts`
+(`queryAggregateFieldName`), `src/components/QueryDisplay.test.tsx`,
+`src/components/QueryDisplayConsumers.test.tsx`,
+`src/components/QueryMacro.test.tsx`.
 
 ## 6. One summary for every grouped or aggregated face
+
+The complete summary is rendered above each inline presentation, including Table,
+Board, and builder-backed Search. Table footers are additional column controls;
+they do not replace or truncate that ordered summary. Board defaults are resolved
+with the existing view-default helper for both controls and summary grouping,
+without writing properties on open.
 
 Query aggregate keys are literal property names, including names starting with
 `prop:` or `formula:`. These prefixes have no special meaning in this grammar.
@@ -423,7 +458,15 @@ enums, three ordered lists and a number.
   is what keeps the entries it cannot represent — an unrecognized aggregate
   segment, a sort field it has no picker for — intact.
 - Sort, Columns and Summarize are ordered lists with move and remove per row, so
-  the second entry is editable rather than invisible.
+  the second entry is editable rather than invisible. Summarize additionally
+  states the `tine.col-aggregates` segments it keeps but does not own, read-only
+  (§5) — the one place the aggregates are edited is the one place their
+  retention has to be legible.
+- Its `+ property` vocabulary offers only keys the slot's own grammar can carry:
+  the columns picker hides a property that would read back as a builtin, the
+  sort picker hides what `sort_key` cannot order by, and the aggregate picker
+  hides only what the segment grammar cannot spell (§5) — a control that looks
+  like it saved is worse than an absent one.
 - A view switch goes through `viewAfterViewSwitch`, the single place the Board
   default is applied, and only over an *unset* grouping (§3). The view switcher
   in the macro toolbar routes through the same function.
@@ -492,7 +535,9 @@ panel; none of them owns a property.
   its number through `querySummary` (§6), never through the sheet's `aggregate`.
   Only ordinary properties get a footer aggregate: a builtin's bare name and a
   query aggregate key are the same bytes but not the same thing, and a formula
-  has no key at all.
+  has no key at all. A property *named* like a builtin is not a builtin and does
+  get one — the footer asks the aggregate grammar (§5), not the columns
+  grammar, which reserves those names for a reason that does not apply here.
 - **Board grouping.** The toolbar dropdown and the context menu both call one
   `QueryGroupingControl.set`. `field: null` carries a `cleared` flag beside it,
   because it is two answers: an EXPLICIT clear is one ungrouped column, while a

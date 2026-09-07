@@ -7,7 +7,15 @@ import {
   viewAfterViewSwitch,
   type QueryDisplayControl,
 } from "../editor/queryViewProperties";
-import { fieldLabel, isFieldId, queryColumnName, queryColumnFieldId, querySortFieldName, type FieldId } from "../sheet/fields";
+import {
+  fieldLabel,
+  isFieldId,
+  queryAggregateFieldName,
+  queryColumnName,
+  queryColumnFieldId,
+  querySortFieldName,
+  type FieldId,
+} from "../sheet/fields";
 import { QueryVocabularyPicker, type VocabularyEntry } from "./QueryVocabularyPicker";
 import { dismissOnOutsidePointer, registerTransientLayer } from "../transientLayers";
 import { registerVisiblePopover, type RegistryAccess } from "./QuerySheet";
@@ -79,8 +87,13 @@ export type DisplaySlot = "group" | "sort" | "column" | "aggregate";
  *     but the note cannot carry them, so they are not offered here.
  *   * **column** — a `tine.columns` token: the six builtins by name, every
  *     other name an ordinary property. Formulas have no token.
- *   * **aggregate** — a property key. Counting rows needs no field at all, and
- *     summing a task marker is not a thing.
+ *   * **aggregate** — a `tine.col-aggregates` key: a LITERAL property name.
+ *     Counting rows needs no field at all and summing a task marker is not a
+ *     thing, so no builtin and no formula is offered — but a property NAMED like
+ *     a builtin is, because that grammar reserves nothing (`sheet/fields.ts::
+ *     queryAggregateFieldName`). A key the segment grammar cannot spell is not
+ *     offered: picking it would write a segment that reads back as something
+ *     else.
  */
 export function displayFieldEntries(input: {
   slot: DisplaySlot;
@@ -118,6 +131,7 @@ export function displayFieldEntries(input: {
     const key = row.normalized_name;
     if (input.slot === "column" && queryColumnName(`prop:${key}`) === null) continue;
     if (input.slot === "sort" && querySortFieldName(`prop:${key}`) === null) continue;
+    if (input.slot === "aggregate" && queryAggregateFieldName(`prop:${key}`) === null) continue;
     const value = input.slot === "group" ? `prop:${key}` : key;
     push(value, key, "•", row.count_blocks + row.count_pages);
   }
@@ -403,7 +417,7 @@ export function QueryDisplay(props: {
   const setView = (next: ViewKindName) =>
     apply(viewAfterViewSwitch(view(), next === "list" ? undefined : next));
 
-  const grouping = createMemo(() => groupingFromViewValue(view().group_by));
+  const grouping = createMemo(() => groupingFromViewValue(viewAfterViewSwitch(view(), view().view).group_by));
   const groupLabel = () => {
     const resolved = grouping();
     if (resolved.kind === "cleared") return "No grouping";
@@ -423,6 +437,9 @@ export function QueryDisplay(props: {
   ];
   const setColumns = (next: string[]) => apply({ ...view(), columns: next });
   const aggregates = () => view().aggregates ?? [];
+  /** The segments of the same property this panel keeps and cannot edit — the
+   *  host reads them from the block's own bytes through the one parser. */
+  const retainedAggregates = () => props.control.retainedAggregates ?? [];
   const setAggregates = (next: ViewSettings["aggregates"]) => apply({ ...view(), aggregates: next });
 
   const [sampleText, setSampleText] = createSignal("");
@@ -642,6 +659,15 @@ export function QueryDisplay(props: {
             )}
           />
         </div>
+        {/* `tine.col-aggregates` is shared ground (contract §5): the sheet
+            footer's own vocabulary rides in the same property, every save
+            preserves it, and none of these controls can edit it. Saying so is
+            the difference between retained and quietly gone. */}
+        <Show when={retainedAggregates().length}>
+          <div class="qd-note qd-retained">
+            Kept from the table, not editable here: {retainedAggregates().join(", ")}
+          </div>
+        </Show>
       </div>
 
       <div class="qd-section">

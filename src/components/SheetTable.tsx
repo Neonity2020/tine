@@ -52,6 +52,7 @@ import {
   formulaReferenceName,
   isFormulaField,
   queryColumnFieldId,
+  queryAggregateFieldName,
   queryColumnName,
   querySortFieldName,
   readField,
@@ -430,22 +431,14 @@ export function SheetTable(props: {
     });
     return tracks.join(" ");
   });
-  /** A query column's aggregate KEY in `tine.col-aggregates`.
-   *
-   *  Only ordinary properties get one. A builtin's bare name and a query
-   *  aggregate key are the same bytes but not the same thing, and a formula has
-   *  no key at all — so rather than write a segment whose meaning depends on who
-   *  reads it, those columns simply have no footer aggregate. */
-  const queryAggregateKey = (field: FieldId): string | null =>
-    field.startsWith("prop:") ? queryColumnName(field) : null;
   const queryAggregateFn = (field: FieldId): QueryAggFn | null => {
-    const key = queryAggregateKey(field);
+    const key = queryAggregateFieldName(field);
     if (key === null) return null;
     return (props.queryDisplay?.view.aggregates ?? []).find(([k]) => k === key)?.[1] ?? null;
   };
   const setQueryAggregate = (field: FieldId, fn: QueryAggFn | null) => {
     const control = props.queryDisplay;
-    const key = queryAggregateKey(field);
+    const key = queryAggregateFieldName(field);
     if (!control || key === null) return;
     // Edited IN PLACE. The list is ordered and repeats are meaningful, so a
     // change to one column's function must not reshuffle the others.
@@ -461,7 +454,7 @@ export function SheetTable(props: {
   /** The value, through the ONE query summary — never the sheet's `aggregate`,
    *  whose vocabulary has no `avg` and whose numbers are its own. */
   const queryAggregateText = (field: FieldId, fn: QueryAggFn): string => {
-    const key = queryAggregateKey(field);
+    const key = queryAggregateFieldName(field);
     if (key === null) return "";
     const summary = querySummary<RowRecord>({
       rows: sortedRows(),
@@ -1585,7 +1578,7 @@ export function SheetTable(props: {
                 columnKey={field}
                 fn={props.queryDisplay ? null : config().colAggregates.get(field) ?? null}
                 query={
-                  props.queryDisplay && queryAggregateKey(field) !== null
+                  props.queryDisplay && queryAggregateFieldName(field) !== null
                     ? {
                         fn: queryAggregateFn(field),
                         text: (() => {
@@ -1597,7 +1590,7 @@ export function SheetTable(props: {
                     : undefined
                 }
                 values={sortedRows().map((row) => rowFieldValue(row, field))}
-                showEmpty={footerPinned() && (!props.queryDisplay || queryAggregateKey(field) !== null)}
+                showEmpty={footerPinned() && (!props.queryDisplay || queryAggregateFieldName(field) !== null)}
               />
             )}
           </For>

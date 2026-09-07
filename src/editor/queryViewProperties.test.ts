@@ -25,6 +25,7 @@ import {
   queryViewPropertyPatch,
   resolveQueryColumns,
   resolveQueryGrouping,
+  retainedQueryAggregateSegments,
   selectedQueryColumns,
   type PropertyPairs,
   type QueryColumnsResolution,
@@ -443,5 +444,34 @@ describe("the aggregate segment merge", () => {
 
   it("removes the property when the last recognized entry goes and nothing else is there", () => {
     expect(mergeQueryAggregateValue("count", [])).toBeNull();
+  });
+
+  // **What the merge keeps, the editor has to be able to SHOW** (P5B §5).
+  //
+  // Preserving a table-only segment byte for byte and then rendering a panel
+  // that lists only the three the query understands is a silent retention: the
+  // author sees `estimate=median` vanish from every surface and has no way to
+  // know their note still carries it. The panel reads the same segments through
+  // the same parser — there is exactly one — and states them as kept.
+  describe("the segments the panel reports as retained", () => {
+    it("names every segment the query reader does not own, in order", () => {
+      expect(retainedQueryAggregateSegments([
+        ["tine.col-aggregates", " count ; estimate=median ;hours=sum; owner=distinct"],
+      ])).toEqual(["estimate=median", "owner=distinct"]);
+    });
+
+    it("reports nothing when every segment is the query's own", () => {
+      expect(retainedQueryAggregateSegments([["tine.col-aggregates", "count;hours=avg"]])).toEqual([]);
+      expect(retainedQueryAggregateSegments([])).toEqual([]);
+      expect(retainedQueryAggregateSegments([["tine.col-aggregates", ""]])).toEqual([]);
+    });
+
+    it("reports exactly what an unrelated edit preserves, so the two cannot drift", () => {
+      const raw = "count;estimate=median;hours=sum";
+      const retained = retainedQueryAggregateSegments([["tine.col-aggregates", raw]]);
+      // The same edit the panel makes when it changes an aggregate it DOES own.
+      const merged = mergeQueryAggregateValue(raw, [["", "count"], ["hours", "avg"]])!;
+      for (const segment of retained) expect(merged.split(";")).toContain(segment);
+    });
   });
 });

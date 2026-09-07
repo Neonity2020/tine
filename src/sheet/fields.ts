@@ -99,6 +99,35 @@ export function queryColumnName(field: FieldId): string | null {
   return queryColumnFieldId(name) === field ? name : null;
 }
 
+/** The `tine.col-aggregates` KEY that names this field, or `null` when that
+ *  grammar has no spelling for it (P5B, contract §5/§6).
+ *
+ *  This is deliberately NOT `queryColumnName`. The two grammars share a shape
+ *  and nothing else:
+ *
+ *   * an aggregate key is a LITERAL property name. `prop:` and `formula:` carry
+ *     no meaning there, so a property named `prop:cost` keeps exactly those
+ *     bytes, and a property named `state` or `page` is an ordinary thing to
+ *     count or sum. The columns grammar RESERVES those six names because a bare
+ *     `state` token selects the task marker — but no builtin has an aggregate
+ *     key at all, so nothing is there to collide with;
+ *   * only an ordinary property has a key. A builtin's bare name and an
+ *     aggregate key are the same bytes but not the same thing, and a formula has
+ *     no key, so those columns simply carry no aggregate rather than a segment
+ *     whose meaning depends on who reads it.
+ *
+ *  What the grammar genuinely cannot carry is its own punctuation: `;` separates
+ *  segments and `=` splits key from function (`view.rs::parse_col_aggregates`),
+ *  CR/LF/NUL end a property line, and an empty key already means the keyless
+ *  whole-result count. A padded key is refused for the same reason: the reader
+ *  trims each segment, so it would come back naming a different property. */
+export function queryAggregateFieldName(field: FieldId): string | null {
+  if (!field.startsWith("prop:")) return null;
+  const name = field.slice(5);
+  if (!name || name !== name.trim() || /[=;\0\r\n]/.test(name)) return null;
+  return name;
+}
+
 /** The sort field names the CURRENT backend sorter understands
  *  (`crates/tine-core/src/query.rs::sort_key`): four builtins with their own
  *  semantics, plus any property key, which falls back to the block's visible

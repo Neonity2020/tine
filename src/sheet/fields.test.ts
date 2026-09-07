@@ -9,6 +9,7 @@ import {
   fieldLabel,
   groupKeysForBlock,
   isFieldId,
+  queryAggregateFieldName,
   readField,
   rowTitle,
   writeField,
@@ -346,5 +347,47 @@ describe("writeTagDelta", () => {
     loadOne("Read #[[tag]]");
     expect(writeTagDelta("a", { remove: "tag" })).toBe(true);
     expect(doc.byId.a.raw).toBe("Read");
+  });
+});
+
+// **The aggregate grammar is not the columns grammar** (P5B, contract §5/§6).
+//
+// `tine.col-aggregates` keys are LITERAL property names: the `prop:`/`formula:`
+// prefixes mean nothing there, and a builtin's bare name is not reserved,
+// because no builtin has a key in that property at all. The footer and the
+// panel both used the COLUMNS check, which reserves the six builtin names — so
+// an ordinary property named `state` or `page` had a saved aggregate the app
+// would neither show nor let the user edit.
+describe("queryAggregateFieldName", () => {
+  it("keeps a property named like a builtin aggregatable", () => {
+    for (const name of ["state", "priority", "scheduled", "deadline", "tags", "page"]) {
+      expect(queryAggregateFieldName(`prop:${name}`)).toBe(name);
+    }
+  });
+
+  it("keeps a literal prop:/formula: property name as itself", () => {
+    expect(queryAggregateFieldName("prop:prop:cost")).toBe("prop:cost");
+    expect(queryAggregateFieldName("prop:formula:effort")).toBe("formula:effort");
+  });
+
+  it("refuses a name the segment grammar cannot carry", () => {
+    // `;` separates segments and `=` splits key from function
+    // (`view.rs::parse_col_aggregates`); CR/LF/NUL end a property line; an
+    // empty key is the whole-result count, not this property.
+    expect(queryAggregateFieldName("prop:a;b")).toBeNull();
+    expect(queryAggregateFieldName("prop:a=b")).toBeNull();
+    expect(queryAggregateFieldName("prop:a\nb")).toBeNull();
+    expect(queryAggregateFieldName("prop:a\rb")).toBeNull();
+    expect(queryAggregateFieldName("prop:a\0b")).toBeNull();
+    expect(queryAggregateFieldName("prop:")).toBeNull();
+    // The reader trims each segment, so a padded key would come back renamed.
+    expect(queryAggregateFieldName("prop: cost")).toBeNull();
+    expect(queryAggregateFieldName("prop:cost ")).toBeNull();
+  });
+
+  it("gives no aggregate key to a builtin field or a formula", () => {
+    expect(queryAggregateFieldName("state")).toBeNull();
+    expect(queryAggregateFieldName("page")).toBeNull();
+    expect(queryAggregateFieldName("formula:effort")).toBeNull();
   });
 });

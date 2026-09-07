@@ -51,7 +51,7 @@ function registryRow(name: string, blocks: number): RegistryRow {
 
 const ROWS = [registryRow("cost", 12), registryRow("severity", 4)];
 
-function harness(initial: ViewSettings, rows = ROWS) {
+function harness(initial: ViewSettings, rows = ROWS, retainedAggregates?: readonly string[]) {
   const [view, setView] = createSignal<ViewSettings>(initial);
   const applied: ViewSettings[] = [];
   const registry: RegistryAccess = {
@@ -69,6 +69,7 @@ function harness(initial: ViewSettings, rows = ROWS) {
           applied.push(next);
           setView(next);
         },
+        retainedAggregates,
       }}
       registry={registry}
       formulas={() => ["effort"]}
@@ -100,6 +101,14 @@ describe("the view kind", () => {
     board.click();
     expect(h.applied.at(-1)).toEqual({ view: "board", group_by: "state" });
     h.dispose();
+  });
+
+  it("shows the existing Board default without writing it on open", () => {
+    const h = harness({ view: "board" });
+    try {
+      expect(rowLabels(h.panel(), "Group by")).toEqual(["State"]);
+      expect(h.applied).toEqual([]);
+    } finally { h.dispose(); }
   });
 
   it("does not reinstate the task marker over an explicit clear", () => {
@@ -199,6 +208,33 @@ describe("the three ordered lists", () => {
     buttons[1].click();
     expect(h.applied.at(-1)?.aggregates).toEqual([["", "count"], ["cost", "avg"], ["cost", "sum"]]);
     h.dispose();
+  });
+
+  // **The sheet footer's own functions ride in the same property** (§5). The
+  // merge preserves them byte for byte — but a panel that lists only the three
+  // the query understands makes that preservation invisible, and an author who
+  // cannot see `estimate=median` has no reason to believe it is still there.
+  it("states the aggregate segments it keeps but cannot edit", () => {
+    // FAIL-BEFORE: the panel rendered the query's aggregates only, so the
+    // retained sheet-only entries were kept in the bytes and shown nowhere.
+    const h = harness({ aggregates: [["cost", "sum"]] }, ROWS, ["estimate=median", "owner=distinct"]);
+    try {
+      const note = section(h.panel(), "Summarize").querySelector(".qd-retained")?.textContent ?? "";
+      expect(note).toContain("estimate=median");
+      expect(note).toContain("owner=distinct");
+      expect(note.toLowerCase()).toContain("kept");
+      // Retained metadata is READ-ONLY here: it offers no control of its own.
+      expect(section(h.panel(), "Summarize").querySelectorAll(".qd-retained button").length).toBe(0);
+      // And showing it changes nothing about the note.
+      expect(h.applied).toEqual([]);
+    } finally { h.dispose(); }
+  });
+
+  it("says nothing about retained aggregates when there are none", () => {
+    const h = harness({ aggregates: [["cost", "sum"]] });
+    try {
+      expect(h.panel().querySelector(".qd-retained")).toBeNull();
+    } finally { h.dispose(); }
   });
 
   it("appends a whole-result count with no field", () => {
@@ -398,6 +434,28 @@ describe("the display field vocabulary", () => {
 
   it("offers only property keys to aggregate", () => {
     expect(entries("aggregate")).toEqual(["cost", "severity"]);
+  });
+
+  it("offers a property named like a builtin to aggregate, unlike a column", () => {
+    // FAIL-BEFORE: the aggregate slot borrowed the COLUMNS grammar's reserved
+    // builtin names, which say nothing about `tine.col-aggregates` keys — an
+    // ordinary property named `state` is a perfectly ordinary thing to sum.
+    const rows = [registryRow("state", 3), registryRow("page", 2), registryRow("cost", 1)];
+    expect(
+      displayFieldEntries({ slot: "aggregate", rows, formulas: [], search: "" }).map((entry) =>
+        entry.choice.kind === "field" ? entry.choice.field : "",
+      ),
+    ).toEqual(["state", "page", "cost"]);
+  });
+
+  it("does not offer a property key the aggregate grammar cannot spell", () => {
+    // FAIL-BEFORE: nothing filtered these, so picking one wrote a segment the
+    // reader parses as another key, another function, or not at all.
+    const rows = ["a;b", "a=b", "a\nb", "a\rb", "a\0b", "", " cost"].map((name) => registryRow(name, 1));
+    expect(
+      displayFieldEntries({ slot: "aggregate", rows: [...rows, registryRow("cost", 1)], formulas: [], search: "" })
+        .map((entry) => (entry.choice.kind === "field" ? entry.choice.field : "")),
+    ).toEqual(["cost"]);
   });
 
   it("filters by the typed search", () => {

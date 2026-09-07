@@ -18,6 +18,7 @@ import {
   groupingFromViewValue,
   queryDisplayPropertyWrites,
   queryViewPropertyPatch,
+  retainedQueryAggregateSegments,
   serializeQuerySort,
   viewAfterViewSwitch,
   type QueryDisplayControl,
@@ -1059,7 +1060,7 @@ export function QueryMacro(props: {
   // id — and the P5B wire spelling distinguishes the two empties that matter:
   // absent is "nothing said" (a Board may default), `""` is the user's explicit
   // "no grouping" (a Board may NOT).
-  const grouping = createMemo(() => groupingFromViewValue(view().group_by));
+  const grouping = createMemo(() => groupingFromViewValue(viewAfterViewSwitch(view(), view().view).group_by));
   /** The field this result groups by, or `null` when it is ungrouped — which an
    *  explicit clear and an absent setting both are, for a LIST. */
   const groupingField = createMemo<FieldId | null>(() => {
@@ -1092,6 +1093,10 @@ export function QueryMacro(props: {
   const queryDisplayControl = createMemo<QueryDisplayControl>(() => ({
     view: displayView(),
     apply: (next) => void applyDisplay(next),
+    // The block's OWN bytes, not the engine's reading: what the query reader
+    // does not understand never reaches `ViewSettings` at all, and the save
+    // preserves it (§5). Reporting it is what makes that preservation visible.
+    retainedAggregates: retainedQueryAggregateSegments(blockPropertyPairs() ?? []),
   }));
   /** The ONE writer a query board's grouping goes through, handed to both its
    *  toolbar dropdown and its context menu.
@@ -1341,6 +1346,79 @@ export function QueryMacro(props: {
               </div>
             </Show>
             <Show when={!collapsed()}>
+              <Show when={currentView() !== "search" || inlineDisplay()}>
+                    {/* Summary panel (1a): the view's aggregates overall, or a
+                        per-group breakdown. ALL requested aggregates render, in
+                        the order the view lists them — a view carries a LIST, and
+                        showing only its first entry dropped every other column
+                        its author asked for. Rendered above the current presentation,
+                        which stays grouped by page. */}
+                    <Show when={summary()}>
+                      {(s) => (
+                        <Show
+                          when={s().groups}
+                          fallback={
+                            <div class="query-summary" onClick={stop}>
+                              <For each={s().columns}>
+                                {(col, i) => (
+                                  <span class="qs-entry">
+                                    <span class="qs-label">{col.label}:</span>{" "}
+                                    <span class="qs-value">{s().overall[i()]?.text ?? ""}</span>
+                                    <Show when={(s().overall[i()]?.skipped ?? 0) > 0}>
+                                      <span class="qs-skip">
+                                        {" "}
+                                        ({s().overall[i()]!.skipped} non-numeric skipped)
+                                      </span>
+                                    </Show>
+                                  </span>
+                                )}
+                              </For>
+                            </div>
+                          }
+                        >
+                          {(rows) => (
+                            <>
+                              <table class="md-table query-summary-table" onClick={stop}>
+                                <thead>
+                                  <tr>
+                                    <th>{s().groupLabel}</th>
+                                    <For each={s().columns}>{(col) => <th>{col.label}</th>}</For>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  <For each={rows()}>
+                                    {(row) => (
+                                      <tr>
+                                        <td>{row.label}</td>
+                                        <For each={row.cells}>
+                                          {(cell) => (
+                                            <td>
+                                              {cell.text}
+                                              <Show when={cell.skipped > 0}>
+                                                <span class="qs-skip"> ({cell.skipped} skipped)</span>
+                                              </Show>
+                                            </td>
+                                          )}
+                                        </For>
+                                      </tr>
+                                    )}
+                                  </For>
+                                </tbody>
+                              </table>
+                              {/* Say the grouping is not a partition rather than
+                                  let the counts look like they should add up. */}
+                              <Show when={s().multiMembership}>
+                                <p class="query-summary-note" onClick={stop}>
+                                  A row with several tags appears in every matching group, so these
+                                  counts can add up to more than the result.
+                                </p>
+                              </Show>
+                            </>
+                          )}
+                        </Show>
+                      )}
+                    </Show>
+              </Show>
               <Show
                 when={sheetFace()}
                 fallback={
@@ -1427,77 +1505,6 @@ export function QueryMacro(props: {
                       </div>
                     </Show>
                     <Show when={currentView() !== "search"}>
-                    {/* Summary panel (1a): the view's aggregates overall, or a
-                        per-group breakdown. ALL requested aggregates render, in
-                        the order the view lists them — a view carries a LIST, and
-                        showing only its first entry dropped every other column
-                        its author asked for. Rendered above the full result list,
-                        which stays grouped by page. */}
-                    <Show when={summary()}>
-                      {(s) => (
-                        <Show
-                          when={s().groups}
-                          fallback={
-                            <div class="query-summary" onClick={stop}>
-                              <For each={s().columns}>
-                                {(col, i) => (
-                                  <span class="qs-entry">
-                                    <span class="qs-label">{col.label}:</span>{" "}
-                                    <span class="qs-value">{s().overall[i()]?.text ?? ""}</span>
-                                    <Show when={(s().overall[i()]?.skipped ?? 0) > 0}>
-                                      <span class="qs-skip">
-                                        {" "}
-                                        ({s().overall[i()]!.skipped} non-numeric skipped)
-                                      </span>
-                                    </Show>
-                                  </span>
-                                )}
-                              </For>
-                            </div>
-                          }
-                        >
-                          {(rows) => (
-                            <>
-                              <table class="md-table query-summary-table" onClick={stop}>
-                                <thead>
-                                  <tr>
-                                    <th>{s().groupLabel}</th>
-                                    <For each={s().columns}>{(col) => <th>{col.label}</th>}</For>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  <For each={rows()}>
-                                    {(row) => (
-                                      <tr>
-                                        <td>{row.label}</td>
-                                        <For each={row.cells}>
-                                          {(cell) => (
-                                            <td>
-                                              {cell.text}
-                                              <Show when={cell.skipped > 0}>
-                                                <span class="qs-skip"> ({cell.skipped} skipped)</span>
-                                              </Show>
-                                            </td>
-                                          )}
-                                        </For>
-                                      </tr>
-                                    )}
-                                  </For>
-                                </tbody>
-                              </table>
-                              {/* Say the grouping is not a partition rather than
-                                  let the counts look like they should add up. */}
-                              <Show when={s().multiMembership}>
-                                <p class="query-summary-note" onClick={stop}>
-                                  A row with several tags appears in every matching group, so these
-                                  counts can add up to more than the result.
-                                </p>
-                              </Show>
-                            </>
-                          )}
-                        </Show>
-                      )}
-                    </Show>
                     {/* `@page`-anchored results are pages, not blocks (K16): they
                         carry `{name, kind, journal_day?}` and need no document
                         load, so they render as page links rather than as empty

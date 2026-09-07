@@ -113,13 +113,18 @@ function load(raw: string, view: ViewSettings): void {
 
 async function mountQuery(): Promise<{ root: HTMLElement; dispose: () => void }> {
   const mounted = mount(() => <Block id="query" />);
-  await vi.waitFor(() => {
-    if (!mounted.root.querySelector(".query-summary, .query-summary-table")) {
-      throw new Error("the summary never rendered");
-    }
-  });
-  await settle();
-  return mounted;
+  try {
+    await vi.waitFor(() => {
+      if (!mounted.root.querySelector(".query-summary, .query-summary-table")) {
+        throw new Error("the summary never rendered");
+      }
+    });
+    await settle();
+    return mounted;
+  } catch (error) {
+    mounted.dispose();
+    throw error;
+  }
 }
 
 const cells = (root: HTMLElement, selector: string) =>
@@ -160,6 +165,14 @@ describe("the overall summary", () => {
     } finally {
       dispose();
     }
+  });
+
+  it.each(["table", "board", "search"] as const)("renders every aggregate in the %s view", async (view) => {
+    load(`{{query (todo TODO)}}\ntine.view:: ${view}\ntine.group-field:: `, { view, group_by: "", aggregates: [["", "count"], ["cost", "sum"], ["cost", "sum"]] });
+    const { root, dispose } = await mountQuery();
+    try {
+      expect(cells(root, ".query-summary .qs-value")).toEqual(["4", "14", "14"]);
+    } finally { dispose(); }
   });
 
   it("counts the rows that could not contribute", async () => {

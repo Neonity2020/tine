@@ -664,6 +664,34 @@ describe("QueryMacro sheet integration", () => {
     } finally { dispose(); }
   });
 
+  it("shows the sheet-only aggregate segments it retains, and keeps them on an edit", async () => {
+    // FAIL-BEFORE: `tine.col-aggregates` is shared ground (contract §5). The
+    // save merges rather than rewrites, so a table-only `estimate=median`
+    // survived — but no surface said so, and the panel that DOES list the
+    // aggregates listed only the three the query reader owns. Retention the
+    // author cannot see is indistinguishable from loss.
+    loadQueryDoc("{{query (todo TODO)}}\ntine.col-aggregates:: estimate=median");
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      const panel = await openDisplay(root);
+      // Read from the block's OWN bytes: the query reader never returns this
+      // segment, so no reading of the view could have produced it.
+      expect(panel.querySelector(".qd-retained")?.textContent).toContain("estimate=median");
+
+      const add = [...panel.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "+ count",
+      )!;
+      add.click();
+      // The unrelated edit appends; the retained segment keeps its text and its
+      // place, and the panel still says it is there.
+      expect(blockProperty("query", "tine.col-aggregates")).toBe("estimate=median;count");
+      await vi.waitFor(() =>
+        expect(document.querySelector(".qd-retained")?.textContent).toContain("estimate=median"),
+      );
+    } finally { dispose(); }
+  });
+
   it("preserves a grouping clear when a sample save starts before the re-parse", async () => {
     loadQueryDoc("{{query (todo TODO)}}\ntine.group-by:: state");
     vi.spyOn(backend(), "queryOgExpressible").mockResolvedValue(true);

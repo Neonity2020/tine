@@ -302,6 +302,41 @@ describe("the query table's aggregate footer", () => {
       dispose();
     }
   });
+
+  it("aggregates a property named like a builtin, which the COLUMNS grammar reserves", () => {
+    // FAIL-BEFORE: the footer asked the columns grammar whether it could spell
+    // the key, and that grammar reserves the six builtin names — so a note
+    // saying `state=count`, about an ordinary property named `state`, rendered
+    // no footer cell at all and could not be edited or removed from the table.
+    load("{{query (task TODO)}}\ntine.view:: table");
+    const h = displayHarness({ view: "table", aggregates: [["state", "count"]] });
+    const groups: RefGroup[] = [{
+      page: "Tracker",
+      kind: "page",
+      blocks: [
+        resultBlock("r1", "TODO Refresh the Guide", [["state", "open"], ["cost", "10"]]),
+        resultBlock("r2", "DONE Publish the demo", [["state", "done"], ["cost", "4"]]),
+      ],
+    }];
+    const { root, dispose } = mount(() => (
+      <>
+        <SheetTable ownerId="query" rowSource="query" groups={groups} queryDisplay={h.control} />
+        <ContextMenu />
+      </>
+    ));
+    try {
+      const cells = [...root.querySelectorAll<HTMLButtonElement>(".sheet-aggregate-value")];
+      expect(cells.map((cell) => cell.textContent?.trim())).toEqual(["2"]);
+      cells[0].click();
+      [...document.querySelectorAll<HTMLElement>(".ctx-item")]
+        .find((element) => (element.textContent ?? "").trim() === "Sum")!
+        .click();
+      // The key stays the LITERAL property name; the task marker keeps no key.
+      expect(h.applied.at(-1)?.aggregates).toEqual([["state", "sum"]]);
+    } finally {
+      dispose();
+    }
+  });
 });
 
 describe("the query table's header reorder", () => {
