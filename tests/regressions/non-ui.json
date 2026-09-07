@@ -205,18 +205,18 @@
   },
   {
    "id": "REG-W3-P0-QUERY-BUILDER-FACETS-DEDUPE-001",
-   "title": "One Query Builder instance fetches facets once per graph revision for all mounted controls",
+   "title": "One Query Builder instance reads the graph vocabulary once per revision for all mounted controls",
    "family": "waited-path-query-cost",
    "sources": {"issues": [], "commits": [], "internal": "Harvest Wave 3 P0 item 4"},
    "platforms": ["all"],
    "layer": "frontend",
    "status": "covered",
    "coverage": {
-    "tests": ["src/components/QueryBuilder.transient.test.tsx::asks for no facets at rest, once when the sheet opens, and once per data revision"],
-    "scenario": "query-builder.facets-once-per-instance-revision",
+    "tests": ["src/components/QueryBuilder.transient.test.tsx::asks the graph nothing at rest, reads the registry when the sheet opens, and again per data revision"],
+    "scenario": "query-builder.vocabulary-once-per-instance-revision",
     "failBefore": "tine-agents/evidence/wave3/P0/item4-fail-before.log at b51e54e3ee3891f1385a50fed2a336ade443e88e: SummarizeControl and PropertyPick made two queryFacets calls in one builder"
    },
-   "notes": "The shared resource is owned by the builder instance and keyed by graphEpoch plus dataRev. Harvest W4-P1 then made the REQUEST shared across instances too, through sharedQueryResult under a query-facets key namespace: the scope stays per-builder by decision, so this row's outcome is unchanged and now holds a fortiori. Its proof test lost the words \"per builder\" from its title in that packet, because per-builder fetching is exactly what stopped being true; see REG-W4-B4B-DIRECT-INDEXED-QUERY-ROUTING-001's sibling UI row UI-HARVEST-W4-P1-QUERY-BUILDER-FACET-SHARING for the cross-instance bound. P3 moved the first fetch later still: a query block at REST is one sentence and asks for no facets at all, so the title now names the moment the sheet opens. The bound per revision is unchanged."
+   "notes": "The shared resource is owned by the builder instance and keyed by graphEpoch plus dataRev. Harvest W4-P1 then made the REQUEST shared across instances too, through sharedQueryResult under a query-facets key namespace: the scope stays per-builder by decision, so this row's outcome is unchanged and now holds a fortiori. Its proof test lost the words \"per builder\" from its title in that packet, because per-builder fetching is exactly what stopped being true; see REG-W4-B4B-DIRECT-INDEXED-QUERY-ROUTING-001's sibling UI row UI-HARVEST-W4-P1-QUERY-BUILDER-FACET-SHARING for the cross-instance bound. P3 moved the first fetch later still: a query block at REST is one sentence and asks for no facets at all, so the title now names the moment the sheet opens. The bound per revision is unchanged. P4 replaced the QUESTION: `queryFacets(false)` was deleted with the two-stage property chooser it fed, and the one read is now `query_registry`, keyed by graph scope, `dataRev` and a shared declaration revision. Both consumers in a builder \u2014 the vocabulary picker and Summarize \u2014 are served from that one read, so this row's outcome is unchanged."
   },
   {
    "id": "REG-W3-A3-BOUNDED-CONFLICT-HISTORY-001",

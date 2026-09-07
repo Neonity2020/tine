@@ -67,14 +67,14 @@ describe("frontend-staleness living contract", () => {
         itTitle: "rebuilds the page-name merge zero times across five unchanged-reply lulls",
       },
       {
-        heading: "**Item 3 — QueryBuilder facets.**",
+        heading: "**Item 3 — QueryBuilder registry.**",
         producerPath: "src/components/QueryBuilder.tsx",
-        producerIdentifier: "sharedQueryResult",
-        bound: "`queryFacets(false)` request per (graph scope, `dataRev`)",
+        producerIdentifier: "requestQueryRegistryRefresh",
+        bound: "`1` `query_registry` request per (graph scope, `dataRev`, declaration revision)",
         testPath: "src/components/QueryBuilder.transient.test.tsx",
-        describeTitle: "QueryBuilder facet sharing (Harvest W4-P1 item 3)",
+        describeTitle: "QueryBuilder registry sharing (Harvest W4-P1 item 3)",
         itTitle:
-          "issues one shared facets request per (graph scope, dataRev) for five mounted builders",
+          "issues one shared registry request per (graph scope, dataRev, declaration) for five mounted builders",
       },
       {
         heading: "**Item 4 — tag-table queries (measured, no cut).**",

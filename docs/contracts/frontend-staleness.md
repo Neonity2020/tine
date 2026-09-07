@@ -50,15 +50,19 @@ is built; a counter downstream would report zero even while the `Set` was
 rebuilt. Proof:
 `src/pages.inventory.test.ts::GH #229 complete page-name inventory::rebuilds the page-name merge zero times across five unchanged-reply lulls`.
 
-**Item 3 — QueryBuilder facets.** Producer: the facets `createResource` in
+**Item 3 — QueryBuilder registry.** Producer: the registry `createResource` in
 `src/components/QueryBuilder.tsx`, routed through `sharedQueryResult` under the
-`query-facets` key namespace. Trigger/key: the canonical graph scope
-`` `${graphMeta()?.root ?? ""}\0${graphEpoch()}` `` plus `dataRev()`. Bound: `1`
-`queryFacets(false)` request per (graph scope, `dataRev`) regardless of how many
-builder instances are mounted, with every mounted builder exposing the current
-payload through its production Property control. `queryFacets(true)`
-(autocomplete) asks a different question and keeps its own call. Proof:
-`src/components/QueryBuilder.transient.test.tsx::QueryBuilder facet sharing (Harvest W4-P1 item 3)::issues one shared facets request per (graph scope, dataRev) for five mounted builders`.
+`query-registry` key namespace. Trigger/key: the canonical graph scope
+`` `${graphMeta()?.root ?? ""}\0${graphEpoch()}` `` plus `dataRev()` and the
+module-level declaration revision that `requestQueryRegistryRefresh()` bumps
+when a builder declares a property the snapshot cannot know about yet. Bound:
+`1` `query_registry` request per (graph scope, `dataRev`, declaration revision)
+regardless of how many builder instances are mounted, with every mounted builder
+exposing the current snapshot through its production vocabulary picker. A closed
+sheet asks nothing at all (the key is `undefined` until the sheet opens), and
+`queryFacets(true)` (autocomplete) asks a different question and keeps its own
+call. Proof:
+`src/components/QueryBuilder.transient.test.tsx::QueryBuilder registry sharing (Harvest W4-P1 item 3)::issues one shared registry request per (graph scope, dataRev, declaration) for five mounted builders`.
 
 **Item 4 — tag-table queries (measured, no cut).** Producer: the tag-table query
 resource behind `TagTableToggle`/`TagPageTable` in `src/components/Page.tsx`.

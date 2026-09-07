@@ -212,3 +212,28 @@ describe("switching what the query selects re-validates it and says how much it 
     }
   });
 });
+
+
+describe("anchor preview belongs to the current open sheet", () => {
+  it.each(["close", "reselect", "newer"])("drops an old success after %s", async (action) => {
+    const replies: ((value: ParsedQuery) => void)[] = [];
+    vi.spyOn(backend(), "parseQuery").mockImplementation(() => new Promise((resolve) => replies.push(resolve)));
+    const builder = mountBuilder(propertyFilter("owner", "Ada"));
+    const pick = (sheet: HTMLElement, label: string) => {
+      sheet.querySelector<HTMLButtonElement>(".qs-anchor-button")!.click();
+      [...sheet.querySelectorAll<HTMLButtonElement>(".qs-option")]
+        .find((option) => option.textContent?.startsWith(label))!.click();
+    };
+    try {
+      const sheet = builder.open();
+      pick(sheet, "pages");
+      await settle();
+      if (action === "close") dismissTopTransient("escape");
+      else pick(sheet, action === "reselect" ? "blocks" : "pages");
+      await settle();
+      replies[0]({ query: session(propertyFilter("owner", "Ada"), "page").query, view: {} } as ParsedQuery);
+      await settle();
+      expect(builder.session().query.anchor).toBe("block");
+    } finally { builder.dispose(); }
+  });
+});

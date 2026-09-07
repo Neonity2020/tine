@@ -10,6 +10,52 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Picking a field now shows you your own graph.** Adding a condition used to
+  ask which KIND of thing you wanted first, and then — for a property — offer an
+  alphabetical list of every key in the graph, with no counts and no types, in
+  which a key you use four hundred times sat below one you used once. Changing an
+  existing row's field asked the same question again through a different control.
+  Both are one list now, and it is your graph: the built-in fields first, then
+  every property key you actually use, commonest first, each row saying what type
+  Tine has observed for it (and what you declared, when you have), how many
+  blocks or pages carry it, and a few of the values it holds. Type to narrow it.
+  A key the list does not already offer where you need it is offered by name —
+  **Use "…" as a block property**, and on a block query **Use "…" as a page
+  property** for the same key read off the block's own page — each with its
+  honest `0 blocks today`. That is how a key your graph has not got yet, and a
+  key it has only on pages, both stay writable. A graph with thousands of keys
+  opens as quickly as a small one — the list draws a screenful at a time — and
+  the arrow keys reach any of them, including on a phone-width window, where the
+  sheet scrolls to bring your own properties into view.
+
+  While Tine is still reading your graph's properties, the list says so and
+  keeps the built-in fields usable; it does not show an empty graph. A property
+  condition waits for that answer rather than guessing that the key holds text —
+  which matters most right after you declare a type, when the old answer is the
+  wrong one. Your chosen key and anything you have typed are kept while it waits.
+
+  Built-in fields — *Task marker*, *Scheduled*, *Page / tag reference* — show no
+  count. Tine keeps no statistics for those, and showing a borrowed number would
+  be telling you something it never measured.
+
+- **The query text is always there, and it answers back.** The box holding the
+  query's text used to be a collapsed *Query text* twisty at the foot of the
+  sheet — the one control that can say everything the rows cannot was the one
+  control you had to know to look for. It is now simply part of an open sheet,
+  and Tine reads what you type as you type it. When it cannot read something it
+  says which word, offers **Show me** to select that word in the text, lists the
+  spellings it does know and the property keys your graph has that look like it,
+  and points at the Guide's query-language reference. Your results stay on
+  screen, greyed, while the text is broken — a typo is not an empty graph — and
+  **Save query text** only ever saves the text that is in front of you. The
+  `⟨advanced⟩` row is a button now: press it and the cursor lands in the text at
+  the part the rows could not draw.
+
+- **A query Tine understood only part of says so plainly.** It used to list what
+  it could not read under a bare *No results*, which read as "here are your
+  results". It now says: *Tine didn't understand part of this query, so it
+  returned no results* — which is what actually happened.
+
 - **A query block now reads as a sentence, and edits as a sheet.** The row of
   chips over every `{{query}}` is gone. At rest a query is one line of plain
   English — *Blocks where task: TODO and page: Project/Roadmap* — with the number

@@ -703,6 +703,28 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-query-vocabulary.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Adding a condition and changing a row's field open one list of this graph's own vocabulary \u2014 built-in fields plus every property key, commonest first, each with its observed type and its authoritative count \u2014 a rare key stays reachable by typing and by the keyboard however many keys the graph has, and the condition the picked key writes survives a restart.",
+     "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "The query text at the foot of an open sheet is always editable, reports the engine's own diagnostic for text it cannot read while the last reading stays on screen and greyed, never saves a parse of text that has since changed, and the \u27e8advanced\u27e9 row puts the cursor in it rather than dead-ending.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The wording of the row metadata, the section headings and the order within one section may evolve while the count and the type shown stay the registry's own.",
+    "How many rows the list keeps mounted, and the pane's debounce, may change as long as a distant key stays reachable and a stale answer is never shown."
+   ],
+   "nonRequirements": [
+    "Pixel geometry of the popover, the scroll animation, or the exact set of values previewed on a row."
+   ],
+   "stability": "burn-in"
+  },
   "scripts/e2e-query-workspace.mjs": {
    "contracts": [
     {

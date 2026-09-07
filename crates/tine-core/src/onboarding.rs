@@ -1060,6 +1060,114 @@ mod tests {
             .contains("**all of** / **any of** / **none of**"));
         assert!(page.markdown.contains("`⟨advanced⟩`"));
 
+        // The P4 section. The pane's own "I did not understand this" message
+        // routes the reader HERE by name, so the heading is part of the
+        // frontend's contract and not a free-text choice
+        // (`src/components/QueryBuilder.tsx`: "the Guide under *Find and
+        // revisit → Query text (TQL)*").
+        assert!(page.markdown.contains("- ## Query text (TQL)"));
+        assert!(page.markdown.contains("**Save query text**"));
+        // The one picker: a key's count and observed type are what the list
+        // shows, and a typed key is offered honestly in BOTH scopes a block
+        // query can write it in — the pair of field kinds the two-stage chooser
+        // used to expose, which one list has to keep offering.
+        assert!(page.markdown.contains("**Use \"…\" as a block property**"));
+        assert!(page.markdown.contains("**Use \"…\" as a page property**"));
+        assert!(page.markdown.contains("`0 blocks today`"));
+        // **Show me is conditional, and the Guide says so.** The engine attaches
+        // a span to some diagnostics and not to others (`unknown_ident` carries
+        // none today), and the pane draws the button only where there is a range
+        // to select. A Guide that promises it unconditionally teaches a reader to
+        // look for a control that is correctly absent.
+        assert!(page
+            .markdown
+            .contains("When the message comes with a place in the text"));
+        assert!(
+            !page
+                .markdown
+                .contains("offers **Show me** to select it in the text"),
+            "the Guide must not promise Show me for every unknown word"
+        );
+        // The pane shows Tine's READING of the query, not the block's bytes:
+        // a saved block may hold Logseq's `{{query …}}` form while the pane
+        // shows the same query in TQL.
+        assert!(
+            !page
+                .markdown
+                .contains("the query text at the foot of the sheet shows exactly what was written"),
+            "the pane is not a view of the saved macro's bytes"
+        );
+
+        // **The examples are checked against the engine, not proof-read.** A
+        // reference whose sample queries do not parse is worse than no
+        // reference: the reader concludes the language is the thing that is
+        // broken. Every fenced ```tql block on the page is parsed by the ONE
+        // parser, with no registry, and must come back valid.
+        let fenced: Vec<String> = page
+            .markdown
+            .split("```tql")
+            .skip(1)
+            .map(|rest| {
+                rest.split("```")
+                    .next()
+                    .expect("a fenced tql block is closed")
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        assert!(
+            fenced.len() >= 2,
+            "the TQL reference must SHOW the language, not only describe it"
+        );
+        for example in &fenced {
+            let (parsed, _) = crate::query::parse_query_text(
+                example,
+                crate::query::QueryDialect::Tql,
+                crate::date::JournalDate::today(),
+            );
+            assert!(
+                !parsed.is_invalid(),
+                "the Guide's TQL example {example:?} does not parse: {:?}",
+                parsed.diagnostics
+            );
+        }
+
+        // Every block/page attribute the parser accepts is NAMED in the
+        // section, in backticks. A vocabulary reference that lists four of five
+        // fields sends the reader to the pane to guess the fifth.
+        let tql_section = page
+            .markdown
+            .split("- ## Query text (TQL)")
+            .nth(1)
+            .expect("the TQL section is present")
+            .split("\n- ## ")
+            .next()
+            .expect("the TQL section ends at the next heading");
+        for attribute in [
+            "content",
+            "task",
+            "priority",
+            "scheduled",
+            "deadline",
+            "name",
+            "journal",
+            "namespace",
+        ] {
+            assert!(
+                tql_section.contains(&format!("`{attribute}`")),
+                "the TQL reference never names the `{attribute}` field"
+            );
+        }
+        for form in ["prop('key')", "any(", "every(", "off(", "@block", "@page"] {
+            assert!(
+                tql_section.contains(form),
+                "the TQL reference never shows {form}"
+            );
+        }
+
         // The two P2 sections. A declared property type is only actionable if
         // the page the declaration must live on is named: the engine binds
         // `tine.type::` by the NORMALIZED key, so a reader who authors the line

@@ -7,6 +7,7 @@ import {
   createSignal,
   createUniqueId,
   onCleanup,
+  onMount,
   type JSX,
 } from "solid-js";
 import { Portal } from "solid-js/web";
@@ -29,11 +30,13 @@ import {
 import type {
   AggFn,
   Anchor,
+  Diagnostic,
   Filter,
   ParsedQuery,
   Query,
   QueryPrintDialect,
   RegistryRow,
+  Span,
   ViewSettings,
 } from "../editor/queryIr";
 import {
@@ -44,8 +47,6 @@ import {
   registerVisiblePopover,
   stop,
   type AnchorPrompt,
-  type QueryFacets,
-  type QueryFacetsAccessor,
   type RegistryAccess,
 } from "./QuerySheet";
 import { sharedQueryResult } from "../queryResultCache";
@@ -67,7 +68,7 @@ import { dismissOnOutsidePointer, registerTransientLayer } from "../transientLay
 // P4's respectively and are unchanged — they simply moved into the sheet's
 // footer.
 
-export type { RegistryAccess, QueryFacets, QueryFacetsAccessor };
+export type { RegistryAccess };
 
 /** The pair an edit session holds (§4.3.1). `query` carries the anchor, the
  *  filter, the diagnostics and the authored source — including the opaque
@@ -201,14 +202,26 @@ function SortControl(props: {
 function SummarizeControl(props: {
   view: () => ViewSettings;
   apply: (view: ViewSettings) => void;
-  facets: QueryFacetsAccessor;
+  /** The host's ONE registry read. P4 removed `query_facets(false)`, whose only
+   *  other consumer this was; the keys it offers are the same keys, ordered by
+   *  the count the registry already knows. P5 rewrites this control — until
+   *  then it reads the same rows the picker does rather than a second graph
+   *  question (§6.4, I-13). */
+  registry: RegistryAccess;
   parentTransientId?: string;
 }): JSX.Element {
   const [open, setOpen] = createSignal(false);
   // Two-step property choice: null = show the top-level buttons; "sum"/"avg" =
   // pick a property to aggregate; "group" = pick a property to group by.
   const [pick, setPick] = createSignal<"sum" | "avg" | "group" | null>(null);
-  const keys = () => (props.facets() ?? []).map(([k]) => k);
+  const keys = () =>
+    [...(props.registry.rows() ?? [])]
+      .sort(
+        (a, b) =>
+          b.count_blocks + b.count_pages - (a.count_blocks + a.count_pages)
+          || a.normalized_name.localeCompare(b.normalized_name),
+      )
+      .map((row) => row.normalized_name);
   const agg = () => currentAgg(props.view());
   const group = () => currentGroup(props.view());
   const active = () => !!agg() || !!group();
@@ -319,6 +332,31 @@ function PropNameInput(props: { onCommit: (key: string) => void }): JSX.Element 
  *  that the rows follow the text rather than trailing it. */
 const PANE_DEBOUNCE_MS = 150;
 
+/** The handle the sheet's `⟨advanced⟩` control and its retained rows use to
+ *  reach the text. Held by the host, filled in by the pane while it is mounted,
+ *  and cleared when it is not — a route that leads nowhere is not offered. */
+export interface PaneHandle {
+  focus: () => void;
+  /** Put the selection on a span of the CURRENT draft, when there is one that
+   *  belongs to this exact text. */
+  select: (span: Span, forText: string) => void;
+}
+
+/** One diagnostic, with the fields §4.3.2 gives it — not a joined string.
+ *
+ *  `span`, `suggestions` and `disabled` are the difference between "something is
+ *  wrong" and "this token, here, and here is what the parser knows instead".
+ *  Flattening them into one message was cheap and it is why an unknown property
+ *  read the same as a missing bracket. */
+interface PaneDiagnostics {
+  /** The revision these belong to. A diagnostic never outlives its draft. */
+  revision: number;
+  /** The exact text they were computed for; a span is only offered while the
+   *  textarea still holds this. */
+  text: string;
+  items: Diagnostic[];
+}
+
 /** The query text pane.
  *
  *  **One implementation, two dialects.** A query block edits TQL and the query
@@ -333,17 +371,28 @@ const PANE_DEBOUNCE_MS = 150;
  *    parser's OWN message, and disables save. It never blanks the pane and never
  *    writes to disk. The bar above renders greyed while this holds, so the rows
  *    on screen are visibly "what still ran", not "what you just typed".
- *  - **I-20:** a monotonically increasing edit revision discards stale parse
- *    responses. A slow answer for text the user has since retyped is DROPPED,
- *    not rendered — the failure mode it prevents is a late success overwriting a
- *    later edit's error, which reads as "my typo was accepted".
- *  - Saving waits for a successful parse of the CURRENT revision, so the pending
- *    state disables save too. There is no spinner that outlives a response:
- *    every settled revision clears it, including a dropped one.
+ *  - **I-20, tightened.** The pane used to accept any response NEWER than the
+ *    last one it settled. That is not enough: with revisions 1 and 2 both in
+ *    flight, 1's answer arrives, is newer than the watermark, and lands — so the
+ *    rows and the error briefly describe text the user has already replaced, and
+ *    a *successful* 1 clears the error 2 is about to raise. A response is now
+ *    accepted only when it is the answer to the CURRENT revision, on a session
+ *    that is still the pane's, in a pane that has not been disposed. Everything
+ *    else is dropped, on the success path and the failure path alike.
+ *  - Saving waits for a successful parse of the CURRENT revision, so a pending
+ *    or invalid draft disables save. **A save can never write an earlier good
+ *    parse**: the last-good reading is remembered for the rows, but the button
+ *    is enabled only while the good parse IS the current revision.
+ *  - Closing the sheet disposes the pane, and a pending callback that lands
+ *    afterwards calls no host prop.
  *  - The pane is not an options editor. */
 function QueryTextPane(props: {
   session: () => BuilderSession | undefined;
   dialect: Extract<QueryPrintDialect, "og" | "tql">;
+  /** Whether the pane is on screen at all. A resting sentence prints nothing:
+   *  the text it would show is an IPC round trip per query block on the page,
+   *  spent on bytes nobody is looking at (I-13). */
+  visible: () => boolean;
   /** A successful parse of the current revision: the new filter/anchor, ready to
    *  be shown. Carry-forward of the view and the opaque options is the caller's
    *  (`QueryBuilder`'s), because it owns the session. */
@@ -351,36 +400,79 @@ function QueryTextPane(props: {
   /** Commit the last-good parse. Enabled only when the current revision parsed. */
   onCommit: (query: Query) => void;
   onStale: (stale: boolean) => void;
-  alwaysOpen?: boolean;
+  /** Published while mounted so the sheet above can bring the user here. */
+  handle?: (handle: PaneHandle | null) => void;
+  /** The §7.5 crossing notice, hosted here while the sheet is open (N3). */
+  notice?: () => JSX.Element;
+  /** The registry's keys, for the honest "what vocabulary exists" hint an
+   *  unknown identifier gets. Read from the host's ONE snapshot — the pane
+   *  never asks the graph anything, and typing here changes no revision. */
+  vocabulary?: () => string[];
 }): JSX.Element {
   const [draft, setDraft] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [pending, setPending] = createSignal(false);
   const [good, setGood] = createSignal<Query | null>(null);
-  // The edit revision. `settled` is the newest revision whose response we
-  // accepted; a response for anything older is dropped unrendered (I-20).
-  let revision = 0;
-  let settled = 0;
+  const [diagnostics, setDiagnostics] = createSignal<PaneDiagnostics | null>(null);
+  // The edit revision, and the revision whose parse currently holds `good`.
+  // Both are SIGNALS because "is the good parse the current one" is what the
+  // save button renders from.
+  const [revision, setRevision] = createSignal(0);
+  const [goodRevision, setGoodRevision] = createSignal<number | null>(null);
   let timer: ReturnType<typeof setTimeout> | undefined;
-  onCleanup(() => clearTimeout(timer));
+  let disposed = false;
+  let textarea: HTMLTextAreaElement | undefined;
+  onCleanup(() => {
+    clearTimeout(timer);
+    // Disposal invalidates every outstanding response. A pane that has been
+    // closed must not reach back into a host it no longer belongs to.
+    disposed = true;
+    setRevision((n) => n + 1);
+    props.handle?.(null);
+  });
 
-  // The pane is collapsed until the user asks for it, and a closed pane prints
-  // nothing: the text it would show is an IPC round trip per query block on the
-  // page, spent on bytes nobody is looking at.
-  const [open, setOpen] = createSignal(!!props.alwaysOpen);
+  /** **The gate BOTH landing paths go through (I-20).**
+   *
+   *  One number answers all three questions the dossier separates, because all
+   *  three bump it: an input bumps it, a session replacement bumps it (the reset
+   *  effect below), and disposal bumps it. So "is this the answer to what is on
+   *  screen right now, in a pane that still exists" is `mine === revision()`
+   *  with `disposed` as the belt.
+   *
+   *  Note the difference from what this replaced. The old test was `mine >
+   *  settled` — newer than the last response we ACCEPTED — which lets revision 1
+   *  land while revision 2 is still in flight. */
+  const accepts = (mine: number) => !disposed && mine === revision();
 
   // The session's own text is PRINTED BY RUST. The pane never renders a query it
-  // spelled itself — that was the twin this packet removed.
+  // spelled itself — that was the twin this packet removed. The printer's answer
+  // carries the session it was computed for, so a print that lands after the
+  // block changed underneath cannot be shown as that block's text.
   const [printed] = createResource(
-    () => (open() ? props.session() : undefined),
+    () => (props.visible() ? props.session() : undefined),
     async (session) => {
+      const key = { query: session.query, view: session.view };
       try {
-        return { text: await backend().printQuery(session.query, session.view, props.dialect), refusal: null };
+        return {
+          ...key,
+          text: await backend().printQuery(session.query, session.view, props.dialect),
+          refusal: null as string | null,
+        };
       } catch (error) {
-        return { text: null, refusal: errorMessage(error) };
+        return { ...key, text: null as string | null, refusal: errorMessage(error) };
       }
     },
   );
+  /** The printed text is shown only for the pair it was printed FROM. Solid's
+   *  resource already discards an out-of-order response; this is the other half
+   *  — a response that arrived in order but is now about a previous reading is
+   *  not this block's text either. */
+  const printedNow = () => {
+    const landed = printed.latest;
+    const current = props.session();
+    if (!landed || !current) return undefined;
+    return landed.query === current.query && landed.view === current.view ? landed : undefined;
+  };
 
   // A session arriving from outside the pane (a chip edit, a save landing, a
   // different block) invalidates every outstanding response and the draft with
@@ -388,54 +480,63 @@ function QueryTextPane(props: {
   // outstanding responses").
   createEffect(() => {
     props.session();
-    revision += 1;
-    settled = revision;
+    setRevision((n) => n + 1);
+    setGoodRevision(null);
     clearTimeout(timer);
     setDraft(null);
     setError(null);
+    setDiagnostics(null);
     setPending(false);
     setGood(null);
     props.onStale(false);
   });
 
-  const text = () => draft() ?? printed.latest?.text ?? "";
-  const refusal = () => (draft() === null ? printed.latest?.refusal ?? null : null);
+  const text = () => draft() ?? printedNow()?.text ?? "";
+  const refusal = () => (draft() === null ? printedNow()?.refusal ?? null : null);
 
   const run = async (source: string, mine: number) => {
+    let parsed: ParsedQuery;
     try {
-      const parsed = await backend().parseQuery(source, props.dialect);
-      // I-20: the user has typed since; this answer is about text that no longer
-      // exists. Dropping it is the whole point — rendering it would replace a
-      // newer reading with an older one.
-      if (mine <= settled) return;
-      settled = mine;
-      setPending(false);
-      // A diagnostic inside an `off` subtree carries `disabled` and does not
-      // invalidate (§3.5) — a parse with only disabled diagnostics is successful
-      // and saveable.
-      const blocking = (parsed.query.diagnostics ?? []).filter((d) => !d.disabled);
-      if (blocking.length) {
-        setError(blocking.map((d) => d.message).join(" · "));
-        props.onStale(true);
-        return;
-      }
-      setError(null);
-      setGood(parsed.query);
-      props.onStale(false);
-      props.onParsed(parsed.query);
+      parsed = await backend().parseQuery(source, props.dialect);
     } catch (error) {
-      if (mine <= settled) return;
-      settled = mine;
+      // The rejection path takes the SAME gate as the success path. A failure
+      // for text the user has already replaced is as wrong to render as a
+      // success for it — more so, because it reads as "your current text is
+      // broken" about text nobody has judged yet.
+      if (!accepts(mine)) return;
       setPending(false);
       setError(errorMessage(error));
+      setDiagnostics(null);
       props.onStale(true);
+      return;
     }
+    if (!accepts(mine)) return;
+    setPending(false);
+    // A diagnostic inside an `off` subtree carries `disabled` and does not
+    // invalidate (§3.5) — a parse with only disabled diagnostics is successful
+    // and saveable. The disabled ones are still SHOWN; they are the greyed rows'
+    // explanation, and a "disabled-only" diagnostic list is a valid state.
+    const all = parsed.query.diagnostics ?? [];
+    setDiagnostics(all.length ? { revision: mine, text: source, items: all } : null);
+    const blocking = all.filter((d) => !d.disabled);
+    if (blocking.length) {
+      setError(blocking.map((d) => d.message).join(" · "));
+      props.onStale(true);
+      return;
+    }
+    setError(null);
+    setGood(parsed.query);
+    setGoodRevision(mine);
+    props.onStale(false);
+    props.onParsed(parsed.query);
   };
 
   const onInput = (next: string) => {
     setDraft(next);
-    revision += 1;
-    const mine = revision;
+    const mine = revision() + 1;
+    setRevision(mine);
+    setGoodRevision(null);
+    setDiagnostics(null);
     clearTimeout(timer);
     // The pane is not an options editor (§4.3.1). TQL has no braces and the OG
     // DSL's form never ends in one, so a trailing `}` is an options map that was
@@ -443,7 +544,6 @@ function QueryTextPane(props: {
     // no claim about WHERE the map starts; splitting one is Rust's job and only
     // Rust's.
     if (next.trim().endsWith("}")) {
-      settled = mine;
       setPending(false);
       setError("The options map (title, collapsed) is edited with the title and Display controls, not here.");
       props.onStale(true);
@@ -453,11 +553,58 @@ function QueryTextPane(props: {
     timer = setTimeout(() => void run(next, mine), PANE_DEBOUNCE_MS);
   };
 
-  const savable = () => draft() !== null && !pending() && !error() && good() !== null;
+  /** Only a good parse OF THE CURRENT REVISION is saveable. */
+  const savable = () =>
+    draft() !== null && !pending() && !error() && good() !== null && goodRevision() === revision();
 
-  const body = () => (
+  // **Spans are already UTF-16 code units** (`queryIr.ts`: converted once, at the
+  // Rust boundary, precisely because the consumer is JavaScript). So locating a
+  // token is `setSelectionRange` and nothing else — converting again would move
+  // every offset past the first non-ASCII character in the draft.
+  //
+  // A span is offered ONLY for the text it was computed from. A stale span
+  // pointing into a different draft selects the wrong words with complete
+  // confidence, which is worse than not offering the jump at all.
+  const spanFor = (diagnostic: Diagnostic): Span | null => {
+    const current = diagnostics();
+    const span = diagnostic.span;
+    if (!current || !span) return null;
+    if (current.revision !== revision() || current.text !== text()) return null;
+    if (span.start < 0 || span.end < span.start || span.end > current.text.length) return null;
+    return span;
+  };
+  const select = (span: Span, forText: string) => {
+    if (!textarea || textarea.value !== forText) return;
+    textarea.focus();
+    textarea.setSelectionRange(span.start, span.end);
+  };
+  onMount(() => props.handle?.({ focus: () => textarea?.focus(), select }));
+
+  /** The registry keys that CONTAIN the token an unknown identifier names.
+   *
+   *  Labelled as what it is — the property vocabulary of this graph — because
+   *  that is the only scope these rows cover. It is a substring scan of a list
+   *  the host already holds, not a resolver: matching a name against the
+   *  language's identifiers is the parser's job, and Rust's own `suggestions`
+   *  are rendered first and separately. */
+  const vocabularyNear = (diagnostic: Diagnostic): string[] => {
+    if (diagnostic.kind !== "unknown_ident") return [];
+    const span = spanFor(diagnostic);
+    const token = span ? text().slice(span.start, span.end).replace(/["']/g, "").trim() : "";
+    if (token.length < 2) return [];
+    const needle = token.toLowerCase();
+    return (props.vocabulary?.() ?? [])
+      .filter((key) => key.toLowerCase().includes(needle) && key.toLowerCase() !== needle)
+      .slice(0, 4);
+  };
+
+  return (
     <div class="query-text-pane">
+      <label class="query-text-pane-label" for={undefined}>
+        {props.dialect === "tql" ? "Query text" : "Raw query DSL"}
+      </label>
       <textarea
+        ref={textarea}
         class="qb-input query-text-pane-input"
         classList={{ "query-text-pane-invalid": !!error() }}
         rows={3}
@@ -472,10 +619,14 @@ function QueryTextPane(props: {
         <Show when={refusal()}>
           {(message) => <span class="query-text-pane-error" role="alert">{message()}</span>}
         </Show>
-        <Show when={error()}>
-          {/* The parser's OWN message, never a catch-all (I-9). The rows above
-              stay on screen and greyed; they are the last reading that ran. */}
-          {(message) => <span class="query-text-pane-error" role="alert">{message()}</span>}
+        {/* The parser's OWN message, never a catch-all (I-9). The rows above
+            stay on screen and greyed; they are the last reading that ran.
+            It is shown HERE only when there is no structured list below to
+            carry it — a refusal, or a rejection with no diagnostics. Printing
+            it in both places said the same sentence twice and made a
+            two-problem query look like a three-problem one. */}
+        <Show when={error() && !diagnostics()?.items.length}>
+          <span class="query-text-pane-error" role="alert">{error()}</span>
         </Show>
         <Show when={pending() && !error()}>
           <span class="query-text-pane-pending">Checking…</span>
@@ -489,26 +640,120 @@ function QueryTextPane(props: {
           Save query text
         </button>
       </div>
+      {/* The structured half of §4.3.2: the kind, the span, the parser's own
+          alternatives, and whether the diagnostic is inside an `off` subtree. */}
+      <Show when={diagnostics()?.items.length}>
+        <ul class="query-text-pane-diagnostics">
+          <For each={diagnostics()!.items}>
+            {(diagnostic) => (
+              <li
+                class="query-text-pane-diagnostic"
+                classList={{ "is-disabled": diagnostic.disabled === true }}
+                data-kind={diagnostic.kind}
+              >
+                <span class="query-text-pane-diagnostic-message">{diagnostic.message}</span>
+                <Show when={diagnostic.disabled}>
+                  <span class="query-text-pane-diagnostic-off"> (in a disabled condition — the query still runs)</span>
+                </Show>
+                <Show when={spanFor(diagnostic)}>
+                  {(span) => (
+                    <button
+                      type="button"
+                      class="query-text-pane-locate"
+                      onClick={() => select(span(), diagnostics()!.text)}
+                    >
+                      Show me
+                    </button>
+                  )}
+                </Show>
+                <Show when={diagnostic.suggestions?.length}>
+                  <span class="query-text-pane-diagnostic-alts">
+                    <For each={diagnostic.suggestions!.slice(0, 4)}>
+                      {(alternative, index) => (
+                        <>
+                          <Show when={index() > 0}>, </Show>
+                          <code>{alternative}</code>
+                        </>
+                      )}
+                    </For>
+                  </span>
+                </Show>
+                <Show when={vocabularyNear(diagnostic).length}>
+                  <span class="query-text-pane-diagnostic-alts">
+                    Properties in this graph: <For each={vocabularyNear(diagnostic)}>
+                      {(key, index) => (
+                        <>
+                          <Show when={index() > 0}>, </Show>
+                          <code>{key}</code>
+                        </>
+                      )}
+                    </For>
+                  </span>
+                </Show>
+                {/* A syntax error the parser had no alternative for still gets a
+                    route: the vocabulary above and the Guide's TQL reference. */}
+                <Show when={diagnostic.kind === "syntax" && !diagnostic.suggestions?.length}>
+                  <span class="query-text-pane-diagnostic-alts">
+                    The fields and properties this graph has are in the picker above; the
+                    query language is in the Guide under <em>Find and revisit → Query text (TQL)</em>.
+                  </span>
+                </Show>
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
+      {/* §7.5: one notice, hosted here while the sheet is open. It is the same
+          component, with the same state, that `Macro.tsx` draws inline while the
+          sheet is closed — never a second copy. */}
+      <Show when={props.notice}>{(render) => render()()}</Show>
     </div>
-  );
-
-  return (
-    <Show when={!props.alwaysOpen} fallback={body()}>
-      <details
-        class="query-text-pane-details"
-        onClick={stop}
-        onToggle={(event) => setOpen(event.currentTarget.open)}
-      >
-        <summary>{props.dialect === "tql" ? "Query text" : "Raw query DSL"}</summary>
-        <Show when={open()}>{body()}</Show>
-      </details>
-    </Show>
   );
 }
 
 // ---------------------------------------------------------------------------
 // The host
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The one registry read, shared by every open builder (§6.4, I-13, N4)
+// ---------------------------------------------------------------------------
+
+/** The graph-scoped declaration revision, bumped when a `tine.type` is written.
+ *
+ *  **One counter, module level, reset by the graph.** A declaration written in
+ *  one sheet is a fact about the GRAPH, so every open builder must see it — a
+ *  per-builder counter meant the sheet next to the one that declared kept the
+ *  old badge until it was closed and reopened. And it is reset rather than
+ *  remembered per graph: keeping a map would be a lifetime-growing store of
+ *  numbers whose only purpose is to differ from the last one (D-5).
+ *
+ *  Note what it is NOT: it is not "the sheet opened". Opening a sheet makes the
+ *  resource key LIVE, which is a different event; conflating them is what made
+ *  the old `registryRequests` counter fire a fresh read per mount. */
+const [declarationBump, setDeclarationBump] = createSignal({ epoch: 0, revision: 0 });
+
+/** Re-read the registry for THIS graph, in every open builder. Called after a
+ *  declaration lands, and on nothing else. */
+export function requestQueryRegistryRefresh(): void {
+  const epoch = graphEpoch();
+  setDeclarationBump((prior) =>
+    prior.epoch === epoch ? { epoch, revision: prior.revision + 1 } : { epoch, revision: 1 },
+  );
+}
+
+/** The current graph's declaration revision. Reading it is pure: a bump made
+ *  under a different graph reads back as 0 rather than leaking that graph's
+ *  count into this one's request key. */
+function declarationRevision(): number {
+  const bump = declarationBump();
+  return bump.epoch === graphEpoch() ? bump.revision : 0;
+}
+
+/** Tests mount several graphs in one process; the counter is module state. */
+export function resetQueryRegistryRevisionForTests(): void {
+  setDeclarationBump({ epoch: -1, revision: 0 });
+}
 
 /** Deepest-and-rightmost first, so removing several leaves in one pass never
  *  invalidates a `loc` that has not been used yet. */
@@ -553,7 +798,17 @@ export function QueryBuilder(props: {
   /** The text pane's language: `tql` for a query block, `og` for the workspace,
    *  which materializes OG text. */
   paneDialect?: Extract<QueryPrintDialect, "og" | "tql">;
-  paneAlwaysOpen?: boolean;
+  /** The §7.5 crossing notice, drawn inside the pane while the sheet is open.
+   *  The HOST owns the notice's state and its undo gating (`Macro.tsx`); this is
+   *  a slot, so the one notice MOVES between hosts rather than a second one
+   *  appearing. It is a render function, not an element: a prop whose value is
+   *  an element gets instantiated once per read, and a `<Show>` reads its
+   *  condition and its child separately — which is two notices, one of them
+   *  detached and stealing the focus grab from the one on screen. */
+  notice?: () => JSX.Element;
+  /** Told whether the sheet is open, so the host can take the notice back when
+   *  it closes. */
+  onOpenChange?: (open: boolean) => void;
   /** The workspace's permanently expanded sheet (§7.2). Inline, not portalled,
    *  and not a dismissable layer of its own. */
   sheetAlwaysOpen?: boolean;
@@ -576,19 +831,11 @@ export function QueryBuilder(props: {
   const [anchorPrompt, setAnchorPrompt] = createSignal<AnchorPrompt | null>(null);
   const [previewError, setPreviewError] = createSignal<string | null>(null);
 
-  // **I-20: an async answer lands only on the state it was computed for.**
-  // The anchor preview is a print-then-parse round trip, so a slow answer for
-  // an anchor the user has since changed must be DROPPED, not rendered — the
-  // failure it prevents is a late "2 conditions don't apply" prompt about a
-  // switch that is no longer pending. A session identity check alone is not
-  // enough: two anchor clicks race under one unchanged host session, which is
-  // why this is a monotonic revision with a settled watermark, exactly as the
-  // text pane does it.
+  // I-20: anchor previews obey the same current-revision rule as text parses.
+  // Selecting the original anchor or closing the sheet cancels pending work.
   let anchorRevision = 0;
-  let anchorSettled = 0;
   const invalidateAnchorPreview = () => {
     anchorRevision += 1;
-    anchorSettled = anchorRevision;
     setAnchorPrompt(null);
   };
   onCleanup(invalidateAnchorPreview);
@@ -612,42 +859,73 @@ export function QueryBuilder(props: {
   const view = () => session()?.view ?? {};
 
   const sheetOpen = () => !!props.sheetAlwaysOpen || open();
+  createEffect(() => { if (!sheetOpen()) invalidateAnchorPreview(); });
+  // The host needs to know, because the §7.5 notice lives inline under the block
+  // while the sheet is shut and inside the pane while it is open (N3).
+  createEffect(() => props.onOpenChange?.(sheetOpen()));
 
-  // N builders on one page asked the SAME whole-graph facets question N times
-  // per (graphEpoch, dataRev). The scope is per-builder by decision (P0), so the
-  // fix is not a shared scope but a shared REQUEST: `sharedQueryResult` collapses
-  // identical in-flight/resolved work under its own key namespace, exactly as the
-  // page-tag query does. Harvest W4-P1 item 3.
+  // **The ONE graph-level read the builder makes (§6.4, K20, I-13, N4).**
   //
-  // **And it is LAZY (I-13).** The key is `undefined` while no sheet is open, so
-  // a page of resting sentences issues zero graph-level calls; the first sheet
-  // that opens issues exactly one, which the sharing keeps shared with every
-  // other builder on the page. (P4 replaces the facets read itself with the
-  // registry, §6.4; this packet only stops it happening at rest.)
-  const [facets] = createResource(
-    () => (sheetOpen() ? `${graphEpoch()}\0${dataRev()}` : undefined),
-    (requestKey) =>
-      sharedQueryResult(
-        `${graphMeta()?.root ?? ""}\0${graphEpoch()}`,
-        `query-facets\0${requestKey}`,
-        () => backend().queryFacets(),
-      ),
-  );
-  // **The ONE registry read (§6.4, K20, I-13).** `query_registry` is a
-  // graph-level table. It is fetched when a sheet opens and again after a
-  // declaration is written — never on a keystroke, never per row. There is no
-  // generation signal from the projection to TypeScript, so there is
-  // deliberately no third trigger.
-  const [registryRequests, setRegistryRequests] = createSignal(0);
+  // It used to make two: `query_facets(false)` — a whole-graph key/value scan
+  // with no counts and no types — for the property chooser, and
+  // `query_registry` for the type badge. The chooser is the registry's now, so
+  // the facets read is gone; `queryFacets(true)` stays, because raw-block
+  // autocomplete asks a genuinely different question.
+  //
+  // Four properties, and each of them is a defect this replaced:
+  //
+  //  - **Zero work at rest.** The key is `undefined` while no sheet is open, so
+  //    a page of resting sentences issues nothing at all.
+  //  - **One request per (graph, dataRev, declaration), across builders.**
+  //    `sharedQueryResult` collapses identical in-flight and resolved work,
+  //    exactly as the page-tag query does. Five open sheets are one call.
+  //  - **Freshness the removed facets path used to provide.** The facets read
+  //    was keyed on `dataRev`; the registry was not, so a sheet left open across
+  //    a save kept a stale vocabulary. It is keyed on `dataRev` now — through
+  //    the SAME save-batch signal, not a timer of its own — and on the shared
+  //    declaration revision, so declaring a type refreshes every open builder
+  //    and cannot be served from an already-resolved stale entry.
+  //  - **Rows never cross a graph.** A reply for the previous graph may still
+  //    settle; it can never be published, because what is exposed is gated on
+  //    the scope the rows were fetched under.
+  const registryScope = () => `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
+  const registryKey = () =>
+    sheetOpen() ? `${dataRev()}\0${declarationRevision()}` : undefined;
   const [registrySnapshot] = createResource(
-    () => (registryRequests() > 0 ? `${graphEpoch()}\0${registryRequests()}` : undefined),
-    () => backend().queryRegistry(),
+    () => {
+      const key = registryKey();
+      return key === undefined ? undefined : { scope: registryScope(), key };
+    },
+    async (request) => ({
+      scope: request.scope,
+      key: request.key,
+      snapshot: await sharedQueryResult(
+        request.scope,
+        `query-registry\0${request.key}`,
+        () => backend().queryRegistry(),
+      ),
+    }),
   );
+  // A type declaration changes operator semantics: rows are usable only for
+  // the current graph AND revision, including while a refresh is pending.
+  const registryRows = () => {
+    const landed = registrySnapshot.latest;
+    return landed && landed.scope === registryScope() && landed.key === registryKey()
+      ? landed.snapshot.rows : undefined;
+  };
   const registry: RegistryAccess = {
-    rows: () => registrySnapshot.latest?.rows,
-    request: () => setRegistryRequests((n) => n + 1),
+    rows: registryRows,
+    // **Undefined rows have two different meanings, and the UI must not read
+    // the wrong one.** With no sheet open there is deliberately no read at all
+    // (I-13), so `undefined` is "nobody asked". With a sheet open it is "the
+    // answer for THIS graph and THIS declaration revision has not landed" —
+    // and a surface that treats that as a known-empty graph shows a graph with
+    // no properties, or coerces a freshly declared key as text.
+    pending: () => registryKey() !== undefined && registryRows() === undefined,
+    request: requestQueryRegistryRefresh,
   };
   const suggestions = createMemo(() => suggestedKeys(registry.rows()));
+  const vocabulary = () => (registry.rows() ?? []).map((row) => row.normalized_name);
 
   // Open the sheet with the field chooser focused when this block was just
   // created via `/query` — consume the one-shot flag so only this block does.
@@ -705,24 +983,21 @@ export function QueryBuilder(props: {
    */
   const switchAnchor = async (anchor: Anchor) => {
     const current = session();
-    if (!current || current.query.anchor === anchor) return;
-    anchorRevision += 1;
-    const mine = anchorRevision;
-    setAnchorPrompt(null);
+    invalidateAnchorPreview();
     setPreviewError(null);
+    if (!current || current.query.anchor === anchor) return;
+    const mine = anchorRevision;
     const next: Query = { ...current.query, anchor };
     let parsed: ParsedQuery;
     try {
       const text = await backend().printQuery(next, current.view, "tql");
       parsed = await backend().parseQuery(text, "tql");
     } catch (error) {
-      if (mine <= anchorSettled) return;
-      anchorSettled = mine;
+      if (mine !== anchorRevision) return;
       setPreviewError(errorMessage(error));
       return;
     }
-    if (mine <= anchorSettled) return;
-    anchorSettled = mine;
+    if (mine !== anchorRevision) return;
     const carried = carryForward(parsed.query);
     const notApplicable = (carried.diagnostics ?? []).filter((d) => d.kind === "not_applicable");
     const live = notApplicable.filter((d) => d.disabled !== true);
@@ -831,18 +1106,32 @@ export function QueryBuilder(props: {
     });
   });
 
+  // The pane publishes a handle while it is mounted, so the sheet's
+  // `⟨advanced⟩` control and its retained rows have somewhere to send the user.
+  // It is cleared on unmount: a route that leads nowhere is not offered.
+  const [paneHandle, setPaneHandle] = createSignal<PaneHandle | null>(null);
+
   const footer = () => (
     <>
       <SortControl view={view} apply={applyView} parentTransientId={sheetLayerId} />
       <SummarizeControl
         view={view}
         apply={applyView}
-        facets={facets}
+        registry={registry}
         parentTransientId={sheetLayerId}
       />
+      {/* **Visible and editable, always, inside an open sheet (§7.5).** It was a
+          collapsed `<details>`, which meant the one control that can express
+          everything the rows cannot was the one control a user had to know to
+          look for. The sheet is what gates the cost: a RESTING sentence still
+          mounts no pane and prints nothing. */}
       <QueryTextPane
         session={props.session}
         dialect={props.paneDialect ?? "tql"}
+        visible={sheetOpen}
+        vocabulary={vocabulary}
+        notice={props.notice}
+        handle={setPaneHandle}
         onParsed={(parsed) => setPaneQuery(carryForward(parsed))}
         onCommit={(parsed) => {
           const current = props.session();
@@ -853,7 +1142,6 @@ export function QueryBuilder(props: {
           setStale(value);
           props.onStale?.(value);
         }}
-        alwaysOpen={props.paneAlwaysOpen}
       />
     </>
   );
@@ -866,8 +1154,8 @@ export function QueryBuilder(props: {
       root={root}
       query={() => session()?.query}
       apply={apply}
-      facets={facets}
       registry={registry}
+      onEditText={() => paneHandle()?.focus()}
       suggestions={suggestions}
       openMenu={openMenu}
       setOpenMenu={setOpenMenu}
@@ -880,8 +1168,6 @@ export function QueryBuilder(props: {
       stale={stale()}
       sheetRef={(element) => {
         sheetEl = element;
-        (window as any).__sheetEl = element;
-        (window as any).__insideProbe = () => [sheetEl, sentenceEl];
         extraRef?.(element);
       }}
     />

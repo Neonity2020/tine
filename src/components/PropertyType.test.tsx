@@ -14,7 +14,7 @@
 //      `normalized_name`, so a key authored `due date` declares on `due-date`.
 //  A4  The registry is read when the picker opens and again after a declaration
 //      lands — and on nothing else (I-13).
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { PropertyType, registryRowFor } from "./PropertyType";
@@ -26,13 +26,25 @@ import { doc, flushPage, readPageProperty, resetStore, setDoc, type FeedPage } f
 import type { PageDto, SavePageResult } from "../types";
 import type { BuilderSession } from "./QueryBuilder";
 import type { RegistryRow, RegistrySnapshot } from "../editor/queryIr";
+import { resetQueryRegistryRevisionForTests } from "./QueryBuilder";
+import { stubVocabularyGeometry } from "./QueryVocabularyPicker.test-helpers";
 
 beforeAll(async () => {
   await initParser();
 });
 
+let restoreGeometry: (() => void) | null = null;
+
+beforeEach(() => {
+  // The vocabulary list is virtualized; jsdom has no layout (N2).
+  restoreGeometry = stubVocabularyGeometry();
+});
+
 afterEach(() => {
+  restoreGeometry?.();
+  restoreGeometry = null;
   vi.restoreAllMocks();
+  resetQueryRegistryRevisionForTests();
   resetSharedQueryResultsForTests();
   resetStore();
   localStorage.clear();
@@ -368,19 +380,17 @@ describe("A4: the registry is read on picker open and after a declaration — an
       expect(registry).toHaveBeenCalledTimes(1);
 
       // The sheet is portalled to <body>, so everything below is queried from
-      // the document rather than from the host element.
+      // the document rather than from the host element. **P4 asks ONE question
+      // here, not two:** the type-first "Property" step is gone, and `cost` is
+      // a row of the same list the built-in vocabulary is in.
       document.querySelector<HTMLButtonElement>(".qs-add")!.click();
-      await settle();
-      [...document.querySelectorAll<HTMLButtonElement>(".qs-option")]
-        .find((b) => b.textContent === "Property")!
-        .click();
       await settle();
       expect(registry).toHaveBeenCalledTimes(1);
 
-      // Typing a key filters the list from the facets already in hand. It must
-      // not ask again — that is the per-keystroke whole-graph question I-13
-      // exists to forbid.
-      const input = document.querySelector<HTMLInputElement>(".qs-value-editor .qs-input")!;
+      // Typing filters the list from the snapshot already in hand. It must not
+      // ask again — that is the per-keystroke whole-graph question I-13 exists
+      // to forbid.
+      const input = document.querySelector<HTMLInputElement>(".qs-menu-filter")!;
       for (const text of ["c", "co", "cos", "cost"]) {
         input.value = text;
         input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -388,8 +398,8 @@ describe("A4: the registry is read on picker open and after a declaration — an
       await settle();
       expect(registry).toHaveBeenCalledTimes(1);
 
-      [...document.querySelectorAll<HTMLButtonElement>(".qs-value-editor .qs-option")]
-        .find((b) => b.textContent === "cost")!
+      document
+        .querySelector<HTMLButtonElement>('.qs-vocab-option[data-vocabulary-key="cost"]')!
         .click();
       await settle();
       expect(registry).toHaveBeenCalledTimes(1);

@@ -53,7 +53,10 @@ export function effectiveTypeOf(row: RegistryRow): { type: ObservedType; cardina
     : { type: row.observed_type, cardinality: row.cardinality };
 }
 
-const typePhrase = (type: ObservedType, cardinality: Cardinality) =>
+/** `number` / `list of number` — the ONE phrase for a type + cardinality pair.
+ *  Exported because P4's vocabulary picker labels the same pair and a second
+ *  spelling of it would drift from the badge this module draws (D-14). */
+export const typePhrase = (type: ObservedType, cardinality: Cardinality) =>
   cardinality === "many" ? `list of ${type}` : type;
 
 /**

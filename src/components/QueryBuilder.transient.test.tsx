@@ -4,12 +4,18 @@ import { render } from "solid-js/web";
 import { autocompleteFacets, backend } from "../backend";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 import { bumpGraphEpoch, setDataRev } from "../ui";
+import type { RegistrySnapshot } from "../editor/queryIr";
 import {
   clearTransientLayersForTest,
   dismissTopTransient,
   registerTransientLayer,
 } from "../transientLayers";
-import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
+import {
+  QueryBuilder,
+  requestQueryRegistryRefresh,
+  resetQueryRegistryRevisionForTests,
+  type BuilderSession,
+} from "./QueryBuilder";
 import {
   ADVANCED_PHRASE,
   MAX_QUERY_BUILDER_DEPTH,
@@ -17,6 +23,7 @@ import {
   taskFilter,
 } from "../editor/queryBuilder";
 import type { Filter } from "../editor/queryIr";
+import { stubVocabularyGeometry } from "./QueryVocabularyPicker.test-helpers";
 
 // The builder edits the IR now, so the harness hands it a `Filter` rather than a
 // DSL string: there is no frontend parser left to turn text into a tree, and the
@@ -80,15 +87,47 @@ const FAMILIES: Array<{ name: string; open: (sheet: HTMLElement) => HTMLButtonEl
   },
 ];
 
+/** Let the shared registry request resolve through its promise chain, and
+ *  report how many backend calls it took. */
+async function settleRegistry(registry: { mock: { calls: unknown[][] } }): Promise<number> {
+  for (let tick = 0; tick < 8; tick += 1) await Promise.resolve();
+  return registry.mock.calls.length;
+}
+
+/** A registry snapshot of exactly these keys, each with a block count. */
+function snapshot(keys: [string, number][]): RegistrySnapshot {
+  return {
+    generation: 1,
+    rows: keys.map(([normalized_name, count_blocks]) => ({
+      normalized_name,
+      cardinality: "one" as const,
+      observed_type: "text" as const,
+      count_blocks,
+      count_pages: 0,
+      mismatch_count: 0,
+    })),
+  };
+}
+
 afterEach(() => {
+  restoreGeometry?.();
+  restoreGeometry = null;
   clearTransientLayersForTest();
   resetSharedQueryResultsForTests();
+  resetQueryRegistryRevisionForTests();
   vi.restoreAllMocks();
   document.body.replaceChildren();
 });
 
+let restoreGeometry: (() => void) | null = null;
+
 beforeEach(() => {
+  // The vocabulary list is virtualized, so a picker in a zero-height jsdom
+  // viewport would mount overscan alone (N2). Production sizing is unchanged.
+  restoreGeometry = stubVocabularyGeometry();
+  resetQueryRegistryRevisionForTests();
   vi.spyOn(backend(), "queryFacets").mockResolvedValue([]);
+  vi.spyOn(backend(), "queryRegistry").mockResolvedValue(snapshot([]));
   // The text pane's contents are PRINTED BY RUST (I-12); these tests are about
   // the popovers above it, so the printer is stubbed rather than exercised.
   vi.spyOn(backend(), "printQuery").mockResolvedValue("(and (task TODO))");
@@ -97,29 +136,47 @@ beforeEach(() => {
 describe("QueryBuilder transient ownership (post-GH #161)", () => {
   // Sharing across instances is proven separately, by the Harvest W4-P1 item 3
   // test below; this one pins the per-revision refresh for a single builder.
-  it("asks for no facets at rest, once when the sheet opens, and once per data revision", async () => {
+  //
+  // **P4 rehomed this from `query_facets(false)` to `query_registry`.** The
+  // facets read is gone with the two-stage property chooser it fed; the
+  // registry is now the sheet's only graph-level question, and it inherited the
+  // lifecycle the facets read used to provide — nothing at rest, once on open,
+  // once per data revision — plus the declaration refresh it never had.
+  it("asks the graph nothing at rest, reads the registry when the sheet opens, and again per data revision", async () => {
+    const registry = vi.mocked(backend().queryRegistry);
     const facets = vi.mocked(backend().queryFacets);
     const { open, dispose } = mountBuilder();
     try {
       await Promise.resolve();
       // A page of RESTING sentences is the common case, and it costs the graph
-      // nothing: the facets are the editor's vocabulary, not the sentence's.
-      expect(facets).toHaveBeenCalledTimes(0);
+      // nothing: the vocabulary is the editor's, not the sentence's.
+      expect(registry).toHaveBeenCalledTimes(0);
 
       const sheet = open();
       await Promise.resolve();
-      expect(facets).toHaveBeenCalledTimes(1);
-
-      sheet.querySelector<HTMLButtonElement>(".qs-add")!.click();
-      [...sheet.querySelectorAll<HTMLButtonElement>(".qs-option")]
-        .find((button) => button.textContent === "Property")!
-        .click();
       await Promise.resolve();
-      expect(facets).toHaveBeenCalledTimes(1);
+      expect(registry).toHaveBeenCalledTimes(1);
+
+      // Opening the picker and typing in its search is pure frontend work over
+      // the snapshot already in hand — never a keystroke-per-request (I-13).
+      sheet.querySelector<HTMLButtonElement>(".qs-add")!.click();
+      const search = sheet.querySelector<HTMLInputElement>(".qs-menu-filter")!;
+      for (const text of ["o", "ow", "own", "owne"]) {
+        search.value = text;
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      await Promise.resolve();
+      expect(registry).toHaveBeenCalledTimes(1);
 
       setDataRev((revision) => revision + 1);
       await Promise.resolve();
-      expect(facets).toHaveBeenCalledTimes(2);
+      await Promise.resolve();
+      expect(registry).toHaveBeenCalledTimes(2);
+
+      // The facets read the builder used to make is gone entirely. The
+      // autocomplete producer's `queryFacets(true)` is a different question and
+      // keeps its own path (`Block.propertyAutocomplete.test.tsx`).
+      expect(facets).toHaveBeenCalledTimes(0);
     } finally {
       dispose();
     }
@@ -325,34 +382,34 @@ describe("GH #472: every Query Builder popover closes on an outside press", () =
   });
 });
 
-describe("QueryBuilder facet sharing (Harvest W4-P1 item 3)", () => {
-  // Drive the production Property picker and read back the keys it offers, so a
-  // "one call" bound cannot be met by starving four of the five builders.
+describe("QueryBuilder registry sharing (Harvest W4-P1 item 3)", () => {
+  // Drive the production vocabulary picker and read back the property keys it
+  // offers, so a "one call" bound cannot be met by starving four of the five
+  // builders. **Rehomed from `query_facets(false)` in P4:** the request being
+  // shared is the registry read, and its key gained two terms the facets key
+  // never had — the shared declaration revision, and the graph root.
   function propertyKeysOffered(sheet: HTMLElement): string[] {
     const add = sheet.querySelector<HTMLButtonElement>(".qs-add")!;
     add.click();
-    [...sheet.querySelectorAll<HTMLButtonElement>(".qs-option")]
-      .find((button) => button.textContent === "Property")!
-      .click();
-    const keys = [...sheet.querySelectorAll<HTMLButtonElement>(".qs-value-editor .qs-option")].map(
-      (button) => button.textContent ?? ""
-    );
+    const keys = [
+      ...sheet.querySelectorAll<HTMLButtonElement>('.qs-vocab-option[data-section="property"]'),
+    ].map((button) => button.getAttribute("data-vocabulary-key") ?? "");
     add.click(); // The trigger toggles: leave the picker closed for the next read.
     return keys;
   }
 
-  it("issues one shared facets request per (graph scope, dataRev) for five mounted builders", async () => {
-    const payloads: Array<[string, string[]][]> = [
-      [["revision-one", ["r1"]]],
-      [["revision-two", ["r2"]]],
-      [["revision-three", ["r3"]]],
+  it("issues one shared registry request per (graph scope, dataRev, declaration) for five mounted builders", async () => {
+    const payloads = [
+      snapshot([["revision-one", 3]]),
+      snapshot([["revision-two", 3]]),
+      snapshot([["revision-three", 3]]),
+      snapshot([["revision-four", 3]]),
     ];
     let current = 0;
+    const registry = vi.mocked(backend().queryRegistry);
+    registry.mockReset();
+    registry.mockImplementation(async () => payloads[current]);
     const facets = vi.mocked(backend().queryFacets);
-    facets.mockReset();
-    facets.mockImplementation(async (autocomplete?: boolean) =>
-      autocomplete ? [["autocomplete-only", ["a"]]] : payloads[current]
-    );
 
     const builders = Array.from({ length: 5 }, () => mountBuilder(taskFilter(["TODO"])));
     try {
@@ -360,52 +417,66 @@ describe("QueryBuilder facet sharing (Harvest W4-P1 item 3)", () => {
       await Promise.resolve();
       // Five RESTING sentences ask nothing at all; the shared request is made
       // when the first sheet opens and served to the other four from the cache.
-      expect(facets.mock.calls.length).toBe(0);
+      expect(registry.mock.calls.length).toBe(0);
       const sheets = builders.map((builder) => builder.open());
-      await Promise.resolve();
-      await Promise.resolve();
-      const mounted = facets.mock.calls.length;
+      const mounted = await settleRegistry(registry);
       for (const sheet of sheets) {
         expect(propertyKeysOffered(sheet)).toEqual(["revision-one"]);
       }
 
       // A new data revision: one fresh shared call, and every builder sees it.
-      facets.mockClear();
+      // The facets path used to be the only thing keyed on `dataRev`; removing
+      // it without giving the registry the same key would have left every open
+      // sheet showing the vocabulary the graph had before the last save.
+      registry.mockClear();
       current = 1;
       setDataRev((revision) => revision + 1);
-      await Promise.resolve();
-      await Promise.resolve();
-      const perRevision = facets.mock.calls.length;
+      const perRevision = await settleRegistry(registry);
       for (const sheet of sheets) {
         expect(propertyKeysOffered(sheet)).toEqual(["revision-two"]);
       }
 
-      // A graph switch: the shared scope changes, so one fresh call again.
-      facets.mockClear();
+      // A declaration written in ONE sheet is a fact about the graph: it
+      // refreshes every open builder, through one shared call, and it cannot be
+      // served from the already-resolved entry the previous key holds.
+      registry.mockClear();
       current = 2;
-      bumpGraphEpoch();
-      await Promise.resolve();
-      await Promise.resolve();
-      const perGraphScope = facets.mock.calls.length;
+      requestQueryRegistryRefresh();
+      const perDeclaration = await settleRegistry(registry);
       for (const sheet of sheets) {
         expect(propertyKeysOffered(sheet)).toEqual(["revision-three"]);
       }
 
-      // The autocomplete producer asks a DIFFERENT question and must not be
-      // served from the builder's shared entry.
+      // A graph switch: the shared scope changes, so one fresh call again — and
+      // the previous graph's rows are never shown under the new one.
+      registry.mockClear();
+      current = 3;
+      bumpGraphEpoch();
+      const perGraphScope = await settleRegistry(registry);
+      for (const sheet of sheets) {
+        expect(propertyKeysOffered(sheet)).toEqual(["revision-four"]);
+      }
+
+      // The autocomplete producer asks a DIFFERENT question, on a different
+      // command, and is not served by any of this.
       facets.mockClear();
+      facets.mockImplementation(async (autocomplete?: boolean) =>
+        autocomplete ? [["autocomplete-only", ["a"]]] : []
+      );
       expect(await autocompleteFacets()).toEqual([["autocomplete-only", ["a"]]]);
       const autocompleteCalls = facets.mock.calls.map(([flag]) => flag ?? false);
 
       // eslint-disable-next-line no-console -- the measurement IS the receipt.
       console.log(
-        `w4_p1_query_facets builders=5 mounted=${mounted} perDataRev=${perRevision} ` +
-          `perGraphScope=${perGraphScope} autocomplete=${JSON.stringify(autocompleteCalls)}`
+        `w4_p1_query_registry builders=5 mounted=${mounted} perDataRev=${perRevision} ` +
+          `perDeclaration=${perDeclaration} perGraphScope=${perGraphScope} ` +
+          `autocomplete=${JSON.stringify(autocompleteCalls)}`
       );
 
-      expect({ mounted, perRevision, perGraphScope, autocompleteCalls }).toEqual({
+      expect({ mounted, perRevision, perDeclaration, perGraphScope, autocompleteCalls }).toEqual({
         mounted: 1,
         perRevision: 1,
+        perDeclaration: 1,
         perGraphScope: 1,
         autocompleteCalls: [true],
       });
@@ -414,3 +485,70 @@ describe("QueryBuilder facet sharing (Harvest W4-P1 item 3)", () => {
     }
   });
 });
+
+describe("QueryBuilder registry landing (I-20)", () => {
+  it.each(["data", "declaration"])("withdraws obsolete rows while the %s revision is pending", async (kind) => {
+    const registry = vi.mocked(backend().queryRegistry);
+    registry.mockReset();
+    let release!: (value: RegistrySnapshot) => void;
+    registry.mockResolvedValueOnce(snapshot([["obsolete-type", 4]]));
+    registry.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const builder = mountBuilder();
+    try {
+      const sheet = builder.open();
+      await settleRegistry(registry);
+      expect(propertyKeys(sheet)).toEqual(["obsolete-type"]);
+      if (kind === "data") setDataRev((n) => n + 1);
+      else requestQueryRegistryRefresh();
+      await settleRegistry(registry);
+      expect(propertyKeys(sheet)).toEqual([]);
+      release(snapshot([["current-type", 4]]));
+      await settleRegistry(registry);
+      expect(propertyKeys(sheet)).toEqual(["current-type"]);
+    } finally { builder.dispose(); }
+  });
+  // A graph switch does not answer instantly. While the new read is in flight
+  // the resource still HOLDS the previous graph's snapshot — that is what
+  // `.latest` is for — and offering it would let a reader build a condition on
+  // a key this graph has never had, from a list that looks entirely current.
+  // So the landed payload carries the scope it was fetched for, and the rows
+  // are read only while that scope is still the live one.
+  it("shows no rows from the previous graph while the new registry read is in flight", async () => {
+    const registry = vi.mocked(backend().queryRegistry);
+    registry.mockReset();
+    let release: ((snapshot: RegistrySnapshot) => void) | null = null;
+    registry.mockImplementationOnce(async () => snapshot([["before-the-switch", 400]]));
+    registry.mockImplementationOnce(
+      () => new Promise<RegistrySnapshot>((resolve) => { release = resolve; }),
+    );
+
+    const builder = mountBuilder(taskFilter(["TODO"]));
+    try {
+      const sheet = builder.open();
+      await settleRegistry(registry);
+      expect(propertyKeys(sheet)).toEqual(["before-the-switch"]);
+
+      // The graph changes. The new read has not answered yet.
+      bumpGraphEpoch();
+      await settleRegistry(registry);
+      expect(propertyKeys(sheet)).toEqual([]);
+
+      release!(snapshot([["after-the-switch", 5]]));
+      await settleRegistry(registry);
+      expect(propertyKeys(sheet)).toEqual(["after-the-switch"]);
+    } finally {
+      builder.dispose();
+    }
+  });
+});
+
+/** The property keys the production picker offers inside an open sheet. */
+function propertyKeys(sheet: HTMLElement): string[] {
+  const add = sheet.querySelector<HTMLButtonElement>(".qs-add")!;
+  add.click();
+  const keys = [
+    ...sheet.querySelectorAll<HTMLButtonElement>('.qs-vocab-option[data-section="property"]'),
+  ].map((button) => button.getAttribute("data-vocabulary-key") ?? "");
+  add.click();
+  return keys;
+}

@@ -8952,7 +8952,17 @@ img.emoji {
 }
 /* Deliberately NOT a scroll container on the wide layout: the row menus are
    absolutely positioned children and a scrolling ancestor would clip them. */
-.qs-sheet-stale {
+/* **The stale mark greys the READING, never the controls.** A whole-sheet
+   `opacity` also made the sheet translucent — the page showed through the
+   panel — and, since P4 made the query text pane a permanent part of the
+   sheet, it faded the very box the reader is typing in to repair the query.
+   So the anchor line and the rows go grey (they are the last reading that
+   actually ran), and the footer — sort, summarize, the text pane, its
+   diagnostics — stays at full strength. */
+.qs-sheet-stale .qs-anchor,
+.qs-sheet-stale .qs-rows,
+.qs-sheet-stale > .qs-row,
+.qs-sheet-stale .qs-try {
   opacity: 0.55;
 }
 
@@ -9164,6 +9174,43 @@ img.emoji {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The advanced chip opens the text pane, so it is a button and reads like one
+   (§7.8): the part the sheet cannot draw is still reachable, never a dead end. */
+.qs-row-advanced .qs-advanced-open {
+  text-align: left;
+  border: 1px dashed var(--border-color);
+  border-radius: 5px;
+  background: transparent;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.qs-row-advanced .qs-advanced-open:hover {
+  border-color: var(--link-color);
+  color: var(--text-primary);
+}
+/* An unparsed row keeps the engine's own repair list and a way into the text. */
+.qs-raw-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.qs-raw-suggestions code {
+  font-family: var(--ls-font-mono);
+}
+.qs-raw-edit {
+  border: none;
+  background: transparent;
+  color: var(--link-color);
+  padding: 0;
+  font-size: 12px;
+  cursor: pointer;
+}
+.qs-raw-edit:hover {
+  text-decoration: underline;
+}
 .qs-group {
   border-left: 2px solid var(--border-color);
   padding-left: 8px;
@@ -9260,6 +9307,13 @@ img.emoji {
   flex-direction: column;
   gap: 2px;
 }
+/* Operator choices inside the add editor participate in its layout. */
+.qs-menu.qs-inline-list {
+  position: static;
+  min-width: 0;
+  margin-top: 0;
+  box-shadow: none;
+}
 .qs-menu-title {
   padding: 2px 6px;
   font-size: 11px;
@@ -9316,6 +9370,135 @@ img.emoji {
   color: var(--text-muted);
   font-size: 11px;
   white-space: nowrap;
+}
+.qs-option-section {
+  padding: 6px 8px 2px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* --- the vocabulary picker (one chooser for built-ins and properties) ---
+   The viewport is the element `@tanstack/solid-virtual` measures and scrolls,
+   so it MUST have a height of its own: a viewport that sizes to its content
+   would mount every registry row and undo the windowing. Row height is
+   `VOCABULARY_ROW_HEIGHT` in QueryVocabularyPicker.tsx; keep the two in step. */
+.qs-vocab {
+  min-width: 320px;
+  max-width: 420px;
+}
+.qs-vocab-viewport {
+  /* A fixed height, because the virtualizer measures THIS element and a
+     viewport that sized to its content would mount every registry row. It
+     yields to a short window so the popover does not exceed one on its own —
+     WHERE the popover is placed is the sheet menus' shared behaviour and is
+     not changed here. */
+  height: min(320px, 40vh);
+  overflow-y: auto;
+  overflow-x: hidden;
+  contain: strict;
+}
+.qs-vocab-options {
+  max-height: none;
+  overflow: visible;
+  gap: 0;
+}
+.qs-vocab-slot {
+  box-sizing: border-box;
+  padding: 1px 0;
+}
+.qs-vocab-option {
+  width: 100%;
+  box-sizing: border-box;
+  /* Centred, because a built-in row is one line and a property row is two. */
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  /* Kept in step with `VOCABULARY_ROW_HEIGHT` (and the compact case with
+     `VOCABULARY_COMPACT_ROW_HEIGHT`): the virtualizer positions every slot from
+     those constants, so a row taller than its slot would overlap the next. */
+  height: 50px;
+  overflow: hidden;
+}
+.qs-vocab-option.is-compact {
+  height: 30px;
+}
+.qs-vocab-icon {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.qs-vocab-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.qs-vocab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A property key is a name the query will contain verbatim, so it is set as
+   one. A built-in's label is prose ("Page / tag reference") and setting it in
+   the code face made the whole list read as syntax. */
+.qs-vocab-label.is-key {
+  font-family: var(--ls-font-mono);
+}
+/* The value preview is a different kind of fact from the count beside it. */
+.qs-vocab-values::before {
+  content: "· ";
+}
+.qs-vocab-meta {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+}
+.qs-vocab-type {
+  flex: 0 0 auto;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+.qs-vocab-type.is-declared {
+  border-style: dashed;
+}
+.qs-vocab-count {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.qs-vocab-count.is-unavailable {
+  font-style: italic;
+  opacity: 0.7;
+}
+.qs-vocab-values {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qs-vocab-novel .qs-vocab-label {
+  font-style: italic;
+}
+/* One line, above the list, while the graph's own vocabulary is on its way.
+   It is not a row: it cannot be focused, arrowed onto or picked, and the
+   built-ins below it stay usable the whole time. */
+.qs-vocab-pending,
+.qs-registry-pending {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 /* --- value editors --- */
@@ -9434,6 +9617,16 @@ img.emoji {
     max-width: none;
     right: 0;
   }
+  /* **The list has to END inside the window once the sheet has been scrolled.**
+     The bottom sheet above is the scroll path — there is no second popover
+     controller here — but at the desktop's 320px the vocabulary viewport still
+     overhung the window edge by ~20px after scrolling to the end, so the
+     graph's own keys could only be read flush against the bottom. Shorter on a
+     narrow window, unchanged on a wide one. Proven by the narrow/phone pass of
+     `scripts/shot-query-vocabulary.mjs`, not by arithmetic. */
+  .qs-vocab-viewport {
+    height: min(272px, 32vh);
+  }
 }
 
 .query-table th {
@@ -9475,6 +9668,15 @@ img.emoji {
   margin: 0 0 6px;
   color: var(--text);
 }
+.query-crossing-notice-changed {
+  margin: 0 0 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.query-crossing-notice-changed code {
+  font-family: var(--ls-font-mono);
+  word-break: break-word;
+}
 .query-crossing-notice-actions {
   display: flex;
   flex-wrap: wrap;
@@ -9504,17 +9706,8 @@ img.emoji {
    stay on screen while the text is invalid, greyed, because they are the last
    reading that actually ran — blanking them would report a typo as an empty
    graph. */
-.query-text-pane-details {
-  flex-basis: 100%;
-  margin-top: 4px;
-  font-size: 12px;
-}
-.query-text-pane-details > summary {
-  cursor: pointer;
-  color: var(--text-muted);
-  user-select: none;
-}
 .query-text-pane {
+  flex-basis: 100%;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -9541,6 +9734,66 @@ img.emoji {
 .query-text-pane-pending {
   color: var(--text-muted);
   font-size: 12px;
+}
+.query-text-pane-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+/* The structured diagnostics the engine returned, one block per item. Each one
+   keeps its own "Show me" (which selects the span) and its own suggestions, so
+   a two-error query is two repairs and not one wall of prose. */
+.query-text-pane-diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.query-text-pane-diagnostic {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-left: 2px solid var(--danger-color, #c0392b);
+  padding-left: 8px;
+}
+.query-text-pane-diagnostic-message {
+  color: var(--text-primary);
+}
+.query-text-pane-diagnostic-off {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.query-text-pane-locate {
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: var(--link-color);
+  padding: 0;
+  font-size: 12px;
+  cursor: pointer;
+}
+.query-text-pane-locate:hover {
+  text-decoration: underline;
+}
+.query-text-pane-diagnostic-alts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  color: var(--text-muted);
+}
+.query-text-pane-diagnostic-alts code {
+  font-family: var(--ls-font-mono);
+  font-size: 11px;
+}
+/* The notice slot: when the sheet is open the §7.5 crossing notice is drawn
+   here, inside the pane, beside the text it is talking about. */
+.query-text-pane-notice {
+  display: contents;
 }
 .query-stale .query-group,
 .query-stale .query-search-results,

@@ -167,6 +167,20 @@ function reportInfo(report: QueryReport): { ran: string[]; ignored: string[]; su
   return { ran: report.ran ?? [], ignored: report.ignored ?? [], supported: report.supported };
 }
 
+/** A bounded excerpt of ENGINE-PRINTED text, for the §7.5 notice.
+ *
+ *  It is bounded because the text is the author's own query, and a query can be
+ *  as long as outside content chooses to make it; a notice is not a place to
+ *  render an unbounded string (I-22). It is an excerpt of what the engine
+ *  printed, and is labelled as that — it is not, and must not be described as,
+ *  "the minimal unsupported subexpression". Nothing in the engine answers that
+ *  question today, so nothing here claims it. */
+export function boundedFeature(message: string): string | null {
+  const single = message.replace(/\s+/g, " ").trim();
+  if (!single) return null;
+  return single.length > 120 ? `${single.slice(0, 119)}…` : single;
+}
+
 /** Remove the block a query is written in from that query's own results.
  *
  *  `{{query "xyz"}}` contains `xyz`, so the block matches its own query and the
@@ -434,6 +448,21 @@ export function QueryMacro(props: {
       }
     }
     setPrintError(null);
+    // **What the notice can show comes from the ENGINE, or from nothing.**
+    //
+    // The crossing itself is `query_og_expressible`'s answer, which is a bare
+    // bool: it says THAT the query left OG, never which part. So the notice
+    // shows the one piece of evidence that exists — a bounded excerpt of the
+    // text the engine just PRINTED and this save is about to write — under its
+    // own wording, and the §7.5 sentence stays exactly as general as the
+    // engine's answer is. It is not called "the unsupported feature": nothing
+    // in the engine answers that question today, and re-deriving it over the
+    // TypeScript IR mirror is the second producer D-14 forbids.
+    //
+    // It costs nothing. `argument` is already in hand; asking the OG printer
+    // for a refusal message would be one more IPC per crossing save to
+    // manufacture evidence the save path did not need.
+    const changed = crossing ? boundedFeature(argument) : null;
     const node = doc.byId[props.blockId];
     const write = () => {
       rewriteMacro(`{{${name} ${argument}}}`);
@@ -451,7 +480,7 @@ export function QueryMacro(props: {
     } else write();
     // The notice is the user half of the crossing (§7.5): the bytes changed
     // under the user without asking, so say so and offer the way back.
-    if (crossing && node) setCrossed(props.blockId);
+    if (crossing && node) setCrossed(props.blockId, changed);
   };
   /** **The view lives in the block's `tine.*` properties (§7.6), for BOTH macro
    *  names (§4.3 "Directive migration", Q15).**
@@ -540,11 +569,31 @@ export function QueryMacro(props: {
    *  a bare flag is what lets the button know whether Undo would still reverse
    *  THIS change. */
   const [crossedTag, setCrossedTag] = createSignal<string | null>(null);
-  const setCrossed = (blockId: string) => {
+  /** A bounded excerpt of the ENGINE-PRINTED text the crossing save wrote, or
+   *  `null`. Never a claim about which subexpression is unsupported. */
+  const [crossedText, setCrossedText] = createSignal<string | null>(null);
+  /** **The notice's own UI state, lifted out of the component (N3).**
+   *
+   *  The notice moves between two hosts — inline under the block while the sheet
+   *  is closed, inside the query text pane while it is open — and a component
+   *  that is re-parented is a component that is re-created. A tick the user made
+   *  on "Don't show this again" must survive that move, and the focus grab must
+   *  NOT happen again on every move: it belongs to the moment the bytes changed,
+   *  not to opening a sheet. */
+  const [noticeDontShow, setNoticeDontShow] = createSignal(false);
+  const [noticeFocused, setNoticeFocused] = createSignal(false);
+  const setCrossed = (blockId: string, changed: string | null) => {
     // One read per graph, shared by every query block (I-13) — never a lookup
     // per block per render.
     primeNoticeDismissals();
+    setCrossedText(changed);
+    setNoticeDontShow(false);
+    setNoticeFocused(false);
     setCrossedTag(`query:cross:${blockId}`);
+  };
+  const dismissCrossingNotice = () => {
+    if (noticeDontShow()) dismissNotice(CROSSING_NOTICE);
+    setCrossedTag(null);
   };
   /** The notice shows only once this device's answer is KNOWN and is "not
    *  dismissed". `undefined` (still reading) renders nothing rather than a
@@ -558,6 +607,26 @@ export function QueryMacro(props: {
     const tag = crossedTag();
     return !!tag && undoTopTag() === tag;
   };
+  /** Whether the builder's sheet is open, which decides WHERE the one notice is
+   *  drawn. Nothing else reads it. */
+  const [sheetOpen, setSheetOpen] = createSignal(false);
+  /** The one notice, built once and placed by whichever host is current. */
+  const crossingNotice = () => (
+    <CrossingNotice
+      canUndo={crossingIsStillUndoable()}
+      changed={crossedText() ?? undefined}
+      dontShow={noticeDontShow()}
+      onDontShowChange={setNoticeDontShow}
+      autoFocus={!noticeFocused()}
+      onFocused={() => setNoticeFocused(true)}
+      onUndo={() => {
+        undo();
+        dismissCrossingNotice();
+      }}
+      onKeep={dismissCrossingNotice}
+      onDontShowAgain={() => dismissNotice(CROSSING_NOTICE)}
+    />
+  );
   /** What the builder edits: the AUTHORING reading, never the execution's
    *  dyvar-substituted one — editing a chip must not bake the page you happen to
    *  be looking at into the saved query. */
@@ -1029,22 +1098,18 @@ export function QueryMacro(props: {
                 blockId={props.blockId}
                 total={<span class="query-count">{total()}</span>}
                 onStale={setPaneStale}
+                onOpenChange={setSheetOpen}
+                notice={showCrossingNotice() && sheetOpen() ? crossingNotice : undefined}
               />
             </Show>
-            {/* §7.5: hosted inline under the block. P4 renders the SAME
-                component inside its pane — the notice owns its logic, its host
-                owns only its position. */}
-            <Show when={showCrossingNotice()}>
-              <CrossingNotice
-                canUndo={crossingIsStillUndoable()}
-                onUndo={() => {
-                  undo();
-                  setCrossedTag(null);
-                }}
-                onKeep={() => setCrossedTag(null)}
-                onDontShowAgain={() => dismissNotice(CROSSING_NOTICE)}
-              />
-            </Show>
+            {/* §7.5, N3: **one** notice with one state, in one of two places.
+                It sits here while the sheet is shut — where P2 put it, under the
+                block whose bytes changed — and inside the query text pane while
+                the sheet is open, where the changed text actually is. The two
+                `Show`s are mutually exclusive, so it is never drawn twice and
+                never silently hidden; its dismissal, its undo gating and its
+                checkbox are this component's, not the pane's. */}
+            <Show when={showCrossingNotice() && !sheetOpen()}>{crossingNotice()}</Show>
             <Show when={printError()}>
               {(message) => (
                 <div class="query-unsupported query-print-refused" role="alert">
@@ -1061,9 +1126,17 @@ export function QueryMacro(props: {
             </Show>
             {/* The run's OWN diagnostics. A query with an enabled diagnostic is
                 invalid and returns zero rows plus these (§3.5) — showing only
-                "No results" would report a broken query as an empty graph. */}
+                "No results" would report a broken query as an empty graph.
+                The lead says what actually happened: the part below was not
+                understood, so the query returned nothing. It does NOT say the
+                part was "ignored", which would imply the rest still ran and
+                these are its results — the exact misreading the unknown-head
+                regression (REG-P0-QUERY-UNKNOWN-HEAD-001) exists to prevent. */}
             <Show when={diagnostics().some((d) => !d.disabled)}>
               <div class="query-unsupported query-diagnostics" role="alert">
+                <span class="query-diagnostics-lead">
+                  Tine didn't understand part of this query, so it returned no results:
+                </span>{" "}
                 {diagnostics().filter((d) => !d.disabled).map((d) => d.message).join(" · ")}
               </div>
             </Show>

@@ -1,0 +1,248 @@
+import { For, Show, createEffect, createMemo, createSignal, type JSX } from "solid-js";
+
+// **The ONE listbox keyboard/ARIA controller the query sheet uses (§7.7, D-14).**
+//
+// It was a private `Listbox` inside `QuerySheet.tsx`, shared by the anchor menu,
+// the operator menu, the row menus and the field chooser. P4 needs the same
+// controller for a list that is VIRTUALIZED and SECTIONED — hundreds of registry
+// rows, drawn a viewport at a time — and writing a second arrow-key/
+// `aria-activedescendant` implementation for it is exactly the twin D-14 forbids.
+//
+// So the controller moved here and grew two seams, and nothing else changed:
+//
+//  - `body` replaces the LIST BODY only. The filter input, the roving active
+//    option, Arrow/Enter/Backspace and the `role="listbox"` wiring stay here, so
+//    the virtualized case cannot drift from the plain one.
+//  - `query`/`onQuery` put the needle under the CALLER's control, for a list
+//    whose filtering is not "does the label contain this" (the vocabulary picker
+//    matches on the property key as spelled AND offers an unmatched-key row).
+//
+// **Option ids are the option's own key, never its index in the filtered or
+// virtual list.** An index-derived id changes meaning as the list is filtered or
+// scrolled, which is how `aria-activedescendant` ends up naming a row the reader
+// is not on — and in a virtual list it can name a row that is not mounted at all.
+
+/** Stops a click inside the builder from bubbling to the block's `onClick`,
+ *  which would drop the block into raw-text edit mode and replace the builder. */
+export const stop = (e: MouseEvent) => e.stopPropagation();
+
+/**
+ * **A row's key → the tail of its DOM id (§7.5, I-22).**
+ *
+ * The keys are the user's own vocabulary: a property key can be `due date`, it
+ * can carry `"`, `#` or `.`, it can be `ünïcode ключ`, and nothing stops a
+ * malformed file from producing a LONE surrogate. `aria-activedescendant` takes
+ * an IDREF — exactly ONE id — so a key with a space produced an attribute the
+ * platform reads as two references and resolves as neither: the reader is told
+ * about a row that does not exist.
+ *
+ * So the key is not interpolated, it is ENCODED: four hex digits per UTF-16
+ * code unit. That is total (every code unit has a code, lone surrogates
+ * included, because `charCodeAt` is defined on them), injective (fixed width,
+ * so no two distinct keys share an encoding), and produces `[0-9a-f]*` — no
+ * whitespace, nothing a selector or an IDREF can misread. Stable identity is
+ * still the KEY: the same row keeps the same id however the list is filtered,
+ * scrolled or windowed, which an index-derived id cannot promise.
+ */
+export function encodeOptionKey(key: string): string {
+  let out = "";
+  for (let i = 0; i < key.length; i += 1) {
+    out += key.charCodeAt(i).toString(16).padStart(4, "0");
+  }
+  return out;
+}
+
+export interface ListboxOption {
+  /** Stable row identity. The option's DOM id is derived from THIS. */
+  key: string;
+  label: string;
+  hint?: string;
+  active?: boolean;
+  /** A non-selectable section label: drawn, skipped by the arrow keys. */
+  header?: boolean;
+  /** A richer second line for the row (the vocabulary picker's type/count). */
+  detail?: JSX.Element;
+}
+
+/** What a replacement list body is handed. Everything it needs to draw rows and
+ *  nothing that would let it own the keyboard. */
+export interface ListboxBody {
+  /** The options to draw, headers included, in order. */
+  shown: () => ListboxOption[];
+  /** The key the keyboard is on, or `null` for an empty list. */
+  activeKey: () => string | null;
+  setActiveKey: (key: string) => void;
+  /** The DOM id for a row, so `aria-activedescendant` and the row agree. */
+  optionId: (key: string) => string;
+  pick: (key: string) => void;
+  listId: string;
+  label: string;
+}
+
+const selectable = (options: ListboxOption[]) => options.filter((option) => !option.header);
+
+/** One `role="listbox"` with `aria-activedescendant`, arrow keys and
+ *  scroll-follow — the pattern `QuickSwitcher.tsx` already implements, reused
+ *  rather than re-rolled (D-14). The trigger passes its own `id` so
+ *  `aria-controls`/`aria-activedescendant` point at real elements. */
+export function Listbox(props: {
+  id: string;
+  label: string;
+  options: ListboxOption[];
+  filterable?: boolean;
+  placeholder?: string;
+  /** Controlled needle. When supplied the caller has ALREADY filtered
+   *  `options`; this component only shows the text and reports edits. */
+  query?: string;
+  onQuery?: (query: string) => void;
+  onPick: (key: string) => void;
+  onEmptyBackspace?: () => void;
+  rootRef?: (element: HTMLDivElement) => void;
+  /** An extra class on the popover root, for a caller whose list needs a
+   *  different width. The keyboard and ARIA wiring are unaffected. */
+  class?: string;
+  /** Drawn between the filter and the list: a compact line about the LIST
+   *  itself (the vocabulary picker's "the registry has not landed yet"). Not a
+   *  row, so it is never focusable and never picked. */
+  status?: JSX.Element;
+  /** Draw the rows some other way (virtualized). The keyboard stays here. */
+  body?: (context: ListboxBody) => JSX.Element;
+  /** Drawn under the list, inside the popover (the "use it anyway" row). */
+  footer?: JSX.Element;
+  inputRef?: (element: HTMLInputElement) => void;
+}): JSX.Element {
+  const controlled = () => props.query !== undefined;
+  const [ownQuery, setOwnQuery] = createSignal("");
+  const query = () => props.query ?? ownQuery();
+  const shown = createMemo(() => {
+    if (controlled()) return props.options;
+    const needle = query().trim().toLowerCase();
+    if (!needle) return props.options;
+    return props.options.filter(
+      (option) => option.header || option.label.toLowerCase().includes(needle),
+    );
+  });
+  const [activeKey, setActiveKey] = createSignal<string | null>(null);
+  // A filter that shrinks the list, or empties it, must not leave the keyboard
+  // pointing at a row that is no longer there — `aria-activedescendant` would
+  // name a missing element and Enter would pick nothing.
+  createEffect(() => {
+    const rows = selectable(shown());
+    const current = activeKey();
+    if (current && rows.some((option) => option.key === current)) return;
+    setActiveKey(rows[0]?.key ?? null);
+  });
+  const optionId = (key: string) => `${props.id}-option-${encodeOptionKey(key)}`;
+  const move = (delta: number) => {
+    const rows = selectable(shown());
+    if (!rows.length) return;
+    const current = rows.findIndex((option) => option.key === activeKey());
+    const next = (current + delta + rows.length) % rows.length;
+    setActiveKey(rows[next].key);
+  };
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "n")) {
+      event.preventDefault();
+      move(1);
+    } else if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "p")) {
+      event.preventDefault();
+      move(-1);
+    } else if (event.key === "Enter") {
+      const key = activeKey();
+      if (key) {
+        event.preventDefault();
+        props.onPick(key);
+      }
+    } else if (event.key === "Backspace" && !query() && props.onEmptyBackspace) {
+      event.preventDefault();
+      props.onEmptyBackspace();
+    }
+  };
+  const setQuery = (next: string) => {
+    if (!controlled()) setOwnQuery(next);
+    props.onQuery?.(next);
+  };
+  const context: ListboxBody = {
+    shown,
+    activeKey,
+    setActiveKey,
+    optionId,
+    pick: (key) => props.onPick(key),
+    listId: props.id,
+    label: props.label,
+  };
+  return (
+    <div
+      ref={(element) => props.rootRef?.(element)}
+      class="qs-menu"
+      classList={{ [props.class ?? ""]: !!props.class }}
+      onClick={stop}
+      onKeyDown={onKeyDown}
+    >
+      <Show when={props.filterable}>
+        <input
+          ref={(element) => props.inputRef?.(element)}
+          class="qs-menu-filter"
+          autofocus
+          role="combobox"
+          aria-expanded="true"
+          aria-controls={props.id}
+          aria-activedescendant={activeKey() ? optionId(activeKey()!) : undefined}
+          aria-label={props.label}
+          placeholder={props.placeholder ?? "Type to filter"}
+          value={query()}
+          onInput={(e) => setQuery(e.currentTarget.value)}
+        />
+      </Show>
+      <Show when={props.status}>{props.status}</Show>
+      <Show when={props.body} fallback={<PlainList context={context} />}>
+        {(body) => body()(context)}
+      </Show>
+      <Show when={props.footer}>{props.footer}</Show>
+    </div>
+  );
+}
+
+/** The default body: every option, as a button. */
+function PlainList(props: { context: ListboxBody }): JSX.Element {
+  let listRef: HTMLDivElement | undefined;
+  const context = props.context;
+  createEffect(() => {
+    context.activeKey();
+    listRef?.querySelector(".qs-option.active")?.scrollIntoView({ block: "nearest" });
+  });
+  return (
+    <div ref={listRef} id={context.listId} class="qs-options" role="listbox" aria-label={context.label}>
+      <For each={context.shown()}>
+        {(option) => (
+          <Show
+            when={!option.header}
+            fallback={
+              <div class="qs-option-section" role="presentation">
+                {option.label}
+              </div>
+            }
+          >
+            <button
+              type="button"
+              id={context.optionId(option.key)}
+              class="qs-option"
+              classList={{ active: option.key === context.activeKey(), current: option.active }}
+              role="option"
+              aria-selected={option.key === context.activeKey()}
+              title={option.hint}
+              onMouseEnter={() => context.setActiveKey(option.key)}
+              onClick={() => context.pick(option.key)}
+            >
+              {option.label}
+              <Show when={option.hint}>
+                <span class="qs-option-hint">{option.hint}</span>
+              </Show>
+              <Show when={option.detail}>{option.detail}</Show>
+            </button>
+          </Show>
+        )}
+      </For>
+    </div>
+  );
+}

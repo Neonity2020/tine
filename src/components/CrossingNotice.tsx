@@ -30,15 +30,42 @@ export function CrossingNotice(props: {
    *  disabled — a button that quietly undid something else would be worse than
    *  no button. */
   canUndo: boolean;
-  /** Filled by P4 from the pane's diagnostics; absent in P2. When set it is
-   *  rendered as the parenthetical the spec's wording carries. */
+  /** The §4.3 seam for NAMING the unsupported feature. Still unfilled: the
+   *  engine's answer here is a bare `og_expressible` bool, and re-deriving
+   *  OG-expressibility over the TypeScript IR mirror to produce a name would be
+   *  a second producer of a question Rust owns (D-14). When something in the
+   *  engine names it, it goes here and the sentence gains its parenthetical. */
   feature?: string;
+  /** **A bounded excerpt of the text the engine just printed (P4).**
+   *
+   *  Not the same claim as `feature`, which is why it is not the same prop and
+   *  not the same sentence: this says "here is what the block now says", which
+   *  is evidence the save path already has, rather than "here is the feature
+   *  that crossed", which nothing today can honestly answer. */
+  changed?: string;
   onUndo: () => void;
   onKeep: () => void;
   /** Called at most once, on close, when "Don't show this again" is ticked. */
   onDontShowAgain: () => void;
+  /** **The checkbox, optionally lifted (P4, N3).** P4 moves this one notice
+   *  between two hosts — inline under the block, and inside the query text pane
+   *  while the sheet is open — and a re-parented component is a re-created one.
+   *  A host that owns the tick passes it down so the move cannot silently
+   *  untick it; a host that does not keeps the local state P2 had. */
+  dontShow?: boolean;
+  onDontShowChange?: (value: boolean) => void;
+  /** Whether to take focus on mount. `false` for a notice that is merely moving
+   *  between hosts: the focus grab belongs to the moment the bytes changed, and
+   *  re-taking it on every sheet toggle would fight the user for the caret. */
+  autoFocus?: boolean;
+  onFocused?: () => void;
 }): JSX.Element {
-  const [dontShow, setDontShow] = createSignal(false);
+  const [ownDontShow, setOwnDontShow] = createSignal(false);
+  const dontShow = () => props.dontShow ?? ownDontShow();
+  const setDontShow = (value: boolean) => {
+    if (props.dontShow === undefined) setOwnDontShow(value);
+    props.onDontShowChange?.(value);
+  };
   const checkboxId = `crossing-notice-dont-show-${createUniqueId()}`;
   let region: HTMLDivElement | undefined;
 
@@ -46,7 +73,11 @@ export function CrossingNotice(props: {
   // as no notice. Focus is moved to the region itself (not to a button) so a
   // screen reader announces the whole message before the choices, and so Enter
   // does not fire a destructive default.
-  onMount(() => region?.focus());
+  onMount(() => {
+    if (props.autoFocus === false) return;
+    region?.focus();
+    props.onFocused?.();
+  });
 
   const close = (act: () => void) => {
     if (dontShow()) props.onDontShowAgain();
@@ -66,6 +97,13 @@ export function CrossingNotice(props: {
         <Show when={props.feature}>{(feature) => <> (<code>{feature()}</code>)</>}</Show>. Logseq
         will show the block as plain text.
       </p>
+      <Show when={props.changed}>
+        {(text) => (
+          <p class="query-crossing-notice-changed">
+            The block now reads: <code>{text()}</code>
+          </p>
+        )}
+      </Show>
       <div class="query-crossing-notice-actions">
         <button
           class="query-crossing-notice-undo"

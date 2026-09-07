@@ -230,7 +230,7 @@ await withApp(0, async (browser) => {
 
   await clickIn(".qs-add");
   try {
-    await browser.$(".qs-menu").waitForExist({ timeout: 5_000 });
+    await browser.$(".qs-menu.qs-vocab").waitForExist({ timeout: 5_000 });
   } catch (error) {
     const proof = await browser.execute(() => ({
       expanded: document.querySelector(".qs-add")?.getAttribute("aria-expanded"),
@@ -245,7 +245,39 @@ await withApp(0, async (browser) => {
   // is supposed to cross to `{{tine-query}}` — that crossing has its own
   // notice and its own tests; this step is about the ordinary case staying
   // ordinary.
-  await clickIn(".qs-menu .qs-option", "Full-text search");
+  //
+  // **P4 migrated this selector.** The chooser is the one VOCABULARY picker
+  // now: its rows carry the observed type and the count under the label, so an
+  // exact-text match on the button no longer identifies a row, and the list is
+  // virtualized, so a row further down may not be mounted at all. Narrow with
+  // the filter the user has, then press the row by the field it names.
+  const filter = await browser.$(".qs-menu.qs-vocab .qs-menu-filter");
+  await filter.waitForExist({ timeout: 5_000 });
+  await filter.click();
+  // Through the production input handler: WebKitWebDriver under Xvfb drops the
+  // odd character out of a synthetic key sequence, and a filter that received
+  // `Fulltext` narrows to nothing and looks exactly like a broken picker.
+  await browser.execute(() => {
+    const el = document.querySelector(".qs-menu.qs-vocab .qs-menu-filter");
+    el.value = "full-text";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const contentRow = await browser.$('.qs-vocab-option[data-vocabulary-key="content"]');
+  if (!(await contentRow.isExisting())) {
+    const shown = await browser.execute(() => ({
+      needle: document.querySelector(".qs-menu.qs-vocab .qs-menu-filter")?.value,
+      keys: [...document.querySelectorAll(".qs-vocab-option")].map((el) => el.getAttribute("data-vocabulary-key")),
+    }));
+    fail(`the full-text field was not in the narrowed list: ${JSON.stringify(shown)}`);
+  }
+  // The list is the graph's, so the row says so: a built-in carries no count,
+  // because the registry holds no statistics for one and inventing a number
+  // the engine never said is the thing this picker exists not to do.
+  const builtinRow = await contentRow.getText();
+  if (/\d+\s+blocks?/.test(builtinRow)) {
+    fail(`a built-in row carries a fabricated count: ${JSON.stringify(builtinRow)}`);
+  }
+  await contentRow.click();
   const value = await browser.$(".qs-sheet .qs-value-editor .qs-input");
   await value.waitForExist({ timeout: 5_000 });
   await value.click();

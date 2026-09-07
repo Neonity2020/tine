@@ -18,7 +18,14 @@ export default defineConfig({
     environment: "jsdom",
     include: ["src/**/*.test.tsx"],
     setupFiles: ["./src/testSetup.render.ts"],
-    server: { deps: { inline: ["solid-js"] } },
+    // Inline the Solid runtime AND any dependency that imports it. A package
+    // left external resolves its own `solid-js`, which is a SECOND reactive
+    // graph: its `onMount` never runs under our owner, so a virtualizer would
+    // silently never attach to its scroll element. (Vite bundles both into one
+    // module in a real build; only the test runner can externalize them.)
+    server: {
+      deps: { inline: ["solid-js", "@tanstack/solid-virtual", "@tanstack/virtual-core"] },
+    },
   },
   resolve: {
     conditions: ["browser"],

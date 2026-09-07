@@ -64,6 +64,8 @@ import type {
   RegistryRow,
 } from "../editor/queryIr";
 import { PropertyType, effectiveTypeOf, registryRowFor } from "./PropertyType";
+import { Listbox, stop, type ListboxOption } from "./QueryListbox";
+import { QueryVocabularyPicker, type VocabularyChoice } from "./QueryVocabularyPicker";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
 import { dismissOnOutsidePointer, registerTransientLayer, type TransientLayer } from "../transientLayers";
 
@@ -89,23 +91,31 @@ import { dismissOnOutsidePointer, registerTransientLayer, type TransientLayer } 
 //    `registerVisiblePopover` under the sheet's own layer id, so Escape, Android
 //    Back and an outside press close the innermost thing first.
 
-/** Stops a click inside the builder from bubbling to the block's `onClick`,
- *  which would drop the block into raw-text edit mode and replace the builder. */
-export const stop = (e: MouseEvent) => e.stopPropagation();
+// `stop` and the listbox keyboard/ARIA controller live in `QueryListbox.tsx`
+// now: P4's vocabulary picker needs the SAME controller over a virtualized list
+// body, and a second arrow-key implementation for it is the twin D-14 forbids
+// (N1). They are re-exported here because this module is where the sheet's
+// callers already import them from.
+export { stop, Listbox, type ListboxOption };
 
-export type QueryFacets = [string, string[]][];
-export type QueryFacetsAccessor = Accessor<QueryFacets | undefined>;
-
-/** **The property registry, read once per opened sheet (§6.4, I-13).**
+/** **The property registry, read once per opened sheet (§6.4, I-13, N4).**
  *
  *  The registry is a graph-level table. Asking for it on a keystroke, or once
- *  per rendered row, is the shape this campaign exists to delete — so the
- *  builder holds ONE read and hands it down. `request()` is called when the
- *  sheet opens and again after a declaration is written, and on nothing else:
- *  the projection exposes no generation signal to TypeScript, so there is no
- *  third moment to invent one for. */
+ *  per rendered row, is the shape this campaign exists to delete — so the HOST
+ *  holds one shared read and hands it down.
+ *
+ *  Two things moved in P4. The read is now the sheet's ONLY graph-level
+ *  question (`query_facets(false)` is gone with the two-stage property chooser
+ *  it fed), and acquiring it is the HOST's job: opening a sheet makes the
+ *  resource key live, which is not the same event as a declaration landing. So
+ *  the sheet no longer calls `request()` on mount — `request()` means "a
+ *  declaration was written, re-read", and nothing else. */
 export interface RegistryAccess {
   rows: Accessor<RegistryRow[] | undefined>;
+  /** The read for the current graph/declaration revision is in flight. Every
+   *  edit whose meaning depends on a key's effective type waits for it rather
+   *  than falling back to the untyped `text` family (§6.3). */
+  pending: Accessor<boolean>;
   request: () => void;
 }
 
@@ -430,112 +440,6 @@ function buildNodes(filter: Filter, loc: number[], depth: number): SheetNode {
   return { kind: "row", loc, filter, core: node, negated, disabled };
 }
 
-// ---------------------------------------------------------------------------
-// A listbox, the way QuickSwitcher does it (§7.7)
-// ---------------------------------------------------------------------------
-
-interface ListboxOption {
-  key: string;
-  label: string;
-  hint?: string;
-  active?: boolean;
-}
-
-/** One `role="listbox"` with `aria-activedescendant`, arrow keys and
- *  scroll-follow — the pattern `QuickSwitcher.tsx` already implements, reused
- *  rather than re-rolled (D-14). The trigger passes its own `id` so
- *  `aria-controls`/`aria-activedescendant` point at real elements. */
-function Listbox(props: {
-  id: string;
-  label: string;
-  options: ListboxOption[];
-  filterable?: boolean;
-  placeholder?: string;
-  onPick: (key: string) => void;
-  onEmptyBackspace?: () => void;
-  rootRef?: (element: HTMLDivElement) => void;
-}): JSX.Element {
-  const [query, setQuery] = createSignal("");
-  const [selected, setSelected] = createSignal(0);
-  let listRef: HTMLDivElement | undefined;
-  const shown = createMemo(() => {
-    const needle = query().trim().toLowerCase();
-    if (!needle) return props.options;
-    return props.options.filter((option) => option.label.toLowerCase().includes(needle));
-  });
-  createEffect(() => {
-    shown();
-    setSelected(0);
-  });
-  createEffect(() => {
-    selected();
-    listRef?.querySelector(".qs-option.active")?.scrollIntoView({ block: "nearest" });
-  });
-  const move = (delta: number) => {
-    const count = shown().length;
-    if (!count) return;
-    setSelected((current) => (current + delta + count) % count);
-  };
-  const onKeyDown = (event: KeyboardEvent) => {
-    if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "n")) {
-      event.preventDefault();
-      move(1);
-    } else if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "p")) {
-      event.preventDefault();
-      move(-1);
-    } else if (event.key === "Enter") {
-      const option = shown()[selected()];
-      if (option) {
-        event.preventDefault();
-        props.onPick(option.key);
-      }
-    } else if (event.key === "Backspace" && !query() && props.onEmptyBackspace) {
-      event.preventDefault();
-      props.onEmptyBackspace();
-    }
-  };
-  return (
-    <div ref={props.rootRef} class="qs-menu" onClick={stop} onKeyDown={onKeyDown}>
-      <Show when={props.filterable}>
-        <input
-          class="qs-menu-filter"
-          autofocus
-          role="combobox"
-          aria-expanded="true"
-          aria-controls={props.id}
-          aria-activedescendant={shown().length ? `${props.id}-option-${selected()}` : undefined}
-          aria-label={props.label}
-          placeholder={props.placeholder ?? "Type to filter"}
-          value={query()}
-          onInput={(e) => setQuery(e.currentTarget.value)}
-        />
-      </Show>
-      <div ref={listRef} id={props.id} class="qs-options" role="listbox" aria-label={props.label}>
-        <For each={shown()}>
-          {(option, index) => (
-            <button
-              type="button"
-              id={`${props.id}-option-${index()}`}
-              class="qs-option"
-              classList={{ active: index() === selected(), current: option.active }}
-              role="option"
-              aria-selected={index() === selected()}
-              title={option.hint}
-              onMouseEnter={() => setSelected(index())}
-              onClick={() => props.onPick(option.key)}
-            >
-              {option.label}
-              <Show when={option.hint}>
-                <span class="qs-option-hint">{option.hint}</span>
-              </Show>
-            </button>
-          )}
-        </For>
-      </div>
-    </div>
-  );
-}
-
 /** A popover anchored to a trigger button, registered in the dismissal ladder. */
 function Popover(props: {
   open: () => boolean;
@@ -765,7 +669,6 @@ function BetweenPick(props: {
 /** The value collector for a filter kind, and the IR leaf `og.rs` builds for the
  *  same intent. Shared by the add-a-condition flow and a row's own value cell. */
 function ValueEditor(props: {
-  facets: QueryFacetsAccessor;
   kind: BuilderLeafKind;
   onCommit: (filter: Filter) => void;
 }): JSX.Element {
@@ -802,39 +705,6 @@ function ValueEditor(props: {
   );
 }
 
-/** The property-key typeahead. The keys come from the host's ONE facets read;
- *  a key the graph does not have yet is still committable, because a query may
- *  be written before the property exists. */
-function PropertyKeyPick(props: {
-  facets: QueryFacetsAccessor;
-  onPick: (key: string) => void;
-}): JSX.Element {
-  const [key, setKey] = createSignal("");
-  const keys = () => (props.facets() ?? []).map(([k]) => k);
-  return (
-    <div class="qs-value-editor">
-      <input
-        class="qs-input"
-        autofocus
-        aria-label="Property key"
-        placeholder="Property key"
-        value={key()}
-        onInput={(e) => setKey(e.currentTarget.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && key().trim()) props.onPick(key().trim());
-        }}
-      />
-      <For each={keys().filter((k) => k.toLowerCase().includes(key().toLowerCase()))}>
-        {(k) => (
-          <button type="button" class="qs-option" onClick={() => props.onPick(k)}>
-            {k}
-          </button>
-        )}
-      </For>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // The sheet
 // ---------------------------------------------------------------------------
@@ -868,8 +738,10 @@ export interface QuerySheetProps {
   /** The whole query, for the diagnostics a red row shows. */
   query: () => Query | undefined;
   apply: (next: Filter) => void;
-  facets: QueryFacetsAccessor;
   registry: RegistryAccess;
+  /** Open and focus the query text pane — the route the `⟨advanced⟩` control
+   *  takes, and the route a row that cannot be edited here always has (§7.4). */
+  onEditText?: () => void;
   /** The four most frequent property keys, for the empty state's "Try:" line. */
   suggestions: () => string[];
   /** Which menu inside the sheet is open, by row loc + purpose. The HOST owns
@@ -893,10 +765,6 @@ export function QuerySheet(props: QuerySheetProps): JSX.Element {
     const node = nodes();
     return node.kind === "group" && node.children.length === 0;
   });
-  // **The ONE registry read for this sheet (§6.4, I-13).** Taken when the sheet
-  // appears, so a page of resting sentences asks the graph nothing at all.
-  onMount(() => props.registry.request());
-
   // The add-condition chooser is one of the sheet's menus, not a signal of its
   // own: sharing `openMenu` is what makes opening it close a row's menu, and
   // what tells the HOST that a press belongs to the menu's rung of the ladder
@@ -954,9 +822,12 @@ export function QuerySheet(props: QuerySheetProps): JSX.Element {
           </For>
         </div>
       </Show>
-      <Show when={props.footer}>
-        <div class="qs-footer">{props.footer}</div>
-      </Show>
+      {/* Read ONCE. `<Show when={x}>{x}</Show>` reads `x` twice — for the
+          condition and for the body — and a JSX prop is a getter, so the footer
+          (and the text pane inside it, and the crossing notice inside that) was
+          instantiated twice, the first copy detached. A detached copy still runs
+          `onMount`, which is how a focus grab lands on nothing. */}
+      <Show when={props.footer}>{(footer) => <div class="qs-footer">{footer()}</div>}</Show>
     </div>
   );
 }
@@ -1222,18 +1093,47 @@ function SheetItem(props: { node: SheetNode; sheet: QuerySheetProps }): JSX.Elem
   );
 }
 
-/** A subtree past the rendering cap: ONE chip, its phrase, and a ×. The language
- *  never refuses it and the pane below shows the whole query, so the chip is a
- *  presentation state — not a `Raw`, not a truncation, not a drop (§7.4). */
+/** A subtree past the rendering cap: ONE control, its phrase, and a ×. The
+ *  language never refuses it and the pane below shows the whole query, so the
+ *  chip is a presentation state — not a `Raw`, not a truncation, not a drop
+ *  (§7.4).
+ *
+ *  **It is a control, not a label (§7.5).** It used to be a `<span>` with a
+ *  `title`, which is unreachable by keyboard and invisible to a screen reader:
+ *  the one part of the sheet that says "this is edited somewhere else" was the
+ *  one part that could not take you there. Pressing it opens and focuses the
+ *  query text pane, where the whole subtree is.
+ *
+ *  It does NOT select a span. A folded subtree has no offset that can be
+ *  associated with the engine-printed draft unambiguously — the printer decides
+ *  the layout, and this node's `loc` is a position in the tree, not in the text
+ *  — so the honest action is to put the cursor in the pane and let the user
+ *  read, rather than to highlight a guess. The real subtree is untouched: it is
+ *  never replaced by a `Raw` merely so that it can be drawn. */
 function AdvancedChip(props: {
   node: Extract<SheetNode, { kind: "advanced" }>;
   sheet: QuerySheetProps;
 }): JSX.Element {
+  const phrase = () => `${ADVANCED_PHRASE} ${filterLabel(props.node.filter)}`;
   return (
     <div class="qs-row qs-row-advanced" role="listitem">
-      <span class="qs-advanced" title="edit in the query text below">
-        {ADVANCED_PHRASE} {filterLabel(props.node.filter)}
-      </span>
+      <Show
+        when={props.sheet.onEditText}
+        fallback={<span class="qs-advanced" title="edit in the query text below">{phrase()}</span>}
+      >
+        <button
+          type="button"
+          class="qs-advanced qs-advanced-open"
+          title="Edit this part in the query text below"
+          aria-label={`Edit in the query text: ${filterLabel(props.node.filter)}`}
+          onClick={(e) => {
+            stop(e);
+            props.sheet.onEditText?.();
+          }}
+        >
+          {phrase()}
+        </button>
+      </Show>
       <button
         type="button"
         class="qs-row-remove"
@@ -1295,6 +1195,13 @@ function QueryRow(props: {
     const leaf = raw();
     return leaf ? diagnosticFor(props.sheet.query(), leaf) : undefined;
   };
+  /** **A property row's edits wait for the registry.** Its operator menu and its
+   *  value encoding are both `effectiveTypeOf` answers, and the fallback when
+   *  there is no row is the untyped `text` family — so editing while the read is
+   *  in flight would silently retype a `number` key, or a key whose declaration
+   *  was written a moment ago, as text. Nothing here is a NEW state: the row
+   *  keeps its own draft and reads exactly as it did (§6.3, I-20). */
+  const propertyPending = () => !!property() && props.sheet.registry.pending();
 
   const key = (purpose: string) => `${purpose}:${locKey(props.node.loc)}`;
   const menuOpen = (purpose: string) => props.sheet.openMenu() === key(purpose);
@@ -1316,7 +1223,7 @@ function QueryRow(props: {
 
   const setPropertyOperator = (id: PropertyOperatorId) => {
     const test = property();
-    if (!test) return;
+    if (!test || propertyPending()) return;
     const arity = propertyOperatorArity(id);
     const next = encodePropertyLeaf({
       id,
@@ -1334,7 +1241,7 @@ function QueryRow(props: {
 
   const setPropertyValues = (values: string[]) => {
     const test = property();
-    if (!test) return;
+    if (!test || propertyPending()) return;
     const next = encodePropertyLeaf({
       id: test.id,
       key: test.key,
@@ -1342,6 +1249,43 @@ function QueryRow(props: {
       type: effective().type,
       throughPage: test.throughPage,
     });
+    if (next) replaceRow(next);
+  };
+
+  /** What this row currently tests, in the vocabulary picker's terms, so the
+   *  list can mark the row the user is already on. */
+  const currentChoice = (): VocabularyChoice | null => {
+    const test = property();
+    if (test) return { kind: "property", key: test.key, throughPage: test.throughPage };
+    const k = kind();
+    return k ? { kind: "builtin", leaf: k } : null;
+  };
+
+  /** Point this row at a different property key.
+   *
+   *  The row keeps the identity it already had when the new key's effective
+   *  type still offers it — retyping `owner` to `cost` should not silently
+   *  discard "is not". When it does not, the type's first identity is taken.
+   *  And when neither can be encoded from the values on the row (an operator
+   *  that needs a value the row has not got yet), the row commits `is set`,
+   *  which is a complete condition the user can then narrow — rather than a
+   *  leaf that claims a comparison nobody typed. */
+  const setPropertyKey = (choice: VocabularyChoice & { kind: "property" }) => {
+    if (props.sheet.registry.pending()) return;
+    const target = effectiveFor(props.sheet.registry, choice.key);
+    const offered = propertyOperators(target).map((operator) => operator.id);
+    const test = property();
+    const values = test?.values ?? [];
+    const id = test && offered.includes(test.id) ? test.id : offered[0] ?? "is_set";
+    const encode = (candidate: PropertyOperatorId) =>
+      encodePropertyLeaf({
+        id: candidate,
+        key: choice.key,
+        values,
+        type: target.type,
+        throughPage: choice.throughPage,
+      });
+    const next = encode(id) ?? encode("is_set");
     if (next) replaceRow(next);
   };
 
@@ -1373,6 +1317,37 @@ function QueryRow(props: {
             <span class="qs-raw-message" role={props.node.disabled ? undefined : "alert"}>
               {diagnostic()?.message ?? "This condition was not understood."}
             </span>
+            <Show when={diagnostic()?.suggestions?.length}>
+              {/* Rust's OWN alternatives (§4.3.2). The frontend has no
+                  fuzzy resolver and does not grow one; this renders the list the
+                  parser already sent. */}
+              <span class="qs-raw-suggestions">
+                Did you mean{" "}
+                <For each={diagnostic()!.suggestions!.slice(0, 4)}>
+                  {(suggestion, index) => (
+                    <>
+                      <Show when={index() > 0}>, </Show>
+                      <code>{suggestion}</code>
+                    </>
+                  )}
+                </For>
+                ?
+              </span>
+            </Show>
+            {/* A retained leaf is exactly the row the sheet cannot edit in
+                place, so it is the row that most needs the way out (§7.5). */}
+            <Show when={props.sheet.onEditText}>
+              <button
+                type="button"
+                class="qs-raw-edit"
+                onClick={(e) => {
+                  stop(e);
+                  props.sheet.onEditText?.();
+                }}
+              >
+                Edit as text
+              </button>
+            </Show>
           </>
         }
       >
@@ -1399,19 +1374,25 @@ function QueryRow(props: {
             trigger={() => fieldTrigger ?? null}
           >
             {(rootRef) => (
-              <Listbox
+              /* The SAME picker the add-condition flow uses (§7.5). Changing a
+                 row's field and adding a condition were two controls asking one
+                 question; they are one control now, so a key's count and type
+                 are visible wherever the question is asked. */
+              <QueryVocabularyPicker
                 id={fieldMenuId}
-                label="Condition field"
-                filterable
+                anchor={props.sheet.anchor()}
+                rows={props.sheet.registry.rows}
+                pending={props.sheet.registry.pending}
+                current={currentChoice()}
                 rootRef={rootRef}
-                options={FILTER_TYPES.map((t) => ({
-                  key: t.kind,
-                  label: t.label,
-                  active: t.kind === kind(),
-                }))}
-                onPick={(picked) => {
+                onPick={(choice) => {
+                  // A property pick needs the key's effective type to encode a
+                  // leaf. While the read is in flight the menu stays open with
+                  // its own line saying why, rather than committing text.
+                  if (choice.kind === "property" && props.sheet.registry.pending()) return;
                   props.sheet.setOpenMenu(null);
-                  const next = picked as BuilderLeafKind;
+                  if (choice.kind === "property") return setPropertyKey(choice);
+                  const next = choice.leaf;
                   if (next === "scheduled" || next === "deadline") return replaceRow(planningFilter(next));
                   if (next === "journal") return replaceRow(journalFilter());
                   // Anything that needs a value re-opens the value editor with
@@ -1431,7 +1412,8 @@ function QueryRow(props: {
             aria-haspopup="listbox"
             aria-expanded={menuOpen("op") ? "true" : "false"}
             aria-controls={opMenuId}
-            disabled={props.node.disabled}
+            disabled={props.node.disabled || propertyPending()}
+            title={propertyPending() ? "Reading this graph's properties…" : undefined}
             onClick={(e) => {
               stop(e);
               toggle("op");
@@ -1531,7 +1513,6 @@ function QueryRow(props: {
                   {(rootRef) => (
                     <div ref={rootRef} class="qs-menu" onClick={stop}>
                       <ValueEditor
-                        facets={props.sheet.facets}
                         kind={(props.sheet.openMenu() ?? "").split(":").pop() as BuilderLeafKind}
                         onCommit={(filter) => {
                           props.sheet.setOpenMenu(null);
@@ -1548,7 +1529,7 @@ function QueryRow(props: {
               <PropertyValueCell
                 test={test()}
                 effective={effective()}
-                disabled={props.node.disabled}
+                disabled={props.node.disabled || propertyPending()}
                 registry={props.sheet.registry}
                 onCommit={setPropertyValues}
               />
@@ -1675,40 +1656,53 @@ function PropertyValueCell(props: {
   );
 }
 
-/** The add-a-condition row: the field chooser, then the value editor for what
- *  was chosen. `/query` opens the sheet with exactly this open and focused
- *  (§7.3). */
+/** The add-a-condition row: the ONE vocabulary picker, then the value editor for
+ *  what was chosen. `/query` opens the sheet with exactly this open and focused
+ *  (§7.3).
+ *
+ *  **It used to ask two questions.** "What kind of condition?" and then, for the
+ *  two property kinds, "which key?" — from a facets list with no counts and no
+ *  types. It now asks one: the built-in vocabulary and the graph's own property
+ *  keys are rows of the same list, so choosing `owner` is one keystroke-filtered
+ *  pick rather than a pick, a submenu and a second pick (§7.5). */
 function AddCondition(props: {
   sheet: QuerySheetProps;
   open: Accessor<boolean>;
   setOpen: (open: boolean) => void;
   onAdd: (filter: Filter) => void;
 }): JSX.Element {
-  const [chosen, setChosen] = createSignal<BuilderLeafKind | null>(null);
-  const [propertyKey, setPropertyKey] = createSignal<string | null>(null);
+  const [chosen, setChosen] = createSignal<VocabularyChoice | null>(null);
   const [propertyId, setPropertyId] = createSignal<PropertyOperatorId>("is");
   const [propertyValues, setPropertyValues] = createSignal<string[]>([]);
   let triggerEl: HTMLButtonElement | undefined;
   const chooserId = `qs-add-${createUniqueId()}`;
   const reset = () => {
     setChosen(null);
-    setPropertyKey(null);
     setPropertyValues([]);
   };
   const close = () => {
     reset();
     props.setOpen(false);
   };
-  const effective = createMemo(() => effectiveFor(props.sheet.registry, propertyKey() ?? undefined));
+  const property = () => {
+    const choice = chosen();
+    return choice?.kind === "property" ? choice : null;
+  };
+  const effective = createMemo(() => effectiveFor(props.sheet.registry, property()?.key));
+  /** The chosen key's operators and value encoding are registry answers, so
+   *  while the read is in flight the editor keeps the key and the draft on
+   *  screen and refuses to commit — rather than encoding a `number` key, or one
+   *  whose declaration has just been written, as text (§6.3). */
+  const registryPending = () => props.sheet.registry.pending();
   const commitProperty = () => {
-    const key = propertyKey();
-    if (!key) return;
+    const choice = property();
+    if (!choice || registryPending()) return;
     const filter = encodePropertyLeaf({
       id: propertyId(),
-      key,
+      key: choice.key,
       values: propertyValues(),
       type: effective().type,
-      throughPage: chosen() === "pageProperty",
+      throughPage: choice.throughPage,
     });
     if (!filter) return;
     props.onAdd(filter);
@@ -1717,6 +1711,29 @@ function AddCondition(props: {
     reset();
     props.setOpen(true);
   };
+  const choose = (choice: VocabularyChoice) => {
+    if (choice.kind === "builtin") {
+      const next = choice.leaf;
+      if (next === "scheduled" || next === "deadline") return props.onAdd(planningFilter(next));
+      if (next === "journal") return props.onAdd(journalFilter());
+      setChosen(choice);
+      return;
+    }
+    setChosen(choice);
+    // The family's first identity is pre-selected the moment the key is chosen,
+    // so the common case needs no click (§7.4). Which family it is comes from
+    // the registry, so when the read is still in flight the pre-selection waits
+    // for it (below) instead of defaulting to text.
+    if (!registryPending()) setPropertyId(propertyOperators(effective())[0]?.id ?? "is");
+  };
+  // The key stays chosen across the wait; the moment its rows land, the family's
+  // first identity is selected exactly as it would have been on the pick.
+  createEffect(() => {
+    if (registryPending() || !property()) return;
+    if (!propertyOperators(effective()).some((operator) => operator.id === propertyId())) {
+      setPropertyId(propertyOperators(effective())[0]?.id ?? "is");
+    }
+  });
   return (
     <div class="qs-add-wrap">
       <button
@@ -1738,31 +1755,24 @@ function AddCondition(props: {
           <Show
             when={chosen()}
             fallback={
-              <Listbox
+              <QueryVocabularyPicker
                 id={chooserId}
-                label="Condition field"
-                filterable
+                anchor={props.sheet.anchor()}
+                rows={props.sheet.registry.rows}
+                pending={props.sheet.registry.pending}
                 placeholder="Type to add a condition"
                 rootRef={rootRef}
-                options={FILTER_TYPES.map((t) => ({ key: t.kind, label: t.label }))}
-                onPick={(picked) => {
-                  const next = picked as BuilderLeafKind;
-                  if (next === "scheduled" || next === "deadline") return props.onAdd(planningFilter(next));
-                  if (next === "journal") return props.onAdd(journalFilter());
-                  setChosen(next);
-                  if (next === "property" || next === "pageProperty") setPropertyId("is");
-                }}
+                onPick={choose}
               />
             }
           >
-            {(kind) => (
+            {(choice) => (
               <div ref={rootRef} class="qs-menu" onClick={stop}>
                 <Show
-                  when={kind() === "property" || kind() === "pageProperty"}
+                  when={property()}
                   fallback={
                     <ValueEditor
-                      facets={props.sheet.facets}
-                      kind={kind()}
+                      kind={(choice() as VocabularyChoice & { kind: "builtin" }).leaf}
                       onCommit={(filter) => {
                         props.onAdd(filter);
                         reset();
@@ -1771,30 +1781,33 @@ function AddCondition(props: {
                     />
                   }
                 >
-                  <Show
-                    when={propertyKey()}
-                    fallback={
-                      <PropertyKeyPick
-                        facets={props.sheet.facets}
-                        onPick={(key) => {
-                          setPropertyKey(key);
-                          // The family's first identity is pre-selected the
-                          // moment the key is chosen, so the common case needs
-                          // no click (§7.4).
-                          setPropertyId(propertyOperators(effective())[0]?.id ?? "is");
-                        }}
+                  {(pick) => (
+                    <div class="qs-value-editor">
+                      <div class="qs-menu-title">
+                        {pick().key}
+                        <Show when={pick().throughPage}>
+                          <span class="qs-menu-scope"> (page property)</span>
+                        </Show>
+                      </div>
+                      <PropertyType
+                        propertyKey={pick().key}
+                        rows={props.sheet.registry.rows}
+                        onDeclarationWritten={props.sheet.registry.request}
                       />
-                    }
-                  >
-                    {(key) => (
-                      <div class="qs-value-editor">
-                        <div class="qs-menu-title">{key()}</div>
-                        <PropertyType
-                          propertyKey={key()}
-                          rows={props.sheet.registry.rows}
-                          onDeclarationWritten={props.sheet.registry.request}
-                        />
+                      <Show
+                        when={!registryPending()}
+                        fallback={
+                          /* The key and the draft below stay exactly where the
+                             user left them; only the choice of comparison waits,
+                             because which comparisons exist is the registry's
+                             answer. */
+                          <div class="qs-registry-pending" role="status">
+                            Reading this graph's properties…
+                          </div>
+                        }
+                      >
                         <Listbox
+                          class="qs-inline-list"
                           id={`${chooserId}-op`}
                           label="Condition operator"
                           options={propertyOperators(effective()).map((operator) => ({
@@ -1809,25 +1822,31 @@ function AddCondition(props: {
                             }
                           }}
                         />
-                        <Show when={propertyOperatorArity(propertyId()) > 0}>
-                          <input
-                            class="qs-input"
-                            autofocus
-                            aria-label="Value"
-                            placeholder="Value"
-                            value={propertyValues()[0] ?? ""}
-                            onInput={(e) => setPropertyValues([e.currentTarget.value])}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") commitProperty();
-                            }}
-                          />
-                        </Show>
-                        <button type="button" class="qs-commit" onClick={commitProperty}>
-                          Add
-                        </button>
-                      </div>
-                    )}
-                  </Show>
+                      </Show>
+                      <Show when={propertyOperatorArity(propertyId()) > 0}>
+                        <input
+                          class="qs-input"
+                          autofocus
+                          aria-label="Value"
+                          placeholder="Value"
+                          disabled={registryPending()}
+                          value={propertyValues()[0] ?? ""}
+                          onInput={(e) => setPropertyValues([e.currentTarget.value])}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitProperty();
+                          }}
+                        />
+                      </Show>
+                      <button
+                        type="button"
+                        class="qs-commit"
+                        disabled={registryPending()}
+                        onClick={commitProperty}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  )}
                 </Show>
               </div>
             )}

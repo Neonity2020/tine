@@ -121,15 +121,10 @@ async function openSheet(root: HTMLElement): Promise<HTMLElement> {
   });
 }
 
+/** P4 retired the `<details>` disclosure: inside an open sheet the pane is
+ *  visible and editable (§7.5). Opening the sheet is opening the pane. */
 async function openPane(root: HTMLElement): Promise<HTMLTextAreaElement> {
   const sheet = await openSheet(root);
-  const details = await vi.waitFor(() => {
-    const found = sheet.querySelector<HTMLDetailsElement>(".query-text-pane-details");
-    if (!found) throw new Error("the query text pane never appeared");
-    return found;
-  });
-  details.open = true;
-  details.dispatchEvent(new Event("toggle"));
   return await vi.waitFor(() => {
     const input = sheet.querySelector<HTMLTextAreaElement>(".query-text-pane-input");
     if (!input) throw new Error("the pane has no input");
@@ -161,8 +156,15 @@ function arrangeCrossing(dismissed: string[] = []): void {
   bumpGraphEpoch();
 }
 
+/** **Document scope, not the block's element (P4, N3).** The one notice moves:
+ *  it is inline under the block while the sheet is shut, and inside the query
+ *  text pane — which is PORTALLED to <body> with the sheet — while it is open.
+ *  Every behavioural assertion below is unchanged; only where the selector
+ *  looks is. `root` is kept in the signature because "the notice belongs to
+ *  this block" is still what is being asserted, and these tests mount one. */
 function notice(root: HTMLElement): HTMLElement | null {
-  return root.querySelector<HTMLElement>(".query-crossing-notice");
+  void root;
+  return document.querySelector<HTMLElement>(".query-crossing-notice");
 }
 
 async function waitForNotice(root: HTMLElement): Promise<HTMLElement> {
@@ -173,8 +175,12 @@ async function waitForNotice(root: HTMLElement): Promise<HTMLElement> {
   });
 }
 
-const undoButton = (root: HTMLElement) =>
-  root.querySelector<HTMLButtonElement>(".query-crossing-notice-undo")!;
+const undoButton = (root: HTMLElement) => {
+  void root;
+  return document.querySelector<HTMLButtonElement>(".query-crossing-notice-undo")!;
+};
+const keepButton = () =>
+  document.querySelector<HTMLButtonElement>(".query-crossing-notice-keep")!;
 
 describe("C1: a crossing says so", () => {
   it("shows the §7.5 notice, in its exact words, as a status region that takes focus", async () => {
@@ -303,7 +309,7 @@ describe("C3: [Keep it] and the device-local dismissal", () => {
     try {
       await saveThroughPane(root, "-- task DONE");
       await waitForNotice(root);
-      root.querySelector<HTMLButtonElement>(".query-crossing-notice-keep")!.click();
+      keepButton().click();
       await vi.waitFor(() => expect(notice(root)).toBeNull());
       expect(doc.byId.query.raw).toContain("{{tine-query");
       expect(save).not.toHaveBeenCalled();
@@ -324,7 +330,7 @@ describe("C3: [Keep it] and the device-local dismissal", () => {
       const box = shown.querySelector<HTMLInputElement>("input[type=checkbox]")!;
       box.checked = true;
       box.dispatchEvent(new Event("change", { bubbles: true }));
-      root.querySelector<HTMLButtonElement>(".query-crossing-notice-keep")!.click();
+      keepButton().click();
       await settle();
 
       // I-18/D-11: the dismissal is app-data keyed by graph. Nothing about it
@@ -367,6 +373,74 @@ describe("C3: [Keep it] and the device-local dismissal", () => {
       // extra notice, never the edit and never the graph.
       await waitForNotice(root);
       expect(doc.byId.query.raw).toBe("{{tine-query -- task DONE}}");
+    } finally {
+      dispose();
+    }
+  });
+});
+
+// C5 (P4). **One notice, which MOVES.** The sheet is portalled to <body>, so a
+// notice drawn under the block while the sheet is open sits somewhere the
+// reader is not looking — at the far end of an overlay, behind the sheet they
+// are editing in. So the same component, with the same state, is hosted by the
+// pane while the sheet is open and inline under the block while it is shut.
+// What must never happen is a SECOND copy: two notices means two undo buttons,
+// one of which is about a change the other already took back.
+describe("C5: the notice is one instance that changes host with the sheet", () => {
+  it("sits inside the text pane while the sheet is open, and under the block once it is shut", async () => {
+    load('{{query (task TODO)}}');
+    arrangeCrossing();
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await saveThroughPane(root, "-- task DONE");
+      const shown = await waitForNotice(root);
+      expect(document.querySelectorAll(".query-crossing-notice")).toHaveLength(1);
+      expect(shown.closest(".query-text-pane")).not.toBeNull();
+
+      // Shut the sheet: the notice is still there, still one, and now inline
+      // under the block where the reader is.
+      root.querySelector<HTMLButtonElement>(".qs-gear")!.click();
+      await settle();
+      expect(document.querySelector(".qs-sheet")).toBeNull();
+      const inline = await waitForNotice(root);
+      expect(document.querySelectorAll(".query-crossing-notice")).toHaveLength(1);
+      expect(inline.closest(".query-text-pane")).toBeNull();
+      expect(root.contains(inline)).toBe(true);
+      expect(inline.textContent?.replace(/\s+/g, " ")).toContain(NOTICE_TEXT);
+      expect(inline.querySelector(".query-crossing-notice-undo")).not.toBeNull();
+
+      // ...and back again, without ever being two.
+      root.querySelector<HTMLButtonElement>(".qs-gear")!.click();
+      await settle();
+      const reopened = await waitForNotice(root);
+      expect(document.querySelectorAll(".query-crossing-notice")).toHaveLength(1);
+      expect(reopened.closest(".query-text-pane")).not.toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
+  it("shows a bounded excerpt of what the block now reads, without printing again", async () => {
+    load('{{query (task TODO)}}');
+    arrangeCrossing();
+    const print = vi.mocked(backend().printQuery);
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await saveThroughPane(root, "-- task DONE");
+      const shown = await waitForNotice(root);
+      const changed = shown.querySelector<HTMLElement>(".query-crossing-notice-changed");
+      expect(changed).not.toBeNull();
+      expect(changed!.textContent).toContain("The block now reads:");
+      // The excerpt is the query ARGUMENT the save wrote, bounded — not the
+      // whole macro, and not a second rendering of the query.
+      expect(changed!.querySelector("code")?.textContent).toBe("-- task DONE");
+      // The excerpt is a slice of the bytes the save ALREADY produced. Asking
+      // the printer a second time to describe the crossing would be a second
+      // print dialect on the save path, which the print-dialect pin forbids.
+      const dialects = print.mock.calls.map(([, , dialect]) => dialect);
+      expect(dialects).not.toContain("og");
     } finally {
       dispose();
     }

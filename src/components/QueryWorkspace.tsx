@@ -519,7 +519,6 @@ function AdvancedModal(props: {
               session={() => builderSession.latest}
               onChange={(next) => void applyBuilderEdit(next)}
               paneDialect="og"
-              paneAlwaysOpen
               sheetAlwaysOpen
               parentTransientId={props.layerId}
             />

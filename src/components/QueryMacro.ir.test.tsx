@@ -155,17 +155,11 @@ async function openSheet(root: HTMLElement): Promise<HTMLElement> {
   });
 }
 
-/** Open the collapsed text pane in the sheet's footer, as a user clicking its
- *  disclosure does. */
+/** Reach the text pane in the sheet's footer. **P4 retired the disclosure**:
+ *  inside an open sheet the pane is visible and editable, so opening the sheet
+ *  IS opening the pane (§7.5). The resting sentence still mounts none of it. */
 async function openPane(root: HTMLElement): Promise<HTMLTextAreaElement> {
   const sheet = await openSheet(root);
-  const details = await vi.waitFor(() => {
-    const found = sheet.querySelector<HTMLDetailsElement>(".query-text-pane-details");
-    if (!found) throw new Error("the query text pane never appeared");
-    return found;
-  });
-  details.open = true;
-  details.dispatchEvent(new Event("toggle"));
   return await vi.waitFor(() => {
     const input = sheet.querySelector<HTMLTextAreaElement>(".query-text-pane-input");
     if (!input) throw new Error("the pane has no input");
@@ -603,6 +597,70 @@ describe("B6: directive migration for blocks that stay {{query}}", () => {
       // property writes are refused TOGETHER rather than half-applied.
       expect(doc.byId.query.raw).toBe(before);
       expect(blockProperty("query", "tine.sort")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+});
+
+// B7 (P4). What the block SAYS when the engine understood only part of the
+// query. `REG-P0-QUERY-UNKNOWN-HEAD-001` fixed the Rust half — an unknown head
+// is a `Raw` leaf with a diagnostic and the query returns nothing rather than a
+// silently narrower answer. The frontend half is the sentence above the empty
+// result: it must say the query returned NO results, and it must not say the
+// part was "ignored", which is exactly the reading ("the rest still ran, and
+// these are its rows") that the Rust fix exists to prevent.
+describe("B7: an unknown head reads as 'returned no results', never as 'ignored'", () => {
+  it("leads the run's diagnostics with what actually happened", async () => {
+    load(TQL_MACRO);
+    vi.spyOn(backend(), "queryRun").mockResolvedValue({
+      ...blockRunResult([]),
+      diagnostics: [
+        { message: "`frobnicate` isn't something Tine can query", kind: "unknown_head", span: { start: 6, end: 16 } },
+      ],
+    });
+    vi.spyOn(backend(), "queryExplainEmpty").mockResolvedValue({
+      rows: [],
+      diagnostics: [],
+      report: { ran: [], ignored: [], supported: true },
+    });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      const note = await vi.waitFor(() => {
+        const found = root.querySelector<HTMLElement>(".query-diagnostics");
+        if (!found) throw new Error("the diagnostics note never appeared");
+        return found;
+      });
+      expect(note.getAttribute("role")).toBe("alert");
+      expect(note.textContent).toContain("returned no results");
+      expect(note.querySelector(".query-diagnostics-lead")?.textContent?.trim()).toBe(
+        "Tine didn't understand part of this query, so it returned no results:",
+      );
+      expect(note.textContent).toContain("`frobnicate` isn't something Tine can query");
+      // The word this test exists for.
+      expect(note.textContent?.toLowerCase()).not.toContain("ignored");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("stays silent for a diagnostic that is inside an `off` subtree (§3.5)", async () => {
+    load(TQL_MACRO);
+    vi.spyOn(backend(), "queryRun").mockResolvedValue({
+      ...blockRunResult(groups()),
+      diagnostics: [
+        { message: "a disabled condition never ran", kind: "syntax", disabled: true },
+      ],
+    });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(root.textContent).toContain("A tracked row"));
+      // The rows are real: a disabled diagnostic does not invalidate, so
+      // announcing "returned no results" over a result that HAS rows would be
+      // the opposite lie.
+      expect(root.querySelector(".query-diagnostics")).toBeNull();
     } finally {
       dispose();
     }

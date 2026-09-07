@@ -10060,7 +10060,7 @@
     },
     {
       "id": "UI-HARVEST-W4-P1-QUERY-BUILDER-FACET-SHARING",
-      "title": "Several query builders on one page ask for the graph's facets once, and all of them show the answer",
+      "title": "Several query builders on one page ask the graph for its vocabulary once, and all of them show the answer",
       "family": "query-builder-facets",
       "sources": {
         "issues": [],
@@ -10074,13 +10074,13 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/QueryBuilder.transient.test.tsx::QueryBuilder facet sharing (Harvest W4-P1 item 3)::issues one shared facets request per (graph scope, dataRev) for five mounted builders",
-          "src/components/QueryBuilder.transient.test.tsx::QueryBuilder transient ownership (post-GH #161)::asks for no facets at rest, once when the sheet opens, and once per data revision"
+          "src/components/QueryBuilder.transient.test.tsx::QueryBuilder registry sharing (Harvest W4-P1 item 3)::issues one shared registry request per (graph scope, dataRev, declaration) for five mounted builders",
+          "src/components/QueryBuilder.transient.test.tsx::QueryBuilder transient ownership (post-GH #161)::asks the graph nothing at rest, reads the registry when the sheet opens, and again per data revision"
         ],
-        "scenario": "query-builder.shared-facets-per-graph-scope-and-datarev",
+        "scenario": "query-builder.shared-registry-per-graph-scope-datarev-and-declaration",
         "failBefore": "proven"
       },
-      "notes": "Blocking stateful UX plus a cost bound: one queryFacets(false) request per (graph scope, dataRev) however many builders are mounted, AND every mounted builder offers the current payload through its own Property picker, so the reduction cannot be met by starving a consumer or serving an earlier revision. Fail-before: five mounted builders issued five identical whole-graph requests per revision (log under tine-agents/evidence/wave4/p1/necessity-p1-3.txt); after routing the resource through sharedQueryResult under a query-facets key namespace, one per mount, one per dataRev bump, one per graph-scope change (after-p1-3.txt). The autocomplete producer's queryFacets(true) is a different question and is asserted to remain its own call. P3 update: the bound got strictly cheaper. Five mounted builders at REST now issue zero requests — a resting sentence needs no vocabulary — and the single shared request is made when the first sheet opens, then served to the other four from the same entry."
+      "notes": "Blocking stateful UX plus a cost bound: one queryFacets(false) request per (graph scope, dataRev) however many builders are mounted, AND every mounted builder offers the current payload through its own Property picker, so the reduction cannot be met by starving a consumer or serving an earlier revision. Fail-before: five mounted builders issued five identical whole-graph requests per revision (log under tine-agents/evidence/wave4/p1/necessity-p1-3.txt); after routing the resource through sharedQueryResult under a query-facets key namespace, one per mount, one per dataRev bump, one per graph-scope change (after-p1-3.txt). The autocomplete producer's queryFacets(true) is a different question and is asserted to remain its own call. P3 update: the bound got strictly cheaper. Five mounted builders at REST now issue zero requests — a resting sentence needs no vocabulary — and the single shared request is made when the first sheet opens, then served to the other four from the same entry. P4 update: the request being shared is the REGISTRY read, `queryFacets(false)` having been deleted with the two-stage property chooser it fed. The key gained the graph root and a module-level declaration revision, so a `tine.type` written in one sheet refreshes every open builder through one shared call and cannot be served from the previous key’s already-resolved entry; a snapshot that resolves after the graph changed underneath is dropped rather than shown under the new graph. `docs/contracts/frontend-staleness.md` Item 3 moved with it."
     },
     {
       "id": "UI-PAGE-REF-ALIAS-RESTYLE-484",
@@ -10561,12 +10561,13 @@
           "src/components/QuerySheet.test.tsx::switching what the query selects re-validates it and says how much it costs::counts the conditions that stop applying and offers a way out of each",
           "src/components/QuerySheet.test.tsx::switching what the query selects re-validates it and says how much it costs::cancels back to the query it had, with nothing changed",
           "crates/tine-core/src/query/tql.rs::a_block_attribute_at_the_page_anchor_is_retained_as_not_applicable",
-          "crates/tine-core/src/query/tql.rs::a_retained_wrong_row_leaf_survives_print_and_reparse"
+          "crates/tine-core/src/query/tql.rs::a_retained_wrong_row_leaf_survives_print_and_reparse",
+          "src/components/QuerySheet.test.tsx::anchor preview belongs to the current open sheet::drops an old success after %s"
         ],
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "User harm: the anchor line lets someone turn a block query into a page query in one click, and half their conditions can stop meaning anything — `task` does not apply to pages. Before this the parser answered a wrong-row name with `unknown identifier` and DROPPED the leaf, so the switch silently deleted conditions. Two halves. In Rust (`tql.rs` only): a name that exists but belongs to the other row now parks a `not_applicable` diagnostic and the author's leaf is RETAINED as `Raw(NotApplicable)` with its original slice, so it survives print-and-reparse byte-for-byte and keeps its place among its siblings; a leaf inside an `Off` carries `disabled: true` and does not invalidate (§3.5). In the frontend: the switch is previewed by printing and re-parsing through the ENGINE before anything is committed, the prompt COUNTS (\"1 of your 2 conditions\"), names the conditions, and offers Remove them / Keep anyway / Cancel. The preview carries an I-20 revision watermark, so a late answer for an anchor the user has since changed is dropped rather than applied. jsdom has no engine, so the round trip runs through one mock-only fixture seam whose mock-onlyness is itself asserted (`src/mockQueryFixture.guard.test.ts`)."
+      "notes": "User harm: the anchor line lets someone turn a block query into a page query in one click, and half their conditions can stop meaning anything — `task` does not apply to pages. Before this the parser answered a wrong-row name with `unknown identifier` and DROPPED the leaf, so the switch silently deleted conditions. Two halves. In Rust (`tql.rs` only): a name that exists but belongs to the other row now parks a `not_applicable` diagnostic and the author's leaf is RETAINED as `Raw(NotApplicable)` with its original slice, so it survives print-and-reparse byte-for-byte and keeps its place among its siblings; a leaf inside an `Off` carries `disabled: true` and does not invalidate (§3.5). In the frontend: the switch is previewed by printing and re-parsing through the ENGINE before anything is committed, the prompt COUNTS (\"1 of your 2 conditions\"), names the conditions, and offers Remove them / Keep anyway / Cancel. The preview carries an I-20 exact request revision, so a late answer for an anchor the user has since changed is dropped rather than applied. jsdom has no engine, so the round trip runs through one mock-only fixture seam whose mock-onlyness is itself asserted (`src/mockQueryFixture.guard.test.ts`). Manager regression: a reply cannot commit after closing, selecting the original anchor, or issuing a newer request; all three fail before the current-revision correction."
     },
     {
       "id": "UI-QUERY-TYPED-LEAF-REOPEN-001",
@@ -10613,7 +10614,7 @@
         "scenario": "query-sheet.sentence-to-sheet-round-trip",
         "failBefore": "proven"
       },
-      "notes": "The sheet is portalled to <body> \u2014 `.query-block` carries `transform: translateZ(0)` (the GH #64 WebKitGTK flicker fix) and would otherwise be the containing block for a `position: fixed` child. But Solid DELEGATES `mousedown` and walks the portal's `_$host`, so a press inside the sheet was still delivered to `.block-content.macro-host`, whose handler starts editing the block: `+ Add condition`, `+ sort` and `+ summarize` each tore the sheet out of the DOM on their own pointerdown, before the click could reach them. `forbidsEditEntry` looked right \u2014 `button` is in its forbidden list \u2014 but its containment guard (`currentTarget.contains(hit)`) is false for a portalled node, so the guard passed the press through. It now refuses edit entry for ANY press the host does not physically contain. jsdom never caught it because the tests clicked through the DOM (`.click()` fires no pointerdown) and the native journey clicked through WebDriver, which does not either; the fail-before mounts a real `<Portal>` and dispatches a real `mousedown`."
+      "notes": "The sheet is portalled to <body> — `.query-block` carries `transform: translateZ(0)` (the GH #64 WebKitGTK flicker fix) and would otherwise be the containing block for a `position: fixed` child. But Solid DELEGATES `mousedown` and walks the portal's `_$host`, so a press inside the sheet was still delivered to `.block-content.macro-host`, whose handler starts editing the block: `+ Add condition`, `+ sort` and `+ summarize` each tore the sheet out of the DOM on their own pointerdown, before the click could reach them. `forbidsEditEntry` looked right — `button` is in its forbidden list — but its containment guard (`currentTarget.contains(hit)`) is false for a portalled node, so the guard passed the press through. It now refuses edit entry for ANY press the host does not physically contain. jsdom never caught it because the tests clicked through the DOM (`.click()` fires no pointerdown) and the native journey clicked through WebDriver, which does not either; the fail-before mounts a real `<Portal>` and dispatches a real `mousedown`."
     },
     {
       "id": "UI-QUERY-SHEET-NARROW-BOTTOM-001",
@@ -10637,6 +10638,201 @@
         "failBefore": "reconstructed"
       },
       "notes": "The sheet is positioned from the resting sentence's rect, which on a phone-width viewport would put a 320px-minimum panel partly off screen and under the thumb's reach. Below 600px the inline top/left/width the host sets are overridden and the sheet docks to the bottom edge, full width, with its own scroll and the shared `--overlay-inset-bottom` token for the home indicator (never a bare `env()` at the call site — `src/mobileSafeArea.test.ts` enforces that). Only a real engine runs a media query and reports layout, so this is a browser-layer check rather than a jsdom test. It is asserted at 560px by `scripts/shot-query-sheet.mjs`, NOT by the native journey: the desktop window declares `minWidth: 640` (src-tauri/tauri.conf.json), so a WebKit window can never reach the breakpoint — what `scripts/e2e-query-sheet.mjs` proves instead is that at the narrowest window the app allows the sheet still fits inside the viewport."
+    },
+    {
+      "id": "UI-QUERY-VOCABULARY-ONE-PICKER-001",
+      "title": "One list answers “which field?”, and it is the graph's own vocabulary rather than an alphabetical key dump",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryVocabularyPicker.test.tsx::the vocabulary list is the registry's, ordered and scoped",
+          "src/components/QueryVocabularyPicker.test.tsx::the picker at the sheet's own mount",
+          "src/components/PropertyType.test.tsx::A4: the registry is read on picker open and after a declaration — and nowhere else (I-13)",
+          "scripts/e2e-query-vocabulary.mjs",
+          "scripts/shot-query-vocabulary.mjs"
+        ],
+        "scenario": "query-vocabulary.one-list-for-adding-and-changing-a-field",
+        "failBefore": "proven"
+      },
+      "notes": "User capability: adding a condition asked for a TYPE first and then for a KEY, from `query_facets(false)` — a whole-graph key/value scan whose answer carried no counts, no types and no ordering, so the list was alphabetical noise in which a key used four hundred times sat below one used once; changing a row's field asked the same question through a SECOND control. Both are now the one registry-backed picker (§6.1, §7.5): built-ins first in their fixed §7.4 order, then this graph's property keys by DESCENDING count with a normalized-name tie-break, each row carrying the observed type, the type declared by `tine.type` when there is one, the authoritative count in the anchor's own scope (blocks for `@block`, pages for `@page` and for a key read through the owning page) and a preview of the registry's `top_values`. A built-in carries NO count: the registry holds no statistics for one, and borrowing a same-named property's would be a number the user could act on and the engine never said — fail-before is that inversion, `evidence/qe/p4/failbefore-builtin-count.log`. A key that is not already listed in a scope the query can use is offered by name in that scope — see UI-QUERY-VOCABULARY-BOTH-SCOPES-001 — with `registryRowFor` (the existing matcher) deciding what the graph already has."
+    },
+    {
+      "id": "UI-QUERY-VOCABULARY-BOTH-SCOPES-001",
+      "title": "A typed property key stays authorable as the row's own property AND as its page's, including a key the graph has only on pages",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryVocabularyPicker.test.tsx::a key stays authorable in BOTH scopes",
+          "scripts/shot-query-vocabulary.mjs"
+        ],
+        "scenario": "query-vocabulary.a-typed-key-is-authorable-in-either-scope",
+        "failBefore": "proven"
+      },
+      "notes": "Regression the correction pass closed. The two-stage chooser reached `PropertyKeyPick` through TWO field kinds, `property` and `pageProperty`, so any typed key could be authored either way. Collapsing that into one list keyed off `registryRowFor` lost both halves: `novelKeyEntry` always encoded `throughPage: false`, so a new page-property condition could not be created on `@block` at all, and it returned `null` for any key the registry knew — so a key written only on PAGES was unauthorable as a block property, since the block section filters on `count_blocks > 0`. The offer is now per scope and is made exactly where that scope's own section does not already carry the key: `@block` offers the block's own property and the owning page's, `@page` offers one (F5 — there is no reading a page's property through a page). Counts are the registry's own numbers with the scope's unit — a key with a row and `count_blocks == 0` honestly reads `0 blocks today` — and while the registry read has not landed the rows carry NO count, because 0 would be a claim about a graph nobody has looked at yet. Both flows are proven to reach the existing `encodePropertyLeaf` with the right `throughPage`: adding a condition and changing a row's field. Fail-before: `evidence/qe/p4c/failbefore-corrections.log`, \"a page-only key was unauthorable as a block property: expected null to be truthy\"."
+    },
+    {
+      "id": "UI-QUERY-LISTBOX-OPTION-ID-001",
+      "title": "aria-activedescendant stays one valid ID reference for a property key with spaces, punctuation or a lone surrogate",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryVocabularyPicker.test.tsx::option ids are single valid ID references"
+        ],
+        "scenario": "query-vocabulary.option-ids-are-valid-id-references",
+        "failBefore": "proven"
+      },
+      "notes": "Accessibility correctness. `QueryListbox`'s option id interpolated the row key straight into a DOM id, and the keys are the user's own vocabulary: `due date`, `quote\"key`, `a#b.c`, `ünïcode ключ`, an emoji, or a lone surrogate out of a malformed file. `aria-activedescendant` takes an IDREF — exactly one id — so a key with a space produced an attribute the platform reads as two references and resolves as neither, which tells a screen-reader user about a row that does not exist. `encodeOptionKey` now writes four hex digits per UTF-16 code unit: total (defined on lone surrogates), injective (fixed width, so distinct keys cannot collide) and `[0-9a-f]*`, which no selector or IDREF can misread. Identity stays the KEY, never a filtered or virtual index. Fail-before: `evidence/qe/p4c/failbefore-corrections.log`, \"step 6: \\\"qs-add-cl-277-option-property:due date\\\" is not a single ID reference\"."
+    },
+    {
+      "id": "UI-QUERY-REGISTRY-PENDING-001",
+      "title": "A registry read in flight is not a graph with no properties, and a property edit waits for it rather than coercing as text",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryVocabularyPicker.test.tsx::a pending registry is not a known-empty graph",
+          "src/components/QueryBuilder.transient.test.tsx::QueryBuilder registry sharing (Harvest W4-P1 item 3)"
+        ],
+        "scenario": "query-vocabulary.pending-registry-is-not-an-empty-graph",
+        "failBefore": "proven"
+      },
+      "notes": "Correctness under the manager's registry-scope fix (§6.3, §6.4, I-20). Rows are exposed only for the CURRENT graph scope and request key, so `rows()` is `undefined` both when nothing was asked and while a `dataRev`/declaration refresh is in flight — and every consumer read the second as the first. The picker showed a graph with no property keys; `effectiveFor` fell back to the untyped `text` family, so an operator or value committed during the wait could retype a `number` key, or one whose `tine.type` was written a moment ago, as text. `RegistryAccess.pending` now distinguishes them from the same predicate that gates the rows: the picker draws one compact line and keeps the built-ins (which need no registry) usable, and the property operator menu, value inputs and commit are suspended — with the chosen key and the typed draft preserved — until the answer lands, at which point the family's first identity is selected exactly as it would have been on the pick. No new cache, timer or scheduling subsystem (F6). Fail-before: `evidence/qe/p4c/failbefore-corrections.log`, \"the operator menu used a stale declaration: expected false to be true\"."
+    },
+    {
+      "id": "UI-QUERY-VOCABULARY-NARROW-001",
+      "title": "On a phone-width window the graph's own property keys and their counts can be scrolled into view and chosen",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/shot-query-vocabulary.mjs"
+        ],
+        "scenario": "query-vocabulary.narrow-window-reaches-the-graphs-keys",
+        "failBefore": "proven"
+      },
+      "notes": "User capability at 560px and at a phone's 390px, DRIVEN rather than photographed. The picker's rows sit under seven built-ins, and on a narrow window the sheet docks to the bottom edge, so the graph's own vocabulary — the point of the packet — opened below the fold. The scroll path is the bottom sheet's own `overflow-y: auto` (no second popover controller): the probe walks the keyboard to the first property row on the UNFILTERED list, wheels over the sheet's top edge, and refuses to pass unless that row, its count and the whole list viewport are inside the window, the popover is not cut off sideways, and Enter opens the row's value editor; it then repeats the same demand for a key reached by typing. One layout change was forced by it: under 600px the vocabulary viewport is `min(272px, 32vh)` instead of the desktop's 320px, because at 320px the box still ended ~20px under the window edge with the sheet scrolled to its end. Evidence: `screenshots/query-vocabulary-{narrow,narrow-chosen,phone,phone-chosen}.png` and `evidence/qe/p4c/shot-final.log`. The chosen-property operator list must stay inside its value editor; inline list placement is checked at both widths."
+    },
+    {
+      "id": "UI-QUERY-VOCABULARY-BOUNDED-001",
+      "title": "A graph with hundreds of property keys still opens a bounded list, and its rarest key is still reachable",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryVocabularyPicker.test.tsx::reveals a rare key by substring, with its registry count and type",
+          "src/components/QueryVocabularyPicker.test.tsx::walks the keyboard to a distant entry and keeps aria-activedescendant mounted",
+          "src/components/QueryVocabularyPicker.test.tsx::asks the graph nothing per keystroke",
+          "src/components/QueryBuilder.transient.test.tsx::QueryBuilder registry sharing (Harvest W4-P1 item 3)",
+          "scripts/e2e-query-vocabulary.mjs"
+        ],
+        "scenario": "query-vocabulary.windowed-list-stays-navigable",
+        "failBefore": "proven"
+      },
+      "notes": "User capability (I-22, I-13). The list is windowed with `@tanstack/solid-virtual`: a 250-key graph mounts a viewport's worth plus overscan, not the graph. Two things windowing can silently break are pinned rather than assumed — `aria-activedescendant` must always name a MOUNTED option (the active row is mounted even before the scroll reaches it, so a keyboard walk never points a screen reader at nothing), and typing filters a list the host ALREADY holds, so the graph is asked nothing per keystroke. The registry itself is read once per (graph scope, `dataRev`, declaration revision) and shared by every open builder; a resting sentence reads nothing at all, and a snapshot that resolves after the graph changed underneath is never shown. jsdom has no layout, so the picker's viewport geometry is stubbed by `src/components/QueryVocabularyPicker.test-helpers.ts` — test-local, with no `isTest` branch in production — and what the rows LOOK like is proved by `scripts/shot-query-vocabulary.mjs`."
+    },
+    {
+      "id": "UI-QUERY-TEXT-PANE-LIVE-001",
+      "title": "The query text is always there, always the engine's answer, and never an answer about text that has changed",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryTextPane.test.tsx::the pane is there, and it is the engine's answer",
+          "src/components/QueryTextPane.test.tsx::I-20: only an answer about what is on screen right now",
+          "src/components/QueryTextPane.test.tsx::invalid text is recoverable, not destructive",
+          "src/components/QueryTextPane.test.tsx::§4.3.2: the diagnostic's own structure survives to the UI",
+          "src/components/QueryMacro.ir.test.tsx::B4: the query text pane",
+          "scripts/e2e-query-vocabulary.mjs",
+          "scripts/shot-query-vocabulary.mjs"
+        ],
+        "scenario": "query-vocabulary.live-text-pane",
+        "failBefore": "proven"
+      },
+      "notes": "User capability (§7.5, §4.3.1–§4.3.2; I-20, I-4/I-9). The pane was a collapsed `<details>`, so the one control that can express everything the rows cannot was the one control a user had to know to look for; inside an open sheet it is now visible and editable, while a RESTING sentence still mounts none of it and prints nothing. Both landing paths take the SAME gate: an answer is rendered only for the exact current revision of a live pane, so neither a stale success nor a stale REJECTION can be shown — a superseded failure reads as “your current text is broken” about text nobody has judged. Save is enabled only for a good parse of the current revision, so it can never write an earlier one. While the text is invalid the last reading that actually ran stays on screen and greyed (blanking it would report a typo as an empty graph, and the grey is scoped to the rows so the box being typed in is not faded), and the diagnostic keeps its structure: kind, disabled-inside-an-`off`-subtree, the engine's own suggestions, the property keys this graph has, and a “Show me” that selects the span — spans are UTF-16 code units converted once at the Rust boundary, so an astral character in the draft does not move them. Fail-before: `evidence/qe/p4/failbefore-i20-gate.log`."
+    },
+    {
+      "id": "UI-QUERY-ADVANCED-AND-NOTICE-001",
+      "title": "The part the sheet cannot draw is reachable, and the crossing notice is one instance that follows the reader",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryTextPane.test.tsx::§7.8: the part the sheet cannot draw is still reachable",
+          "src/components/QueryCrossingNotice.test.tsx::C5: the notice is one instance that changes host with the sheet",
+          "src/components/QueryMacro.ir.test.tsx::B7: an unknown head reads as 'returned no results', never as 'ignored'",
+          "scripts/shot-query-vocabulary.mjs"
+        ],
+        "scenario": "query-vocabulary.advanced-row-and-crossing-notice",
+        "failBefore": "proven"
+      },
+      "notes": "User capability (§7.5, §7.8). Three dead ends closed. (1) The `⟨advanced⟩` row was a label: a query too deep to draw could be seen and removed but not edited. It is a button now, with its own `aria-label`, and it puts the cursor in the query text without touching the IR — the real subtree is never replaced by a `Raw` merely so that it can be drawn. (2) The §7.5 crossing notice was drawn under the block even while the sheet was open over it, which is behind an overlay the reader is not looking at; it is now ONE instance whose host moves — inside the pane while the sheet is open, inline under the block while it is shut — and it carries a bounded excerpt of what the block now reads, sliced from bytes the save already produced rather than from a second print (a second print would add an `og` dialect to the save path). (3) A query the engine understood only part of showed its diagnostics under a bare “No results”; the lead now says the query returned NO results, and never that the part was “ignored”, which is the reading `REG-P0-QUERY-UNKNOWN-HEAD-001` fixed in Rust. Fail-before: `evidence/qe/p4/failbefore-advanced-chip.log`, `failbefore-notice-one-instance.log`, `failbefore-unknown-head-lead.log`."
     }
   ]
 }
