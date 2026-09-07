@@ -113,3 +113,81 @@ fn owned_peer_continues_counters_through_repeated_shallow_reopens() {
         "fixed live state grew: {compact_sizes:?}"
     );
 }
+
+#[test]
+fn update_ranges_start_at_exact_retained_peer_counters() {
+    let id = DocumentId::new();
+    let source = LoroDoc::new();
+    source.set_peer_id(401).unwrap();
+    source.get_text("text").insert(0, "base").unwrap();
+    source.commit();
+    let floor = source.oplog_frontiers();
+    let before = clone_doc(&source, 401).unwrap();
+    source.get_text("text").insert(4, " first").unwrap();
+    source.commit();
+    let first = source
+        .export(ExportMode::updates(&before.oplog_vv()))
+        .unwrap();
+    validate_update_base(id, &before, &first).unwrap();
+    assert!(validate_update_base(id, &source, &first).is_err());
+    let compact = LoroDoc::new();
+    compact
+        .import(&source.export(ExportMode::shallow_snapshot(&floor)).unwrap())
+        .unwrap();
+    let tail = clone_doc(&compact, 401).unwrap();
+    tail.get_text("text").insert(0, "second ").unwrap();
+    tail.commit();
+    let update = tail
+        .export(ExportMode::updates(&compact.oplog_vv()))
+        .unwrap();
+    validate_update_base(id, &compact, &update).unwrap();
+    let other = clone_doc(&compact, 402).unwrap();
+    other.get_text("text").insert(0, "other ").unwrap();
+    other.commit();
+    tail.import(
+        &other
+            .export(ExportMode::updates(&compact.oplog_vv()))
+            .unwrap(),
+    )
+    .unwrap();
+    let combined = tail
+        .export(ExportMode::updates(&compact.oplog_vv()))
+        .unwrap();
+    validate_update_base(id, &compact, &combined).unwrap();
+}
+
+#[test]
+fn exact_frontier_alone_does_not_reject_overlapping_peer_ranges() {
+    let id = DocumentId::new();
+    let source = LoroDoc::new();
+    source.set_peer_id(501).unwrap();
+    source.get_text("text").insert(0, "a").unwrap();
+    source.commit();
+    source.set_peer_id(502).unwrap();
+    source.get_text("text").insert(1, "b").unwrap();
+    source.commit();
+    let before = clone_doc(&source, 503).unwrap();
+    source.set_peer_id(503).unwrap();
+    source.get_text("text").insert(2, "c").unwrap();
+    source.commit();
+    // A non-causal requested vector resends 501's old operation alongside
+    // 503's new operation. The new operation depends on the exact frontier
+    // at 502; the extra old root operation contributes no external dependency.
+    let mut partial = before.oplog_vv();
+    partial.remove(&501);
+    let overlapping = source.export(ExportMode::updates(&partial)).unwrap();
+    let metadata = LoroDoc::decode_import_blob_meta(&overlapping, true).unwrap();
+    assert_eq!(metadata.start_frontiers, before.oplog_frontiers());
+    assert_eq!(metadata.partial_start_vv.get(&501).copied(), Some(0));
+    // Upstream accepts the replay, so the application must reject it before
+    // using carried peer ranges to grant a writer ownership binding.
+    let permissive = clone_doc(&before, 504).unwrap();
+    assert!(permissive.import(&overlapping).unwrap().pending.is_none());
+    assert_eq!(permissive.get_text("text").to_string(), "abc");
+    assert!(matches!(validate_update_base(id, &before, &overlapping),
+        Err(EngineError::CrdtUpdateBaseMismatch(found)) if found == id));
+    let exact = source
+        .export(ExportMode::updates(&before.oplog_vv()))
+        .unwrap();
+    validate_update_base(id, &before, &exact).unwrap();
+}

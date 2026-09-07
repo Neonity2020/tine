@@ -1825,7 +1825,7 @@ already complete for this class.
 | `EngineError::RejectedDependency` | U | Every dependency of a local batch is an accepted batch or an earlier record of the same journal-durable prefix. |
 | `EngineError::DuplicateDocumentUpdate` | U | `updates` is a map built by the foreground; the draft validates the same object set. |
 | `EngineError::MissingDocument` | U | A non-empty page effect puts the catalog in `updates` by construction; `affected_projection_pages` equality is proven at draft. |
-| `EngineError::CrdtUpdateBaseMismatch` | U | `validate_update_base` runs at draft and maps this exact error to `ManagedLocalRecordError::StaleBase` before the append. |
+| `EngineError::CrdtUpdateBaseMismatch` | U | `validate_update_base` runs at draft and maps this exact error to `ManagedLocalRecordError::StaleBase` before the append. It checks both the exact starting frontier and each carried peer range: its start counter equals the retained before-vector counter, its end is strictly greater, and every start has an end. Loro metadata supplies the ranges; replayed overlapping operations cannot establish a new writer binding. |
 | `EngineError::BlockAlreadyExists` | U | The draft checks accepted claims **and** `local_overlay.block_claims`, so it already sees claims introduced by journal-durable records. |
 | `EngineError::MalformedDocument` | U | Document-shape checks over documents the draft built and already validated with `validate_shard` / `validate_immutable_shard_identity`. |
 | `EngineError::ProjectionManifest` | U | `validate_managed_local_projection_candidate` re-renders every intent deterministically and compares target bytes and annotations before the append. |

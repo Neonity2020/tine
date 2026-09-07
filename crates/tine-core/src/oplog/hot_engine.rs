@@ -24588,6 +24588,20 @@ fn validate_update_base(
     if metadata.start_frontiers != before.oplog_frontiers() {
         return Err(EngineError::CrdtUpdateBaseMismatch(document_id));
     }
+    let before_vector = before.oplog_vv();
+    for (peer, end) in metadata.partial_end_vv.iter() {
+        let start = metadata.partial_start_vv.get(peer).copied().unwrap_or(0);
+        if start != before_vector.get(peer).copied().unwrap_or(0) || *end <= start {
+            return Err(EngineError::CrdtUpdateBaseMismatch(document_id));
+        }
+    }
+    if metadata
+        .partial_start_vv
+        .iter()
+        .any(|(peer, _)| !metadata.partial_end_vv.contains_key(peer))
+    {
+        return Err(EngineError::CrdtUpdateBaseMismatch(document_id));
+    }
     Ok(())
 }
 
