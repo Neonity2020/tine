@@ -364,6 +364,8 @@ fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> R
 pub(crate) struct SealedAcceptedCutoff {
     frontier: AcceptedFrontierRoot,
     roots: tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2,
+    causal_tip_root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
+    causal_tips: BTreeMap<[u8; 16], tine_storage::sealed_accepted_index::CausalTipRecordV2>,
 }
 
 impl SealedAcceptedCutoff {
@@ -388,6 +390,8 @@ impl SealedAcceptedCutoff {
                 status_map: empty,
                 sequence: AcceptedSequenceRootV2::empty(),
             },
+            causal_tip_root: empty,
+            causal_tips: BTreeMap::new(),
         })
     }
 
@@ -397,6 +401,18 @@ impl SealedAcceptedCutoff {
 
     pub(crate) fn roots(&self) -> tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2 {
         self.roots
+    }
+
+    pub(crate) fn causal_tip_root(
+        &self,
+    ) -> tine_storage::sealed_accepted_index::AuthenticatedMapRootV1 {
+        self.causal_tip_root
+    }
+
+    pub(crate) fn causal_tips(
+        &self,
+    ) -> impl Iterator<Item = &tine_storage::sealed_accepted_index::CausalTipRecordV2> {
+        self.causal_tips.values()
     }
 
     pub(crate) fn builder<'a, Store>(
@@ -434,6 +450,37 @@ impl<Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore>
         {
             return Err("sealed cutoff repeats an accepted batch".into());
         }
+        let peer_id = row
+            .causal_dot
+            .peer_id()
+            .as_device_id()
+            .as_uuid()
+            .into_bytes();
+        let prior_tip = self.cutoff.causal_tips.get(&peer_id).copied();
+        let expected_tip = prior_tip
+            .map(|tip| tip.value_digest())
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        if SealedAcceptedIndexReader::new(&*self.store)
+            .map_value(self.cutoff.causal_tip_root, peer_id)
+            .map_err(|error| error.to_string())?
+            != expected_tip
+        {
+            return Err("sealed cutoff causal-tip predecessor does not authenticate".into());
+        }
+        let tip = tine_storage::sealed_accepted_index::CausalTipRecordV2 {
+            peer_id,
+            highest_accepted_counter: row.causal_dot.counter(),
+            batch_id,
+        };
+        if prior_tip.is_some_and(|prior| {
+            prior.highest_accepted_counter == tip.highest_accepted_counter
+                && prior.batch_id != tip.batch_id
+        }) {
+            return Err("sealed cutoff has conflicting batches at one causal tip".into());
+        }
+        let advance_tip = prior_tip
+            .is_none_or(|prior| prior.highest_accepted_counter < tip.highest_accepted_counter);
         // Publish immutable nodes first, but do not move any candidate roots
         // until every check passes. An interrupted/erroring append can leave
         // unreachable construction objects; predecessor roots still resolve.
@@ -463,10 +510,38 @@ impl<Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore>
         {
             return Err("sealed cutoff status differs from engine acceptance".into());
         }
-        self.cutoff = SealedAcceptedCutoff {
-            frontier: frontier.clone(),
-            roots,
+        let causal_tip_root = if advance_tip {
+            tine_storage::sealed_accepted_index::SealedAcceptedIndexWriter::new(&mut *self.store)
+                .upsert_map(
+                    self.cutoff.causal_tip_root,
+                    peer_id,
+                    tip.value_digest().map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            self.cutoff.causal_tip_root
         };
+        let expected_tip = if advance_tip { Some(tip) } else { prior_tip }
+            .ok_or("sealed cutoff causal tip disappeared")?;
+        if SealedAcceptedIndexReader::new(&*self.store)
+            .map_value(causal_tip_root, peer_id)
+            .map_err(|error| error.to_string())?
+            != Some(
+                expected_tip
+                    .value_digest()
+                    .map_err(|error| error.to_string())?,
+            )
+        {
+            return Err("sealed cutoff causal tip is missing after publication".into());
+        }
+        // Mutate only the builder's private token after all immutable writes
+        // and point proofs succeed. The input predecessor remains unchanged.
+        self.cutoff.frontier = frontier.clone();
+        self.cutoff.roots = roots;
+        self.cutoff.causal_tip_root = causal_tip_root;
+        if advance_tip {
+            self.cutoff.causal_tips.insert(peer_id, tip);
+        }
         Ok(())
     }
 
@@ -1318,16 +1393,24 @@ mod tests {
     }
 
     fn generation_rows(count: u64) -> Vec<CleanCheckpointAcceptedRow> {
-        let peer = CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_u128(19)));
+        generation_rows_with_dots(&(1..=count).map(|counter| (19, counter)).collect::<Vec<_>>())
+    }
+
+    fn generation_rows_with_dots(dots: &[(u128, u64)]) -> Vec<CleanCheckpointAcceptedRow> {
         let mut prior = AcceptedFrontierRoot::empty();
         let mut entries = Vec::new();
-        (1..=count)
-            .map(|sequence| {
+        dots.iter()
+            .enumerate()
+            .map(|(index, &(peer_id, counter))| {
+                let sequence = index as u64 + 1;
+                let peer = CausalPeerId::from_device_id(DeviceId::from_uuid(
+                    uuid::Uuid::from_u128(peer_id),
+                ));
                 let batch_id = BatchId::from_uuid(uuid::Uuid::from_u128(sequence as u128));
                 let fingerprint = ContentDigest::of(&sequence.to_le_bytes());
                 let event = ContentDigest::of(&sequence.to_be_bytes());
-                let dot = BatchCausalDot::new(peer, sequence).unwrap();
-                let clock = vec![(peer, sequence)];
+                let dot = BatchCausalDot::new(peer, counter).unwrap();
+                let clock = vec![(peer, counter)];
                 let (key, digest) = authenticated_causal_clock_root(&clock).unwrap();
                 let causal =
                     accepted_causal_record_digest(batch_id, fingerprint, event, dot, key, digest);
@@ -1403,13 +1486,25 @@ mod tests {
             .unwrap();
         assert_eq!(cutoff.roots().sequence.len, 0);
         for n in 1..=2 {
-            let transaction = OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                page_id: PageId::from_uuid(uuid::Uuid::from_u128(200 + n)),
-                home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
-                name: LogicalPageName::parse(format!("Page {n}")).unwrap(),
-                path: ManagedPath::parse(format!("pages/Page{n}.md")).unwrap(),
-                kind: ManagedTextKind::Page,
-            }])
+            let transaction = OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(uuid::Uuid::from_u128(200 + n)),
+                    home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+                    name: LogicalPageName::parse(format!("Page {n}")).unwrap(),
+                    path: ManagedPath::parse(format!("pages/Page{n}.md")).unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: crate::oplog::BlockLocation {
+                        block_id: crate::oplog::BlockId::from_uuid(uuid::Uuid::from_u128(600 + n)),
+                        home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+                    },
+                    page_id: PageId::from_uuid(uuid::Uuid::from_u128(200 + n)),
+                    parent: None,
+                    order: "a".into(),
+                    content: format!("Nested CRDT text {n}"),
+                },
+            ])
             .unwrap();
             let prepared = engine
                 .prepare_fixture_transaction(
@@ -1430,12 +1525,33 @@ mod tests {
                 "{:?}",
                 outcome.disposition()
             );
+            assert!(engine
+                .build_compact_accepted_document(&cutoff, catalog)
+                .is_err());
             let before = engine.capture_clean_checkpoint(0).unwrap().state_bytes;
             let manifests = archive.committed_manifest_names().unwrap();
             cutoff = engine
                 .build_sealed_accepted_cutoff(&mut store, Some(&cutoff))
                 .unwrap();
             assert_eq!(cutoff.roots().sequence.len, n as u64);
+            for id in [
+                catalog,
+                DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+            ] {
+                let compact = engine.build_compact_accepted_document(&cutoff, id).unwrap();
+                assert_eq!(
+                    compact.cutoff_state_digest(),
+                    cutoff.frontier().state_digest()
+                );
+                assert_eq!(compact.dependencies().document_id(), id);
+                let restored = loro::LoroDoc::new();
+                assert!(restored
+                    .import(compact.checkpoint())
+                    .unwrap()
+                    .pending
+                    .is_none());
+                assert!(!compact.checkpoint().is_empty());
+            }
             assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
             assert_eq!(archive.committed_manifest_names().unwrap(), manifests);
             assert_eq!(
@@ -1491,6 +1607,11 @@ mod tests {
             .unwrap();
         assert_eq!(second.roots(), full.roots());
         assert_eq!(second.frontier(), full.frontier());
+        assert_eq!(second.causal_tip_root(), full.causal_tip_root());
+        assert_eq!(
+            second.causal_tips().collect::<Vec<_>>(),
+            full.causal_tips().collect::<Vec<_>>()
+        );
         let reader = SealedAcceptedIndexReader::new(&store);
         for row in &rows {
             let sequence = row.evidence.acceptance_sequence();
@@ -1511,6 +1632,113 @@ mod tests {
                     .is_some());
             }
         }
+    }
+
+    #[test]
+    fn sealed_cutoff_causal_tips_keep_exact_highest_per_peer_and_reject_tip_forks() {
+        let rows = generation_rows_with_dots(&[(19, 1), (23, 8), (19, 2), (23, 3)]);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut store = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut store);
+        for row in &rows[..3] {
+            builder.append(row).unwrap();
+        }
+        let first = builder
+            .finish(rows[2].evidence.post_frontier_root())
+            .unwrap();
+        let mut builder = first.builder(&mut store);
+        builder.append(&rows[3]).unwrap();
+        let second = builder
+            .finish(rows[3].evidence.post_frontier_root())
+            .unwrap();
+        // An older accepted counter must not replace the already qualified tip.
+        assert_eq!(second.causal_tip_root(), first.causal_tip_root());
+        let tips = second.causal_tips().copied().collect::<Vec<_>>();
+        assert_eq!(tips.len(), 2);
+        assert_eq!(
+            (tips[0].highest_accepted_counter, tips[0].batch_id),
+            (2, 3u128.to_be_bytes())
+        );
+        assert_eq!(
+            (tips[1].highest_accepted_counter, tips[1].batch_id),
+            (8, 2u128.to_be_bytes())
+        );
+        assert_eq!(second.causal_tip_root().count, 2);
+        let reader = SealedAcceptedIndexReader::new(&store);
+        for tip in &tips {
+            assert_eq!(
+                reader
+                    .map_value(second.causal_tip_root(), tip.peer_id)
+                    .unwrap(),
+                Some(tip.value_digest().unwrap())
+            );
+        }
+        let unchanged = second
+            .builder(&mut store)
+            .finish(second.frontier())
+            .unwrap();
+        assert_eq!(unchanged.causal_tip_root(), second.causal_tip_root());
+        assert_eq!(
+            unchanged.causal_tips().collect::<Vec<_>>(),
+            second.causal_tips().collect::<Vec<_>>()
+        );
+
+        let forks = generation_rows_with_dots(&[(19, 1), (19, 1)]);
+        let mut fork_store = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut fork_store);
+        builder.append(&forks[0]).unwrap();
+        assert!(builder
+            .append(&forks[1])
+            .unwrap_err()
+            .contains("conflicting batches"));
+        let preserved = builder
+            .finish(forks[0].evidence.post_frontier_root())
+            .unwrap();
+        assert_eq!(preserved.roots().sequence.len, 1);
+        assert_eq!(
+            preserved.causal_tips().next().unwrap().batch_id,
+            1u128.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn sealed_cutoff_damaged_causal_tip_predecessor_preserves_cutoff() {
+        let rows = generation_rows(2);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut store = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut store);
+        builder.append(&rows[0]).unwrap();
+        let first = builder
+            .finish(rows[0].evidence.post_frontier_root())
+            .unwrap();
+        let address = first.causal_tip_root().root.unwrap().digest;
+        let slot = store
+            .objects
+            .iter()
+            .position(|(kind, digest, _)| {
+                *kind == SealedAcceptedObjectKind::MapNode && *digest == address
+            })
+            .unwrap();
+        let original = store.objects[slot].2.clone();
+        store.objects[slot].2 = vec![0xff];
+        let mut builder = first.builder(&mut store);
+        assert!(builder.append(&rows[1]).is_err());
+        let preserved = builder.finish(first.frontier()).unwrap();
+        assert_eq!(preserved.roots(), first.roots());
+        assert_eq!(preserved.causal_tip_root(), first.causal_tip_root());
+        store.objects[slot].2 = original;
+        let mut builder = preserved.builder(&mut store);
+        builder.append(&rows[1]).unwrap();
+        assert_eq!(
+            builder
+                .finish(rows[1].evidence.post_frontier_root())
+                .unwrap()
+                .causal_tips()
+                .next()
+                .unwrap()
+                .highest_accepted_counter,
+            2
+        );
     }
 
     #[test]
@@ -1636,7 +1864,7 @@ mod tests {
             .split("pub(crate) fn build_sealed_accepted_cutoff<Store>(")
             .nth(1)
             .unwrap()
-            .split("/// Capture the exact semantic clean-runtime state")
+            .split("/// Reconstruct one accepted document using the existing loader")
             .next()
             .unwrap();
         for forbidden in [
@@ -1653,6 +1881,27 @@ mod tests {
             );
         }
         assert!(!engine.contains(".build_sealed_accepted_cutoff("));
+        assert!(!engine.contains(".build_compact_accepted_document("));
+        assert!(!include_str!("../sync_runtime.rs").contains("build_compact_accepted_document"));
+        let compact = engine
+            .split("pub(crate) fn build_compact_accepted_document(")
+            .nth(1)
+            .unwrap()
+            .split("/// Capture the exact semantic")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "LazyGenesisCheckpointBuilder",
+            "publish_activation_marker",
+            "replace_activation_marker",
+            "fs::",
+            "commit_clean_prepared",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "compact qualification acquired {forbidden}"
+            );
+        }
         assert!(!include_str!("../sync_runtime.rs").contains("build_sealed_accepted_cutoff"));
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
         assert!(contract.contains("R1b accepted-cutoff builder"));

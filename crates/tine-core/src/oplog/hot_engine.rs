@@ -6279,6 +6279,27 @@ pub(crate) struct CleanCheckpointAcceptedRow {
     pub(crate) canonical_causal_clock: Vec<(CausalPeerId, u64)>,
 }
 
+/// One qualified compact document for inert generation construction. This has
+/// no persistence codec or live-install capability. Its dependency binding is
+/// the accepted document's existing canonical identity, including exact heads.
+pub(crate) struct CompactAcceptedDocument {
+    cutoff_state_digest: ContentDigest,
+    dependencies: DocumentDependencies,
+    checkpoint: Vec<u8>,
+}
+
+impl CompactAcceptedDocument {
+    pub(crate) fn cutoff_state_digest(&self) -> ContentDigest {
+        self.cutoff_state_digest
+    }
+    pub(crate) fn dependencies(&self) -> &DocumentDependencies {
+        &self.dependencies
+    }
+    pub(crate) fn checkpoint(&self) -> &[u8] {
+        &self.checkpoint
+    }
+}
+
 pub(crate) struct CleanCheckpointCapture {
     pub(crate) base_sequence: u64,
     pub(crate) target_sequence: u64,
@@ -7409,6 +7430,95 @@ impl ShardedHotEngine {
         builder
             .finish(&self.accepted_frontier_root)
             .map_err(EngineError::Archive)
+    }
+
+    /// Reconstruct one accepted document using the existing loader, compact it
+    /// without reauthoring any identities, and qualify it through a fresh import.
+    /// This is synchronous staging/qualification, not a live actor capture path.
+    pub(crate) fn build_compact_accepted_document(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        document_id: DocumentId,
+    ) -> Result<CompactAcceptedDocument, EngineError> {
+        if cutoff.frontier() != &self.accepted_frontier_root {
+            return Err(EngineError::Archive(
+                "compact document cutoff is no longer current".into(),
+            ));
+        }
+        self.authenticate_accepted_frontier_root(cutoff.frontier())?;
+        let dependencies = self
+            .accepted_frontier_document(cutoff.frontier(), document_id)?
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        let document = self
+            .load_document_at_accepted_frontier(cutoff.frontier(), document_id)?
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        self.validate_lazy_genesis_document(document_id, &document)?;
+        if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
+            return Err(EngineError::FrontierVectorMismatch(document_id));
+        }
+        let checkpoint = document
+            .export(ExportMode::shallow_snapshot(&document.oplog_frontiers()))
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        let restored = LoroDoc::new();
+        import_complete(document_id, &restored, std::slice::from_ref(&checkpoint))?;
+        self.validate_lazy_genesis_document(document_id, &restored)?;
+        if canonical_peer_counters(&restored.oplog_vv())? != dependencies.peer_counters() {
+            return Err(EngineError::InvalidCrdt(
+                "compact accepted document changed version vector".into(),
+            ));
+        }
+        if restored.oplog_frontiers() != document.oplog_frontiers() {
+            return Err(EngineError::InvalidCrdt(
+                "compact accepted document changed oplog frontiers".into(),
+            ));
+        }
+        if restored.get_value() != document.get_value() {
+            return Err(EngineError::InvalidCrdt(
+                "compact accepted document changed state or root container identity".into(),
+            ));
+        }
+        // Tine's validated documents consist of root maps and optional text
+        // leaves. Compare their actual ContainerIDs, never Loro's diagnostic
+        // get_deep_value_with_id(), which also includes run-local arena slots.
+        let LoroValue::Map(roots) = document.get_value() else {
+            unreachable!("validated root map")
+        };
+        for name in roots.keys() {
+            let original_map = document.get_map(name.as_str());
+            let restored_map = restored.get_map(name.as_str());
+            let original_values = original_map.get_value();
+            if original_values != restored_map.get_value() {
+                return Err(EngineError::InvalidCrdt(
+                    "compact accepted document changed nested container identity".into(),
+                ));
+            }
+            for (_, value) in original_values.as_map().expect("map value").iter() {
+                if let LoroValue::Container(id) = value {
+                    let (
+                        Some(Container::Text(original_text)),
+                        Some(Container::Text(restored_text)),
+                    ) = (
+                        document.get_container(id.clone()),
+                        restored.get_container(id.clone()),
+                    )
+                    else {
+                        return Err(EngineError::InvalidCrdt(
+                            "compact qualification encountered a non-text nested container".into(),
+                        ));
+                    };
+                    if original_text.to_delta() != restored_text.to_delta() {
+                        return Err(EngineError::InvalidCrdt(
+                            "compact accepted document changed text attributes".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(CompactAcceptedDocument {
+            cutoff_state_digest: cutoff.frontier().state_digest(),
+            dependencies,
+            checkpoint,
+        })
     }
 
     /// Capture the exact semantic clean-runtime state at the current accepted

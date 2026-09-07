@@ -13010,9 +13010,31 @@ fn rebaselining_foundations_real_corpus_gate() {
         .unwrap();
     let cutoff_ms = started.elapsed().as_millis();
     assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
+    let compact_started = Instant::now();
+    let mut compact_bytes = 0usize;
+    let mut compact_documents = 0usize;
+    for document_id in std::iter::once(engine.catalog_document_id()).chain(
+        before
+            .pages
+            .iter()
+            .map(|(_, state)| state.home_document_id()),
+    ) {
+        let compact = engine
+            .build_compact_accepted_document(&cutoff, document_id)
+            .unwrap();
+        assert_eq!(
+            compact.cutoff_state_digest(),
+            cutoff.frontier().state_digest()
+        );
+        assert_eq!(compact.dependencies().document_id(), document_id);
+        compact_bytes += compact.checkpoint().len();
+        compact_documents += 1;
+    }
+    let compact_ms = compact_started.elapsed().as_millis();
+    assert_eq!(compact_documents, before.pages.len() + 1);
     assert_eq!(engine.canonical_snapshot().unwrap(), before);
     assert_eq!(user_graph_bytes(&joiner.graph_root), expected);
-    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms}",
+    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms} compact_documents={compact_documents} compact_bytes={compact_bytes} compact_ms={compact_ms}",
         expected.len(), before.pages.len(), before.blocks.len(), cutoff.roots().sequence.len);
 }
 

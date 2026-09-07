@@ -1996,9 +1996,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // Join marker fix adds exactly one fully qualified shared publication open
     // in lazy_genesis.rs. Its replace_exact method replaces the removed private
     // two-rename protocol; g_a pins the removed raw mutation sites separately.
+    // R1b/2 adds the shared CausalTipRecordV2 constructor and one qualified
+    // SealedAcceptedIndexWriter::new call for the per-peer map. Both are in
+    // checkpoint_generation.rs; no physical write boundary changes.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "71f5483895629518c64d5f65fd52fdb4ec724a1f0c618dbe24d019dd5679308c",
+        "2b18e1455e978713619f9cab60c6f20146702c8069732d88af16bfe3b5a07878",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

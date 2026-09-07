@@ -2038,10 +2038,24 @@ exact predecessor/target frontiers, unique batch membership, the resulting
 causal batch-map root and the new status/sequence/causal point proof. Continuation
 reads persistent index paths and the new row, not the covered status/sequence
 inventory. Failed appends leave predecessor roots unchanged; unreachable
-construction nodes do not confer authority. This is an inert, in-process staging
+construction nodes do not confer authority. The cutoff also binds exact highest
+accepted `(peer, counter, batch)` tips through the shared causal-tip value digest
+and authenticated map. Delta builds update only affected peer paths; older
+accepted counters cannot lower a tip. Empty-tail continuation retains exact tips.
+Damaged tip nodes or conflicting batches at one tip fail before candidate roots
+advance. The O(peers) in-process records are not yet live authoring input.
+This is an inert, in-process staging
 surface with no new on-disk format, serialized cutoff token, cache-payload
 adoption or live scheduler/cutover caller. The engine's capture reads the existing
-accepted-row seam without encoding documents. This is not yet a complete durable
+accepted-row seam without encoding documents. A separate inert per-document builder
+uses the existing accepted-root loader and document validators, exports a shallow
+snapshot at the exact accepted frontier, then imports it into a fresh document.
+Qualification requires exact version vectors, oplog frontiers, root and nested
+container IDs, map values and text deltas. Run-local Loro allocation slots are
+excluded from identity. It never recreates documents from visible page text. This
+synchronous staging proof has no installation path and makes no COW actor-budget
+claim; old concurrent branches still require full-ancestry recovery.
+This is not yet a complete durable
 generation: capsules, retention facts, independent disk qualification and the COW
 actor epoch remain prerequisites to enabling cutover. The physical layer has
 one current SQLite schema for both the live disposable projection and a
