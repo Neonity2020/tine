@@ -2821,6 +2821,9 @@ pub struct Graph {
     /// Page loading and disposable projection recovery share this owner; neither
     /// needs to retain a Document or trust a damaged database to recover IDs.
     session_page_ids: RwLock<std::collections::HashMap<PathBuf, SessionPageIds>>,
+    /// One source-inventory repair at a time. Joiners return to readiness
+    /// admission without retaining a snapshot or waiting under a graph lock.
+    projection_recovery: std::sync::Mutex<()>,
     /// Graph-relative paths of pages skipped by the latest whole-graph cache
     /// build because their parse/projection panicked. Kept retrievable so an
     /// lsdoc ownership gap can never degrade search completeness invisibly.
@@ -6081,6 +6084,7 @@ impl Graph {
             journal_format,
             cache: RwLock::new(None),
             session_page_ids: RwLock::new(std::collections::HashMap::new()),
+            projection_recovery: std::sync::Mutex::new(()),
             page_index_failures: RwLock::new(Vec::new()),
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
@@ -7008,24 +7012,24 @@ impl Graph {
 
     /// §5.9/M9: schedule the recovery a FAILED projection read owes.
     ///
-    /// `mark_stale` alone only clears `ready`, which would leave the projection
-    /// unusable until the user happened to save a page. This is the same
-    /// full-snapshot enqueue the open path makes, with a forced cache reset,
-    /// from the same already-parsed
-    /// cache — no reparse, no disk read, no user action.
-    fn direct_projection_recover_after_failed_read(&self) {
+    /// `mark_stale` alone would strand the projection until another edit. Repair
+    /// uses a complete source inventory and bounded page batches when there is
+    /// no parsed cache, or reuses an already-owned parsed snapshot. It never
+    /// builds a parsed graph solely to reconstruct the disposable database.
+    pub(crate) fn direct_projection_recover_after_failed_read(&self) {
+        let Ok(_repair) = self.projection_recovery.try_lock() else {
+            return;
+        };
         if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
             projection.request_rebuild();
         }
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) else {
-            // R6: a warm session holds no parsed snapshot to rebuild FROM.
-            // Build one now — `install_built` enqueues the full snapshot the
-            // worker's pending `rebuild` waits for — rather than clearing
-            // `ready` and stranding the projection until the next open (M9).
-            // The walk that answers this same failed read would parse the
-            // graph anyway; it finds the cache already built.
-            self.with_pages(|_| ());
+            // The existing worker resets the disposable projection before
+            // validating this source inventory, then consumes bounded page
+            // batches. Never call warm_cache here: its legacy fallback builds
+            // the parsed graph when streaming cannot currently acquire ownership.
+            self.warm_projection_cancellable(&|| false);
             return;
         };
         let revisions = self.disk_revs.read().unwrap().clone();

@@ -237,8 +237,16 @@ impl PendingProjection {
     /// Seed the queue's page order from a complete inventory (a full snapshot
     /// or a warm walk), replacing whatever a cache-less session appended.
     fn seed_page_order<'a>(&mut self, inventory: impl ExactSizeIterator<Item = &'a str>) {
+        let mut inventory = inventory.collect::<Vec<_>>();
+        if self.rebuild {
+            // Repair preserves the session's retained/append order. Stable
+            // sorting leaves newly discovered paths in their inventory order,
+            // after existing pages. Re-number both owners together below.
+            inventory.sort_by_key(|path| self.page_order.get(*path).copied().unwrap_or(u64::MAX));
+        }
         self.next_page_order = inventory.len() as u64;
         self.page_order = inventory
+            .into_iter()
             .enumerate()
             .map(|(position, rel_path)| (rel_path.to_owned(), position as u64))
             .collect();
@@ -468,7 +476,7 @@ impl DirectProjection {
         Ok(Self { shared })
     }
 
-    /// Keep the repair request until a complete parser snapshot is available.
+    /// Keep repair requested until a complete source inventory or parser snapshot arrives.
     pub(crate) fn request_rebuild(&self) {
         let mut pending = self.shared.pending.lock().unwrap();
         pending.rebuild = true;
@@ -525,7 +533,7 @@ impl DirectProjection {
         if pending.has_work()
             || pending.warm_stream.is_some()
             || pending.latest_generation > generation
-            || self.shared.worker_failed.load(Ordering::Acquire)
+            || (self.shared.worker_failed.load(Ordering::Acquire) && !pending.rebuild)
         {
             return false;
         }
@@ -1852,7 +1860,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             if std::mem::take(&mut pending.needs_full) {
                 requires_full_rebuild = true;
             }
-            let rebuild = pending.full.is_some() && std::mem::take(&mut pending.rebuild);
+            let rebuild = (pending.full.is_some() || pending.warm.is_some())
+                && std::mem::take(&mut pending.rebuild);
             // R6: a full snapshot queued beside a warm validation owns
             // readiness; the warm is dropped as superseded.
             let warm = if pending.full.is_some() {
@@ -1904,69 +1913,70 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let stream_closed = order.is_some();
         #[cfg(test)]
         run_before_apply_pending_hook();
-        let applied: Result<AppliedTurn, String> = if requires_full_rebuild && !had_full {
-            Err("a prior projection failure requires a complete parser snapshot".into())
-        } else {
-            (|| {
-                if rebuild || requires_full_rebuild || writer_slot.is_none() {
-                    // R3: interrupt and drain every query job first, so no
-                    // owned snapshot retains a handle to the file about to be
-                    // reset or removed, and the rebuild never waits on a read
-                    // nobody will finish. In-scope scenario: a torn projection
-                    // rebuilt under a live reader (D-3).
-                    shared.query_jobs.cancel_all_and_drain();
-                    // Drop every connection before the disposable file can be
-                    // replaced; a reader must not retain an old file handle.
-                    let mut reader = shared.reader.lock().unwrap();
-                    let mut seam = shared.statement_seam.lock().unwrap();
-                    reader.take();
-                    seam.take();
-                    shared.fts_ever_ready.store(false, Ordering::Release);
-                    writer_slot.take();
-                    let mut database = open_projection_database(&shared.path)
-                        .map_err(|error| error.to_string())?;
-                    // Even repaired DDL leaves unchanged source stamps behind.
-                    // Reset them so the full snapshot lowers every source page.
-                    database.reset().map_err(|error| error.to_string())?;
-                    writer_slot = Some(database);
-                }
-                let mut applied =
-                    apply_pending(writer_slot.as_mut().unwrap(), full, warm.as_ref(), deltas)?;
-                // R6: the stream's closing turn (or a `Clean` warm turn, or a
-                // turn that lowered mid-stream deltas without positions)
-                // reconciles the order table over the queue's inventory. The
-                // queue's map tracks every applied replacement and deletion
-                // since its seed, so it names exactly the projected pages.
-                let warm_clean = matches!(applied.warm_outcome, Some(WarmOutcome::Clean));
-                applied.stream_open = if had_warm {
-                    matches!(applied.warm_outcome, Some(WarmOutcome::Replacements(_)))
-                } else {
-                    stream_open && !stream_closed
-                };
-                if !applied.stream_open
-                    && (stream_closed || warm_clean || applied.unordered_replacements)
-                {
-                    let inventory = inventory.ok_or_else(|| {
-                        "the order turn ran without its queue inventory".to_owned()
-                    })?;
-                    writer_slot
-                        .as_mut()
-                        .unwrap()
-                        .apply_with_source_revisions_aliases_and_page_order(
-                            &PhysicalGraphProjectionChange {
-                                replacements: Vec::new(),
-                                deletions: Vec::new(),
-                                reference_postings: Vec::new(),
-                            },
-                            &[],
-                            &[],
-                            &inventory,
-                        )
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(applied)
-            })()
-        };
+        let applied: Result<AppliedTurn, String> =
+            if requires_full_rebuild && !had_full && !had_warm {
+                Err("a prior projection failure requires a complete source inventory".into())
+            } else {
+                (|| {
+                    if rebuild || requires_full_rebuild || writer_slot.is_none() {
+                        // R3: interrupt and drain every query job first, so no
+                        // owned snapshot retains a handle to the file about to be
+                        // reset or removed, and the rebuild never waits on a read
+                        // nobody will finish. In-scope scenario: a torn projection
+                        // rebuilt under a live reader (D-3).
+                        shared.query_jobs.cancel_all_and_drain();
+                        // Drop every connection before the disposable file can be
+                        // replaced; a reader must not retain an old file handle.
+                        let mut reader = shared.reader.lock().unwrap();
+                        let mut seam = shared.statement_seam.lock().unwrap();
+                        reader.take();
+                        seam.take();
+                        shared.fts_ever_ready.store(false, Ordering::Release);
+                        writer_slot.take();
+                        let mut database = open_projection_database(&shared.path)
+                            .map_err(|error| error.to_string())?;
+                        // Even repaired DDL leaves unchanged source stamps behind.
+                        // Reset them so the complete inventory relowers every source page.
+                        database.reset().map_err(|error| error.to_string())?;
+                        writer_slot = Some(database);
+                    }
+                    let mut applied =
+                        apply_pending(writer_slot.as_mut().unwrap(), full, warm.as_ref(), deltas)?;
+                    // R6: the stream's closing turn (or a `Clean` warm turn, or a
+                    // turn that lowered mid-stream deltas without positions)
+                    // reconciles the order table over the queue's inventory. The
+                    // queue's map tracks every applied replacement and deletion
+                    // since its seed, so it names exactly the projected pages.
+                    let warm_clean = matches!(applied.warm_outcome, Some(WarmOutcome::Clean));
+                    applied.stream_open = if had_warm {
+                        matches!(applied.warm_outcome, Some(WarmOutcome::Replacements(_)))
+                    } else {
+                        stream_open && !stream_closed
+                    };
+                    if !applied.stream_open
+                        && (stream_closed || warm_clean || applied.unordered_replacements)
+                    {
+                        let inventory = inventory.ok_or_else(|| {
+                            "the order turn ran without its queue inventory".to_owned()
+                        })?;
+                        writer_slot
+                            .as_mut()
+                            .unwrap()
+                            .apply_with_source_revisions_aliases_and_page_order(
+                                &PhysicalGraphProjectionChange {
+                                    replacements: Vec::new(),
+                                    deletions: Vec::new(),
+                                    reference_postings: Vec::new(),
+                                },
+                                &[],
+                                &[],
+                                &inventory,
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(applied)
+                })()
+            };
         let applied = match applied {
             Ok(applied) => applied,
             Err(error) => {
@@ -1990,7 +2000,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             }
         };
         shared.record_session_pages(&applied.pages);
-        if had_full {
+        if had_full || had_warm {
             requires_full_rebuild = false;
         }
         if had_full || stream_closed || matches!(applied.warm_outcome, Some(WarmOutcome::Clean)) {
@@ -3054,38 +3064,44 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1, "the owned snapshot reads the projection");
 
-        // The production rebuild path, taken while the job is held.
-        graph.direct_projection_recover_after_failed_read_test();
-        let started = Instant::now();
-        while !job.is_cancelled() {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the rebuild must cancel the live job"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // The worker waits for the drain: the slot is still held, the
-        // projection is not ready, and nothing has been able to reset the file
-        // under the pinned read transaction.
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(projection.active_query_jobs_test(), 1);
-        assert!(!graph.direct_projection_ready_test());
-        let interrupted = job.snapshot.visit_projection_query(
-            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000) \
+        // Streaming repair waits for reset before producing replacement pages.
+        // Hold the reader on this thread while a separate caller requests
+        // recovery, as in production (a failed query releases its own job
+        // before requesting repair). Otherwise this fixture waits on itself.
+        std::thread::scope(|scope| {
+            let repair = scope.spawn(|| graph.direct_projection_recover_after_failed_read_test());
+            let started = Instant::now();
+            while !job.is_cancelled() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the rebuild must cancel the live job"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The worker waits for the drain: the slot is still held, the
+            // projection is not ready, and nothing has been able to reset the file
+            // under the pinned read transaction.
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(projection.active_query_jobs_test(), 1);
+            assert!(!graph.direct_projection_ready_test());
+            let interrupted = job.snapshot.visit_projection_query(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000) \
              SELECT count(*) FROM c",
-            &[],
-            |_| Ok(std::ops::ControlFlow::Continue(())),
-        );
-        assert!(
-            interrupted.is_err(),
-            "a cancelled snapshot cannot run a statement"
-        );
-        assert!(matches!(
-            projection.open_query_job(generation),
-            QueryJobOpen::NotReady
-        ));
+                &[],
+                |_| Ok(std::ops::ControlFlow::Continue(())),
+            );
+            assert!(
+                interrupted.is_err(),
+                "a cancelled snapshot cannot run a statement"
+            );
+            assert!(matches!(
+                projection.open_query_job(generation),
+                QueryJobOpen::NotReady
+            ));
 
-        drop(job);
+            drop(job);
+            repair.join().unwrap();
+        });
         wait_ready(&graph);
         assert_eq!(projection.active_query_jobs_test(), 0);
         let generation = graph.cache_generation();
@@ -5019,6 +5035,90 @@ mod tests {
                 .id,
             external_id
         );
+    }
+
+    #[test]
+    fn failed_projection_recovery_does_not_build_a_parsed_graph() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("streamed-damage-recovery");
+        let database = scratch("streamed-damage-recovery-db").join("projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert!(!graph.has_parsed_cache_test());
+        assert!(graph
+            .create_markdown_page_if_absent("aaa-added", "- TODO appended\n")
+            .unwrap());
+        wait_ready(&graph);
+        let query = "(and (task TODO) (not (journal)))";
+        // Admission happens before output sorting. A new page appends to this
+        // session even when its filename sorts before the existing pages.
+        let expected = graph.run_query_bounded(query, 1, 1_000_000);
+        assert_ne!(expected.groups[0].page, "aaa-added");
+        // Page creation may have warmed another feature's cache. Evict it
+        // before repair so this gate measures recovery's own source ownership.
+        graph.invalidate_cache();
+        assert!(!graph.has_parsed_cache_test());
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer.execute_batch("DROP TABLE block_text").unwrap();
+        drop(writer);
+        graph.direct_projection_recover_after_failed_read();
+        wait_ready(&graph);
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "projection repair must stream source pages without retaining the parsed graph"
+        );
+        graph.clear_query_memos_test();
+        let before = graph.direct_projection_statement_reads_test();
+        let actual = graph.run_query_bounded(query, 1, 1_000_000);
+        assert_eq!(graph.direct_projection_statement_reads_test(), before + 1);
+        assert_eq!(signature(&actual.groups), signature(&expected.groups));
+    }
+
+    #[test]
+    fn failed_projection_writer_can_recover_from_source_inventory() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("failed-writer-stream-recovery");
+        let database = scratch("failed-writer-stream-recovery-db").join("projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "one")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO repaired from acknowledged edit".into();
+        let kept_id = page.blocks[0].id.clone();
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer.execute_batch("DROP TABLE block_text").unwrap();
+        drop(writer);
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        let projection = graph.direct_projection_test().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !projection.shared.worker_failed.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "damaged projection must fail its edit turn"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        graph.direct_projection_recover_after_failed_read();
+        wait_ready(&graph);
+        assert!(!graph.has_parsed_cache_test());
+        let result = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let block = result
+            .groups
+            .iter()
+            .flat_map(|group| &group.blocks)
+            .find(|block| block.id == kept_id)
+            .unwrap();
+        assert_eq!(block.raw, page.blocks[0].raw);
+        assert!(!projection.shared.worker_failed.load(Ordering::Acquire));
     }
 
     /// Cache eviction does not change an unchanged page's session identities.
