@@ -4,33 +4,17 @@
 //! accepted transaction protocol. Final packed storage and rendering need their
 //! own end-to-end gates.
 use super::*;
-use crate::oplog::semantic::{BlockState, PagePreambleState, PageState, VisibleMembership};
+use crate::oplog::retirable_document::{DocumentIdentity, DocumentState, RetirableDocument};
+use crate::oplog::semantic::{MembershipClaim, PagePreambleState, PageState, VisibleMembership};
+use crate::oplog::DocumentKey as Key;
 use loro::{ContainerTrait, ExportMode, LoroDoc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum Key {
-    Entity(uuid::Uuid),
-    Membership(uuid::Uuid, uuid::Uuid),
-}
 
 fn put<T: Serialize>(doc: &LoroDoc, key: &str, value: &T) {
     doc.get_map("meta")
         .insert(key, serde_json::to_string(value).unwrap())
         .unwrap();
-}
-
-fn get<T: serde::de::DeserializeOwned>(doc: &LoroDoc, key: &str) -> T {
-    let value = doc.get_map("meta").get(key).unwrap().get_deep_value();
-    serde_json::from_str(value.as_string().unwrap()).unwrap()
-}
-
-fn sealed(doc: LoroDoc) -> Vec<u8> {
-    put(&doc, "checkpoint", &1u64);
-    doc.commit();
-    doc.export(ExportMode::shallow_snapshot(&doc.oplog_frontiers()))
-        .unwrap()
 }
 
 fn memory_kib() -> Option<u64> {
@@ -102,53 +86,109 @@ fn retirable_loro_layout_real_corpus_gate() {
     let rss_before = memory_kib();
     let started = Instant::now();
     let mut records = Vec::new();
-    let graph = LoroDoc::new();
-    put(&graph, "kind", &"graph");
-    records.push((Key::Entity(uuid::Uuid::new_v4()), sealed(graph)));
-    let mut page_docs = BTreeMap::new();
-    let mut block_docs = BTreeMap::new();
+    // Expected identities come from accepted fixture births, independently of
+    // pack metadata. Mapping old homes below is solely the semantic oracle's
+    // coordinate conversion, not a runtime migration or admission rule.
+    let page_docs: BTreeMap<_, _> = before
+        .pages
+        .iter()
+        .map(|(id, _)| (*id, crate::oplog::DocumentId::new()))
+        .collect();
+    let block_docs: BTreeMap<_, _> = before
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, crate::oplog::DocumentId::new()))
+        .collect();
+    let old_pages: BTreeMap<_, _> = before
+        .pages
+        .iter()
+        .map(|(id, state)| (*id, state.home_document_id()))
+        .collect();
+    let birth_pages: BTreeMap<_, _> = old_pages.iter().map(|(id, doc)| (*doc, *id)).collect();
+    let old_blocks: BTreeMap<_, _> = before
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block.home_document_id))
+        .collect();
     let preambles: BTreeMap<_, _> = before
         .page_preambles
         .iter()
         .map(|preamble| (preamble.page_id, preamble))
         .collect();
+    let mut identities = BTreeMap::new();
+    let seal = crate::oplog::BatchId::from_uuid(uuid::Uuid::from_u128(1));
+    let mut append = |identity: DocumentIdentity, state| {
+        let doc = RetirableDocument::create(
+            identity.clone(),
+            crate::oplog::CrdtPeerId::from_u64(1),
+            state,
+        )
+        .unwrap();
+        doc.seal(seal).unwrap();
+        doc.document().commit();
+        records.push((
+            doc.key(),
+            doc.snapshot(&doc.document().oplog_frontiers()).unwrap(),
+        ));
+        assert!(identities.insert(doc.key(), identity).is_none());
+    };
+    append(
+        DocumentIdentity::Graph {
+            document_id: crate::oplog::DocumentId::new(),
+            workspace_id: joiner.request.identities.workspace_id,
+            lineage: engine.lineage_digest(),
+        },
+        DocumentState::Graph,
+    );
     for (id, state) in &before.pages {
-        let document_id = uuid::Uuid::new_v4();
-        page_docs.insert(*id, document_id);
-        let doc = LoroDoc::new();
-        put(&doc, "kind", &"page");
-        put(&doc, "identity", id);
-        put(&doc, "state", state);
-        put(&doc, "preamble", &preambles.get(id).copied());
-        records.push((Key::Entity(document_id), sealed(doc)));
+        let mut state = state.clone();
+        match &mut state {
+            PageState::Live {
+                home_document_id, ..
+            }
+            | PageState::Tombstone {
+                home_document_id, ..
+            } => *home_document_id = page_docs[id],
+        }
+        append(
+            DocumentIdentity::Page {
+                document_id: page_docs[id],
+                page_id: *id,
+            },
+            DocumentState::Page {
+                state,
+                preamble: preambles.get(id).and_then(|p| p.preamble.clone()),
+            },
+        );
     }
     for block in &before.blocks {
-        let document_id = uuid::Uuid::new_v4();
-        block_docs.insert(block.block_id, document_id);
-        let doc = LoroDoc::new();
-        put(&doc, "kind", &"block");
-        put(&doc, "identity", &block.block_id);
-        // Existing home is birth provenance in this fixture; the new document
-        // key is distinct and is the stable text home in the proposed format.
-        put(&doc, "birth", &block.home_document_id);
-        put(&doc, "owner", &block.owner);
-        put(&doc, "logseq_uuid", &block.logseq_uuid);
-        put(&doc, "logseq_origin", &block.logseq_identity_origin);
-        doc.get_text("text").insert(0, &block.content).unwrap();
-        records.push((Key::Entity(document_id), sealed(doc)));
+        let birth_page_id = birth_pages[&block.home_document_id];
+        let mut state = block.clone();
+        state.home_document_id = block_docs[&block.block_id];
+        append(
+            DocumentIdentity::Block {
+                document_id: state.home_document_id,
+                block_id: block.block_id,
+                birth_page_id,
+                birth_page_document_id: page_docs[&birth_page_id],
+            },
+            DocumentState::Block(state),
+        );
     }
     for membership in &before.memberships {
-        let doc = LoroDoc::new();
-        put(&doc, "kind", &"membership");
-        put(&doc, "identity", &(membership.block_id, membership.page_id));
-        put(&doc, "claim", membership);
-        records.push((
-            Key::Membership(
-                block_docs[&membership.block_id],
-                page_docs[&membership.page_id],
-            ),
-            sealed(doc),
-        ));
+        append(
+            DocumentIdentity::Membership {
+                block_document_id: block_docs[&membership.block_id],
+                block_id: membership.block_id,
+                page_document_id: page_docs[&membership.page_id],
+                page_id: membership.page_id,
+            },
+            DocumentState::Membership(Some(MembershipClaim {
+                home_document_id: block_docs[&membership.block_id],
+                parent: membership.parent,
+                order: membership.order.clone(),
+            })),
+        );
     }
     let build_ms = started.elapsed().as_millis();
     let document_count = records.len();
@@ -185,47 +225,63 @@ fn retirable_loro_layout_real_corpus_gate() {
             cache.pop_front();
         }
         let started = Instant::now();
-        let doc = LoroDoc::new();
-        assert!(doc.import(&snapshot).unwrap().pending.is_none());
+        let identity = identities.remove(&key).unwrap();
+        let doc = RetirableDocument::open(identity.clone(), &snapshot).unwrap();
+        assert_eq!(doc.key(), key);
         import_elapsed += started.elapsed();
         let started = Instant::now();
-        let key = &key;
-        let doc = &doc;
-        let kind: String = get(doc, "kind");
-        match kind.as_str() {
-            "graph" => (),
-            "page" => {
-                let id = get(doc, "identity");
-                assert!(matches!(key, Key::Entity(value) if *value == page_docs[&id]));
-                after.pages.push((id, get(doc, "state")));
-                if let Some(preamble) = get::<Option<PagePreambleState>>(doc, "preamble") {
-                    after.page_preambles.push(preamble);
+        match (identity, doc.state().unwrap()) {
+            (DocumentIdentity::Graph { .. }, DocumentState::Graph) => (),
+            (
+                DocumentIdentity::Page { page_id, .. },
+                DocumentState::Page {
+                    mut state,
+                    preamble,
+                },
+            ) => {
+                match &mut state {
+                    PageState::Live {
+                        home_document_id, ..
+                    }
+                    | PageState::Tombstone {
+                        home_document_id, ..
+                    } => *home_document_id = old_pages[&page_id],
+                }
+                after.pages.push((page_id, state));
+                if preambles.contains_key(&page_id) {
+                    after.page_preambles.push(PagePreambleState {
+                        page_id,
+                        home_document_id: old_pages[&page_id],
+                        preamble,
+                    });
+                } else {
+                    assert!(preamble.is_none());
                 }
             }
-            "block" => {
-                let block_id = get(doc, "identity");
-                assert!(matches!(key, Key::Entity(value) if *value == block_docs[&block_id]));
-                after.blocks.push(BlockState {
+            (DocumentIdentity::Block { .. }, DocumentState::Block(mut block)) => {
+                block.home_document_id = old_blocks[&block.block_id];
+                after.blocks.push(block);
+            }
+            (
+                DocumentIdentity::Membership {
+                    block_id, page_id, ..
+                },
+                DocumentState::Membership(Some(claim)),
+            ) => {
+                after.memberships.push(VisibleMembership {
                     block_id,
-                    home_document_id: get(doc, "birth"),
-                    owner: get(doc, "owner"),
-                    logseq_uuid: get(doc, "logseq_uuid"),
-                    logseq_identity_origin: get(doc, "logseq_origin"),
-                    content: doc.get_text("text").to_string(),
+                    page_id,
+                    home_document_id: old_blocks[&block_id],
+                    parent: claim.parent,
+                    order: claim.order,
                 });
             }
-            "membership" => {
-                let claim: VisibleMembership = get(doc, "claim");
-                assert!(matches!(key, Key::Membership(block, page)
-                    if *block == block_docs[&claim.block_id] && *page == page_docs[&claim.page_id]));
-                after.memberships.push(claim);
-            }
-            _ => panic!("unexpected fixture document kind"),
+            _ => panic!("fixture identity/state mismatch"),
         }
-
         materialize_elapsed += started.elapsed();
-        cache.push_back(doc.clone());
+        cache.push_back(doc);
     }
+    assert!(identities.is_empty());
     let import_ms = import_elapsed.as_millis();
     let rss_with_docs = memory_kib();
     let materialize_ms = materialize_elapsed.as_millis();

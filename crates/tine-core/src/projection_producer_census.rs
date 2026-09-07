@@ -1686,7 +1686,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.16.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.17.0\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -2018,9 +2018,16 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // authenticated_map_root and point reader, deriving the root from exactly
     // the accepted keys. Descriptor reading moved into one reuse helper.
     // Reviewed source adds no write boundary, raw mutation or alternate codec.
+    // Retirable document-map foundation: roster map imports and point reads
+    // move from checkpoint_generation into sealed_document_map. Full membership
+    // keys compose existing maps; their shared writer handles entity and nested
+    // pair upsert/removal. One shared bounded read loads the inner descriptor;
+    // canonical full-key qualification reuses authenticated_map_root. Reviewed
+    // the complete staged source delta: no new physical publication boundary,
+    // raw mutation, alternate tree or second object codec is introduced.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "c0ccd31a949c7960bb2df360c8ccf0eae6a399e6e0d22c7ec45fb5cb6baf3dff",
+        "9cb4cb5527cf6ae3f90fc7f3683241eddef0ed466dc36f3a6492db87068b8b2f",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

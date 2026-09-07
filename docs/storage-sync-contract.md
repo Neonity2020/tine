@@ -2093,8 +2093,19 @@ proof, and merely opening a directory is not generation adoption. Collision,
 missing/corrupt record, no-follow, publication-fault and retry tests preserve
 predecessor roots. Complete generation commits and live cutover remain absent.
 
-The staged **document capsule roster** uses the same canonical authenticated map,
-keyed by document UUID. A map value addresses one canonical postcard record
+The staged **document capsule roster** uses `SealedDocumentMap`, composed from
+shared canonical UUID maps. `DocumentKey::Entity` has its own UUID root;
+`DocumentKey::Membership` retains the full `(block_document_id, page_document_id)`
+pair through an outer block map and an inner page map, without tuple hashing.
+The current capsule producer still supplies only entity keys. Membership root
+records are canonical postcard `{schema=1, count, root}` values authenticated by
+the outer map. Logical retirement uses the certified shared `remove_map`
+operation: it removes search-path entries and drops empty outer membership
+groups while preserving older immutable roots. It never physically deletes
+objects. Construction reads pending staged root records before on-disk records;
+a fresh complete-key census independently rebuilds both domains and verifies
+the combined count. The fixed membership-root read bound is 128 bytes and is
+independent of graph size or history. A map value addresses one canonical postcard record
 `{schema=1, dependencies: DocumentDependencies, checkpoint: BlobDescription}`.
 Descriptor and actual CRDT checkpoint blobs share the `capsule-v1-<digest>`
 content-addressed staging namespace and the same bounded publication machinery.

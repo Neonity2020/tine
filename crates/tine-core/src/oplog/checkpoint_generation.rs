@@ -5,6 +5,11 @@
 //! generation publisher. Managed Storage is pre-0.7, so this module still
 //! contains no legacy decoder, version dispatch, or migration bridge.
 
+#[path = "sealed_document_map.rs"]
+mod sealed_document_map;
+
+use sealed_document_map::SealedDocumentMap;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -533,13 +538,13 @@ impl DocumentCapsuleRecord {
 /// prove the complete roster and bind workspace/catalog/cutoff/retention facts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SealedDocumentRoster {
-    root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
+    map: SealedDocumentMap,
 }
 
 impl SealedDocumentRoster {
     pub(crate) fn empty() -> Self {
         Self {
-            root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty(),
+            map: SealedDocumentMap::empty(),
         }
     }
 
@@ -549,7 +554,6 @@ impl SealedDocumentRoster {
         cutoff: &SealedAcceptedCutoff,
         compact: &CompactAcceptedDocument,
     ) -> Result<Self, String> {
-        use tine_storage::sealed_accepted_index::SealedAcceptedIndexWriter;
         if compact.cutoff_state_digest() != cutoff.frontier().state_digest() {
             return Err("generation capsule belongs to another accepted cutoff".into());
         }
@@ -560,14 +564,12 @@ impl SealedDocumentRoster {
             checkpoint,
         };
         let record_blob = store.stage_capsule_blob(&record.encode()?)?;
-        let root = SealedAcceptedIndexWriter::new(store)
-            .upsert_map(
-                self.root,
-                record.dependencies.document_id().as_uuid().into_bytes(),
-                ContentDigest::from_bytes(*record_blob.sha256()),
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(Self { root })
+        let map = self.map.upsert(
+            store,
+            super::DocumentKey::Entity(record.dependencies.document_id()),
+            ContentDigest::from_bytes(*record_blob.sha256()),
+        )?;
+        Ok(Self { map })
     }
 
     pub(crate) fn load_document(
@@ -590,27 +592,12 @@ impl SealedDocumentRoster {
         store: &SealedGenerationDirectory,
         documents: impl Iterator<Item = DocumentId>,
     ) -> Result<(), String> {
-        use tine_storage::sealed_accepted_index::{
-            authenticated_map_root, SealedAcceptedIndexReader,
-        };
-        let reader = SealedAcceptedIndexReader::new(store);
-        let mut entries = Vec::new();
-        for document in documents {
-            let key = document.as_uuid().into_bytes();
-            let value = reader
-                .map_value(self.root, key)
-                .map_err(|error| error.to_string())?
-                .ok_or("generation roster omits an accepted document")?;
-            entries.push((key, value));
-        }
-        if authenticated_map_root(&entries).map_err(|error| error.to_string())? != self.root {
-            return Err("generation roster is not exactly the accepted document key set".into());
-        }
-        Ok(())
+        self.map
+            .qualify_complete_keys(store, documents.map(super::DocumentKey::Entity))
     }
 
     pub(crate) fn document_count(self) -> u64 {
-        self.root.count
+        self.map.count()
     }
 
     pub(crate) fn inherited_dependencies(
@@ -631,10 +618,9 @@ impl SealedDocumentRoster {
         store: &SealedGenerationDirectory,
         document: DocumentId,
     ) -> Result<Option<DocumentCapsuleRecord>, String> {
-        use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
-        let Some(address) = SealedAcceptedIndexReader::new(store)
-            .map_value(self.root, document.as_uuid().into_bytes())
-            .map_err(|error| error.to_string())?
+        let Some(address) = self
+            .map
+            .value(store, super::DocumentKey::Entity(document))?
         else {
             return Ok(None);
         };
@@ -2283,7 +2269,7 @@ mod tests {
                 assert_eq!(restored.get_deep_value(), expected.get_deep_value());
                 assert_eq!(restored.oplog_frontiers(), expected.oplog_frontiers());
             }
-            assert_eq!(roster.root.count, n as u64 + 1);
+            assert_eq!(roster.document_count(), n as u64 + 1);
             if n == 2 {
                 let id = DocumentId::from_uuid(uuid::Uuid::from_u128(301));
                 let old = previous_roster
@@ -2306,7 +2292,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(written, 2, "only catalog plus new page need compaction");
-            assert_eq!(automatic.root, roster.root);
+            assert_eq!(automatic.map, roster.map);
             drop(complete_store.finish().unwrap());
             engine
                 .qualify_full_document_roster(&cutoff, automatic, &reopened_capsules)
@@ -2323,7 +2309,7 @@ mod tests {
                 .build_compact_document_roster(&cutoff, &mut unchanged, Some(automatic))
                 .unwrap();
             assert_eq!(written, 0);
-            assert_eq!(same.root, automatic.root);
+            assert_eq!(same.map, automatic.map);
             assert!(unchanged.publication.is_none());
             assert!(unchanged.pending.objects.is_empty());
             unchanged.failed = true;
@@ -2333,7 +2319,7 @@ mod tests {
             assert!(unchanged.finish().is_err());
 
             let address = SealedAcceptedIndexReader::new(&reopened_capsules)
-                .map_value(roster.root, catalog.as_uuid().into_bytes())
+                .map_value(roster.map.entity_root(), catalog.as_uuid().into_bytes())
                 .unwrap()
                 .unwrap();
             let path = capsule_root.join(capsule_blob_name(address));
@@ -2341,14 +2327,20 @@ mod tests {
             let mut extra_store = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
             let extra_id = DocumentId::from_uuid(uuid::Uuid::from_u128(888_888));
             let mut extra_root = SealedAcceptedIndexWriter::new(&mut extra_store)
-                .upsert_map(roster.root, extra_id.as_uuid().into_bytes(), address)
+                .upsert_map(
+                    roster.map.entity_root(),
+                    extra_id.as_uuid().into_bytes(),
+                    address,
+                )
                 .unwrap();
             drop(extra_store.finish().unwrap());
-            extra_root.count = roster.root.count; // count alone must not certify completeness
+            extra_root.count = roster.document_count(); // count alone must not certify completeness
             assert!(engine
                 .qualify_full_document_roster(
                     &cutoff,
-                    SealedDocumentRoster { root: extra_root },
+                    SealedDocumentRoster {
+                        map: roster.map.with_entity_root_for_test(extra_root)
+                    },
                     &reopened_capsules
                 )
                 .is_err());
@@ -2390,7 +2382,7 @@ mod tests {
                 .unwrap();
             let bad_root = SealedAcceptedIndexWriter::new(&mut malformed)
                 .upsert_map(
-                    roster.root,
+                    roster.map.entity_root(),
                     catalog.as_uuid().into_bytes(),
                     ContentDigest::from_bytes(*bad_blob.sha256()),
                 )
@@ -2415,18 +2407,22 @@ mod tests {
                 .unwrap();
             let wrong_root = SealedAcceptedIndexWriter::new(&mut malformed)
                 .upsert_map(
-                    roster.root,
+                    roster.map.entity_root(),
                     catalog.as_uuid().into_bytes(),
                     ContentDigest::from_bytes(*wrong_blob.sha256()),
                 )
                 .unwrap();
             drop(malformed.finish().unwrap());
-            assert!(SealedDocumentRoster { root: bad_root }
-                .load_document(&reopened_capsules, catalog, catalog)
-                .is_err());
-            assert!(SealedDocumentRoster { root: wrong_root }
-                .load_document(&reopened_capsules, catalog, catalog)
-                .is_err());
+            assert!(SealedDocumentRoster {
+                map: roster.map.with_entity_root_for_test(bad_root)
+            }
+            .load_document(&reopened_capsules, catalog, catalog)
+            .is_err());
+            assert!(SealedDocumentRoster {
+                map: roster.map.with_entity_root_for_test(wrong_root)
+            }
+            .load_document(&reopened_capsules, catalog, catalog)
+            .is_err());
             assert!(roster
                 .load_document(&reopened_capsules, catalog, catalog)
                 .unwrap()
@@ -2467,7 +2463,7 @@ mod tests {
                 .with_document(&mut disk, &independent, &compact)
                 .unwrap();
         }
-        assert_eq!(full_roster.root, roster.root);
+        assert_eq!(full_roster.map, roster.map);
         drop(disk.finish().unwrap());
         drop(capsule_dir);
         drop(replay);

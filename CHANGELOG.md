@@ -128,6 +128,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Managed Storage validates the exact peer-counter ranges in incoming CRDT
+  updates, rejecting replayed ranges even when their starting frontier matches.
+
 - **A query written in the middle of a line now shows its title.** A
   `{{query …}}` with a title or other display options — anything in the trailing
   `{…}` — was read back from a truncated copy of your text whenever it sat

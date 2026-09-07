@@ -88,6 +88,19 @@ opaque_uuid_id!(
     DocumentId
 );
 
+/// Full identity of one retirable CRDT document. Membership facts are addressed
+/// by both entity document UUIDs; they are never truncated into a synthetic UUID.
+/// Root Loro container identities are scoped by this key.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum DocumentKey {
+    Entity(DocumentId),
+    Membership {
+        block_document_id: DocumentId,
+        page_document_id: DocumentId,
+    },
+}
+
 /// Opaque, engine-neutral identity of a CRDT peer within a causal document.
 ///
 /// The numeric representation is an interchange value, not a Loro peer type.

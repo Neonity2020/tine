@@ -43,6 +43,9 @@ pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub(crate) mod reference_catalog;
 pub(crate) mod refusal;
+// Qualify the replacement schema before the single live-format cutover.
+#[cfg(test)]
+pub(crate) mod retirable_document;
 pub(crate) mod semantic;
 pub(crate) mod sqlite;
 mod sqlite_identity;
@@ -117,8 +120,8 @@ pub use hot_engine::{
 pub(crate) use hot_engine::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
 pub use identity::{
     BatchId, BlockId, CanonicalArchiveResourceId, CanonicalGraphResourceId, CrdtPeerId, DeviceId,
-    DocumentId, ImportId, LogseqUuid, PageId, ProjectionEndpointId, ProjectionReceiptStoreId,
-    SessionId, WorkspaceId,
+    DocumentId, DocumentKey, ImportId, LogseqUuid, PageId, ProjectionEndpointId,
+    ProjectionReceiptStoreId, SessionId, WorkspaceId,
 };
 pub use import::{
     classify_conflict_copy, inventory_affected, inventory_initial_shadow, BlockImportMatch,
