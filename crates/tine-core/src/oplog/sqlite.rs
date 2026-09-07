@@ -387,7 +387,15 @@ impl AcceptedBatchEvent {
         // anything else. This constructor is reached only for a batch the engine
         // reports as accepted (the `accepted_batch_evidence` lookup above). A
         // missing manifest or object still fails closed.
-        let manifest = store.read_manifest(batch_id)?.ok_or_else(|| {
+        //
+        // Read class: indexed-cold. Projection rebuild replays the whole
+        // accepted history, so it is one of the named consumers that must still
+        // resolve a batch whose hot originals have been relocated into cold
+        // packs. It goes through the single `ObjectStore` resolver -- hot
+        // original first, then one indexed cold lookup bounded by this object's
+        // own index path -- never through a second reader. With no cold history
+        // published, this behaves exactly like the hot-only read it replaced.
+        let manifest = store.resolve_logical_manifest(batch_id)?.ok_or_else(|| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "accepted batch {batch_id} is absent from the object store"
             ))
@@ -441,6 +449,8 @@ impl AcceptedBatchEvent {
 
     /// Fetch just the batch's `SemanticEffect` payload, located through the
     /// manifest's descriptors rather than by scanning decoded objects.
+    ///
+    /// Read class: indexed-cold, for the same reason as its caller.
     fn read_semantic_effect(
         store: &ObjectStore,
         manifest: &OperationBatch,
@@ -455,7 +465,7 @@ impl AcceptedBatchEvent {
                     manifest.batch_id()
                 ))
             })?;
-        let object = store.read_object(descriptor.content_digest())?;
+        let object = store.resolve_logical_object(descriptor.content_digest())?;
         if object.kind() != ObjectKind::SemanticEffect {
             return Err(ProjectionError::InvalidAcceptedEvent(format!(
                 "accepted batch {} semantic effect object has the wrong kind",
@@ -485,7 +495,8 @@ impl AcceptedBatchEvent {
                 "accepted sequence evidence is bound to another batch".into(),
             ));
         }
-        let validated = match store.inspect_batch(batch_id)? {
+        // Read class: indexed-cold. Same replay consumer, same single resolver.
+        let validated = match store.inspect_batch_with_cold_history(batch_id)? {
             BatchInspection::Ready(validated) => validated,
             BatchInspection::Absent => {
                 return Err(ProjectionError::InvalidAcceptedEvent(format!(
@@ -12315,6 +12326,104 @@ mod tests {
         assert_eq!(
             deleted_rebuild.database.frontier_root().unwrap(),
             engine.accepted_frontier_root().unwrap()
+        );
+    }
+
+    /// The single logical-object resolver, exercised by a real production
+    /// consumer rather than a library probe.
+    ///
+    /// Projection rebuild is the full replay of accepted history, so it is one
+    /// of MS-02's indexed-cold consumers: after R2 relocates a batch's exact
+    /// originals into cold packs and the hot originals are gone, replay must
+    /// still reconstruct the identical event. Nothing here retires anything in
+    /// production -- the fixture removes the hot files itself, the way a
+    /// completed retirement eventually will -- so this is a qualification of the
+    /// read path, not a claim that R2 retirement is enabled.
+    #[test]
+    fn projection_replay_resolves_a_rebaselined_batch_through_the_single_resolver() {
+        let ids = TestIds::new(2_262);
+        let mut fixture = CleanIdentityFixture::new("clean-identity-cold-replay", ids);
+        let create = root_transaction_named(
+            ids,
+            "pages/identity-cold.md",
+            "Identity Cold",
+            "identity cold block",
+        );
+        let expected = fixture.apply_and_assert_identity_shadow(&create);
+        let batch_id = expected.batch_id();
+
+        let engine = fixture.runtime.engine();
+        let store = engine.archive_store().unwrap();
+
+        // Additively relocate this batch's exact originals into cold packs.
+        let outcome = store
+            .publish_cold_history_for_batches(&BTreeSet::from([batch_id]))
+            .unwrap();
+        assert_eq!(outcome.manifests_published, 1);
+        assert!(outcome.objects_published > 0);
+        let before = store.instrumentation();
+
+        // Remove the hot originals, exactly as a completed retirement will.
+        let manifest = store.read_manifest(batch_id).unwrap().unwrap();
+        let archive_root = store.root_path().to_path_buf();
+        fs::remove_file(
+            archive_root
+                .join("batches")
+                .join(format!("{batch_id}.manifest")),
+        )
+        .unwrap();
+        for descriptor in manifest.required_objects() {
+            fs::remove_file(
+                archive_root
+                    .join("objects")
+                    .join(format!("{}.object", descriptor.content_digest())),
+            )
+            .unwrap();
+        }
+
+        // The ordinary hot-only reader honestly reports absence and has touched
+        // no pack byte.
+        assert_eq!(
+            store.inspect_batch(batch_id).unwrap(),
+            BatchInspection::Absent
+        );
+        assert_eq!(
+            store.instrumentation().cold_object_reads,
+            before.cold_object_reads
+        );
+
+        // The production replay consumer still reconstructs the exact event,
+        // through the resolver on the `ObjectStore` boundary.
+        let replayed = AcceptedBatchEvent::from_accepted(engine, store, batch_id).unwrap();
+        assert_eq!(replayed.batch_id(), batch_id);
+        assert_eq!(replayed.causal_dot(), expected.causal_dot());
+        assert_eq!(
+            replayed.acceptance_sequence(),
+            expected.acceptance_sequence()
+        );
+        // IDs alone do not establish exact replayed effects.
+        assert_eq!(replayed.manifest_digest(), expected.manifest_digest());
+        assert_eq!(
+            replayed.semantic_effect_digest(),
+            expected.semantic_effect_digest()
+        );
+        assert_eq!(replayed.semantic_effect(), expected.semantic_effect());
+        assert_eq!(
+            replayed.authored_semantic_effect(),
+            expected.authored_semantic_effect()
+        );
+        assert_eq!(
+            replayed.dependency_frontier(),
+            expected.dependency_frontier()
+        );
+        let after = store.instrumentation();
+        assert!(
+            after.cold_manifest_reads > before.cold_manifest_reads,
+            "the replayed manifest must have come from cold history"
+        );
+        assert!(
+            after.cold_object_reads > before.cold_object_reads,
+            "the replayed semantic effect must have come from cold history"
         );
     }
 

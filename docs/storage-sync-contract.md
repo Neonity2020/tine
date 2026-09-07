@@ -2141,6 +2141,124 @@ checker. These are explicit construction/repair operations, with no live runtime
 caller or generation installation capability. Complete generation binding and
 retention closure remain prerequisites for adoption.
 
+### Additive cold whole-object history and one read resolution
+
+R2's cold tier is a **physical** layer below the existing object model. It changes
+where a logical object's bytes live and nothing else: canonical `OperationObject`
+and `OperationBatch` bytes, their content digests, their `ObjectDescriptor`s and
+their `BatchId`s are preserved verbatim, and every read re-proves them. There is
+one current representation and no migration path; an unrecognized private store is
+still backed up and rebuilt.
+
+Layout, under the retained archive capability beside `clean-open-checkpoint-v1`:
+
+```
+<archive>/cold-history-v1/
+  pack-v1-<uuid>            immutable pack file
+  sealed-v2-<kind>-<digest> shared authenticated-map nodes
+  current                   canonical root marker, installed last
+```
+
+A pack is `record* footer footer_len:u64be "TINECLD1"`. A record is
+`sha256(payload):32 payload_len:u64be payload`, so one ranged read self-verifies
+its payload. The footer makes each pack self-describing, which is what keeps the
+locator index disposable derived state: `repack_cold_history` rebuilds every root
+from pack footers alone. Packs are built to a 4 MiB construction target; that is a
+target, never an occupancy cap, and one larger legal record is packed alone.
+
+`ColdLocatorV1` is exactly `pack_uuid:16 offset:u64be length:u64be` = 32 bytes, so
+it occupies the shared authenticated map's fixed value slot directly. No side blob
+and no filesystem object exists per logical record: many small records share one
+pack and one point read.
+
+Two key domains compose the same shared canonical UUID map; there is no second
+tree, no tuple hashing and no SHA-256 truncated into a UUID. The **object domain**
+carries the full 256-bit key by composing two of those maps, the way
+`SealedDocumentMap` composes a membership pair. The outer map is keyed by
+`sha256[0..16]`; its value locates a canonical postcard **inner-root descriptor**
+`{schema=1, root: {count, root_key, root_digest}}` packed with the same physical
+pack machinery, and that descriptor names an inner authenticated map keyed by
+`sha256[16..32]` whose values are the record locators. An outer entry therefore
+holds a whole map, not a list: the number of objects sharing one 128-bit prefix is
+unbounded, there is no bucket byte cap and no fixed-occupancy refusal, and
+lookup cost under a prefix is a map path rather than a scan. The descriptor's
+fixed 256-byte read bound is the codec size of that constant structure and is
+independent of prefix occupancy, history size or graph size. The **manifest
+domain** keys the map by the `BatchId` UUID and locates the record directly. One
+object lookup costs `O(log n)` outer map-node reads, one bounded descriptor read,
+`O(log m)` inner map-node reads and one bounded payload read — two pack reads
+however large history or a prefix grows; one manifest lookup costs exactly one.
+No pack, manifest or object namespace is enumerated on any lookup path.
+
+Publication is **additive**: nothing here retires a hot original, and a repack
+publishes new packs and swaps the root while leaving the predecessor packs in
+place (publish-new-before-retire-old). Enabling deletion needs the generation,
+fallback and retention proofs that follow. Publication order is payload pack
+bytes, then the inner prefix maps, then the packed inner-root descriptors, then
+the outer and manifest maps, then the root marker; before the marker installs,
+every staged pack and index node is unreferenced residue and the predecessor root
+is untouched, so an interrupted publication never becomes authority through
+filename presence.
+
+A repeated identity is "already archived" only when its **bytes** are
+byte-identical to what cold history already holds, compared through the shared
+reader. A `BatchId` is an identity, not a content address: two valid canonical
+manifests may legitimately carry the same `BatchId` and differ (a different
+`SessionId` alone suffices), so a repeated `BatchId` with different bytes is a
+collision, refused as `ColdManifestConflict` with the batch named. The exactness
+comparison runs before any record is appended, so a refused conflict leaves the
+predecessor root, the original bytes and the pack set exactly as they were.
+Publication, repack and footer reconstruction all apply the same rule; object
+records are additionally bound by their content digest, which every read
+re-proves. Republishing byte-identical content is a counted no-op that leaves the
+roots byte-identical.
+
+The root marker is derived state; the self-describing packs are the truth. No
+cold directory, or a cold directory with neither marker nor packs, is ordinary
+absence. A cold directory whose packs survive but whose marker is **gone** is a
+named damaged state, `StoreError::ColdHistoryRootMissing` — never ordinary
+absence, and never a licence to publish a fresh empty-based root over the old
+history: reads, publication and repack all refuse it by that name. A **torn or
+otherwise malformed** marker over surviving packs is the same damaged class:
+ordinary reads reject it as `ColdHistoryIndexUnavailable`, and repair treats it
+exactly like a missing one.
+
+`repair_cold_history_root` is the explicit recovery for both. It reads the raw
+marker bytes once — using them only as the audited replacement guard for the
+marker-last swap, never as history — rebuilds the locator index from the pack
+footers, and reuses every surviving record exactly where it already lies, without
+rewriting, relocating or re-encoding a byte. A healthy marker makes it a bounded
+no-op. A damaged marker with **no** surviving pack is never replaced with an
+empty history: there is nothing to rebuild from, so it refuses and leaves the
+bytes alone. Repair is the only operation that enumerates cold history; healthy
+opens stay bounded point operations, and the damaged-state check short-circuits
+at the first pack it sees. Throughout a damaged state and its repair, the hot
+tier and current state stay usable.
+
+Read resolution has exactly one implementation, on `ObjectStore`. Ordinary reads
+-- `inspect_batch`, `read_object`, `read_object_bytes`, `read_manifest`,
+`read_manifest_bytes`, `contains_object` -- are **hot-only** and have no cold
+branch at all: page open/save/move, the SQLite applier, projection payload pins
+and the operational coordinator's admission path can never reach a pack byte, and
+`ObjectStoreStats::cold_object_reads` / `cold_manifest_reads` are the oracle for
+that. The **indexed-cold** surface is `resolve_logical_object_bytes`,
+`resolve_logical_object`, `resolve_logical_manifest_bytes`,
+`resolve_logical_manifest`, `contains_logical_object` and
+`inspect_batch_with_cold_history`: each reads the hot original first and falls
+through to one indexed cold lookup. It is reserved for the named historical
+consumers -- Restore, historical admission, republication, previous-generation
+fallback and full replay. SQLite projection rebuild (the full replay of accepted
+history) resolves through it today; the remaining historical consumers are routed
+as their owning modules are cut over.
+
+Missing or corrupt cold data is history authority, never active-state authority.
+A damaged pack, record, locator or map node refuses with the affected logical
+object named (`cold logical object <digest> is unavailable: …` /
+`cold logical manifest <batch> is unavailable: …`), while every other object, the
+whole hot tier and current state stay usable; a damaged or noncanonical root
+marker refuses only the index. An archive that has never relocated anything is
+ordinary absence, not a refusal. No asset bytes enter these packs.
+
 The separate **live graph document closure** is captured at an exact accepted
 cutoff from the existing canonical graph view: catalog (when accepted), live page
 homes, and every visible block/membership's immutable home. Deleted page homes
