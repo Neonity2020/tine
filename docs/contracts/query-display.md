@@ -731,3 +731,22 @@ combining helper; `src/router.test.ts` (`query workspace display draft (P5C)`)
 for the mutation seam; `src/session.test.ts` for the round trip, the absent-
 versus-`{}` distinction, the malformed-draft drop, and the copy that keeps a
 persisted snapshot from aliasing a live route.
+
+## 12. Ordered sort execution (P5C shared prerequisite)
+
+The shared Rust view adapter applies every requested sort clause in order. Each
+clause uses its existing field semantics and ascending/descending direction; only
+when all keys tie does original row order decide. Sampling follows the completed
+sort. A nonempty sort list disables the unsorted sample admission shortcut, and
+a recency field in any position requests the same recency construction metadata
+and memo profile as a primary recency sort. Cached and fresh results share this
+adapter; the frontend does not sort a replacement result set.
+
+This corrects the former first-clause-only QueryOpts adapter. Sort keys are
+computed once per admitted block per requested clause; existing missing-property
+visible-text fallback can parse each admitted block for a missing key. No page
+document is loaded. Work scales with admitted rows and requested clauses.
+
+Tests: query.rs ordered_view_sort_uses_secondary_direction_before_sample_and_keeps_ties
+and ordered_view_sort_secondary_recency_requires_construction_axis; existing
+query tests retain single-sort/sample behavior.

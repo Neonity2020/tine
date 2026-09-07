@@ -2511,8 +2511,8 @@ impl ConstructionProfile {
     pub(crate) fn from_view(view: &ViewSettings) -> ConstructionProfile {
         let opts = QueryOpts::from_view(view);
         ConstructionProfile {
-            sample_admission_cap: opts.sample.filter(|_| opts.sort.is_none()),
-            want_recency: matches!(&opts.sort, Some((field, _)) if is_recency_field(field)),
+            sample_admission_cap: opts.sample.filter(|_| opts.sort.is_empty()),
+            want_recency: opts.uses_recency(),
         }
     }
 }
@@ -2569,7 +2569,7 @@ pub(crate) fn apply_cached_view(
     exceeded: bool,
 ) -> crate::model::BoundedRefGroups {
     let opts = QueryOpts::from_view(view);
-    let groups = if opts.sort.is_none() && opts.sample.is_none() {
+    let groups = if opts.sort.is_empty() && opts.sample.is_none() {
         std::sync::Arc::clone(groups)
     } else {
         std::sync::Arc::new(apply_view_directives(
@@ -2850,13 +2850,14 @@ pub(crate) fn apply_view_directives(
     // land at different sort positions, e.g. an A and a C task under a priority sort,
     // still appears at each of those positions). Non-sorted queries keep their
     // natural page grouping untouched.
-    if let Some((field, asc)) = &opts.sort {
-        // Decorate each block with its sort key (computed ONCE — an lsdoc parse per
-        // result block, not per comparison) and its original index. The index is a
+    if !opts.sort.is_empty() {
+        // Compute each requested key once per block, outside the comparator.
+        // A missing property can require a bounded visible-text parse per key.
+        // Keep the original index as the
         // stable tiebreaker so equal-key blocks keep DOCUMENT order in both
         // directions: a plain `reverse()` for `desc` would flip a page's blocks
         // upside-down under its heading.
-        let mut flat: Vec<(SortDecor, usize, RefGroup)> = Vec::new();
+        let mut flat: Vec<(Vec<SortDecor>, usize, RefGroup)> = Vec::new();
         for g in groups {
             let RefGroup {
                 page,
@@ -2865,16 +2866,22 @@ pub(crate) fn apply_view_directives(
                 evidence: _,
             } = g;
             for b in blocks {
-                let key = if is_recency_field(field) {
-                    // Recency is numeric (Unix seconds on one axis): journal pages by
-                    // the day they represent, others by file mtime.
-                    SortDecor::Num(recency_by_page.get(&page).copied().unwrap_or(i64::MIN))
-                } else {
-                    SortDecor::Text(sort_key(&b, &page, field))
-                };
+                let keys = opts
+                    .sort
+                    .iter()
+                    .map(|(field, _)| {
+                        if is_recency_field(field) {
+                            // Recency is numeric (Unix seconds on one axis): journal pages by
+                            // the day they represent, others by file mtime.
+                            SortDecor::Num(recency_by_page.get(&page).copied().unwrap_or(i64::MIN))
+                        } else {
+                            SortDecor::Text(sort_key(&b, &page, field))
+                        }
+                    })
+                    .collect();
                 let idx = flat.len();
                 flat.push((
-                    key,
+                    keys,
                     idx,
                     RefGroup {
                         page: page.clone(),
@@ -2886,8 +2893,19 @@ pub(crate) fn apply_view_directives(
             }
         }
         flat.sort_by(|a, b| {
-            let ord = a.0.cmp(&b.0);
-            (if *asc { ord } else { ord.reverse() }).then(a.1.cmp(&b.1))
+            a.0.iter()
+                .zip(&b.0)
+                .zip(&opts.sort)
+                .map(|((left, right), (_, asc))| {
+                    let order = left.cmp(right);
+                    if *asc {
+                        order
+                    } else {
+                        order.reverse()
+                    }
+                })
+                .find(|order| !order.is_eq())
+                .unwrap_or_else(|| a.1.cmp(&b.1))
         });
         // Merge adjacent one-block groups that share a page (and kind) into a single
         // group, so consecutive same-page results render under one heading.
@@ -3316,7 +3334,7 @@ pub(crate) fn sparse_task_query_eligibility(query_src: &str) -> Option<SparseTas
     let opts = QueryOpts::from_view(&view);
     Some(SparseTaskQueryEligibility {
         markers: markers.into_iter().collect(),
-        uses_recency: matches!(&opts.sort, Some((field, _)) if is_recency_field(field)),
+        uses_recency: opts.uses_recency(),
     })
 }
 
@@ -3887,8 +3905,8 @@ pub(crate) fn run_parser_sparse_task_query_bounded(
     }
 
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
-    let sample_admission_cap = opts.sample.filter(|_| opts.sort.is_none());
-    let want_recency = matches!(&opts.sort, Some((field, _)) if is_recency_field(field));
+    let sample_admission_cap = opts.sample.filter(|_| opts.sort.is_empty());
+    let want_recency = opts.uses_recency();
     let mut groups = Vec::<SparseGroup>::new();
     let mut group_indexes = HashMap::<(String, String, PageKind), usize>::new();
     for candidate in &evaluated {
@@ -6164,7 +6182,7 @@ pub fn is_advanced(query_src: &str) -> bool {
 #[derive(Debug, Default, Clone)]
 struct QueryOpts {
     sample: Option<usize>,
-    sort: Option<(String, bool)>, // (field, ascending)
+    sort: Vec<(String, bool)>, // ordered (field, ascending) clauses
 }
 
 impl QueryOpts {
@@ -6173,9 +6191,14 @@ impl QueryOpts {
             sample: view.sample.map(|n| n as usize),
             sort: view
                 .sort
-                .first()
-                .map(|(field, dir)| (field.0.clone(), *dir == SortDir::Asc)),
+                .iter()
+                .map(|(field, dir)| (field.0.clone(), *dir == SortDir::Asc))
+                .collect(),
         }
+    }
+
+    fn uses_recency(&self) -> bool {
+        self.sort.iter().any(|(field, _)| is_recency_field(field))
     }
 }
 
@@ -7582,7 +7605,62 @@ mod tests {
         let view = view_of("(and (task TODO) (sample 5) (sort-by priority desc))");
         let opts = QueryOpts::from_view(&view);
         assert_eq!(opts.sample, Some(5));
-        assert_eq!(opts.sort, Some(("priority".to_string(), false)));
+        assert_eq!(opts.sort, vec![("priority".to_string(), false)]);
+    }
+
+    #[test]
+    fn ordered_view_sort_uses_secondary_direction_before_sample_and_keeps_ties() {
+        use ir::Field;
+        use std::sync::Arc;
+        let blocks = [("a", "Ada"), ("b", "Bo"), ("c", "Bo")]
+            .into_iter()
+            .map(|(id, owner)| BlockDto {
+                id: id.into(),
+                raw: id.into(),
+                priority: Some("A".into()),
+                properties: vec![("owner".into(), owner.into())],
+                ..BlockDto::default()
+            })
+            .collect();
+        let groups = vec![RefGroup {
+            page: "Page".into(),
+            kind: PageKind::Page,
+            blocks,
+            evidence: Vec::new(),
+        }];
+        let view = ViewSettings {
+            sort: vec![
+                (Field::new("priority"), SortDir::Asc),
+                (Field::new("owner"), SortDir::Desc),
+            ],
+            sample: Some(2),
+            ..ViewSettings::default()
+        };
+        let output = apply_cached_view(&Arc::new(groups), &HashMap::new(), &view, 3, false);
+        let ids: Vec<_> = output
+            .groups
+            .iter()
+            .flat_map(|g| g.blocks.iter().map(|b| b.id.as_str()))
+            .collect();
+        assert_eq!(ids, ["b", "c"]);
+        assert_eq!(output.total, 3);
+        assert!(!output.exceeded);
+    }
+
+    #[test]
+    fn ordered_view_sort_secondary_recency_requires_construction_axis() {
+        use ir::Field;
+        let view = ViewSettings {
+            sort: vec![
+                (Field::new("priority"), SortDir::Asc),
+                (Field::new("modified"), SortDir::Desc),
+            ],
+            sample: Some(2),
+            ..ViewSettings::default()
+        };
+        let profile = ConstructionProfile::from_view(&view);
+        assert!(profile.want_recency);
+        assert_eq!(profile.sample_admission_cap, None);
     }
 
     #[test]

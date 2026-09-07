@@ -58,6 +58,8 @@ struct JobState {
     /// Bumped by every drain so a waiter admitted across one learns it was
     /// cancelled instead of taking the slot the drain just freed.
     drain_epoch: u64,
+    #[cfg(test)]
+    waiting_started: Option<std::sync::mpsc::Sender<()>>,
 }
 
 pub(crate) struct QueryJobOwner {
@@ -93,6 +95,8 @@ impl QueryJobOwner {
                 handles: Vec::new(),
                 closed: false,
                 drain_epoch: 0,
+                #[cfg(test)]
+                waiting_started: None,
             }),
             changed: Condvar::new(),
             capacity: capacity.max(1),
@@ -122,6 +126,10 @@ impl QueryJobOwner {
             let now = Instant::now();
             if now >= deadline {
                 return Admission::Busy;
+            }
+            #[cfg(test)]
+            if let Some(started) = state.waiting_started.take() {
+                started.send(()).unwrap();
             }
             let (next, _) = self.changed.wait_timeout(state, deadline - now).unwrap();
             state = next;
@@ -257,11 +265,12 @@ mod tests {
         std::thread::scope(|scope| {
             // A waiter that will be woken by the drain, not by a freed slot.
             let (started, waiting) = mpsc::channel();
+            // Signal under the admission lock after capturing the drain epoch.
+            // A signal before acquire() only proves the thread was scheduled;
+            // the whole drain could finish before it actually starts waiting.
+            owner.state.lock().unwrap().waiting_started = Some(started);
             let owner = &owner;
-            let waiter = scope.spawn(move || {
-                started.send(()).unwrap();
-                matches!(owner.acquire(), Admission::Cancelled)
-            });
+            let waiter = scope.spawn(move || matches!(owner.acquire(), Admission::Cancelled));
             waiting.recv().unwrap();
             // The drain blocks until the held slot is released; release it
             // from another thread once the drain has cancelled the snapshot.
@@ -305,6 +314,8 @@ mod tests {
         assert!(cancellation.is_cancelled());
         assert!(early.is_cancelled());
         drop(early);
+        // Admission beginning after a drain belongs to the new generation.
+        assert!(matches!(owner2.acquire(), Admission::Slot(_)));
         let _ = std::fs::remove_file(&path);
     }
 
