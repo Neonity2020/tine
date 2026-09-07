@@ -4696,6 +4696,53 @@ mod tests {
     /// block-ref counts, the property registry, `list_pages` — answers from
     /// SQL with the cache still absent.
     #[test]
+    fn public_ir_query_on_warm_reopen_uses_sql_without_parsed_cache() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("public-ir-warm");
+        let database = scratch("public-ir-warm-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert!(!graph.has_parsed_cache_test());
+        let (query, view) = crate::query::parse_query_text(
+            "(task TODO)",
+            crate::query::QueryDialect::Og,
+            crate::date::JournalDate::today(),
+        );
+        let before = graph.direct_projection_statement_reads_test();
+        let result = crate::query::run_query_result_ir(
+            &graph,
+            &query,
+            &view,
+            crate::query::ir::Bounds {
+                max_rows: 100,
+                max_bytes: 1_000_000,
+            },
+            &crate::query::ir::ExecutionContext::default(),
+        );
+        assert!(
+            result.total > 0,
+            "fixture must exercise actual result construction"
+        );
+        assert_eq!(
+            graph.direct_projection_statement_reads_test(),
+            before + 1,
+            "public query_run must execute SQLite, not the oracle"
+        );
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "query_run must not hydrate the graph"
+        );
+    }
+
+    #[test]
     fn warm_reopen_parses_nothing_and_answers_from_sql() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = r6_graph("warm-reopen");

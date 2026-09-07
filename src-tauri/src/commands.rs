@@ -6162,6 +6162,72 @@ mod query_command_surface_tests {
         }
     }
 
+    /// RET1: the two §7.1 IR commands reach the engine through the DATABASE
+    /// entry points, on both backends, and nothing else.
+    ///
+    /// The parity and counter gates live in `tine-core`, where the projection
+    /// counters are visible; what has to be pinned HERE is which functions the
+    /// wire calls, because a command that reached a walk entry directly would
+    /// bypass every one of those gates while still answering correctly.
+    /// `crates/tine-core/tests/public_query_executor_census.rs` pins the
+    /// complementary negative — that this crate builds no page source at all.
+    #[test]
+    fn the_two_ir_commands_reach_only_the_database_entry_points() {
+        // Only the PRODUCTION half of this file: the negative assertions below
+        // name the retired producers, so a whole-file scan would find its own
+        // test data.
+        let whole = include_str!("commands.rs");
+        let source = &whole[..whole
+            .find("mod query_command_surface_tests {")
+            .expect("this test lives in that module")];
+        let body = |name: &str| -> &str {
+            let at = source
+                .find(&format!("pub(crate) async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} is a command in this file"));
+            let rest = &source[at..];
+            let end = rest
+                .find("\n#[tauri::command]")
+                .or_else(|| rest.find("\n}\n\n"))
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+
+        let run = body("query_run");
+        assert!(
+            run.contains("tine_core::query::run_query_result_ir("),
+            "`query_run`'s Direct Files branch calls the database result entry"
+        );
+        assert!(
+            run.contains("SyncApplicationNavigationRequest::QueryRun {"),
+            "`query_run`'s Managed branch goes through the captured navigation request"
+        );
+
+        let explain = body("query_explain_empty");
+        assert!(
+            explain.contains("tine_core::query::explain_empty_query("),
+            "`query_explain_empty`'s Direct Files branch calls the database explain entry"
+        );
+        assert!(
+            explain.contains("SyncApplicationNavigationRequest::QueryExplainEmpty {"),
+            "`query_explain_empty`'s Managed branch goes through the captured \
+             navigation request"
+        );
+
+        // The retired actor-side producers, by name: RET1 deleted both, and a
+        // command naming one again would be reconnecting the oracle.
+        for retired in [
+            "run_application_query_result",
+            "explain_application_empty_query",
+            "ApplicationQueryPages",
+            "GraphQueryPages",
+        ] {
+            assert!(
+                !source.contains(retired),
+                "the command layer names the retired/oracle producer `{retired}`"
+            );
+        }
+    }
+
     /// K16: a `@page` query answers with page rows and never loads a document.
     #[test]
     fn query_run_answers_page_rows_for_a_page_anchored_query() {

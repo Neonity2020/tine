@@ -38,6 +38,9 @@ adapter call edges.
 | application_hydration_retained_bytes | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed hydration-cache accounting boundary. |
 | application_inventory_of_kind_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed kind-filtered inventory index. |
 | application_inventory_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed materialized inventory plus overlay. |
+| application_ir_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed driver for SPEC §7.1's two IR commands (RET1): one short actor turn, then the captured read executes on the caller's thread with `operation` released; `Stale` re-captures, `Busy`/`Cancelled` walk, `Failed` errors. |
+| application_ir_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The actor half of `query_run`/`query_explain_empty` (RET1): the §4.4 binding, readiness, memo hit, pending-suffix walk, or a capture for off-actor execution. |
+| application_ir_query_walk_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | ir_walk_ready | The recovery walk a captured IR read falls back to (RET1): it rebuilds the resolved tree from the capture and delegates to `ir_walk_ready`, the ONE walk an IR execution can take on this actor. RET2 retires it together with the fallback arms that reach it. |
 | application_journal_feed | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed journal-feed state owner. |
 | application_journal_feed_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed journal index plus pending overlay. |
 | application_journal_naming | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed graph-config journal naming input. |
@@ -70,11 +73,9 @@ adapter call edges.
 | application_property_registry_cache_key | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The evidence stamp a registry snapshot was built from — accepted frontier pair plus `ParseConfig::digest()` — so an unchanged graph reuses the snapshot instead of rebuilding it per query (SPEC §6.2). Managed-only: it encodes the acceptance-sequence/pending-suffix rule the Direct Files side has no analogue for. |
 | application_property_registry_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed property-registry snapshot: the materialized owner-row stream masked by the unaccepted local overlay, merged with the overlay's own rows (SPEC §6.2 C4). |
 | application_property_registry_snapshot_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | SPEC §7.1 `query_registry` on the Managed side: the wire snapshot of the merged registry, carrying `application_property_registry`'s refusal policy (the last published table, never a half-built one). |
-| application_query_explain_empty_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | explain_application_empty_query | SPEC §7.1 `query_explain_empty` (Q14, N19): assembles the Managed page set and calls the shared computation. |
 | application_query_page_journal | `crates/tine-core/src/sync_runtime.rs` | adapter | parse | Calls `crate::date::JournalFormat::parse` (the census records a call by its last path segment) to read the page's journal day from the graph's CONFIGURED format — the same producer that fills Direct's `PageEntry::date_key`. Never `JournalDate::from_title`, which hardcodes the default format. |
 | application_query_page_recency | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Computes recency from Managed path and graph config. |
 | application_query_plan_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed query-plan/index preparation boundary. |
-| application_query_run_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | run_application_query_result | SPEC §7.1 `query_run`: the IR arrives parsed, so only the Managed page assembly is mode-specific; the evaluator is the shared one. |
 | application_request | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed application request boundary. |
 | application_resolve_blocks_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Materializes resolved Managed UUID groups. |
 | application_simple_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed simple-query driver (R4): one short actor turn, then the captured accepted-frontier read executes on the caller's thread with `operation` released; `Stale` re-captures, `Busy`/`Cancelled` walk, `Failed` errors. |
@@ -101,6 +102,10 @@ adapter call edges.
 | application_crumb_line | `crates/tine-core/src/sync_runtime.rs` | crumb_line | W4-C7b-1 |
 | application_sparse_task_query_ready | `crates/tine-core/src/sync_runtime.rs` | execute_managed_query | R4a |
 | application_sparse_query_doc_block | `crates/tine-core/src/query.rs` | query::results::read_results | R4a-F3 |
+| application_query_run_ready | `crates/tine-core/src/sync_runtime.rs` | application_ir_query_turn | RET1 |
+| application_query_explain_empty_ready | `crates/tine-core/src/sync_runtime.rs` | application_ir_query_turn | RET1 |
+| run_application_query_result | `crates/tine-core/src/query.rs` | query::results::read_results | RET1 |
+| explain_application_empty_query | `crates/tine-core/src/query.rs` | query::view::explain_empty_plan | RET1 |
 
 ## UUID ownership policy
 

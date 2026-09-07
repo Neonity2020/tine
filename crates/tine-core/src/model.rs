@@ -4039,9 +4039,15 @@ struct PropertyRegistryState {
 const PROPERTY_REGISTRY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Which of SPEC §5.9's states one dispatched query attempt reached.
-enum DispatchedQuery {
+///
+/// Generic in what a READY statement produced, because §5.9's four states are a
+/// property of the projection and not of the row shape: `@block` pre-view
+/// groups, `@page` rows and an explanation's probe counts all reach the
+/// projection the same way and owe the same note and the same recovery
+/// (`Graph::dispatched_or_walk` is the one place that pays them).
+enum DispatchedQuery<T> {
     /// The statement answered and its rows were hydrated.
-    Answered(crate::query::PreViewGroups),
+    Answered(T),
     /// No statement was run: the compiler declined this shape (a leaf family
     /// this wave does not lower), or no projection is attached at all. Nothing
     /// failed, so nothing is counted and nothing is scheduled.
@@ -6525,23 +6531,44 @@ impl Graph {
                 profile,
             )
         };
-        match self.direct_projection_statement_pre_view(query, today, max_rows, max_bytes, profile)
-        {
-            DispatchedQuery::Answered(pre) => pre,
+        self.dispatched_or_walk(
+            self.direct_projection_statement_pre_view(query, today, max_rows, max_bytes, profile),
+            || walk(self),
+        )
+    }
+
+    /// **The ONE §5.9 fallback owner.**
+    ///
+    /// Every arm below except `Answered` is production traversal that the
+    /// readiness/recovery/retry packet (RET2) retires. It is not retired HERE
+    /// because there is not yet a typed pending state to return through the
+    /// command boundary, nor an automatic retry behind it: `NotReady` is reached
+    /// on every keystroke while a save's delta applies, and a graph with no
+    /// projection attached (an export, a headless tool, a test graph) reaches
+    /// `Declined` with no database to ask at all. Deleting the arms before then
+    /// would return a fabricated empty result, which the approved
+    /// no-production-traversal amendment forbids.
+    ///
+    /// It is generic over the answer so that adding a row shape cannot add a
+    /// fallback branch: `@page` rows and explanation probe counts route through
+    /// exactly these five arms, and RET2 deletes four of them once, here.
+    fn dispatched_or_walk<T>(&self, dispatched: DispatchedQuery<T>, walk: impl FnOnce() -> T) -> T {
+        match dispatched {
+            DispatchedQuery::Answered(answer) => answer,
             // The compiler declined this shape, or there is no projection to
             // ask. Nothing failed and nothing is stale, so there is no fallback
             // to count and no recovery to schedule.
-            DispatchedQuery::Declined => walk(self),
+            DispatchedQuery::Declined => walk(),
             DispatchedQuery::NotReady => {
                 self.direct_projection_note_fallback_read();
-                walk(self)
+                walk()
             }
             DispatchedQuery::FailedRead => {
                 self.direct_projection_note_fallback_read();
                 self.direct_projection_recover_after_failed_read();
-                walk(self)
+                walk()
             }
-            DispatchedQuery::Cancelled => walk(self),
+            DispatchedQuery::Cancelled => walk(),
         }
     }
 
@@ -6556,7 +6583,7 @@ impl Graph {
         max_rows: usize,
         max_bytes: usize,
         profile: crate::query::ConstructionProfile,
-    ) -> DispatchedQuery {
+    ) -> DispatchedQuery<crate::query::PreViewGroups> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(projection) = self
@@ -6653,6 +6680,336 @@ impl Graph {
                 DispatchedQuery::FailedRead
             }
         }
+    }
+
+    /// **SPEC §7.1 `query_run`'s Direct Files execution** (RET1).
+    ///
+    /// The public IR command used to hand `GraphQueryPages` to the shared
+    /// result driver, so a ready warm graph answered a real result by walking
+    /// the parsed graph and read no statement at all. It now takes exactly the
+    /// same two routes the `{{query …}}` render path takes: `@block` through
+    /// §5.9's IR-keyed pre-view memo and dispatch, `@page` through the page
+    /// statement and the shared page read.
+    ///
+    /// **Post-resolution only.** `resolved` is the bound tree and its ONE
+    /// execution-day snapshot (§4.4), so `?current-page` and `:today` are
+    /// resolved once, before anything is keyed, lowered or cached. The support
+    /// report is NOT attached here: it is a property of how this source was
+    /// bound, not of the rows, which is why the rows may be shared by the memo
+    /// and the report may not (`query::run_query_result_ir` attaches it).
+    pub(crate) fn direct_ir_query_result(
+        &self,
+        resolved: &crate::query::ResolvedQuery,
+        view: &crate::query::ir::ViewSettings,
+        bounds: crate::query::ir::Bounds,
+    ) -> crate::query::ir::QueryResult {
+        let query = resolved.query();
+        let mut result = crate::query::ir::QueryResult {
+            rows: crate::query::ir::QueryRows::Page { pages: Vec::new() },
+            diagnostics: query.diagnostics.clone(),
+            report: crate::query::ir::QueryReport {
+                ran: Vec::new(),
+                ignored: Vec::new(),
+                supported: true,
+            },
+            total: 0,
+            exceeded: false,
+        };
+        if query.anchor == crate::query::ir::Anchor::Page {
+            let answer = self.direct_page_rows(query, resolved.today(), bounds);
+            result.total = answer.total;
+            result.exceeded = answer.exceeded;
+            result.rows = crate::query::ir::QueryRows::Page {
+                pages: answer.pages,
+            };
+            return result;
+        }
+        // The block-anchored tree both engines evaluate, and the tree §5.9's
+        // cache is keyed by — the same `block_anchored_query` rebase
+        // `run_query_bounded` lowers through, never a second one.
+        let query = crate::query::block_anchored_query(query);
+        let bounded = self.derived_memo_pre_view(
+            &query,
+            view,
+            bounds.max_rows,
+            bounds.max_bytes,
+            |profile| {
+                self.direct_simple_query_pre_view(
+                    &query,
+                    resolved.today(),
+                    bounds.max_rows,
+                    bounds.max_bytes,
+                    profile,
+                )
+            },
+        );
+        result.total = bounded.total;
+        result.exceeded = bounded.exceeded;
+        result.rows = crate::query::ir::QueryRows::Block {
+            groups: Arc::try_unwrap(bounded.groups)
+                .unwrap_or_else(|groups| groups.as_ref().clone()),
+        };
+        result
+    }
+
+    /// **SPEC §7.1 `query_explain_empty`'s Direct Files execution** (RET1).
+    ///
+    /// The decomposition, the printing and the report are `query::view`'s and
+    /// are shared with the oracle; only the counting is here. Every probe of one
+    /// explanation is counted from ONE owned snapshot, so the conjunct counts
+    /// and the whole-query answer describe the same graph state rather than N
+    /// separately-timed reads.
+    pub(crate) fn direct_ir_explain_empty(
+        &self,
+        resolved: &crate::query::ResolvedQuery,
+        view: &crate::query::ir::ViewSettings,
+        bounds: crate::query::ir::Bounds,
+    ) -> crate::query::ir::ExplainEmptyResult {
+        let plan = crate::query::view::explain_empty_plan(resolved);
+        if plan.probes.is_empty() {
+            return plan.answer(resolved, &[]);
+        }
+        let today = resolved.today();
+        let walk = || {
+            plan.probes
+                .iter()
+                .map(|probe| {
+                    crate::query::run_query_result_over(
+                        &crate::query::GraphQueryPages(self),
+                        probe,
+                        view,
+                        today,
+                        bounds,
+                    )
+                    .total
+                })
+                .collect::<Vec<_>>()
+        };
+        let counts = self.dispatched_or_walk(
+            self.direct_projection_statement_probe_counts(&plan.probes, view, today, bounds),
+            walk,
+        );
+        plan.answer(resolved, &counts)
+    }
+
+    /// §5.9's dispatch for an `@page` answer: the page statement when the
+    /// projection is ready, this graph's page walk otherwise.
+    fn direct_page_rows(
+        &self,
+        query: &crate::query::ir::Query,
+        today: crate::date::JournalDate,
+        bounds: crate::query::ir::Bounds,
+    ) -> crate::query::results::PageAnswer {
+        let walk = || {
+            crate::query::collect_page_rows_over(
+                &crate::query::GraphQueryPages(self),
+                query,
+                today,
+                bounds,
+            )
+        };
+        self.dispatched_or_walk(
+            self.direct_projection_statement_page_rows(query, today, bounds),
+            walk,
+        )
+    }
+
+    /// The statement half of [`Graph::direct_page_rows`], and of
+    /// [`Graph::direct_ir_explain_empty`]'s counting: ONE query job, then the
+    /// caller's reads over its snapshot.
+    ///
+    /// It performs no fallback of its own — it reports which §5.9 state it
+    /// reached, exactly as `direct_projection_statement_pre_view` does, so the
+    /// note and the recovery stay in `dispatched_or_walk`.
+    fn direct_projection_query_job<T>(
+        &self,
+        read: impl FnOnce(
+            &mut crate::direct_projection::DirectQueryJob<'_>,
+        ) -> Result<T, crate::query::results::ResultReadError>,
+    ) -> DispatchedQuery<T> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        else {
+            return DispatchedQuery::Declined;
+        };
+        if !projection.ready_at(generation) {
+            return DispatchedQuery::NotReady;
+        }
+        let mut job = match projection.open_query_job(generation) {
+            crate::direct_projection::QueryJobOpen::Job(job) => job,
+            crate::direct_projection::QueryJobOpen::NotReady => return DispatchedQuery::NotReady,
+            crate::direct_projection::QueryJobOpen::Failed => return DispatchedQuery::FailedRead,
+            crate::direct_projection::QueryJobOpen::Cancelled => return DispatchedQuery::Cancelled,
+        };
+        match read(&mut job) {
+            Ok(answer) => DispatchedQuery::Answered(answer),
+            Err(crate::query::results::ResultReadError::Cancelled) => DispatchedQuery::Cancelled,
+            Err(crate::query::results::ResultReadError::Sql(_))
+            | Err(crate::query::results::ResultReadError::Corrupt(_)) => {
+                DispatchedQuery::FailedRead
+            }
+        }
+    }
+
+    /// The §6.2 lowering inputs one Direct execution runs under: ONE registry
+    /// snapshot and ONE parse of every `content match` payload, the same values
+    /// the walk reads (I-12). Returned as the two owned pieces the borrow in
+    /// `LoweringInputs` needs.
+    fn direct_lowering_inputs(
+        &self,
+        query: &crate::query::ir::Query,
+    ) -> (
+        Arc<crate::query::registry::Registry>,
+        crate::query::eval::CompiledLeaves,
+    ) {
+        (
+            self.property_registry(),
+            crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter()),
+        )
+    }
+
+    fn direct_projection_statement_page_rows(
+        &self,
+        query: &crate::query::ir::Query,
+        today: crate::date::JournalDate,
+        bounds: crate::query::ir::Bounds,
+    ) -> DispatchedQuery<crate::query::results::PageAnswer> {
+        use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+        let fts_ready = {
+            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            match self.direct_projection.lock().unwrap().as_ref() {
+                Some(projection) => projection.fts_ready(generation),
+                None => return DispatchedQuery::Declined,
+            }
+        };
+        let (registry, compiled) = self.direct_lowering_inputs(query);
+        let statement = lower_query(
+            query,
+            &LoweringInputs {
+                today,
+                registry: &registry,
+                masked_pages: &[],
+                // NOT `max_rows`: the page loop's `exceeded` is decided by the
+                // row AFTER the cap, so a `LIMIT` would hide it.
+                cutoff: None,
+                compiled: &compiled,
+                fts_ready,
+                result_set_rule: RESULT_SET_RULE,
+            },
+        );
+        // A filter that folded to false — an invalid query's zero results
+        // (§3.5), or a leaf that can never hold — has its answer already.
+        if statement.matches_nothing {
+            return DispatchedQuery::Answered(crate::query::results::PageAnswer::default());
+        }
+        self.direct_projection_query_job(|job| {
+            crate::query::results::read_page_results(
+                &mut job.snapshot,
+                &statement,
+                crate::query::results::BackendOrder::Direct,
+                bounds.max_rows,
+            )
+        })
+    }
+
+    /// Every probe of one explanation, counted over ONE snapshot.
+    ///
+    /// The probes share the anchor of the query they decompose, so a `@page`
+    /// explanation counts page rows and a `@block` one counts the same `total`
+    /// the block budget reports — the identical two producers the answer itself
+    /// uses, never a third counting rule.
+    fn direct_projection_statement_probe_counts(
+        &self,
+        probes: &[crate::query::ir::Query],
+        view: &crate::query::ir::ViewSettings,
+        today: crate::date::JournalDate,
+        bounds: crate::query::ir::Bounds,
+    ) -> DispatchedQuery<Vec<usize>> {
+        use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+        let fts_ready = {
+            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            match self.direct_projection.lock().unwrap().as_ref() {
+                Some(projection) => projection.fts_ready(generation),
+                None => return DispatchedQuery::Declined,
+            }
+        };
+        let profile = crate::query::ConstructionProfile::from_view(view);
+        // One lowering per probe, all under ONE registry snapshot: a probe that
+        // read a different effective type than its siblings would explain a
+        // query nobody ran.
+        let registry = self.property_registry();
+        let page_anchored = probes
+            .first()
+            .is_some_and(|probe| probe.anchor == crate::query::ir::Anchor::Page);
+        let lowered = probes
+            .iter()
+            .map(|probe| {
+                let probe = if page_anchored {
+                    probe.clone()
+                } else {
+                    crate::query::block_anchored_query(probe)
+                };
+                let compiled =
+                    crate::query::eval::CompiledLeaves::for_query(&probe.evaluable_filter());
+                lower_query(
+                    &probe,
+                    &LoweringInputs {
+                        today,
+                        registry: &registry,
+                        masked_pages: &[],
+                        cutoff: None,
+                        compiled: &compiled,
+                        fts_ready,
+                        result_set_rule: RESULT_SET_RULE,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        self.direct_projection_query_job(|job| {
+            let identity = crate::query::results::ResultIdentity::DirectStructural {
+                session_pages: Arc::clone(&job.session_pages),
+                all_session: false,
+            };
+            let recency = |page: crate::query::results::RecencyPage<'_>| {
+                crate::query::page_recency_secs_for(page.journal_day, &self.root.join(page.path))
+            };
+            let mut counts = Vec::with_capacity(lowered.len());
+            for statement in &lowered {
+                if statement.matches_nothing {
+                    counts.push(0);
+                    continue;
+                }
+                counts.push(if page_anchored {
+                    crate::query::results::read_page_results(
+                        &mut job.snapshot,
+                        statement,
+                        crate::query::results::BackendOrder::Direct,
+                        bounds.max_rows,
+                    )?
+                    .total
+                } else {
+                    crate::query::results::read_results(
+                        &mut job.snapshot,
+                        &crate::query::results::ResultReadInputs {
+                            statement,
+                            order: crate::query::results::BackendOrder::Direct,
+                            identity: &identity,
+                            max_rows: bounds.max_rows,
+                            max_bytes: bounds.max_bytes,
+                            profile,
+                            recency: &recency,
+                        },
+                    )?
+                    .total
+                });
+            }
+            Ok(counts)
+        })
     }
 
     /// §5.9/M9: schedule the recovery a FAILED projection read owes.

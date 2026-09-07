@@ -31054,7 +31054,9 @@ fn r4b_a_stale_snapshot_recaptures_twice_then_walks() {
         vec![
             Outcome::Stale,
             Outcome::Stale,
-            Outcome::Answered(crate::query::PreViewGroups::default()),
+            Outcome::Answered(crate::managed_query::ManagedQueryAnswer::Blocks(
+                crate::query::PreViewGroups::default(),
+            )),
         ],
     );
     let answered = r4b_query(&handle).unwrap();
@@ -34278,6 +34280,804 @@ fn r5c_the_worst_case_patch_is_measured() {
         query_us[SAMPLES / 2],
         query_us[SAMPLES - 1],
     );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+// ===== RET1: the PUBLIC IR commands over Managed storage =====
+//
+// `r4a_*` above proves the accepted-frontier route for the older SimpleQuery
+// text entry. These prove the two SHIPPED IR commands — SPEC §7.1 `query_run`
+// and `query_explain_empty`, reached through
+// `SyncApplicationNavigationRequest::QueryRun` / `QueryExplainEmpty` — take the
+// same captured off-actor route: the same answer as the walk, a statement read,
+// no page hydration, no whole-graph inventory pass, and an actor that stays
+// free while the selection waits.
+
+/// One PUBLIC IR execution, at explicit bounds and in one execution context.
+fn ret1_ir_navigate(
+    handle: &SyncRuntimeHandle,
+    query: &crate::query::ir::Query,
+    view: &crate::query::ir::ViewSettings,
+    context: &crate::query::ir::ExecutionContext,
+    explain: bool,
+    max_rows: usize,
+    max_bytes: usize,
+) -> SyncApplicationNavigationReply {
+    let request = if explain {
+        SyncApplicationNavigationRequest::QueryExplainEmpty {
+            query: query.clone(),
+            view: view.clone(),
+            context: context.clone(),
+            max_rows,
+            max_bytes,
+        }
+    } else {
+        SyncApplicationNavigationRequest::QueryRun {
+            query: query.clone(),
+            view: view.clone(),
+            context: context.clone(),
+            max_rows,
+            max_bytes,
+        }
+    };
+    match handle.application_navigation(request).unwrap() {
+        SyncApplicationNavigationOutcome::Loaded { reply } => reply,
+        other => panic!("an IR query returned the wrong outcome: {other:?}"),
+    }
+}
+
+/// The walk answer for the same execution, taken on the actor through the same
+/// binding and decomposition.
+fn ret1_ir_oracle(
+    handle: &SyncRuntimeHandle,
+    query: &crate::query::ir::Query,
+    view: &crate::query::ir::ViewSettings,
+    context: &crate::query::ir::ExecutionContext,
+    explain: bool,
+    max_rows: usize,
+    max_bytes: usize,
+) -> SyncApplicationNavigationReply {
+    handle.clear_application_simple_query_memo().unwrap();
+    let answer = handle
+        .application_complete_page_ir_query(
+            query.clone(),
+            view.clone(),
+            context.clone(),
+            explain,
+            max_rows,
+            max_bytes,
+        )
+        .unwrap();
+    handle.clear_application_simple_query_memo().unwrap();
+    answer
+}
+
+/// Complete wire equality between two answers of the SAME backend. Both sides
+/// are Managed, so a difference is a defect and never a mode difference.
+fn ret1_assert_same(
+    label: &str,
+    actual: &SyncApplicationNavigationReply,
+    expected: &SyncApplicationNavigationReply,
+) {
+    let actual = serde_json::to_value(actual).unwrap();
+    let expected = serde_json::to_value(expected).unwrap();
+    assert_eq!(actual, expected, "{label}");
+}
+
+/// How many rows an IR reply carries, so a gate can refuse to pass on an answer
+/// that was empty for both sides.
+fn ret1_reply_rows(reply: &SyncApplicationNavigationReply) -> usize {
+    match reply {
+        SyncApplicationNavigationReply::QueryRun(result) => match &result.rows {
+            crate::query::ir::QueryRows::Block { groups } => {
+                groups.iter().map(|group| group.blocks.len()).sum::<usize>()
+            }
+            crate::query::ir::QueryRows::Page { pages } => pages.len(),
+        },
+        SyncApplicationNavigationReply::QueryExplainEmpty(explained) => explained.rows.len(),
+        other => panic!("not an IR reply: {other:?}"),
+    }
+}
+
+/// The shapes the Managed IR gates run: §5's own three tables, plus the two OG
+/// view directives, plus the `@page` anchor the tables already carry.
+fn ret1_ir_shapes() -> Vec<(String, crate::query::QueryInput)> {
+    use crate::query::sql::sql_gates_tests::{CONTENT_PLAN_SHAPES, IDENTITY_SHAPES, PLAN_SHAPES};
+    use crate::query::{QueryDialect, QueryInput};
+
+    let input_of = |dialect: QueryDialect| match dialect {
+        QueryDialect::Og => QueryInput::Og,
+        QueryDialect::Tql => QueryInput::Tql,
+    };
+    let mut shapes: Vec<(String, QueryInput)> = Vec::new();
+    for (source, dialect) in IDENTITY_SHAPES.iter().chain(PLAN_SHAPES.iter()) {
+        shapes.push(((*source).to_owned(), input_of(*dialect)));
+    }
+    for (source, dialect, _plan) in CONTENT_PLAN_SHAPES {
+        shapes.push(((*source).to_owned(), input_of(*dialect)));
+    }
+    let with_views = shapes
+        .iter()
+        .filter(|(_, input)| matches!(input, QueryInput::Og))
+        .take(24)
+        .flat_map(|(source, input)| {
+            [
+                (format!("{source} (sample 3)"), *input),
+                (format!("{source} (sort-by modified desc)"), *input),
+            ]
+        })
+        .collect::<Vec<_>>();
+    shapes.extend(with_views);
+    shapes
+}
+
+fn ret1_parse(
+    source: &str,
+    input: crate::query::QueryInput,
+) -> (crate::query::ir::Query, crate::query::ir::ViewSettings) {
+    crate::query::parse_query_input(
+        source,
+        input,
+        crate::date::JournalDate::today(),
+        crate::query::registry::Registry::none(),
+    )
+}
+
+/// **RET1's acceptance bar for `query_run` over Managed storage.** Every shape
+/// §5 names, at both anchors, answered by the captured database route exactly
+/// as the actor-side walk answers it.
+#[test]
+fn ret1_the_public_ir_route_answers_every_shape_exactly_as_the_walk() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("ret1-ir-parity", 0x4a20);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+
+    let mut differences = Vec::new();
+    let mut block_rows = 0usize;
+    let mut page_rows = 0usize;
+    for (source, input) in ret1_ir_shapes() {
+        let (query, view) = ret1_parse(&source, input);
+        // The wire refuses a zero row or byte bound outright (§7.1's request
+        // limits), so the legal edges here are the smallest ACCEPTED ones; the
+        // zero edges are asserted as refusals below, and the Direct gates cover
+        // zero at the engine entry, which is under the wire.
+        for (max_rows, max_bytes) in [(R4B_ROWS, R4B_BYTES), (1, R4B_BYTES), (R4B_ROWS, 1)] {
+            let oracle =
+                ret1_ir_oracle(&handle, &query, &view, &context, false, max_rows, max_bytes);
+            handle.clear_application_simple_query_memo().unwrap();
+            let answered =
+                ret1_ir_navigate(&handle, &query, &view, &context, false, max_rows, max_bytes);
+            let rows = ret1_reply_rows(&oracle);
+            match &oracle {
+                SyncApplicationNavigationReply::QueryRun(result) => match result.rows {
+                    crate::query::ir::QueryRows::Block { .. } => block_rows += rows,
+                    crate::query::ir::QueryRows::Page { .. } => page_rows += rows,
+                },
+                other => panic!("`query_run` must reply with a result: {other:?}"),
+            }
+            let actual = serde_json::to_value(&answered).unwrap();
+            let expected = serde_json::to_value(&oracle).unwrap();
+            if actual != expected {
+                differences.push(format!(
+                    "shape {source:?} rows={max_rows} bytes={max_bytes}: the captured route \
+                     and the walk disagree ({rows} walk row(s))"
+                ));
+            }
+        }
+    }
+    assert!(
+        block_rows > 0 && page_rows > 0,
+        "the corpus answered {block_rows} block and {page_rows} page row(s); both \
+         anchors have to be exercised"
+    );
+
+    // The zero edges, at the wire: §7.1 bounds a request by what it can make
+    // the runtime construct, and RET1 did not widen that.
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+    for (max_rows, max_bytes) in [(0, R4B_BYTES), (R4B_ROWS, 0)] {
+        for explain in [false, true] {
+            let request = if explain {
+                SyncApplicationNavigationRequest::QueryExplainEmpty {
+                    query: query.clone(),
+                    view: view.clone(),
+                    context: context.clone(),
+                    max_rows,
+                    max_bytes,
+                }
+            } else {
+                SyncApplicationNavigationRequest::QueryRun {
+                    query: query.clone(),
+                    view: view.clone(),
+                    context: context.clone(),
+                    max_rows,
+                    max_bytes,
+                }
+            };
+            assert!(
+                matches!(
+                    handle.application_navigation(request),
+                    Err(SyncApplicationPageRequestError::RequestTooLarge(_))
+                ),
+                "a zero bound (rows={max_rows}, bytes={max_bytes}, explain={explain}) \
+                 must be refused at the wire, not answered"
+            );
+        }
+    }
+    assert!(
+        differences.is_empty(),
+        "the captured IR route and the walk disagree:\n{}",
+        differences.join("\n")
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// The same bar for `query_explain_empty`: the same per-conjunct explanation,
+/// from the captured route.
+#[test]
+fn ret1_the_public_ir_explanation_matches_the_walk_over_every_shape() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("ret1-ir-explain-parity", 0x4a21);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+
+    let mut differences = Vec::new();
+    let mut explained_rows = 0usize;
+    for (source, input) in ret1_ir_shapes() {
+        let (query, view) = ret1_parse(&source, input);
+        let oracle = ret1_ir_oracle(&handle, &query, &view, &context, true, R4B_ROWS, R4B_BYTES);
+        handle.clear_application_simple_query_memo().unwrap();
+        let answered =
+            ret1_ir_navigate(&handle, &query, &view, &context, true, R4B_ROWS, R4B_BYTES);
+        explained_rows += ret1_reply_rows(&oracle);
+        if serde_json::to_value(&answered).unwrap() != serde_json::to_value(&oracle).unwrap() {
+            differences.push(format!(
+                "shape {source:?}: the captured explanation and the walk disagree"
+            ));
+        }
+    }
+    assert!(
+        explained_rows > 0,
+        "no shape produced an explanation row; the gate proves nothing"
+    );
+    assert!(
+        differences.is_empty(),
+        "the captured IR explanation and the walk disagree:\n{}",
+        differences.join("\n")
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// **RET1's counter bar.** Every public IR execution — a block `query_run`, a
+/// `@page` `query_run`, and a `query_explain_empty` — is answered by ONE
+/// statement read, with no fallback, no failure, no re-capture, no page DTO
+/// loaded and no whole-graph inventory pass. The second run of the same
+/// execution is a memo hit that executes nothing.
+#[test]
+fn ret1_the_public_ir_route_reads_statements_and_hydrates_no_page() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("ret1-ir-census", 0x4a22);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+
+    for (label, source, input, explain) in [
+        (
+            "block query_run",
+            "(task TODO)",
+            crate::query::QueryInput::Og,
+            false,
+        ),
+        (
+            "page query_run",
+            "@page and journal = false",
+            crate::query::QueryInput::Tql,
+            false,
+        ),
+        (
+            "block query_explain_empty",
+            "(and (task TODO) [[Project]])",
+            crate::query::QueryInput::Og,
+            true,
+        ),
+        (
+            "page query_explain_empty",
+            "@page and journal = false and name like 'proj/%'",
+            crate::query::QueryInput::Tql,
+            true,
+        ),
+    ] {
+        let (query, view) = ret1_parse(source, input);
+        let oracle = ret1_ir_oracle(
+            &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+        );
+        assert!(
+            ret1_reply_rows(&oracle) > 0,
+            "{label}: the fixture must answer this execution nonempty"
+        );
+
+        handle.clear_application_simple_query_memo().unwrap();
+        handle.reset_managed_query_census();
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let answered = ret1_ir_navigate(
+            &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+        );
+        assert_eq!(
+            r4b_census(&handle),
+            (1, 0, 0, 0),
+            "{label}: one statement read, no fallback, no failure, no re-capture"
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(
+            counters.result_page_hydrations, 0,
+            "{label}: the captured route loads no page DTO: {counters:?}"
+        );
+        assert_eq!(
+            counters.metadata_page_hydrations, 0,
+            "{label}: {counters:?}"
+        );
+        assert_eq!(counters.full_inventory_passes, 0, "{label}: {counters:?}");
+        ret1_assert_same(label, &answered, &oracle);
+    }
+
+    // The memo is a property of the BLOCK route only: an explanation's counts
+    // and a page answer are not stored beside a row set, so their second run
+    // executes again rather than replying from a cache that never held them.
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    let first = ret1_ir_navigate(&handle, &query, &view, &context, false, R4B_ROWS, R4B_BYTES);
+    assert_eq!(r4b_census(&handle), (1, 0, 0, 0));
+    let memoized = ret1_ir_navigate(&handle, &query, &view, &context, false, R4B_ROWS, R4B_BYTES);
+    assert_eq!(
+        r4b_census(&handle),
+        (1, 0, 0, 0),
+        "a memo hit executes nothing"
+    );
+    ret1_assert_same("memo hit", &memoized, &first);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// **RET1's barrier bar.** The captured selection runs OFF the actor: while it
+/// waits for its snapshot, an ordinary editor turn — loading a page and saving
+/// it — completes on the actor, advances the accepted frontier, and the
+/// execution re-captures once and answers at the NEW frontier.
+///
+/// Stated for all three public shapes, not only the block `query_run`: a page
+/// answer and an explanation take the same route and must take the same
+/// barrier.
+#[test]
+fn ret1_an_actor_edit_turn_completes_while_a_public_ir_selection_waits() {
+    for (label, source, input, explain) in [
+        (
+            "block query_run",
+            "(task TODO)",
+            crate::query::QueryInput::Og,
+            false,
+        ),
+        (
+            "page query_run",
+            "@page and journal = false",
+            crate::query::QueryInput::Tql,
+            false,
+        ),
+        (
+            "block query_explain_empty",
+            "(and (task TODO) (task TODO DOING))",
+            crate::query::QueryInput::Og,
+            true,
+        ),
+    ] {
+        let (fixture, handle) = r4b_reopened("ret1-ir-barrier", 0x4a23);
+        let (query, view) = ret1_parse(source, input);
+        let context = crate::query::ir::ExecutionContext::none();
+        let before = ret1_ir_oracle(
+            &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+        );
+        assert!(
+            ret1_reply_rows(&before) > 0,
+            "{label}: the fixture must answer this execution nonempty"
+        );
+        let witness_before = {
+            let (witness_query, witness_view) =
+                ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+            ret1_reply_rows(&ret1_ir_oracle(
+                &handle,
+                &witness_query,
+                &witness_view,
+                &context,
+                false,
+                R4B_ROWS,
+                R4B_BYTES,
+            ))
+        };
+
+        // Advance the accepted frontier exactly once, from inside the executor,
+        // after the capture and before its snapshot is opened. The save is a
+        // FULL actor turn: if the selection held the actor, it could not run.
+        let witness_path = Graph::open(&fixture.graph_root)
+            .list_pages()
+            .into_iter()
+            .next()
+            .expect("the fixture has pages")
+            .rel_path;
+        let advanced = std::cell::Cell::new(0usize);
+        let handle_for_hook: *const SyncRuntimeHandle = &handle;
+        crate::managed_query::set_before_managed_open_hook(Some(Box::new(move || {
+            if advanced.replace(1) != 0 {
+                return;
+            }
+            // SAFETY: the executor runs on THIS thread, inside this test's own
+            // call, and the handle outlives the hook, which is cleared below.
+            let handle = unsafe { &*handle_for_hook };
+            let (mut page, revision) = load_application_exact(handle, &witness_path);
+            page.blocks
+                .push(application_move_test_root("TODO ret1-barrier-witness", 0));
+            let save = handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: page.path.clone(),
+                        revision,
+                    },
+                    page,
+                })
+                .unwrap();
+            assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
+            drain_managed_local(handle);
+        })));
+
+        handle.clear_application_simple_query_memo().unwrap();
+        handle.reset_managed_query_census();
+        let answered = ret1_ir_navigate(
+            &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+        );
+        crate::managed_query::set_before_managed_open_hook(None);
+        assert_eq!(
+            r4b_census(&handle),
+            (1, 0, 0, 1),
+            "{label}: one Stale re-capture, then one statement read at the new frontier"
+        );
+        let after = ret1_ir_oracle(
+            &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+        );
+        // The frontier really advanced, witnessed independently of the shape
+        // under test: appending one block changes the BLOCK answer by one and
+        // leaves the page set alone, so the shape's own answer is not a usable
+        // witness for `@page`.
+        let (witness_query, witness_view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+        let witness = ret1_ir_oracle(
+            &handle,
+            &witness_query,
+            &witness_view,
+            &context,
+            false,
+            R4B_ROWS,
+            R4B_BYTES,
+        );
+        assert_eq!(
+            ret1_reply_rows(&witness),
+            witness_before + 1,
+            "{label}: the accepted frontier must have advanced by exactly one match"
+        );
+        ret1_assert_same(
+            &format!("{label}: answer at the new frontier"),
+            &answered,
+            &after,
+        );
+
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+}
+
+/// The shapes the RET1 pending gate runs. R5b's turn rule admits only
+/// page-local, property-free selections to the two-source read, so these are
+/// the shapes that actually reach the executor while a suffix is pending —
+/// plus the `@page` anchor, which RET1 added and which has to obey the same
+/// masks.
+const RET1_PENDING_SHAPES: &[(&str, crate::query::QueryInput)] = &[
+    ("(task TODO)", crate::query::QueryInput::Og),
+    (
+        "(task TODO) (sort-by modified desc)",
+        crate::query::QueryInput::Og,
+    ),
+    ("(task TODO) (sample 3)", crate::query::QueryInput::Og),
+    ("(content-regex \"ret1\")", crate::query::QueryInput::Og),
+    ("(task DONE)", crate::query::QueryInput::Og),
+    ("@page and journal = false", crate::query::QueryInput::Tql),
+    ("@page and journal = true", crate::query::QueryInput::Tql),
+    ("@page and name like 'r5a%'", crate::query::QueryInput::Tql),
+    (
+        "@page and day >= '2026-01-01'",
+        crate::query::QueryInput::Tql,
+    ),
+];
+
+/// Every RET1 pending shape at every legal bound, plus its explanation,
+/// compared against the actor's masked walk over the SAME pending state.
+fn ret1_pending_parity_over(handle: &SyncRuntimeHandle, label: &str) -> (usize, Vec<String>) {
+    let context = crate::query::ir::ExecutionContext::none();
+    let mut differences = Vec::new();
+    let mut rows = 0usize;
+    for (index, (source, input)) in RET1_PENDING_SHAPES.iter().enumerate() {
+        let (query, view) = ret1_parse(source, *input);
+        for (max_rows, max_bytes) in [
+            (R5A_ROWS, R5A_BYTES),
+            (1, R5A_BYTES),
+            (2, R5A_BYTES),
+            (R5A_ROWS, 1),
+        ] {
+            for explain in [false, true] {
+                // Named by INDEX, never by source: this helper's shape list is
+                // fixed, but the fixture's rows are content.
+                let at = format!(
+                    "{label}: shape #{index} rows={max_rows} bytes={max_bytes} explain={explain}"
+                );
+                let expected = ret1_ir_oracle(
+                    handle, &query, &view, &context, explain, max_rows, max_bytes,
+                );
+                rows += ret1_reply_rows(&expected);
+                handle.clear_application_simple_query_memo().unwrap();
+                handle.reset_managed_query_census();
+                let actual = ret1_ir_navigate(
+                    handle, &query, &view, &context, explain, max_rows, max_bytes,
+                );
+                let (statement_reads, pending_reads, fallbacks, failures, _) = r5a_census(handle);
+                // Every one of these shapes is page-local and property-free, so
+                // every one of them must reach the TWO-source read rather than
+                // the actor's masked walk.
+                if statement_reads != 1 || pending_reads != 1 || fallbacks != 0 || failures != 0 {
+                    differences.push(format!(
+                        "{at} did not answer from the two-source read: \
+                         statement_reads={statement_reads} pending_reads={pending_reads} \
+                         fallbacks={fallbacks} failures={failures}"
+                    ));
+                }
+                if serde_json::to_value(&actual).unwrap()
+                    != serde_json::to_value(&expected).unwrap()
+                {
+                    differences.push(format!("{at}: the pending read and the walk disagree"));
+                }
+            }
+        }
+    }
+    (rows, differences)
+}
+
+/// **RET1's pending-suffix bar.** With an undrained local suffix holding an
+/// added block, a removed block, a never-accepted page, a deleted page, a moved
+/// page and a second physical file of one display name, both public IR commands
+/// answer from the two-source read — accepted file plus overlay — exactly as
+/// the actor's masked walk over the same state answers.
+///
+/// The page masks are the point: a deleted, replaced or renamed physical path
+/// must be masked out of the ACCEPTED statement, or a `@page` answer would
+/// carry a row for a page that no longer exists at that path.
+#[test]
+fn ret1_the_public_ir_route_answers_a_pending_suffix_exactly_as_the_walk() {
+    let fixture = r5a_fixture("ret1-ir-pending", 0x5a20);
+    // A second physical file of one display name, accepted before the suffix:
+    // Managed storage owns ONE page for it, and the masks have to keep that
+    // true while the twin's sibling is pending.
+    fs::write(
+        fixture.graph_root.join("notes/twin-one.md"),
+        "title:: R5a Twin\n\n- TODO ret1 twin accepted\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/twin-two.md"),
+        "title:: R5a Twin\n\n- DONE ret1 twin second file\n",
+    )
+    .unwrap();
+    let handle = r4a_reopen(&fixture);
+
+    // A page that was never accepted, and a page deleted while pending, both
+    // reached through the runtime's own new-page and delete paths.
+    let doomed = r5a_pending_new_page(
+        &handle,
+        "Foxtrot",
+        vec![application_move_test_root("TODO ret1 foxtrot doomed", 0)],
+    );
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+
+    // (a) an edit that ADDS the first matching block to a page; (b) an edit
+    // that REMOVES the only matching block; (c)/(d) a never-accepted page and a
+    // deleted one; plus an Org page, a Unicode path and a journal.
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO ret1 delta added");
+    r5a_pending_replace(
+        &handle,
+        "notes/Echo.md",
+        vec![application_move_test_root("ret1 echo without a marker", 0)],
+    );
+    r5a_pending_append(&handle, "notes/Kilo.org", "TODO ret1 kilo added");
+    r5a_pending_append(&handle, "notes/Ärger.md", "TODO ret1 arger added");
+    r5a_pending_append(&handle, "diary/20-07-2026.md", "TODO ret1 journal added");
+    // The twin pair stays ACCEPTED rather than pending: Managed storage's
+    // pre-commit graph check refuses a semantic write while two physical files
+    // claim one display name, which is its own long-standing rule and not
+    // something this packet changes. The `@page` shapes below still have to
+    // answer with ONE row for the pair.
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Foxtrot".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: Some(doomed.clone()),
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied
+    );
+    let created = r5a_pending_new_page(
+        &handle,
+        "Charlie",
+        vec![application_move_test_root("TODO ret1 charlie new", 0)],
+    );
+    let (_, state) = r5a_overlay(&handle);
+    assert!(
+        state.pending_paths.contains(&created) && state.pending_paths.contains(&doomed),
+        "both the never-accepted page and the deleted one are pending: {state:?}"
+    );
+    assert!(state.incomplete.is_empty(), "{state:?}");
+    assert_eq!(state.failed, None);
+
+    let (rows, differences) = ret1_pending_parity_over(&handle, "pending suffix");
+    assert!(
+        rows > 0,
+        "the corpus admitted nothing; the gate proves nothing"
+    );
+    assert!(
+        differences.is_empty(),
+        "the pending IR read and the walk disagree:\n{}",
+        differences.join("\n")
+    );
+
+    // After the drain the ACCEPTED route answers the same questions, still
+    // exactly as the walk does.
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    let context = crate::query::ir::ExecutionContext::none();
+    for (source, input) in RET1_PENDING_SHAPES {
+        let (query, view) = ret1_parse(source, *input);
+        for explain in [false, true] {
+            let expected = ret1_ir_oracle(
+                &handle, &query, &view, &context, explain, R5A_ROWS, R5A_BYTES,
+            );
+            handle.clear_application_simple_query_memo().unwrap();
+            handle.reset_managed_query_census();
+            let actual = ret1_ir_navigate(
+                &handle, &query, &view, &context, explain, R5A_ROWS, R5A_BYTES,
+            );
+            let (statement_reads, pending_reads, fallbacks, failures, _) = r5a_census(&handle);
+            assert_eq!(
+                (statement_reads, pending_reads, fallbacks, failures),
+                (1, 0, 0, 0),
+                "after the drain the accepted route answers and reads one source"
+            );
+            ret1_assert_same("accepted route after the drain", &actual, &expected);
+        }
+    }
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// **RET1 preserves §3.5 and §4.4's refusal semantics on Managed storage too.**
+/// An invalid query, a false leaf and an advanced clause nothing lowers answer
+/// exactly what the walk answers — zero rows, their diagnostics, their support
+/// report — through the same public commands, and an unbound execution is never
+/// explained as a table of zeroes.
+#[test]
+fn ret1_the_public_ir_route_refuses_exactly_as_the_walk_does() {
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("ret1-ir-refusals", 0x4a24);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+
+    for (label, source, input, supported, diagnostics) in [
+        (
+            "an inapplicable leaf",
+            "@page and day is not null",
+            crate::query::QueryInput::Tql,
+            true,
+            true,
+        ),
+        (
+            "an invalid regex",
+            "(content-regex \"[\")",
+            crate::query::QueryInput::Og,
+            true,
+            false,
+        ),
+        (
+            "an unlowerable advanced clause",
+            "[:find (pull ?b [*]) :where [?b :block/unknown-attribute \"x\"]]",
+            crate::query::QueryInput::Advanced,
+            false,
+            true,
+        ),
+    ] {
+        let (query, view) = ret1_parse(source, input);
+        // An execution that was never bound has nothing honest to count; one
+        // that WAS bound and simply matches nothing still explains itself with
+        // a conjunct row whose count is zero.
+        let executable = crate::query::resolve_for_execution(
+            &query,
+            &context,
+            crate::date::JournalDate::today(),
+        )
+        .is_executable();
+        for explain in [false, true] {
+            let expected = ret1_ir_oracle(
+                &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+            );
+            handle.clear_application_simple_query_memo().unwrap();
+            handle.reset_managed_query_census();
+            let actual = ret1_ir_navigate(
+                &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+            );
+            let (_, _, fallbacks, failures, _) = r5a_census(&handle);
+            assert_eq!(
+                (fallbacks, failures),
+                (0, 0),
+                "{label} (explain={explain}): a refusal is not a fallback and not a failure"
+            );
+            ret1_assert_same(&format!("{label} (explain={explain})"), &actual, &expected);
+            let expected_rows = usize::from(explain && executable);
+            assert_eq!(
+                ret1_reply_rows(&actual),
+                expected_rows,
+                "{label} (explain={explain}): a refusal has no result rows, and only a \
+                 BOUND execution has conjunct rows"
+            );
+            match &actual {
+                SyncApplicationNavigationReply::QueryRun(result) => {
+                    assert_eq!(result.total, 0, "{label}: a refusal counts nothing");
+                    assert!(!result.exceeded, "{label}: a refusal is not over budget");
+                    assert_eq!(
+                        result.report.supported, supported,
+                        "{label}: the support report travels with the answer"
+                    );
+                    assert_eq!(
+                        !result.diagnostics.is_empty(),
+                        diagnostics,
+                        "{label}: diagnostics travel with the answer"
+                    );
+                }
+                SyncApplicationNavigationReply::QueryExplainEmpty(explained) => {
+                    assert_eq!(
+                        explained.report.supported, supported,
+                        "{label}: the explanation reports the same binding"
+                    );
+                    assert_eq!(
+                        !explained.diagnostics.is_empty(),
+                        diagnostics,
+                        "{label}: the explanation carries the same diagnostics"
+                    );
+                }
+                other => panic!("not an IR reply: {other:?}"),
+            }
+        }
+    }
+
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)

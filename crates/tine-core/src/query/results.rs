@@ -52,7 +52,7 @@ use crate::model::{
     block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, PageKind,
     RefGroup, ShallowBlockFacets,
 };
-use crate::query::sql::{descriptor_statement, SqlQuery};
+use crate::query::sql::{descriptor_statement, page_statement, SqlQuery};
 use crate::query::{ConstructionBudget, ConstructionProfile, PreViewGroups};
 
 // The gates. `#[path]` keeps the file beside this one so the shared
@@ -271,6 +271,263 @@ pub(crate) fn read_results_merged(
         read_payload(source.snapshot, &mut pages, admitted)?;
     }
     Ok(pages.finish(shared, budget))
+}
+
+/// One `@page` answer, in the SAME shape the retired page walk returned.
+///
+/// `total` is the number of rows ADMITTED, not the number seen: the walk's page
+/// loop stops at `max_rows` and reports `pages.len()`, which is a different
+/// rule from the block budget's and is preserved here rather than unified.
+#[derive(Debug, Default)]
+pub(crate) struct PageAnswer {
+    pub(crate) pages: Vec<crate::query::ir::PageRow>,
+    pub(crate) total: usize,
+    pub(crate) exceeded: bool,
+}
+
+/// One `@page` source: an owned read snapshot and the statement lowered for it.
+pub(crate) struct PageSource<'a> {
+    pub(crate) snapshot: &'a mut PhysicalProjectionQuerySnapshot,
+    pub(crate) statement: &'a SqlQuery,
+}
+
+/// Construct one `@page` query's ordered public rows from the projection alone.
+///
+/// No `PageDto`, no `Document`, no parsed cache: the page index — name, kind and
+/// journal day — is what an `@page` answer is made of (K16), and the compiler
+/// already selected exactly the matching pages. The caller owns capacity, the
+/// snapshot and its lifecycle, exactly as it does for [`read_results`].
+pub(crate) fn read_page_results(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    statement: &SqlQuery,
+    order: BackendOrder,
+    max_rows: usize,
+) -> Result<PageAnswer, ResultReadError> {
+    read_page_results_merged(
+        &mut [PageSource {
+            snapshot,
+            statement,
+        }],
+        order,
+        max_rows,
+    )
+}
+
+/// The same construction over ONE OR MORE projections of one graph — the
+/// Managed pending route's overlay plus its masked accepted projection (R5a).
+///
+/// The merge rule is the block read's: every source but the LAST is buffered in
+/// full, the last is streamed, and a buffered row is admitted as soon as it
+/// sorts at or before the streamed row. A page row is two small strings, so the
+/// buffer is bounded by the pending overlay's page count. Merged order is
+/// admission order, so `total` and `exceeded` are the walk's over the same
+/// pending state. Sources must be DISJOINT (the accepted statement masks every
+/// pending page); a page id reaching two sources is
+/// [`ResultReadError::Corrupt`], never a page emitted twice.
+pub(crate) fn read_page_results_merged(
+    sources: &mut [PageSource<'_>],
+    order: BackendOrder,
+    max_rows: usize,
+) -> Result<PageAnswer, ResultReadError> {
+    for source in sources.iter_mut() {
+        install_regexes(source.snapshot, source.statement)?;
+    }
+    let Some((streamed, earlier)) = sources.split_last_mut() else {
+        return Ok(PageAnswer::default());
+    };
+    let mut seen: HashSet<[u8; 16]> = HashSet::new();
+    let mut buffered: Vec<PageRowRead> = Vec::new();
+    for source in earlier.iter_mut() {
+        buffer_page_rows(source, order, &mut buffered, &mut seen)?;
+    }
+    if earlier.len() > 1 {
+        // Each source arrives in key order already; the stable sort only
+        // interleaves them and keeps the sources' given order on a tie.
+        buffered.sort_by(|left, right| left.key(order).cmp(&right.key(order)));
+    }
+    let mut buffered = buffered.into_iter().peekable();
+
+    if streamed.snapshot.cancellation().is_cancelled() {
+        return Err(ResultReadError::Cancelled);
+    }
+    let statement = page_statement(streamed.statement, order).map_err(ResultReadError::Sql)?;
+    let mut answer = PageAnswer::default();
+    let mut damage: Option<String> = None;
+    let visit =
+        streamed
+            .snapshot
+            .visit_projection_query(&statement.sql, &statement.params, |row| {
+                #[cfg(test)]
+                note(|census| census.page_rows += 1);
+                let decoded = match decode_page_row(row, order) {
+                    Ok(decoded) => decoded,
+                    Err(what) => {
+                        damage = Some(what);
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
+                };
+                if !seen.insert(decoded.page_id) {
+                    damage = Some("page in two sources".to_string());
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                let key = decoded.key(order);
+                while buffered.peek().is_some_and(|held| held.key(order) <= key)
+                    && admit_page(buffered.peek().expect("peeked"), &mut answer, max_rows)
+                {
+                    buffered.next();
+                }
+                if answer.exceeded {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                if !admit_page(&decoded, &mut answer, max_rows) {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                Ok(std::ops::ControlFlow::Continue(()))
+            });
+    if let Err(error) = visit {
+        return Err(sql_or_cancelled(streamed.snapshot, error));
+    }
+    if let Some(what) = damage {
+        return Err(ResultReadError::Corrupt(what));
+    }
+    // The stream ended: everything still buffered sorts after its last row.
+    if !answer.exceeded {
+        for held in buffered {
+            if !admit_page(&held, &mut answer, max_rows) {
+                break;
+            }
+        }
+    }
+    Ok(answer)
+}
+
+/// One buffered source's whole page stream, decoded in statement order.
+fn buffer_page_rows(
+    source: &mut PageSource<'_>,
+    order: BackendOrder,
+    buffered: &mut Vec<PageRowRead>,
+    seen: &mut HashSet<[u8; 16]>,
+) -> Result<(), ResultReadError> {
+    if source.snapshot.cancellation().is_cancelled() {
+        return Err(ResultReadError::Cancelled);
+    }
+    let statement = page_statement(source.statement, order).map_err(ResultReadError::Sql)?;
+    let mut damage: Option<String> = None;
+    let visit = source
+        .snapshot
+        .visit_projection_query(&statement.sql, &statement.params, |row| {
+            #[cfg(test)]
+            note(|census| census.page_rows += 1);
+            match decode_page_row(row, order) {
+                Ok(decoded) => {
+                    if !seen.insert(decoded.page_id) {
+                        damage = Some("page in two sources".to_string());
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
+                    buffered.push(decoded);
+                    Ok(std::ops::ControlFlow::Continue(()))
+                }
+                Err(what) => {
+                    damage = Some(what);
+                    Ok(std::ops::ControlFlow::Break(()))
+                }
+            }
+        });
+    if let Err(error) = visit {
+        return Err(sql_or_cancelled(source.snapshot, error));
+    }
+    match damage {
+        Some(what) => Err(ResultReadError::Corrupt(what)),
+        None => Ok(()),
+    }
+}
+
+/// The walk's page-loop admission, transcribed: the cap is checked BEFORE the
+/// push, so exactly `max_rows` matches fill the answer without setting
+/// `exceeded`, and the `max_rows + 1`-th match sets it and stops. `false` means
+/// "stop" — either the cap closed or, at `max_rows == 0`, it was closed from
+/// the first row. `max_bytes` is deliberately not charged: the page walk never
+/// charged it.
+fn admit_page(row: &PageRowRead, answer: &mut PageAnswer, max_rows: usize) -> bool {
+    if answer.pages.len() >= max_rows {
+        answer.exceeded = true;
+        return false;
+    }
+    answer.pages.push(crate::query::ir::PageRow {
+        name: row.name.clone(),
+        kind: row.kind,
+        journal_day: row.journal_day,
+    });
+    answer.total = answer.pages.len();
+    true
+}
+
+/// One decoded `@page` row: the public answer's three fields plus the order
+/// keys and the identity the merge and the damage checks read.
+struct PageRowRead {
+    page_id: [u8; 16],
+    name: String,
+    kind: PageKind,
+    journal_day: Option<i64>,
+    path: String,
+    position: Option<i64>,
+}
+
+impl PageRowRead {
+    /// The order the page statement itself imposed, as a comparable key — the
+    /// same shape [`merge_key`] uses for block rows.
+    fn key(&self, order: BackendOrder) -> (Option<i64>, &str) {
+        match order {
+            BackendOrder::Direct => (self.position, ""),
+            BackendOrder::Managed => (None, self.path.as_str()),
+        }
+    }
+}
+
+/// Column offsets of the page row, in the order [`page_statement`] selects them.
+mod page_column {
+    pub(super) const PAGE_ID: usize = 0;
+    pub(super) const NAME: usize = 1;
+    pub(super) const TEXT_KIND: usize = 2;
+    pub(super) const JOURNAL_DAY: usize = 3;
+    pub(super) const PATH: usize = 4;
+    pub(super) const POSITION: usize = 5;
+    pub(super) const COLUMNS: usize = 6;
+}
+
+/// One page row: validate its identity, its kind and its order key. A row that
+/// does not decode is damage and fails the read; it is never a page silently
+/// missing from the answer (D-3).
+fn decode_page_row(row: &[PhysicalQueryValue], order: BackendOrder) -> Result<PageRowRead, String> {
+    use page_column as column;
+    if row.len() != column::COLUMNS {
+        return Err(format!(
+            "page row has {} columns, expected {}",
+            row.len(),
+            column::COLUMNS
+        ));
+    }
+    let page_id = blob16(row, column::PAGE_ID, "page row page_id")?;
+    let name = text(row, column::NAME, "pages.name")?;
+    let text_kind = integer(row, column::TEXT_KIND, "pages.text_kind")?;
+    let Some(kind) = page_kind_from_sql(text_kind) else {
+        return Err(format!("pages.text_kind {text_kind} is not a page kind"));
+    };
+    let journal_day = opt_integer(row, column::JOURNAL_DAY, "pages.journal_day")?;
+    let path = text(row, column::PATH, "pages.path")?;
+    let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
+    // Direct Files' page order IS this column (see `decode_descriptor`).
+    if order == BackendOrder::Direct && position.is_none() {
+        return Err("query_page_order has no position for a matched page".to_string());
+    }
+    Ok(PageRowRead {
+        page_id,
+        name,
+        kind,
+        journal_day,
+        path,
+        position,
+    })
 }
 
 /// §4.3.2's compiled-regex table for THIS statement, installed unconditionally.
@@ -1202,6 +1459,11 @@ pub(crate) struct ResultReadCensus {
     pub(crate) payload_block_rows: usize,
     pub(crate) payload_tag_rows: usize,
     pub(crate) payload_property_rows: usize,
+    /// `@page` rows the page statement returned (RET1). Beside the descriptor
+    /// count, never instead of it: a page answer reads no descriptor and no
+    /// payload at all, so a gate that asserts "one page row, zero payload
+    /// statements" is asserting the whole cost of the answer.
+    pub(crate) page_rows: usize,
 }
 
 // Thread-local rather than the process-global atomics beside
@@ -1217,6 +1479,7 @@ thread_local! {
             payload_block_rows: 0,
             payload_tag_rows: 0,
             payload_property_rows: 0,
+            page_rows: 0,
         }) };
 }
 

@@ -24,7 +24,11 @@ use std::sync::Arc;
 
 use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
+use crate::date::JournalDate;
+
 use crate::model::{block_dto_estimated_bytes, BlockDto, PageKind};
+use crate::query::ir::{Bounds, ExecutionContext};
+use crate::query::ir::{Query, ViewSettings};
 use crate::query::results::{
     read_results, reset_result_read_census, result_read_census, set_before_payload_batch_hook,
     BackendOrder, RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs, PAYLOAD_BATCH,
@@ -36,7 +40,7 @@ use crate::query::sql::sql_gates_tests::{
 use crate::query::sql::{descriptor_statement, ContentPlan};
 use crate::query::{
     collect_pred_bounded_over, page_recency_secs_for, ConstructionProfile, GraphQueryPages,
-    PreViewGroups, QueryDialect, QueryPageSource,
+    PreViewGroups, QueryDialect, QueryInput, QueryPageSource,
 };
 
 /// Every shape the parity gates run, from §5's own three tables. `PLAN_SHAPES`
@@ -1740,4 +1744,797 @@ fn a_page_reachable_from_two_sources_fails_the_merged_read() {
     }
     let _ = std::fs::remove_file(&one);
     let _ = std::fs::remove_file(&two);
+}
+
+// ===== RET1: the PUBLIC IR commands answer from the database =====
+//
+// The gates above prove the shared result CONSTRUCTOR equals the walk. These
+// prove the two shipped commands — SPEC §7.1 `query_run` and
+// `query_explain_empty`, reached through `run_query_result_ir` and
+// `explain_empty_query` — actually go through it: same complete answer, an
+// actual statement read, and NO traversal of the parsed graph.
+//
+// The walk is still the oracle and is still built here, so every measurement is
+// taken BEFORE the oracle runs: constructing `GraphQueryPages` is what a
+// reconnection would look like, and the counters cannot tell the two apart
+// after the fact.
+
+/// One public execution, measured cold, with everything a walk would leave
+/// behind counted beside its answer.
+struct PublicRun<T> {
+    answer: T,
+    /// Query jobs opened on the projection. A dispatched read opens exactly
+    /// one; a lowering that folded to `matches_nothing` needs none.
+    statement_reads: u64,
+    /// `collect_pred_bounded_over` / `collect_page_rows_over` entries — the
+    /// walk's own instrumentation. RET1's claim is that this stays 0.
+    walks: u64,
+    /// Page documents the projection-side readers loaded from the parsed
+    /// cache. A database read contributes nothing here (R3).
+    hydrated: usize,
+}
+
+fn measured<T>(corpus: &Corpus, run: impl FnOnce(&crate::model::Graph) -> T) -> PublicRun<T> {
+    // §5.9's pre-view memo would answer the second run of a shape from the
+    // first one's rows, and a memo hit reads exactly like a walk that never
+    // happened. Every measurement below is a COMPUTATION.
+    corpus.graph.clear_query_memos_test();
+    corpus.graph.reset_direct_projection_candidate_probe_test();
+    let before = corpus.graph.direct_projection_statement_reads_test();
+    let answer = run(&corpus.graph);
+    PublicRun {
+        answer,
+        statement_reads: corpus
+            .graph
+            .direct_projection_statement_reads_test()
+            .saturating_sub(before),
+        walks: crate::query::full_graph_query_evaluations(),
+        hydrated: corpus.graph.direct_projection_hydrated_pages_test().len(),
+    }
+}
+
+fn wire(value: &impl serde::Serialize) -> serde_json::Value {
+    serde_json::to_value(value).expect("the IR result serializes")
+}
+
+/// The bounds edges §4 names for the public route: unbounded, zero rows, one
+/// row (the `@page` loop decides `exceeded` on the row AFTER the cap, so zero
+/// and one are different code paths), and zero bytes.
+fn public_bounds() -> Vec<Bounds> {
+    vec![
+        Bounds {
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+        },
+        Bounds {
+            max_rows: 0,
+            max_bytes: usize::MAX,
+        },
+        Bounds {
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        },
+        Bounds {
+            max_rows: usize::MAX,
+            max_bytes: 0,
+        },
+    ]
+}
+
+/// Compare one public `query_run` against the walk, and account for how it was
+/// answered. Returns the difference lines and whether the answer had rows.
+fn public_run_differences(
+    corpus: &Corpus,
+    source: &str,
+    dialect: QueryDialect,
+    context: &ExecutionContext,
+    bounds: Bounds,
+) -> (Vec<String>, Option<crate::query::ir::Anchor>) {
+    let today = JournalDate::today();
+    let (query, view) = crate::query::parse_query_text(source, dialect, today);
+    let label = format!(
+        "{source} rows={} bytes={}",
+        bounds.max_rows, bounds.max_bytes
+    );
+    let mut differences = Vec::new();
+
+    let run = measured(corpus, |graph| {
+        crate::query::run_query_result_ir(graph, &query, &view, bounds, context)
+    });
+
+    // The oracle, built only now: a `GraphQueryPages` constructed before the
+    // measurement is exactly the reconnection this gate exists to catch.
+    let resolved = crate::query::resolve_for_execution(&query, context, today);
+    let walked = crate::query::run_resolved_query_result_over(
+        &GraphQueryPages(&corpus.graph),
+        &resolved,
+        &view,
+        bounds,
+    );
+
+    let (rows, anchor) = match &walked.rows {
+        crate::query::ir::QueryRows::Block { groups } => (
+            groups.iter().map(|group| group.blocks.len()).sum::<usize>(),
+            crate::query::ir::Anchor::Block,
+        ),
+        crate::query::ir::QueryRows::Page { pages } => {
+            (pages.len(), crate::query::ir::Anchor::Page)
+        }
+    };
+    if wire(&run.answer) != wire(&walked) {
+        differences.push(format!(
+            "{label}: the public result differs from the walk (walk rows={rows}, \
+             public total={}, walk total={})",
+            run.answer.total, walked.total
+        ));
+    }
+    if run.walks != 0 {
+        differences.push(format!(
+            "{label}: the public result walked the graph {} time(s)",
+            run.walks
+        ));
+    }
+    if run.hydrated != 0 {
+        differences.push(format!(
+            "{label}: the public result hydrated {} page document(s)",
+            run.hydrated
+        ));
+    }
+    // A non-empty answer cannot come from a `matches_nothing` lowering, so it
+    // proves a statement actually ran rather than merely that no walk did.
+    if rows > 0 && run.statement_reads != 1 {
+        differences.push(format!(
+            "{label}: a {rows}-row answer opened {} query job(s), expected 1",
+            run.statement_reads
+        ));
+    }
+    (differences, (rows > 0).then_some(anchor))
+}
+
+/// The same, for `query_explain_empty`. Every probe of one explanation must be
+/// counted from ONE job, so the read budget here is exactly one as well.
+fn public_explain_differences(
+    corpus: &Corpus,
+    source: &str,
+    dialect: QueryDialect,
+    context: &ExecutionContext,
+    bounds: Bounds,
+) -> Vec<String> {
+    let today = JournalDate::today();
+    let (query, view) = crate::query::parse_query_text(source, dialect, today);
+    let label = format!("explain {source}");
+    let mut differences = Vec::new();
+
+    let explained = measured(corpus, |graph| {
+        crate::query::explain_empty_query(graph, &query, &view, bounds, context)
+    });
+
+    let resolved = crate::query::resolve_for_execution(&query, context, today);
+    let walked = crate::query::view::explain_empty(
+        &GraphQueryPages(&corpus.graph),
+        &resolved,
+        &view,
+        bounds,
+    );
+
+    if explained.answer != walked {
+        differences.push(format!(
+            "{label}: the explanation differs from the walk's\n  public: {:?}\n  walk:   {:?}",
+            explained.answer, walked
+        ));
+    }
+    if explained.walks != 0 {
+        differences.push(format!(
+            "{label}: the explanation walked the graph {} time(s)",
+            explained.walks
+        ));
+    }
+    if explained.hydrated != 0 {
+        differences.push(format!(
+            "{label}: the explanation hydrated {} page document(s)",
+            explained.hydrated
+        ));
+    }
+    // Every probe shares one snapshot. An explanation whose conjuncts came from
+    // N separately-timed reads describes N graph states.
+    if explained.statement_reads > 1 {
+        differences.push(format!(
+            "{label}: the explanation opened {} query jobs; every probe of one \
+             explanation shares one snapshot",
+            explained.statement_reads
+        ));
+    }
+    if !walked.rows.is_empty() && explained.statement_reads != 1 {
+        differences.push(format!(
+            "{label}: a {}-conjunct explanation opened {} query job(s), expected 1",
+            walked.rows.len(),
+            explained.statement_reads
+        ));
+    }
+    differences
+}
+
+/// **RET1's acceptance bar for `query_run` over Direct Files.** Every shape §5
+/// names — block and page anchors, refs, tags, tasks, properties, `content
+/// match`, regexes, nested `refs`, page relations — under the row and byte
+/// edges, answered by the database and equal to the walk row for row.
+#[test]
+fn the_public_ir_result_equals_the_walk_and_reads_the_database() {
+    let _serial = serialize();
+    let root = scratch("ret1-public-run");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let context = ExecutionContext::none();
+    // The two view directives that change what is CONSTRUCTED rather than how
+    // it is displayed: an unsorted `(sample N)` stops admission at N, and a
+    // recency sort measures the per-result-page axis. Only OG spells them —
+    // TQL has no view clause — and neither may reach a `@page` answer.
+    let mut shapes = every_shape()
+        .into_iter()
+        .map(|(source, dialect)| (source.to_string(), dialect))
+        .collect::<Vec<_>>();
+    let with_views = shapes
+        .iter()
+        .filter(|(_, dialect)| *dialect == QueryDialect::Og)
+        .flat_map(|(source, dialect)| {
+            [
+                (format!("{source} (sample 3)"), *dialect),
+                (format!("{source} (sort-by modified desc)"), *dialect),
+            ]
+        })
+        .collect::<Vec<_>>();
+    shapes.extend(with_views);
+
+    let mut differences = Vec::new();
+    let mut answered_blocks = 0usize;
+    let mut answered_pages = 0usize;
+    for (source, dialect) in &shapes {
+        let (source, dialect) = (source.as_str(), *dialect);
+        for bounds in public_bounds() {
+            let (lines, answered) =
+                public_run_differences(&corpus, source, dialect, &context, bounds);
+            differences.extend(lines);
+            match answered {
+                Some(crate::query::ir::Anchor::Block) => answered_blocks += 1,
+                Some(crate::query::ir::Anchor::Page) => answered_pages += 1,
+                None => {}
+            }
+        }
+    }
+    // Both anchors have to be exercised with actual rows: the `@page` read is a
+    // different statement, a different row reader and a different budget, and a
+    // gate that only ever saw empty page answers would prove nothing about it.
+    assert!(
+        answered_blocks > 100 && answered_pages > 10,
+        "the corpus answered {answered_blocks} block and {answered_pages} page \
+         executions with rows; the gate proves nothing about a read it never made"
+    );
+    assert!(
+        differences.is_empty(),
+        "the public IR result is not the database's answer:\n{}",
+        differences.join("\n")
+    );
+}
+
+/// The same bar for `query_explain_empty`, over the same corpus and the same
+/// shapes: same explanation, one snapshot, no walk.
+#[test]
+fn the_public_ir_explanation_equals_the_walk_and_reads_the_database() {
+    let _serial = serialize();
+    let root = scratch("ret1-public-explain");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let context = ExecutionContext::none();
+    let bounds = Bounds {
+        max_rows: usize::MAX,
+        max_bytes: usize::MAX,
+    };
+    let mut differences = Vec::new();
+    for (source, dialect) in every_shape() {
+        differences.extend(public_explain_differences(
+            &corpus, source, dialect, &context, bounds,
+        ));
+    }
+    assert!(
+        differences.is_empty(),
+        "the public IR explanation is not the database's answer:\n{}",
+        differences.join("\n")
+    );
+}
+
+/// A corpus for the inputs the shape tables do not carry: an Org page beside
+/// the Markdown ones, two PHYSICAL pages that share one display name, a journal
+/// day around today, and blocks a `?current-page` / date-input advanced query
+/// can select.
+fn write_ret1_context_corpus(root: &Path) {
+    let today = JournalDate::today();
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    std::fs::create_dir_all(root.join("journals")).expect("journals");
+
+    std::fs::write(
+        root.join("pages/one.md"),
+        "- TODO one mentions [[target]]\n\
+         \t- child under one\n\
+         - DONE two\n",
+    )
+    .expect("one");
+    std::fs::write(
+        root.join("pages/target.md"),
+        "- the target block\n  status:: active\n- another target block\n",
+    )
+    .expect("target");
+
+    // The Org half. The parser types this page by extension, so every leaf a
+    // shape names — marker, priority, ref, nesting — has to answer identically
+    // through a different reader.
+    std::fs::write(
+        root.join("pages/org-notes.org"),
+        "* TODO [#B] org task mentions [[target]]\n\
+         ** DONE org child\n\
+         * LATER org later\n",
+    )
+    .expect("org notes");
+
+    // Two PHYSICAL pages carrying one display name. `@page` must answer with
+    // both rows; a read that de-duplicated on the name would silently lose one.
+    std::fs::write(
+        root.join("pages/dup-a.md"),
+        "title:: Shared Title\n\n- TODO from the first file\n",
+    )
+    .expect("dup a");
+    std::fs::write(
+        root.join("pages/dup-b.md"),
+        "title:: Shared Title\n\n- TODO from the second file\n",
+    )
+    .expect("dup b");
+
+    std::fs::write(
+        root.join(format!("journals/{}.md", today.file_stem())),
+        "- TODO today mentions [[target]]\n",
+    )
+    .expect("today");
+    std::fs::write(
+        root.join(format!("journals/{}.md", today.add_days(-3).file_stem())),
+        "- TODO three days ago\n",
+    )
+    .expect("earlier");
+    std::fs::write(
+        root.join(format!("journals/{}.md", today.add_days(-40).file_stem())),
+        "- TODO forty days ago\n",
+    )
+    .expect("older");
+}
+
+/// The advanced sources whose answer is a function of WHERE and WHEN the
+/// execution happens (§4.4): `?current-page` bound from the execution context,
+/// and a `(between …)` bound from relative date inputs resolved against the
+/// execution day. RET1 must resolve both ONCE, at execution, and hand the
+/// bound tree to the compiler — not fold them in at parse time.
+const RET1_ADVANCED_SOURCES: &[&str] = &[
+    r#"{:query [:find (pull ?b [*])
+                :in $ ?current-page
+                :where
+                [?p :block/name ?current-page]
+                [?b :block/refs ?p]]
+        :inputs [:current-page]}"#,
+    r#"[:find (pull ?b [*])
+        :in $ ?start ?end
+        :where (between ?b ?start ?end)]
+       :inputs [:-7d :today]"#,
+    // The unsupported half of the same surface: an advanced source whose
+    // clause nothing lowers must still report `supported = false` and the same
+    // `ignored` list through the database route.
+    r#"[:find (pull ?b [*])
+        :where [?b :block/unknown-attribute "x"]]"#,
+];
+
+/// The ONE text -> IR entry the commands use, per input grammar (§7.1, C3).
+/// An advanced form reaches it as `QueryInput::Advanced`; handing the same text
+/// to the OG parser would produce a refusal, not a datalog query.
+fn ret1_parse(source: &str, input: QueryInput, today: JournalDate) -> (Query, ViewSettings) {
+    crate::query::parse_query_input(
+        source,
+        input,
+        today,
+        crate::query::registry::Registry::none(),
+    )
+}
+
+fn ret1_context_shapes() -> Vec<(String, QueryInput)> {
+    let mut shapes = vec![
+        // block anchor, both formats
+        ("(task TODO)".to_string(), QueryInput::Og),
+        ("(task TODO DOING LATER)".to_string(), QueryInput::Og),
+        ("(priority B)".to_string(), QueryInput::Og),
+        ("[[target]]".to_string(), QueryInput::Og),
+        ("(property status active)".to_string(), QueryInput::Og),
+        ("(content-regex \"org\")".to_string(), QueryInput::Og),
+        (
+            "any(children, content like '%child%')".to_string(),
+            QueryInput::Tql,
+        ),
+        ("(journal)".to_string(), QueryInput::Og),
+        // a sorted sample: ranking over the constructed rows
+        (
+            "(task TODO) (sort-by modified desc) (sample 2)".to_string(),
+            QueryInput::Og,
+        ),
+        ("(task TODO) (sample 2)".to_string(), QueryInput::Og),
+        // page anchor, including the duplicate display name and the journal
+        // metadata a page row carries
+        (
+            "@page and name = 'shared title'".to_string(),
+            QueryInput::Tql,
+        ),
+        ("@page and journal = true".to_string(), QueryInput::Tql),
+        ("@page and journal = false".to_string(), QueryInput::Tql),
+        ("@page and day is not null".to_string(), QueryInput::Tql),
+        ("@page and name like 'org-%'".to_string(), QueryInput::Tql),
+    ];
+    shapes.extend(
+        RET1_ADVANCED_SOURCES
+            .iter()
+            .map(|source| ((*source).to_string(), QueryInput::Advanced)),
+    );
+    shapes
+}
+
+/// Wait for a Direct projection to converge, the way `Corpus::open` does.
+fn ret1_wait_ready(graph: &crate::model::Graph) {
+    let started = std::time::Instant::now();
+    while !graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(120),
+            "the Direct Files projection did not converge"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// **RET1's warm-reopen bar.** A session that reopens a valid projection has no
+/// parsed cache at all, and both public IR commands still answer — from the
+/// database, with the walk's exact rows, and WITHOUT parsing the graph.
+///
+/// This is the property the fail-before probe in `direct_projection.rs` states
+/// for one query; here it is stated for both anchors, both file formats, the
+/// duplicate display name, the journal metadata, a sorted sample, and the two
+/// execution-time bindings (`?current-page` and a relative date input).
+///
+/// The oracle is a SECOND graph opened on the same directory with no projection
+/// attached, so the measured session never has to parse anything to be checked.
+#[test]
+fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
+    let _serial = serialize();
+    let root = scratch("ret1-warm-reopen");
+    write_ret1_context_corpus(&root);
+    let database = scratch("ret1-warm-reopen-db").join("projection.sqlite");
+
+    {
+        let graph = crate::model::Graph::open(&root);
+        graph
+            .attach_direct_projection(database.clone())
+            .expect("the projection worker starts");
+        graph.warm_cache();
+        ret1_wait_ready(&graph);
+    }
+
+    let graph = crate::model::Graph::open(&root);
+    graph
+        .attach_direct_projection(database.clone())
+        .expect("the projection worker starts");
+    graph.warm_cache();
+    ret1_wait_ready(&graph);
+    assert!(
+        !graph.has_parsed_cache_test(),
+        "a valid projection must be adopted from file bytes alone"
+    );
+
+    // The independent oracle: a fully parsed session with no projection.
+    let oracle = crate::model::Graph::open(&root);
+    oracle.warm_cache();
+
+    let today = JournalDate::today();
+    let bounds = Bounds {
+        max_rows: 100,
+        max_bytes: 1_000_000,
+    };
+    let contexts = [
+        ExecutionContext::none(),
+        ExecutionContext::on_page("target"),
+        ExecutionContext::on_page("one"),
+    ];
+
+    let mut differences = Vec::new();
+    let mut answered = 0usize;
+    for (source, input) in ret1_context_shapes() {
+        let (query, view) = ret1_parse(&source, input, today);
+        for context in &contexts {
+            let label = format!("{source} on {:?}", context.current_page);
+
+            graph.clear_query_memos_test();
+            graph.reset_direct_projection_candidate_probe_test();
+            let before = graph.direct_projection_statement_reads_test();
+            let result = crate::query::run_query_result_ir(&graph, &query, &view, bounds, context);
+            let explained =
+                crate::query::explain_empty_query(&graph, &query, &view, bounds, context);
+            let statement_reads = graph.direct_projection_statement_reads_test() - before;
+            let walks = crate::query::full_graph_query_evaluations();
+            let hydrated = graph.direct_projection_hydrated_pages_test().len();
+
+            if graph.has_parsed_cache_test() {
+                differences.push(format!("{label}: the public route parsed the graph"));
+            }
+            if walks != 0 {
+                differences.push(format!("{label}: the public route walked {walks} time(s)"));
+            }
+            if hydrated != 0 {
+                differences.push(format!(
+                    "{label}: the public route hydrated {hydrated} page(s)"
+                ));
+            }
+
+            let resolved = crate::query::resolve_for_execution(&query, context, today);
+            let walked = crate::query::run_resolved_query_result_over(
+                &GraphQueryPages(&oracle),
+                &resolved,
+                &view,
+                bounds,
+            );
+            let walked_explained = crate::query::view::explain_empty(
+                &GraphQueryPages(&oracle),
+                &resolved,
+                &view,
+                bounds,
+            );
+            let rows = match &walked.rows {
+                crate::query::ir::QueryRows::Block { groups } => {
+                    groups.iter().map(|group| group.blocks.len()).sum::<usize>()
+                }
+                crate::query::ir::QueryRows::Page { pages } => pages.len(),
+            };
+            if rows > 0 {
+                answered += 1;
+                // One job for the result and one for the explanation: a
+                // non-empty answer cannot have come from a folded-away lowering.
+                if statement_reads != 2 {
+                    differences.push(format!(
+                        "{label}: a {rows}-row answer plus its explanation opened \
+                         {statement_reads} query job(s), expected 2"
+                    ));
+                }
+            }
+            if wire(&result) != wire(&walked) {
+                differences.push(format!(
+                    "{label}: the result differs from the walk's\n  public: {}\n  walk:   {}",
+                    wire(&result),
+                    wire(&walked)
+                ));
+            }
+            if explained != walked_explained {
+                differences.push(format!(
+                    "{label}: the explanation differs from the walk's\n  public: {explained:?}\n  \
+                     walk:   {walked_explained:?}"
+                ));
+            }
+        }
+    }
+
+    // The duplicate display name, against an oracle that is not the walk: the
+    // page read must return one row per PHYSICAL page, not one per name.
+    let physical_shared = oracle
+        .list_pages()
+        .into_iter()
+        .filter(|entry| entry.name.eq_ignore_ascii_case("shared title"))
+        .count();
+    let (query, view) = ret1_parse("@page and name = 'shared title'", QueryInput::Tql, today);
+    graph.clear_query_memos_test();
+    let shared =
+        crate::query::run_query_result_ir(&graph, &query, &view, bounds, &ExecutionContext::none());
+    let shared_rows = match &shared.rows {
+        crate::query::ir::QueryRows::Page { pages } => pages.len(),
+        other => panic!("a `@page` query must answer with page rows, got {other:?}"),
+    };
+    assert_eq!(
+        physical_shared, 2,
+        "the fixture must write two physical pages under one display name"
+    );
+    assert_eq!(
+        shared_rows, physical_shared,
+        "the page read returned {shared_rows} row(s) for {physical_shared} physical page(s) \
+         sharing one display name"
+    );
+
+    // The two execution-time bindings, asserted directly rather than only
+    // through the parity comparison: a route that ignored the context or the
+    // day would agree with a walk that ignored them too.
+    let rows_of = |source: &str, input: QueryInput, context: &ExecutionContext| {
+        let (query, view) = ret1_parse(source, input, today);
+        graph.clear_query_memos_test();
+        match crate::query::run_query_result_ir(&graph, &query, &view, bounds, context).rows {
+            crate::query::ir::QueryRows::Block { groups } => {
+                groups.iter().map(|group| group.blocks.len()).sum::<usize>()
+            }
+            crate::query::ir::QueryRows::Page { pages } => pages.len(),
+        }
+    };
+    let current_page = RET1_ADVANCED_SOURCES[0];
+    assert_eq!(
+        rows_of(
+            current_page,
+            QueryInput::Advanced,
+            &ExecutionContext::none()
+        ),
+        0,
+        "an unbound `?current-page` leaves its clause unsupported (§4.4), so it \
+         selects nothing"
+    );
+    assert!(
+        rows_of(
+            current_page,
+            QueryInput::Advanced,
+            &ExecutionContext::on_page("target")
+        ) > 0,
+        "`?current-page` bound to `target` must select the blocks that reference it"
+    );
+    assert_ne!(
+        rows_of(
+            current_page,
+            QueryInput::Advanced,
+            &ExecutionContext::on_page("target")
+        ),
+        rows_of(
+            current_page,
+            QueryInput::Advanced,
+            &ExecutionContext::on_page("one")
+        ),
+        "two different current pages must produce two different answers"
+    );
+    let dated = RET1_ADVANCED_SOURCES[1];
+    let within_a_week = rows_of(dated, QueryInput::Advanced, &ExecutionContext::none());
+    assert!(
+        within_a_week > 0,
+        "the `:-7d`/`:today` inputs must resolve against the execution day and \
+         select the journal blocks inside that window"
+    );
+    assert!(
+        within_a_week < rows_of("(journal)", QueryInput::Og, &ExecutionContext::none()),
+        "the date window must exclude the journal day outside it; a route that \
+         resolved no date at all would select every journal block"
+    );
+
+    assert!(
+        answered > 10,
+        "only {answered} execution(s) returned rows; the gate proves little about the read"
+    );
+    assert!(
+        differences.is_empty(),
+        "the warm-reopened public IR route is not the database's answer:\n{}",
+        differences.join("\n")
+    );
+    assert!(
+        !graph.has_parsed_cache_test(),
+        "no public execution above may have parsed the graph"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(database.parent().expect("the database has a directory"));
+}
+
+/// **RET1 preserves §3.5 and §4.4's refusal semantics.** An INVALID query and
+/// an advanced query nothing lowers both answer ZERO rows with their
+/// diagnostics and their support report — not a truncated answer, not a table
+/// of zeroes that reads like a result — and neither reaches the parsed graph to
+/// find that out.
+#[test]
+fn the_public_ir_route_refuses_without_walking_and_keeps_its_report() {
+    let _serial = serialize();
+    let root = scratch("ret1-refusals");
+    write_ret1_context_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let bounds = Bounds {
+        max_rows: 100,
+        max_bytes: 1_000_000,
+    };
+    let context = ExecutionContext::none();
+    let today = JournalDate::today();
+
+    // `diagnostics` says whether the refusal is REPORTED as one; an invalid
+    // regex is a FALSE LEAF (§3.4/§4.3.2) rather than a refusal, so it matches
+    // nothing and says nothing.
+    for (label, source, input, supported, diagnostics) in [
+        // §3.5: a syntactically valid form whose leaf does not apply. The whole
+        // query is invalid, so it returns zero results plus its diagnostics —
+        // never a truncated answer.
+        (
+            "an inapplicable leaf",
+            "@page and day is not null",
+            QueryInput::Tql,
+            true,
+            true,
+        ),
+        // §4.3.2: an invalid regex is a false leaf, not a crash.
+        (
+            "an invalid regex",
+            "(content-regex \"[\")",
+            QueryInput::Og,
+            true,
+            false,
+        ),
+        // §4.4: an advanced clause nothing lowers is REFUSED, and says so.
+        (
+            "an unlowerable advanced clause",
+            RET1_ADVANCED_SOURCES[2],
+            QueryInput::Advanced,
+            false,
+            true,
+        ),
+    ] {
+        let (query, view) = ret1_parse(source, input, today);
+        let run = measured(&corpus, |graph| {
+            crate::query::run_query_result_ir(graph, &query, &view, bounds, &context)
+        });
+        let explained = measured(&corpus, |graph| {
+            crate::query::explain_empty_query(graph, &query, &view, bounds, &context)
+        });
+
+        let rows = match &run.answer.rows {
+            crate::query::ir::QueryRows::Block { groups } => {
+                groups.iter().map(|group| group.blocks.len()).sum::<usize>()
+            }
+            crate::query::ir::QueryRows::Page { pages } => pages.len(),
+        };
+        assert_eq!(rows, 0, "{label}: a refusal has no rows");
+        assert_eq!(run.answer.total, 0, "{label}: a refusal counts nothing");
+        assert!(
+            !run.answer.exceeded,
+            "{label}: a refusal is not over budget"
+        );
+        assert_eq!(
+            run.answer.report.supported, supported,
+            "{label}: the support report travels with the answer"
+        );
+        assert_eq!(
+            run.walks, 0,
+            "{label}: a refusal must not walk the graph to produce no rows"
+        );
+        assert_eq!(explained.walks, 0, "{label}: nor must its explanation");
+
+        // The diagnostics are the ANSWER for a refusal: without them an empty
+        // result reads as "nothing matched" instead of "this was refused".
+        assert_eq!(
+            !run.answer.diagnostics.is_empty(),
+            diagnostics,
+            "{label}: diagnostics travel with the answer exactly when there are any"
+        );
+        assert_eq!(
+            explained.answer.report, run.answer.report,
+            "{label}: the explanation reports the same binding as the result"
+        );
+        assert_eq!(
+            explained.answer.diagnostics, run.answer.diagnostics,
+            "{label}: the explanation carries the result's diagnostics"
+        );
+
+        // And the same answer the walk would have given, so the refusal is the
+        // engine's shared rule and not a database-route shortcut.
+        let resolved = crate::query::resolve_for_execution(&query, &context, today);
+        // An execution that was never bound has nothing honest to count; one
+        // that WAS bound and simply matches nothing still explains itself.
+        assert_eq!(
+            explained.answer.rows.is_empty(),
+            !resolved.is_executable(),
+            "{label}: only an unbound execution has no conjunct rows"
+        );
+        let walked = crate::query::run_resolved_query_result_over(
+            &GraphQueryPages(&corpus.graph),
+            &resolved,
+            &view,
+            bounds,
+        );
+        assert_eq!(
+            wire(&run.answer),
+            wire(&walked),
+            "{label}: the refusal differs from the walk's"
+        );
+    }
 }

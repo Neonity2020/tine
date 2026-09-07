@@ -1981,9 +1981,23 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // already uses; this is the one write-side addition, and it crosses no new
     // boundary), and `MaterializationError::Corrupt(` 3 → 4 (the inventory
     // row decode). No new `tine_storage` symbol is imported.
+    // Re-pinned 2026-09-07 (query engine RET1, the public IR commands read the
+    // database). Derived by dumping the surface at the working head (370) and
+    // diffing it against the R6 pin (369): ONE entry added, NOTHING removed or
+    // changed —
+    //   `query/sql.rs`  `MaterializationError::InvalidQuery(`  3 -> 4
+    // — the `page_statement` wrapper refusing a lowered statement that is not
+    // page-anchored, exactly as `descriptor_statement` refuses one that is not
+    // block-anchored. Read-side and a refusal, so the write-crossing table
+    // above is byte-identical. The packet's other production edits
+    // (`query/results.rs`' page read, `model.rs`' §5.9 page/probe dispatch,
+    // `managed_query.rs`' request-shaped executor, `sync_runtime.rs`' captured
+    // IR route) add no `tine_storage` token at all: they decode through this
+    // module's existing row helpers and reuse the snapshots their callers
+    // already own.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "d638f6eefe0e0fd892f515dba2bb4a786558bf19b50654964bf6cfd363f796be",
+        "9f1774d5021d44c533036f73074b2fc21f8f26431455e6a5fbebd5fe7855e839",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

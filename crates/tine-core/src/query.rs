@@ -1982,6 +1982,25 @@ pub struct ResolvedQuery {
 }
 
 impl ResolvedQuery {
+    /// Re-assemble a binding from the three things a Managed capture carries
+    /// across the actor boundary (RET1).
+    ///
+    /// It is NOT a second binding: `resolve_for_execution` is still the one
+    /// producer, and this only rebuilds the value it produced on the actor turn
+    /// so the off-actor executor and the recovery walk explain the same bound
+    /// tree, at the same execution day, under the same report.
+    pub(crate) fn from_parts(
+        query: Query,
+        report: ir::QueryReport,
+        today: JournalDate,
+    ) -> ResolvedQuery {
+        ResolvedQuery {
+            query,
+            report,
+            today,
+        }
+    }
+
     /// The bound IR — an advanced form's lowered filter, or the OG/TQL IR
     /// unchanged.
     pub fn query(&self) -> &Query {
@@ -2402,15 +2421,39 @@ pub(crate) fn run_query_result_over(
         result.exceeded = bounded.exceeded;
         return result;
     }
+    let answer = collect_page_rows_over(source, query, today, bounds);
+    result.total = answer.total;
+    result.exceeded = answer.exceeded;
+    result.rows = ir::QueryRows::Page {
+        pages: answer.pages,
+    };
+    result
+}
+
+/// The `@page` half of [`run_query_result_over`], as its own producer: the
+/// matched page rows in the SOURCE's enumeration order, under `max_rows`.
+///
+/// It is the WALK's page loop and the ORACLE the database page read is compared
+/// against (`results::read_page_results` is the production producer). `total` is
+/// the number of rows ADMITTED and `max_bytes` is never charged — both are the
+/// page loop's own long-standing rules and neither is unified with the block
+/// budget's here.
+pub(crate) fn collect_page_rows_over(
+    source: &dyn QueryPageSource,
+    query: &Query,
+    today: JournalDate,
+    bounds: ir::Bounds,
+) -> results::PageAnswer {
+    #[cfg(test)]
+    source.note_predicate_evaluation();
+    let mut answer = results::PageAnswer::default();
     if query.is_invalid() {
-        return result;
+        return answer;
     }
     let filter = query.evaluable_filter();
     let compiled = eval::CompiledLeaves::for_query(&filter);
     let parse_config = source.parse_config();
     let registry = source.registry();
-    let mut pages: Vec<ir::PageRow> = Vec::new();
-    let mut exceeded = false;
     source.for_each_page(&mut |page| {
         let (page_props, _tags) = page_facets(page.pre_block);
         if !eval::page_row_matches(
@@ -2427,21 +2470,19 @@ pub(crate) fn run_query_result_over(
         ) {
             return std::ops::ControlFlow::Continue(());
         }
-        if pages.len() >= bounds.max_rows {
-            exceeded = true;
+        if answer.pages.len() >= bounds.max_rows {
+            answer.exceeded = true;
             return std::ops::ControlFlow::Break(());
         }
-        pages.push(ir::PageRow {
+        answer.pages.push(ir::PageRow {
             name: page.name.to_string(),
             kind: page.kind,
             journal_day: page.journal,
         });
         std::ops::ControlFlow::Continue(())
     });
-    result.total = pages.len();
-    result.exceeded = exceeded;
-    result.rows = ir::QueryRows::Page { pages };
-    result
+    answer.total = answer.pages.len();
+    answer
 }
 
 /// The public page-or-block entry over a Direct Files graph. The dialect is the
@@ -3708,57 +3749,16 @@ pub(crate) fn run_application_query_pages_bounded(
     )
 }
 
-/// The §7.1 `query_run` evaluator over managed pages: the IR arrives already
-/// parsed, so this is `run_query_result_over` with the managed page source
-/// bound. One evaluator, two backends (I-19) — the Direct Files twin is
-/// [`run_query_result`].
-pub(crate) fn run_application_query_result(
-    pages: &[ApplicationQueryPage],
-    query: &Query,
-    view: &ViewSettings,
-    bounds: ir::Bounds,
-    config: crate::config::ParseConfig,
-    registry: std::sync::Arc<registry::Registry>,
-    context: &ir::ExecutionContext,
-) -> ir::QueryResult {
-    let resolved = resolve_for_execution(query, context, JournalDate::today());
-    run_resolved_query_result_over(
-        &ApplicationQueryPages {
-            pages,
-            config,
-            registry,
-        },
-        &resolved,
-        view,
-        bounds,
-    )
-}
+// RET1 deleted `run_application_query_result` and
+// `explain_application_empty_query`, the two Managed adapters that resolved the
+// IR and then handed `ApplicationQueryPages` to the shared driver. §7.1's two IR
+// commands now bind on the actor turn and execute against the projection off it
+// (`sync_runtime::RuntimeActor::application_ir_query_turn`); the same driver is
+// still reached with the same page source by the RECOVERY walk, which is the one
+// remaining caller and is what RET2 retires.
 
-/// The §7.1 `query_explain_empty` computation over managed pages.
-pub(crate) fn explain_application_empty_query(
-    pages: &[ApplicationQueryPage],
-    query: &Query,
-    view: &ViewSettings,
-    bounds: ir::Bounds,
-    config: crate::config::ParseConfig,
-    registry: std::sync::Arc<registry::Registry>,
-    context: &ir::ExecutionContext,
-) -> ir::ExplainEmptyResult {
-    let resolved = resolve_for_execution(query, context, JournalDate::today());
-    view::explain_empty(
-        &ApplicationQueryPages {
-            pages,
-            config,
-            registry,
-        },
-        &resolved,
-        view,
-        bounds,
-    )
-}
-
-/// The Direct Files twin of [`run_application_query_result`]: `query_run` when
-/// the IR is already parsed (the §7.1 command hands the IR, not text).
+/// `query_run` over a Direct Files graph when the IR is already parsed (the
+/// §7.1 command hands the IR, not text).
 ///
 /// §4.4: the IR arriving already parsed is exactly why this resolves. A parse
 /// is context-free, so the `{query, view}` a caller holds may have been parsed
@@ -3771,11 +3771,18 @@ pub fn run_query_result_ir(
     bounds: ir::Bounds,
     context: &ir::ExecutionContext,
 ) -> ir::QueryResult {
+    // §4.4: resolve ONCE — the current page, the execution day and the support
+    // report — before anything is keyed, lowered or cached.
     let resolved = resolve_for_execution(query, context, JournalDate::today());
-    run_resolved_query_result_over(&GraphQueryPages(graph), &resolved, view, bounds)
+    let mut result = graph.direct_ir_query_result(&resolved, view, bounds);
+    // The report is attached HERE, after the execution and after any cache
+    // retrieval, because it is a property of how this source was BOUND and not
+    // of the rows: the rows may be shared, the report may not.
+    result.report = resolved.report().clone();
+    result
 }
 
-/// The Direct Files twin of [`explain_application_empty_query`].
+/// Explain one IR query over Direct Files through the captured database read.
 pub fn explain_empty_query(
     graph: &Graph,
     query: &Query,
@@ -3784,7 +3791,7 @@ pub fn explain_empty_query(
     context: &ir::ExecutionContext,
 ) -> ir::ExplainEmptyResult {
     let resolved = resolve_for_execution(query, context, JournalDate::today());
-    view::explain_empty(&GraphQueryPages(graph), &resolved, view, bounds)
+    graph.direct_ir_explain_empty(&resolved, view, bounds)
 }
 
 /// Parser mode and page facts needed to evaluate one sparse candidate without

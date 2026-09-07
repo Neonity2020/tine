@@ -53,8 +53,8 @@ use crate::oplog::ContentDigest;
 use crate::query::ir::{Query, ViewSettings};
 use crate::query::registry::Registry;
 use crate::query::results::{
-    read_results, read_results_merged, BackendOrder, RecencyPage, ResultIdentity, ResultReadError,
-    ResultReadInputs, ResultReadShared, ResultSource,
+    read_page_results, read_page_results_merged, read_results, read_results_merged, BackendOrder,
+    RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs, ResultReadShared, ResultSource,
 };
 use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
 use crate::query::{ConstructionProfile, PreViewGroups};
@@ -133,6 +133,67 @@ pub(crate) struct ManagedQueryCapture {
     /// `query::simple_query_cache_key` of the resolved IR and bounds — the
     /// memo key, so two spellings of one query share one entry (I-12).
     pub(crate) key: String,
+    /// WHICH answer this capture is for (RET1). The immutable inputs above are
+    /// the same for all three; only the row shape and, for an explanation, the
+    /// probe decomposition differ.
+    pub(crate) request: ManagedQueryRequest,
+    /// §4.4's support report for the binding this capture was taken under.
+    ///
+    /// It travels with the capture rather than with the rows because it is a
+    /// property of HOW the source was bound: a memoized row set may be shared
+    /// by two executions with different reports, so the report may never be
+    /// memoized beside it.
+    pub(crate) report: crate::query::ir::QueryReport,
+}
+
+/// Which answer one captured Managed execution produces (RET1).
+///
+/// One capture shape, three row shapes. `Blocks` is the accepted-frontier
+/// simple-query route R4 shipped and the public `@block` IR command; `Pages` is
+/// the public `@page` IR command, whose rows are the page index and never a
+/// loaded document (K16); `Counts` is `query_explain_empty`'s probe
+/// decomposition, counted over the SAME snapshots as the answer would be.
+#[derive(Clone, Debug)]
+pub(crate) enum ManagedQueryRequest {
+    Blocks,
+    Pages,
+    /// The probe queries `query::view::explain_empty_plan` decomposed, in the
+    /// order it needs them counted.
+    Counts(Vec<Query>),
+}
+
+/// What a captured Managed execution answered, by request.
+#[derive(Debug)]
+pub(crate) enum ManagedQueryAnswer {
+    Blocks(PreViewGroups),
+    Pages(crate::query::results::PageAnswer),
+    Counts(Vec<usize>),
+}
+
+impl ManagedQueryAnswer {
+    /// The block answer, or `None` when the executor answered another request
+    /// than the caller captured — structurally impossible, and therefore
+    /// classified by the caller rather than panicked on.
+    pub(crate) fn into_blocks(self) -> Option<PreViewGroups> {
+        match self {
+            ManagedQueryAnswer::Blocks(pre) => Some(pre),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_pages(self) -> Option<crate::query::results::PageAnswer> {
+        match self {
+            ManagedQueryAnswer::Pages(pages) => Some(pages),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_counts(self) -> Option<Vec<usize>> {
+        match self {
+            ManagedQueryAnswer::Counts(counts) => Some(counts),
+            _ => None,
+        }
+    }
 }
 
 /// What one execution attempt produced. There is no fifth state: an attempt
@@ -140,7 +201,7 @@ pub(crate) struct ManagedQueryCapture {
 #[derive(Debug)]
 pub(crate) enum ManagedQueryOutcome {
     /// The statement answered from the snapshot; pre-view, un-ordered.
-    Answered(PreViewGroups),
+    Answered(ManagedQueryAnswer),
     /// The file's stamp no longer matches the capture: an accepted batch
     /// landed between the turn and the open. Not a failure — re-capture.
     Stale,
@@ -323,36 +384,35 @@ fn execute_on_slot(
         Ok(ready) => ready,
         Err(outcome) => return outcome,
     };
-    // The tree the WALK evaluates, at the anchor it evaluates it at — the same
-    // `block_anchored_query` rebase Direct lowers through, never a second one.
-    let query = crate::query::block_anchored_query(&capture.query);
-    let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
-    let statement = lower_query(
-        &query,
-        &LoweringInputs {
-            today: capture.today,
-            registry: &capture.registry,
-            // Empty BY CONSTRUCTION: the actor captures only when it holds no
-            // pending local suffix, so there is no unaccepted overlay to mask
-            // (the masked walk is the pending route, and R5 replaces it).
-            masked_pages: &[],
-            // NOT `max_rows`: `total` is the number of matches SEEN, so a
-            // `LIMIT` in the statement would truncate the count the user is
-            // shown. The bounds are charged by `read_results`' budget.
-            cutoff: None,
-            compiled: &compiled,
-            fts_ready,
-            result_set_rule: RESULT_SET_RULE,
-        },
-    );
-    // A filter that folded to false has its answer already (§3.5, I-15).
-    // Lowering can only happen after the snapshot is open, because `fts_ready`
-    // is a property of THIS snapshot, so an empty answer pays one transaction
-    // here where Direct pays none. That is the price of validating the stamp
-    // inside the read, not a regression.
-    if statement.matches_nothing {
-        return ManagedQueryOutcome::Answered(PreViewGroups::default());
-    }
+    // ONE lowering per selection this request needs, all under the capture's
+    // single registry and its ONE execution day. `block_anchored_query` is the
+    // same rebase Direct lowers through, never a second one; an `@page` request
+    // keeps its own anchor, because a page answer IS the page index.
+    //
+    // Empty `masked_pages` BY CONSTRUCTION: this arm runs only when the actor
+    // held no pending local suffix (the pending route is
+    // `execute_pending_on_slot`).
+    //
+    // NOT `max_rows` as a cutoff: `total` is the number of matches SEEN for a
+    // block answer, and the row AFTER the cap is what decides `exceeded` for a
+    // page answer, so a `LIMIT` in the statement would corrupt both.
+    let lower = |query: &Query| {
+        let query = anchored_for(query, &capture.request);
+        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let statement = lower_query(
+            &query,
+            &LoweringInputs {
+                today: capture.today,
+                registry: &capture.registry,
+                masked_pages: &[],
+                cutoff: None,
+                compiled: &compiled,
+                fts_ready,
+                result_set_rule: RESULT_SET_RULE,
+            },
+        );
+        (query.anchor, statement)
+    };
     // The recency axis is the Managed WALK's producer
     // (`application_query_page_recency`), over the descriptor row: a journal
     // page by its display NAME's date (`i64::MIN` when the name does not
@@ -367,21 +427,70 @@ fn execute_on_slot(
             &capture.graph_root.join(page.path),
         )
     };
-    let outcome = match read_results(
-        &mut snapshot,
-        &ResultReadInputs {
-            statement: &statement,
-            order: BackendOrder::Managed,
-            identity: &ResultIdentity::Stored,
-            max_rows: capture.max_rows,
-            max_bytes: capture.max_bytes,
-            profile: capture.profile,
-            recency: &recency,
-        },
-    ) {
-        Ok(pre) => {
+    // The ROW SHAPE is the lowered query's anchor and nothing else, so a
+    // page-anchored explanation probe counts page rows exactly as the page
+    // answer itself does.
+    let read = |snapshot: &mut PhysicalProjectionQuerySnapshot,
+                anchor: crate::query::ir::Anchor,
+                statement: &crate::query::sql::SqlQuery|
+     -> Result<ManagedQueryAnswer, ResultReadError> {
+        // A filter that folded to false has its answer already (§3.5, I-15).
+        // Lowering can only happen after the snapshot is open, because
+        // `fts_ready` is a property of THIS snapshot, so an empty answer pays
+        // one transaction here where Direct pays none. That is the price of
+        // validating the stamp inside the read, not a regression.
+        if statement.matches_nothing {
+            return Ok(empty_answer(anchor));
+        }
+        match anchor {
+            crate::query::ir::Anchor::Page => Ok(ManagedQueryAnswer::Pages(read_page_results(
+                snapshot,
+                statement,
+                BackendOrder::Managed,
+                capture.max_rows,
+            )?)),
+            crate::query::ir::Anchor::Block => Ok(ManagedQueryAnswer::Blocks(read_results(
+                snapshot,
+                &ResultReadInputs {
+                    statement,
+                    order: BackendOrder::Managed,
+                    identity: &ResultIdentity::Stored,
+                    max_rows: capture.max_rows,
+                    max_bytes: capture.max_bytes,
+                    profile: capture.profile,
+                    recency: &recency,
+                },
+            )?)),
+        }
+    };
+    let answer = match &capture.request {
+        ManagedQueryRequest::Counts(probes) => {
+            let mut counts = Vec::with_capacity(probes.len());
+            let mut failure = None;
+            for probe in probes {
+                let (anchor, statement) = lower(probe);
+                match read(&mut snapshot, anchor, &statement) {
+                    Ok(answer) => counts.push(answer_total(&answer)),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(ManagedQueryAnswer::Counts(counts)),
+            }
+        }
+        _ => {
+            let (anchor, statement) = lower(&capture.query);
+            read(&mut snapshot, anchor, &statement)
+        }
+    };
+    let outcome = match answer {
+        Ok(answer) => {
             census.note_statement_read();
-            ManagedQueryOutcome::Answered(pre)
+            ManagedQueryOutcome::Answered(answer)
         }
         Err(ResultReadError::Cancelled) => ManagedQueryOutcome::Cancelled,
         // A seam refusal or a projection that contradicts itself: the read was
@@ -394,6 +503,44 @@ fn execute_on_slot(
     };
     drop(snapshot);
     outcome
+}
+
+/// The tree one Managed selection lowers, and therefore the ROW SHAPE it
+/// produces. The REQUEST decides it, never the incoming anchor:
+///
+/// * `Blocks` always rebases (`block_anchored_query`). A `{{query …}}` source
+///   may parse to an `@page` anchor, and the simple-query route has always
+///   answered it as block groups — rebasing is that behaviour, and reading the
+///   raw anchor here would silently turn those shapes into page rows.
+/// * `Pages` is §7.1's `@page` answer and keeps its anchor.
+/// * `Counts` follows the PROBE's own anchor, which is exactly what the oracle
+///   (`run_query_result_over`) does per probe, so a `@page` explanation counts
+///   page rows and a `@block` one counts block matches.
+fn anchored_for(query: &Query, request: &ManagedQueryRequest) -> Query {
+    match (request, query.anchor) {
+        (ManagedQueryRequest::Pages, _)
+        | (ManagedQueryRequest::Counts(_), crate::query::ir::Anchor::Page) => query.clone(),
+        _ => crate::query::block_anchored_query(query),
+    }
+}
+
+/// The empty answer of the shape this anchor produces.
+fn empty_answer(anchor: crate::query::ir::Anchor) -> ManagedQueryAnswer {
+    match anchor {
+        crate::query::ir::Anchor::Page => {
+            ManagedQueryAnswer::Pages(crate::query::results::PageAnswer::default())
+        }
+        crate::query::ir::Anchor::Block => ManagedQueryAnswer::Blocks(PreViewGroups::default()),
+    }
+}
+
+/// The `total` one probe answer contributes to an explanation.
+fn answer_total(answer: &ManagedQueryAnswer) -> usize {
+    match answer {
+        ManagedQueryAnswer::Blocks(pre) => pre.total,
+        ManagedQueryAnswer::Pages(pages) => pages.total,
+        ManagedQueryAnswer::Counts(_) => 0,
+    }
 }
 
 /// How long a PENDING execution waits for the overlay worker to carry the
@@ -499,34 +646,33 @@ fn execute_pending_on_slot(
         Ok(ready) => ready,
         Err(outcome) => return outcome,
     };
-    // (5) ONE IR, ONE compiled-leaf parse, lowered twice — the sources differ
-    // only in the masked pages and their own readiness.
-    let query = crate::query::block_anchored_query(&capture.query);
-    let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
-    let lower = |masked_pages: &[[u8; 16]], fts_ready: bool| {
-        lower_query(
-            &query,
-            &LoweringInputs {
-                today: capture.today,
-                registry: &registry,
-                masked_pages,
-                // NOT `max_rows`: `total` is the number of matches SEEN, and a
-                // buffered source may not be truncated at all.
-                cutoff: None,
-                compiled: &compiled,
-                fts_ready,
-                result_set_rule: RESULT_SET_RULE,
-            },
+    // (5) ONE IR per selection, ONE compiled-leaf parse each, lowered TWICE —
+    // the sources differ only in the masked pages and their own readiness.
+    let lower = |query: &Query| {
+        let query = anchored_for(query, &capture.request);
+        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let lower_for = |masked_pages: &[[u8; 16]], fts_ready: bool| {
+            lower_query(
+                &query,
+                &LoweringInputs {
+                    today: capture.today,
+                    registry: &registry,
+                    masked_pages,
+                    // NOT `max_rows`: `total` is the number of matches SEEN,
+                    // and a buffered source may not be truncated at all.
+                    cutoff: None,
+                    compiled: &compiled,
+                    fts_ready,
+                    result_set_rule: RESULT_SET_RULE,
+                },
+            )
+        };
+        (
+            query.anchor,
+            lower_for(&[], overlay_fts),
+            lower_for(&mask, accepted_fts),
         )
     };
-    let overlay_statement = lower(&[], overlay_fts);
-    let accepted_statement = lower(&mask, accepted_fts);
-    // A filter that folded to false has its answer already (§3.5, I-15); a
-    // source whose statement matches nothing contributes nothing, and if both
-    // do the answer is empty without a statement being run.
-    if overlay_statement.matches_nothing && accepted_statement.matches_nothing {
-        return ManagedQueryOutcome::Answered(PreViewGroups::default());
-    }
     let recency = |page: RecencyPage<'_>| {
         capture.journal_format.page_recency_secs(
             page.kind == PageKind::Journal,
@@ -538,36 +684,111 @@ fn execute_pending_on_slot(
     // (`sources` is `[overlay pages…, accepted candidate pages…]` before its
     // stable sort by path), and the merged constructor buffers every source but
     // the last, so the small pending file is the buffered one.
-    let mut sources = Vec::with_capacity(2);
-    if !overlay_statement.matches_nothing {
-        sources.push(ResultSource {
-            snapshot: &mut overlay,
-            statement: &overlay_statement,
-        });
-    }
-    if !accepted_statement.matches_nothing {
-        sources.push(ResultSource {
-            snapshot: &mut accepted,
-            statement: &accepted_statement,
-        });
-    }
-    let outcome = match read_results_merged(
-        &mut sources,
-        &ResultReadShared {
-            order: BackendOrder::Managed,
-            // The overlay's rows come from the accept path's own per-page
-            // lowering, so its `result_id`s are the real Managed ones.
-            identity: &ResultIdentity::Stored,
-            max_rows: capture.max_rows,
-            max_bytes: capture.max_bytes,
-            profile: capture.profile,
-            recency: &recency,
-        },
-    ) {
-        Ok(pre) => {
+    let read = |overlay: &mut PhysicalProjectionQuerySnapshot,
+                accepted: &mut PhysicalProjectionQuerySnapshot,
+                anchor: crate::query::ir::Anchor,
+                overlay_statement: &crate::query::sql::SqlQuery,
+                accepted_statement: &crate::query::sql::SqlQuery|
+     -> Result<ManagedQueryAnswer, ResultReadError> {
+        // A filter that folded to false has its answer already (§3.5, I-15); a
+        // source whose statement matches nothing contributes nothing, and if
+        // both do the answer is empty without a statement being run.
+        if overlay_statement.matches_nothing && accepted_statement.matches_nothing {
+            return Ok(empty_answer(anchor));
+        }
+        match anchor {
+            crate::query::ir::Anchor::Page => {
+                let mut sources = Vec::with_capacity(2);
+                if !overlay_statement.matches_nothing {
+                    sources.push(crate::query::results::PageSource {
+                        snapshot: overlay,
+                        statement: overlay_statement,
+                    });
+                }
+                if !accepted_statement.matches_nothing {
+                    sources.push(crate::query::results::PageSource {
+                        snapshot: accepted,
+                        statement: accepted_statement,
+                    });
+                }
+                Ok(ManagedQueryAnswer::Pages(read_page_results_merged(
+                    &mut sources,
+                    BackendOrder::Managed,
+                    capture.max_rows,
+                )?))
+            }
+            crate::query::ir::Anchor::Block => {
+                let mut sources = Vec::with_capacity(2);
+                if !overlay_statement.matches_nothing {
+                    sources.push(ResultSource {
+                        snapshot: overlay,
+                        statement: overlay_statement,
+                    });
+                }
+                if !accepted_statement.matches_nothing {
+                    sources.push(ResultSource {
+                        snapshot: accepted,
+                        statement: accepted_statement,
+                    });
+                }
+                Ok(ManagedQueryAnswer::Blocks(read_results_merged(
+                    &mut sources,
+                    &ResultReadShared {
+                        order: BackendOrder::Managed,
+                        // The overlay's rows come from the accept path's own
+                        // per-page lowering, so its `result_id`s are the real
+                        // Managed ones.
+                        identity: &ResultIdentity::Stored,
+                        max_rows: capture.max_rows,
+                        max_bytes: capture.max_bytes,
+                        profile: capture.profile,
+                        recency: &recency,
+                    },
+                )?))
+            }
+        }
+    };
+    let answer = match &capture.request {
+        ManagedQueryRequest::Counts(probes) => {
+            let mut counts = Vec::with_capacity(probes.len());
+            let mut failure = None;
+            for probe in probes {
+                let (anchor, overlay_statement, accepted_statement) = lower(probe);
+                match read(
+                    &mut overlay,
+                    &mut accepted,
+                    anchor,
+                    &overlay_statement,
+                    &accepted_statement,
+                ) {
+                    Ok(answer) => counts.push(answer_total(&answer)),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(ManagedQueryAnswer::Counts(counts)),
+            }
+        }
+        _ => {
+            let (anchor, overlay_statement, accepted_statement) = lower(&capture.query);
+            read(
+                &mut overlay,
+                &mut accepted,
+                anchor,
+                &overlay_statement,
+                &accepted_statement,
+            )
+        }
+    };
+    let outcome = match answer {
+        Ok(answer) => {
             census.note_statement_read();
             census.note_pending_read();
-            ManagedQueryOutcome::Answered(pre)
+            ManagedQueryOutcome::Answered(answer)
         }
         Err(ResultReadError::Cancelled) => ManagedQueryOutcome::Cancelled,
         Err(ResultReadError::Sql(_)) => ManagedQueryOutcome::Failed("managed projection statement"),
@@ -579,7 +800,6 @@ fn execute_pending_on_slot(
         }
     };
     // (8) Both transactions end before the slot releases its capacity.
-    drop(sources);
     drop(overlay);
     drop(accepted);
     outcome
@@ -1238,6 +1458,12 @@ is `Failed` too rather than answered twice",
             max_rows: 10,
             max_bytes: 100,
             profile,
+            request: ManagedQueryRequest::Blocks,
+            report: crate::query::ir::QueryReport {
+                ran: Vec::new(),
+                ignored: Vec::new(),
+                supported: true,
+            },
         };
         assert!(matches!(
             execute_managed_query(

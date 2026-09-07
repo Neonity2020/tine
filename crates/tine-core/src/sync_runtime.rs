@@ -3550,6 +3550,51 @@ enum SimpleQueryTurn {
     Captured(Box<crate::managed_query::ManagedQueryCapture>),
 }
 
+/// What one §7.1 IR-command actor turn produced (RET1), the twin of
+/// [`SimpleQueryTurn`].
+///
+/// The answered arm carries a whole navigation REPLY rather than a row set,
+/// because one route serves both `query_run` and `query_explain_empty` and the
+/// two reply shapes are what distinguishes them.
+enum IrQueryTurn {
+    Deferred(SyncEditorDeferred),
+    /// The turn answered: a deferred binding with nothing to count, a memo hit,
+    /// or the walk an actor holding an unsplittable pending suffix takes.
+    Answered(SyncApplicationNavigationReply),
+    /// Everything the off-actor executor needs, captured at this turn's
+    /// accepted frontier.
+    Captured(Box<crate::managed_query::ManagedQueryCapture>),
+}
+
+/// An executor that answered a different request shape than it was captured
+/// for. Structurally impossible — the request decides the row shape — so it is
+/// classified as a failed read rather than panicked on or silently reshaped.
+fn ir_answer_shape_error(
+    census: &crate::managed_query::ManagedQueryCensus,
+) -> SyncApplicationPageRequestError {
+    census.note_failed_read();
+    SyncApplicationPageRequestError::ActorRefusedAt("application_ir_query_answer_shape")
+}
+
+/// §7.1's `query_run` result for a `@block` answer: the constructed rows, the
+/// selection's diagnostics, and the binding's report attached from OUTSIDE the
+/// memoized row answer.
+fn managed_ir_block_result(
+    selection: &crate::query::ir::Query,
+    report: &crate::query::ir::QueryReport,
+    bounded: SyncApplicationBoundedRefGroups,
+) -> crate::query::ir::QueryResult {
+    crate::query::ir::QueryResult {
+        rows: crate::query::ir::QueryRows::Block {
+            groups: bounded.groups,
+        },
+        diagnostics: selection.diagnostics.clone(),
+        report: report.clone(),
+        total: bounded.total,
+        exceeded: bounded.exceeded,
+    }
+}
+
 /// One simple query's shared per-request inputs (see
 /// `RuntimeActor::application_simple_query_prepared`).
 /// Which property registry one preparation of a simple query is lowered
@@ -4477,6 +4522,26 @@ impl SyncRuntimeHandle {
                 max_rows,
                 max_bytes,
             } => return self.application_simple_query(query, max_rows, max_bytes),
+            // RET1: §7.1's two IR commands take the same two-phase captured
+            // route. They are intercepted HERE, before any actor turn that
+            // could select rows, which is what makes "the public command read
+            // the database" a property of the route rather than of an arm.
+            SyncApplicationNavigationRequest::QueryRun {
+                query,
+                view,
+                context,
+                max_rows,
+                max_bytes,
+            } => {
+                return self.application_ir_query(query, view, context, false, max_rows, max_bytes)
+            }
+            SyncApplicationNavigationRequest::QueryExplainEmpty {
+                query,
+                view,
+                context,
+                max_rows,
+                max_bytes,
+            } => return self.application_ir_query(query, view, context, true, max_rows, max_bytes),
             request => request,
         };
         let lane = match &request {
@@ -4547,7 +4612,17 @@ impl SyncRuntimeHandle {
             };
             // `operation` was released when `application_request` returned.
             match shared.execute(&capture) {
-                ManagedQueryOutcome::Answered(mut pre) => {
+                ManagedQueryOutcome::Answered(answer) => {
+                    // Structurally always `Blocks`: this route captures
+                    // `ManagedQueryRequest::Blocks`. Another shape would mean
+                    // the executor answered a request it was not given, which
+                    // is a failed read and never a silently wrong answer.
+                    let Some(mut pre) = answer.into_blocks() else {
+                        shared.census.note_failed_read();
+                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                            "application_simple_query_answer_shape",
+                        ));
+                    };
                     crate::query::base_order_groups(&mut pre.groups);
                     let stored = shared.memo.lock().unwrap().insert_if_current(
                         &capture.stamp,
@@ -4600,6 +4675,136 @@ impl SyncRuntimeHandle {
         Ok(SyncApplicationNavigationOutcome::Loaded {
             reply: SyncApplicationNavigationReply::SimpleQuery(result),
         })
+    }
+
+    /// **SPEC §7.1's `query_run` / `query_explain_empty` route** (RET1).
+    ///
+    /// The same two phases `application_simple_query` runs, for the commands
+    /// the query macro actually calls. Phase one is a short actor turn that
+    /// binds the IR (§4.4), consults the memo and either answers or CAPTURES;
+    /// phase two runs `crate::managed_query::execute_managed_query` on the
+    /// CALLING thread, after `application_request` released `operation`, so the
+    /// actor keeps serving saves and navigation while the statement runs.
+    ///
+    /// Before this packet these two commands were a single serialized actor
+    /// turn that loaded every page of the graph and walked it — on the actor —
+    /// for every rendered query block.
+    ///
+    /// `Stale`, `Busy`, `Cancelled` and `Failed` are classified exactly as the
+    /// simple-query route classifies them, including SPEC §5.9 M10: a FAILED
+    /// managed read is an error, never a walk. Only a `@block` answer is
+    /// memoized, under the capture's stamp and only while the memo still stands
+    /// at it; `@page` rows and an explanation's counts are not memoized at all,
+    /// and no report is ever stored beside a row set.
+    fn application_ir_query(
+        &self,
+        query: crate::query::ir::Query,
+        view: crate::query::ir::ViewSettings,
+        context: crate::query::ir::ExecutionContext,
+        explain: bool,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
+        use crate::managed_query::{ManagedQueryOutcome, ManagedQueryRequest};
+        let shared = &self.inner.managed_query;
+        let mut recaptures = 0;
+        let capture = loop {
+            let turn = self.application_request(|reply| ActorRequest::ApplicationIrQueryTurn {
+                query: query.clone(),
+                view: view.clone(),
+                context: context.clone(),
+                explain,
+                max_rows,
+                max_bytes,
+                reply,
+            })?;
+            let capture = match turn {
+                IrQueryTurn::Deferred(state) => {
+                    return Ok(SyncApplicationNavigationOutcome::Deferred { state });
+                }
+                IrQueryTurn::Answered(reply) => {
+                    return Ok(SyncApplicationNavigationOutcome::Loaded { reply });
+                }
+                IrQueryTurn::Captured(capture) => capture,
+            };
+            // `operation` was released when `application_request` returned.
+            match shared.execute(&capture) {
+                ManagedQueryOutcome::Answered(answer) => {
+                    let reply = match &capture.request {
+                        ManagedQueryRequest::Blocks => {
+                            let Some(mut pre) = answer.into_blocks() else {
+                                return Err(ir_answer_shape_error(&shared.census));
+                            };
+                            crate::query::base_order_groups(&mut pre.groups);
+                            let stored = shared.memo.lock().unwrap().insert_if_current(
+                                &capture.stamp,
+                                capture.registry_generation,
+                                &capture.key,
+                                capture.props,
+                                pre,
+                            );
+                            SyncApplicationNavigationReply::QueryRun(managed_ir_block_result(
+                                &capture.query,
+                                &capture.report,
+                                finish_managed_pre_view(stored, &capture.view),
+                            ))
+                        }
+                        ManagedQueryRequest::Pages => {
+                            let Some(pages) = answer.into_pages() else {
+                                return Err(ir_answer_shape_error(&shared.census));
+                            };
+                            SyncApplicationNavigationReply::QueryRun(
+                                crate::query::ir::QueryResult {
+                                    rows: crate::query::ir::QueryRows::Page { pages: pages.pages },
+                                    diagnostics: capture.query.diagnostics.clone(),
+                                    report: capture.report.clone(),
+                                    total: pages.total,
+                                    exceeded: pages.exceeded,
+                                },
+                            )
+                        }
+                        ManagedQueryRequest::Counts(_) => {
+                            let Some(counts) = answer.into_counts() else {
+                                return Err(ir_answer_shape_error(&shared.census));
+                            };
+                            let resolved = crate::query::ResolvedQuery::from_parts(
+                                capture.query.clone(),
+                                capture.report.clone(),
+                                capture.today,
+                            );
+                            let plan = crate::query::view::explain_empty_plan(&resolved);
+                            SyncApplicationNavigationReply::QueryExplainEmpty(
+                                plan.answer(&resolved, &counts),
+                            )
+                        }
+                    };
+                    return Ok(SyncApplicationNavigationOutcome::Loaded { reply });
+                }
+                ManagedQueryOutcome::Stale
+                    if recaptures < crate::managed_query::MAX_STALE_RECAPTURES =>
+                {
+                    recaptures += 1;
+                    shared.census.note_stale_recapture();
+                    continue;
+                }
+                ManagedQueryOutcome::Stale | ManagedQueryOutcome::Busy => {
+                    shared.census.note_fallback_read();
+                    break capture;
+                }
+                ManagedQueryOutcome::Cancelled => break capture,
+                // SPEC §5.9 M10: a failed Managed read is an error, as a failed
+                // materialized read is today.
+                ManagedQueryOutcome::Failed(_) => {
+                    shared.census.note_failed_read();
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "application_ir_query_managed_read",
+                    ));
+                }
+            }
+        };
+        let reply = self
+            .application_request(|reply| ActorRequest::ApplicationIrQueryWalk { capture, reply })?;
+        Ok(SyncApplicationNavigationOutcome::Loaded { reply })
     }
 
     /// The accepted route's counters, read without an actor turn.
@@ -5078,6 +5283,40 @@ impl SyncRuntimeHandle {
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::ApplicationCompletePageSimpleQuery {
             query: query.to_owned(),
+            max_rows,
+            max_bytes,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// [`Self::application_complete_page_simple_query`]'s IR twin (RET1): the
+    /// walk answer for `query_run` / `query_explain_empty`, taken through the
+    /// actor's own binding and decomposition.
+    ///
+    /// It is the ORACLE the captured database route is compared against, and it
+    /// is deliberately not reachable from any wire command.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn application_complete_page_ir_query(
+        &self,
+        query: crate::query::ir::Query,
+        view: crate::query::ir::ViewSettings,
+        context: crate::query::ir::ExecutionContext,
+        explain: bool,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationNavigationReply, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ApplicationCompletePageIrQuery {
+            query: Box::new(query),
+            view: Box::new(view),
+            context: Box::new(context),
+            explain,
             max_rows,
             max_bytes,
             reply: reply_sender,
@@ -7891,6 +8130,49 @@ fn flatten_application_blocks(blocks: &[BlockDto]) -> Vec<ApplicationBlockRef<'_
     output
 }
 
+/// The ONE walk an IR execution can take on the application actor (RET1, I-12).
+///
+/// Every recovery reaches the parsed graph through here:
+/// `application_ir_query_turn`'s own no-stamp / non-local / unopenable-capture
+/// branch, `application_ir_query_walk_ready`'s busy / repeatedly-stale /
+/// cancelled branch, and the test-only oracle the parity gates compare against.
+/// One walk site is one thing for RET2 to delete and one thing for the
+/// walk-source census to pin.
+///
+/// (Prose here deliberately spells the test configuration attribute out in
+/// words: the census's `cfg`-region eraser is a text scan, and writing the
+/// attribute literally in a doc comment blanks the function under it.)
+///
+/// It takes the RESOLVED tree and the row-shape request rather than a query
+/// text, so the oracle cannot decompose an execution differently than the
+/// captured route did.
+fn ir_walk_ready(
+    pages: &[crate::query::ApplicationQueryPage],
+    config: crate::config::ParseConfig,
+    registry: std::sync::Arc<crate::query::registry::Registry>,
+    resolved: &crate::query::ResolvedQuery,
+    request: &crate::managed_query::ManagedQueryRequest,
+    view: &crate::query::ir::ViewSettings,
+    bounds: crate::query::ir::Bounds,
+) -> SyncApplicationNavigationReply {
+    use crate::managed_query::ManagedQueryRequest;
+    let source = crate::query::ApplicationQueryPages {
+        pages,
+        config,
+        registry,
+    };
+    match request {
+        ManagedQueryRequest::Counts(_) => SyncApplicationNavigationReply::QueryExplainEmpty(
+            crate::query::view::explain_empty(&source, resolved, view, bounds),
+        ),
+        ManagedQueryRequest::Blocks | ManagedQueryRequest::Pages => {
+            SyncApplicationNavigationReply::QueryRun(crate::query::run_resolved_query_result_over(
+                &source, resolved, view, bounds,
+            ))
+        }
+    }
+}
+
 fn flatten_application_blocks_bounded(
     blocks: &[BlockDto],
     block_limit: usize,
@@ -10312,6 +10594,24 @@ enum ActorRequest {
         reply:
             mpsc::Sender<Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError>>,
     },
+    /// The short actor half of §7.1's two IR commands (RET1): readiness, the
+    /// §4.4 binding, the memo, and either an answer or a capture the handle
+    /// executes off the actor.
+    ApplicationIrQueryTurn {
+        query: crate::query::ir::Query,
+        view: crate::query::ir::ViewSettings,
+        context: crate::query::ir::ExecutionContext,
+        explain: bool,
+        max_rows: usize,
+        max_bytes: usize,
+        reply: mpsc::Sender<Result<IrQueryTurn, SyncApplicationPageRequestError>>,
+    },
+    /// The recovery walk a captured IR read falls back to (RET1).
+    ApplicationIrQueryWalk {
+        capture: Box<crate::managed_query::ManagedQueryCapture>,
+        reply:
+            mpsc::Sender<Result<SyncApplicationNavigationReply, SyncApplicationPageRequestError>>,
+    },
     LoadApplicationPage {
         request: SyncApplicationPageLoadRequest,
         reply:
@@ -10435,6 +10735,18 @@ enum ActorRequest {
         #[allow(clippy::type_complexity)]
         reply:
             mpsc::Sender<Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError>>,
+    },
+    #[cfg(test)]
+    ApplicationCompletePageIrQuery {
+        query: Box<crate::query::ir::Query>,
+        view: Box<crate::query::ir::ViewSettings>,
+        context: Box<crate::query::ir::ExecutionContext>,
+        explain: bool,
+        max_rows: usize,
+        max_bytes: usize,
+        #[allow(clippy::type_complexity)]
+        reply:
+            mpsc::Sender<Result<SyncApplicationNavigationReply, SyncApplicationPageRequestError>>,
     },
     #[cfg(test)]
     ManagedApplicationQueryInstrumentation {
@@ -10602,6 +10914,26 @@ fn run_actor_loop(
                     .and_then(|prepared| {
                         actor.application_simple_query_walk(&query, prepared, max_rows, max_bytes)
                     });
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ApplicationIrQueryTurn {
+                query,
+                view,
+                context,
+                explain,
+                max_rows,
+                max_bytes,
+                reply,
+            } => {
+                let result = actor.application_ir_query_turn(
+                    &query, &view, &context, explain, max_rows, max_bytes,
+                );
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ApplicationIrQueryWalk { capture, reply } => {
+                let result = actor.application_ir_query_walk_ready(&capture);
                 let _ = reply.send(result);
                 false
             }
@@ -10898,6 +11230,21 @@ fn run_actor_loop(
                             )
                         }),
                 );
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ApplicationCompletePageIrQuery {
+                query,
+                view,
+                context,
+                explain,
+                max_rows,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(actor.application_complete_page_ir_query(
+                    &query, &view, &context, explain, max_rows, max_bytes,
+                ));
                 false
             }
             #[cfg(test)]
@@ -14087,26 +14434,17 @@ impl RuntimeActor {
                     self.application_property_registry_snapshot_ready()?,
                 )
             }
-            SyncApplicationNavigationRequest::QueryRun {
-                query,
-                view,
-                context,
-                max_rows,
-                max_bytes,
-            } => SyncApplicationNavigationReply::QueryRun(
-                self.application_query_run_ready(&query, &view, &context, max_rows, max_bytes)?,
-            ),
-            SyncApplicationNavigationRequest::QueryExplainEmpty {
-                query,
-                view,
-                context,
-                max_rows,
-                max_bytes,
-            } => SyncApplicationNavigationReply::QueryExplainEmpty(
-                self.application_query_explain_empty_ready(
-                    &query, &view, &context, max_rows, max_bytes,
-                )?,
-            ),
+            // RET1: §7.1's two IR commands are the handle's two-phase captured
+            // route (`SyncRuntimeHandle::application_ir_query`), exactly as
+            // `SimpleQuery` is. They never reach a serialized actor turn that
+            // selects rows, so there is no arm here that could quietly walk the
+            // parsed page set instead of reading the projection.
+            SyncApplicationNavigationRequest::QueryRun { .. }
+            | SyncApplicationNavigationRequest::QueryExplainEmpty { .. } => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_navigation_ir_query_is_captured",
+                ))
+            }
             SyncApplicationNavigationRequest::AdvancedQuery {
                 query,
                 current_page,
@@ -15615,6 +15953,14 @@ impl RuntimeActor {
                 max_bytes,
                 profile: prepared.profile,
                 key: prepared.key,
+                request: crate::managed_query::ManagedQueryRequest::Blocks,
+                // A `{{query …}}` source has no advanced clause report: OG and
+                // TQL report an empty `ignored` and `supported = true` (M5).
+                report: crate::query::ir::QueryReport {
+                    ran: Vec::new(),
+                    ignored: Vec::new(),
+                    supported: true,
+                },
             },
         )))
     }
@@ -16029,54 +16375,264 @@ impl RuntimeActor {
         Ok(self.application_property_registry().snapshot())
     }
 
-    /// SPEC §7.1 `query_run` over Managed pages. The IR arrives parsed, so the
-    /// only Managed-specific work is assembling the same page set the simple
-    /// and advanced query paths assemble.
-    fn application_query_run_ready(
+    /// The RECOVERY WALK for §7.1's two IR commands (RET1): the evaluation the
+    /// actor ran for every `query_run` before this packet, now reached only
+    /// when the off-actor database read reported `Busy`, `Cancelled` or a third
+    /// `Stale`.
+    ///
+    /// It re-uses the CAPTURE rather than re-resolving: the bound tree, its one
+    /// execution day and its support report are the turn's, so the walk cannot
+    /// answer a different question than the statement was going to. The
+    /// registry is re-taken MERGED here for the same reason
+    /// `prepared_for_walk` re-takes it — the walk coerces against the actor's
+    /// merged table, and with nothing pending the two are the same table.
+    ///
+    /// RET2 deletes this method together with the fallback arms that reach it.
+    fn application_ir_query_walk_ready(
         &self,
-        query: &crate::query::ir::Query,
-        view: &crate::query::ir::ViewSettings,
-        context: &crate::query::ir::ExecutionContext,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Result<crate::query::ir::QueryResult, SyncApplicationPageRequestError> {
-        let pages = self.application_all_query_pages_ready()?;
-        Ok(crate::query::run_application_query_result(
-            &pages,
-            query,
-            view,
-            crate::query::ir::Bounds {
-                max_rows,
-                max_bytes,
-            },
+        capture: &crate::managed_query::ManagedQueryCapture,
+    ) -> Result<SyncApplicationNavigationReply, SyncApplicationPageRequestError> {
+        let resolved = crate::query::ResolvedQuery::from_parts(
+            capture.query.clone(),
+            capture.report.clone(),
+            capture.today,
+        );
+        Ok(ir_walk_ready(
+            &self.application_all_query_pages_ready()?,
             self.graph.config.parse_config(),
             self.application_property_registry(),
-            context,
+            &resolved,
+            &capture.request,
+            &capture.view,
+            crate::query::ir::Bounds {
+                max_rows: capture.max_rows,
+                max_bytes: capture.max_bytes,
+            },
         ))
     }
 
-    /// SPEC §7.1 `query_explain_empty` over Managed pages (Q14, N19).
-    fn application_query_explain_empty_ready(
-        &self,
+    /// The selection tree and the row-shape request ONE IR execution runs
+    /// under, or the complete answer when a refused binding leaves nothing
+    /// honest to count (§Q14/N19).
+    ///
+    /// Extracted from [`Self::application_ir_query_turn`] so the `#[cfg(test)]`
+    /// walk oracle decomposes a query exactly as the captured route does. An
+    /// oracle that picked its own anchor, or its own explain decomposition,
+    /// would be comparing two different questions and calling the difference a
+    /// defect.
+    fn ir_query_selection(
+        resolved: &crate::query::ResolvedQuery,
+        explain: bool,
+    ) -> Result<
+        (
+            crate::query::ir::Query,
+            crate::managed_query::ManagedQueryRequest,
+        ),
+        SyncApplicationNavigationReply,
+    > {
+        use crate::managed_query::ManagedQueryRequest;
+        if explain {
+            let plan = crate::query::view::explain_empty_plan(resolved);
+            if plan.probes.is_empty() {
+                return Err(SyncApplicationNavigationReply::QueryExplainEmpty(
+                    plan.answer(resolved, &[]),
+                ));
+            }
+            return Ok((
+                resolved.query().clone(),
+                ManagedQueryRequest::Counts(plan.probes),
+            ));
+        }
+        if resolved.query().anchor == crate::query::ir::Anchor::Page {
+            return Ok((resolved.query().clone(), ManagedQueryRequest::Pages));
+        }
+        Ok((
+            crate::query::block_anchored_query(resolved.query()),
+            ManagedQueryRequest::Blocks,
+        ))
+    }
+
+    /// The IR route's walk oracle: the evaluation the actor ran for every
+    /// `query_run` and `query_explain_empty` before RET1, reached through the
+    /// SAME binding, the SAME decomposition and the SAME walk the recovery
+    /// branches use — only never through the database.
+    ///
+    /// This is the receipt's "before", and the independent answer the captured
+    /// route's parity gates compare against.
+    #[cfg(test)]
+    fn application_complete_page_ir_query(
+        &mut self,
         query: &crate::query::ir::Query,
         view: &crate::query::ir::ViewSettings,
         context: &crate::query::ir::ExecutionContext,
+        explain: bool,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Result<crate::query::ir::ExplainEmptyResult, SyncApplicationPageRequestError> {
-        let pages = self.application_all_query_pages_ready()?;
-        Ok(crate::query::explain_application_empty_query(
-            &pages,
-            query,
+    ) -> Result<SyncApplicationNavigationReply, SyncApplicationPageRequestError> {
+        let today = crate::date::JournalDate::today();
+        let resolved = crate::query::resolve_for_execution(query, context, today);
+        let (_selection, request) = match Self::ir_query_selection(&resolved, explain) {
+            Ok(pair) => pair,
+            Err(reply) => return Ok(reply),
+        };
+        Ok(ir_walk_ready(
+            &self.application_all_query_pages_ready()?,
+            self.graph.config.parse_config(),
+            self.application_property_registry(),
+            &resolved,
+            &request,
             view,
             crate::query::ir::Bounds {
                 max_rows,
                 max_bytes,
             },
-            self.graph.config.parse_config(),
-            self.application_property_registry(),
-            context,
         ))
+    }
+
+    /// Phase one of §7.1's captured IR route (RET1), the twin of
+    /// `application_simple_query_turn`.
+    ///
+    /// §4.4's binding happens HERE, once, on the actor: `?current-page` and the
+    /// execution day are resolved before anything is keyed, lowered, memoized
+    /// or captured, and the resulting report travels on the capture so that a
+    /// memoized row set is never stored beside one.
+    fn application_ir_query_turn(
+        &mut self,
+        query: &crate::query::ir::Query,
+        view: &crate::query::ir::ViewSettings,
+        context: &crate::query::ir::ExecutionContext,
+        explain: bool,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<IrQueryTurn, SyncApplicationPageRequestError> {
+        use crate::managed_query::ManagedQueryRequest;
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
+            return Ok(IrQueryTurn::Deferred(state));
+        }
+        let today = crate::date::JournalDate::today();
+        let resolved = crate::query::resolve_for_execution(query, context, today);
+        let bounds = crate::query::ir::Bounds {
+            max_rows,
+            max_bytes,
+        };
+        // The selection tree, at the anchor the engines evaluate it at, and the
+        // request that decides the row shape. A refused binding has nothing
+        // honest to count (§Q14/N19): the rows are empty and the caller gets
+        // the diagnostics and the report.
+        let (selection, request) = match Self::ir_query_selection(&resolved, explain) {
+            Ok(pair) => pair,
+            Err(reply) => return Ok(IrQueryTurn::Answered(reply)),
+        };
+        let profile = crate::query::ConstructionProfile::from_view(view);
+        let config = self.graph.config.parse_config();
+        let props = selection.filter.has_props_leaf()
+            || matches!(&request, ManagedQueryRequest::Counts(probes)
+                if probes.iter().any(|probe| probe.filter.has_props_leaf()));
+        let stamp = self.managed_simple_query_stamp(&config, today)?;
+        // C6: the registry generation is part of the key only for a query that
+        // reads property atoms. The CAPTURE path prepares under the ACCEPTED
+        // table, because that is the base the off-actor executor patches.
+        let registry = if props {
+            self.accepted_property_registry()
+        } else {
+            std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
+        };
+        let registry_generation = if props { registry.generation() } else { 0 };
+        let key = crate::query::simple_query_cache_key(&selection, max_rows, max_bytes, profile);
+        let memoizable = matches!(request, ManagedQueryRequest::Blocks);
+        let walk = |actor: &Self,
+                    registry: std::sync::Arc<crate::query::registry::Registry>|
+         -> Result<SyncApplicationNavigationReply, SyncApplicationPageRequestError> {
+            Ok(ir_walk_ready(
+                &actor.application_all_query_pages_ready()?,
+                actor.graph.config.parse_config(),
+                registry,
+                &resolved,
+                &request,
+                view,
+                bounds,
+            ))
+        };
+        // No stamp (no overlay could be created for a pending suffix): the walk
+        // answers on the actor, as it does for a simple query.
+        let Some(stamp) = stamp else {
+            return Ok(IrQueryTurn::Answered(walk(
+                self,
+                self.application_property_registry(),
+            )?));
+        };
+        // R5b/R5c: with a pending suffix, only a query every relation of which
+        // stays inside one page can be split between the accepted file and the
+        // overlay. An explanation is split only when EVERY probe is.
+        let local = selection.page_locality() == crate::query::ir::PageLocality::Local
+            && match &request {
+                ManagedQueryRequest::Counts(probes) => probes
+                    .iter()
+                    .all(|probe| probe.page_locality() == crate::query::ir::PageLocality::Local),
+                _ => true,
+            };
+        if stamp.overlay_revision.is_some() && !local {
+            return Ok(IrQueryTurn::Answered(walk(
+                self,
+                self.application_property_registry(),
+            )?));
+        }
+        if memoizable {
+            if let Some(hit) =
+                self.managed_query
+                    .memo
+                    .lock()
+                    .unwrap()
+                    .get(&stamp, registry_generation, &key)
+            {
+                return Ok(IrQueryTurn::Answered(
+                    SyncApplicationNavigationReply::QueryRun(managed_ir_block_result(
+                        &selection,
+                        resolved.report(),
+                        finish_managed_pre_view(hit, view),
+                    )),
+                ));
+            }
+        }
+        let database = self
+            .active_database()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let overlay = match stamp.overlay_revision {
+            Some(required_revision) => {
+                let overlay = self
+                    .managed_local
+                    .as_ref()
+                    .and_then(|managed| managed.pending_overlay.clone())
+                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+                Some(crate::managed_query::PendingOverlayCapture {
+                    required_revision,
+                    overlay,
+                })
+            }
+            None => None,
+        };
+        Ok(IrQueryTurn::Captured(Box::new(
+            crate::managed_query::ManagedQueryCapture {
+                path: database.path().to_path_buf(),
+                overlay,
+                graph_root: self.graph.root.clone(),
+                stamp,
+                config,
+                journal_format: self.graph.journal_format.clone(),
+                registry,
+                registry_generation,
+                props,
+                query: selection,
+                view: view.clone(),
+                today,
+                max_rows,
+                max_bytes,
+                profile,
+                key,
+                request,
+                report: resolved.report().clone(),
+            },
+        )))
     }
 
     fn application_orphan_assets_ready(

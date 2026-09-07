@@ -422,23 +422,83 @@ pub(crate) fn explain_empty(
     view: &ViewSettings,
     bounds: crate::query::ir::Bounds,
 ) -> crate::query::ir::ExplainEmptyResult {
+    let plan = explain_empty_plan(resolved);
+    let counts = plan
+        .probes
+        .iter()
+        .map(|probe| {
+            crate::query::run_query_result_over(source, probe, view, resolved.today(), bounds).total
+        })
+        .collect::<Vec<_>>();
+    plan.answer(resolved, &counts)
+}
+
+/// The DECOMPOSITION half of [`explain_empty`], separated from the evaluator so
+/// that one explanation's probes can be answered from ONE coherent snapshot
+/// rather than one page walk each (RET1).
+///
+/// Nothing here reads a graph: it takes the resolved tree apart, prints each
+/// conjunct and states which probe queries have to be counted. The evaluator is
+/// the caller's — the database read for both backends, the walk for the oracle
+/// — and [`ExplainPlan::answer`] reassembles the same rows either way, so the
+/// decomposition, the printing and the `And`/non-`And` rule exist once.
+pub(crate) struct ExplainPlan {
+    /// Every probe query, in the order the evaluator must count them. Empty
+    /// when the binding failed: there is nothing honest to count then.
+    pub(crate) probes: Vec<crate::query::ir::Query>,
+    /// One entry per answer row: the printed conjunct, the index of its `alone`
+    /// probe, and of its `without` probe when the root is an `And`.
+    rows: Vec<(String, usize, Option<usize>)>,
+}
+
+impl ExplainPlan {
+    /// The rows, given one count per [`ExplainPlan::probes`] entry in order.
+    ///
+    /// A `counts` slice shorter than the plan can only mean the evaluator
+    /// answered a different plan than it was given; that reads as `0` rather
+    /// than panicking, exactly as a refused binding does.
+    pub(crate) fn answer(
+        &self,
+        resolved: &crate::query::ResolvedQuery,
+        counts: &[usize],
+    ) -> crate::query::ir::ExplainEmptyResult {
+        let at = |index: usize| counts.get(index).copied().unwrap_or(0);
+        crate::query::ir::ExplainEmptyResult {
+            rows: self
+                .rows
+                .iter()
+                .map(|(conjunct, alone, without)| EmptyExplanation {
+                    conjunct: conjunct.clone(),
+                    alone: at(*alone),
+                    without: without.map(at),
+                })
+                .collect(),
+            diagnostics: resolved.query().diagnostics.clone(),
+            report: resolved.report().clone(),
+        }
+    }
+}
+
+pub(crate) fn explain_empty_plan(resolved: &crate::query::ResolvedQuery) -> ExplainPlan {
     use crate::query::ir::Filter;
 
     let query = resolved.query();
-    let answer = |rows: Vec<EmptyExplanation>| crate::query::ir::ExplainEmptyResult {
-        rows,
-        diagnostics: query.diagnostics.clone(),
-        report: resolved.report().clone(),
+    let mut plan = ExplainPlan {
+        probes: Vec::new(),
+        rows: Vec::new(),
     };
     if !resolved.is_executable() {
-        return answer(Vec::new());
+        return plan;
     }
 
-    let count = |filter: Filter| -> usize {
+    // The probe carries the query's anchor and its immutable source (so the
+    // printer still reads as query text) with the conjunct as its filter and no
+    // diagnostics — an explanation counts rows, it does not re-refuse.
+    let probe = |filter: Filter| -> crate::query::ir::Query {
         let mut probe = query.clone();
         probe.filter = filter;
         probe.diagnostics.clear();
-        crate::query::run_query_result_over(source, &probe, view, resolved.today(), bounds).total
+        probe
     };
     let printed = |filter: &Filter| -> String {
         let mut probe = query.clone();
@@ -448,30 +508,31 @@ pub(crate) fn explain_empty(
 
     let mut evaluable = query.clone();
     evaluable.filter = query.evaluable_filter();
-    answer(match evaluable.normalized().filter {
-        Filter::And { items } if items.len() > 1 => items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
+    match evaluable.normalized().filter {
+        Filter::And { items } if items.len() > 1 => {
+            for (index, item) in items.iter().enumerate() {
                 let others = items
                     .iter()
                     .enumerate()
                     .filter(|(other, _)| *other != index)
                     .map(|(_, filter)| filter.clone())
                     .collect::<Vec<_>>();
-                EmptyExplanation {
-                    conjunct: printed(item),
-                    alone: count(item.clone()),
-                    without: Some(count(Filter::and(others))),
-                }
-            })
-            .collect(),
-        whole => vec![EmptyExplanation {
-            conjunct: printed(&whole),
-            alone: count(whole),
-            without: None,
-        }],
-    })
+                let conjunct = printed(item);
+                let alone = plan.probes.len();
+                plan.probes.push(probe(item.clone()));
+                let without = plan.probes.len();
+                plan.probes.push(probe(Filter::and(others)));
+                plan.rows.push((conjunct, alone, Some(without)));
+            }
+        }
+        whole => {
+            let conjunct = printed(&whole);
+            let alone = plan.probes.len();
+            plan.probes.push(probe(whole));
+            plan.rows.push((conjunct, alone, None));
+        }
+    }
+    plan
 }
 
 #[cfg(test)]

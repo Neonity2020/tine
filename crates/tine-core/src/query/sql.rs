@@ -376,6 +376,19 @@ const MATCH_SET_SELECT: &str = "SELECT m.block_id, m.page_id, p.path";
 const MATCH_SET_FROM: &str = "FROM m JOIN pages p ON p.page_id = m.page_id";
 const MATCH_SET_IDS: &str = "SELECT m.block_id, m.page_id FROM m";
 
+/// §5.3's PAGE answer row and its relation, the same named pair for `@page`.
+///
+/// [`page_statement`] wraps exactly this relation for the same reason
+/// [`descriptor_statement`] wraps the block one. The `_IDS` twin adds `p.path`:
+/// the page read re-joins `query_page_order` itself (LEFT), and Managed
+/// Storage's page order IS the path, so both order keys have to survive into
+/// the wrapper's CTE. `p` is the anchor alias and can never collide with a
+/// nested relation's, because [`Compiler::alias`] always appends a number.
+const PAGE_ANCHOR_SELECT: &str = "SELECT p.page_id, p.name, p.text_kind, p.journal_day";
+const PAGE_ANCHOR_FROM: &str = "FROM pages p";
+const PAGE_ANCHOR_IDS: &str =
+    "SELECT p.page_id, p.name, p.text_kind, p.journal_day, p.path FROM pages p";
+
 /// Lower one resolved query (SPEC §5.1–§5.7).
 ///
 /// The filter is the EVALUABLE one: `Off` subtrees are removed bottom-up first,
@@ -410,11 +423,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
             BLOCK_ANCHOR_SELECT,
             BLOCK_ANCHOR_FROM,
         ),
-        Anchor::Page => (
-            Row::Page("p"),
-            "SELECT p.page_id, p.name, p.text_kind, p.journal_day",
-            "FROM pages p",
-        ),
+        Anchor::Page => (Row::Page("p"), PAGE_ANCHOR_SELECT, PAGE_ANCHOR_FROM),
     };
     let mut where_ = compiler.filter(&filter, row);
     // §5.3: the result-set rule is applied in the SAME statement. OG's
@@ -633,6 +642,57 @@ pub(crate) fn descriptor_statement(
         // The wrapper adds ordering and metadata to an already-classified
         // statement; it neither creates nor removes a bound, and it lowers no
         // content leaf of its own.
+        positively_bounded: statement.positively_bounded,
+        matches_nothing: statement.matches_nothing,
+        content_plans: statement.content_plans.clone(),
+        regexes: statement.regexes.clone(),
+    })
+}
+
+/// The PAGE statement for one lowered `@page` query: the same selected pages,
+/// plus the two order keys the shared page read charges its `max_rows` in.
+///
+/// **A wrapper, not a second compiler**, exactly as [`descriptor_statement`] is:
+/// `statement` is [`lower_query`]'s output verbatim, its selected-page relation
+/// becomes one more CTE (`r`) beside whatever `WITH` list the statement already
+/// carries, and nothing is bound here. A block-anchored statement is rejected —
+/// its rows are the descriptor read's.
+///
+/// **The join is LEFT on purpose (D-3).** Direct Files' page order IS
+/// `query_page_order.position`; a missing row must FAIL the read rather than
+/// sort a page silently to one end of a truncated answer. Managed Storage
+/// supplies no `query_page_order` and orders by `pages.path` under SQLite's
+/// BINARY collation, which is `String::cmp` on the UTF-8 bytes and is exactly
+/// the `rel_path` sort `application_navigation_pages_ready` ends with.
+pub(crate) fn page_statement(
+    statement: &SqlQuery,
+    order: crate::query::results::BackendOrder,
+) -> Result<SqlQuery, MaterializationError> {
+    let page_anchor = format!("{PAGE_ANCHOR_SELECT} {PAGE_ANCHOR_FROM}");
+    let Some(at) = find_once(&statement.sql, &page_anchor)? else {
+        return Err(MaterializationError::InvalidQuery(
+            "only a page-anchored lowered statement has a page read".into(),
+        ));
+    };
+    let (leading_ctes, body) = statement.sql.split_at(at);
+    let body = body.replacen(page_anchor.as_str(), PAGE_ANCHOR_IDS, 1);
+    let with = match leading_ctes.trim_end() {
+        "" => "WITH".to_string(),
+        ctes => format!("{ctes},"),
+    };
+    let base = match order {
+        crate::query::results::BackendOrder::Direct => "o.position",
+        crate::query::results::BackendOrder::Managed => "r.path",
+    };
+    Ok(SqlQuery {
+        sql: format!(
+            "{with} r(page_id, name, text_kind, journal_day, path) AS ({body}) \
+             SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, o.position \
+             FROM r \
+             LEFT JOIN query_page_order o ON o.page_id = r.page_id \
+             ORDER BY {base}"
+        ),
+        params: statement.params.clone(),
         positively_bounded: statement.positively_bounded,
         matches_nothing: statement.matches_nothing,
         content_plans: statement.content_plans.clone(),
