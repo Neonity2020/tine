@@ -86,6 +86,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Reopening an unchanged Direct Files graph no longer re-parses it.** Tine
+  now checks the graph's files against the query projection it keeps beside
+  the graph, page by page from the file bytes, and parses only the pages that
+  actually changed since the last session; an unchanged graph is ready with
+  nothing parsed and nothing retained in memory. A missing or damaged
+  projection is rebuilt by streaming pages through a bounded queue instead of
+  holding the whole parsed graph. Saves and deletions reach the projection
+  whether or not a parsed copy of the graph exists.
 - **A query about pages now answers with pages.** `{{query (page-property …)}}`,
   `(page-tags …)` and `(namespace …)` ask a question about pages, but Tine
   answered them by listing every block on each matching page — so one matching

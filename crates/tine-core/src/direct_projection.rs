@@ -32,9 +32,18 @@ type PageRevisions = Arc<HashMap<PathBuf, String>>;
 // when tine-storage's disposable SQLite schema itself remains compatible.
 const DIRECT_PROJECTION_FACTS_VERSION: u32 = 2;
 const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// R6: how many streamed warm deltas may wait in the queue before the warm
+/// thread parses the next batch. It bounds what a cold or changed open retains
+/// beyond the worker's current turn to one batch of documents, instead of the
+/// whole parsed graph the full snapshot used to pin (plan §2D).
+pub(crate) const WARM_STREAM_HIGH_WATER: usize = 64;
 
 #[cfg(test)]
 static PHYSICAL_PAGE_LOWERINGS: AtomicU64 = AtomicU64::new(0);
+/// R6 test receipt: the most deltas a warm stream ever left queued, so a test
+/// can prove the stream never retained more than `WARM_STREAM_HIGH_WATER`.
+#[cfg(test)]
+static MAX_PENDING_DELTAS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static BEFORE_APPLY_PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
@@ -87,11 +96,31 @@ enum PageDelta {
         document: Arc<Document>,
         revision: String,
         parse_config: Arc<ParseConfig>,
-        query_page_order: u64,
+        /// `None` while a warm stream is open (R6): the rows carry no order
+        /// position until the stream's closing order turn reconciles the
+        /// whole `query_page_order` table, because a position written mid-stream
+        /// could collide with a retained page's previous-session position.
+        query_page_order: Option<u64>,
+        identity: DeltaIdentity,
     },
     Delete {
         entry: PageEntry,
     },
+}
+
+/// R6 session identity rule (WARM-IDENTITY-ORDER-CONTRACT.md item 3): where a
+/// replacement's runtime ids came from decides whether the page joins or
+/// leaves `ProjectionShared::session_pages`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeltaIdentity {
+    /// The document is this process's live one (a save, or a parsed-cache
+    /// snapshot that may carry preserved ids): the stored `result_id`s ARE the
+    /// public ids, so the page is added.
+    Live,
+    /// A fresh parse (the warm stream): the stored ids are structural, equal to
+    /// what `doc_runtime_id_for_order` derives, so the page is removed — an
+    /// external incompatible revision invalidates any live mapping it had.
+    Structural,
 }
 
 impl PageDelta {
@@ -113,6 +142,42 @@ struct PendingFull {
     parse_config: Arc<ParseConfig>,
 }
 
+/// R6 warm validation: the walk inventory with each page's exact content
+/// revision, and nothing parsed. The worker compares it with
+/// `direct_source_revisions`; an unchanged graph publishes readiness from this
+/// alone, a changed one names the pages the warm thread must parse.
+struct PendingWarm {
+    generation: u64,
+    sources: Vec<(PageEntry, String)>,
+    parse_config: Arc<ParseConfig>,
+}
+
+/// What the worker's warm-validation turn decided (R6), read by the warm
+/// thread through `wait_warm_outcome`.
+#[derive(Clone, Debug)]
+pub(crate) enum WarmOutcome {
+    /// Every walk page's rows are current: readiness publishes without a parse.
+    Clean,
+    /// These pages' rows are missing or stale; the warm thread streams them.
+    Replacements(Vec<PageEntry>),
+    /// A full parsed snapshot arrived first and owns readiness.
+    Superseded,
+    /// The validation turn failed; the parser fallback owns readiness.
+    Failed,
+}
+
+/// One page of the R6 warm stream, as the warm thread hands it over.
+pub(crate) enum WarmStreamItem {
+    Replace {
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+    },
+    Delete {
+        entry: PageEntry,
+    },
+}
+
 #[derive(Default)]
 struct PendingProjection {
     full: Option<PendingFull>,
@@ -122,6 +187,24 @@ struct PendingProjection {
     stop: bool,
     page_order: BTreeMap<String, u64>,
     next_page_order: u64,
+    /// R6 warm validation queued for the worker.
+    warm: Option<PendingWarm>,
+    /// R6: the worker's verdict on the last warm validation.
+    warm_outcome: Option<WarmOutcome>,
+    /// R6: a warm stream is open at this generation. Readiness never publishes
+    /// while it is `Some`, and deltas recorded meanwhile carry no order
+    /// position (see `PageDelta::Replace::query_page_order`).
+    warm_stream: Option<u64>,
+    /// R6: the stream's closing turn — reconcile `query_page_order` over the
+    /// queue's own inventory and then publish readiness.
+    order: Option<u64>,
+    /// R6: a full snapshot was queued after the warm; the stream must stop
+    /// enqueueing (its deltas would drop the snapshot's order rows).
+    warm_superseded: bool,
+    /// R6: an abandoned stream left stale rows behind; only a full snapshot may
+    /// publish readiness again (the worker turns this into
+    /// `requires_full_rebuild`).
+    needs_full: bool,
 }
 
 impl PendingProjection {
@@ -131,7 +214,7 @@ impl PendingProjection {
             PageDelta::Replace {
                 query_page_order, ..
             } => {
-                *query_page_order = if let Some(position) = self.page_order.get(&key) {
+                let position = if let Some(position) = self.page_order.get(&key) {
                     *position
                 } else {
                     let position = self.next_page_order;
@@ -139,6 +222,7 @@ impl PendingProjection {
                     self.page_order.insert(key.clone(), position);
                     position
                 };
+                *query_page_order = self.warm_stream.is_none().then_some(position);
             }
             PageDelta::Delete { .. } => {
                 self.page_order.remove(&key);
@@ -146,6 +230,37 @@ impl PendingProjection {
         }
         self.deltas.insert(key, (generation, delta));
         self.latest_generation = self.latest_generation.max(generation);
+    }
+
+    /// Seed the queue's page order from a complete inventory (a full snapshot
+    /// or a warm walk), replacing whatever a cache-less session appended.
+    fn seed_page_order<'a>(&mut self, inventory: impl ExactSizeIterator<Item = &'a str>) {
+        self.next_page_order = inventory.len() as u64;
+        self.page_order = inventory
+            .enumerate()
+            .map(|(position, rel_path)| (rel_path.to_owned(), position as u64))
+            .collect();
+    }
+
+    /// The queue's own page inventory in position order: the R6 order turn's
+    /// authority. After a warm seed the map tracks every applied replacement
+    /// and deletion, so it names exactly the pages the projection holds.
+    fn ordered_inventory(&self) -> Vec<[u8; 16]> {
+        let mut ordered = self
+            .page_order
+            .iter()
+            .map(|(rel_path, position)| (*position, page_id(rel_path)))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(position, _)| *position);
+        ordered.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn has_work(&self) -> bool {
+        self.full.is_some()
+            || !self.deltas.is_empty()
+            || self.warm.is_some()
+            || self.order.is_some()
+            || self.needs_full
     }
 }
 
@@ -197,6 +312,14 @@ struct ProjectionShared {
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
+    /// R6: this session has validated the complete page inventory against
+    /// the projection at least once (a full snapshot, or a warm validation's
+    /// `Clean` or closing order turn). Until then a live delta keeps the file
+    /// converging but must not publish readiness: rows of pages this session
+    /// has never compared to disk could be stale from an earlier session.
+    /// In-scope scenario: an external edit between two sessions, followed by
+    /// a save of some other page before the warm runs.
+    validated: AtomicBool,
     #[cfg(test)]
     indexed_reads: AtomicU64,
     /// §5.9's dispatched statements: how many times the lowering ANSWERED a
@@ -226,13 +349,20 @@ impl ProjectionShared {
     /// successful apply: the pages just lowered carry this process's live ids;
     /// the pages just deleted carry nothing.
     fn record_session_pages(&self, applied: &AppliedPages) {
-        if applied.lowered.is_empty() && applied.deleted.is_empty() {
+        if applied.lowered.is_empty()
+            && applied.deleted.is_empty()
+            && applied.relowered_structurally.is_empty()
+        {
             return;
         }
         let mut current = self.session_pages.lock().unwrap();
         let mut next: HashSet<[u8; 16]> = (**current).clone();
         next.extend(applied.lowered.iter().copied());
-        for page in &applied.deleted {
+        for page in applied
+            .deleted
+            .iter()
+            .chain(applied.relowered_structurally.iter())
+        {
             next.remove(page);
         }
         *current = Arc::new(next);
@@ -315,6 +445,7 @@ impl DirectProjection {
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            validated: AtomicBool::new(false),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -352,12 +483,7 @@ impl DirectProjection {
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
-        pending.page_order = pages
-            .iter()
-            .enumerate()
-            .map(|(position, (entry, _))| (entry.rel_path.clone(), position as u64))
-            .collect();
-        pending.next_page_order = pages.len() as u64;
+        pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
         pending.full = Some(PendingFull {
             pages,
             revisions,
@@ -365,7 +491,245 @@ impl DirectProjection {
         });
         pending.deltas.clear();
         pending.latest_generation = generation;
-        self.shared.changed.notify_one();
+        // R6: a complete parsed snapshot owns readiness from here. A warm
+        // validation or stream still in flight must not lower beside it — its
+        // deltas carry no order positions and would erase the snapshot's.
+        if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
+            pending.warm = None;
+            pending.warm_stream = None;
+            pending.order = None;
+            pending.warm_superseded = true;
+            pending.warm_outcome = Some(WarmOutcome::Superseded);
+        }
+        pending.needs_full = false;
+        self.shared.changed.notify_all();
+    }
+
+    /// R6 warm validation: hand the worker the walk inventory with exact
+    /// content revisions and nothing parsed. Refused (`false`) when a newer
+    /// mutation or queued work already outranks this generation — the caller
+    /// then leaves readiness to the parser fallback, exactly as
+    /// `install_built` does on generation drift.
+    pub(crate) fn enqueue_warm(
+        &self,
+        generation: u64,
+        sources: Vec<(PageEntry, String)>,
+        parse_config: Arc<ParseConfig>,
+    ) -> bool {
+        if !self.shared.worker_available.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.has_work()
+            || pending.warm_stream.is_some()
+            || pending.latest_generation > generation
+            || self.shared.worker_failed.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.shared.ready.store(false, Ordering::Release);
+        pending.seed_page_order(sources.iter().map(|(entry, _)| entry.rel_path.as_str()));
+        // Optimistically open the stream now so every delta recorded from here
+        // until the outcome carries no order position; the worker closes it
+        // again in the same turn when the outcome is `Clean`.
+        pending.warm_stream = Some(generation);
+        pending.warm_outcome = None;
+        pending.warm_superseded = false;
+        pending.warm = Some(PendingWarm {
+            generation,
+            sources,
+            parse_config,
+        });
+        pending.latest_generation = generation;
+        self.shared.changed.notify_all();
+        true
+    }
+
+    /// Block until the worker has decided the queued warm validation.
+    pub(crate) fn wait_warm_outcome(&self) -> WarmOutcome {
+        let mut pending = self.shared.pending.lock().unwrap();
+        loop {
+            if let Some(outcome) = pending.warm_outcome.take() {
+                return outcome;
+            }
+            if !self.shared.worker_available.load(Ordering::Acquire) || pending.stop {
+                return WarmOutcome::Failed;
+            }
+            pending = self.shared.changed.wait(pending).unwrap();
+        }
+    }
+
+    /// R6 stream back-pressure: wait until fewer than `WARM_STREAM_HIGH_WATER`
+    /// deltas are queued, so the warm thread never parses further ahead than
+    /// one batch beyond the worker's current turn. `false` when the stream is
+    /// no longer this thread's to feed (superseded, failed, or drifted).
+    pub(crate) fn warm_stream_admit(&self, generation: u64, batch_len: usize) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        loop {
+            if pending.warm_superseded
+                || pending.warm_stream != Some(generation)
+                || pending.latest_generation > generation
+                || pending.stop
+                || !self.shared.worker_available.load(Ordering::Acquire)
+                || self.shared.worker_failed.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            if pending.deltas.len() + batch_len <= WARM_STREAM_HIGH_WATER {
+                return true;
+            }
+            pending = self.shared.changed.wait(pending).unwrap();
+        }
+    }
+
+    /// Queue one parsed batch of the warm stream (R6). Every replacement is a
+    /// fresh parse, so its identity is `Structural`; a page that failed to
+    /// parse is deleted from the projection. `false` means the batch was
+    /// refused: a newer mutation outranks this generation, a full snapshot
+    /// superseded the stream, or the worker failed — the caller abandons.
+    pub(crate) fn enqueue_warm_stream(
+        &self,
+        generation: u64,
+        batch: Vec<WarmStreamItem>,
+        parse_config: Arc<ParseConfig>,
+    ) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.warm_superseded
+            || pending.warm_stream != Some(generation)
+            || pending.latest_generation > generation
+            || self.shared.worker_failed.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        for item in batch {
+            let delta = match item {
+                WarmStreamItem::Replace {
+                    entry,
+                    document,
+                    revision,
+                } => PageDelta::Replace {
+                    entry,
+                    document,
+                    revision,
+                    parse_config: Arc::clone(&parse_config),
+                    query_page_order: None,
+                    identity: DeltaIdentity::Structural,
+                },
+                WarmStreamItem::Delete { entry } => PageDelta::Delete { entry },
+            };
+            pending.record_delta(generation, delta);
+        }
+        #[cfg(test)]
+        MAX_PENDING_DELTAS.fetch_max(pending.deltas.len() as u64, Ordering::Relaxed);
+        self.shared.changed.notify_all();
+        true
+    }
+
+    /// Close the warm stream (R6): the worker reconciles `query_page_order`
+    /// over the queue's inventory and then publishes readiness. `false` when
+    /// the stream is no longer this thread's; a superseding snapshot owns
+    /// readiness in that case and nothing is owed.
+    pub(crate) fn finish_warm_stream(&self, generation: u64) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.warm_superseded {
+            return true;
+        }
+        if pending.warm_stream != Some(generation)
+            || pending.latest_generation > generation
+            || self.shared.worker_failed.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        pending.order = Some(generation);
+        self.shared.changed.notify_all();
+        true
+    }
+
+    /// Abandon an open warm stream (R6: cancellation, drift, or a refused
+    /// batch). Rows already validated or streamed are consistent, but the
+    /// replacements not yet streamed are stale; only a full snapshot may
+    /// publish readiness again. In-scope scenario: a save racing the warm.
+    /// Returns whether a full snapshot superseded the stream — in which case
+    /// that snapshot owns readiness and the caller has nothing to fall back to.
+    pub(crate) fn abandon_warm_stream(&self, generation: u64) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.warm_superseded {
+            return true;
+        }
+        if pending.warm_stream != Some(generation) {
+            return false;
+        }
+        pending.warm_stream = None;
+        pending.order = None;
+        pending.needs_full = true;
+        self.shared.ready.store(false, Ordering::Release);
+        self.shared.changed.notify_all();
+        false
+    }
+
+    /// R6: the projected page inventory as `(name, path, text_kind)` rows,
+    /// read through `drain_after` from the ready projection. `list_pages`
+    /// rebuilds `PageEntry`s from it instead of parsing every file.
+    pub(crate) fn page_inventory(
+        &self,
+        cache_generation: u64,
+    ) -> Option<Vec<(String, String, i64)>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut rows = Vec::new();
+        drain_after(
+            |cursor: Option<([u8; 16], String)>, batch| {
+                read.navigation_pages_after_with_header_validation(
+                    cursor.as_ref().map(|(_, path)| path.as_str()),
+                    cursor.as_ref().map(|(id, _)| id),
+                    batch,
+                    |_, kind| match kind {
+                        0 | 1 => Ok(()),
+                        _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
+                            format!("unknown Direct Files text kind {kind}"),
+                        )),
+                    },
+                )
+            },
+            |row| (row.page_id, row.path.clone()),
+            |row| {
+                rows.push((row.name, row.path, row.text_kind));
+                Ok(())
+            },
+            |error, batch| {
+                matches!(
+                    error,
+                    tine_storage::sqlite::MaterializationError::ResourceLimit { .. }
+                )
+                .then(|| (batch / 2).max(1))
+            },
+        )
+        .ok()?;
+        self.ready_at(cache_generation).then_some(rows)
+    }
+
+    /// R6 identity rule: dropping the parsed cache drops every live-id claim.
+    /// A page's fresh parse carries structural ids, which is what the derived
+    /// public id already is, so "no entry" is the correct mapping afterwards.
+    pub(crate) fn forget_session_identities(&self) {
+        let mut current = self.shared.session_pages.lock().unwrap();
+        if !current.is_empty() {
+            *current = Arc::new(HashSet::new());
+        }
+    }
+
+    /// Bounded wait for readiness at `generation` (R6): the whole-graph derived
+    /// reads that would otherwise fall to a full parse in the milliseconds
+    /// after a save or a warm turn wait for that bounded worker turn first.
+    /// Same ceiling and same non-authority as `wait_for_reference_generation`.
+    pub(crate) fn wait_ready_at(&self, generation: u64) -> bool {
+        self.wait_for_reference_generation(generation)
     }
 
     pub(crate) fn enqueue_replace(
@@ -383,7 +747,8 @@ impl DirectProjection {
                 document,
                 revision,
                 parse_config,
-                query_page_order: 0, // Filled under the queue lock, before coalescing.
+                query_page_order: None, // Filled under the queue lock, before coalescing.
+                identity: DeltaIdentity::Live,
             },
         );
     }
@@ -425,8 +790,8 @@ impl DirectProjection {
             {
                 return false;
             }
-            if pending.full.is_none()
-                && pending.deltas.is_empty()
+            if !pending.has_work()
+                && pending.warm_stream.is_none()
                 && !self.shared.worker_busy.load(Ordering::Acquire)
             {
                 return false;
@@ -1321,6 +1686,39 @@ impl DirectProjection {
             && self.shared.ready_generation.load(Ordering::Acquire) == generation
     }
 
+    /// Test diagnostic: the queue and readiness state in one line, for a
+    /// convergence failure that would otherwise be a bare timeout.
+    #[cfg(test)]
+    pub(crate) fn debug_state_test(&self) -> String {
+        let pending = self.shared.pending.lock().unwrap();
+        format!(
+            "ready={} validated={} ready_generation={} latest_generation={} full={} deltas={} warm={} warm_outcome={:?} warm_stream={:?} order={:?} superseded={} needs_full={} rebuild={} stop={} page_order={} worker_available={} worker_failed={} worker_busy={}",
+            self.shared.ready.load(Ordering::Acquire),
+            self.shared.validated.load(Ordering::Acquire),
+            self.shared.ready_generation.load(Ordering::Acquire),
+            pending.latest_generation,
+            pending.full.is_some(),
+            pending.deltas.len(),
+            pending.warm.is_some(),
+            pending.warm_outcome.as_ref().map(|outcome| match outcome {
+                WarmOutcome::Clean => "Clean".to_owned(),
+                WarmOutcome::Replacements(pages) => format!("Replacements({})", pages.len()),
+                WarmOutcome::Superseded => "Superseded".to_owned(),
+                WarmOutcome::Failed => "Failed".to_owned(),
+            }),
+            pending.warm_stream,
+            pending.order,
+            pending.warm_superseded,
+            pending.needs_full,
+            pending.rebuild,
+            pending.stop,
+            pending.page_order.len(),
+            self.shared.worker_available.load(Ordering::Acquire),
+            self.shared.worker_failed.load(Ordering::Acquire),
+            self.shared.worker_busy.load(Ordering::Acquire),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn indexed_reads(&self) -> u64 {
         self.shared.indexed_reads.load(Ordering::Relaxed)
@@ -1447,9 +1845,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     let _lease = lease;
     let mut requires_full_rebuild = false;
     loop {
-        let (full, deltas, latest_generation, rebuild) = {
+        let turn = {
             let mut pending = shared.pending.lock().unwrap();
-            while pending.full.is_none() && pending.deltas.is_empty() && !pending.stop {
+            while !pending.has_work() && !pending.stop {
                 pending = shared.changed.wait(pending).unwrap();
             }
             if pending.stop {
@@ -1458,18 +1856,62 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 return;
             }
             shared.worker_busy.store(true, Ordering::Release);
+            if std::mem::take(&mut pending.needs_full) {
+                requires_full_rebuild = true;
+            }
             let rebuild = pending.full.is_some() && std::mem::take(&mut pending.rebuild);
-            (
-                pending.full.take(),
-                std::mem::take(&mut pending.deltas),
-                pending.latest_generation,
+            // R6: a full snapshot queued beside a warm validation owns
+            // readiness; the warm is dropped as superseded.
+            let warm = if pending.full.is_some() {
+                if pending.warm.take().is_some() {
+                    pending.warm_stream = None;
+                    pending.warm_superseded = true;
+                    pending.warm_outcome = Some(WarmOutcome::Superseded);
+                }
+                None
+            } else {
+                pending.warm.take()
+            };
+            let order = pending.order.take();
+            let deltas = std::mem::take(&mut pending.deltas);
+            let unordered = deltas.values().any(|(_, delta)| {
+                matches!(
+                    delta,
+                    PageDelta::Replace {
+                        query_page_order: None,
+                        ..
+                    }
+                )
+            });
+            let inventory = (order.is_some() || warm.is_some() || unordered)
+                .then(|| pending.ordered_inventory());
+            WorkerTurn {
+                full: pending.full.take(),
+                warm,
+                deltas,
+                order,
+                inventory,
+                stream_open: pending.warm_stream.is_some(),
+                latest_generation: pending.latest_generation,
                 rebuild,
-            )
+            }
         };
+        let WorkerTurn {
+            full,
+            warm,
+            deltas,
+            order,
+            inventory,
+            stream_open,
+            latest_generation,
+            rebuild,
+        } = turn;
         let had_full = full.is_some();
+        let had_warm = warm.is_some();
+        let stream_closed = order.is_some();
         #[cfg(test)]
         run_before_apply_pending_hook();
-        let applied: Result<AppliedPages, String> = if requires_full_rebuild && !had_full {
+        let applied: Result<AppliedTurn, String> = if requires_full_rebuild && !had_full {
             Err("a prior projection failure requires a complete parser snapshot".into())
         } else {
             (|| {
@@ -1495,7 +1937,41 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     database.reset().map_err(|error| error.to_string())?;
                     writer_slot = Some(database);
                 }
-                apply_pending(writer_slot.as_mut().unwrap(), full, deltas)
+                let mut applied =
+                    apply_pending(writer_slot.as_mut().unwrap(), full, warm.as_ref(), deltas)?;
+                // R6: the stream's closing turn (or a `Clean` warm turn, or a
+                // turn that lowered mid-stream deltas without positions)
+                // reconciles the order table over the queue's inventory. The
+                // queue's map tracks every applied replacement and deletion
+                // since its seed, so it names exactly the projected pages.
+                let warm_clean = matches!(applied.warm_outcome, Some(WarmOutcome::Clean));
+                applied.stream_open = if had_warm {
+                    matches!(applied.warm_outcome, Some(WarmOutcome::Replacements(_)))
+                } else {
+                    stream_open && !stream_closed
+                };
+                if !applied.stream_open
+                    && (stream_closed || warm_clean || applied.unordered_replacements)
+                {
+                    let inventory = inventory.ok_or_else(|| {
+                        "the order turn ran without its queue inventory".to_owned()
+                    })?;
+                    writer_slot
+                        .as_mut()
+                        .unwrap()
+                        .apply_with_source_revisions_aliases_and_page_order(
+                            &PhysicalGraphProjectionChange {
+                                replacements: Vec::new(),
+                                deletions: Vec::new(),
+                                reference_postings: Vec::new(),
+                            },
+                            &[],
+                            &[],
+                            &inventory,
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(applied)
             })()
         };
         let applied = match applied {
@@ -1504,31 +1980,75 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 requires_full_rebuild = true;
                 shared.ready.store(false, Ordering::Release);
                 shared.worker_failed.store(true, Ordering::Release);
+                {
+                    let mut pending = shared.pending.lock().unwrap();
+                    if had_warm {
+                        pending.warm_outcome = Some(WarmOutcome::Failed);
+                    }
+                    if had_warm || stream_closed {
+                        pending.warm_stream = None;
+                        pending.order = None;
+                    }
+                }
                 shared.worker_busy.store(false, Ordering::Release);
                 shared.changed.notify_all();
                 report_projection_failure("is stale; using parser fallback", &error);
                 continue;
             }
         };
-        shared.record_session_pages(&applied);
+        shared.record_session_pages(&applied.pages);
         if had_full {
             requires_full_rebuild = false;
         }
+        if had_full || stream_closed || matches!(applied.warm_outcome, Some(WarmOutcome::Clean)) {
+            shared.validated.store(true, Ordering::Release);
+        }
         shared.worker_failed.store(false, Ordering::Release);
-        let pending = shared.pending.lock().unwrap();
+        let mut pending = shared.pending.lock().unwrap();
         shared.worker_busy.store(false, Ordering::Release);
+        if had_warm {
+            // A `Replacements` outcome keeps the stream open at its generation
+            // and readiness waits for the closing order turn; any other
+            // outcome closes the stream this warm opened.
+            if !applied.stream_open {
+                pending.warm_stream = None;
+            }
+            if pending.warm_outcome.is_none() && !pending.warm_superseded {
+                pending.warm_outcome = applied.warm_outcome.clone();
+            }
+        }
+        if stream_closed {
+            pending.warm_stream = None;
+        }
         if !pending.rebuild
-            && pending.full.is_none()
-            && pending.deltas.is_empty()
+            && !pending.has_work()
+            && pending.warm_stream.is_none()
             && pending.latest_generation == latest_generation
+            && shared.validated.load(Ordering::Acquire)
         {
             shared
                 .ready_generation
                 .store(latest_generation, Ordering::Release);
             shared.ready.store(true, Ordering::Release);
-            shared.changed.notify_all();
         }
+        drop(pending);
+        shared.changed.notify_all();
     }
+}
+
+/// One worker turn's queued work (R6 widened it beyond full + deltas).
+struct WorkerTurn {
+    full: Option<PendingFull>,
+    warm: Option<PendingWarm>,
+    deltas: BTreeMap<String, (u64, PageDelta)>,
+    order: Option<u64>,
+    /// The queue's inventory captured with the deltas, so the order turn
+    /// reconciles exactly the pages this turn leaves projected.
+    inventory: Option<Vec<[u8; 16]>>,
+    /// Whether a warm stream was open when the turn was taken.
+    stream_open: bool,
+    latest_generation: u64,
+    rebuild: bool,
 }
 
 fn open_projection_database(
@@ -1563,14 +2083,83 @@ fn open_projection_database(
 struct AppliedPages {
     lowered: Vec<[u8; 16]>,
     deleted: Vec<[u8; 16]>,
+    /// R6: pages relowered from a fresh parse; they leave the session set.
+    relowered_structurally: Vec<[u8; 16]>,
+}
+
+#[derive(Default)]
+struct AppliedTurn {
+    pages: AppliedPages,
+    /// R6: the warm validation's verdict, when this turn ran one.
+    warm_outcome: Option<WarmOutcome>,
+    /// R6: this turn lowered replacements that carried no order position
+    /// (queued while a stream was open), so the order table must be
+    /// reconciled once the stream is closed.
+    unordered_replacements: bool,
+    stream_open: bool,
+}
+
+/// R6 warm validation inside one worker turn: compare the walk inventory's
+/// exact revisions with `direct_source_revisions`, delete what the walk no
+/// longer has, and name what must be relowered. Nothing here parses.
+fn validate_warm(
+    database: &mut PhysicalGraphProjectionDatabase,
+    warm: &PendingWarm,
+    applied: &mut AppliedPages,
+) -> Result<WarmOutcome, String> {
+    let config_digest = warm.parse_config.digest();
+    let sources = warm
+        .sources
+        .iter()
+        .map(|(entry, revision)| PhysicalGraphProjectionSourceRevision {
+            page_id: page_id(&entry.rel_path),
+            revision: projection_source_revision(revision, config_digest),
+        })
+        .collect::<Vec<_>>();
+    let source_delta = database
+        .source_delta(&sources)
+        .map_err(|error| error.to_string())?;
+    if !source_delta.deletions.is_empty() {
+        applied
+            .deleted
+            .extend(source_delta.deletions.iter().copied());
+        database
+            .apply_with_source_revisions_and_aliases(
+                &PhysicalGraphProjectionChange {
+                    replacements: Vec::new(),
+                    deletions: source_delta.deletions,
+                    reference_postings: Vec::new(),
+                },
+                &[],
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if source_delta.replacements.is_empty() {
+        return Ok(WarmOutcome::Clean);
+    }
+    let needed = source_delta
+        .replacements
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(WarmOutcome::Replacements(
+        warm.sources
+            .iter()
+            .filter(|(entry, _)| needed.contains(&page_id(&entry.rel_path)))
+            .map(|(entry, _)| entry.clone())
+            .collect(),
+    ))
 }
 
 fn apply_pending(
     database: &mut PhysicalGraphProjectionDatabase,
     full: Option<PendingFull>,
+    warm: Option<&PendingWarm>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<AppliedPages, String> {
-    let mut applied = AppliedPages::default();
+) -> Result<AppliedTurn, String> {
+    let mut turn = AppliedTurn::default();
+    let applied = &mut turn.pages;
     if let Some(PendingFull {
         pages,
         revisions,
@@ -1647,6 +2236,9 @@ fn apply_pending(
             )
             .map_err(|error| error.to_string())?;
     }
+    if let Some(warm) = warm {
+        turn.warm_outcome = Some(validate_warm(database, warm, applied)?);
+    }
     if !deltas.is_empty() {
         let mut replacements = Vec::new();
         let mut reference_postings = Vec::new();
@@ -1663,6 +2255,7 @@ fn apply_pending(
                     revision,
                     parse_config,
                     query_page_order,
+                    identity,
                 } => {
                     replacement_sources.push(PhysicalGraphProjectionSourceRevision {
                         page_id: page_id(&entry.rel_path),
@@ -1670,8 +2263,16 @@ fn apply_pending(
                     });
                     let (mut page, mut postings, mut page_aliases) =
                         physical_page(&entry, &document, &parse_config)?;
-                    page.query_page_order = Some(query_page_order);
-                    applied.lowered.push(page.page_id);
+                    page.query_page_order = query_page_order;
+                    if query_page_order.is_none() {
+                        turn.unordered_replacements = true;
+                    }
+                    match identity {
+                        DeltaIdentity::Live => applied.lowered.push(page.page_id),
+                        DeltaIdentity::Structural => {
+                            applied.relowered_structurally.push(page.page_id)
+                        }
+                    }
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
@@ -1695,7 +2296,7 @@ fn apply_pending(
             )
             .map_err(|error| error.to_string())?;
     }
-    Ok(applied)
+    Ok(turn)
 }
 
 /// The revision Direct Files compares to decide whether a page's rows are still
@@ -2119,7 +2720,12 @@ mod tests {
         while !graph.direct_projection_ready_test() {
             assert!(
                 started.elapsed() < Duration::from_secs(15),
-                "Direct Files projection did not converge"
+                "Direct Files projection did not converge: cache_generation={} {}",
+                graph.cache_generation(),
+                graph
+                    .direct_projection_test()
+                    .map(|projection| projection.debug_state_test())
+                    .unwrap_or_else(|| "no projection".to_owned())
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2431,9 +3037,11 @@ mod tests {
         };
         assert_eq!(projection.active_query_jobs_test(), 1);
         assert!(!job.is_cancelled());
+        // R6: the cold open streamed a fresh parse (structural ids), so the
+        // page holds no live-id claim; only a live save adds one.
         assert!(
-            job.session_pages.contains(&page_id("pages/source.md")),
-            "a page lowered by this process carries this process's ids"
+            !job.session_pages.contains(&page_id("pages/source.md")),
+            "a streamed structural lowering claims no live ids"
         );
         let mut rows = 0usize;
         job.snapshot
@@ -2516,16 +3124,15 @@ mod tests {
             graph.warm_cache();
             wait_ready(&graph);
             let projection = graph.direct_projection_test().unwrap();
-            assert_eq!(
-                *projection.session_pages_test(),
-                ids(&graph, &["one", "two"])
-            );
+            // R6: a cold open streams fresh parses (structural ids), so no
+            // page holds a live-id claim yet.
+            assert!(projection.session_pages_test().is_empty());
 
             let two = ids(&graph, &["two"]);
             graph.delete_page("two", PageKind::Page).unwrap();
             wait_ready(&graph);
             let after_delete = projection.session_pages_test();
-            assert_eq!(*after_delete, ids(&graph, &["one"]));
+            assert!(after_delete.is_empty());
             assert!(after_delete.is_disjoint(&two));
 
             let entry = graph
@@ -2551,10 +3158,12 @@ mod tests {
             wait_ready(&graph);
             assert_eq!(lowerings(), 1, "only the externally written page relowers");
             let projection = graph.direct_projection_test().unwrap();
-            assert_eq!(
-                *projection.session_pages_test(),
-                ids(&graph, &["two"]),
-                "a reused row keeps an earlier session's id; only the relowered page is this session's"
+            // R6: the relowering is a warm-stream parse — structural ids, so
+            // the page holds no live-id claim either (the derived id and the
+            // stored id coincide). Only a live save adds a page.
+            assert!(
+                projection.session_pages_test().is_empty(),
+                "a reused row keeps an earlier session's id and a structural relowering claims none"
             );
         }
         let _ = std::fs::remove_dir_all(root);
@@ -3643,7 +4252,8 @@ mod tests {
             document: Arc::new(crate::doc::parse("- text")),
             revision: "exact-revision".into(),
             parse_config: Arc::new(ParseConfig::default()),
-            query_page_order: 0,
+            query_page_order: None,
+            identity: DeltaIdentity::Live,
         };
         let position = |pending: &PendingProjection, name: &str| match &pending.deltas
             [&format!("pages/{name}.md")]
@@ -3651,7 +4261,7 @@ mod tests {
         {
             PageDelta::Replace {
                 query_page_order, ..
-            } => *query_page_order,
+            } => query_page_order.expect("a delta outside a warm stream carries its position"),
             _ => panic!("replacement expected"),
         };
         let mut pending = PendingProjection::default();
@@ -3806,7 +4416,8 @@ mod tests {
                         }),
                         revision: format!("sha256:{rel_path}"),
                         parse_config: Arc::clone(parse_config),
-                        query_page_order: u64::from(rel_path == "beta.md"),
+                        query_page_order: Some(u64::from(rel_path == "beta.md")),
+                        identity: DeltaIdentity::Live,
                     },
                 ),
             )
@@ -3815,7 +4426,7 @@ mod tests {
             queued("alpha.md", &default_config),
             queued("beta.md", &edited_config),
         ]);
-        apply_pending(&mut database, None, deltas).unwrap();
+        apply_pending(&mut database, None, None, deltas).unwrap();
 
         let stamped = |alpha: &Arc<ParseConfig>, beta: &Arc<ParseConfig>| {
             database
@@ -3871,6 +4482,10 @@ mod tests {
         assert!(contract.contains("the worker drains every job before a rebuild touches the file"));
         assert!(contract.contains("Cancellation is\nan answer by the walk, not a failed read"));
         assert!(contract.contains("Result identity follows who lowered the row"));
+        // R6: warm validation and the session-identity ownership rule.
+        assert!(contract.contains("Warm validation from bytes, never from a parsed graph"));
+        assert!(contract.contains("a delta alone never publishes an\ninventory"));
+        assert!(contract.contains("dropping the parsed cache clears the set"));
 
         // The routing rule is asserted inside its own section, not anywhere in
         // the document: a whole-document `contains` passes with the sentence
@@ -4003,6 +4618,449 @@ mod tests {
         );
     }
 
+    // ----- R6: parsed independence (warm reuse, streaming cold init, session
+    // identity). Each test below was RED at 5684c8cb (necessity receipt in
+    // tine-agents/evidence/qe/r6/).
+
+    fn r6_graph(tag: &str) -> PathBuf {
+        let root = scratch(tag);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        std::fs::write(root.join("pages/one.md"), "- TODO one [[target]]\n").unwrap();
+        std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
+        std::fs::write(
+            root.join("pages/target.md"),
+            "- target\n  status:: active\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pages/titled.md"),
+            "title:: Titled Page\n\n- TODO titled\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("journals/2026_09_06.md"), "- TODO today\n").unwrap();
+        root
+    }
+
+    fn entry_signature(entries: &[PageEntry]) -> Vec<(String, String, Option<i64>, String)> {
+        let mut signature = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.rel_path.clone(),
+                    entry.name.clone(),
+                    format!("{:?}", entry.kind),
+                    entry.date_key,
+                )
+            })
+            .map(|(rel_path, name, kind, date_key)| (rel_path, name, date_key, kind))
+            .collect::<Vec<_>>();
+        signature.sort();
+        signature
+    }
+
+    /// **R6 §1.** An unchanged reopen validates the projection from file
+    /// bytes alone: nothing is parsed, nothing is lowered, no parsed cache
+    /// exists, and every startup consumer — the dispatched query, aliases,
+    /// block-ref counts, the property registry, `list_pages` — answers from
+    /// SQL with the cache still absent.
+    #[test]
+    fn warm_reopen_parses_nothing_and_answers_from_sql() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("warm-reopen");
+        let database = scratch("warm-reopen-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        reset_lowerings();
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        assert_eq!(lowerings(), 0, "unchanged pages stay inside SQLite");
+        assert_eq!(
+            graph.page_build_parses_test(),
+            0,
+            "a warm reopen parses nothing"
+        );
+        assert_eq!(graph.warm_stream_parses_test(), 0);
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "readiness must not require the whole-graph parsed cache"
+        );
+
+        let oracle = Graph::open(&root);
+        let statements = graph.direct_projection_statement_reads_test();
+        let fallbacks = graph.direct_projection_fallback_reads_test();
+        let indexed = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert_eq!(
+            signature(&indexed.groups),
+            signature(
+                &crate::query::run_query_bounded(&oracle, "(task TODO)", 100, 1_000_000).groups
+            )
+        );
+        assert_eq!(
+            graph.direct_projection_statement_reads_test(),
+            statements + 1
+        );
+        assert_eq!(graph.direct_projection_fallback_reads_test(), fallbacks);
+
+        assert_eq!(
+            graph.page_aliases_with_owners(),
+            crate::query::page_aliases_with_owners(&oracle)
+        );
+        assert_eq!(
+            *graph.block_ref_counts().unwrap(),
+            *oracle.block_ref_counts().unwrap()
+        );
+        let _ = graph.property_registry();
+        assert_eq!(
+            entry_signature(&graph.list_pages()),
+            entry_signature(&oracle.list_pages())
+        );
+        assert_eq!(graph.page_build_parses_test(), 0);
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "no startup consumer may force the whole-graph parse"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// **R6 §1, cold.** A fresh projection streams its build: every page is
+    /// lowered, no parsed cache is retained, and never more than
+    /// `WARM_STREAM_HIGH_WATER` documents wait in the queue.
+    #[test]
+    fn cold_open_streams_without_retaining_the_graph() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("cold-stream");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        let pages = 3 * WARM_STREAM_HIGH_WATER + 7;
+        for i in 0..pages {
+            std::fs::write(
+                root.join(format!("pages/p{i:03}.md")),
+                format!("- TODO task {i}\n- DONE done {i}\n"),
+            )
+            .unwrap();
+        }
+        let database = scratch("cold-stream-db").join("projection.sqlite");
+        reset_lowerings();
+        MAX_PENDING_DELTAS.store(0, Ordering::Relaxed);
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        assert_eq!(lowerings(), pages as u64);
+        assert_eq!(graph.warm_stream_parses_test(), pages);
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "a cold open must stream, not pin the graph"
+        );
+        assert!(
+            MAX_PENDING_DELTAS.load(Ordering::Relaxed) <= WARM_STREAM_HIGH_WATER as u64,
+            "the stream ran ahead of the worker: {} queued deltas",
+            MAX_PENDING_DELTAS.load(Ordering::Relaxed)
+        );
+        let oracle = Graph::open(&root);
+        assert_eq!(
+            signature(
+                &graph
+                    .run_query_bounded("(task TODO)", 1_000, 8_000_000)
+                    .groups
+            ),
+            signature(
+                &crate::query::run_query_bounded(&oracle, "(task TODO)", 1_000, 8_000_000).groups
+            )
+        );
+        assert!(!graph.has_parsed_cache_test());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// **R6 §1, one external edit between sessions.** Exactly that page is
+    /// parsed and relowered; the parsed cache is never built.
+    #[test]
+    fn an_external_edit_between_sessions_relowers_one_page_without_a_cache() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("external-edit-stream");
+        let database = scratch("external-edit-stream-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("pages/two.md"), "- TODO two changed\n").unwrap();
+
+        reset_lowerings();
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        assert_eq!(lowerings(), 1);
+        assert_eq!(graph.warm_stream_parses_test(), 1);
+        assert_eq!(graph.page_build_parses_test(), 0);
+        assert!(!graph.has_parsed_cache_test());
+        let oracle = Graph::open(&root);
+        let indexed = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert_eq!(
+            signature(&indexed.groups),
+            signature(
+                &crate::query::run_query_bounded(&oracle, "(task TODO)", 100, 1_000_000).groups
+            )
+        );
+        assert!(indexed.groups.iter().any(|group| group
+            .blocks
+            .iter()
+            .any(|block| block.raw.contains("two changed"))));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// **R6 §1, damaged file.** A projection whose schema is damaged is
+    /// recreated and its rebuild streams like a cold open — no parsed cache.
+    #[test]
+    fn a_damaged_projection_streams_its_rebuild() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("damaged-stream");
+        let database = scratch("damaged-stream-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        // Schema damage (a dropped fact table) is the in-scope shape: the open
+        // route recreates the file, so the warm meets an empty projection.
+        let damaged = rusqlite::Connection::open(&database).unwrap();
+        damaged.execute("DROP TABLE block_path_refs", []).unwrap();
+        drop(damaged);
+
+        reset_lowerings();
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        assert_eq!(
+            lowerings(),
+            5,
+            "every page is relowered into the recreated file"
+        );
+        assert_eq!(graph.warm_stream_parses_test(), 5);
+        assert!(!graph.has_parsed_cache_test());
+        let oracle = Graph::open(&root);
+        assert_eq!(
+            signature(
+                &graph
+                    .run_query_bounded("(task TODO)", 100, 1_000_000)
+                    .groups
+            ),
+            signature(
+                &crate::query::run_query_bounded(&oracle, "(task TODO)", 100, 1_000_000).groups
+            )
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// **R6 §3.** A page saved live carries preserved runtime ids into its
+    /// rows and joins the session set. Dropping the parsed cache drops that
+    /// claim: the frontend's next load is a fresh parse with structural ids,
+    /// so the projection must answer with the derived structural id too —
+    /// which it only does once the page has left the set.
+    #[test]
+    fn session_identity_is_dropped_when_the_parsed_page_is_evicted() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("identity-eviction");
+        let database = scratch("identity-eviction-db").join("projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "one")
+            .unwrap();
+        let one = page_id(&entry.rel_path);
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        let kept = page.blocks[0].clone();
+        let mut inserted = kept.clone();
+        inserted.id = Uuid::new_v4().to_string();
+        inserted.raw = "TODO inserted first".into();
+        page.blocks.insert(0, inserted);
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        assert!(projection.session_pages_test().contains(&one));
+        let live = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let live_id = live
+            .groups
+            .iter()
+            .flat_map(|group| group.blocks.iter())
+            .find(|block| block.raw == "TODO one [[target]]")
+            .map(|block| block.id.clone())
+            .expect("the moved block answers");
+        assert_eq!(
+            live_id, kept.id,
+            "a live save answers with the preserved id"
+        );
+
+        graph.invalidate_cache();
+        assert!(
+            !projection.session_pages_test().contains(&one),
+            "dropping the parsed cache must drop the live-id claim"
+        );
+        graph.warm_cache();
+        wait_ready(&graph);
+        let statements = graph.direct_projection_statement_reads_test();
+        let after = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert_eq!(
+            graph.direct_projection_statement_reads_test(),
+            statements + 1
+        );
+        let oracle = Graph::open(&root);
+        assert_eq!(
+            signature(&after.groups),
+            signature(
+                &crate::query::run_query_bounded(&oracle, "(task TODO)", 100, 1_000_000).groups
+            ),
+            "after eviction the projection answers with the fresh parse's structural ids"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// **R6 §3, unit.** A structural relowering removes the page from the
+    /// session set exactly as a deletion does.
+    #[test]
+    fn a_structural_relower_drops_the_session_identity() {
+        let shared = ProjectionShared {
+            path: PathBuf::from("unused"),
+            pending: Mutex::new(PendingProjection::default()),
+            changed: Condvar::new(),
+            ready: AtomicBool::new(false),
+            ready_generation: AtomicU64::new(0),
+            reader: Mutex::new(None),
+            statement_seam: Mutex::new(None),
+            query_jobs: QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY),
+            session_pages: Mutex::new(Arc::new(HashSet::new())),
+            fts_ready_at: AtomicU64::new(0),
+            fts_ever_ready: AtomicBool::new(false),
+            worker_available: AtomicBool::new(true),
+            worker_failed: AtomicBool::new(false),
+            worker_busy: AtomicBool::new(false),
+            validated: AtomicBool::new(false),
+            indexed_reads: AtomicU64::new(0),
+            statement_reads: AtomicU64::new(0),
+            inject_read_failure: AtomicBool::new(false),
+            fallback_reads: AtomicU64::new(0),
+            referenced_name_reads: AtomicU64::new(0),
+            fuzzy_candidate_reads: AtomicU64::new(0),
+        };
+        let a = page_id("pages/a.md");
+        let b = page_id("pages/b.md");
+        shared.record_session_pages(&AppliedPages {
+            lowered: vec![a, b],
+            ..AppliedPages::default()
+        });
+        assert_eq!(
+            **shared.session_pages.lock().unwrap(),
+            HashSet::from([a, b])
+        );
+        shared.record_session_pages(&AppliedPages {
+            relowered_structurally: vec![a],
+            ..AppliedPages::default()
+        });
+        assert_eq!(**shared.session_pages.lock().unwrap(), HashSet::from([b]));
+    }
+
+    /// **R6 §2.** Backlinks on a warm, cache-less graph hydrate exactly the
+    /// projection's candidates from disk and build no whole-graph cache.
+    #[test]
+    fn reference_hydration_without_a_cache_parses_only_candidates() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("hydration");
+        let database = scratch("hydration-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        graph.reset_direct_projection_candidate_probe_test();
+        let backlinks = crate::query::backlinks(&graph, "target");
+        let oracle = Graph::open(&root);
+        assert_eq!(
+            signature(&backlinks),
+            signature(&crate::query::backlinks(&oracle, "target"))
+        );
+        assert_eq!(
+            graph.direct_projection_hydrated_pages_test(),
+            vec![PathBuf::from("pages/one.md")]
+        );
+        assert_eq!(graph.on_demand_parses_test(), 1);
+        assert_eq!(graph.page_build_parses_test(), 0);
+        assert!(!graph.has_parsed_cache_test());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    /// **R6 §2.** `list_pages` is served from the projection inventory when
+    /// it is ready: no parse, no cache, and the same effective entries as the
+    /// cold whole-graph listing — a `title::` page and a journal's sort key
+    /// included.
+    #[test]
+    fn list_pages_is_served_from_the_projection_when_ready() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("list-pages");
+        let database = scratch("list-pages-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        let listed = graph.list_pages();
+        assert_eq!(graph.page_build_parses_test(), 0);
+        assert!(!graph.has_parsed_cache_test());
+        let oracle = Graph::open(&root);
+        assert_eq!(
+            entry_signature(&listed),
+            entry_signature(&oracle.list_pages())
+        );
+        assert!(listed
+            .iter()
+            .any(|entry| entry.name == "Titled Page" && entry.rel_path == "pages/titled.md"));
+        assert!(listed.iter().any(|entry| {
+            entry.kind == PageKind::Journal
+                && entry.date_key == Some(20260906)
+                && entry.rel_path == "journals/2026_09_06.md"
+        }));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
     #[test]
     #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
     fn real_corpus_clean_reopen_reuses_projected_pages() {
@@ -4028,6 +5086,10 @@ mod tests {
         let warm = started.elapsed();
         wait_ready(&graph);
         let converged = started.elapsed();
+        // R6: the warm validated from bytes alone — no page parsed, no cache.
+        let parses = graph.page_build_parses_test() + graph.warm_stream_parses_test();
+        assert_eq!(parses, 0, "clean reopen must not parse any page");
+        assert!(!graph.has_parsed_cache_test());
         let query_started = Instant::now();
         let indexed = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
         let indexed_elapsed = query_started.elapsed();
@@ -4039,12 +5101,14 @@ mod tests {
             "clean reopen must not lower unchanged pages"
         );
         eprintln!(
-            "direct projection clean-reopen receipt: warm_ms={} projection_total_ms={} projection_tail_ms={} indexed_query_us={} pages_lowered={}",
+            "direct projection clean-reopen receipt: warm_ms={} warm_validate_ms={} projection_total_ms={} projection_tail_ms={} indexed_query_us={} pages_lowered={} pages_parsed={}",
+            warm.as_millis(),
             warm.as_millis(),
             converged.as_millis(),
             converged.saturating_sub(warm).as_millis(),
             indexed_elapsed.as_micros(),
             lowerings(),
+            parses,
         );
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }

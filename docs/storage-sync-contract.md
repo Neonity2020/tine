@@ -534,12 +534,31 @@ an answer by the walk, not a failed read: it schedules no recovery.
 
 **Result identity follows who lowered the row.** `query_block_results.result_id`
 is the runtime id the lowering process assigned. The projection tracks
-`session_pages` — exactly the pages THIS process lowered: a full snapshot's
-replacements and each live delta's page, minus deletions — and captures that
-set with the snapshot. A row on a session page answers with its stored id; a
-row reused from an earlier session (a warm reopen lowers none of them) answers
-with the structural runtime id the shared helper reproduces from page path and
-structural order, which is the id the fresh parse assigned it.
+`session_pages` — exactly the pages whose stored ids are LIVE in this process:
+a full snapshot's replacements and each live save's page add to the set; a
+structural relowering (a warm-stream replacement parsed in isolation) and a
+deletion remove the page; dropping the parsed cache clears the set, because
+the ids it held are no longer reachable. The set is captured with each
+snapshot. A row on a session page answers with its stored id; every other row
+(a warm reopen lowers none of them) answers with the structural runtime id the
+shared helper reproduces from page path and structural order, which is the id
+a fresh parse assigns it.
+
+**Warm validation from bytes, never from a parsed graph.** Opening a Direct
+Files graph validates the projection against the walk inventory and each
+page's exact content revision computed from file bytes, parsing nothing. An
+unchanged graph is READY with no parsed cache and nothing retained. A changed,
+missing, damaged or config-mismatched projection names its replacement pages
+and the caller streams them through a bounded high-water queue, parsing each
+page in isolation and retaining none. Live saves and deletions enqueue their
+delta whether or not a parsed cache exists, but readiness is published only
+after this session has validated the complete inventory once (a full
+snapshot, a clean warm, or a closed stream) — a delta alone never publishes an
+inventory this process has not compared to disk. The `query_page_order` table
+is reconciled by the worker from the queue's own page order whenever a stream
+closes or a delta arrives without a position. In-scope scenario: an external
+edit between two sessions, followed by a save of a different page before the
+warm completes.
 
 **One parse config, or a rebuild.** Six graph-config facts decide those derived
 rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,

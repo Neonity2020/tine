@@ -1957,9 +1957,22 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `open_direct` calls are `#[cfg(test)]` and outside `production_rust()`.
     // Removing exactly those 8 entries from the head dump reproduces the R5a
     // digest above, so the other 355 are byte-identical.
+    // Re-pinned 2026-09-07 (query engine R6, warm validation from bytes).
+    // Derived by diffing the dump at `2ad7911d` (352) against the working
+    // head (369) and subtracting the R5a/R5c deltas above (11): R6 adds 7
+    // entries and changes 1, ALL in `direct_projection.rs`, nothing removed
+    // elsewhere — `page_inventory` (the warm-session `list_pages` source: one
+    // more `open_read_only(` and the `reader.lock/is_none/as_ref` receiver
+    // triple every other read in this file uses), `validate_warm` (ONE
+    // `database.source_delta` — the read that names replacements from the
+    // caller's byte revisions — and ONE `database.apply_with_source_revisions_and_aliases`,
+    // applying the warm's DELETIONS through the same writer `apply_pending`
+    // already uses; this is the one write-side addition, and it crosses no new
+    // boundary), and `MaterializationError::Corrupt(` 3 → 4 (the inventory
+    // row decode). No new `tine_storage` symbol is imported.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "3e80bb92d8a04f02f84b53c21049125e4c86b17d755b1c39ecada82743dcc3a6",
+        "d638f6eefe0e0fd892f515dba2bb4a786558bf19b50654964bf6cfd363f796be",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

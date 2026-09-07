@@ -3832,6 +3832,11 @@ struct PageBuildTestState {
     parses: std::sync::atomic::AtomicUsize,
     installs: std::sync::atomic::AtomicUsize,
     censuses: std::sync::atomic::AtomicUsize,
+    /// R6: pages parsed by the warm STREAM (replacements only).
+    warm_stream_parses: std::sync::atomic::AtomicUsize,
+    /// R6: pages parsed on demand for reference/fuzzy hydration without a
+    /// parsed cache.
+    on_demand_parses: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -6177,6 +6182,12 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         {
+            // R6: a projection already READY at this generation was validated
+            // from the same bytes this snapshot was parsed from; a redundant
+            // snapshot would only open a NotReady window while it re-validates.
+            if projection.ready_at(generation) {
+                return;
+            }
             projection.enqueue_full(
                 generation,
                 pages,
@@ -6233,6 +6244,93 @@ impl Graph {
         {
             projection.mark_stale();
         }
+    }
+
+    fn direct_projection_forget_session_identities(&self) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.forget_session_identities();
+        }
+    }
+
+    /// R6: the page inventory from the ready projection, rebuilt into the
+    /// walk's `PageEntry` shape. `pages.name` is the effective (title::-aware)
+    /// name because the producer lowers the effective entry; kind comes from
+    /// the row and a journal's sort key from its name.
+    fn direct_projection_page_inventory(&self, generation: u64) -> Option<Vec<PageEntry>> {
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        if !projection.wait_ready_at(generation) {
+            return None;
+        }
+        let rows = projection.page_inventory(generation)?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for (name, rel_path, kind) in rows {
+            let kind = crate::direct_projection::page_kind_from_sql(kind)?;
+            let date_key = match kind {
+                PageKind::Journal => Some(self.journal_format.parse(&name)?.ordinal_key()),
+                PageKind::Page => None,
+            };
+            entries.push(PageEntry {
+                name,
+                kind,
+                date_key,
+                path: self.root.join(&rel_path),
+                rel_path,
+            });
+        }
+        entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(entries)
+    }
+
+    /// R6: parse exactly the named pages for reference/fuzzy hydration when no
+    /// parsed cache exists. The documents are returned to the caller and
+    /// dropped after use — nothing is installed or retained.
+    fn parse_pages_on_demand(
+        &self,
+        generation: u64,
+        paths: Vec<PathBuf>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let permit = self.admit_retained_managed_text_writer().ok()?;
+        let mut pages = Vec::with_capacity(paths.len());
+        for relative in paths {
+            let absolute = self.root.join(&relative);
+            let entry = self.graph_inventory_entry(&absolute).ok()??;
+            if entry.rel_path != relative.to_string_lossy() {
+                return None;
+            }
+            let (content, _) = self
+                .managed_read_optional_text_with_identity(&permit, &entry.path)
+                .ok()??;
+            #[cfg(test)]
+            self.page_build_test
+                .on_demand_parses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (effective, document, _) =
+                isolate_page_parse(entry, &self.journal_format, |entry| {
+                    Some(parse_page_content(entry, &content))
+                })
+                .ok()??;
+            pages.push((effective, Arc::new(document)));
+        }
+        #[cfg(test)]
+        DIRECT_HYDRATED_PAGES.with(|recorded| {
+            recorded.borrow_mut().extend(
+                pages
+                    .iter()
+                    .map(|(entry, _)| PathBuf::from(&entry.rel_path)),
+            );
+        });
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
     }
 
     fn direct_projection_sparse_task_query(
@@ -6365,6 +6463,9 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
+        if !projection.wait_ready_at(generation) {
+            return None;
+        }
         let result = projection.property_owner_rows(generation)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
@@ -6567,9 +6668,13 @@ impl Graph {
         }
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) else {
-            // Nothing is warm to rebuild FROM; clearing `ready` is all that is
-            // available, and the next warm cache enqueues a full snapshot anyway.
-            self.direct_projection_mark_stale();
+            // R6: a warm session holds no parsed snapshot to rebuild FROM.
+            // Build one now — `install_built` enqueues the full snapshot the
+            // worker's pending `rebuild` waits for — rather than clearing
+            // `ready` and stranding the projection until the next open (M9).
+            // The walk that answers this same failed read would parse the
+            // graph anyway; it finds the cache already built.
+            self.with_pages(|_| ());
             return;
         };
         let revisions = self.disk_revs.read().unwrap().clone();
@@ -6612,10 +6717,15 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)?;
         let paths = projection.fuzzy_candidate_paths(generation, normalized_needle)?;
-        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone);
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             return None;
         }
+        let Some(snapshot) = snapshot else {
+            // R6: no parsed cache — hydrate exactly the candidates from disk.
+            return self
+                .parse_pages_on_demand(generation, paths.into_iter().map(PathBuf::from).collect());
+        };
         let cache_index = self.cache_index.read().unwrap();
         let cache_index = cache_index.as_ref()?;
         let mut pages = Vec::with_capacity(paths.len());
@@ -6640,10 +6750,14 @@ impl Graph {
         generation: u64,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone);
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             return None;
         }
+        let Some(snapshot) = snapshot else {
+            // R6: no parsed cache — hydrate exactly the candidates from disk.
+            return self.parse_pages_on_demand(generation, paths.into_iter().collect());
+        };
         let cache_index = self.cache_index.read().unwrap();
         let cache_index = cache_index.as_ref()?;
         let mut pages = Vec::new();
@@ -6675,6 +6789,9 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
+        if !projection.wait_ready_at(generation) {
+            return None;
+        }
         let aliases = projection.page_aliases_with_owners(generation)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(aliases)
     }
@@ -6735,6 +6852,9 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
+        if !projection.wait_ready_at(generation) {
+            return None;
+        }
         let counts = projection.block_ref_counts(generation)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(counts)
     }
@@ -12440,6 +12560,12 @@ impl Graph {
                 return entries.clone();
             }
         }
+        // R6: a ready projection already holds the effective inventory; the
+        // whole-graph parse below is the not-ready fallback.
+        if let Some(entries) = self.direct_projection_page_inventory(gen) {
+            *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
+            return entries;
+        }
         let entries = match self
             .admit_retained_managed_text_writer()
             .and_then(|permit| {
@@ -14720,7 +14846,9 @@ impl Graph {
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
         if let Some(pages) = self.direct_projection_reference_candidate_pages(names_norm, kind) {
-            let full_page_count = self.with_pages(|all| all.len());
+            // R6: the inventory is the projection's (memoized), never a reason
+            // to build the whole parsed graph.
+            let full_page_count = self.list_pages().len();
             return ReferenceCandidatePages {
                 pages,
                 indexed: true,
@@ -15176,7 +15304,16 @@ impl Graph {
     /// Build graph-open caches while allowing a revoked window binding to stop
     /// between files and derived-map phases. Returns false when cancelled.
     pub fn warm_cache_cancellable(&self, cancelled: impl Fn() -> bool) -> bool {
-        if !self.warm_page_cache_cancellable(&cancelled) || cancelled() {
+        // R6: validate the projection from file bytes first. An unchanged graph
+        // is READY after that with nothing parsed and nothing retained; a
+        // changed or cold one streams only its replacement pages. The full
+        // parse below is the fallback when no projection can own readiness.
+        if !self.warm_projection_cancellable(&cancelled)
+            && (!self.warm_page_cache_cancellable(&cancelled) || cancelled())
+        {
+            return false;
+        }
+        if cancelled() {
             return false;
         }
         // Warm the derived maps the frontend fetches right after `warm-cache-done`
@@ -15189,6 +15326,164 @@ impl Graph {
             return false;
         }
         !cancelled()
+    }
+
+    /// R6 warm validation: publish Direct Files projection readiness from the
+    /// walk inventory and each page's exact content revision, parsing nothing
+    /// unless the worker names replacements. `true` means the projection owns
+    /// readiness at the generation this warm observed (or a full snapshot
+    /// superseded it); `false` means the caller must fall back to the full
+    /// parse — no projection, a lease held elsewhere, a failed worker,
+    /// cancellation, or a mutation that raced the warm (generation drift).
+    fn warm_projection_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
+        if cancelled() {
+            return false;
+        }
+        if self.cache.read().unwrap().is_some() {
+            // The full-snapshot path owns readiness while a parsed cache exists.
+            return false;
+        }
+        let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        else {
+            return false;
+        };
+        let Ok(permit) = self.admit_retained_managed_text_writer() else {
+            return false;
+        };
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let Ok(entries) = self.page_build_entries(&permit) else {
+            return false;
+        };
+        let mut sources = Vec::with_capacity(entries.len());
+        let mut failures = Vec::new();
+        for (i, entry) in entries.into_iter().enumerate() {
+            if cancelled() {
+                return false;
+            }
+            match self.managed_read_optional_text_with_identity(&permit, &entry.path) {
+                Ok(Some((content, _))) => {
+                    let revision = content_rev(&content);
+                    sources.push((entry, revision));
+                }
+                _ => failures.push(entry.rel_path),
+            }
+            if i % 24 == 23 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return false;
+        }
+        let parse_config = Arc::new(self.config.parse_config());
+        if !projection.enqueue_warm(generation, sources, Arc::clone(&parse_config)) {
+            return false;
+        }
+        match projection.wait_warm_outcome() {
+            crate::direct_projection::WarmOutcome::Clean => {
+                self.publish_page_index_failures(generation, failures);
+                true
+            }
+            crate::direct_projection::WarmOutcome::Superseded => true,
+            crate::direct_projection::WarmOutcome::Failed => false,
+            crate::direct_projection::WarmOutcome::Replacements(pages) => self
+                .stream_warm_replacements(
+                    &projection,
+                    &permit,
+                    generation,
+                    pages,
+                    parse_config,
+                    failures,
+                    cancelled,
+                ),
+        }
+    }
+
+    /// R6 warm stream: parse ONLY the pages the worker named, in bounded
+    /// batches, retaining nothing beyond the batch in flight. Every batch is
+    /// admitted against the queue's high-water mark, so a cold open never pins
+    /// the parsed graph. Any refusal (drift, supersession, worker failure,
+    /// cancellation) abandons the stream; a superseding full snapshot owns
+    /// readiness instead and nothing is owed.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_warm_replacements(
+        &self,
+        projection: &crate::direct_projection::DirectProjection,
+        permit: &ManagedTextWritePermit,
+        generation: u64,
+        pages: Vec<PageEntry>,
+        parse_config: Arc<crate::config::ParseConfig>,
+        mut failures: Vec<String>,
+        cancelled: &impl Fn() -> bool,
+    ) -> bool {
+        use crate::direct_projection::WarmStreamItem;
+        const BATCH: usize = 16;
+        let total = pages.len();
+        let mut batch = Vec::with_capacity(BATCH.min(total));
+        for (i, entry) in pages.into_iter().enumerate() {
+            if cancelled() {
+                return projection.abandon_warm_stream(generation);
+            }
+            let fallback = entry.clone();
+            let item = match self.managed_read_optional_text_with_identity(permit, &entry.path) {
+                Ok(Some((content, _))) => {
+                    #[cfg(test)]
+                    self.page_build_test
+                        .warm_stream_parses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match isolate_page_parse(entry, &self.journal_format, |entry| {
+                        Some(parse_page_content(entry, &content))
+                    }) {
+                        Ok(Some((effective, document, revision))) => WarmStreamItem::Replace {
+                            entry: effective,
+                            document: Arc::new(document),
+                            revision,
+                        },
+                        Ok(None) | Err(_) => {
+                            failures.push(fallback.rel_path.clone());
+                            WarmStreamItem::Delete { entry: fallback }
+                        }
+                    }
+                }
+                _ => {
+                    failures.push(fallback.rel_path.clone());
+                    WarmStreamItem::Delete { entry: fallback }
+                }
+            };
+            batch.push(item);
+            if batch.len() == BATCH || i + 1 == total {
+                if !projection.warm_stream_admit(generation, batch.len())
+                    || self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation
+                    || !projection.enqueue_warm_stream(
+                        generation,
+                        std::mem::take(&mut batch),
+                        Arc::clone(&parse_config),
+                    )
+                {
+                    return projection.abandon_warm_stream(generation);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation
+            || !projection.finish_warm_stream(generation)
+        {
+            return projection.abandon_warm_stream(generation);
+        }
+        self.publish_page_index_failures(generation, failures);
+        true
+    }
+
+    fn publish_page_index_failures(&self, generation: u64, mut failures: Vec<String>) {
+        failures.sort();
+        failures.dedup();
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
+            *self.page_index_failures.write().unwrap() = failures;
+        }
     }
 
     fn warm_page_cache_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
@@ -15296,8 +15591,38 @@ impl Graph {
         self.invalidate_cache_after_tine_mutation();
     }
 
+    #[cfg(test)]
+    pub(crate) fn page_build_parses_test(&self) -> usize {
+        self.page_build_test
+            .parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warm_stream_parses_test(&self) -> usize {
+        self.page_build_test
+            .warm_stream_parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_demand_parses_test(&self) -> usize {
+        self.page_build_test
+            .on_demand_parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_parsed_cache_test(&self) -> bool {
+        self.cache.read().unwrap().is_some()
+    }
+
     fn invalidate_cache_after_tine_mutation(&self) {
         self.direct_projection_mark_stale();
+        // R6 identity rule: the parsed documents whose live ids the session set
+        // vouched for are gone; their fresh parses carry structural ids, which
+        // the derived public id already is.
+        self.direct_projection_forget_session_identities();
         let mut guard = self.cache.write().unwrap();
         *guard = None;
         self.page_index_failures.write().unwrap().clear();
@@ -15511,16 +15836,12 @@ impl Graph {
             newgen,
             scoped,
         );
-        if cache_built {
-            self.direct_projection_enqueue_replace(
-                newgen,
-                evict_entry,
-                evict_doc,
-                projection_revision,
-            );
-        } else {
-            self.direct_projection_mark_stale();
-        }
+        // R6: the projection receives the delta whether or not a parsed cache
+        // exists. A warm session has no cache at all, so gating the delta on
+        // it would leave every save unprojected until some whole-graph
+        // consumer happened to build one. Readiness still needs this
+        // session's inventory validated first (the projection's own rule).
+        self.direct_projection_enqueue_replace(newgen, evict_entry, evict_doc, projection_revision);
     }
 
     /// See `cache_upsert`. When `scoped`, evict only derived entries the edited
@@ -15729,13 +16050,41 @@ impl Graph {
     }
 
     /// Drop one page from the cache after deleting its file.
-    fn cache_remove(&self, name: &str, kind: PageKind) {
+    /// `known` is the exact entry the caller just removed from disk, so the
+    /// projection delete can be named in a session that holds no parsed cache
+    /// (R6). Without it and without a cache, the current page-list memo is the
+    /// remaining inventory; failing both, the projection is only marked stale.
+    fn cache_remove(&self, name: &str, kind: PageKind, known: Option<PageEntry>) {
         // A page delete is a page-set change (affects namespaces, exists-by-ref,
         // every backlink/query) — drop the whole derived cache.
         *self.derived_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
         let mut removed_entries = Vec::new();
+        let cache_built = guard.is_some();
+        if !cache_built {
+            match known {
+                Some(entry) => removed_entries.push(entry),
+                None => {
+                    let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                    if let Some((memo_generation, entries)) =
+                        self.page_list_cache.read().unwrap().as_ref()
+                    {
+                        if *memo_generation == generation {
+                            removed_entries.extend(
+                                entries
+                                    .iter()
+                                    .filter(|entry| {
+                                        entry.kind == kind
+                                            && crate::refs::same_page(&entry.name, name)
+                                    })
+                                    .cloned(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
             removed_entries.extend(
@@ -15794,6 +16143,11 @@ impl Graph {
         }
         if !page_list_advanced && self.page_index_failures.read().unwrap().is_empty() {
             self.publish_warm_page_inventory(newgen);
+        }
+        if removed_entries.is_empty() && !cache_built {
+            // The deleted file could not be named; the next warm validation or
+            // full snapshot re-derives the inventory.
+            self.direct_projection_mark_stale();
         }
         for entry in removed_entries {
             self.direct_projection_enqueue_delete(newgen, entry);
@@ -17115,7 +17469,8 @@ impl Graph {
             ));
         }
         self.validate_page_mutation_target(&write, &entries, name, kind, expected_path)?;
-        if let Some(entry) = matching.into_iter().next() {
+        let removed = matching.into_iter().next();
+        if let Some(entry) = &removed {
             let lock = self.page_lock(&entry.path);
             let _guard = lock.lock().unwrap();
             let trash = typed_trash_dir(
@@ -17133,7 +17488,7 @@ impl Graph {
             let dest = trash.join(format!("{}__{fname}", trash_stamp()));
             self.managed_move_to_trash(&write, &entry.path, &dest, &trash)?;
         }
-        self.cache_remove(name, kind);
+        self.cache_remove(name, kind, removed);
         Ok(())
     }
 
@@ -18520,7 +18875,11 @@ impl Graph {
                             "legacy highlight page changed during migration cleanup",
                         ));
                     }
-                    self.cache_remove(&crate::pdf::hls_page_name(&legacy_key), PageKind::Page);
+                    self.cache_remove(
+                        &crate::pdf::hls_page_name(&legacy_key),
+                        PageKind::Page,
+                        None,
+                    );
                 }
             }
         }

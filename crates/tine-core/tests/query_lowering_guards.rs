@@ -186,10 +186,12 @@ fn hand_written_cursor_drains_are_pinned() {
     // DELEGATE to `drain_after` — which is what this guard is for — so the pin
     // moves; it would be a violation only if the new consumer owned its own
     // `loop {}`, which the per-symbol assertions above still forbid.
+    // 12 → 13: R6's `page_inventory` (the warm-session `list_pages` source)
+    // drains the page map through `drain_after` like the twelve before it.
     assert_eq!(
         direct.matches("drain_after(").count(),
-        12,
-        "I-12: the twelve owned Direct cursor consumers must each delegate to drain_after"
+        13,
+        "I-12: the thirteen owned Direct cursor consumers must each delegate to drain_after"
     );
 
     for allowed in NON_OWNED_DRAINS {
@@ -288,6 +290,11 @@ fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static s
         }
         (DIRECT, "property_owner_rows", "property_facet_rows_after") => {
             ("other-question", "Direct registry snapshot property rows")
+        }
+        // R6: `list_pages` in a warm session (no parsed cache) is served from
+        // the ready projection's page inventory instead of a whole-graph parse.
+        (DIRECT, "page_inventory", "navigation_pages_after_with_header_validation") => {
+            ("other-question", "Direct page inventory for list_pages")
         }
         // R5c (`e61e03d5`) moved the two registry reads out of
         // `application_property_registry_ready` into the shared builder both
@@ -434,6 +441,12 @@ fn expected_census() -> BTreeSet<CensusRecord> {
             DIRECT,
             "property_owner_rows",
             "Direct registry snapshot property rows",
+        ),
+        (
+            "navigation_pages_after_with_header_validation",
+            DIRECT,
+            "page_inventory",
+            "Direct page inventory for list_pages",
         ),
         (
             "property_facet_rows_after",
