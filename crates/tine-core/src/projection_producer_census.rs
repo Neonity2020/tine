@@ -1981,9 +1981,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // already uses; this is the one write-side addition, and it crosses no new
     // boundary), and `MaterializationError::Corrupt(` 3 → 4 (the inventory
     // row decode). No new `tine_storage` symbol is imported.
+    // Re-pinned 2026-09-07 (rebaselining R1b/1). Reviewed the production
+    // checkpoint_generation.rs diff: the existing sealed row writer is shared
+    // with the inert cutoff builder; empty roots and point membership readers
+    // qualify each delta. Imports move with that extraction. No physical write
+    // boundary changes: the independently pinned table above still matches.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "d638f6eefe0e0fd892f515dba2bb4a786558bf19b50654964bf6cfd363f796be",
+        "000b7495d67c7d0da1a9ac7cbcb8b0b3342aa6496562911b6e520567141af529",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

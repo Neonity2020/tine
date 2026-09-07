@@ -2031,9 +2031,19 @@ canonical authenticated-map priority/node algorithm has one owner,
 SQLite. The same module owns the one current sealed batch/status/sequence/causal
 encoding and its bounded cross-checking reader; its caller-provided Tine
 evidence decoder validates the one current accepted-evidence encoding without
-reversing the crate dependency. The R1a adapter has no filesystem/publication
-capability, so a live checkpoint-generation marker remains impossible until a
-later cut deliberately changes that tested boundary. The physical layer has
+reversing the crate dependency. The **R1b accepted-cutoff builder** streams engine
+accepted rows through the same row writer as A5, starting at a sequence-zero
+frontier or continuing a previously built cutoff. It checks contiguous evidence,
+exact predecessor/target frontiers, unique batch membership, the resulting
+causal batch-map root and the new status/sequence/causal point proof. Continuation
+reads persistent index paths and the new row, not the covered status/sequence
+inventory. Failed appends leave predecessor roots unchanged; unreachable
+construction nodes do not confer authority. This is an inert, in-process staging
+surface with no new on-disk format, serialized cutoff token, cache-payload
+adoption or live scheduler/cutover caller. The engine's capture reads the existing
+accepted-row seam without encoding documents. This is not yet a complete durable
+generation: capsules, retention facts, independent disk qualification and the COW
+actor epoch remain prerequisites to enabling cutover. The physical layer has
 one current SQLite schema for both the live disposable projection and a
 separately built checkpoint candidate, plus a read-only injected sealed-history
 reader. It has no prior-schema enum, reader, compatibility fixture, or

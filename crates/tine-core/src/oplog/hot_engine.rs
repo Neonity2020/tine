@@ -7306,6 +7306,111 @@ impl ShardedHotEngine {
         Ok(batch_ids.len())
     }
 
+    fn clean_checkpoint_accepted_row(
+        &self,
+        sequence: u64,
+    ) -> Result<CleanCheckpointAcceptedRow, EngineError> {
+        let batch_id = self
+            .accepted_sequence
+            .get(&sequence)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean checkpoint accepted sequence {sequence} is absent"
+                ))
+            })?;
+        let (no_op, evidence) = match self.statuses.get(&batch_id) {
+            Some(ArchiveStatus::Accepted { no_op, evidence }) => (*no_op, evidence.clone()),
+            _ => {
+                return Err(EngineError::Archive(format!(
+                    "clean checkpoint batch {batch_id} has no accepted evidence"
+                )))
+            }
+        };
+        let causal_dot = self
+            .clean_checkpoint_causal_dots
+            .get(&batch_id)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean checkpoint batch {batch_id} has no causal dot"
+                ))
+            })?;
+        let canonical_causal_clock = self
+            .ephemeral_causal_clocks
+            .get(&batch_id)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "clean checkpoint batch {batch_id} has no causal clock"
+                ))
+            })?;
+        Ok(CleanCheckpointAcceptedRow {
+            no_op,
+            evidence,
+            causal_dot,
+            canonical_causal_clock,
+        })
+    }
+
+    /// Build only accepted-history index facts for an inert R1b candidate.
+    /// This is a staging operation, not the bounded actor snapshot epoch required
+    /// before live cutover. It streams one accepted row at a time and never asks
+    /// the disposable checkpoint to serialize documents or provide authority.
+    pub(crate) fn build_sealed_accepted_cutoff<Store>(
+        &self,
+        store: &mut Store,
+        predecessor: Option<&super::checkpoint_generation::SealedAcceptedCutoff>,
+    ) -> Result<super::checkpoint_generation::SealedAcceptedCutoff, EngineError>
+    where
+        Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore,
+    {
+        use super::checkpoint_generation::SealedAcceptedCutoff;
+        let base_sequence = predecessor.map_or(0, |cutoff| cutoff.frontier().acceptance_sequence());
+        if let Some(reason) = self.clean_checkpoint_capture_skip_reason(base_sequence) {
+            return Err(EngineError::Archive(
+                clean_checkpoint_capture_skip_detail(reason).into(),
+            ));
+        }
+        let base_frontier = if base_sequence != 0 {
+            self.clean_checkpoint_accepted_row(base_sequence)?
+                .evidence
+                .post_frontier_root()
+                .clone()
+        } else if self.next_acceptance_sequence != 0 {
+            self.clean_checkpoint_accepted_row(1)?
+                .evidence
+                .prior_frontier_root()
+                .clone()
+        } else {
+            self.accepted_frontier_root.clone()
+        };
+        let bootstrap;
+        let predecessor = match predecessor {
+            Some(cutoff) if cutoff.frontier() == &base_frontier => cutoff,
+            Some(_) => {
+                return Err(EngineError::Archive(
+                    "sealed cutoff predecessor is not this engine's accepted prefix".into(),
+                ))
+            }
+            None => {
+                bootstrap =
+                    SealedAcceptedCutoff::empty(base_frontier).map_err(EngineError::Archive)?;
+                &bootstrap
+            }
+        };
+        let mut builder = predecessor.builder(store);
+        for sequence in (base_sequence..self.next_acceptance_sequence).map(|sequence| sequence + 1)
+        {
+            builder
+                .append(&self.clean_checkpoint_accepted_row(sequence)?)
+                .map_err(EngineError::Archive)?;
+        }
+        builder
+            .finish(&self.accepted_frontier_root)
+            .map_err(EngineError::Archive)
+    }
+
     /// Capture the exact semantic clean-runtime state at the current accepted
     /// frontier. Serialization happens here, on the owning actor, so the
     /// background publisher never observes concurrently mutating engine data.
@@ -7326,47 +7431,7 @@ impl ShardedHotEngine {
         let mut accepted_rows = Vec::with_capacity(usize::try_from(delta_len).unwrap_or(0));
         let mut required_objects = BTreeSet::new();
         for sequence in durable_sequence.saturating_add(1)..=self.next_acceptance_sequence {
-            let batch_id = self
-                .accepted_sequence
-                .get(&sequence)
-                .copied()
-                .ok_or_else(|| {
-                    EngineError::Archive(format!(
-                        "clean checkpoint accepted sequence {sequence} is absent"
-                    ))
-                })?;
-            let (no_op, evidence) = match self.statuses.get(&batch_id) {
-                Some(ArchiveStatus::Accepted { no_op, evidence }) => (*no_op, evidence.clone()),
-                _ => {
-                    return Err(EngineError::Archive(format!(
-                        "clean checkpoint batch {batch_id} has no accepted evidence"
-                    )))
-                }
-            };
-            let causal_dot = self
-                .clean_checkpoint_causal_dots
-                .get(&batch_id)
-                .copied()
-                .ok_or_else(|| {
-                    EngineError::Archive(format!(
-                        "clean checkpoint batch {batch_id} has no causal dot"
-                    ))
-                })?;
-            let canonical_causal_clock = self
-                .ephemeral_causal_clocks
-                .get(&batch_id)
-                .cloned()
-                .ok_or_else(|| {
-                    EngineError::Archive(format!(
-                        "clean checkpoint batch {batch_id} has no causal clock"
-                    ))
-                })?;
-            accepted_rows.push(CleanCheckpointAcceptedRow {
-                no_op,
-                evidence,
-                causal_dot,
-                canonical_causal_clock,
-            });
+            accepted_rows.push(self.clean_checkpoint_accepted_row(sequence)?);
             required_objects.extend(
                 self.clean_checkpoint_required_objects_by_sequence
                     .get(&sequence)

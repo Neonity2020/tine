@@ -13,8 +13,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use super::hot_engine::{
-    AcceptedBatchEvidence, CleanCheckpointAcceptedRow, CleanCheckpointCapture,
-    ACCEPTED_EVIDENCE_SCHEMA_VERSION,
+    AcceptedBatchEvidence, AcceptedFrontierRoot, CleanCheckpointAcceptedRow,
+    CleanCheckpointCapture, ACCEPTED_EVIDENCE_SCHEMA_VERSION,
 };
 use super::object_store::ObjectStore;
 use super::{BatchCausalDot, BatchId, CausalPeerId, ContentDigest, DeviceId};
@@ -356,15 +356,219 @@ fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> R
     Ok(value)
 }
 
+/// An in-process accepted-history cutoff built from engine evidence. It is not
+/// a durable generation, a portable frontier, or a decoded checkpoint payload.
+/// The unchanged run-local frontier is only a qualification witness for this
+/// construction; a later generation format must bind the canonical facts.
+#[derive(Clone, Debug)]
+pub(crate) struct SealedAcceptedCutoff {
+    frontier: AcceptedFrontierRoot,
+    roots: tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2,
+}
+
+impl SealedAcceptedCutoff {
+    pub(crate) fn empty(frontier: AcceptedFrontierRoot) -> Result<Self, String> {
+        use tine_storage::sealed_accepted_index::{
+            AcceptedSequenceRootV2, AuthenticatedMapRootV1, SealedAcceptedIndexRootsV2,
+        };
+        frontier
+            .encode_canonical()
+            .map_err(|error| error.to_string())?;
+        let empty = AuthenticatedMapRootV1::empty();
+        if frontier.acceptance_sequence() != 0
+            || frontier.batch_map_root_key().is_some()
+            || frontier.batch_map_root_digest() != empty.root_digest()
+        {
+            return Err("sealed cutoff bootstrap requires a sequence-zero frontier".into());
+        }
+        Ok(Self {
+            frontier,
+            roots: SealedAcceptedIndexRootsV2 {
+                batch_map: empty,
+                status_map: empty,
+                sequence: AcceptedSequenceRootV2::empty(),
+            },
+        })
+    }
+
+    pub(crate) fn frontier(&self) -> &AcceptedFrontierRoot {
+        &self.frontier
+    }
+
+    pub(crate) fn roots(&self) -> tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2 {
+        self.roots
+    }
+
+    pub(crate) fn builder<'a, Store>(
+        &self,
+        store: &'a mut Store,
+    ) -> AcceptedCutoffBuilder<'a, Store>
+    where
+        Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore,
+    {
+        AcceptedCutoffBuilder {
+            store,
+            cutoff: self.clone(),
+        }
+    }
+}
+
+pub(crate) struct AcceptedCutoffBuilder<'a, Store> {
+    store: &'a mut Store,
+    cutoff: SealedAcceptedCutoff,
+}
+
+impl<Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore>
+    AcceptedCutoffBuilder<'_, Store>
+{
+    pub(crate) fn append(&mut self, row: &CleanCheckpointAcceptedRow) -> Result<(), String> {
+        use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
+        if row.evidence.prior_frontier_root() != &self.cutoff.frontier {
+            return Err("sealed cutoff row does not extend its exact predecessor".into());
+        }
+        let batch_id = row.evidence.batch_id().as_uuid().into_bytes();
+        if SealedAcceptedIndexReader::new(&*self.store)
+            .map_value(self.cutoff.roots.batch_map, batch_id)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("sealed cutoff repeats an accepted batch".into());
+        }
+        // Publish immutable nodes first, but do not move any candidate roots
+        // until every check passes. An interrupted/erroring append can leave
+        // unreachable construction objects; predecessor roots still resolve.
+        let roots = append_accepted_row(self.store, self.cutoff.roots, row)?;
+        let frontier = row.evidence.post_frontier_root();
+        if roots.batch_map.root.map(|link| link.key) != frontier.batch_map_root_key()
+            || roots.batch_map.root_digest() != frontier.batch_map_root_digest()
+            || roots.sequence.len != frontier.acceptance_sequence()
+        {
+            return Err("sealed cutoff causal membership differs from engine evidence".into());
+        }
+        let proof = SealedAcceptedIndexReader::new(&*self.store)
+            .prove_membership(
+                roots,
+                row.evidence.acceptance_sequence(),
+                batch_id,
+                &TineAcceptedEvidenceDecoder,
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or("sealed cutoff membership is missing after publication")?;
+        if proof.status.no_op != row.no_op
+            || proof.status.exact_evidence_bytes
+                != row
+                    .evidence
+                    .encode_canonical()
+                    .map_err(|error| error.to_string())?
+        {
+            return Err("sealed cutoff status differs from engine acceptance".into());
+        }
+        self.cutoff = SealedAcceptedCutoff {
+            frontier: frontier.clone(),
+            roots,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        self,
+        expected: &AcceptedFrontierRoot,
+    ) -> Result<SealedAcceptedCutoff, String> {
+        if &self.cutoff.frontier != expected {
+            return Err("sealed cutoff does not reach the requested engine frontier".into());
+        }
+        Ok(self.cutoff)
+    }
+}
+
+/// One conversion from engine acceptance evidence to the shared sealed formats.
+/// Both the disposable checkpoint and inert generation builder call this writer.
+fn append_accepted_row<
+    Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore,
+>(
+    store: &mut Store,
+    roots: tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2,
+    row: &CleanCheckpointAcceptedRow,
+) -> Result<tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2, String> {
+    use tine_storage::sealed_accepted_index::{
+        AcceptedSequenceEntryV2, AcceptedStatusRecordV2, SealedAcceptedCausalClockEntryV2,
+        SealedAcceptedCausalRecordV2, SealedAcceptedIndexRootsV2, SealedAcceptedIndexWriter,
+    };
+    roots.validate_counts().map_err(|error| error.to_string())?;
+    if roots.sequence.len.checked_add(1) != Some(row.evidence.acceptance_sequence()) {
+        return Err("sealed accepted delta sequence is not contiguous".into());
+    }
+    let mut batch_map = roots.batch_map;
+    let mut status_map = roots.status_map;
+    let mut sequence_root = roots.sequence;
+    let batch_id = row.evidence.batch_id().as_uuid().into_bytes();
+    let causal = SealedAcceptedCausalRecordV2 {
+        batch_id,
+        manifest_fingerprint: row.evidence.manifest_fingerprint(),
+        event_binding_digest: row.evidence.event_binding_digest(),
+        causal_peer_id: row
+            .causal_dot
+            .peer_id()
+            .as_device_id()
+            .as_uuid()
+            .into_bytes(),
+        causal_counter: row.causal_dot.counter(),
+        canonical_causal_clock: row
+            .canonical_causal_clock
+            .iter()
+            .map(|(peer, counter)| SealedAcceptedCausalClockEntryV2 {
+                peer_id: peer.as_device_id().as_uuid().into_bytes(),
+                counter: *counter,
+            })
+            .collect(),
+    };
+    let mut writer = SealedAcceptedIndexWriter::new(store);
+    let causal_address = writer
+        .publish_causal(&causal)
+        .map_err(|error| error.to_string())?;
+    let status = AcceptedStatusRecordV2 {
+        batch_id,
+        no_op: row.no_op,
+        evidence_schema: ACCEPTED_EVIDENCE_SCHEMA_VERSION,
+        exact_evidence_bytes: row
+            .evidence
+            .encode_canonical()
+            .map_err(|error| error.to_string())?,
+        accepted_causal_record_digest: causal_address,
+    };
+    let status_address = writer
+        .publish_status(&status)
+        .map_err(|error| error.to_string())?;
+    batch_map = writer
+        .upsert_map(batch_map, batch_id, causal_address)
+        .map_err(|error| error.to_string())?;
+    status_map = writer
+        .upsert_map(status_map, batch_id, status_address)
+        .map_err(|error| error.to_string())?;
+    sequence_root = writer
+        .append_sequence(
+            sequence_root,
+            AcceptedSequenceEntryV2 {
+                sequence: row.evidence.acceptance_sequence(),
+                batch_id,
+                accepted_status_value_digest: status_address,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let roots = SealedAcceptedIndexRootsV2 {
+        batch_map,
+        status_map,
+        sequence: sequence_root,
+    };
+    roots.validate_counts().map_err(|error| error.to_string())?;
+    Ok(roots)
+}
+
 fn build_payload(
     capture: CleanCheckpointCapture,
     predecessor: Option<(u64, CheckpointPayloadV1)>,
 ) -> Result<(u64, Vec<u8>), String> {
-    use tine_storage::sealed_accepted_index::{
-        AcceptedSequenceEntryV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
-        AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
-        SealedAcceptedIndexWriter,
-    };
+    use tine_storage::sealed_accepted_index::{AcceptedSequenceRootV2, AuthenticatedMapRootV1};
 
     let (mut store, mut batch_map, mut status_map, mut sequence_root, mut required_objects) =
         match predecessor {
@@ -409,63 +613,18 @@ fn build_payload(
         if row.evidence.acceptance_sequence() <= sequence_root.len {
             continue;
         }
-        if row.evidence.acceptance_sequence() != sequence_root.len.saturating_add(1) {
-            return Err("clean checkpoint delta sequence is not contiguous".into());
-        }
-        let batch_id = row.evidence.batch_id().as_uuid().into_bytes();
-        let causal = SealedAcceptedCausalRecordV2 {
-            batch_id,
-            manifest_fingerprint: row.evidence.manifest_fingerprint(),
-            event_binding_digest: row.evidence.event_binding_digest(),
-            causal_peer_id: row
-                .causal_dot
-                .peer_id()
-                .as_device_id()
-                .as_uuid()
-                .into_bytes(),
-            causal_counter: row.causal_dot.counter(),
-            canonical_causal_clock: row
-                .canonical_causal_clock
-                .iter()
-                .map(|(peer, counter)| SealedAcceptedCausalClockEntryV2 {
-                    peer_id: peer.as_device_id().as_uuid().into_bytes(),
-                    counter: *counter,
-                })
-                .collect(),
-        };
-        let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-        let causal_address = writer
-            .publish_causal(&causal)
-            .map_err(|error| error.to_string())?;
-        let status = AcceptedStatusRecordV2 {
-            batch_id,
-            no_op: row.no_op,
-            evidence_schema: ACCEPTED_EVIDENCE_SCHEMA_VERSION,
-            exact_evidence_bytes: row
-                .evidence
-                .encode_canonical()
-                .map_err(|error| error.to_string())?,
-            accepted_causal_record_digest: causal_address,
-        };
-        let status_address = writer
-            .publish_status(&status)
-            .map_err(|error| error.to_string())?;
-        batch_map = writer
-            .upsert_map(batch_map, batch_id, causal_address)
-            .map_err(|error| error.to_string())?;
-        status_map = writer
-            .upsert_map(status_map, batch_id, status_address)
-            .map_err(|error| error.to_string())?;
-        sequence_root = writer
-            .append_sequence(
-                sequence_root,
-                AcceptedSequenceEntryV2 {
-                    sequence: row.evidence.acceptance_sequence(),
-                    batch_id,
-                    accepted_status_value_digest: status_address,
-                },
-            )
-            .map_err(|error| error.to_string())?;
+        let roots = append_accepted_row(
+            &mut store,
+            tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2 {
+                batch_map,
+                status_map,
+                sequence: sequence_root,
+            },
+            row,
+        )?;
+        batch_map = roots.batch_map;
+        status_map = roots.status_map;
+        sequence_root = roots.sequence;
     }
     let sequence = capture.target_sequence;
     if sequence_root.len != sequence {
@@ -1076,6 +1235,7 @@ mod tests {
     #[derive(Default)]
     struct SealedMemoryStore {
         objects: Vec<(SealedAcceptedObjectKind, ContentDigest, Vec<u8>)>,
+        reads: RefCell<Vec<(u8, ContentDigest)>>,
     }
 
     impl SealedAcceptedIndexObjectStore for SealedMemoryStore {
@@ -1085,6 +1245,9 @@ mod tests {
             address: ContentDigest,
         ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
         {
+            self.reads
+                .borrow_mut()
+                .push((sealed_kind_code(kind), address));
             Ok(self
                 .objects
                 .iter()
@@ -1152,6 +1315,348 @@ mod tests {
             vec![(first, digest(0x81)), (batch_id, digest(0x82))],
             0,
         )
+    }
+
+    fn generation_rows(count: u64) -> Vec<CleanCheckpointAcceptedRow> {
+        let peer = CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_u128(19)));
+        let mut prior = AcceptedFrontierRoot::empty();
+        let mut entries = Vec::new();
+        (1..=count)
+            .map(|sequence| {
+                let batch_id = BatchId::from_uuid(uuid::Uuid::from_u128(sequence as u128));
+                let fingerprint = ContentDigest::of(&sequence.to_le_bytes());
+                let event = ContentDigest::of(&sequence.to_be_bytes());
+                let dot = BatchCausalDot::new(peer, sequence).unwrap();
+                let clock = vec![(peer, sequence)];
+                let (key, digest) = authenticated_causal_clock_root(&clock).unwrap();
+                let causal =
+                    accepted_causal_record_digest(batch_id, fingerprint, event, dot, key, digest);
+                entries.push((batch_id, causal));
+                let evidence = AcceptedBatchEvidence::for_test(
+                    batch_id,
+                    fingerprint,
+                    event,
+                    prior.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    entries.clone(),
+                    0,
+                );
+                prior = evidence.post_frontier_root().clone();
+                CleanCheckpointAcceptedRow {
+                    no_op: sequence % 2 == 0,
+                    evidence,
+                    causal_dot: dot,
+                    canonical_causal_clock: clock,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sealed_cutoff_streams_real_engine_evidence_and_matches_clean_replay() {
+        use crate::oplog::hot_engine::{LazyGenesisCheckpointBuilder, ShardedHotEngine};
+        use crate::oplog::lazy_genesis::LazyGenesisPackBuilder;
+        use crate::oplog::BlobDescription;
+        use crate::oplog::{
+            AuthorBatch, BatchDisposition, CrdtPeerId, DocumentId, LineageDigest, LogicalPageName,
+            ManagedPath, ManagedTextKind, OperationTransaction, PageId, SemanticOperation,
+            SessionId, WorkspaceId,
+        };
+        let root =
+            std::env::temp_dir().join(format!("tine-sealed-cutoff-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(101));
+        let lineage = LineageDigest::of(b"sealed-cutoff-engine");
+        let catalog = DocumentId::from_uuid(uuid::Uuid::from_u128(102));
+        let (checkpoint, dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let baseline = Arc::new(
+            LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog,
+                BlobDescription::of(b"empty source"),
+                &root,
+            )
+            .unwrap()
+            .finish(checkpoint, dependencies)
+            .unwrap(),
+        );
+        let archive = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        engine
+            .install_lazy_genesis_baseline(Arc::clone(&baseline))
+            .unwrap();
+        engine
+            .attach_clean_archive_store(archive.duplicate_retained_capability().unwrap())
+            .unwrap();
+        let claims = engine
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let mut store = SealedMemoryStore::default();
+        let mut cutoff = engine
+            .build_sealed_accepted_cutoff(&mut store, None)
+            .unwrap();
+        assert_eq!(cutoff.roots().sequence.len, 0);
+        for n in 1..=2 {
+            let transaction = OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(uuid::Uuid::from_u128(200 + n)),
+                home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+                name: LogicalPageName::parse(format!("Page {n}")).unwrap(),
+                path: ManagedPath::parse(format!("pages/Page{n}.md")).unwrap(),
+                kind: ManagedTextKind::Page,
+            }])
+            .unwrap();
+            let prepared = engine
+                .prepare_fixture_transaction(
+                    AuthorBatch {
+                        batch_id: BatchId::from_uuid(uuid::Uuid::from_u128(400 + n)),
+                        author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(500)),
+                        author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(501)),
+                        crdt_peer_id: CrdtPeerId::from_u64(502),
+                    },
+                    &transaction,
+                )
+                .unwrap();
+            let outcome = engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap();
+            assert!(
+                matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+                "{:?}",
+                outcome.disposition()
+            );
+            let before = engine.capture_clean_checkpoint(0).unwrap().state_bytes;
+            let manifests = archive.committed_manifest_names().unwrap();
+            cutoff = engine
+                .build_sealed_accepted_cutoff(&mut store, Some(&cutoff))
+                .unwrap();
+            assert_eq!(cutoff.roots().sequence.len, n as u64);
+            assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
+            assert_eq!(archive.committed_manifest_names().unwrap(), manifests);
+            assert_eq!(
+                engine.capture_clean_checkpoint(0).unwrap().state_bytes,
+                before
+            );
+        }
+        let mut replay = ShardedHotEngine::new(workspace, lineage, catalog);
+        replay.install_lazy_genesis_baseline(baseline).unwrap();
+        replay
+            .attach_clean_archive_store(archive.duplicate_retained_capability().unwrap())
+            .unwrap();
+        assert_eq!(
+            replay.replay_clean_committed_tail(claims.as_ref()).unwrap(),
+            2
+        );
+        let independent = replay
+            .build_sealed_accepted_cutoff(&mut SealedMemoryStore::default(), None)
+            .unwrap();
+        assert_eq!(cutoff.roots(), independent.roots());
+        assert_eq!(cutoff.frontier(), independent.frontier());
+        drop(replay);
+        drop(engine);
+        drop(archive);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sealed_cutoff_incremental_build_matches_independent_full_rederivation() {
+        let rows = generation_rows(65);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut store = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut store);
+        for row in &rows[..64] {
+            builder.append(row).unwrap();
+        }
+        let first = builder
+            .finish(rows[63].evidence.post_frontier_root())
+            .unwrap();
+        let mut builder = first.builder(&mut store);
+        builder.append(&rows[64]).unwrap();
+        let second = builder
+            .finish(rows[64].evidence.post_frontier_root())
+            .unwrap();
+
+        let mut independent = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut independent);
+        for row in &rows {
+            builder.append(row).unwrap();
+        }
+        let full = builder
+            .finish(rows[64].evidence.post_frontier_root())
+            .unwrap();
+        assert_eq!(second.roots(), full.roots());
+        assert_eq!(second.frontier(), full.frontier());
+        let reader = SealedAcceptedIndexReader::new(&store);
+        for row in &rows {
+            let sequence = row.evidence.acceptance_sequence();
+            let id = row.evidence.batch_id().as_uuid().into_bytes();
+            let proof = reader
+                .prove_membership(second.roots(), sequence, id, &TineAcceptedEvidenceDecoder)
+                .unwrap()
+                .unwrap();
+            assert_eq!(proof.status.no_op, row.no_op);
+            assert_eq!(
+                proof.status.exact_evidence_bytes,
+                row.evidence.encode_canonical().unwrap()
+            );
+            if sequence <= 64 {
+                assert!(reader
+                    .prove_membership(first.roots(), sequence, id, &TineAcceptedEvidenceDecoder)
+                    .unwrap()
+                    .is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_cutoff_one_row_delta_does_not_visit_historical_status_or_sequence_leaves() {
+        let rows = generation_rows(513);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut store = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut store);
+        for row in &rows[..512] {
+            builder.append(row).unwrap();
+        }
+        let first = builder
+            .finish(rows[511].evidence.post_frontier_root())
+            .unwrap();
+        store.reads.borrow_mut().clear();
+        let mut builder = first.builder(&mut store);
+        builder.append(&rows[512]).unwrap();
+        let second = builder
+            .finish(rows[512].evidence.post_frontier_root())
+            .unwrap();
+        let reads = store.reads.borrow().clone();
+        assert!(
+            reads.len() < 256,
+            "one-row append enumerated retained history: {} reads",
+            reads.len()
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(
+                    |(kind, _)| *kind == sealed_kind_code(SealedAcceptedObjectKind::StatusRecord)
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(
+                    |(kind, _)| *kind == sealed_kind_code(SealedAcceptedObjectKind::SequenceLeaf)
+                )
+                .count(),
+            1
+        );
+        assert_eq!(second.roots().sequence.len, 513);
+    }
+
+    #[test]
+    fn sealed_cutoff_rejects_gaps_forks_wrong_causal_membership_and_target() {
+        let rows = generation_rows(3);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut store = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut store);
+        assert!(builder.append(&rows[1]).is_err());
+        builder.append(&rows[0]).unwrap();
+        assert!(builder.append(&rows[0]).is_err());
+        let mut wrong = rows[1].clone();
+        let peer = wrong.causal_dot.peer_id();
+        wrong.causal_dot = BatchCausalDot::new(peer, 99).unwrap();
+        wrong.canonical_causal_clock = vec![(peer, 99)];
+        assert!(builder
+            .append(&wrong)
+            .unwrap_err()
+            .contains("causal membership"));
+        // The failed append did not move the roots. The correct immutable
+        // records can still extend the preceding accepted cutoff.
+        builder.append(&rows[1]).unwrap();
+        assert!(builder
+            .finish(rows[2].evidence.post_frontier_root())
+            .is_err());
+        assert!(
+            SealedAcceptedCutoff::empty(rows[0].evidence.post_frontier_root().clone()).is_err()
+        );
+    }
+
+    #[test]
+    fn sealed_cutoff_damaged_predecessor_fails_without_changing_other_roots() {
+        let rows = generation_rows(2);
+        let empty = SealedAcceptedCutoff::empty(AcceptedFrontierRoot::empty()).unwrap();
+        let mut store = SealedMemoryStore::default();
+        let mut builder = empty.builder(&mut store);
+        builder.append(&rows[0]).unwrap();
+        let first = builder
+            .finish(rows[0].evidence.post_frontier_root())
+            .unwrap();
+        let address = first.roots().batch_map.root.unwrap().digest;
+        let (_, _, bytes) = store
+            .objects
+            .iter_mut()
+            .find(|(kind, digest, _)| {
+                *kind == SealedAcceptedObjectKind::MapNode && *digest == address
+            })
+            .unwrap();
+        let saved = bytes.clone();
+        bytes.push(0);
+        assert!(first.builder(&mut store).append(&rows[1]).is_err());
+        store
+            .objects
+            .iter_mut()
+            .find(|(kind, digest, _)| {
+                *kind == SealedAcceptedObjectKind::MapNode && *digest == address
+            })
+            .unwrap()
+            .2 = saved;
+        assert!(SealedAcceptedIndexReader::new(&store)
+            .prove_membership(
+                first.roots(),
+                1,
+                rows[0].evidence.batch_id().as_uuid().into_bytes(),
+                &TineAcceptedEvidenceDecoder
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn sealed_cutoff_has_no_live_cutover_or_cache_adoption_path() {
+        let engine = include_str!("hot_engine.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let builder = engine
+            .split("pub(crate) fn build_sealed_accepted_cutoff<Store>(")
+            .nth(1)
+            .unwrap()
+            .split("/// Capture the exact semantic clean-runtime state")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "capture_clean_checkpoint(",
+            "state_bytes",
+            "ExportMode",
+            "publish_activation_marker",
+            "replace_activation_marker",
+            "schedule_clean_checkpoint(",
+        ] {
+            assert!(
+                !builder.contains(forbidden),
+                "inert cutoff builder acquired {forbidden}"
+            );
+        }
+        assert!(!engine.contains(".build_sealed_accepted_cutoff("));
+        assert!(!include_str!("../sync_runtime.rs").contains("build_sealed_accepted_cutoff"));
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("R1b accepted-cutoff builder"));
+        assert!(contract.contains("no new on-disk format"));
     }
 
     #[test]
