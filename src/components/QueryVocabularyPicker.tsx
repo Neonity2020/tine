@@ -332,6 +332,15 @@ export function QueryVocabularyPicker(props: {
    *  list still offers everything that needs no registry; what it must not do
    *  is look like a graph with no properties in it. */
   pending?: () => boolean;
+  /** The one registry read FAILED for the current graph/revision, and nothing
+   *  is retrying it. The list is in exactly the same "the graph's own keys are
+   *  missing" state as `pending`, but it ends only when someone asks — so it
+   *  says which failure it was and offers `onRetry`, rather than an indexing
+   *  line that never finishes. */
+  failure?: () => Error | null;
+  /** Read the registry again. Wired to the host's ONE refresh owner, never to a
+   *  retry the picker runs itself. */
+  onRetry?: () => void;
   /** What the row currently tests, so the list can mark it. */
   current?: VocabularyChoice | null;
   onPick: (choice: VocabularyChoice) => void;
@@ -390,13 +399,39 @@ export function QueryVocabularyPicker(props: {
       onQuery={setSearch}
       options={options()}
       status={
-        <Show when={props.pending?.()}>
-          {/* Compact, one line, above the list: the built-ins below it are
-              usable now, and the graph's own keys are on their way. */}
-          <div class="qs-vocab-pending" role="status">
-            Reading this graph's properties…
-          </div>
-        </Show>
+        <>
+          <Show when={props.pending?.()}>
+            {/* Compact, one line, above the list: the built-ins below it are
+                usable now, and the graph's own keys are on their way. */}
+            <div class="qs-vocab-pending" role="status">
+              Reading this graph's properties…
+            </div>
+          </Show>
+          <Show when={props.failure?.() ?? null}>
+            {(failure) => (
+              /* Same slot, same size — but this one names the failure and
+                 carries the only control that starts another read, because
+                 nothing is going to finish on its own. */
+              <div class="qs-vocab-failure" role="alert">
+                <span class="qs-vocab-failure-message">
+                  This graph's properties could not be read. {failure().message}
+                </span>
+                <Show when={props.onRetry}>
+                  <button
+                    type="button"
+                    class="qs-vocab-retry"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      props.onRetry?.();
+                    }}
+                  >
+                    Try again
+                  </button>
+                </Show>
+              </div>
+            )}
+          </Show>
+        </>
       }
       rootRef={props.rootRef}
       onEmptyBackspace={props.onEmptyBackspace}

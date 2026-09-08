@@ -1067,6 +1067,7 @@ mod tests {
         assert!(page.markdown.contains("- ## Read a query, then edit it"));
         assert!(page.markdown.contains("**Find blocks ▾ where …**"));
         assert!(page.markdown.contains("**+ Add condition**"));
+        assert!(page.markdown.contains("**Try again**"));
         assert!(page.markdown.contains("**Remove them**"));
         assert!(page
             .markdown

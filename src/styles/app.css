@@ -9643,6 +9643,34 @@ img.emoji {
   font-size: 11px;
   color: var(--text-muted);
 }
+/* The same slot, for the read that will NOT finish on its own. It keeps the
+   one line's geometry and adds the one control that starts another read, so a
+   failed registry never reads as an empty graph or an endless index. */
+.qs-vocab-failure,
+.qs-registry-failure {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--danger, #b33);
+}
+.qs-vocab-failure-message,
+.qs-registry-failure-message {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.qs-vocab-retry,
+.qs-registry-retry {
+  flex: 0 0 auto;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-secondary, transparent);
+  color: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
 
 /* --- value editors --- */
 .qs-value-editor {

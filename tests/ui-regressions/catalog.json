@@ -11002,6 +11002,29 @@
         "failBefore": "proven"
       },
       "notes": "User capability (docs/contracts/query-display.md §6). `tine.col-aggregates::` is an ORDERED LIST in which repeats are meaningful, and the summary folded `aggregates[0]` and dropped the rest — so a note asking for `count; cost=sum` rendered one number, whichever the property happened to spell first. The list face and the board face also grouped through different code and could disagree about which group a row was in. `queryAggregate.ts::querySummary` is now the only fold: it returns one cell per requested aggregate for the whole result and for each group, and its grouping keys come from `sheet/fields.ts::groupKeysForBlock` over the same DTO rows the Board renders, with formula columns through `readFormulaRowField`. The arithmetic is unchanged (count / numeric sum / numeric avg dividing by the numeric contributors, three-decimal rounding, skipped-row accounting). A tags grouping places a row in every tag's group exactly as the board does, and the summary says so rather than presenting counts that do not partition the result as if they did."
+    },
+    {
+      "id": "UI-QUERY-REGISTRY-UNAVAILABLE-001",
+      "title": "A property-registry read that fails is reported and retryable, not a crash or an endless index",
+      "family": "query-builder",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryBuilder.registry.test.tsx::reports an initial terminal read failure instead of crashing or indexing forever",
+          "src/components/QueryBuilder.registry.test.tsx::keeps type-dependent edits disabled while the registry is unavailable",
+          "src/components/QueryBuilder.registry.test.tsx::reports a REFRESH failure after a healthy read without publishing the stale vocabulary",
+          "src/components/QueryBuilder.registry.test.tsx::retries typed readiness by itself and keeps the chosen key and its draft value",
+          "src/components/QueryBuilder.registry.test.tsx::stops the automatic retry when readiness turns into a terminal failure",
+          "src/components/QueryBuilder.registry.test.tsx::recovers on explicit retry without reopening the sheet or resetting the draft",
+          "src/components/QueryBuilder.registry.test.tsx::cannot land a previous graph's rows or its failure",
+          "src/components/QueryBuilder.registry.test.tsx::shares one failing read and one retry across two mounted builders"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Stateful-UX. `query_registry` is SQL-only on both backends and answers a snapshot, typed readiness, or a typed terminal failure; the sheet had a rendering for the first two only. A terminal `query-unavailable` rejected the shared `createReadyQueryResource`, and `Resource.latest` RETHROWS a rejected resource — so the throw escaped the reactive graph into an error boundary and the add-condition/field picker could not be opened at all, while every control gated on `registry.pending()` (rows still `undefined`) sat on \"Reading this graph's properties…\" with nothing retrying behind it. Fixed in the ONE registry owner (`QueryBuilder.tsx`): a terminal failure is captured as a scoped VALUE, which is what stops the automatic retry, while readiness stays `runQueryWhenReady`'s to retry and a cancellation is rethrown so a superseded read is never published as a result. `RegistryAccess` gained `failure` (the typed error), `unavailable` (`pending || failure`, which every type-dependent edit now waits on instead of `pending` alone) and `retry` — which IS `request`'s owner, so one shared read serves every open builder and no second retry, backoff or cache exists. The scope/declaration-revision guard covers the failure exactly as it covers rows, so a previous graph's error cannot land either."
     }
   ]
 }

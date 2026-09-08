@@ -250,6 +250,8 @@ function FieldPicker(props: {
             anchor="block"
             rows={props.registry.rows}
             pending={props.registry.pending}
+            failure={props.registry.failure}
+            onRetry={props.registry.retry}
             current={props.current ? { kind: "field", field: props.current } : null}
             entries={(search) =>
               displayFieldEntries({
