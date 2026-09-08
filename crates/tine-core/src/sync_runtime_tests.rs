@@ -31189,17 +31189,21 @@ fn ret2_pending_repair_automatically_recovers_the_captured_public_routes() {
     r5a_pending_append(&handle, "notes/Delta.md", "TODO public repair witness");
     let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
     let context = crate::query::ir::ExecutionContext::none();
-    for route in 0..3 {
+    // Route 3 is RET2-Managed-Metadata's PUBLIC `query_registry`: it takes the
+    // same capture/repair protocol, so a missing pending projection recovers
+    // there too instead of answering from a stale published table.
+    for route in 0..4 {
         let run = || match route {
             0 | 1 => serde_json::to_value(
                 ret2_ir_navigate(&handle, &query, &view, &context, route == 1).unwrap(),
             )
             .unwrap(),
-            _ => serde_json::to_value(
+            2 => serde_json::to_value(
                 ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R5A_ROWS, R5A_BYTES)
                     .unwrap(),
             )
             .unwrap(),
+            _ => serde_json::to_value(ret2m_registry(&handle).unwrap()).unwrap(),
         };
         let expected = run();
         let (path, old) = r5a_overlay(&handle);
@@ -31237,6 +31241,10 @@ fn ret2_pending_repair_creation_failure_is_terminal_for_later_queries() {
     let error = ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R5A_ROWS, R5A_BYTES)
         .unwrap_err();
     assert_query_execution_error("later request", &error, expected);
+    // RET2-Managed-Metadata: the PUBLIC registry request is terminal for the
+    // same reason, and still does not fall back to a published table.
+    let error = ret2m_registry(&handle).unwrap_err();
+    assert_query_execution_error("later registry request", &error, expected);
     assert!(!path.exists());
 }
 
@@ -34914,6 +34922,784 @@ fn r5c_the_worst_case_patch_is_measured() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// RET2-Managed-Metadata: the PUBLIC property-registry request (SPEC §7.1
+// `query_registry`) reads the database.
+//
+// Before this packet the request was a serialized actor turn
+// (`application_property_registry_snapshot_ready`) over the MERGED registry
+// builder: with a pending local suffix it HYDRATED every pending page document
+// through `application_navigation_overlay_ready` and rebuilt the graph's whole
+// registry on the actor, and a build that FAILED was not an error at all —
+// `serve_application_property_registry` served the last published table, or an
+// empty one before the first build. That is the frontend's query type
+// information, so either behaviour silently changes what every `prop(…)` filter
+// means even though the rows themselves come from SQL.
+//
+// Every gate below drives the PUBLIC request and compares against the
+// INDEPENDENT merged oracle (`application_property_registry_probe`), which is
+// still the actor's own mask-and-overlay build over the same evidence.
+// ---------------------------------------------------------------------------
+
+/// The PUBLIC `query_registry` request, exactly as the command layer issues it
+/// (`src-tauri/src/commands.rs`' `query_registry`).
+fn ret2m_registry(
+    handle: &SyncRuntimeHandle,
+) -> Result<crate::query::ir::RegistrySnapshot, SyncApplicationPageRequestError> {
+    handle
+        .application_navigation(SyncApplicationNavigationRequest::PropertyRegistry)
+        .map(|outcome| match outcome {
+            SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::PropertyRegistry(snapshot),
+            } => snapshot,
+            other => panic!("the public registry request returned the wrong outcome: {other:?}"),
+        })
+}
+
+/// The public snapshot beside the INDEPENDENT merged oracle at the same state.
+#[track_caller]
+fn ret2m_assert_matches_merged_oracle(label: &str, handle: &SyncRuntimeHandle) {
+    let probe = handle
+        .application_property_registry_probe()
+        .expect("the merged oracle rebuilds on the actor");
+    let snapshot = ret2m_registry(handle).expect("the public registry request answers");
+    assert_eq!(
+        snapshot.rows,
+        probe.merged.snapshot().rows,
+        "{label}: the public snapshot is not the merged oracle's table\n\
+         public: {:?}\noracle: {:?}",
+        snapshot
+            .rows
+            .iter()
+            .map(|row| (
+                row.normalized_name.as_str(),
+                row.observed_type,
+                row.cardinality,
+                row.count_blocks,
+                row.count_pages,
+                row.declared,
+                row.top_values.len(),
+            ))
+            .collect::<Vec<_>>(),
+        probe
+            .merged
+            .rows()
+            .iter()
+            .map(|row| (
+                row.normalized_name.as_str(),
+                row.observed_type,
+                row.cardinality,
+                row.count_blocks,
+                row.count_pages,
+                row.declared,
+                row.top_values.len(),
+            ))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        snapshot.generation,
+        probe.accepted.generation(),
+        "{label}: the wire generation is the ACCEPTED table's (G7)"
+    );
+}
+
+/// **The headline fail-before.** The PUBLIC `query_registry` request, with a
+/// pending property/type edit, after REAL damage to the accepted projection:
+/// an accepted property row whose page the same snapshot can no longer resolve.
+///
+/// Before this packet the request ANSWERED — with the last published accepted
+/// table, which neither reflects the pending edit nor the damage — and the
+/// frontend had no way to tell that from the truth. It is now a typed
+/// `Unavailable(ReadFailed)`, published nowhere and memoized nowhere, so the
+/// same request fails the same way rather than settling into a wrong table.
+#[test]
+fn ret2_the_public_registry_never_serves_stale_metadata_after_read_damage() {
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    let fixture = r5c_fixture("ret2-registry-damage", 0x5c40);
+    let handle = r4a_reopen(&fixture);
+
+    // The answer the frontend already holds, at the accepted frontier.
+    let before = ret2m_registry(&handle).unwrap();
+    assert!(!before.rows.is_empty(), "{before:?}");
+    assert!(
+        before.generation > 0,
+        "the accepted table is published once"
+    );
+
+    // The pending edit: `score` — declared `number` by `notes/score.md` — gets
+    // a text value, and the page loses one of its two rows.
+    r5a_pending_replace(
+        &handle,
+        "notes/Data.md",
+        vec![r5c_block(
+            "TODO row one\n  score:: not-a-number\n  status:: open",
+        )],
+    );
+    let pending = ret2m_registry(&handle).unwrap();
+    assert_ne!(
+        pending.rows, before.rows,
+        "the pending property edit must change the table"
+    );
+
+    // REAL read damage, exactly the shape
+    // `r5c_a_property_row_naming_an_absent_page_fails_the_pending_read` uses:
+    // `notes/More.md` keeps its `score` property row and loses its page row, so
+    // rebuilding `score` — an affected key, because the masked page owns rows
+    // for it — cannot resolve the row's page.
+    let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
+    writer.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    assert_eq!(
+        writer
+            .execute("DELETE FROM pages WHERE path = ?1", ["notes/More.md"])
+            .unwrap(),
+        1
+    );
+    drop(writer);
+    // The previous request already patched this exact pending state, and a
+    // patch-cache hit is a coherent earlier read, not a fresh one: clear it so
+    // the damaged evidence is actually read.
+    handle.inner.managed_query.patched_registry.clear();
+    handle.reset_managed_query_census();
+
+    let damaged = handle.application_navigation(SyncApplicationNavigationRequest::PropertyRegistry);
+    let error = match damaged {
+        Ok(SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::PropertyRegistry(served),
+        }) => panic!(
+            "the public registry ANSWERED after read damage: rows={} generation={} \
+             equals_pre_edit_table={} equals_pending_table={} empty={}",
+            served.rows.len(),
+            served.generation,
+            served.rows == before.rows,
+            served.rows == pending.rows,
+            served.rows.is_empty(),
+        ),
+        Ok(other) => panic!("unexpected navigation outcome: {other:?}"),
+        Err(error) => error,
+    };
+    assert_query_execution_error(
+        "damaged registry metadata",
+        &error,
+        QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed),
+    );
+    let census = handle.managed_query_census();
+    assert_eq!(
+        (
+            census.metadata_reads,
+            census.statement_reads,
+            census.failed_reads,
+            census.fallback_reads
+        ),
+        (0, 0, 1, 0),
+        "one failed metadata read, no answer and no fallback: {census:?}"
+    );
+    assert_eq!(
+        handle.managed_query_census().registry_patches,
+        0,
+        "a refused patch is not a patch"
+    );
+
+    // Nothing about the failure is published or memoized: the same request
+    // fails the same way rather than serving a cached empty or stale table.
+    handle.inner.managed_query.patched_registry.clear();
+    let again = ret2m_registry(&handle).unwrap_err();
+    assert_eq!(again, error);
+    assert_eq!(handle.managed_query_census().failed_reads, 2);
+}
+
+/// Requirement 2: a public metadata read hydrates NO page document, rebuilds no
+/// merged table on the actor, and shares its effective patch with repeated
+/// requests AND with result queries at the same opened state.
+#[test]
+fn ret2_the_public_registry_reads_snapshots_and_hydrates_no_page() {
+    let fixture = r5c_fixture("ret2-registry-cost", 0x5c41);
+    let handle = r4a_reopen(&fixture);
+
+    // The separately measured residual: the COLD accepted build. It is the
+    // existing accepted-registry cache's setup cost, not affected-key work.
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    let _ = ret2m_registry(&handle).unwrap();
+    let cold = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        cold.property_registry_builds, 1,
+        "the cold accepted table is built once: {cold:?}"
+    );
+
+    r5a_pending_replace(
+        &handle,
+        "notes/Data.md",
+        vec![r5c_block("TODO row one\n  score:: 07\n  status:: open")],
+    );
+    handle.inner.managed_query.patched_registry.clear();
+    handle.reset_managed_query_census();
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    crate::managed_registry_patch::reset_accepted_key_reads();
+
+    let first = ret2m_registry(&handle).unwrap();
+    let work = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        work.navigation_overlay_pending_path_loads, 0,
+        "the public registry must not load one pending page DOCUMENT: {work:?}"
+    );
+    assert_eq!(work.metadata_page_hydrations, 0, "{work:?}");
+    assert_eq!(work.result_page_hydrations, 0, "{work:?}");
+    assert_eq!(
+        work.property_registry_builds, 0,
+        "no merged rebuild on the actor and no second accepted build: {work:?}"
+    );
+    assert!(work.property_registry_cache_hits >= 1, "{work:?}");
+    let census = handle.managed_query_census();
+    assert_eq!(
+        (
+            census.metadata_reads,
+            census.statement_reads,
+            census.registry_patches,
+            census.failed_reads
+        ),
+        (1, 0, 1, 0),
+        "one metadata read, one patch, no descriptor statement: {census:?}"
+    );
+    assert!(
+        crate::managed_registry_patch::accepted_key_reads() > 0,
+        "a pending PROPERTY edit does read its affected keys"
+    );
+
+    // The same request again shares the effective patch.
+    let second = ret2m_registry(&handle).unwrap();
+    assert_eq!(second, first, "the same opened state is the same table");
+    assert_eq!(
+        handle.managed_query_census().registry_patches,
+        1,
+        "a repeated metadata request is a patch-cache hit"
+    );
+
+    // And so does a RESULT query at the same opened state: one patch serves
+    // both routes, which is only true because they share one acquisition.
+    let answered = r4a_navigate(&handle, "(property score 7)", R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(answered.total, 1, "{answered:?}");
+    let census = handle.managed_query_census();
+    assert_eq!(
+        (
+            census.registry_patches,
+            census.metadata_reads,
+            census.statement_reads,
+            census.pending_reads
+        ),
+        (1, 2, 1, 1),
+        "the result query shares the metadata read's patch: {census:?}"
+    );
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Requirement 2, the other half: an ordinary TEXT edit does not make the
+/// public registry scan the graph's property rows. It affects no key, so the
+/// patch reads no accepted property row and returns the accepted table.
+#[test]
+fn ret2_an_ordinary_text_edit_costs_the_public_registry_no_key_work() {
+    let fixture = r5c_fixture("ret2-registry-text-edit", 0x5c42);
+    let handle = r4a_reopen(&fixture);
+    let accepted = ret2m_registry(&handle).unwrap();
+
+    r5a_pending_append(&handle, "notes/Plain.md", "TODO ordinary text edit");
+    handle.inner.managed_query.patched_registry.clear();
+    handle.reset_managed_query_census();
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    crate::managed_registry_patch::reset_accepted_key_reads();
+
+    let pending = ret2m_registry(&handle).unwrap();
+    assert_eq!(
+        crate::managed_registry_patch::accepted_key_reads(),
+        0,
+        "a text edit touches no property key, so no accepted property row is read"
+    );
+    assert_eq!(
+        pending, accepted,
+        "and the effective table is the accepted one, unchanged"
+    );
+    let work = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(work.navigation_overlay_pending_path_loads, 0, "{work:?}");
+    assert_eq!(work.property_registry_builds, 0, "{work:?}");
+    let census = handle.managed_query_census();
+    assert_eq!(
+        (census.registry_patches, census.metadata_reads),
+        (1, 1),
+        "one patch attempt that found nothing affected: {census:?}"
+    );
+    ret2m_assert_matches_merged_oracle("a text-only pending edit", &handle);
+}
+
+/// Requirement 1: the PUBLIC snapshot is EXACTLY the independent merged
+/// oracle's table over accepted and pending Markdown/Org data — duplicate keys,
+/// type declarations, a declaration page rename and delete, a normalized-name
+/// collision and mixed values.
+#[test]
+fn ret2_the_public_registry_snapshot_equals_the_merged_oracle_over_every_shape() {
+    // Markdown and Org pending pages, duplicate keys on one block, a mixed
+    // value that contradicts the declaration, a brand new pending page.
+    {
+        let fixture = r5c_fixture("ret2-registry-oracle", 0x5c43);
+        let handle = r4a_reopen(&fixture);
+        ret2m_assert_matches_merged_oracle("nothing pending", &handle);
+        r5a_pending_replace(
+            &handle,
+            "notes/Data.md",
+            vec![
+                r5c_block("TODO row one\n  score:: 01\n  score:: 02\n  status:: open"),
+                r5c_block("DONE row two\n  score:: not-a-number\n  Status:: Done"),
+            ],
+        );
+        ret2m_assert_matches_merged_oracle("duplicate keys and mixed values", &handle);
+        r5a_pending_replace(
+            &handle,
+            "notes/Kilo.org",
+            vec![r5c_block(
+                "TODO org row\n:PROPERTIES:\n:tone: [[south]]\n:score: 7\n:END:",
+            )],
+        );
+        ret2m_assert_matches_merged_oracle("an Org pending page beside a Markdown one", &handle);
+        r5a_pending_new_page(
+            &handle,
+            "Ret2 Fresh",
+            vec![r5c_block("TODO fresh row\n  score:: 44\n  fresh:: yes")],
+        );
+        ret2m_assert_matches_merged_oracle("a never-accepted pending page", &handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // A declaration page RENAMED, then DELETED, while pending.
+    {
+        let fixture = r5c_fixture("ret2-registry-oracle-declaration", 0x5c44);
+        let handle = r4a_reopen(&fixture);
+        r5c_accept_declaration_page(&handle, "tone", "checkbox");
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "tone".into(),
+                    new: "lonely".into(),
+                    expected_path: None,
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        ret2m_assert_matches_merged_oracle("a pending declaration rename", &handle);
+        let renamed = ret2m_registry(&handle).unwrap();
+        assert_eq!(
+            renamed
+                .rows
+                .iter()
+                .find(|row| row.normalized_name == "tone")
+                .and_then(|row| row.declared),
+            None,
+            "the old name no longer declares: {renamed:?}"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // A declaration page DELETED while pending. Delete-by-name only reaches a
+    // page the ACCEPTED engine owns the logical name for, so this is its own
+    // fixture rather than a second step on the renamed one.
+    {
+        let fixture = r5c_fixture("ret2-registry-oracle-undeclare", 0x5c4b);
+        let handle = r4a_reopen(&fixture);
+        r5c_accept_declaration_page(&handle, "tone", "checkbox");
+        let declared = ret2m_registry(&handle).unwrap();
+        assert!(
+            declared
+                .rows
+                .iter()
+                .find(|row| row.normalized_name == "tone")
+                .and_then(|row| row.declared)
+                .is_some(),
+            "the accepted declaration binds before the deletion: {declared:?}"
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                    name: "tone".into(),
+                    page_kind: SyncPageKind::Page,
+                    expected_path: None,
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        ret2m_assert_matches_merged_oracle("a pending declaration delete", &handle);
+        let deleted = ret2m_registry(&handle).unwrap();
+        assert_eq!(
+            deleted
+                .rows
+                .iter()
+                .find(|row| row.normalized_name == "tone")
+                .and_then(|row| row.declared),
+            None,
+            "the declaration went with its page: {deleted:?}"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    // Two accepted pages whose names collide under `refs::page_key`, both
+    // declaring: the public snapshot must resolve the declaration exactly as
+    // the merged build does, which pins the declaration stream ORDER.
+    {
+        let fixture = r5c_fixture("ret2-registry-oracle-collision", 0x5c45);
+        let handle = r4a_reopen(&fixture);
+        let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
+        assert_eq!(
+            writer
+                .execute(
+                    "UPDATE pages SET name = 'SCORE', name_key = 'score' WHERE path = ?1",
+                    ["notes/Plain.md"],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            writer
+                .execute(
+                    "INSERT INTO properties \
+                     (owner_type, owner_id, page_id, name, normalized_name, value, ordinal) \
+                     SELECT 0, page_id, page_id, 'tine.type', 'tine.type', 'text', 0 \
+                     FROM pages WHERE path = ?1",
+                    ["notes/Plain.md"],
+                )
+                .unwrap(),
+            1
+        );
+        drop(writer);
+        r5a_pending_append(&handle, "notes/More.md", "TODO ret2 collision witness");
+        ret2m_assert_matches_merged_oracle("two colliding declaration pages", &handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+}
+
+/// Requirement 3: every disposition a public metadata read can have is the
+/// SAME typed `query::QueryExecutionError` the result routes report — never
+/// fallback metadata — and a failed request is followed by a healthy one that
+/// answers from durable evidence rather than from the failure.
+#[test]
+fn ret2_the_public_registry_reports_typed_execution_errors_and_never_falls_back() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    use crate::query::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
+    let fixture = r5c_fixture("ret2-registry-errors", 0x5c46);
+    let handle = r4a_reopen(&fixture);
+    // The independent answer this request HAS, so every error leg below is
+    // provably not an empty success in disguise.
+    let oracle = ret2m_registry(&handle).unwrap();
+    assert!(!oracle.rows.is_empty(), "{oracle:?}");
+
+    for (label, outcomes, expected, failures) in [
+        (
+            "an exhausted job owner",
+            vec![Outcome::Busy],
+            QueryExecutionError::NotReady(QueryReadinessReason::Busy),
+            0,
+        ),
+        (
+            "re-captures spent",
+            vec![Outcome::Stale, Outcome::Stale, Outcome::Stale],
+            QueryExecutionError::NotReady(QueryReadinessReason::PendingEdits),
+            0,
+        ),
+        (
+            "a drained owner",
+            vec![Outcome::Cancelled],
+            QueryExecutionError::Cancelled,
+            0,
+        ),
+        (
+            "a failed read",
+            vec![Outcome::Failed("gate")],
+            QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed),
+            1,
+        ),
+    ] {
+        r4b_inject(&handle, outcomes);
+        let error = ret2m_registry(&handle).unwrap_err();
+        assert_query_execution_error(label, &error, expected);
+        let census = handle.managed_query_census();
+        assert_eq!(
+            (
+                census.metadata_reads,
+                census.statement_reads,
+                census.fallback_reads,
+                census.failed_reads
+            ),
+            (0, 0, 0, failures),
+            "{label}: no answer, no walk: {census:?}"
+        );
+        // The very next request is healthy and answers the real table: the
+        // failure was neither published nor memoized.
+        let healthy = ret2m_registry(&handle).unwrap();
+        assert_eq!(healthy, oracle, "{label}: the healthy request after it");
+        assert_eq!(
+            handle.managed_query_census().metadata_reads,
+            1,
+            "{label}: exactly one real metadata read"
+        );
+    }
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Requirement 3, for real: a genuinely exhausted job owner is
+/// `NotReady(Busy)` — capacity is acquired before any transaction — and a freed
+/// slot puts the very next request back on the database route.
+#[test]
+fn ret2_the_public_registry_reports_a_real_exhausted_job_owner() {
+    use crate::query::{QueryExecutionError, QueryReadinessReason};
+    let fixture = r5c_fixture("ret2-registry-busy", 0x5c47);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Plain.md", "TODO ret2 registry busy witness");
+    let oracle = ret2m_registry(&handle).unwrap();
+    assert!(!oracle.rows.is_empty(), "{oracle:?}");
+
+    *handle.inner.managed_query.job_wait.lock().unwrap() = Some(Duration::from_millis(5));
+    let mut held = Vec::new();
+    loop {
+        match handle
+            .managed_query_jobs()
+            .acquire_within(Duration::from_millis(5))
+        {
+            crate::query_jobs::Admission::Slot(slot) => held.push(slot),
+            crate::query_jobs::Admission::Busy => break,
+            crate::query_jobs::Admission::Cancelled => panic!("the owner must not be closed"),
+        }
+    }
+    assert_eq!(held.len(), crate::query_jobs::DEFAULT_QUERY_JOB_CAPACITY);
+
+    handle.reset_managed_query_census();
+    handle.inner.managed_query.patched_registry.clear();
+    let error = ret2m_registry(&handle).unwrap_err();
+    assert_query_execution_error(
+        "a real exhausted job owner",
+        &error,
+        QueryExecutionError::NotReady(QueryReadinessReason::Busy),
+    );
+    let census = handle.managed_query_census();
+    assert_eq!(
+        (
+            census.metadata_reads,
+            census.statement_reads,
+            census.registry_patches,
+            census.fallback_reads
+        ),
+        (0, 0, 0, 0),
+        "no slot within the wait means no transaction was opened at all: {census:?}"
+    );
+
+    drop(held);
+    let read = ret2m_registry(&handle).unwrap();
+    assert_eq!(read, oracle, "a freed slot answers the real table");
+    assert_eq!(handle.managed_query_census().metadata_reads, 1);
+}
+
+/// Requirement 3, cancellation for real: a capture bound to the old projection
+/// lifecycle is cancelled by a replacement drain even before it acquires
+/// capacity, and a fresh request answers afterwards.
+#[test]
+fn ret2_a_registry_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain() {
+    let fixture = r5c_fixture("ret2-registry-capture-drain", 0x5c48);
+    let handle = r4a_reopen(&fixture);
+    let capture = match handle
+        .application_request(|reply| ActorRequest::ApplicationCapturedRegistryTurn { reply })
+        .unwrap()
+    {
+        RegistryTurn::Captured(capture) => capture,
+        RegistryTurn::Deferred(state) => panic!("the registry turn deferred: {state:?}"),
+    };
+    let shared = &handle.inner.managed_query;
+    shared.jobs.cancel_all_and_drain();
+    let cancelled = matches!(
+        shared.execute_metadata(&capture),
+        crate::managed_metadata::ManagedMetadataOutcome::NotAnswered(
+            crate::managed_query::ManagedQueryOutcome::Cancelled
+        )
+    );
+    let fresh = ret2m_registry(&handle).unwrap();
+    assert!(!fresh.rows.is_empty(), "{fresh:?}");
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    assert!(
+        cancelled,
+        "a pre-drain registry capture must never enter a new admission epoch"
+    );
+}
+
+#[test]
+fn ret2_a_registry_drain_after_construction_cancels_the_answer_and_releases_handles() {
+    let fixture = r5c_fixture("ret2-registry-final-drain", 0x5c59);
+    let handle = r4a_reopen(&fixture);
+    let shared = &handle.inner.managed_query;
+    handle.reset_managed_query_census();
+    crate::managed_metadata::drain_after_next_construction();
+    let answer = ret2m_registry(&handle);
+    shared.jobs.cancel_all_and_drain();
+    assert!(
+        matches!(
+            answer,
+            Err(SyncApplicationPageRequestError::QueryExecution(
+                crate::query::QueryExecutionError::Cancelled
+            ))
+        ),
+        "a lifecycle drain during metadata construction must cancel: {answer:?}"
+    );
+    assert_eq!(handle.managed_query_census().metadata_reads, 0);
+    assert!(!ret2m_registry(&handle).unwrap().rows.is_empty());
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Requirement 4, and the manager's own
+/// `ret2_pending_registry_cache_follows_the_opened_snapshot_not_the_capture`
+/// regression for the PUBLIC metadata route: two identical captures, executed
+/// on DIFFERENT overlay revisions, must not share the wrong type information.
+#[test]
+fn ret2_public_registry_captures_follow_the_opened_snapshot_not_the_capture() {
+    let fixture = r5c_fixture("ret2-registry-opened-snapshot", 0x5c49);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Solo.md", "TODO queued registry witness");
+    let capture = || match handle
+        .application_request(|reply| ActorRequest::ApplicationCapturedRegistryTurn { reply })
+        .unwrap()
+    {
+        RegistryTurn::Captured(capture) => capture,
+        RegistryTurn::Deferred(state) => panic!("the registry turn deferred: {state:?}"),
+    };
+    let first = capture();
+    let second = capture();
+    assert_eq!(first.stamp, second.stamp, "two identical captures");
+    let execute = |capture: &crate::managed_metadata::ManagedMetadataCapture| match handle
+        .inner
+        .managed_query
+        .execute_metadata(capture)
+    {
+        crate::managed_metadata::ManagedMetadataOutcome::Answered(snapshot) => snapshot,
+        crate::managed_metadata::ManagedMetadataOutcome::NotAnswered(other) => {
+            panic!("the queued metadata read did not answer: {other:?}")
+        }
+    };
+    let declared = |snapshot: &crate::query::ir::RegistrySnapshot| {
+        snapshot
+            .rows
+            .iter()
+            .find(|row| row.normalized_name == "score")
+            .and_then(|row| row.declared)
+            .map(|(kind, _)| kind)
+    };
+    assert_eq!(
+        declared(&execute(&first)),
+        Some(crate::query::ir::ObservedType::Number),
+        "the fixture declares `score` as a number"
+    );
+
+    // The declaration page changes while the SECOND capture is still queued.
+    let (mut page, revision) = load_application_exact(&handle, "notes/score.md");
+    page.pre_block = Some("tine.type:: text".to_owned());
+    assert!(matches!(
+        handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap(),
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+    let (_, opened) = r5a_overlay(&handle);
+    assert!(Some(opened.flushed_revision) > second.stamp.overlay_revision);
+    assert_eq!(
+        declared(&execute(&second)),
+        Some(crate::query::ir::ObservedType::Text),
+        "the second read must publish its OWN opened snapshot's declaration"
+    );
+    // And the public request agrees with the merged oracle at that state.
+    ret2m_assert_matches_merged_oracle("after the queued declaration change", &handle);
+}
+
+/// Requirement 4, the other barrier: an acceptance that lands BETWEEN the
+/// capture and the snapshot open is caught by the stamp validation inside the
+/// accepted read transaction, re-captured, and answered at the NEW frontier —
+/// never served from the superseded capture's table.
+#[test]
+fn ret2_an_acceptance_between_registry_capture_and_open_recaptures() {
+    let fixture = r5c_fixture("ret2-registry-barrier", 0x5c4a);
+    let handle = r4a_reopen(&fixture);
+    let before = ret2m_registry(&handle).unwrap();
+    r5a_pending_replace(
+        &handle,
+        "notes/Solo.md",
+        vec![r5c_block("TODO only owner\n  lonely:: barrier")],
+    );
+    handle.inner.managed_query.patched_registry.clear();
+    handle.reset_managed_query_census();
+
+    // The barrier runs ONCE, on the executor's thread, between the slot
+    // admission and the first snapshot open: it accepts the pending batch for
+    // real, so the capture's stamp is stale by the time the open validates it.
+    let accepted_once = std::cell::Cell::new(0usize);
+    let handle_for_hook: *const SyncRuntimeHandle = &handle;
+    crate::managed_query::set_before_managed_open_hook(Some(Box::new(move || {
+        if accepted_once.replace(1) != 0 {
+            return;
+        }
+        // SAFETY: the executor runs on THIS thread, inside this test's own
+        // call, and the handle outlives the hook, which is cleared below.
+        drain_managed_local(unsafe { &*handle_for_hook });
+    })));
+    let after = ret2m_registry(&handle);
+    crate::managed_query::set_before_managed_open_hook(None);
+    let after = after.unwrap();
+
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    let census = handle.managed_query_census();
+    assert!(
+        census.stale_recaptures >= 1,
+        "the acceptance must have been caught by the stamp validation: {census:?}"
+    );
+    assert_eq!(census.failed_reads, 0, "{census:?}");
+    assert_ne!(
+        after.rows, before.rows,
+        "the answer is the NEW accepted frontier's table"
+    );
+    assert!(
+        after.generation > before.generation,
+        "and it is published at the advanced generation (G7): {} -> {}",
+        before.generation,
+        after.generation
+    );
+    ret2m_assert_matches_merged_oracle("after the acceptance barrier", &handle);
 }
 
 // ===== RET1: the PUBLIC IR commands over Managed storage =====

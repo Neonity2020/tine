@@ -1022,7 +1022,34 @@ complete row set. An ordinary text edit affects no key and reads no accepted
 property row. The walk's merged table while pending is built per read and never
 published; when a pending build is refused, readers fall back to the accepted
 table (a coherent older answer), never to a merged table from another pending
-revision.
+revision. Since RET2-Managed-Metadata those readers are query export and the
+test-only walk oracles only — the public registry request below does not fall
+back at all.
+
+**The PUBLIC registry snapshot (§7.1 `query_registry`) is that same captured
+read, and it never falls back.** It takes one short actor turn — readiness, the
+query stamp, the accepted table's own fallible cached acquisition, and the
+pending overlay's instance and required revision — and is then answered off the
+actor through the SAME snapshot/mask/registry acquisition a result query uses:
+capacity before any transaction, the overlay opened first, the accepted file
+second with the stamp validated inside its read transaction, the mask derived
+from the OPENED pending state, and the effective table patched under both. It
+loads no page document and rebuilds no merged table on the actor. Every
+non-answering disposition is the result routes' typed
+`query::QueryExecutionError` — readiness for `Busy` and for exhausted stale
+re-captures, `Cancelled` for a drain or close, `Unavailable(ReadFailed)` for a
+read that was attempted and did not answer — and none of them is published,
+memoized, or served as metadata. A failed pending projection takes the same
+bounded exact-instance repair after every snapshot and slot handle releases;
+failed creation stays terminal. The wire generation remains the ACCEPTED
+table's: a pending suffix never advances it, and only acceptance does, under the
+existing G7 rules. Two reads that opened the same overlay instance and revision
+share one patched table, whether they are metadata reads or result queries;
+two that opened different revisions never do.
+Lifecycle cancellation is checked again after constructing the registry wire
+snapshot and releasing its read transactions, before releasing job capacity or
+counting a successful metadata read. A drain during construction therefore
+returns `Cancelled`, just as it does for result construction.
 
 ## 2. Enrollment and synchronization state machine
 

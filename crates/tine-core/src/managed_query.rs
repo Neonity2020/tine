@@ -37,7 +37,7 @@
 //! R4a/R5a lanes'.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -103,6 +103,35 @@ pub(crate) struct PendingOverlayCapture {
     pub(crate) overlay: Arc<crate::managed_overlay::PendingOverlay>,
 }
 
+/// The SNAPSHOT half of a captured Managed read: everything both a result
+/// query and the public property-registry metadata read
+/// ([`crate::managed_metadata`]) open under.
+///
+/// Borrowed rather than owned, so [`ManagedQueryCapture`] keeps its fields
+/// exactly where the executor already reads them and the metadata capture owns
+/// the same values without a second copy of the query's execution inputs.
+///
+/// **D-14: there is ONE snapshot/mask/registry acquisition**
+/// ([`open_managed_read`]), not a metadata twin of it. A metadata read is the
+/// same two opens in the same order under the same job slot; what it does NOT
+/// have is an IR, a predicate, a row shape or a result budget, so none of those
+/// is fabricated to reach the shared open.
+pub(crate) struct ManagedReadInput<'a> {
+    pub(crate) job_epoch: crate::query_jobs::QueryJobEpoch,
+    /// The accepted projection's SQLite file.
+    pub(crate) path: &'a Path,
+    /// The pending overlay to merge with, when the actor held a pending suffix.
+    pub(crate) overlay: Option<&'a PendingOverlayCapture>,
+    pub(crate) stamp: &'a ManagedQueryStamp,
+    pub(crate) config: &'a ParseConfig,
+    /// The ACCEPTED property table the pending patch is applied to.
+    pub(crate) registry: &'a Arc<Registry>,
+    /// Whether this read consults effective property types at all (C6). A
+    /// result query without a `props` leaf reads none and carries the empty
+    /// registry; a metadata read IS the property table and always does.
+    pub(crate) props: bool,
+}
+
 /// The immutable inputs one actor turn captures for an accepted-frontier
 /// query. Everything the executor reads is HERE; it touches no actor state,
 /// no graph mutex and no live registry after the turn ends.
@@ -148,6 +177,21 @@ pub(crate) struct ManagedQueryCapture {
     /// by two executions with different reports, so the report may never be
     /// memoized beside it.
     pub(crate) report: crate::query::ir::QueryReport,
+}
+
+impl ManagedQueryCapture {
+    /// The snapshot half of this capture, as the shared open reads it.
+    pub(crate) fn read_input(&self) -> ManagedReadInput<'_> {
+        ManagedReadInput {
+            job_epoch: self.job_epoch,
+            path: &self.path,
+            overlay: self.overlay.as_ref(),
+            stamp: &self.stamp,
+            config: &self.config,
+            registry: &self.registry,
+            props: self.props,
+        }
+    }
 }
 
 /// Which answer one captured Managed execution produces (RET1).
@@ -259,6 +303,12 @@ pub(crate) struct ManagedQueryCensus {
     /// (a patched-registry cache hit costs nothing and is not counted). One
     /// per distinct pending state per property query, never one per read.
     pub(crate) registry_patches: AtomicUsize,
+    /// RET2: PUBLIC property-registry metadata reads that acquired a slot,
+    /// opened their snapshots off the actor and answered. Counted BESIDE
+    /// `statement_reads`, never inside it: a metadata read runs no descriptor
+    /// statement, so folding it into that counter would make every existing
+    /// "one database read" assertion mean something else.
+    pub(crate) metadata_reads: AtomicUsize,
 }
 
 /// A copy of [`ManagedQueryCensus`] for assertions.
@@ -271,6 +321,7 @@ pub(crate) struct ManagedQueryCensusSnapshot {
     pub(crate) failed_reads: usize,
     pub(crate) stale_recaptures: usize,
     pub(crate) registry_patches: usize,
+    pub(crate) metadata_reads: usize,
 }
 
 impl ManagedQueryCensus {
@@ -294,6 +345,10 @@ impl ManagedQueryCensus {
         self.registry_patches.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn note_metadata_read(&self) {
+        self.metadata_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> ManagedQueryCensusSnapshot {
         ManagedQueryCensusSnapshot {
@@ -303,6 +358,7 @@ impl ManagedQueryCensus {
             failed_reads: self.failed_reads.load(Ordering::Relaxed),
             stale_recaptures: self.stale_recaptures.load(Ordering::Relaxed),
             registry_patches: self.registry_patches.load(Ordering::Relaxed),
+            metadata_reads: self.metadata_reads.load(Ordering::Relaxed),
         }
     }
 
@@ -314,6 +370,7 @@ impl ManagedQueryCensus {
         self.failed_reads.store(0, Ordering::Relaxed);
         self.stale_recaptures.store(0, Ordering::Relaxed);
         self.registry_patches.store(0, Ordering::Relaxed);
+        self.metadata_reads.store(0, Ordering::Relaxed);
     }
 }
 
@@ -372,33 +429,111 @@ fn execute_on_slot(
     census: &ManagedQueryCensus,
     patched: &PatchedRegistryCache,
 ) -> ManagedQueryOutcome {
+    let opened = match open_managed_read(&capture.read_input(), slot, census, patched) {
+        Ok(opened) => opened,
+        Err(outcome) => return outcome,
+    };
+    let OpenedManagedRead {
+        overlay,
+        accepted,
+        mask,
+        registry,
+    } = opened;
+    match overlay {
+        // R5a: a capture taken while the actor held a pending local suffix is
+        // answered from TWO snapshots.
+        Some(overlay) => {
+            execute_pending_sources(capture, overlay, accepted, &mask, &registry, census)
+        }
+        None => execute_accepted_source(capture, accepted, &registry, census),
+    }
+}
+
+/// The two snapshots, the mask and the effective registry ONE captured Managed
+/// read opens under — shared by result execution and the public metadata read.
+///
+/// The field order IS the drop order: the overlay's read transaction ends
+/// before the accepted one's, and both end before the caller releases its slot.
+pub(crate) struct OpenedManagedRead {
+    /// The pending overlay, when the capture carried one.
+    pub(crate) overlay: Option<PhysicalProjectionQuerySnapshot>,
+    pub(crate) accepted: PhysicalProjectionQuerySnapshot,
+    /// The accepted page id of every path the OPENED overlay holds pending;
+    /// empty for an accepted-only read, by construction.
+    pub(crate) mask: Vec<[u8; 16]>,
+    /// The one registry both sources are lowered under, and the exact table a
+    /// metadata read answers with.
+    pub(crate) registry: Arc<Registry>,
+}
+
+/// Acquire the snapshots, the mask and the effective registry for one captured
+/// read, with the job slot already held.
+///
+/// The contract is the executor's, unchanged: the OVERLAY opens first at
+/// exactly one published state, the ACCEPTED file second with the capture's
+/// stamp validated inside its own read transaction (the order is the coherence
+/// proof — see the comment at the accepted open), the mask is derived from the
+/// OPENED pending state, and the registry is patched under those two snapshots
+/// and that mask. Nothing here holds the actor, `operation`, the overlay's
+/// state mutex beyond `open_snapshot`, or any graph mutex; nothing spawns a
+/// thread; nothing writes to either file.
+pub(crate) fn open_managed_read(
+    input: &ManagedReadInput<'_>,
+    slot: &JobSlot<'_>,
+    census: &ManagedQueryCensus,
+    patched: &PatchedRegistryCache,
+) -> Result<OpenedManagedRead, ManagedQueryOutcome> {
     #[cfg(test)]
     run_before_managed_open_hook();
-    // R5a: a capture taken while the actor held a pending local suffix is
-    // answered from TWO snapshots. It stays BELOW the hook, so every barrier
-    // gate still runs before the first snapshot of either file.
-    if let Some(pending) = capture.overlay.as_ref() {
-        return execute_pending_on_slot(capture, pending, slot, census, patched);
+    // Both routes stay BELOW the hook, so every barrier gate still runs before
+    // the first snapshot of either file.
+    match input.overlay {
+        Some(pending) => open_pending_sources(input, pending, slot, census, patched),
+        None => open_accepted_source(input, slot),
     }
+}
+
+/// The accepted-only open: one snapshot, the capture's own registry.
+fn open_accepted_source(
+    input: &ManagedReadInput<'_>,
+    slot: &JobSlot<'_>,
+) -> Result<OpenedManagedRead, ManagedQueryOutcome> {
     // The stamp is validated INSIDE the read transaction that will serve every
     // later statement, so an accepted batch cannot land between the check and
     // the rows. A projection that has moved on is `Stale`, not a failure: the
     // handle re-captures against the actor's new stamp.
-    let mut snapshot = match PhysicalProjectionQuerySnapshot::open_managed(
-        &capture.path,
-        capture.stamp.acceptance_sequence,
-        capture.stamp.frontier_digest,
+    let accepted = match PhysicalProjectionQuerySnapshot::open_managed(
+        input.path,
+        input.stamp.acceptance_sequence,
+        input.stamp.frontier_digest,
     ) {
         Ok(snapshot) => snapshot,
-        Err(MaterializationError::Stale { .. }) => return ManagedQueryOutcome::Stale,
-        Err(_) => return ManagedQueryOutcome::Failed("managed projection snapshot"),
+        Err(MaterializationError::Stale { .. }) => return Err(ManagedQueryOutcome::Stale),
+        Err(_) => return Err(ManagedQueryOutcome::Failed("managed projection snapshot")),
     };
     // Registered exactly as `DirectProjection::open_query_job` registers: a job
     // admitted before a drain but opening after it is cancelled here, so no
     // reader retains a handle to a file that is about to be replaced (I-21).
-    if !slot.register(snapshot.cancellation()) {
-        return ManagedQueryOutcome::Cancelled;
+    if !slot.register(accepted.cancellation()) {
+        return Err(ManagedQueryOutcome::Cancelled);
     }
+    // Nothing is pending, so nothing is masked and nothing is patched: the
+    // accepted table the actor cached IS the effective one.
+    Ok(OpenedManagedRead {
+        overlay: None,
+        accepted,
+        mask: Vec::new(),
+        registry: Arc::clone(input.registry),
+    })
+}
+
+/// The accepted-frontier read, over the snapshot the shared open validated.
+fn execute_accepted_source(
+    capture: &ManagedQueryCapture,
+    mut snapshot: PhysicalProjectionQuerySnapshot,
+    registry: &Arc<Registry>,
+    census: &ManagedQueryCensus,
+) -> ManagedQueryOutcome {
     let fts_ready = match probe_fts_ready(&mut snapshot) {
         Ok(ready) => ready,
         Err(outcome) => return outcome,
@@ -410,7 +545,8 @@ fn execute_on_slot(
     //
     // Empty `masked_pages` BY CONSTRUCTION: this arm runs only when the actor
     // held no pending local suffix (the pending route is
-    // `execute_pending_on_slot`).
+    // `execute_pending_sources`), so `open_accepted_source` returned an empty
+    // mask and the capture's own accepted registry.
     //
     // NOT `max_rows` as a cutoff: `total` is the number of matches SEEN for a
     // block answer, and the row AFTER the cap is what decides `exceeded` for a
@@ -422,7 +558,7 @@ fn execute_on_slot(
             &query,
             &LoweringInputs {
                 today: capture.today,
-                registry: &capture.registry,
+                registry,
                 masked_pages: &[],
                 cutoff: None,
                 compiled: &compiled,
@@ -576,21 +712,21 @@ fn answer_total(answer: &ManagedQueryAnswer) -> usize {
 pub(crate) const OVERLAY_FLUSH_WAIT: Duration =
     Duration::from_millis(crate::query_jobs::QUERY_JOB_WAIT.as_millis() as u64 / 10);
 
-/// The PENDING read: the overlay at the flushed state the capture required (or
+/// The PENDING open: the overlay at the flushed state the capture required (or
 /// a later one), plus the accepted projection with every pending page masked
-/// out of its statement, merged under one budget (R5a).
+/// out of its statement, under one effective registry (R5a/R5c).
 ///
 /// The order of the two opens is the coherence proof; see the comment at the
 /// accepted open. Nothing here holds the actor, `operation`, the overlay's
 /// state mutex beyond `open_snapshot`, or any graph mutex; nothing spawns a
 /// thread; nothing writes to either file.
-fn execute_pending_on_slot(
-    capture: &ManagedQueryCapture,
+fn open_pending_sources(
+    input: &ManagedReadInput<'_>,
     pending: &PendingOverlayCapture,
     slot: &JobSlot<'_>,
     census: &ManagedQueryCensus,
     patched: &PatchedRegistryCache,
-) -> ManagedQueryOutcome {
+) -> Result<OpenedManagedRead, ManagedQueryOutcome> {
     use crate::managed_overlay::OverlayOpen;
 
     // (1) The OVERLAY first, at exactly one published state. Only unfinished
@@ -601,18 +737,18 @@ fn execute_pending_on_slot(
         .open_snapshot(pending.required_revision, OVERLAY_FLUSH_WAIT)
     {
         OverlayOpen::Snapshot { snapshot, state } => (snapshot, state),
-        OverlayOpen::Pending => return ManagedQueryOutcome::Busy,
+        OverlayOpen::Pending => return Err(ManagedQueryOutcome::Busy),
         OverlayOpen::Failed(reason) => {
-            return ManagedQueryOutcome::PendingFailed {
+            return Err(ManagedQueryOutcome::PendingFailed {
                 instance: pending.overlay.instance(),
                 reason,
-            };
+            });
         }
-        OverlayOpen::Stale => return ManagedQueryOutcome::Stale,
-        OverlayOpen::Closed => return ManagedQueryOutcome::Cancelled,
+        OverlayOpen::Stale => return Err(ManagedQueryOutcome::Stale),
+        OverlayOpen::Closed => return Err(ManagedQueryOutcome::Cancelled),
     };
     if !slot.register(overlay.cancellation()) {
-        return ManagedQueryOutcome::Cancelled;
+        return Err(ManagedQueryOutcome::Cancelled);
     }
     // (2) The ACCEPTED file second, validated against the capture's stamp
     // inside its own read transaction.
@@ -629,33 +765,42 @@ fn execute_pending_on_slot(
     // statement below and present in the overlay. No page is read twice and no
     // page is missing; the answer is "as of overlay acquisition" (plan §2B).
     let mut accepted = match PhysicalProjectionQuerySnapshot::open_managed(
-        &capture.path,
-        capture.stamp.acceptance_sequence,
-        capture.stamp.frontier_digest,
+        input.path,
+        input.stamp.acceptance_sequence,
+        input.stamp.frontier_digest,
     ) {
         Ok(snapshot) => snapshot,
-        Err(MaterializationError::Stale { .. }) => return ManagedQueryOutcome::Stale,
-        Err(_) => return ManagedQueryOutcome::Failed("managed projection snapshot"),
+        Err(MaterializationError::Stale { .. }) => return Err(ManagedQueryOutcome::Stale),
+        Err(_) => return Err(ManagedQueryOutcome::Failed("managed projection snapshot")),
     };
     if !slot.register(accepted.cancellation()) {
-        return ManagedQueryOutcome::Cancelled;
+        return Err(ManagedQueryOutcome::Cancelled);
     }
     // (3) The mask: the accepted page id of every pending path.
     let mask = match overlay_mask_ids(&mut accepted, &state) {
         Ok(mask) => mask,
-        Err(outcome) => return outcome,
+        Err(outcome) => return Err(outcome),
     };
     // (3b) R5c: ONE registry for both sources, so the two files can never be
-    // lowered under different effective types. `capture.registry` is the
-    // ACCEPTED table the actor caches; for a query with a property leaf it is
-    // patched HERE, under these two snapshots and this mask, over exactly the
-    // keys the pending pages can have changed. A query with no property leaf
-    // reads no effective type at all (C6) and carries the empty registry.
-    let mut registry_stamp = capture.stamp.clone();
+    // lowered under different effective types — and, since RET2's metadata
+    // route, so a published property table can never disagree with the types a
+    // result query is lowered under at the same opened state. `input.registry`
+    // is the ACCEPTED table the actor caches; for a read that consults
+    // effective types it is patched HERE, under these two snapshots and this
+    // mask, over exactly the keys the pending pages can have changed. A query
+    // with no property leaf reads no effective type at all (C6) and carries the
+    // empty registry.
+    //
+    // The stamp the patch is keyed by describes the overlay instance/revision
+    // this open ACTUALLY landed on, never the one an older actor capture asked
+    // for: two captures whose required revisions differ but whose opened states
+    // are equal share one patch, and two that opened different revisions can
+    // never share one.
+    let mut registry_stamp = input.stamp.clone();
     registry_stamp.overlay_instance = Some(state.instance);
     registry_stamp.overlay_revision = Some(state.flushed_revision);
     let registry = match patched_registry(
-        capture,
+        input,
         &registry_stamp,
         &mut accepted,
         &mut overlay,
@@ -664,8 +809,27 @@ fn execute_pending_on_slot(
         patched,
     ) {
         Ok(registry) => registry,
-        Err(outcome) => return outcome,
+        Err(outcome) => return Err(outcome),
     };
+    Ok(OpenedManagedRead {
+        overlay: Some(overlay),
+        accepted,
+        mask,
+        registry,
+    })
+}
+
+/// The PENDING read: the overlay's rows merged with the masked accepted
+/// projection's under one construction budget (R5a), over the snapshots the
+/// shared open already validated.
+fn execute_pending_sources(
+    capture: &ManagedQueryCapture,
+    mut overlay: PhysicalProjectionQuerySnapshot,
+    mut accepted: PhysicalProjectionQuerySnapshot,
+    mask: &[[u8; 16]],
+    registry: &Arc<Registry>,
+    census: &ManagedQueryCensus,
+) -> ManagedQueryOutcome {
     // (4) Readiness PER SOURCE. The overlay's `fts_ready` is 1 by schema
     // seeding, but it is probed with the same statement and the same mapping
     // anyway: a file that says otherwise is damaged, not "still building".
@@ -687,7 +851,7 @@ fn execute_pending_on_slot(
                 &query,
                 &LoweringInputs {
                     today: capture.today,
-                    registry: &registry,
+                    registry,
                     masked_pages,
                     // NOT `max_rows`: `total` is the number of matches SEEN,
                     // and a buffered source may not be truncated at all.
@@ -701,7 +865,7 @@ fn execute_pending_on_slot(
         (
             query.anchor,
             lower_for(&[], overlay_fts),
-            lower_for(&mask, accepted_fts),
+            lower_for(mask, accepted_fts),
         )
     };
     let recency = |page: RecencyPage<'_>| {
@@ -836,11 +1000,13 @@ fn execute_pending_on_slot(
     outcome
 }
 
-/// The registry BOTH sources of a pending read are lowered under (R5c).
+/// The registry BOTH sources of a pending read are lowered under (R5c), and
+/// the table the public metadata read answers with (RET2).
 ///
 /// For a query with no property leaf this is the capture's empty registry and
-/// nothing is read (C6). For a query WITH one it is the accepted table the
-/// capture carries, patched over the affected keys under these two snapshots —
+/// nothing is read (C6). For a read WITH effective types it is the accepted
+/// table the capture carries, patched over the affected keys under these two
+/// snapshots —
 /// from the one-entry cache when the same pending state already paid for it,
 /// which is what makes a burst of property queries between two keystrokes cost
 /// one patch.
@@ -848,7 +1014,7 @@ fn execute_pending_on_slot(
 /// A patch refusal is `Failed` (D-3: a damaged read fails, never a silently
 /// wrong table); a cancelled read is `Cancelled`, exactly as the probes are.
 fn patched_registry(
-    capture: &ManagedQueryCapture,
+    input: &ManagedReadInput<'_>,
     snapshot_stamp: &ManagedQueryStamp,
     accepted: &mut PhysicalProjectionQuerySnapshot,
     overlay: &mut PhysicalProjectionQuerySnapshot,
@@ -856,10 +1022,10 @@ fn patched_registry(
     census: &ManagedQueryCensus,
     cache: &PatchedRegistryCache,
 ) -> Result<Arc<Registry>, ManagedQueryOutcome> {
-    if !capture.props {
-        return Ok(Arc::clone(&capture.registry));
+    if !input.props {
+        return Ok(Arc::clone(input.registry));
     }
-    let base_generation = capture.registry.generation();
+    let base_generation = input.registry.generation();
     if let Some(hit) = cache.get(snapshot_stamp, base_generation) {
         return Ok(hit);
     }
@@ -867,8 +1033,8 @@ fn patched_registry(
         accepted,
         overlay,
         mask,
-        &capture.registry,
-        &capture.config,
+        input.registry,
+        input.config,
     )
     .map_err(|error| match error {
         crate::managed_registry_patch::PatchError::Cancelled => ManagedQueryOutcome::Cancelled,
@@ -1059,6 +1225,30 @@ impl ManagedQueryShared {
             return outcome;
         }
         execute_managed_query(
+            capture,
+            &self.jobs,
+            &self.census,
+            &self.patched_registry,
+            self.job_wait(),
+        )
+    }
+
+    /// Run the PUBLIC metadata executor — or, under test, the next injected
+    /// outcome, from the SAME queue the result routes consume, so one gate can
+    /// drive both routes through the same transition.
+    ///
+    /// An injected `Answered` is a result answer and is deliberately not
+    /// reshaped into metadata: it stays a non-answer here and the handle
+    /// classifies it as a snapshot contradicting itself.
+    pub(crate) fn execute_metadata(
+        &self,
+        capture: &crate::managed_metadata::ManagedMetadataCapture,
+    ) -> crate::managed_metadata::ManagedMetadataOutcome {
+        #[cfg(test)]
+        if let Some(outcome) = self.injected_outcomes.lock().unwrap().pop_front() {
+            return crate::managed_metadata::ManagedMetadataOutcome::NotAnswered(outcome);
+        }
+        crate::managed_metadata::execute_managed_metadata(
             capture,
             &self.jobs,
             &self.census,
