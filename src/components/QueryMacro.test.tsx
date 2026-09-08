@@ -235,6 +235,43 @@ describe("QueryMacro sheet integration", () => {
     }
   });
 
+  it("keeps the live DONE edit when an early committed query still returns the older TODO row", async () => {
+    setWorkflow("todo");
+    loadQueryDoc("{{query (task TODO)}}");
+    const older = blockResult(queryGroups(["todo"]));
+    let answer = older;
+    const run = vi.spyOn(backend(), "queryRun").mockImplementation(async () => answer);
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      const row = await vi.waitFor(() => {
+        const found = root.querySelector<HTMLElement>('[data-block-id="todo"]');
+        expect(found).not.toBeNull();
+        return found!;
+      });
+      row.querySelector<HTMLElement>(".block-task-checkbox")!
+        .dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      bumpDataRev();
+      expect(doc.byId.todo.raw).toMatch(/^DONE /);
+      await new Promise((resolve) => setTimeout(resolve, 2_050));
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+      expect(root.querySelector('[data-block-id="todo"]')).toBe(row);
+      expect(row.querySelector(".block-marker")?.textContent).toBe("DONE");
+      expect(doc.byId.todo.raw).toMatch(/^DONE /);
+      expect(root.querySelector(".query-count")?.textContent).toBe("1");
+
+      // Later ordinary projection progress updates membership without rolling
+      // back the independently live editor/source object in the meantime.
+      answer = blockResult(queryGroups([]));
+      bumpDataRev();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() => expect(root.querySelector('[data-block-id="todo"]')).toBeNull());
+      expect(root.querySelector(".query-count")?.textContent).toBe("0");
+      expect(doc.byId.todo.raw).toMatch(/^DONE /);
+    } finally {
+      dispose();
+    }
+  });
+
   it("coalesces checkbox reversal and Undo into the latest grace refresh", async () => {
     setWorkflow("todo");
     loadQueryDoc("{{query (task TODO)}}");

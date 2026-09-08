@@ -130,11 +130,15 @@ try {
       anchorConnected:old.isConnected,groupConnected:window.__queryScrollGroup.isConnected,
       count:document.querySelector(".query-count")?.textContent};
   });
-  await browser.saveScreenshot(path.join(tmp,"after.png"));
   const report={app,hostPage,queryText,flatQuery,before,duringGrace,after,anchorDrift:after.anchorTop-before.anchorTop};
   fs.writeFileSync(path.join(tmp,"report.json"),JSON.stringify(report,null,2));
   console.log(JSON.stringify(report));
   if(!after.anchorConnected || Math.abs(report.anchorDrift)>24) throw new Error("Unchanged result anchor moved or remounted after task completion");
+  // The assertions above, not image acquisition, are this geometry gate.
+  // WebKit's second screenshot can stall after the dynamic row removal even
+  // though script evaluation and repaint complete. Keep the exact measured
+  // geometry and post-refresh DOM; before.png remains the visual baseline.
+  fs.writeFileSync(path.join(tmp,"after.html"),await browser.execute(()=>document.body.outerHTML));
 } catch(error) {
   try { await browser?.saveScreenshot(path.join(tmp,"failure.png")); fs.writeFileSync(path.join(tmp,"failure.html"),await browser.execute(()=>document.body.outerHTML)); } catch {}
   console.error(String(error)); process.exitCode=1;

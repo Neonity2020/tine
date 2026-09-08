@@ -870,7 +870,10 @@ format, graph root or active route changes underneath it.
 
 ## 14. Live result editing and refresh retention
 
-Query result blocks use the ordinary editor, save path and Undo stack. Crossing
+Query result blocks use the ordinary editor, save path and Undo stack. A coherent
+older SQL membership answer must not replace a newer live block edit with its
+older payload: the mounted result continues to use the ordinary source object.
+Crossing
 the open/completed task boundary updates live block content immediately.
 `QUERY_COMPLETION_GRACE_MS` is 2,000 milliseconds: a query displaying the
 interacted block defers membership reads during this presentation grace, retaining
