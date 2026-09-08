@@ -650,7 +650,6 @@ fn a_huge_page_with_one_match_costs_one_descriptor_row_and_one_payload_row() {
     // projection alone. The census below records every parsed document the
     // projection-side readers load; a dispatched query contributes none.
     corpus.graph.reset_direct_projection_candidate_probe_test();
-    corpus.graph.clear_query_memos_test();
     let today = corpus
         .graph
         .run_query_bounded(source, usize::MAX, usize::MAX)
@@ -1776,10 +1775,7 @@ struct PublicRun<T> {
 }
 
 fn measured<T>(corpus: &Corpus, run: impl FnOnce(&crate::model::Graph) -> T) -> PublicRun<T> {
-    // §5.9's pre-view memo would answer the second run of a shape from the
-    // first one's rows, and a memo hit reads exactly like a walk that never
-    // happened. Every measurement below is a COMPUTATION.
-    corpus.graph.clear_query_memos_test();
+    // Every request computes its answer; count SQLite work and oracle/page reads separately.
     corpus.graph.reset_direct_projection_candidate_probe_test();
     let before = corpus.graph.direct_projection_statement_reads_test();
     let answer = run(&corpus.graph);
@@ -2265,7 +2261,6 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
         for context in &contexts {
             let label = format!("{source} on {:?}", context.current_page);
 
-            graph.clear_query_memos_test();
             graph.reset_direct_projection_candidate_probe_test();
             let before = graph.direct_projection_statement_reads_test();
             let result = crate::query::run_query_result_ir(&graph, &query, &view, bounds, context)
@@ -2343,7 +2338,6 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
         .filter(|entry| entry.name.eq_ignore_ascii_case("shared title"))
         .count();
     let (query, view) = ret1_parse("@page and name = 'shared title'", QueryInput::Tql, today);
-    graph.clear_query_memos_test();
     let shared =
         crate::query::run_query_result_ir(&graph, &query, &view, bounds, &ExecutionContext::none())
             .expect("the ready projection answers the public IR route");
@@ -2366,7 +2360,6 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
     // day would agree with a walk that ignored them too.
     let rows_of = |source: &str, input: QueryInput, context: &ExecutionContext| {
         let (query, view) = ret1_parse(source, input, today);
-        graph.clear_query_memos_test();
         match crate::query::run_query_result_ir(&graph, &query, &view, bounds, context)
             .expect("the ready projection answers the public IR route")
             .rows
@@ -2559,4 +2552,30 @@ fn the_public_ir_route_refuses_without_walking_and_keeps_its_report() {
             "{label}: the refusal differs from the walk's"
         );
     }
+}
+
+#[test]
+fn fts_readiness_uses_owned_image_and_propagates_cancellation() {
+    let root = scratch("fts-owned-image");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("projection.sqlite");
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE search_fts_build(singleton INTEGER PRIMARY KEY, phase INTEGER); INSERT INTO search_fts_build VALUES(1, 1);").unwrap();
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    assert!(crate::query::results::probe_fts_ready(&mut snapshot).unwrap());
+    writer
+        .execute("UPDATE search_fts_build SET phase = 0", [])
+        .unwrap();
+    assert!(crate::query::results::probe_fts_ready(&mut snapshot).unwrap());
+    let mut newer = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    assert!(!crate::query::results::probe_fts_ready(&mut newer).unwrap());
+    snapshot.cancellation().cancel();
+    assert!(matches!(
+        crate::query::results::probe_fts_ready(&mut snapshot),
+        Err(ResultReadError::Cancelled)
+    ));
+    drop(newer);
+    drop(snapshot);
+    drop(writer);
+    std::fs::remove_dir_all(root).unwrap();
 }

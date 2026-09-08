@@ -75,7 +75,7 @@ pub(crate) struct QueryJobOwner {
 
 /// The admission generation captured with immutable query inputs. Ordinary
 /// edits do not change it; projection lifecycle drains do.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QueryJobEpoch(u64);
 
 /// A cancellation boundary whose completion can be awaited outside the actor.

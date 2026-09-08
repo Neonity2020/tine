@@ -17,8 +17,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
     PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
-    PhysicalProjectionQueryProgress, PhysicalProjectionQueryReader,
-    PhysicalProjectionQuerySnapshot, PhysicalProjectionQueryTarget, PhysicalProperty,
+    PhysicalProjectionQueryReader, PhysicalProjectionQuerySnapshot, PhysicalProperty,
     PhysicalQueryValue, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
 use unicode_normalization::UnicodeNormalization;
@@ -181,8 +180,13 @@ pub(crate) enum WarmStreamItem {
     },
 }
 
+enum QueryCaptureRequirement {
+    CurrentSnapshot,
+    StrictGeneration(u64),
+}
+
 struct PendingQueryCapture {
-    generation: u64,
+    requirement: QueryCaptureRequirement,
     registry_sensitivity: RegistrySensitivity,
     slot: crate::query_jobs::OwnedJobSlot,
     reply: std::sync::mpsc::SyncSender<QueryJobOpen>,
@@ -208,7 +212,6 @@ fn reject_query_captures(captures: Vec<PendingQueryCapture>) {
 
 #[derive(Default)]
 struct PendingProjection {
-    saved_query_target: Option<PhysicalProjectionQueryTarget>,
     // Each capture owns one slot from the shared two-job cap.
     captures: Vec<PendingQueryCapture>,
     full: Option<PendingFull>,
@@ -305,7 +308,6 @@ impl PendingProjection {
 
 struct ProjectionShared {
     path: PathBuf,
-    query_progress: PhysicalProjectionQueryProgress,
     pending: Mutex<PendingProjection>,
     changed: Condvar,
     ready: AtomicBool,
@@ -414,17 +416,10 @@ impl ProjectionShared {
             let mut pending = self.pending.lock().unwrap();
             let fence = if close {
                 pending.stop = true;
-                self.query_progress.close();
-                pending.saved_query_target = None;
                 self.query_jobs.begin_close()
             } else {
-                // Reset/config replacement invalidates waits as well as jobs.
+                // Reset/config replacement invalidates existing reader jobs.
                 // Ordinary page deltas never enter this lifecycle boundary.
-                let _ = self.query_progress.restart();
-                if pending.saved_query_target.is_some() {
-                    pending.saved_query_target =
-                        Some(self.query_progress.target(pending.latest_generation));
-                }
                 self.query_jobs.begin_drain()
             };
             (fence, std::mem::take(&mut pending.captures))
@@ -458,9 +453,30 @@ impl ProjectionShared {
     }
 }
 
+/// Completeness gate shared by admission and producer snapshot capture.
+/// Live queries may read an older committed image, but a partial warm stream,
+/// replacement or failed write must not be mistaken for a complete graph.
+fn query_capture_available(
+    shared: &ProjectionShared,
+    requirement: &QueryCaptureRequirement,
+) -> bool {
+    match requirement {
+        QueryCaptureRequirement::CurrentSnapshot => {
+            let pending = shared.pending.lock().unwrap();
+            !pending.stop
+                && !pending.rebuild
+                && !pending.needs_full
+                && pending.warm_stream.is_none()
+                && shared.validated.load(Ordering::Acquire)
+                && !shared.worker_failed.load(Ordering::Acquire)
+        }
+        QueryCaptureRequirement::StrictGeneration(generation) => shared.ready_at(*generation),
+    }
+}
+
 fn capture_query_job(
     shared: &ProjectionShared,
-    cache_generation: u64,
+    requirement: QueryCaptureRequirement,
     registry_sensitivity: RegistrySensitivity,
     slot: crate::query_jobs::OwnedJobSlot,
 ) -> QueryJobOpen {
@@ -472,55 +488,56 @@ fn capture_query_job(
         return QueryJobOpen::Cancelled;
     }
     let validate = || {
-        if shared.ready_at(cache_generation) {
+        if query_capture_available(shared, &requirement) {
             Ok(())
         } else {
             Err(tine_storage::sqlite::MaterializationError::Incomplete(
-                "projection generation moved during snapshot acquisition".into(),
+                "projection became unavailable during snapshot acquisition".into(),
             ))
         }
     };
     let mut snapshot = match PhysicalProjectionQuerySnapshot::open_direct(&shared.path, validate) {
         Ok(snapshot) => snapshot,
         // The validator is the only `Incomplete` this call can produce and
-        // it means the generation moved: not a defect. Anything else is
-        // an unopenable or unreadable file.
-        Err(_) if !shared.ready_at(cache_generation) => return QueryJobOpen::NotReady,
+        // it means the acquisition condition changed, not a corrupt read.
+        // Anything else is an unopenable or unreadable file.
+        Err(_) if !query_capture_available(shared, &requirement) => return QueryJobOpen::NotReady,
         Err(_) => return QueryJobOpen::Failed,
     };
     if !slot.register(snapshot.cancellation()) {
         return QueryJobOpen::Cancelled;
     }
     let session_pages = Arc::clone(&shared.session_pages.lock().unwrap());
-    let registry = match registry_sensitivity {
-        RegistrySensitivity::Insensitive => {
-            // Preserve the committed-owner readiness gate without copying any
-            // registry state a property-free query cannot observe.
-            if shared.committed_registry.lock().unwrap().is_none() {
-                return QueryJobOpen::NotReady;
-            }
-            None
-        }
-        RegistrySensitivity::Required => {
-            let owner = shared.committed_registry.lock().unwrap();
-            let Some(owner) = owner.as_ref() else {
-                return QueryJobOpen::NotReady;
-            };
-            #[cfg(test)]
-            shared
-                .registry_capture_attempts
-                .fetch_add(1, Ordering::Relaxed);
-            let capture = snapshot
-                .query_revision()
-                .ok()
-                .and_then(|revision| owner.cache.capture(revision, &owner.config).ok());
-            let Some(capture) = capture else {
-                return QueryJobOpen::Failed;
-            };
-            Some(capture)
-        }
+    let query_revision = match snapshot.query_revision() {
+        Ok(revision) => revision,
+        Err(_) => return QueryJobOpen::Failed,
     };
-    if !shared.ready_at(cache_generation) {
+    // Config is an input to every query, even when no property registry is
+    // needed. Capture it beside this transaction, never from the live Graph.
+    let (config, registry) = {
+        let owner = shared.committed_registry.lock().unwrap();
+        let Some(owner) = owner.as_ref() else {
+            return QueryJobOpen::NotReady;
+        };
+        let registry = match registry_sensitivity {
+            RegistrySensitivity::Insensitive => None,
+            RegistrySensitivity::Required => {
+                #[cfg(test)]
+                shared
+                    .registry_capture_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let Ok(capture) = owner.cache.capture(query_revision, &owner.config) else {
+                    return QueryJobOpen::Failed;
+                };
+                Some(capture)
+            }
+        };
+        (Arc::clone(&owner.config), registry)
+    };
+    if slot.is_cancelled() {
+        return QueryJobOpen::Cancelled;
+    }
+    if !query_capture_available(shared, &requirement) {
         return QueryJobOpen::NotReady;
     }
     #[cfg(test)]
@@ -529,14 +546,15 @@ fn capture_query_job(
         _slot: slot,
         snapshot,
         session_pages,
+        config,
+        query_revision,
         registry,
         registry_owner: Arc::clone(&shared.committed_registry),
     })
 }
 
 /// One admitted, snapshot-owning Direct query job (R3). Everything the result
-/// read needs is captured here, at acquisition, under the ready-generation
-/// validation: the pinned read transaction, the compiled-regex program already
+/// read needs is captured here at a complete producer boundary: the pinned read transaction, the compiled-regex program already
 /// installed on its connection, and the identity policy input. Dropping the
 /// job releases the transaction and the capacity slot.
 pub(crate) struct DirectQueryJob {
@@ -548,6 +566,9 @@ pub(crate) struct DirectQueryJob {
     /// The pages whose rows this process lowered (see
     /// `ProjectionShared::session_pages`), as of the snapshot.
     pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    pub(crate) config: Arc<ParseConfig>,
+    /// Actual acquired SQL image, distinct from the admission target.
+    pub(crate) query_revision: u64,
     registry: Option<RegistryCapture>,
     registry_owner: SharedCommittedRegistry,
 }
@@ -654,7 +675,6 @@ impl DirectProjection {
     pub(crate) fn start(path: PathBuf) -> std::io::Result<Self> {
         let shared = Arc::new(ProjectionShared {
             path,
-            query_progress: PhysicalProjectionQueryProgress::new(),
             pending: Mutex::new(PendingProjection::default()),
             changed: Condvar::new(),
             ready: AtomicBool::new(false),
@@ -702,7 +722,6 @@ impl DirectProjection {
     pub(crate) fn request_rebuild(&self) {
         let mut pending = self.shared.pending.lock().unwrap();
         pending.rebuild = true;
-        pending.saved_query_target = None;
         self.shared.ready.store(false, Ordering::Release);
     }
 
@@ -724,7 +743,6 @@ impl DirectProjection {
         });
         pending.deltas.clear();
         pending.latest_generation = generation;
-        pending.saved_query_target = Some(self.shared.query_progress.target(generation));
         // R6: a complete parsed snapshot owns readiness from here. A warm
         // validation or stream still in flight must not lower beside it — its
         // deltas carry no order positions and would erase the snapshot's.
@@ -775,7 +793,6 @@ impl DirectProjection {
             parse_config,
         });
         pending.latest_generation = generation;
-        pending.saved_query_target = Some(self.shared.query_progress.target(generation));
         self.shared.changed.notify_all();
         true
     }
@@ -898,7 +915,6 @@ impl DirectProjection {
         pending.warm_stream = None;
         pending.order = None;
         pending.needs_full = true;
-        pending.saved_query_target = None;
         self.shared.ready.store(false, Ordering::Release);
         self.shared.changed.notify_all();
         false
@@ -988,32 +1004,13 @@ impl DirectProjection {
         self.shared.ready.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
         pending.record_delta(generation, delta);
-        pending.saved_query_target =
-            Some(self.shared.query_progress.target(pending.latest_generation));
         self.shared.changed.notify_one();
     }
 
     pub(crate) fn mark_stale(&self) {
         self.shared.ready.store(false, Ordering::Release);
-        // This source change has no exact delta yet. New requests must await
-        // reconciliation; an already coherent read is still allowed to finish.
-        self.shared.pending.lock().unwrap().saved_query_target = None;
-    }
-
-    /// Clone the target recorded at enqueue, never a moving source generation.
-    /// The next query-admission packet consumes this beside the existing job
-    /// owner; reference consumers continue to use strict `ready_at`.
-    pub(crate) fn saved_query_target(&self) -> Option<PhysicalProjectionQueryTarget> {
-        self.shared
-            .pending
-            .lock()
-            .unwrap()
-            .saved_query_target
-            .clone()
-    }
-
-    pub(crate) fn query_progress(&self) -> PhysicalProjectionQueryProgress {
-        self.shared.query_progress.clone()
+        // Source-oriented navigation waits for reconciliation; live queries
+        // can still read the complete committed image.
     }
 
     /// A reference read which races an already-queued one-page fact delta is
@@ -1249,6 +1246,39 @@ impl DirectProjection {
         if !self.ready_at(cache_generation) {
             return QueryJobOpen::NotReady;
         }
+        self.enqueue_query_capture(
+            QueryCaptureRequirement::StrictGeneration(cache_generation),
+            registry_sensitivity,
+        )
+    }
+
+    /// Existing reader lifecycle identity; ordinary saves do not advance it.
+    pub(crate) fn query_epoch(&self) -> crate::query_jobs::QueryJobEpoch {
+        self.shared.query_jobs.capture_epoch()
+    }
+
+    /// Acquire the current complete projection without waiting for a saved edit.
+    /// Ordinary queued deltas do not invalidate the committed image.
+    pub(crate) fn open_current_query_job(
+        &self,
+        registry_sensitivity: RegistrySensitivity,
+    ) -> QueryJobOpen {
+        if !self.shared.worker_available.load(Ordering::Acquire)
+            || !query_capture_available(&self.shared, &QueryCaptureRequirement::CurrentSnapshot)
+        {
+            return QueryJobOpen::NotReady;
+        }
+        self.enqueue_query_capture(
+            QueryCaptureRequirement::CurrentSnapshot,
+            registry_sensitivity,
+        )
+    }
+
+    fn enqueue_query_capture(
+        &self,
+        requirement: QueryCaptureRequirement,
+        registry_sensitivity: RegistrySensitivity,
+    ) -> QueryJobOpen {
         #[cfg(test)]
         if self
             .shared
@@ -1278,11 +1308,21 @@ impl DirectProjection {
             if !self.shared.worker_available.load(Ordering::Acquire) {
                 return QueryJobOpen::Failed;
             }
-            if !self.ready_at(cache_generation) {
+            let available = match &requirement {
+                QueryCaptureRequirement::CurrentSnapshot => {
+                    !pending.rebuild
+                        && !pending.needs_full
+                        && pending.warm_stream.is_none()
+                        && self.shared.validated.load(Ordering::Acquire)
+                        && !self.shared.worker_failed.load(Ordering::Acquire)
+                }
+                QueryCaptureRequirement::StrictGeneration(generation) => self.ready_at(*generation),
+            };
+            if !available {
                 return QueryJobOpen::NotReady;
             }
             pending.captures.push(PendingQueryCapture {
-                generation: cache_generation,
+                requirement,
                 registry_sensitivity,
                 slot,
                 reply,
@@ -1377,7 +1417,7 @@ impl DirectProjection {
         matches!(
             self.seam_read(
                 cache_generation,
-                crate::managed_query::FTS_READY_PROBE_SQL,
+                crate::query::results::FTS_READY_PROBE_SQL,
                 &[],
             ),
             StatementRead::Rows(rows)
@@ -1907,7 +1947,6 @@ struct ProjectionWorkerExit(Arc<ProjectionShared>);
 impl Drop for ProjectionWorkerExit {
     fn drop(&mut self) {
         self.0.worker_available.store(false, Ordering::Release);
-        self.0.query_progress.close();
         let captures = std::mem::take(&mut self.0.pending.lock().unwrap().captures);
         reject_query_captures(captures);
         let resources = self.0.worker_resources.lock().unwrap().take();
@@ -2003,7 +2042,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             for capture in captures {
                 let job = capture_query_job(
                     &shared,
-                    capture.generation,
+                    capture.requirement,
                     capture.registry_sensitivity,
                     capture.slot,
                 );
@@ -2048,7 +2087,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             let inventory = (order.is_some() || warm.is_some() || unordered)
                 .then(|| pending.ordered_inventory());
             WorkerTurn {
-                query_target: shared.query_progress.target(pending.latest_generation),
                 full: pending.full.take(),
                 warm,
                 deltas,
@@ -2060,7 +2098,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             }
         };
         let WorkerTurn {
-            mut query_target,
             full,
             warm,
             deltas,
@@ -2112,7 +2149,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 if config_changed && !(rebuild || requires_full_rebuild || writer_slot.is_none()) {
                     let fence = shared.cancel_queued_captures(false);
                     shared.query_jobs.wait_for_drain(fence);
-                    query_target = shared.query_progress.target(latest_generation);
                 }
                 if rebuild || requires_full_rebuild || writer_slot.is_none() {
                     // R3: interrupt and drain every query job first, so no
@@ -2122,7 +2158,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     // rebuilt under a live reader (D-3).
                     let fence = shared.cancel_queued_captures(false);
                     shared.query_jobs.wait_for_drain(fence);
-                    query_target = shared.query_progress.target(latest_generation);
                     // Drop every connection before the disposable file can be
                     // replaced; a reader must not retain an old file handle.
                     let mut reader = shared.reader.lock().unwrap();
@@ -2194,7 +2229,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         .query_revision()
                         .map_err(|error| error.to_string())?
                 };
-                applied.query_revision = revision;
                 #[cfg(test)]
                 if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
                     hook();
@@ -2239,10 +2273,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let applied = match applied {
             Ok(applied) => applied,
             Err(error) => {
-                let _ = shared.query_progress.fail(
-                    &query_target,
-                    "Direct projection update failed; reconciliation is required".into(),
-                );
                 shared.committed_registry.lock().unwrap().take();
                 requires_full_rebuild = true;
                 shared.ready.store(false, Ordering::Release);
@@ -2286,33 +2316,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         if stream_closed {
             pending.warm_stream = None;
         }
-        if !pending.stop
-            && !pending.rebuild
-            && !pending.needs_full
-            && !applied.stream_open
-            && shared.validated.load(Ordering::Acquire)
-        {
-            // Coverage belongs to this complete turn, not to queue emptiness.
-            // A subsequent query must still acquire its snapshot at a complete
-            // producer boundary and use that snapshot's actual image identity.
-            if shared
-                .query_progress
-                .publish(&query_target, applied.query_revision)
-                .is_err()
-            {
-                let _ = shared.query_progress.fail(
-                    &query_target,
-                    "Direct projection coverage could not be published".into(),
-                );
-                requires_full_rebuild = true;
-                shared.committed_registry.lock().unwrap().take();
-                shared.worker_failed.store(true, Ordering::Release);
-                shared.ready.store(false, Ordering::Release);
-                drop(pending);
-                shared.changed.notify_all();
-                continue;
-            }
-        }
         if !pending.rebuild
             && !pending.has_work()
             && pending.warm_stream.is_none()
@@ -2331,7 +2334,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
 
 /// One worker turn's queued work (R6 widened it beyond full + deltas).
 struct WorkerTurn {
-    query_target: PhysicalProjectionQueryTarget,
     full: Option<PendingFull>,
     warm: Option<PendingWarm>,
     deltas: BTreeMap<String, (u64, PageDelta)>,
@@ -2383,7 +2385,6 @@ struct AppliedPages {
 
 #[derive(Default)]
 struct AppliedTurn {
-    query_revision: u64,
     pages: AppliedPages,
     registry_pages: PageRegistryMetadata,
     /// R6: the warm validation's verdict, when this turn ran one.
@@ -2979,6 +2980,24 @@ pub(crate) fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_query_producer_has_no_saved_edit_or_answer_cache_protocol() {
+        let source = include_str!("direct_projection.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for forbidden in [
+            "PhysicalProjectionQueryProgress",
+            "PhysicalProjectionQueryTarget",
+            "saved_query_target",
+            "QueryResultMemo",
+            "SharedResultMemo",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "Direct queries must use current SQLite and existing reader lifecycle: {forbidden}"
+            );
+        }
+    }
+
     use super::*;
     use crate::model::Graph;
     use std::sync::{mpsc, Arc, Mutex};
@@ -3073,6 +3092,8 @@ mod tests {
             snapshot,
             _slot: slot,
             session_pages: Arc::new(HashSet::new()),
+            config: Arc::new(ParseConfig::default()),
+            query_revision: 0,
             registry: None,
             registry_owner: Arc::new(Mutex::new(None)),
         };
@@ -3108,123 +3129,199 @@ mod tests {
     }
 
     #[test]
-    fn query_target_covers_completed_save_without_waiting_for_later_queued_save() {
-        use tine_storage::sqlite::PhysicalProjectionQueryProgressOutcome as Outcome;
+    fn public_query_replacement_returns_readiness_for_a_new_request() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = r6_graph("fixed-target-coverage");
-        let database = root.join("private/projection.sqlite");
+        let root = r6_graph("public-target-replacement-retry");
         let graph = Graph::open(&root);
-        graph.attach_direct_projection(database.clone()).unwrap();
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
         graph.warm_cache();
         wait_ready(&graph);
         let projection = graph.direct_projection_test().unwrap();
-        let progress = projection.query_progress();
-        let request = progress.request();
-        let entry = graph.list_pages().into_iter().next().unwrap();
-        let mut page = graph.load_page(&entry).unwrap();
-        let baseline = page.rev.clone();
-        page.blocks[0].raw = "TODO target A".into();
-        let (a_paused, a_observed) = std::sync::mpsc::channel();
-        let (a_resume, a_resumed) = std::sync::mpsc::channel();
-        *projection.shared.after_sql_commit.lock().unwrap() = Some(Box::new(move || {
-            a_paused.send(()).unwrap();
-            a_resumed.recv().unwrap();
-        }));
-        graph.save_page(&page, baseline.as_deref()).unwrap();
-        a_observed.recv_timeout(Duration::from_secs(3)).unwrap();
-        let a = projection.saved_query_target().unwrap();
-        let a_generation = graph.cache_generation();
-        let before_publication = progress.wait_for_target(&a, &request, Duration::ZERO);
-
-        let (b_paused, b_observed) = std::sync::mpsc::channel();
-        let (b_resume, b_resumed) = std::sync::mpsc::channel();
-        *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
-            b_paused.send(()).unwrap();
-            b_resumed.recv().unwrap();
-        }));
-        let mut page = graph.load_page(&entry).unwrap();
-        let baseline = page.rev.clone();
-        page.blocks[0].raw = "TODO target B".into();
-        graph.save_page(&page, baseline.as_deref()).unwrap();
-        let b = projection.saved_query_target().unwrap();
-        a_resume.send(()).unwrap();
-        b_observed.recv_timeout(Duration::from_secs(3)).unwrap();
-
-        let a_covered = progress.wait_for_target(&a, &request, Duration::ZERO);
-        let b_pending = progress.wait_for_target(&b, &request, Duration::ZERO);
-        let strict_a_ready = projection.ready_at(a_generation);
-        let slots = projection.active_query_jobs_test();
-        let actual_revision = {
-            let mut snapshot =
-                PhysicalProjectionQuerySnapshot::open_direct(&database, || Ok(())).unwrap();
-            snapshot.query_revision().unwrap()
-        };
-        // Release the barrier before assertions so a failing fixture cannot
-        // strand the writer or its directory lease.
-        b_resume.send(()).unwrap();
+        let old_epoch = projection.query_epoch();
+        graph.direct_projection_inject_read_failure_test();
+        let first = graph.run_query_bounded("(task TODO)", 100, 1 << 20);
+        assert!(
+            matches!(first, Err(crate::query::QueryExecutionError::NotReady(_))),
+            "replacement must reach the existing automatic readiness retry"
+        );
         wait_ready(&graph);
-        assert_eq!(before_publication, Outcome::Pending);
-        assert_eq!(
-            a_covered,
-            Outcome::Ready {
-                minimum_revision: actual_revision
-            }
-        );
-        assert_eq!(b_pending, Outcome::Pending);
-        assert!(
-            !strict_a_ready,
-            "old strict readiness still waits for queue convergence"
-        );
-        assert_eq!(slots, 0, "coverage waits must not admit a query job");
-        assert!(
-            matches!(progress.wait_for_target(&b, &request, Duration::ZERO),
-            Outcome::Ready { minimum_revision } if minimum_revision > actual_revision)
-        );
+        assert_eq!(projection.active_query_jobs_test(), 0);
+        assert_ne!(projection.query_epoch(), old_epoch);
+        let result = graph
+            .run_query_bounded("(task TODO)", 100, 1 << 20)
+            .unwrap();
+        assert_eq!(result.total, 3);
         assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn query_target_is_withheld_before_initialization_and_after_unrepresented_invalidation() {
-        use tine_storage::sqlite::PhysicalProjectionQueryProgressOutcome as Outcome;
+    fn current_snapshot_capture_runs_before_later_queued_save() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
-        let root = r6_graph("target-inventory-boundary");
+        let root = r6_graph("target-capture-before-later-save");
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let entry = graph.list_pages().into_iter().next().unwrap();
+        let (paused, observed) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+            paused.send(()).unwrap();
+            resumed.recv().unwrap();
+        }));
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO save B".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let query_projection = Arc::clone(&projection);
+        let query = std::thread::spawn(move || {
+            query_projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while projection
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .captures
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let capture_queued = !projection
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .captures
+            .is_empty();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO save C".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        resume.send(()).unwrap();
+        let result = query.join().unwrap();
+        wait_ready(&graph);
+        assert!(
+            capture_queued,
+            "covered target must enter the bounded capture queue"
+        );
+        let QueryJobOpen::Job(job) = result else {
+            panic!("queued C must not reject the earlier covered query");
+        };
+        let QueryJobOpen::Job(current) = projection.open_query_job(graph.cache_generation()) else {
+            panic!("final C snapshot");
+        };
+        assert!(
+            job.query_revision < current.query_revision,
+            "capture must occur between B and C"
+        );
+        assert!(!job.is_cancelled());
+        drop(current);
+        drop(job);
+        assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("target-acquired-image");
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let QueryJobOpen::Job(initial) = projection.open_query_job(graph.cache_generation()) else {
+            panic!("initial snapshot");
+        };
+        let initial_revision = initial.query_revision;
+        drop(initial);
+        let entry = graph.list_pages().into_iter().next().unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO newer acquired image".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        projection.mark_stale();
+        assert!(!projection.ready_at(graph.cache_generation()));
+        let QueryJobOpen::Job(mut job) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("a complete current image needs no saved target");
+        };
+        assert!(job.query_revision > initial_revision);
+        assert_eq!(job.query_revision, job.snapshot.query_revision().unwrap());
+        assert_eq!(job.config.digest(), graph.config.parse_config().digest());
+        assert!(job.registry.is_none());
+        let acquired_revision = job.query_revision;
+        // Current snapshot reads cannot admit a partial warm image. This
+        // models the stream interval between replacement and ordering turns.
+        projection.shared.pending.lock().unwrap().warm_stream = Some(graph.cache_generation());
+        let partial = projection.open_current_query_job(RegistrySensitivity::Insensitive);
+        projection.shared.pending.lock().unwrap().warm_stream = None;
+        assert!(matches!(partial, QueryJobOpen::NotReady));
+        assert_eq!(
+            projection.active_query_jobs_test(),
+            1,
+            "only the held job retains capacity"
+        );
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO after snapshot".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        assert!(!job.is_cancelled());
+        assert_eq!(job.snapshot.query_revision().unwrap(), acquired_revision);
+        let QueryJobOpen::Job(current) = projection.open_query_job(graph.cache_generation()) else {
+            panic!("new image job");
+        };
+        assert!(current.query_revision > acquired_revision);
+        drop(current);
+        drop(job);
+        assert_eq!(projection.active_query_jobs_test(), 0);
+        assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_snapshot_requires_initialization_but_not_source_freshness() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("current-initialization");
         let graph = Graph::open(&root);
         graph
             .attach_direct_projection(root.join("private/projection.sqlite"))
             .unwrap();
         let projection = graph.direct_projection_test().unwrap();
-        let progress = projection.query_progress();
-        assert!(projection.saved_query_target().is_none());
-        assert_eq!(progress.observe().1, Outcome::Pending);
+        assert!(matches!(
+            projection.open_current_query_job(RegistrySensitivity::Insensitive),
+            QueryJobOpen::NotReady
+        ));
         graph.warm_cache();
         wait_ready(&graph);
-        let target = projection.saved_query_target().unwrap();
-        let request = progress.request();
-        assert!(matches!(
-            progress.wait_for_target(&target, &request, Duration::ZERO),
-            Outcome::Ready { .. }
-        ));
         projection.mark_stale();
-        assert!(projection.saved_query_target().is_none());
-        assert!(
-            matches!(
-                progress.wait_for_target(&target, &request, Duration::ZERO),
-                Outcome::Ready { .. }
-            ),
-            "ordinary invalidation must not cancel an older coherent target"
-        );
+        let QueryJobOpen::Job(job) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("a complete image remains available while source freshness is unknown");
+        };
+        drop(job);
         assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
-        assert_eq!(
-            progress.wait_for_target(&target, &request, Duration::ZERO),
-            Outcome::Cancelled
-        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn query_target_same_config_inventory_preserves_jobs_but_changed_config_cancels_them() {
-        use tine_storage::sqlite::PhysicalProjectionQueryProgressOutcome as Outcome;
+    fn same_config_inventory_preserves_jobs_but_changed_config_cancels_them() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = r6_graph("target-config-lifecycle");
         let graph = Graph::open(&root);
@@ -3234,8 +3331,16 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
         let projection = graph.direct_projection_test().unwrap();
-        let progress = projection.query_progress();
-        let request = progress.request();
+        let wait_generation = |generation| {
+            let started = Instant::now();
+            while !projection.ready_at(generation) && started.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                projection.ready_at(generation),
+                "producer did not complete inventory"
+            );
+        };
         let mut pages = Vec::new();
         let mut revisions = HashMap::new();
         for entry in graph.list_pages() {
@@ -3263,26 +3368,21 @@ mod tests {
         let QueryJobOpen::Job(job) = projection.open_query_job(generation) else {
             panic!("initial job");
         };
-        let original = projection.saved_query_target().unwrap();
+        let original = projection.query_epoch();
         projection.enqueue_full(
             generation + 1,
             Arc::clone(&pages),
             Arc::clone(&revisions),
             Arc::clone(&config),
         );
-        let same_config = projection.saved_query_target().unwrap();
-        let same_outcome = progress.wait_for_target(&same_config, &request, Duration::from_secs(3));
+        wait_generation(generation + 1);
         let ordinary_cancelled = job.is_cancelled();
         drop(job);
-        assert!(matches!(same_outcome, Outcome::Ready { .. }));
         assert!(
             !ordinary_cancelled,
             "ordinary inventory reconciliation is not replacement"
         );
-        assert!(matches!(
-            progress.wait_for_target(&original, &request, Duration::ZERO),
-            Outcome::Ready { .. }
-        ));
+        assert_eq!(projection.query_epoch(), original);
 
         let QueryJobOpen::Job(job) = projection.open_query_job(generation + 1) else {
             panic!("current job");
@@ -3302,22 +3402,14 @@ mod tests {
             config_cancelled,
             "config replacement must interrupt existing jobs before writing"
         );
-        assert_eq!(
-            progress.wait_for_target(&same_config, &request, Duration::ZERO),
-            Outcome::Cancelled
-        );
-        let replacement = projection.saved_query_target().unwrap();
-        assert!(matches!(
-            progress.wait_for_target(&replacement, &request, Duration::from_secs(3)),
-            Outcome::Ready { .. }
-        ));
+        assert_ne!(projection.query_epoch(), original);
+        wait_generation(generation + 2);
         assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn query_target_write_failure_is_failed_until_recovery_replaces_its_incarnation() {
-        use tine_storage::sqlite::PhysicalProjectionQueryProgressOutcome as Outcome;
+    fn current_snapshot_write_failure_recovers_from_authoritative_source() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = r6_graph("target-write-failure");
         let database = root.join("private/projection.sqlite");
@@ -3326,8 +3418,6 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
         let projection = graph.direct_projection_test().unwrap();
-        let progress = projection.query_progress();
-        let request = progress.request();
         let entry = graph.list_pages().into_iter().next().unwrap();
         let mut page = graph.load_page(&entry).unwrap();
         let baseline = page.rev.clone();
@@ -3336,22 +3426,19 @@ mod tests {
         drop(writer);
         page.blocks[0].raw = "TODO acknowledged source survives failed projection".into();
         graph.save_page(&page, baseline.as_deref()).unwrap();
-        let failed = projection.saved_query_target().unwrap();
+        let started = Instant::now();
+        while !projection.shared.worker_failed.load(Ordering::Acquire)
+            && started.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(projection.shared.worker_failed.load(Ordering::Acquire));
         assert!(matches!(
-            progress.wait_for_target(&failed, &request, Duration::from_secs(3)),
-            Outcome::Failed(_)
+            projection.open_current_query_job(RegistrySensitivity::Insensitive),
+            QueryJobOpen::NotReady
         ));
         graph.direct_projection_recover_after_failed_read();
         wait_ready(&graph);
-        assert_eq!(
-            progress.wait_for_target(&failed, &request, Duration::ZERO),
-            Outcome::Cancelled
-        );
-        let repaired = projection.saved_query_target().unwrap();
-        assert!(matches!(
-            progress.wait_for_target(&repaired, &request, Duration::ZERO),
-            Outcome::Ready { .. }
-        ));
         let result = graph
             .run_query_bounded("(task TODO)", 100, 1_000_000)
             .unwrap();
@@ -3405,8 +3492,8 @@ mod tests {
             );
         }
         // R3: every user query above was answered by the dispatched statement.
-        // Three distinct pre-view shapes: `sort-by` is a view directive, so the
-        // fourth query shares the first one's pre-view memo entry.
+        // Every invocation acquires its own coherent snapshot, including
+        // repeated filters and queries that differ only in view directives.
         assert_eq!(graph.direct_projection_fallback_reads_test(), 0);
         assert!(graph.direct_projection_statement_reads_test() >= 3);
         let statement_reads = graph.direct_projection_statement_reads_test();
@@ -3421,8 +3508,8 @@ mod tests {
         );
         assert_eq!(
             graph.direct_projection_statement_reads_test(),
-            statement_reads,
-            "the generation-keyed presentation memo must avoid repeated SQL/parser work"
+            statement_reads + 1,
+            "a repeated query must acquire and validate its own snapshot"
         );
 
         let entry = graph
@@ -3526,12 +3613,12 @@ mod tests {
         // and §5.9 routes both to the statement anyway.
         for (query, expected_captures) in [
             ("(and (task TODO) (page source))", 1),
-            ("(property status active)", 2),
-            ("(page-property category work)", 2),
+            ("(property status active)", 1),
+            ("(page-property category work)", 1),
             ("(page source)", 1),
             ("(namespace Project)", 1),
             ("(journal)", 1),
-            ("(and (property status active) (page source))", 2),
+            ("(and (property status active) (page source))", 1),
             ("(or (page source) (page Target))", 1),
             ("\"points\"", 1),
         ] {
@@ -3555,7 +3642,7 @@ mod tests {
             assert_eq!(
                 graph.direct_projection_statement_reads_test(),
                 statements_before + expected_captures,
-                "{query}: result snapshot plus property metadata snapshot when needed"
+                "{query}: results and property metadata share one owned snapshot"
             );
             assert_eq!(
                 crate::query::full_graph_query_evaluations(),
@@ -3592,10 +3679,9 @@ mod tests {
             "a refused source must not record fallback access"
         );
 
-        // Staleness splits the two families RET2 deliberately treats
-        // differently. The property-facet read is NOT a public query and keeps
-        // its parser fallback; the public query route has no fallback left and
-        // owes readiness instead.
+        // Property-facet navigation keeps its existing parser fallback.
+        // Live queries may read a complete committed image even while source
+        // readiness is stale; an incomplete recovery image owes readiness.
         let fallback_query = "(and (page-ref Target) (not (page Missing)))";
         let oracle = crate::query::run_query_bounded(&graph, fallback_query, 100, 1_000_000);
         assert!(
@@ -3619,9 +3705,9 @@ mod tests {
         // The worker may already have caught up, so accept either verdict --
         // but ONLY the two the route is allowed to give.
         match graph.run_query_bounded(fallback_query, 100, 1_000_000) {
-            Ok(_) => assert!(graph.direct_projection_ready_test()),
+            Ok(answer) => assert_eq!(signature(&answer.groups), signature(&oracle.groups)),
             Err(crate::query::QueryExecutionError::NotReady(_)) => {}
-            other => panic!("a stale projection owes readiness, got {other:?}"),
+            other => panic!("a query needs a coherent SQL answer or readiness, got {other:?}"),
         }
         let fallback = when_ready(|| graph.run_query_bounded(fallback_query, 100, 1_000_000));
         assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
@@ -3906,12 +3992,9 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
 
-        // The projection answers a DIFFERENT query first, so the route is known
-        // to be healthy going in. It has to be a different one: a memoized
-        // answer is returned without ever opening a query job, so reusing this
-        // source below would test the memo and not the cancellation.
-        let warm =
-            when_ready(|| graph.run_query_bounded("(property status active)", 100, 1_000_000));
+        // Prime the SAME query: even a cache hit must acquire its image and
+        // respect cancellation before it can return the shared result.
+        let warm = when_ready(|| graph.run_query_bounded("(task TODO)", 100, 1_000_000));
         assert!(warm.total > 0, "the warm-up query must match something");
 
         // Non-vacuity for the cancelled query itself, from the independent
@@ -3949,13 +4032,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// **RET2's readiness shape.** A projection that is genuinely behind the
-    /// parsed cache answers `NotReady`, carrying the reason the queue is in —
-    /// never a walked answer and never a false empty one. This is the signal
-    /// `src/queryReadiness.ts` retries on, so getting the CLASS wrong (a
-    /// terminal `Unavailable` for a transient lag) is a user-visible defect.
+    /// A live read may use the committed image while an ordinary edit is
+    /// still projecting. A subsequent read observes the completed projection.
     #[test]
-    fn a_projection_behind_the_parsed_cache_reports_readiness_not_an_answer() {
+    fn a_projection_behind_edits_serves_coherent_sql_then_refreshes() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("behind-parsed-cache");
         std::fs::create_dir_all(root.join("pages")).unwrap();
@@ -3983,26 +4063,26 @@ mod tests {
         page.blocks[0].raw = "TODO ship it soon".into();
         graph.save_page(&page, page.rev.as_deref()).unwrap();
 
-        // The race is real, so accept either verdict — but ONLY the two the
-        // route is allowed to give: the projection had already caught up, or it
-        // says so in words the frontend retries on.
-        match graph.run_query_bounded("(task TODO)", 100, 1_000_000) {
-            Ok(answer) => assert!(
-                graph.direct_projection_ready_test(),
-                "an answer may only come from a caught-up projection: {}",
-                answer.total
-            ),
-            Err(crate::query::QueryExecutionError::NotReady(_)) => {}
-            other => panic!("a projection behind the cache owes readiness, got {other:?}"),
-        }
+        // Either committed version is valid; freshness does not gate a read.
+        let answer = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .unwrap();
+        assert_eq!(answer.total, 1);
+        assert_eq!(answer.groups.len(), 1);
+        assert_eq!(answer.groups[0].blocks.len(), 1);
+        assert!(matches!(
+            answer.groups[0].blocks[0].raw.as_str(),
+            "TODO ship it" | "TODO ship it soon"
+        ));
         assert_eq!(
             crate::query::full_graph_query_evaluations(),
             walks_before,
             "an unready projection must not traverse the graph"
         );
 
-        // And readiness is transient by construction: the same query answers
-        // once the worker converges, with the edited row.
+        // Synchronize the test with producer completion, not query success:
+        // a successful current read deliberately makes no freshness promise.
+        wait_ready(&graph);
         let after = when_ready(|| graph.run_query_bounded("(task TODO)", 100, 1_000_000));
         assert_eq!(after.total, 1);
         assert_eq!(after.groups[0].blocks[0].raw, "TODO ship it soon");
@@ -4081,9 +4161,8 @@ mod tests {
         // the already-parsed cache, so it needs no reparse, no disk read, and no
         // user action — `ready` comes back on its own.
         wait_ready(&graph);
-        // A DIFFERENT query, because the first one's answer is now in the
-        // derived cache under its IR key and would be served without touching
-        // the statement seam at all.
+        // A different query exercises result construction after recovery;
+        // a same-image cache hit still acquires a snapshot but skips payload.
         let after = "(property status active)";
         let after_oracle = crate::query::run_query_bounded(&graph, after, 100, 1_000_000);
         let statements_before = graph.direct_projection_statement_reads_test();
@@ -4095,8 +4174,8 @@ mod tests {
         );
         assert_eq!(
             graph.direct_projection_statement_reads_test(),
-            statements_before + 2,
-            "property memo metadata and result each acquire an owned SQL snapshot"
+            statements_before + 1,
+            "property metadata and result must share one acquired SQL snapshot"
         );
         assert_eq!(
             graph.direct_projection_fallback_reads_test(),
@@ -4432,14 +4511,14 @@ mod tests {
         for (query, expected_captures) in [
             ("(page-ref \"B4 Indexed Target\")", 1),
             ("(and (task TODO) (page \"B4 Indexed Source\"))", 1),
-            ("(property b4-facet yes)", 2),
-            ("(page-property b4-page-facet yes)", 2),
+            ("(property b4-facet yes)", 1),
+            ("(page-property b4-page-facet yes)", 1),
             ("(page \"B4 Indexed Source\")", 1),
             ("(namespace B4)", 1),
             ("(journal)", 1),
             (
                 "(and (property b4-facet yes) (page \"B4 Indexed Source\"))",
-                2,
+                1,
             ),
             (
                 "(or (page \"B4 Indexed Source\") (page \"B4 Indexed Target\"))",
@@ -4464,7 +4543,7 @@ mod tests {
             assert_eq!(
                 graph.direct_projection_statement_reads_test(),
                 statements_before + expected_captures,
-                "{query}: result snapshot plus property metadata snapshot when needed"
+                "{query}: results and property metadata share one owned snapshot"
             );
             assert_eq!(
                 graph.direct_projection_fallback_reads_test(),
@@ -5509,13 +5588,9 @@ mod tests {
             "otherwise recovery validates a\ncomplete source inventory from bytes and streams bounded per-page replacements",
             "Clearing readiness\nalone would strand the projection until another edit.",
             "Cancellation is excluded\nfrom repair",
-            // The cache key.
-            "memoized PRE-VIEW",
-            "under the resolved normalized query IR, the\ngraph cache generation, the execution day, the construction bounds and profile",
-            "The parse-config digest is unconditional",
-            "A warm parsed cache\nallows a safe ordinary content edit to retain unaffected entries",
-            "A cold session with no parsed\ncache, a page-set or alias/identity change, an unreadable key, or another\ngraph-wide uncertainty drops the applicable memo",
-            "Query execution and memo hits themselves\ndo not require a resident parsed graph.",
+            // Answer ownership belongs to the read operation, not a producer cache.
+            "Direct simple and advanced queries construct an\noperation-scoped answer from the acquired SQLite snapshot.",
+            "The producer retains\nno query answers and manages no answer-cache invalidation.",
             // Navigation and Friendly remain separately scoped migration work.
             "Friendly graph\nsearch likewise still ranks and produces evidence from parser-projected blocks",
             "they do not authorize a fallback from the\nsimple, advanced, page, registry, or Explain public-query dispatch",
@@ -5736,12 +5811,6 @@ mod tests {
         );
         assert_eq!(graph.warm_stream_parses_test(), 0);
         let projection = graph.direct_projection_test().unwrap();
-        let progress = projection.query_progress();
-        let target = projection.saved_query_target().unwrap();
-        assert!(matches!(
-            progress.wait_for_target(&target, &progress.request(), Duration::ZERO),
-            tine_storage::sqlite::PhysicalProjectionQueryProgressOutcome::Ready { .. }
-        ));
         assert!(
             !graph.has_parsed_cache_test(),
             "readiness must not require the whole-graph parsed cache"
@@ -5824,13 +5893,9 @@ mod tests {
         let QueryJobOpen::Job(mut new_job) = projection.open_query_job(new_generation) else {
             panic!("updated snapshot must be ready");
         };
-        let new = graph
-            .query_property_registry_at(new_generation, &config, &mut new_job)
-            .unwrap();
+        let new = graph.query_property_registry_at(&mut new_job).unwrap();
         assert!(!old.rows_equal(&new), "the property type changed");
-        let retained = graph
-            .query_property_registry_at(old_generation, &config, &mut old_job)
-            .unwrap();
+        let retained = graph.query_property_registry_at(&mut old_job).unwrap();
         assert!(
             old.rows_equal(&retained),
             "later edits preserve the acquired read"
@@ -6077,9 +6142,10 @@ mod tests {
 
         let property = graph
             .run_query_bounded("(property score 1)", 100, 1_000_000)
-            .expect("the property query publishes a property-sensitive memo");
+            .expect("the property query reads committed metadata");
         assert_eq!(property.total, 1);
-        assert_eq!(graph.derived_props_entry_count_test(), 1);
+        let projection = graph.direct_projection_test().unwrap();
+        projection.take_registry_capture_attempts();
 
         graph.property_registry();
         graph.set_editor_registry_generation_test(777);
@@ -6088,9 +6154,9 @@ mod tests {
             .expect("the property-free query remains available");
         assert_eq!(task.total, 1);
         assert_eq!(
-            graph.derived_props_entry_count_test(),
-            1,
-            "a property-free memo lookup must not evict from an editor-only generation"
+            projection.take_registry_capture_attempts(),
+            0,
+            "a property-free query must not acquire editor or SQL registry metadata"
         );
         assert!(!graph.has_parsed_cache_test());
     }
@@ -6355,7 +6421,6 @@ mod tests {
             !graph.has_parsed_cache_test(),
             "projection repair must stream source pages without retaining the parsed graph"
         );
-        graph.clear_query_memos_test();
         let before = graph.direct_projection_statement_reads_test();
         let actual = graph
             .run_query_bounded(query, 1, 1_000_000)
@@ -6498,7 +6563,6 @@ mod tests {
     fn empty_projection_shared() -> ProjectionShared {
         ProjectionShared {
             path: PathBuf::from("unused"),
-            query_progress: PhysicalProjectionQueryProgress::new(),
             pending: Mutex::new(PendingProjection::default()),
             changed: Condvar::new(),
             ready: AtomicBool::new(false),
@@ -6550,7 +6614,7 @@ mod tests {
                     .unwrap()
                     .captures
                     .push(PendingQueryCapture {
-                        generation: 0,
+                        requirement: QueryCaptureRequirement::StrictGeneration(0),
                         registry_sensitivity: RegistrySensitivity::Required,
                         slot,
                         reply,
@@ -6639,7 +6703,7 @@ mod tests {
             .unwrap()
             .captures
             .push(PendingQueryCapture {
-                generation: graph.cache_generation(),
+                requirement: QueryCaptureRequirement::StrictGeneration(graph.cache_generation()),
                 registry_sensitivity: RegistrySensitivity::Required,
                 slot,
                 reply,

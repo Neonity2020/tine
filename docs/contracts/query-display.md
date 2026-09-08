@@ -745,8 +745,8 @@ clause uses its existing field semantics and ascending/descending direction; onl
 when all keys tie does original row order decide. Sampling follows the completed
 sort. A nonempty sort list disables the unsorted sample admission shortcut, and
 a recency field in any position requests the same recency construction metadata
-and memo profile as a primary recency sort. Cached and fresh results share this
-adapter; the frontend does not sort a replacement result set.
+and construction profile as a primary recency sort. Every result passes through
+this adapter; the frontend does not sort a replacement result set.
 
 This corrects the former first-clause-only QueryOpts adapter. Sort keys are
 computed once per admitted block per requested clause; existing missing-property
@@ -756,6 +756,26 @@ document is loaded. Work scales with admitted rows and requested clauses.
 Tests: query.rs ordered_view_sort_uses_secondary_direction_before_sample_and_keeps_ties
 and ordered_view_sort_secondary_recency_requires_construction_axis; existing
 query tests retain single-sort/sample behavior.
+
+### 12.1 Result lifetime
+
+The backend does not retain complete query answers. Each valid query executes
+against the current projection, constructs operation-local pre-view groups,
+and applies the requested view before returning the final DTO. Repeating the
+same query therefore performs another projection read and returns the same
+ordered groups, totals and exceeded state when the projection is unchanged.
+Display rerenders may keep their mounted frontend state, but that state is not
+a backend answer cache.
+
+The observed property registry, pending-registry patch, parsed document,
+projection and reference caches remain separate derived data. They do not
+authorize reuse of a complete query result. The SQL result route does not load
+page documents merely because it executes again.
+
+Tests: `clean_runtime_repeated_simple_queries_execute_again_and_follow_edits`,
+`ret1_the_public_ir_route_reads_statements_and_hydrates_no_page`,
+`ret2_the_public_advanced_route_reads_statements_and_hydrates_no_page`, and
+`ret2_repeated_advanced_queries_execute_again_and_follow_edits_and_declarations`.
 
 ## 13. Materializing a workspace: revision safety and format (P5C2A)
 

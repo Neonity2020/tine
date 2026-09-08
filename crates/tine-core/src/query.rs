@@ -73,7 +73,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Query source crosses several boundaries (live macros, native IPC, static
 /// publication, and export). Keep one shared ceiling so no caller can make the
-/// parser or its cache key proportional to an unbounded graph-authored string.
+/// parser proportional to an unbounded graph-authored string.
 pub const QUERY_SOURCE_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const QUERY_NESTING_MAX: usize = 64;
 
@@ -2636,7 +2636,7 @@ fn run_pred_bounded_over(
     apply_view(pre, view)
 }
 
-/// §5.9: the view applied to an already-constructed (possibly CACHED) pre-view
+/// §5.9: the view applied to an already-constructed pre-view
 /// result. Base order, then `sort-by`, then `sample` — `finish_query_groups`
 /// unchanged, reached from both the walk and the dispatched statement.
 pub(crate) fn apply_view(pre: PreViewGroups, view: &ViewSettings) -> BoundedGroups {
@@ -2645,37 +2645,6 @@ pub(crate) fn apply_view(pre: PreViewGroups, view: &ViewSettings) -> BoundedGrou
     budget.total = pre.total;
     budget.exceeded = pre.exceeded;
     finish_query_groups(pre.groups, pre.recency_by_page, &opts, budget)
-}
-
-/// §5.9: apply a view to an already-cached PRE-VIEW result.
-///
-/// A query with no `sort-by` and no `sample` shares the cached `Arc` — the rows
-/// are already in base order, and a view that reorders nothing has nothing to
-/// do. Anything else copies once and applies its own directives, which is the
-/// point of storing the pre-view result: two views of one filter no longer
-/// recompute it.
-pub(crate) fn apply_cached_view(
-    groups: &std::sync::Arc<Vec<RefGroup>>,
-    recency_by_page: &std::collections::HashMap<String, i64>,
-    view: &ViewSettings,
-    total: usize,
-    exceeded: bool,
-) -> crate::model::BoundedRefGroups {
-    let opts = QueryOpts::from_view(view);
-    let groups = if opts.sort.is_empty() && opts.sample.is_none() {
-        std::sync::Arc::clone(groups)
-    } else {
-        std::sync::Arc::new(apply_view_directives(
-            groups.as_ref().clone(),
-            recency_by_page,
-            &opts,
-        ))
-    };
-    crate::model::BoundedRefGroups {
-        groups,
-        total,
-        exceeded,
-    }
 }
 
 /// The construction half of [`run_pred_bounded_over`]: the matched rows in the
@@ -2808,71 +2777,6 @@ pub(crate) fn block_anchored_query(query: &Query) -> Query {
         diagnostics: query.diagnostics.clone(),
         source: ir::Source::Builder,
     }
-}
-
-/// §5.9's cache identity for one simple/advanced query: the **resolved
-/// normalized IR** plus the bounds the construction ran under.
-///
-/// The query SOURCE is deliberately absent. `(task TODO)`, `(and (task TODO))`
-/// and TQL `task = 'TODO'` are one question, so they are one cache entry; two
-/// spellings of one filter no longer compute it twice, and — the reason §5.9
-/// asks for this — a view-only edit (`(sort-by …)`, `(sample N)`) no longer
-/// invalidates rows the view has not looked at yet.
-///
-/// [`ConstructionProfile`]'s two flags travel WITH the bounds rather than being
-/// dropped as view state: they change what is CONSTRUCTED (an unsorted
-/// `(sample N)` stops the walk at N and reports that as `total`; a recency sort
-/// measures a per-result-page axis), so a cached entry built without them cannot
-/// answer for a view that needs them.
-///
-/// The remaining components of §5.9's key — execution day, `ParseConfig::digest`
-/// and the registry generation — are the derived cache's own identity
-/// (`DerivedCache`), not part of this string.
-pub(crate) fn simple_query_cache_key(
-    query: &Query,
-    max_rows: usize,
-    max_bytes: usize,
-    profile: ConstructionProfile,
-) -> String {
-    let cap = profile
-        .sample_admission_cap
-        .map_or_else(|| "-".to_string(), |cap| cap.to_string());
-    let recency = u8::from(profile.want_recency);
-    // `serde_json` escapes control characters, so the serialized IR contains no
-    // raw NUL and the structural fields in front of it stay unambiguous.
-    let ir = serde_json::to_string(&query.normalized()).unwrap_or_default();
-    format!("q\0{max_rows}\0{max_bytes}\0{cap}\0{recency}\0{ir}")
-}
-
-/// The retention rule (§5.9) over an IR-keyed entry: "could an edit to page
-/// (entry, doc) change this query's result?".
-///
-/// The same predicate and the same evaluator the real matcher uses — now read
-/// back from the key's IR instead of re-parsed from a query source, which is
-/// what makes the answer independent of the dialect the query was written in.
-/// An unreadable key evicts, because a retained entry nobody can judge is the
-/// one failure mode this rule exists to prevent.
-pub(crate) fn page_affects_query_ir(
-    serialized_ir: &str,
-    entry: &PageEntry,
-    doc: &Document,
-    config: &crate::config::ParseConfig,
-    registry: &registry::Registry,
-) -> bool {
-    let Ok(query) = serde_json::from_str::<Query>(serialized_ir) else {
-        return true;
-    };
-    if query.is_invalid() {
-        return false;
-    }
-    page_contributes_to_filter(
-        &block_anchored_filter(&query),
-        entry,
-        doc,
-        JournalDate::today(),
-        config,
-        registry,
-    )
 }
 
 #[cfg(test)]
@@ -7203,7 +7107,15 @@ mod tests {
             sample: Some(2),
             ..ViewSettings::default()
         };
-        let output = apply_cached_view(&Arc::new(groups), &HashMap::new(), &view, 3, false);
+        let output = apply_view(
+            PreViewGroups {
+                groups,
+                recency_by_page: HashMap::new(),
+                total: 3,
+                exceeded: false,
+            },
+            &view,
+        );
         let ids: Vec<_> = output
             .groups
             .iter()
@@ -7840,53 +7752,6 @@ mod tests {
             ids("(and (task TODO) (page \"Target\"))"),
             vec![ON_PAGE.to_string()]
         );
-
-        graph.with_pages(|pages| {
-            let (entry, doc) = pages
-                .iter()
-                .find(|(entry, _)| entry.name == "Inherited Only")
-                .expect("inherited-only fixture page");
-            let config = crate::config::ParseConfig::default();
-            let registry = registry::Registry::empty(&config);
-            // §5.9's retention rule reads the cache key's serialized IR back,
-            // which is what makes the keep/evict answer independent of the
-            // dialect the query was written in: the OG form and the advanced
-            // form below produce the SAME key and are judged by the SAME
-            // predicate. `page_affects_query` and `page_affects_advanced_query`
-            // were two spellings of that one question (I-12).
-            let key_ir = |query: &Query| {
-                serde_json::to_string(&block_anchored_query(query).normalized())
-                    .expect("the IR serializes")
-            };
-            let og_ir = |src: &str| key_ir(&parse_query_source(src, JournalDate::today()).0);
-            let advanced_ir = |src: &str| match resolve_advanced_source(src, None) {
-                ResolvedAdvanced::Executable { query, .. } => key_ir(&query),
-                ResolvedAdvanced::Refused(_) => panic!("the fixture advanced query resolves"),
-            };
-            assert!(page_affects_query_ir(
-                &og_ir("(and (task TODO) [[Target]])"),
-                entry,
-                doc,
-                &config,
-                &registry
-            ));
-            assert!(!page_affects_query_ir(
-                &og_ir("(and (task TODO) (page \"Target\"))"),
-                entry,
-                doc,
-                &config,
-                &registry
-            ));
-            assert!(page_affects_query_ir(
-                &advanced_ir(
-                    r#"[:find (pull ?b [*]) :where (and (task ?b #{"TODO"}) (page-ref ?b "Target"))]"#
-                ),
-                entry,
-                doc,
-                &config,
-                &registry,
-            ));
-        });
 
         let _ = fs::remove_dir_all(&dir);
     }

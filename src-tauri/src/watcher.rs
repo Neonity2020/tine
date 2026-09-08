@@ -2763,9 +2763,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 })();
                 match result {
                     Ok(tick) => {
-                        // Only an admission that actually committed a batch is
-                        // a content change. `AdmittedNoop` is, by its own name,
-                        // the step that took no completed batch.
+                        // Completed local, provider and watcher batches wake
+                        // readers; pending recovery and quiet admissions do not.
                         let changed = tick.committed_observable_change();
                         // A bounded tick settles one lane. The tick result
                         // describes only that lane, so continuation must also

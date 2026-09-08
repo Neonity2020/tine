@@ -1,57 +1,6 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-#[test]
-fn query_execution_errors_are_not_memoized_as_empty_results() {
-    use crate::query::{
-        QueryExecutionError as Error, QueryReadinessReason, QueryUnavailableReason,
-    };
-    let root = scratch("query-error-memo");
-    let graph = Graph::open(&root);
-    let stamp = DerivedMemoStamp {
-        gen: graph.cache_generation(),
-        today: crate::date::JournalDate::today().ordinal_key(),
-        config_digest: graph.config.parse_config().digest(),
-        registry_gen: None,
-    };
-    for (index, error) in [
-        Error::NotReady(QueryReadinessReason::Indexing),
-        Error::Unavailable(QueryUnavailableReason::ReadFailed),
-        Error::Cancelled,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let key = format!("query-error-{index}");
-        let failed = graph.try_derived_memo_entry(
-            key.clone(),
-            CacheSensitivity::Known(false),
-            stamp,
-            || Err(error),
-        );
-        assert!(matches!(failed, Err(actual) if actual == error));
-        let retried = std::cell::Cell::new(false);
-        let success = graph
-            .try_derived_memo_entry(key.clone(), CacheSensitivity::Known(false), stamp, || {
-                retried.set(true);
-                Ok::<_, Error>(DerivedEntry::plain(BoundedRefGroups {
-                    groups: Arc::new(Vec::new()),
-                    total: 0,
-                    exceeded: false,
-                }))
-            })
-            .unwrap();
-        assert!(retried.get(), "failure must leave a later attempt runnable");
-        let cached = graph
-            .try_derived_memo_entry(key, CacheSensitivity::Known(false), stamp, || {
-                Err(Error::Cancelled)
-            })
-            .unwrap();
-        assert!(Arc::ptr_eq(&success.result.groups, &cached.result.groups));
-    }
-    crate::test_support::remove_dir_all(root);
-}
-
 // DUP mapping semantics (2026-08-25 duplication audit): both tree walkers
 // delegate every block to the one shared field mapping, so identical DTO
 // input must produce identical parseable trees (identity, format flag,
@@ -10184,11 +10133,11 @@ fn advanced_query_skeleton_ignores_comment_hints() {
 }
 
 #[test]
-fn persisted_query_sources_cannot_reach_unbounded_cache_keys_or_parser_recursion() {
+fn persisted_query_sources_are_refused_before_projection_or_parser_recursion() {
     let dir = scratch("query-source-recursion-bound");
     fs::write(dir.join("pages").join("P.md"), "- TODO ship\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
+    let reads_before = g.direct_projection_statement_reads_test();
 
     // This is the graph-authored shape that previously overflowed the Rust
     // stack when a persisted query macro rendered. Keep it below the byte
@@ -10200,7 +10149,6 @@ fn persisted_query_sources_cannot_reach_unbounded_cache_keys_or_parser_recursion
         .run_query_bounded(&nested, 20_000, 32 * 1024 * 1024)
         .expect("a refused query source is answered before any dispatch");
     assert!(simple.groups.is_empty());
-    assert!(g.derived_cache.read().unwrap().is_none());
 
     let advanced = format!("[:find (pull ?b [*]) :where {nested}]");
     let result = g
@@ -10208,31 +10156,99 @@ fn persisted_query_sources_cannot_reach_unbounded_cache_keys_or_parser_recursion
         .expect("a refused query source is answered before any dispatch");
     assert!(!result.supported);
     assert_eq!(result.ignored, vec!["query-nesting-too-deep"]);
-    assert!(g.advanced_cache.read().unwrap().is_none());
+    assert_eq!(
+        g.direct_projection_statement_reads_test(),
+        reads_before,
+        "refused simple and advanced sources must not execute a projection statement"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// §5.9's advanced-cache key, built from the SAME two producers production uses:
-/// the one advanced resolve and the one key function. Spelling the key by hand
-/// here would be a second key producer, and a test that guessed the key wrong
-/// would silently stop testing the cache.
-fn advanced_cache_key(query_src: &str, max_rows: usize, max_bytes: usize) -> String {
-    let crate::query::ResolvedAdvanced::Executable { query, .. } =
+/// Ask the production advanced route for its acquired pre-view rows. The source
+/// report remains outside this shared value and is checked through the public
+/// route by the caller.
+fn advanced_query_pre_view_rows(
+    graph: &Graph,
+    query_src: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Vec<RefGroup> {
+    let crate::query::ResolvedAdvanced::Executable { query, today, .. } =
         crate::query::resolve_advanced_source(query_src, None)
     else {
         panic!("the fixture advanced query resolves");
     };
-    crate::query::simple_query_cache_key(
-        &crate::query::block_anchored_query(&query),
-        max_rows,
-        max_bytes,
-        crate::query::ConstructionProfile::default(),
-    )
+    let query = crate::query::block_anchored_query(&query);
+    when_ready(|| {
+        graph.direct_simple_query_pre_view(
+            &query,
+            today,
+            max_rows,
+            max_bytes,
+            crate::query::ConstructionProfile::default(),
+        )
+    })
+    .groups
+}
+
+fn simple_query_pre_view_rows_at(
+    graph: &Graph,
+    query_src: &str,
+    today: crate::date::JournalDate,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Vec<RefGroup> {
+    let (query, view) = crate::query::parse_query_source(query_src, today);
+    let query = crate::query::block_anchored_query(&query);
+    let profile = crate::query::ConstructionProfile::from_view(&view);
+    when_ready(|| graph.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile))
+        .groups
 }
 
 #[test]
-fn advanced_query_reuses_cached_result_until_graph_changes() {
-    let dir = scratch("adv-memo");
+fn repeated_query_executes_again_at_the_same_or_a_later_day() {
+    let dir = scratch("query-repeat-execution-day");
+    fs::write(dir.join("pages").join("Tasks.md"), "- TODO ship\n").unwrap();
+    let graph = ready_graph(&dir);
+    let today = crate::date::JournalDate::today();
+    let first = simple_query_pre_view_rows_at(&graph, "(task TODO)", today, usize::MAX, usize::MAX);
+    let after_first = graph.direct_projection_statement_reads_test();
+    let same_day =
+        simple_query_pre_view_rows_at(&graph, "(task TODO)", today, usize::MAX, usize::MAX);
+    assert_eq!(
+        graph.direct_projection_statement_reads_test(),
+        after_first + 1,
+        "the repeated valid query executes SQL again"
+    );
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&same_day).unwrap(),
+        "the repeated read returns the same ordered rows"
+    );
+
+    let next_day = simple_query_pre_view_rows_at(
+        &graph,
+        "(task TODO)",
+        today.add_days(1),
+        usize::MAX,
+        usize::MAX,
+    );
+    assert_eq!(
+        graph.direct_projection_statement_reads_test(),
+        after_first + 2,
+        "the later-day request also executes SQL"
+    );
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&next_day).unwrap(),
+        "a day-insensitive query keeps the same answer"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn advanced_query_reexecutes_and_observes_every_edit() {
+    let dir = scratch("adv-repeat");
     fs::write(dir.join("pages").join("P.md"), "- TODO ship\n").unwrap();
     fs::write(
         dir.join("pages").join("Notes.md"),
@@ -10242,58 +10258,65 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
     let g = ready_graph(&dir);
     let q = r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#;
 
-    // §5.9: the advanced cache is keyed by the RESOLVED NORMALIZED IR and stores
-    // the pre-view rows. `ran`/`ignored` are a report about the source and are
-    // recomputed per call, so the shared value — the thing "served from the memo
-    // cache" now means — is the rows `Arc`.
-    let cached_rows = |max_rows: usize, max_bytes: usize| {
-        let key = advanced_cache_key(q, max_rows, max_bytes);
-        g.advanced_cache
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .results
-            .get(&key)
-            .unwrap()
-            .0
-            .groups
-            .clone()
-    };
-
     let first_result = when_ready(|| g.run_advanced_query_cached(q, None));
-    let first = cached_rows(usize::MAX, usize::MAX);
-    let _ = when_ready(|| g.run_advanced_query_cached(q, None));
-    let second = cached_rows(usize::MAX, usize::MAX);
-    assert!(
-        Arc::ptr_eq(&first, &second),
-        "identical advanced query should be served from the memo cache"
+    let first = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    let after_first = g.direct_projection_statement_reads_test();
+    let second = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    assert_eq!(g.direct_projection_statement_reads_test(), after_first + 1);
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&second).unwrap(),
+        "repeated SQL reads return the same ordered rows"
+    );
+    let simple = when_ready(|| g.run_query_bounded("(task TODO)", usize::MAX, usize::MAX));
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(simple.groups.as_ref()).unwrap()
     );
     assert_eq!(first_result.groups.len(), 1);
-    let _ = when_ready(|| g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024));
-    let bounded_first = cached_rows(20_000, 32 * 1024 * 1024);
+    assert!(first_result.supported);
+    assert_eq!(first_result.ran, vec!["task".to_string()]);
+    assert!(first_result.ignored.is_empty());
+    assert_eq!(
+        serde_json::to_vec(&first_result.groups).unwrap(),
+        serde_json::to_vec(&first).unwrap(),
+        "the public route attaches its source report to the shared rows"
+    );
+    let bounded_first = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    let after_bounded_first = g.direct_projection_statement_reads_test();
+    let bounded_second = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    assert_eq!(
+        g.direct_projection_statement_reads_test(),
+        after_bounded_first + 1
+    );
+    assert_eq!(
+        serde_json::to_vec(&bounded_first).unwrap(),
+        serde_json::to_vec(&bounded_second).unwrap()
+    );
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let _ = when_ready(|| g.run_advanced_query_cached(q, None));
-    let after_unrelated = cached_rows(usize::MAX, usize::MAX);
-    let _ = when_ready(|| g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024));
-    let bounded_after_unrelated = cached_rows(20_000, 32 * 1024 * 1024);
-    assert!(
-        Arc::ptr_eq(&first, &after_unrelated),
-        "an unrelated edit must retain the advanced-query memo"
+    let after_unrelated = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    let bounded_after_unrelated = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&after_unrelated).unwrap(),
+        "the unrelated edit leaves the ordered answer unchanged"
     );
-    assert!(Arc::ptr_eq(&bounded_first, &bounded_after_unrelated));
+    assert_eq!(
+        serde_json::to_vec(&bounded_first).unwrap(),
+        serde_json::to_vec(&bounded_after_unrelated).unwrap()
+    );
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.pre_block = Some("alias:: Renamed Scratch\n".into());
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let _ = when_ready(|| g.run_advanced_query_cached(q, None));
-    let after_alias_change = cached_rows(usize::MAX, usize::MAX);
-    assert!(
-        !Arc::ptr_eq(&first, &after_alias_change),
-        "a semantic alias change must invalidate graph-wide derived results"
+    let after_alias_change = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&after_alias_change).unwrap(),
+        "the task answer is unchanged by an alias on an unrelated page"
     );
 
     let mut dto = g.load_named("P", PageKind::Page).unwrap().unwrap();
@@ -10301,14 +10324,10 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
     g.save_page(&dto, dto.rev.as_deref()).unwrap();
 
     let third_result = when_ready(|| g.run_advanced_query_cached(q, None));
-    let third = cached_rows(usize::MAX, usize::MAX);
-    let _ = when_ready(|| g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024));
-    let bounded_after_affected = cached_rows(20_000, 32 * 1024 * 1024);
-    assert!(
-        !Arc::ptr_eq(&first, &third),
-        "graph mutation must invalidate the advanced-query memo"
-    );
-    assert!(!Arc::ptr_eq(&bounded_first, &bounded_after_affected));
+    let third = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
+    let bounded_after_affected = advanced_query_pre_view_rows(&g, q, 20_000, 32 * 1024 * 1024);
+    assert!(third.is_empty());
+    assert!(bounded_after_affected.is_empty());
     assert!(third_result.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -10367,8 +10386,8 @@ fn windows_directory_durability_limit_does_not_block_save_or_rename() {
 }
 
 #[test]
-fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
-    let dir = scratch("bounded-query-scoped-memo");
+fn bounded_query_reexecutes_and_observes_every_edit() {
+    let dir = scratch("bounded-query-repeat");
     fs::write(dir.join("pages").join("Tasks.md"), "- TODO ship\n").unwrap();
     fs::write(
         dir.join("pages").join("Notes.md"),
@@ -10379,40 +10398,39 @@ fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
 
     let todo_tasks = || when_ready(|| g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024));
     let first = todo_tasks();
+    let after_first = g.direct_projection_statement_reads_test();
     let second = todo_tasks();
-    assert!(Arc::ptr_eq(&first.groups, &second.groups));
+    assert_eq!(g.direct_projection_statement_reads_test(), after_first + 1);
+    assert_eq!(first.total, second.total);
+    assert_eq!(first.exceeded, second.exceeded);
+    assert_eq!(
+        serde_json::to_vec(first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(second.groups.as_ref()).unwrap()
+    );
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still an ordinary note".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
     let after_unrelated = todo_tasks();
-    assert!(
-        Arc::ptr_eq(&first.groups, &after_unrelated.groups),
-        "an unrelated edit must retain the scoped bounded-query memo"
+    assert_eq!(
+        serde_json::to_vec(first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(after_unrelated.groups.as_ref()).unwrap(),
+        "the unrelated edit leaves the meaningful answer unchanged"
     );
+    assert_eq!(first.total, after_unrelated.total);
+    assert_eq!(first.exceeded, after_unrelated.exceeded);
 
     let mut tasks = g.load_named("Tasks", PageKind::Page).unwrap().unwrap();
     tasks.blocks[0].raw = "DONE ship".into();
     g.save_page(&tasks, tasks.rev.as_deref()).unwrap();
     let after_affected = todo_tasks();
-    assert!(!Arc::ptr_eq(&first.groups, &after_affected.groups));
     assert!(after_affected.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// §5.9's cache-key claim has two halves, and the second one is the one a
-/// coarse "bump a generation" invalidation would silently fail.
-///
-/// [`bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages`]
-/// checks that ONE query keeps its memo across an unrelated edit. This checks
-/// the cross-query direction: with TWO queries cached and one page edited, the
-/// query that page contributes to loses its entry and the query it cannot
-/// contribute to keeps its. Both directions are needed — an invalidation that
-/// clears everything passes the first test and fails this one, and an
-/// invalidation that clears nothing passes this one and fails the first.
 #[test]
-fn a_page_edit_evicts_only_the_memo_of_the_query_that_page_can_answer() {
-    let dir = scratch("scoped-memo-two-queries");
+fn every_query_request_executes_again_and_reads_the_current_sql_image() {
+    let dir = scratch("repeat-two-queries");
     fs::write(
         dir.join("pages").join("Roadmap.md"),
         "tags:: work\n- TODO ship\n",
@@ -10429,25 +10447,35 @@ fn a_page_edit_evicts_only_the_memo_of_the_query_that_page_can_answer() {
     let tasks_first = tasks();
     assert_eq!(tagged_first.groups.len(), 1, "one tagged page");
     assert_eq!(tasks_first.groups.len(), 2, "both pages carry a TODO");
-    assert!(Arc::ptr_eq(&tagged_first.groups, &tagged().groups));
-    assert!(Arc::ptr_eq(&tasks_first.groups, &tasks().groups));
+    let before_repeats = g.direct_projection_statement_reads_test();
+    let tagged_repeat = tagged();
+    let tasks_repeat = tasks();
+    assert_eq!(
+        g.direct_projection_statement_reads_test(),
+        before_repeats + 2
+    );
+    assert_eq!(
+        serde_json::to_vec(tagged_first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(tagged_repeat.groups.as_ref()).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(tasks_first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(tasks_repeat.groups.as_ref()).unwrap()
+    );
 
-    // Errand carries no `tags::`, so it cannot contribute to `(page-tags work)`
-    // however it is edited; it does carry the TODO that `(task TODO)` returns.
     let mut errand = g.load_named("Errand", PageKind::Page).unwrap().unwrap();
     errand.blocks[0].raw = "DONE buy milk".into();
     g.save_page(&errand, errand.rev.as_deref()).unwrap();
 
     let tagged_after = tagged();
     let tasks_after = tasks();
-    assert!(
-        Arc::ptr_eq(&tagged_first.groups, &tagged_after.groups),
-        "editing a page the query cannot match must leave that query's memo alone"
+    assert_eq!(
+        serde_json::to_vec(tagged_first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(tagged_after.groups.as_ref()).unwrap(),
+        "the page-tags answer remains meaningful-equal across the irrelevant edit"
     );
-    assert!(
-        !Arc::ptr_eq(&tasks_first.groups, &tasks_after.groups),
-        "editing a page the query DOES match must evict that query's memo"
-    );
+    assert_eq!(tagged_first.total, tagged_after.total);
+    assert_eq!(tagged_first.exceeded, tagged_after.exceeded);
     assert_eq!(tasks_after.groups.len(), 1, "one TODO survives the edit");
     let _ = fs::remove_dir_all(&dir);
 }
@@ -10575,7 +10603,7 @@ fn nfd_alias_resolves_and_canonical_equivalent_alias_cannot_shadow_real_page() {
 }
 
 #[test]
-fn overflowed_bounded_memo_recomputes_when_an_omitted_match_stops_matching() {
+fn overflowed_bounded_query_reexecutes_when_an_omitted_match_stops_matching() {
     let dir = scratch("bounded-overflow-negative-transition");
     fs::write(dir.join("pages").join("A.md"), "- TODO first\n").unwrap();
     fs::write(dir.join("pages").join("B.md"), "- TODO second\n").unwrap();
@@ -10590,9 +10618,13 @@ fn overflowed_bounded_memo_recomputes_when_an_omitted_match_stops_matching() {
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
     let after_unrelated = tasks();
-    assert!(Arc::ptr_eq(&first.groups, &after_unrelated.groups));
     assert!(after_unrelated.exceeded);
     assert_eq!(after_unrelated.total, 2);
+    assert_eq!(
+        serde_json::to_vec(first.groups.as_ref()).unwrap(),
+        serde_json::to_vec(after_unrelated.groups.as_ref()).unwrap(),
+        "the new SQL image has the same bounded answer after an irrelevant edit"
+    );
 
     let admitted = first.groups[0].page.clone();
     let omitted = if admitted == "A" { "B" } else { "A" };
@@ -10601,14 +10633,13 @@ fn overflowed_bounded_memo_recomputes_when_an_omitted_match_stops_matching() {
     g.save_page(&page, page.rev.as_deref()).unwrap();
 
     let after = tasks();
-    assert!(!Arc::ptr_eq(&first.groups, &after.groups));
     assert!(!after.exceeded);
     assert_eq!(after.total, 1);
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn advanced_cache_invalidation_preserves_nul_inside_opaque_query_source() {
+fn advanced_query_recomputes_opaque_nul_source_after_sql_revision_change() {
     let dir = scratch("advanced-cache-nul-query");
     fs::write(dir.join("pages").join("P.md"), "- DONE ship\n").unwrap();
     let g = ready_graph(&dir);
@@ -10629,29 +10660,16 @@ fn advanced_cache_invalidation_preserves_nul_inside_opaque_query_source() {
 }
 
 #[test]
-fn derived_and_advanced_memos_are_lru_bounded() {
+fn derived_reference_memo_is_lru_bounded() {
     let dir = scratch("memo-lru-bound");
     let g = Graph::open(&dir);
-    // The LRU budget is a property of the memo tables themselves, so the
-    // compute closure answers directly and no projection is involved. RET2
-    // made the advanced memo fallible and props-aware; a props-blind key reads
-    // only the published registry generation, so this stays a pure cache test.
-    let empty = || {
-        Ok(crate::query::BoundedGroups {
-            groups: Vec::new(),
-            total: 0,
-            exceeded: false,
-        })
-    };
+    // This is the independent reference-cache bound; query answers are not retained.
     for i in 0..(DERIVED_CACHE_MAX_ENTRIES + 20) {
         let _ = g.derived_memo(format!("test\0{i}"), Vec::new);
-        let _ = g.advanced_memo_bounded(format!("test\0{i}"), false, empty);
     }
     let oversized_key = "x".repeat(DERIVED_CACHE_MAX_ENTRY_BYTES / 2 + 1);
     let _ = g.derived_memo(oversized_key.clone(), Vec::new);
-    let _ = g.advanced_memo_bounded(oversized_key.clone(), false, empty);
     let derived = g.derived_cache.read().unwrap();
-    let advanced = g.advanced_cache.read().unwrap();
     assert_eq!(
         derived.as_ref().unwrap().results.len(),
         DERIVED_CACHE_MAX_ENTRIES
@@ -10661,18 +10679,8 @@ fn derived_and_advanced_memos_are_lru_bounded() {
         .unwrap()
         .results
         .contains_key(&oversized_key));
-    assert!(!advanced
-        .as_ref()
-        .unwrap()
-        .results
-        .contains_key(&oversized_key));
-    assert_eq!(
-        advanced.as_ref().unwrap().results.len(),
-        DERIVED_CACHE_MAX_ENTRIES
-    );
     let oldest = format!("test\0{}", 0);
     assert!(!derived.as_ref().unwrap().results.contains_key(&oldest));
-    assert!(!advanced.as_ref().unwrap().results.contains_key(&oldest));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -13252,50 +13260,10 @@ fn direct_query_bench_report(
     );
 }
 
-fn direct_query_bench_cache_keys(graph: &Graph) -> std::collections::BTreeSet<String> {
-    graph
-        .derived_cache
-        .read()
-        .unwrap()
-        .as_ref()
-        .map(|cache| cache.results.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
-fn direct_query_bench_prime_invalidation(graph: &Graph) -> std::collections::BTreeSet<String> {
-    *graph.derived_cache.write().unwrap() = None;
-    for query in [
-        "(task TODO)",
-        "\"b4-unrelated-before\"",
-        "\"b4-never-present\"",
-        "(page-ref \"B4 Measurement Target\")",
-    ] {
-        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
-    }
-    let keys = direct_query_bench_cache_keys(graph);
-    assert_eq!(keys.len(), 4, "the invalidation probe must seed four memos");
-    keys
-}
-
-fn direct_query_bench_report_invalidation(
-    edit: &str,
-    before: &std::collections::BTreeSet<String>,
-    after: &std::collections::BTreeSet<String>,
-    generation_before: u64,
-    generation_after: u64,
-) {
-    let retained = before.intersection(after).count();
-    let evicted = before.difference(after).count();
-    println!(
-        "b4_invalidation edit={edit} before={} retained={retained} evicted={evicted} cache_gen_before={generation_before} cache_gen_after={generation_after}",
-        before.len(),
-    );
-}
-
-/// B4 step 0 measurement. This release-only ignored benchmark compares memo
-/// hits with invalidated evaluation for one representative of each sequencing
-/// class, measures projection readiness immediately after a Direct delta, and
-/// records scoped memo retention. Point it at a copied graph with
+/// B4 step 0 measurement. This release-only ignored benchmark compares
+/// repeated evaluation before and after edits for each sequencing class,
+/// measures projection readiness immediately after a Direct delta, and
+/// records acquired-image execution. Point it at a copied graph with
 /// TINE_DIRECT_QUERY_BENCH_GRAPH_COPY; graph content is never printed.
 #[test]
 #[ignore = "manual benchmark: Direct query classes, facets, and invalidation"]
@@ -13341,10 +13309,10 @@ fn direct_query_latency_manual_benchmark() {
     let mut serial = 0;
     for (class, query) in classes {
         std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
-        let mut memo = (0..rounds)
+        let mut repeated = (0..rounds)
             .map(|_| direct_query_bench_sample(&graph, query))
             .collect::<Vec<_>>();
-        direct_query_bench_report(class, "memo", &mut memo, pages, blocks, 0);
+        direct_query_bench_report(class, "repeat", &mut repeated, pages, blocks, 0);
 
         let indexed_before = graph.direct_projection_indexed_reads_test();
         let mut invalidated = Vec::with_capacity(rounds);
@@ -13352,7 +13320,6 @@ fn direct_query_latency_manual_benchmark() {
             serial += 1;
             direct_query_bench_edit(&graph, serial);
             wait_for_direct_query_projection(&graph);
-            *graph.derived_cache.write().unwrap() = None;
             graph.reset_direct_projection_candidate_probe_test();
             let fallback_before = graph.direct_projection_fallback_reads_test();
             let candidate_before = graph.direct_projection_indexed_reads_test();
@@ -13441,7 +13408,44 @@ fn direct_query_latency_manual_benchmark() {
         ready_hits + ready_misses,
     );
 
-    let before = direct_query_bench_prime_invalidation(&graph);
+    let today = crate::date::JournalDate::today();
+    let queries = [
+        "(task TODO)",
+        "\"needle\"",
+        "\"b4-never-present\"",
+        "(page-ref \"B4 Measurement Target\")",
+    ];
+    let acquire_rows = |day| {
+        queries
+            .iter()
+            .map(|query| {
+                simple_query_pre_view_rows_at(&graph, query, day, 20_000, 32 * 1024 * 1024)
+            })
+            .collect::<Vec<_>>()
+    };
+    let report_new_image = |edit: &str,
+                            before: &[Vec<RefGroup>],
+                            after: &[Vec<RefGroup>],
+                            generation_before: u64| {
+        let outputs_equal = before.iter().zip(after).all(|(before, after)| {
+            serde_json::to_vec(before).unwrap() == serde_json::to_vec(after).unwrap()
+        });
+        println!(
+            "b4_acquired_image edit={edit} queries={} executions={} outputs_equal={outputs_equal} cache_gen_before={generation_before} cache_gen_after={}",
+            before.len(),
+            after.len(),
+            graph.cache_generation(),
+        );
+        assert!(outputs_equal);
+    };
+
+    let before = acquire_rows(today);
+    let same_image = acquire_rows(today);
+    assert_eq!(
+        serde_json::to_vec(&before).unwrap(),
+        serde_json::to_vec(&same_image).unwrap(),
+        "same-image executions must agree"
+    );
     let generation_before = graph.cache_generation();
     let mut unrelated = graph
         .load_by_path("pages/B4 Measurement Unrelated.md")
@@ -13451,18 +13455,11 @@ fn direct_query_latency_manual_benchmark() {
     graph
         .save_page(&unrelated, unrelated.rev.as_deref())
         .unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "content_only",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
-    );
-    assert_eq!((after.len(), before.difference(&after).count()), (2, 2));
     wait_for_direct_query_projection(&graph);
+    let after = acquire_rows(today);
+    report_new_image("content_only", &before, &after, generation_before);
 
-    let before = direct_query_bench_prime_invalidation(&graph);
+    let before = acquire_rows(today);
     let generation_before = graph.cache_generation();
     let mut unrelated = graph
         .load_by_path("pages/B4 Measurement Unrelated.md")
@@ -13472,54 +13469,28 @@ fn direct_query_latency_manual_benchmark() {
     graph
         .save_page(&unrelated, unrelated.rev.as_deref())
         .unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "alias_change",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
-    );
-    assert!(after.is_empty());
     wait_for_direct_query_projection(&graph);
+    let after = acquire_rows(today);
+    report_new_image("alias_change", &before, &after, generation_before);
 
-    let before = direct_query_bench_prime_invalidation(&graph);
+    let before = acquire_rows(today);
     let generation_before = graph.cache_generation();
     let mut new_page = direct_save_bench_new_page("B4 Measurement New Page");
     new_page.blocks[0].id = Uuid::from_u128(0xb400_0000_0000_0000_0000_0000_0000_0001).to_string();
     graph.save_page(&new_page, None).unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "page_set_change",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
-    );
-    assert!(after.is_empty());
     wait_for_direct_query_projection(&graph);
+    let after = acquire_rows(today);
+    report_new_image("page_set_change", &before, &after, generation_before);
 
-    let before = direct_query_bench_prime_invalidation(&graph);
-    graph.derived_cache.write().unwrap().as_mut().unwrap().today -= 1;
-    let generation_before = graph.cache_generation();
-    let mut unrelated = graph
-        .load_by_path("pages/B4 Measurement Unrelated.md")
-        .unwrap()
-        .unwrap();
-    unrelated.blocks[0].raw = "b4-unrelated-day-rollover".into();
-    graph
-        .save_page(&unrelated, unrelated.rev.as_deref())
-        .unwrap();
-    let after = direct_query_bench_cache_keys(&graph);
-    direct_query_bench_report_invalidation(
-        "day_rollover_simulated",
-        &before,
-        &after,
-        generation_before,
-        graph.cache_generation(),
+    let before = acquire_rows(today);
+    let same_day = acquire_rows(today);
+    assert_eq!(
+        serde_json::to_vec(&before).unwrap(),
+        serde_json::to_vec(&same_day).unwrap()
     );
-    assert!(after.is_empty());
-    wait_for_direct_query_projection(&graph);
+    let generation_before = graph.cache_generation();
+    let after = acquire_rows(today.add_days(1));
+    report_new_image("explicit_day_change", &before, &after, generation_before);
 
     let facet_sizes = std::env::var("TINE_DIRECT_QUERY_BENCH_FACET_SIZES")
         .unwrap_or_else(|_| "1000,4000".into())
@@ -20999,8 +20970,8 @@ fn a_declared_type_change_evicts_the_cached_typed_query_it_retypes() {
 /// SPEC §5.9 guard (c), Direct Files half (E6): a query with NO property leaf
 /// is still config-sensitive, because `journal_page_title_format` decides
 /// whether a page in `pages/` is a journal day at all. The config is read at
-/// open, so the guard is a reopen — and the digest is what keeps the two
-/// answers apart in the cache.
+/// open, so the guard is a reopen and the next execution must use the new
+/// digest.
 #[test]
 fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
     let dir = scratch("registry-journal-title-format");

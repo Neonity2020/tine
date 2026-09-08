@@ -1864,6 +1864,7 @@ fn drive_initial_feed_with_turn_budget(handle: &SyncRuntimeHandle, turn_budget: 
                 }
             }
             SyncRuntimeTick::Recovering
+            | SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable { .. })
             | SyncRuntimeTick::RetryFull
             | SyncRuntimeTick::Failed(_) => {}
             other => panic!("initial exact feed did not settle: {other:?}"),
@@ -26538,6 +26539,21 @@ fn clean_runtime_does_not_publish_legacy_retained_scratch_resume_authority() {
 fn only_a_committing_tick_reports_an_observable_change() {
     assert!(SyncRuntimeTick::AdmittedComplete { epoch: 7 }.committed_observable_change());
     assert!(
+        SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable {
+            batch_id: BatchId::from_uuid(Uuid::from_u128(8)),
+        })
+        .committed_observable_change(),
+        "completed local projection work must wake live readers"
+    );
+    assert!(
+        !SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::RetryableRetainedRecovery {
+            batch_id: None,
+            phase: SyncLocalMutationPhase::SqliteDrain,
+        })
+        .committed_observable_change(),
+        "a pending local drain must not announce completion"
+    );
+    assert!(
         SyncRuntimeTick::ProviderMutation {
             batch_id: BatchId::from_uuid(Uuid::from_u128(7)),
         }
@@ -27099,10 +27115,7 @@ fn managed_query_search_manual_receipt(
             .reset_managed_application_query_instrumentation()
             .unwrap();
         handle.reset_managed_query_census();
-        // Each sample is a cold measurement by construction: the receipt
-        // is about what one evaluation costs, not what the second one
-        // costs once the memo holds the answer.
-        handle.clear_application_simple_query_memo().unwrap();
+        // Each request executes against the current projection.
         let started = Instant::now();
         let outcome = handle
             .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
@@ -27129,7 +27142,7 @@ fn managed_query_search_manual_receipt(
         handle
             .reset_managed_application_query_instrumentation()
             .unwrap();
-        handle.clear_application_simple_query_memo().unwrap();
+        handle.clear_application_document_caches().unwrap();
         let started = Instant::now();
         let outcome = handle
             .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
@@ -27286,7 +27299,7 @@ fn managed_query_search_manual_receipt(
     // the receipt's before/after: one build, one fixture, one machine.
     let mut complete_page_samples = Vec::with_capacity(samples);
     for sample in 0..samples {
-        handle.clear_application_simple_query_memo().unwrap();
+        handle.clear_application_document_caches().unwrap();
         let started = Instant::now();
         let result = handle
             .application_complete_page_simple_query(indexed, MAX_ROWS, MAX_BYTES)
@@ -27587,23 +27600,18 @@ fn clean_runtime_task_query_is_answered_from_the_database_without_hydrating_page
     ));
 }
 
-/// The complete-page evaluator's memo: what it saves, what drops it, and
-/// that dropping it is driven by the accepted frontier rather than by the
-/// caller remembering to ask.
-///
-/// The last leg is the one that matters. An answer memoized before a save
-/// must not survive the accepted batch that save produces, or a query page
-/// would keep showing the graph as it was.
+/// Every simple-query request executes again, while pending and accepted
+/// edits remain visible to the next execution.
 #[test]
-fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch() {
+fn clean_runtime_repeated_simple_queries_execute_again_and_follow_edits() {
     const TOTAL_PAGES: usize = 24;
     const CANDIDATE_PAGES: usize = 6;
     const MAX_ROWS: usize = 20_000;
     const MAX_BYTES: usize = 32 * 1024 * 1024;
-    const WITNESS: &str = "memo-invalidation-witness";
+    const WITNESS: &str = "repeat-edit-witness";
 
     let fixture = ActivationFixture::scaled_query_candidate_density(
-        "clean-simple-query-memo",
+        "clean-simple-query-repeat",
         0xa3f4,
         TOTAL_PAGES,
         CANDIDATE_PAGES,
@@ -27664,6 +27672,7 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
         "the database route hydrates no page at all: {counters:?}"
     );
     assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+    let cold_value = serde_json::to_value(&cold).unwrap();
     assert_managed_simple_query_matches_direct(
         "cold accepted-frontier query",
         cold,
@@ -27675,35 +27684,22 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
         )),
     );
 
-    let (repeat, counters, census) = run("memoized query");
+    let (repeat, counters, census) = run("repeated query");
     assert_eq!(repeat.total, 0);
     assert_eq!(
         census,
-        (0, 0, 0, 0),
-        "the repeated evaluation must be served from the memo, on the actor turn: {census:?}"
+        (1, 0, 0, 0),
+        "the repeated evaluation executes another statement read: {census:?}"
     );
+    assert_eq!(serde_json::to_value(&repeat).unwrap(), cold_value);
     assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
     assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
-
-    handle.clear_application_simple_query_memo().unwrap();
-    let (recomputed, _counters, census) = run("query after an explicitly dropped memo");
-    assert_eq!(recomputed.total, 0);
-    assert_eq!(
-        census,
-        (1, 0, 0, 0),
-        "a dropped memo must recompute rather than answer empty: {census:?}"
-    );
-
-    // Refill the memo, then change the graph through the ordinary save
-    // path. The accepted batch, not the caller, is what has to invalidate.
-    let (_, _counters, census) = run("refilled memo");
-    assert_eq!(census, (0, 0, 0, 0), "{census:?}");
 
     let witness_path = Graph::open(&fixture.graph_root)
         .list_pages()
         .into_iter()
         .next()
-        .expect("the memo fixture must contain pages")
+        .expect("the repeat fixture must contain pages")
         .rel_path;
     let (mut page, revision) = load_application_exact(&handle, &witness_path);
     page.blocks[0].raw = format!("{} {WITNESS}", page.blocks[0].raw);
@@ -27718,18 +27714,16 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
         .unwrap();
     assert!(
         matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }),
-        "the memo fixture edit was not accepted: {save:?}"
+        "the repeat fixture edit was not accepted: {save:?}"
     );
 
-    // While the save is still an undrained local suffix the stamp carries the
-    // pending overlay's revision (R5b), so the earlier memo entry cannot be
-    // reused: the query is captured and R5a's executor answers it OFF the
-    // actor from the overlay and the masked accepted projection.
+    // While the save is still an undrained local suffix, R5a's executor
+    // answers from the overlay and the masked accepted projection.
     assert_eq!(handle.status().unwrap().managed_local_pending, 1);
     let (pending, counters, census) = run("query while the save is pending");
     assert_eq!(
         pending.total, 1,
-        "a memo that answered a pending turn would still answer zero"
+        "the pending execution must observe the new row"
     );
     assert_eq!(
         census,
@@ -27751,19 +27745,17 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
         )),
     );
 
-    // Once the batch is accepted the frontier IS the whole story again. The
-    // stamp moved, so the entry memoized before the save is gone and the
-    // answer is recomputed from the new projection.
+    // Once the batch is accepted the frontier is the whole story again.
     drain_managed_local(&handle);
     let (after_save, counters, census) = run("query after an accepted batch");
     assert_eq!(
         after_save.total, 1,
-        "a memo that survived its accepted batch would still answer zero"
+        "the accepted execution must preserve the new row"
     );
     assert_eq!(
         census,
         (1, 0, 0, 0),
-        "the invalidated memo must recompute from the accepted projection: {census:?}"
+        "the query executes from the accepted projection: {census:?}"
     );
     assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
     assert_managed_simple_query_matches_direct(
@@ -28181,8 +28173,8 @@ fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
 /// The managed projection cache: what it saves and that it cannot go stale.
 ///
 /// Graph search is deliberately the vehicle -- unlike the simple-query
-/// evaluator it holds no answer memo, so a repeated evaluation really does
-/// re-walk every page and the only thing that can have become cheaper is
+/// evaluator, a repeated evaluation re-walks every page and the only thing
+/// that can have become cheaper is
 /// the per-block lsdoc projection.
 ///
 /// The counters are the architectural claim and hold in any build profile.
@@ -28208,7 +28200,7 @@ fn managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones() {
     let pages = direct.list_pages().len();
     assert!(pages > SYNTHETIC_PAGES, "fixture did not activate at scale");
     let handle = open_reopened_managed_actor(&fixture);
-    handle.clear_application_simple_query_memo().unwrap();
+    handle.clear_application_document_caches().unwrap();
     let source = "references";
 
     let run = || {
@@ -32424,10 +32416,8 @@ fn r5c_a_pending_local_suffix_reads_the_accepted_property_registry_from_cache() 
 
     let property_query = "(property status Done)";
     let run = |query: &str| {
-        // The memo would answer the second call without reading the registry
-        // at all, which is a different measurement; clear it so each call is a
-        // real evaluation.
-        handle.clear_application_simple_query_memo().unwrap();
+        // Each call is a real evaluation; the observed registry remains the
+        // independent cache measured here.
         match c7b_navigation(
             &handle,
             SyncApplicationNavigationRequest::SimpleQuery {
@@ -32581,7 +32571,6 @@ fn managed_property_registry_cost_while_typing_manual_receipt() {
     const ROUNDS: usize = 20;
     let query = "(property tine-wave-d-absent-key tine-wave-d-absent-value)";
     let sample = || {
-        handle.clear_application_simple_query_memo().unwrap();
         let started = Instant::now();
         match c7b_navigation(
             &handle,
@@ -32729,8 +32718,7 @@ fn managed_property_registry_cost_while_typing_manual_receipt() {
 
 const R4B_ROWS: usize = 20_000;
 const R4B_BYTES: usize = 32 * 1024 * 1024;
-/// A non-sparse shape so the walk fills the shared memo (the sparse task
-/// runner, which R4a retires, never did).
+/// A non-sparse shape that exercises the general SQL route.
 const R4B_QUERY: &str = "(content-regex \"TODO\")";
 
 fn r4b_reopened(label: &str, seed: u128) -> (ActivationFixture, SyncRuntimeHandle) {
@@ -32786,13 +32774,12 @@ fn r4b_oracle(fixture: &ActivationFixture) -> crate::model::BoundedRefGroups {
     ))
 }
 
-/// Arm the next captures with `outcomes`, on a cleared memo and census, so
-/// the very next query captures and the outcomes are consumed in order.
+/// Arm the next captures with `outcomes` and reset the census so the very
+/// next query consumes the first outcome.
 fn r4b_inject(
     handle: &SyncRuntimeHandle,
     outcomes: Vec<crate::managed_query::ManagedQueryOutcome>,
 ) {
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let mut queue = handle.inner.managed_query.injected_outcomes.lock().unwrap();
     queue.clear();
@@ -32843,8 +32830,7 @@ fn assert_query_execution_error(
 /// count). The recovery leg then proves the refusal fabricated nothing: the
 /// next attempt captures, reads ONE statement, and answers exactly what the
 /// independent Direct Files oracle answers over the same graph — so the error
-/// could not have been an empty success in disguise, and nothing was memoized
-/// under the capture's stamp while the read had not happened.
+/// could not have been an empty success in disguise.
 #[test]
 fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
@@ -32874,7 +32860,7 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
     assert_eq!(
         r4b_census(&handle),
         (1, 0, 0, 0),
-        "the retry is one database read; the Busy attempt memoized nothing"
+        "the retry is one database read after the Busy refusal"
     );
     assert!(
         first.total > 0,
@@ -32882,15 +32868,14 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
     );
     assert_managed_simple_query_matches_direct("read after Busy", first, oracle);
 
-    // That read filled the shared memo, so the next turn answers on the actor
-    // and nothing is captured: the census does not move.
+    // Every successful request executes again and returns the same result.
     let second = r4b_query(&handle).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 0),
-        "a memo hit captures nothing"
+        (2, 0, 0, 0),
+        "the repeated query performs a second statement read"
     );
-    assert_managed_simple_query_matches_direct("memo hit", second, r4b_oracle(&fixture));
+    assert_managed_simple_query_matches_direct("repeated query", second, r4b_oracle(&fixture));
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -33022,35 +33007,14 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
         "{after_query:?}"
     );
 
-    // The pending answer is memoized under the overlay revision: the same
-    // query again is a memo hit and executes nothing. (`r4b_inject` clears
-    // the memo, so the outcome is queued directly.)
-    handle
-        .inner
-        .managed_query
-        .injected_outcomes
-        .lock()
-        .unwrap()
-        .push_back(Outcome::Failed("must not be consumed"));
-    let _ = r4b_query(&handle).unwrap();
-    assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0), "memo hit");
-    assert_eq!(
-        handle
-            .inner
-            .managed_query
-            .injected_outcomes
-            .lock()
-            .unwrap()
-            .len(),
-        1
+    // The same pending query executes again against the same overlay state.
+    let repeated = r4b_query(&handle).unwrap();
+    assert_eq!(r5a_census(&handle), (2, 2, 0, 0, 0), "repeated query");
+    assert_managed_simple_query_matches_direct(
+        "repeated pending query",
+        repeated,
+        r4b_oracle(&fixture),
     );
-    handle
-        .inner
-        .managed_query
-        .injected_outcomes
-        .lock()
-        .unwrap()
-        .clear();
 
     // Draining the batch removes the path from the overlay and empties the
     // file; the next query is the accepted route again.
@@ -33069,8 +33033,8 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
     let _ = r4b_query(&handle).unwrap();
     assert_eq!(
         r5a_census(&handle),
-        (2, 1, 0, 0, 0),
-        "accepted route after the drain: a second statement read, still one pending read"
+        (3, 2, 0, 0, 0),
+        "accepted route after the drain: a third statement read, two pending reads"
     );
 
     assert!(matches!(
@@ -33185,7 +33149,6 @@ fn ret2_pending_repair_restores_a_missing_projection_without_document_hydration(
     r5a_pending_append(&handle, "notes/Delta.md", "TODO actor repair witness");
     let expected = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
     let (path, old) = r5a_overlay(&handle);
-    handle.clear_application_simple_query_memo().unwrap();
     handle
         .reset_managed_application_query_instrumentation()
         .unwrap();
@@ -33224,7 +33187,6 @@ fn ret2_pending_repair_automatically_recovers_the_captured_public_routes() {
         };
         let expected = run();
         let (path, old) = r5a_overlay(&handle);
-        handle.clear_application_simple_query_memo().unwrap();
         handle.reset_managed_query_census();
         fs::remove_file(path).unwrap();
         assert_eq!(run(), expected, "public route {route}");
@@ -33242,7 +33204,6 @@ fn ret2_pending_repair_creation_failure_is_terminal_for_later_queries() {
     let handle = r4a_reopen(&fixture);
     r5a_pending_append(&handle, "notes/Delta.md", "TODO persistent repair witness");
     let (path, _) = r5a_overlay(&handle);
-    handle.clear_application_simple_query_memo().unwrap();
     fs::remove_file(&path).unwrap();
     fs::create_dir(&path).unwrap();
     let expected = QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed);
@@ -33367,14 +33328,13 @@ fn ret2_pending_projection_rebuild_does_not_construct_parser_or_editor_pages() {
         work.result_page_hydrations, 0,
         "projection rebuild must not hydrate query results: {work:?}"
     );
-    handle.clear_application_simple_query_memo().unwrap();
     let actual = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
     r4a_assert_same("rebuilt pending projection", &actual, &expected);
 }
 
 #[test]
-fn ret2_recreated_pending_projection_cannot_reuse_an_older_instances_memo() {
-    let fixture = r5a_fixture("ret2-overlay-instance-memo", 0x5a41);
+fn ret2_recreated_pending_projection_reads_the_new_instance() {
+    let fixture = r5a_fixture("ret2-overlay-instance", 0x5a41);
     let handle = r4a_reopen(&fixture);
     const QUERY: &str = "(content-regex \"after-instance\")";
     r5a_pending_append(&handle, "notes/Delta.md", "TODO before-instance");
@@ -33395,12 +33355,10 @@ fn ret2_recreated_pending_projection_cannot_reuse_an_older_instances_memo() {
         rebuilt.flushed_revision, first.flushed_revision,
         "recreation can reuse a revision number"
     );
-    // Do not clear the memo or run the oracle before this assertion: the
-    // saved edit and replacement must invalidate it through actual identity.
     let actual = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
     assert_eq!(
         actual.total, 1,
-        "the new pending source must not reuse the old empty answer"
+        "the new pending source must expose the edited answer"
     );
     let oracle = r5a_walk(&handle, QUERY, R5A_ROWS, R5A_BYTES);
     r4a_assert_same("new overlay instance", &actual, &oracle);
@@ -33491,15 +33449,16 @@ fn r5c_a_pending_property_query_is_captured_and_patched() {
     );
     r4a_assert_same("the patched pending answer", &answered, &walked);
 
-    // The same question again: the memo answers and nothing is patched.
-    let memoized = r4a_navigate(&handle, QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    // The same question executes again, while the patched registry remains a
+    // one-entry cache hit for this unchanged pending state.
+    let repeated = r4a_navigate(&handle, QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
         r5a_census(&handle),
-        (1, 1, 0, 0, 0),
-        "a memo hit executes nothing"
+        (2, 2, 0, 0, 0),
+        "the repeated query performs another two-source read"
     );
     assert_eq!(r5c_patches(&handle), 1);
-    r4a_assert_same("memo hit", &memoized, &walked);
+    r4a_assert_same("repeated query", &repeated, &walked);
 
     // A DIFFERENT property query under the SAME pending state executes, but
     // the patched registry is a one-entry cache hit: still one patch. This is
@@ -33507,8 +33466,8 @@ fn r5c_a_pending_property_query_is_captured_and_patched() {
     let other = r4a_navigate(&handle, OTHER, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
         r5a_census(&handle),
-        (2, 2, 0, 0, 0),
-        "a second distinct property query is a second two-source read"
+        (3, 3, 0, 0, 0),
+        "a distinct property query performs the third two-source read"
     );
     assert_eq!(
         r5c_patches(&handle),
@@ -33698,9 +33657,8 @@ fn r4b_dropping_the_handle_closes_the_query_job_owner() {
 // being exactly the walk's, never by reaching into the executor.
 // ---------------------------------------------------------------------------
 
-/// The ONE oracle for these gates: the actor-side complete-page evaluator, on
-/// a cleared memo so it computes rather than reads the entry the route just
-/// filled. It dispatches to the same `application_simple_query_pages_ready`
+/// The ONE oracle for these gates: the actor-side complete-page evaluator. It
+/// dispatches to the same `application_simple_query_pages_ready`
 /// the walk calls, so it is load-bearing only where the EXECUTOR produced the
 /// answer under test.
 fn r4a_oracle(
@@ -33709,11 +33667,9 @@ fn r4a_oracle(
     max_rows: usize,
     max_bytes: usize,
 ) -> SyncApplicationBoundedRefGroups {
-    handle.clear_application_simple_query_memo().unwrap();
     let answer = handle
         .application_complete_page_simple_query(query, max_rows, max_bytes)
         .unwrap();
-    handle.clear_application_simple_query_memo().unwrap();
     answer
 }
 
@@ -33813,15 +33769,14 @@ fn r4a_an_accepted_only_query_is_one_statement_read_and_no_page_load() {
     assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
     r4a_assert_same("accepted-frontier answer", &answered, &oracle);
 
-    // The same query again: the handle memoized the executor's answer under
-    // the capture's stamp, so the turn answers it and the census does not move.
-    let memoized = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    // The same query executes again and returns the same semantic answer.
+    let repeated = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 0),
-        "a memo hit executes nothing"
+        (2, 0, 0, 0),
+        "the repeated query performs a second statement read"
     );
-    r4a_assert_same("memo hit", &memoized, &oracle);
+    r4a_assert_same("repeated query", &repeated, &oracle);
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -34114,8 +34069,6 @@ fn r4a_a_real_frontier_advance_between_capture_and_open_is_a_stale_recapture() {
         assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
         drain_managed_local(handle);
     })));
-
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let answered = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     crate::managed_query::set_before_managed_open_hook(None);
@@ -34281,14 +34234,12 @@ fn r4a_a_drain_cancels_a_live_read_and_waits_for_its_slot() {
 
 /// D-3: a projection that contradicts itself FAILS the read. It never
 /// answers with fewer rows, never falls back to the walk (SPEC §5.9 M10),
-/// and memoizes nothing -- the next query captures and reads again.
+/// and the next query captures and reads again.
 ///
-/// RET2: the failure is now the bounded public `Unavailable(ReadFailed)`, and
-/// the "memoizes nothing" half doubles as the memo-error-nonpublication gate:
-/// a failed execution is never stored, so the second attempt fails again for
-/// the same reason instead of serving a cached error or a cached answer.
+/// RET2: the failure is now the bounded public `Unavailable(ReadFailed)`; the
+/// second attempt fails again for the same reason.
 #[test]
-fn r4a_a_corrupt_projection_fails_the_read_and_memoizes_nothing() {
+fn r4a_a_corrupt_projection_fails_every_read() {
     // Both halves of the read, each on its OWN runtime so neither damage can
     // stand in for the other:
     //
@@ -34327,8 +34278,6 @@ fn r4a_a_corrupt_projection_fails_the_read_and_memoizes_nothing() {
             .unwrap_or_else(|| panic!("{label}: the fixture must answer {query} nonempty"))
             .page
             .clone();
-
-        handle.clear_application_simple_query_memo().unwrap();
         handle.reset_managed_query_census();
         let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
         let removed = writer.execute(damage, [&page]).unwrap();
@@ -34349,8 +34298,8 @@ fn r4a_a_corrupt_projection_fails_the_read_and_memoizes_nothing() {
             "{label}: one failed read, no fallback, no statement read"
         );
 
-        // Nothing was memoized: the next query captures and reads again, and
-        // fails again for the same reason rather than answering from a cache.
+        // The next query captures and reads again, then fails for the same
+        // reason.
         let again = r4a_navigate(&handle, query, R4B_ROWS, R4B_BYTES).unwrap_err();
         assert_eq!(again, error, "{label}");
         assert_eq!(r4b_census(&handle), (0, 0, 2, 0), "{label}");
@@ -34398,7 +34347,6 @@ fn r4a_an_exhausted_job_owner_is_not_ready() {
     );
 
     drop(held);
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let read = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
@@ -34439,18 +34387,15 @@ fn r5a_census(handle: &SyncRuntimeHandle) -> (usize, usize, usize, usize, usize)
     )
 }
 
-/// The ONE oracle for a PENDING state: the actor's own masked WALK over the
-/// same pending state, on a cleared memo.
+/// The ONE oracle for a pending state: the actor's own masked walk over that
+/// state.
 ///
 /// `r4b_oracle` reads the graph FILES. It is valid for the ordinary pending
 /// `Existing` save — the Managed save writes the file in the same turn — and it
 /// is NOT valid for a pending deletion, a pending new page, a move, or any
 /// shape whose file write has not landed, so every gate below uses this one.
-/// `r4a_oracle` dispatches to `application_simple_query_pages_ready`, which is
-/// exactly the function the handle's `Busy`/`Cancelled` fallback walks through,
-/// and it moves no `managed_query` counter;
-/// `r5a_a_pending_page_local_query_is_answered_off_the_actor` proves the two
-/// spellings of "the walk" agree by ALSO forcing the handle's own fallback.
+/// `r4a_oracle` dispatches to `application_simple_query_pages_ready` and moves
+/// no `managed_query` counter.
 fn r5a_walk(
     handle: &SyncRuntimeHandle,
     query: &str,
@@ -34676,8 +34621,8 @@ fn r5a_fixture(label: &str, seed: u128) -> ActivationFixture {
 
 /// **The headline fail-before.** A pending page-local query is answered OFF the
 /// actor from two databases: one statement read, no fallback, no page document
-/// loaded, exactly the walk's answer. Then a memo hit; then, after the drain,
-/// the ACCEPTED route answers the same question.
+/// loaded, exactly the walk's answer. A repeat executes again; after the drain,
+/// the accepted route answers the same question.
 #[test]
 fn r5a_a_pending_page_local_query_is_answered_off_the_actor() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
@@ -34744,18 +34689,17 @@ fn r5a_a_pending_page_local_query_is_answered_off_the_actor() {
     assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
     r4a_assert_same("pending two-source answer", &answered, &actor_walk);
 
-    // A query is a read: it advanced no overlay revision, and the answer is
-    // memoized under the capture's stamp, so the same question executes
-    // nothing at all.
+    // A query is a read: it advances no overlay revision. The same question
+    // executes again against that unchanged pending state.
     let (_, after_read) = r5a_overlay(&handle);
     assert_eq!(after_read.flushed_revision, pending.flushed_revision);
-    let memoized = r4b_query(&handle).unwrap();
+    let repeated = r4b_query(&handle).unwrap();
     assert_eq!(
         r5a_census(&handle),
-        (1, 1, 0, 0, 0),
-        "a memo hit executes nothing"
+        (2, 2, 0, 0, 0),
+        "the repeated query performs a second two-source read"
     );
-    r4a_assert_same("memo hit", &memoized, &actor_walk);
+    r4a_assert_same("repeated query", &repeated, &actor_walk);
 
     // The drain empties the pending set; the ACCEPTED route answers next, and
     // its answer is the same one (the batch changed nothing the query sees).
@@ -34764,8 +34708,8 @@ fn r5a_a_pending_page_local_query_is_answered_off_the_actor() {
     let drained = r4b_query(&handle).unwrap();
     assert_eq!(
         r5a_census(&handle),
-        (2, 1, 0, 0, 0),
-        "after the drain the accepted route answers and notes no pending read"
+        (3, 2, 0, 0, 0),
+        "after the drain the accepted route answers and notes no new pending read"
     );
     assert_managed_simple_query_matches_direct(
         "accepted route after the drain",
@@ -35011,9 +34955,7 @@ fn r5a_two_files_of_one_display_name_are_one_managed_page() {
 /// executor's own pre-open hook, and `pending_overlay_state()` forces its flush
 /// there, so the outcome is deterministic rather than a race with the worker.
 ///
-/// The entry is stored under the OLD stamp; the next turn computes a new
-/// `overlay_revision`, misses, and captures again — which is what is asserted,
-/// never that the memo is empty.
+/// The next turn captures again at the newer overlay revision.
 #[test]
 fn r5a_a_later_overlay_flush_than_the_capture_required_is_not_stale() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
@@ -35046,8 +34988,6 @@ fn r5a_a_later_overlay_flush_than_the_capture_required_is_not_stale() {
         );
         assert!(state.incomplete.is_empty(), "{state:?}");
     })));
-
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let answered = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
     crate::managed_query::set_before_managed_open_hook(None);
@@ -35061,8 +35001,7 @@ fn r5a_a_later_overlay_flush_than_the_capture_required_is_not_stale() {
     let walk = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
     r4a_assert_same("answer as of overlay acquisition", &answered, &walk);
 
-    // The entry was stored under the OLD stamp and is unreachable at the new
-    // one: the next query captures again and the injected outcome is consumed.
+    // The next query captures again and consumes the injected outcome.
     r4b_inject(&handle, vec![Outcome::Busy]);
     let _ = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
     assert_eq!(
@@ -35074,7 +35013,7 @@ fn r5a_a_later_overlay_flush_than_the_capture_required_is_not_stale() {
             .unwrap()
             .len(),
         0,
-        "the memo entry under the older overlay revision must be unreachable"
+        "the repeated request must reach the executor"
     );
 
     assert!(matches!(
@@ -35104,8 +35043,6 @@ fn r5a_an_accepted_advance_between_the_two_opens_is_a_stale_recapture() {
         let handle = unsafe { &*handle_for_hook };
         drain_managed_local(handle);
     })));
-
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let answered = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
     crate::managed_query::set_before_managed_open_hook(None);
@@ -35146,8 +35083,6 @@ fn r5a_an_unopenable_overlay_is_repaired_once_without_traversal() {
             let _ = fs::remove_file(name);
         }
     })));
-
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let answer = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
     crate::managed_query::set_before_managed_open_hook(None);
@@ -35171,7 +35106,7 @@ fn r5a_an_unopenable_overlay_is_repaired_once_without_traversal() {
 
 /// D-3 on the OVERLAY file: a row that decodes wrong inside a successfully
 /// opened, validated snapshot FAILS the read. It is never a silently smaller
-/// answer, never a walk (SPEC §5.9 M10), and nothing is memoized.
+/// answer and never a walk (SPEC §5.9 M10).
 ///
 /// Two damages, each on its own runtime, mirroring the accepted file's gate:
 /// the descriptor's `query_block_results` row for an admitted block (the LEFT
@@ -35207,8 +35142,6 @@ fn r5a_a_damaged_overlay_row_fails_the_pending_read() {
         r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a damage witness");
         let (overlay_path, state) = r5a_overlay(&handle);
         assert!(state.pending_paths.contains("notes/Delta.md"), "{state:?}");
-
-        handle.clear_application_simple_query_memo().unwrap();
         handle.reset_managed_query_census();
         let writer = rusqlite::Connection::open(&overlay_path).unwrap();
         let removed = writer.execute(damage, ["notes/Delta.md"]).unwrap();
@@ -35228,8 +35161,7 @@ fn r5a_a_damaged_overlay_row_fails_the_pending_read() {
             (0, 0, 0, 1, 0),
             "{label}: one failed read, no fallback"
         );
-        // Nothing memoized: the next query captures and fails again for the
-        // same reason rather than answering from a cache.
+        // The next query captures and fails again for the same reason.
         let again = r4a_navigate(&handle, query, R5A_ROWS, R5A_BYTES).unwrap_err();
         assert_eq!(again, error, "{label}");
         assert_eq!(r5a_census(&handle), (0, 0, 0, 2, 0), "{label}");
@@ -35253,7 +35185,6 @@ fn r5a_an_ambiguous_accepted_path_fails_the_pending_read() {
     // accept path keys a page by its path), so the fixture is built at the
     // storage level: a second row copied from an unrelated accepted page and
     // re-pathed onto the pending one.
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
     let changed = writer
@@ -35405,7 +35336,6 @@ fn r5a_an_exhausted_job_owner_is_not_ready_while_pending() {
     );
 
     drop(held);
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let read = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
     assert_eq!(
@@ -35608,13 +35538,12 @@ fn r5a_the_pending_walk_and_the_pending_read_are_timed_on_a_real_corpus() {
     let mut walk_us = Vec::new();
     let mut read_us = Vec::new();
     for _ in 0..SAMPLES {
-        handle.clear_application_simple_query_memo().unwrap();
+        handle.clear_application_document_caches().unwrap();
         let started = Instant::now();
         let walked = handle
             .application_complete_page_simple_query(query, R5A_ROWS, R5A_BYTES)
             .unwrap();
         walk_us.push(started.elapsed().as_micros());
-        handle.clear_application_simple_query_memo().unwrap();
         let started = Instant::now();
         let read = r4a_navigate(&handle, query, R5A_ROWS, R5A_BYTES).unwrap();
         read_us.push(started.elapsed().as_micros());
@@ -35661,7 +35590,6 @@ fn r5a_the_pending_walk_and_the_pending_read_are_timed_on_a_real_corpus() {
     }
     let (_, state) = r5a_overlay(&handle);
     assert!(state.failed.is_none(), "{state:?}");
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     crate::query::results::reset_buffered_descriptor_bytes();
     let started = Instant::now();
@@ -36427,8 +36355,6 @@ fn r5c_a_property_row_naming_an_absent_page_fails_the_pending_read() {
     );
     let (overlay_path, state) = r5a_overlay(&handle);
     assert!(state.pending_paths.contains("notes/Solo.md"), "{state:?}");
-
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     handle.inner.managed_query.patched_registry.clear();
     let writer = rusqlite::Connection::open(&overlay_path).unwrap();
@@ -36452,8 +36378,7 @@ fn r5c_a_property_row_naming_an_absent_page_fails_the_pending_read() {
         "one failed read, no fallback, no statement read"
     );
     assert_eq!(r5c_patches(&handle), 0, "a refused patch is not a patch");
-    // Nothing memoized and nothing cached: the next query fails again for the
-    // same reason rather than answering from a cache.
+    // The next query executes and fails again for the same reason.
     let again = r4a_navigate(&handle, "(property lonely still)", R5A_ROWS, R5A_BYTES).unwrap_err();
     assert_eq!(again, error);
     assert_eq!(r5a_census(&handle), (0, 0, 0, 2, 0));
@@ -36506,14 +36431,13 @@ fn ret2_failed_accepted_registry_aborts_capture_before_execution() {
     }
 }
 
-/// I-20 exactness: a memoized pending answer is exact for the pending state it
-/// was taken under. A second pending save on the same page moves the stamp, so
-/// the memo misses, the patch cache misses and the answer follows the new
-/// value; the drain then rebuilds the ACCEPTED table exactly once and the
-/// drained answer is Direct's.
+/// I-20 exactness: repeated pending reads execute against the current state. A
+/// second pending save on the same page makes the patch cache miss and the
+/// answer follows the new value; the drain then rebuilds the accepted table
+/// exactly once and the drained answer is Direct's.
 #[test]
 fn r5c_a_second_pending_save_repatches_and_the_drain_rebuilds_the_accepted_table_once() {
-    let fixture = r5c_fixture("r5c-memo-exactness", 0x5c25);
+    let fixture = r5c_fixture("r5c-repeat-exactness", 0x5c25);
     let handle = r4a_reopen(&fixture);
     const QUERY: &str = "(property lonely maybe)";
 
@@ -36522,16 +36446,20 @@ fn r5c_a_second_pending_save_repatches_and_the_drain_rebuilds_the_accepted_table
         "notes/Solo.md",
         vec![r5c_block("TODO only owner\n  lonely:: no")],
     );
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     handle.inner.managed_query.patched_registry.clear();
     let first = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
     assert_eq!(first.total, 0, "`maybe` is not the pending value yet");
     assert_eq!(r5c_patches(&handle), 1);
-    // Memoized: the same question under the same pending state executes nothing.
-    let _ = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
-    assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0));
+    // The same question executes again under the same pending state while the
+    // patched-registry cache remains reusable.
+    let repeated = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(r5a_census(&handle), (2, 2, 0, 0, 0));
     assert_eq!(r5c_patches(&handle), 1);
+    assert_eq!(
+        serde_json::to_value(&repeated).unwrap(),
+        serde_json::to_value(&first).unwrap()
+    );
 
     // A SECOND pending save on the same page, changing the property value.
     r5a_pending_replace(
@@ -36557,7 +36485,6 @@ fn r5c_a_second_pending_save_repatches_and_the_drain_rebuilds_the_accepted_table
         .unwrap();
     drain_managed_local(&handle);
     assert_eq!(handle.status().unwrap().managed_local_pending, 0);
-    handle.clear_application_simple_query_memo().unwrap();
     let drained = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
     let counters = handle.managed_application_query_instrumentation().unwrap();
     assert_eq!(
@@ -36945,7 +36872,6 @@ fn r5c_the_worst_case_patch_is_measured() {
     const QUERY: &str = "(property type kind-1)";
     let mut query_us: Vec<u128> = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
-        handle.clear_application_simple_query_memo().unwrap();
         handle.inner.managed_query.patched_registry.clear();
         let started = Instant::now();
         let answered = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
@@ -37060,8 +36986,8 @@ fn ret2m_assert_matches_merged_oracle(label: &str, handle: &SyncRuntimeHandle) {
 /// Before this packet the request ANSWERED — with the last published accepted
 /// table, which neither reflects the pending edit nor the damage — and the
 /// frontend had no way to tell that from the truth. It is now a typed
-/// `Unavailable(ReadFailed)`, published nowhere and memoized nowhere, so the
-/// same request fails the same way rather than settling into a wrong table.
+/// `Unavailable(ReadFailed)` and published nowhere, so the same request fails
+/// the same way rather than settling into a wrong table.
 #[test]
 fn ret2_the_public_registry_never_serves_stale_metadata_after_read_damage() {
     use crate::query::{QueryExecutionError, QueryUnavailableReason};
@@ -37149,8 +37075,7 @@ fn ret2_the_public_registry_never_serves_stale_metadata_after_read_damage() {
         "a refused patch is not a patch"
     );
 
-    // Nothing about the failure is published or memoized: the same request
-    // fails the same way rather than serving a cached empty or stale table.
+    // Nothing about the failure is published: the same request fails again.
     handle.inner.managed_query.patched_registry.clear();
     let again = ret2m_registry(&handle).unwrap_err();
     assert_eq!(again, error);
@@ -37499,7 +37424,7 @@ fn ret2_the_public_registry_reports_typed_execution_errors_and_never_falls_back(
             "{label}: no answer, no walk: {census:?}"
         );
         // The very next request is healthy and answers the real table: the
-        // failure was neither published nor memoized.
+        // failure was not published.
         let healthy = ret2m_registry(&handle).unwrap();
         assert_eq!(healthy, oracle, "{label}: the healthy request after it");
         assert_eq!(
@@ -37804,7 +37729,6 @@ fn ret1_ir_oracle(
     max_rows: usize,
     max_bytes: usize,
 ) -> SyncApplicationNavigationReply {
-    handle.clear_application_simple_query_memo().unwrap();
     let answer = handle
         .application_complete_page_ir_query(
             query.clone(),
@@ -37815,7 +37739,6 @@ fn ret1_ir_oracle(
             max_bytes,
         )
         .unwrap();
-    handle.clear_application_simple_query_memo().unwrap();
     answer
 }
 
@@ -37912,7 +37835,6 @@ fn ret1_the_public_ir_route_answers_every_shape_exactly_as_the_walk() {
         for (max_rows, max_bytes) in [(R4B_ROWS, R4B_BYTES), (1, R4B_BYTES), (R4B_ROWS, 1)] {
             let oracle =
                 ret1_ir_oracle(&handle, &query, &view, &context, false, max_rows, max_bytes);
-            handle.clear_application_simple_query_memo().unwrap();
             let answered =
                 ret1_ir_navigate(&handle, &query, &view, &context, false, max_rows, max_bytes);
             let rows = ret1_reply_rows(&oracle);
@@ -37996,7 +37918,6 @@ fn ret1_the_public_ir_explanation_matches_the_walk_over_every_shape() {
     for (source, input) in ret1_ir_shapes() {
         let (query, view) = ret1_parse(&source, input);
         let oracle = ret1_ir_oracle(&handle, &query, &view, &context, true, R4B_ROWS, R4B_BYTES);
-        handle.clear_application_simple_query_memo().unwrap();
         let answered =
             ret1_ir_navigate(&handle, &query, &view, &context, true, R4B_ROWS, R4B_BYTES);
         explained_rows += ret1_reply_rows(&oracle);
@@ -38024,8 +37945,8 @@ fn ret1_the_public_ir_explanation_matches_the_walk_over_every_shape() {
 /// **RET1's counter bar.** Every public IR execution — a block `query_run`, a
 /// `@page` `query_run`, and a `query_explain_empty` — is answered by ONE
 /// statement read, with no fallback, no failure, no re-capture, no page DTO
-/// loaded and no whole-graph inventory pass. The second run of the same
-/// execution is a memo hit that executes nothing.
+/// loaded and no whole-graph inventory pass. A repeat executes another
+/// statement read and returns the same result.
 #[test]
 fn ret1_the_public_ir_route_reads_statements_and_hydrates_no_page() {
     let _serial = crate::query::sql::sql_gates_tests::serialize();
@@ -38067,8 +37988,6 @@ fn ret1_the_public_ir_route_reads_statements_and_hydrates_no_page() {
             ret1_reply_rows(&oracle) > 0,
             "{label}: the fixture must answer this execution nonempty"
         );
-
-        handle.clear_application_simple_query_memo().unwrap();
         handle.reset_managed_query_census();
         handle
             .reset_managed_application_query_instrumentation()
@@ -38094,21 +38013,19 @@ fn ret1_the_public_ir_route_reads_statements_and_hydrates_no_page() {
         ret1_assert_same(label, &answered, &oracle);
     }
 
-    // The memo is a property of the BLOCK route only: an explanation's counts
-    // and a page answer are not stored beside a row set, so their second run
-    // executes again rather than replying from a cache that never held them.
+    // A repeated BLOCK execution performs another read and returns the same
+    // semantic result, like the explanation and page routes above.
     let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let first = ret1_ir_navigate(&handle, &query, &view, &context, false, R4B_ROWS, R4B_BYTES);
     assert_eq!(r4b_census(&handle), (1, 0, 0, 0));
-    let memoized = ret1_ir_navigate(&handle, &query, &view, &context, false, R4B_ROWS, R4B_BYTES);
+    let repeated = ret1_ir_navigate(&handle, &query, &view, &context, false, R4B_ROWS, R4B_BYTES);
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 0),
-        "a memo hit executes nothing"
+        (2, 0, 0, 0),
+        "the repeated IR query performs a second statement read"
     );
-    ret1_assert_same("memo hit", &memoized, &first);
+    ret1_assert_same("repeated IR query", &repeated, &first);
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -38203,8 +38120,6 @@ fn ret1_an_actor_edit_turn_completes_while_a_public_ir_selection_waits() {
             assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
             drain_managed_local(handle);
         })));
-
-        handle.clear_application_simple_query_memo().unwrap();
         handle.reset_managed_query_census();
         let answered = ret1_ir_navigate(
             &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
@@ -38297,7 +38212,6 @@ fn ret1_pending_parity_over(handle: &SyncRuntimeHandle, label: &str) -> (usize, 
                     handle, &query, &view, &context, explain, max_rows, max_bytes,
                 );
                 rows += ret1_reply_rows(&expected);
-                handle.clear_application_simple_query_memo().unwrap();
                 handle.reset_managed_query_census();
                 let actual = ret1_ir_navigate(
                     handle, &query, &view, &context, explain, max_rows, max_bytes,
@@ -38423,7 +38337,6 @@ fn ret1_the_public_ir_route_answers_a_pending_suffix_exactly_as_the_walk() {
             let expected = ret1_ir_oracle(
                 &handle, &query, &view, &context, explain, R5A_ROWS, R5A_BYTES,
             );
-            handle.clear_application_simple_query_memo().unwrap();
             handle.reset_managed_query_census();
             let actual = ret1_ir_navigate(
                 &handle, &query, &view, &context, explain, R5A_ROWS, R5A_BYTES,
@@ -38493,7 +38406,6 @@ fn ret1_the_public_ir_route_refuses_exactly_as_the_walk_does() {
             let expected = ret1_ir_oracle(
                 &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
             );
-            handle.clear_application_simple_query_memo().unwrap();
             handle.reset_managed_query_census();
             let actual = ret1_ir_navigate(
                 &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
@@ -38677,8 +38589,8 @@ fn ret2_the_public_ir_route_reports_typed_execution_errors_and_never_walks() {
             );
         }
 
-        // Nothing above poisoned the route or the memo: the same execution,
-        // run for real, reads the database and equals the oracle.
+        // The same execution, run for real, reads the database and equals the
+        // oracle after every refusal.
         r4b_inject(&handle, vec![]);
         let answered = ret2_ir_navigate(&handle, &query, &view, &context, explain).unwrap();
         assert!(
@@ -38839,7 +38751,6 @@ fn ret2_a_pending_suffix_without_an_overlay_is_projection_unavailable() {
         handle.pending_overlay_state().unwrap().is_none(),
         "the pending set is now unreadable"
     );
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     handle
         .reset_managed_application_query_instrumentation()
@@ -39077,9 +38988,9 @@ const RET2_ADVANCED_QUERY: &str = r#"[:find (pull ?b [*]) :where (task ?b #{"TOD
 
 /// **RET2's counter bar for the public advanced route.** Every public advanced
 /// execution is answered by ONE statement read, with no fallback, no failure,
-/// no re-capture, no page DTO loaded and no whole-graph inventory pass. The
-/// second run of the same execution is a memo hit that executes nothing, and a
-/// task-only source never scans global properties.
+/// no re-capture, no page DTO loaded and no whole-graph inventory pass. A
+/// repeat executes again with the same result, and a task-only source never
+/// scans global properties.
 ///
 /// This is the gate that fails on the pre-RET2 route: the actor arm answered
 /// this exact request by hydrating every page of the graph.
@@ -39115,7 +39026,6 @@ fn ret2_the_public_advanced_route_reads_statements_and_hydrates_no_page() {
             false,
         ),
     ] {
-        handle.clear_application_simple_query_memo().unwrap();
         handle.reset_managed_query_census();
         handle
             .reset_managed_application_query_instrumentation()
@@ -39165,19 +39075,18 @@ fn ret2_the_public_advanced_route_reads_statements_and_hydrates_no_page() {
             );
         }
 
-        // The memo is keyed by the RESOLVED IR, so the second run of the same
-        // source answers from it and executes nothing.
-        let memoized =
+        // The second run of the same resolved source executes again.
+        let repeated =
             ret2_advanced_navigate(&handle, source, current_page, R4B_ROWS, R4B_BYTES).unwrap();
         assert_eq!(
             r4b_census(&handle),
-            (1, 0, 0, 0),
-            "{label}: a memo hit executes nothing"
+            (2, 0, 0, 0),
+            "{label}: the repeat performs a second statement read"
         );
         assert_eq!(
-            serde_json::to_value(&memoized).unwrap(),
+            serde_json::to_value(&repeated).unwrap(),
             serde_json::to_value(&answered).unwrap(),
-            "{label}: the memo hit is the same answer"
+            "{label}: the repeated execution has the same answer"
         );
     }
 
@@ -39261,8 +39170,8 @@ fn ret2_the_public_advanced_route_reports_typed_execution_errors_and_never_walks
         );
     }
 
-    // Nothing above poisoned the route or the memo: the same execution, run for
-    // real, reads the database and answers nonempty.
+    // The same execution, run for real after every refusal, reads the database
+    // and answers nonempty.
     r4b_inject(&handle, vec![]);
     let answered =
         ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R4B_ROWS, R4B_BYTES).unwrap();
@@ -39431,8 +39340,8 @@ const RET2_ADVANCED_SHAPES: &[(&str, &str, Option<&str>)] = &[
     ),
 ];
 
-/// The independent actor-side WALK answer for one advanced execution, on a
-/// cleared memo. Q18: this is an ORACLE, never a readiness or recovery answer.
+/// The independent actor-side walk answer for one advanced execution. Q18:
+/// this is an oracle, never a readiness or recovery answer.
 fn ret2_advanced_oracle(
     handle: &SyncRuntimeHandle,
     query: &str,
@@ -39440,11 +39349,9 @@ fn ret2_advanced_oracle(
     max_rows: usize,
     max_bytes: usize,
 ) -> SyncApplicationBoundedAdvancedResult {
-    handle.clear_application_simple_query_memo().unwrap();
     let answer = handle
         .application_complete_page_advanced_query(query, current_page, max_rows, max_bytes)
         .unwrap();
-    handle.clear_application_simple_query_memo().unwrap();
     answer
 }
 
@@ -39462,7 +39369,6 @@ fn ret2_advanced_parity_over(
         // the gate below). The public validator is unchanged by this packet.
         for (max_rows, max_bytes) in [(R4B_ROWS, R4B_BYTES), (1, R4B_BYTES), (R4B_ROWS, 1)] {
             let oracle = ret2_advanced_oracle(handle, source, *current_page, max_rows, max_bytes);
-            handle.clear_application_simple_query_memo().unwrap();
             handle.reset_managed_query_census();
             let answered =
                 ret2_advanced_navigate(handle, source, *current_page, max_rows, max_bytes).unwrap();
@@ -39599,7 +39505,6 @@ fn ret2_the_public_advanced_route_answers_a_pending_suffix_exactly_as_the_walk()
 
     // The counter bar for the pending state: ONE two-source read, no page
     // document loaded, no whole-graph inventory pass.
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     handle
         .reset_managed_application_query_instrumentation()
@@ -39626,15 +39531,12 @@ fn ret2_the_public_advanced_route_answers_a_pending_suffix_exactly_as_the_walk()
     ));
 }
 
-/// **The advanced route's memo, end to end.** Cold execution, warm memo hit,
-/// invalidation by a PENDING edit, invalidation by the accepted batch that edit
-/// becomes, and invalidation of a TYPED source by a `tine.type::` declaration —
-/// all driven by the frontier and the registry generation, never by the caller
-/// remembering to ask.
+/// Repeated advanced executions run again and observe pending edits, accepted
+/// batches, and property declarations.
 #[test]
-fn ret2_the_public_advanced_memo_is_invalidated_by_edits_and_property_declarations() {
+fn ret2_repeated_advanced_queries_execute_again_and_follow_edits_and_declarations() {
     const PROPERTY: &str = r#"[:find (pull ?b [*]) :where (property ?b :score "12")]"#;
-    let fixture = ret2_advanced_fixture("ret2-advanced-memo", 0x4a44);
+    let fixture = ret2_advanced_fixture("ret2-advanced-repeat", 0x4a44);
     let handle = r4a_reopen(&fixture);
     let run = |label: &str, source: &str| {
         handle.reset_managed_query_census();
@@ -39642,8 +39544,6 @@ fn ret2_the_public_advanced_memo_is_invalidated_by_edits_and_property_declaratio
             .unwrap_or_else(|error| panic!("{label}: {error:?}"));
         (answered, r4b_census(&handle))
     };
-
-    handle.clear_application_simple_query_memo().unwrap();
     let (cold, census) = run("cold task", RET2_ADVANCED_QUERY);
     assert_eq!(
         census,
@@ -39651,70 +39551,72 @@ fn ret2_the_public_advanced_memo_is_invalidated_by_edits_and_property_declaratio
         "the cold execution reads the database"
     );
     let cold_rows = ret2_advanced_rows(&cold);
-    assert!(cold_rows > 0, "the memo fixture must answer nonempty");
-    let (warm, census) = run("warm task", RET2_ADVANCED_QUERY);
+    assert!(cold_rows > 0, "the repeat fixture must answer nonempty");
+    let (repeat, census) = run("repeated task", RET2_ADVANCED_QUERY);
     assert_eq!(
         census,
-        (0, 0, 0, 0),
-        "the second run is a memo hit that executes nothing"
+        (1, 0, 0, 0),
+        "the second run executes another statement read"
     );
     assert_eq!(
-        serde_json::to_value(&warm).unwrap(),
+        serde_json::to_value(&repeat).unwrap(),
         serde_json::to_value(&cold).unwrap(),
-        "the memo hit is the same answer"
+        "the repeated execution has the same answer"
     );
 
-    // A PENDING edit that adds a matching block: the capture's stamp carries
-    // the overlay revision, so the accepted-frontier entry cannot answer it.
+    // A pending edit adds a matching block to the next execution.
     let witness_path = Graph::open(&fixture.graph_root)
         .list_pages()
         .into_iter()
         .find(|entry| entry.rel_path.ends_with("Other.md"))
         .expect("the advanced corpus has its other page")
         .rel_path;
-    r5a_pending_append(&handle, &witness_path, "TODO advanced memo witness");
+    r5a_pending_append(&handle, &witness_path, "TODO advanced repeat witness");
     assert_eq!(handle.status().unwrap().managed_local_pending, 1);
     let (pending, census) = run("pending task", RET2_ADVANCED_QUERY);
     assert_eq!(
         census,
         (1, 0, 0, 0),
-        "a pending stamp cannot reuse the accepted entry"
+        "the pending execution reads the current two-source projection"
     );
     assert_eq!(
         ret2_advanced_rows(&pending),
         cold_rows + 1,
-        "a memo that answered the pending turn would still be missing the new row"
+        "the pending execution includes the new row"
     );
 
-    // The accepted batch moves the stamp again.
+    // The accepted batch preserves the new row on the accepted route.
     drain_managed_local(&handle);
     let (accepted, census) = run("task after the accepted batch", RET2_ADVANCED_QUERY);
     assert_eq!(
         census,
         (1, 0, 0, 0),
-        "the invalidated memo recomputes from the new accepted projection"
+        "the query executes from the new accepted projection"
     );
     assert_eq!(ret2_advanced_rows(&accepted), cold_rows + 1);
 
-    // A TYPED source is memoized under the observed-registry generation too.
-    handle.clear_application_simple_query_memo().unwrap();
+    // A typed source also executes on every request.
     let (cold_property, census) = run("cold property", PROPERTY);
     assert_eq!(census, (1, 0, 0, 0));
     assert!(
         ret2_advanced_rows(&cold_property) > 0,
         "the typed source must answer nonempty before the declaration"
     );
-    let (_, census) = run("warm property", PROPERTY);
-    assert_eq!(census, (0, 0, 0, 0), "the typed entry is memoized");
+    let (repeated_property, census) = run("repeated property", PROPERTY);
+    assert_eq!(census, (1, 0, 0, 0), "the typed query executes again");
+    assert_eq!(
+        serde_json::to_value(&repeated_property).unwrap(),
+        serde_json::to_value(&cold_property).unwrap(),
+        "the repeated typed execution has the same answer"
+    );
 
-    // Declaring `score` advances the registry generation, so the entry
-    // memoized under the old one is not served for it.
+    // Declaring `score` changes how the next execution coerces the property.
     r5c_accept_declaration_page(&handle, "score", "number");
     let (redeclared, census) = run("property after a `tine.type::` declaration", PROPERTY);
     assert_eq!(
         census,
         (1, 0, 0, 0),
-        "a declaration for the key this source reads must invalidate its entry"
+        "the declared query executes against the updated registry"
     );
     let oracle = ret2_advanced_oracle(&handle, PROPERTY, None, R4B_ROWS, R4B_BYTES);
     assert_eq!(
@@ -39775,8 +39677,6 @@ fn ret2_an_actor_edit_turn_completes_while_a_public_advanced_selection_waits() {
         assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
         drain_managed_local(handle);
     })));
-
-    handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
     let answered =
         ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R4B_ROWS, R4B_BYTES).unwrap();
@@ -39985,4 +39885,58 @@ fn cold_archive_republication_uses_accepted_names_and_preserves_original_bytes()
             .join(format!("{extra_id}.manifest"))
             .exists());
     }
+}
+
+// Manager-authored test to insert into sync_runtime_tests.rs after the active
+// cache-removal worker releases that file. Run fail-before before source fix.
+#[test]
+fn completed_local_projection_drain_wakes_query_refresh() {
+    let fixture = ActivationFixture::nested_unicode("query-local-completion-refresh", 0xa175);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated
+        .handle
+        .expect("local query-refresh fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    save_application_block_text(&handle, page, revision, "TODO local completion refresh");
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+    let mut completion_seen = false;
+    for _ in 0..64 {
+        let before = handle.status().unwrap().managed_local_pending;
+        let tick = handle.tick().unwrap();
+        let after = handle.status().unwrap().managed_local_pending;
+        assert!(
+            !matches!(
+                tick,
+                SyncRuntimeTick::RecoveryBlocked(_)
+                    | SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Failed(_)
+                    | SyncRuntimeTick::Terminal(_)
+            ),
+            "healthy local save must finish: {tick:?}"
+        );
+        if before > 0 && after == 0 {
+            assert!(
+                tick.committed_observable_change(),
+                "local SQLite completion must emit the existing refresh notification: {tick:?}"
+            );
+            completion_seen = true;
+            break;
+        }
+    }
+    assert!(
+        completion_seen,
+        "local save did not complete within bounded test turns"
+    );
+    let (stored, _) = load_application_exact(&handle, "Root.md");
+    assert!(stored
+        .blocks
+        .iter()
+        .any(|block| block.raw == "TODO local completion refresh"));
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
 }

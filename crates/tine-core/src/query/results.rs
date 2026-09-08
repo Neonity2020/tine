@@ -258,6 +258,23 @@ pub(crate) enum ResultReadError {
     Cancelled,
 }
 
+/// Shared full-text readiness fact, read from the query's owned image.
+pub(crate) const FTS_READY_PROBE_SQL: &str =
+    "SELECT phase FROM search_fts_build WHERE singleton = 1";
+
+pub(crate) fn probe_fts_ready(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+) -> Result<bool, ResultReadError> {
+    match snapshot.run_projection_query(FTS_READY_PROBE_SQL, &[]) {
+        Ok(rows) => Ok(matches!(
+            rows.first().and_then(|row| row.first()),
+            Some(PhysicalQueryValue::Integer(1))
+        )),
+        Err(_) if snapshot.cancellation().is_cancelled() => Err(ResultReadError::Cancelled),
+        Err(error) => Err(ResultReadError::Sql(error)),
+    }
+}
+
 impl std::fmt::Display for ResultReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

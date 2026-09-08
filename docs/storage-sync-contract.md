@@ -707,8 +707,7 @@ simple, advanced, page, registry, or Explain public-query dispatch below.
 
 **The Direct public-query route has no production tree-walk fallback.** A
 semantically refused source returns its existing empty or unsupported-report
-answer before any job or snapshot, and a successful pre-view memo hit can reuse
-an earlier SQL answer. Otherwise simple `{{query ...}}`, advanced datalog,
+answer before any job or snapshot. Otherwise simple `{{query ...}}`, advanced datalog,
 `@block`, `@page` and Explain reads enter `dispatch_direct_query`. The public
 registry returns its published snapshot only when the graph generation, parse
 config and declaration state still match; a refresh enters the same dispatcher
@@ -753,25 +752,28 @@ it does not duplicate text or construct output payload. The durable schema is
 unchanged. Regex program IDs distinguish the effective patterns of both
 syntaxes, and missing required visible text fails the read.
 
-**Direct producer coverage.** The existing coalesced queue records an opaque
-saved-query target before an exact delta or inventory enqueue returns. A
-completed, validated worker turn publishes its covered generation and actual
-SQLite query revision after fact/order writes, session identity and registry
-publication, even when later ordinary deltas are queued. Incomplete warm
-streams and failed writes publish no successful coverage. Unrepresented source
-invalidation withholds new targets until reconciliation; it does not cancel an
-already coherent read. Reset/replacement and changed producer parse config
-restart progress with the existing job drain; close or worker exit cancels
-progress waits. Same-config inventory reconciliation alone is not a lifecycle
-replacement. Progress waiting holds no query slot or SQLite transaction.
-This producer boundary is additive: dispatched queries still use the strict
-generation admission below until acquired-snapshot memo identity is switched
-with admission. Coverage alone is not permission to open during a partial
-producer turn or key a memo by its minimum requested generation.
+**Direct current-snapshot reads.** Live queries do not capture saved-edit
+targets, wait for coverage or require the projection to match the latest source
+generation. Query execution reads the current complete SQLite image.
+It uses the existing bounded producer capture queue to open the current complete
+image, with actual SQL revision, session identity, parse configuration and
+registry inputs captured together. Incomplete initial/rebuild images are refused;
+ordinary queued edits do not make the committed image unusable. Full-text
+readiness is read from the same transaction. Closure and replacement continue
+to use the existing query-job lifecycle and cancellation owner.
+
+**Query answer ownership.** Direct and Managed simple and advanced queries
+construct an operation-scoped answer from their acquired SQLite snapshots. The producer retains
+no query answers and manages no answer-cache invalidation. SQLite owns database
+page caching. Sharing result groups within an operation does not retain answers
+across requests. UI retention of displayed results during refresh is independent
+of this backend read path. Non-query reference caches keep their existing policy.
+Repeated valid requests execute SQL again; only the displayed UI result may
+remain mounted while its replacement is loading.
 
 **What one dispatched query reads.** Capacity is acquired before SQLite opens
-the owned snapshot. The snapshot is validated against the exact current graph
-cache generation before and after its read transaction starts, then its
+the owned snapshot. The snapshot is validated against the complete producer
+image before and after its read transaction starts, then its
 interrupt handle and the snapshot-scoped `session_pages` identity set are
 registered with the job owner. A property-bearing Direct query captures its
 committed registry cache alongside the SQL snapshot, using the actual storage
@@ -842,28 +844,6 @@ alone would strand the projection until another edit. Cancellation is excluded
 from repair because the drain or close deliberately removed the snapshot's
 subject.
 
-**What a cached query result is keyed by.** A Direct Files simple or advanced
-query result is memoized PRE-VIEW — the matched rows in base order, before
-display sorting and sampling — under the resolved normalized query IR, the
-graph cache generation, the execution day, the construction bounds and profile,
-the parse-config digest, and, when the query names a property, the observed
-registry generation. Property-free memo lookups carry no registry-generation
-term and do not consult the editor registry or evict property entries. The key
-is the IR and not the query text, so `(task TODO)`,
-`(and (task TODO))` and the datalog spelling of the same question are ONE entry.
-View directives that do not change the construction profile reuse those rows.
-The parse-config digest is unconditional, because
-`:journal/page-title-format` decides whether a page is a journal day at all and
-a query with no property leaf is still config-sensitive. A warm parsed cache
-allows a safe ordinary content edit to retain unaffected entries: the old and
-new page are tested against the entry's serialized IR with the shared evaluator,
-and survivors advance to the new generation. A cold session with no parsed
-cache, a page-set or alias/identity change, an unreadable key, or another
-graph-wide uncertainty drops the applicable memo instead of claiming scoped
-retention. A property-key declaration change advances the registry generation
-and evicts property-sensitive entries. Query execution and memo hits themselves
-do not require a resident parsed graph.
-
 Managed production queries no longer construct a candidate-page plan or apply
 its selectivity cutoff. A simple query is parsed once; invalid input returns its
 semantic empty refusal before any snapshot or registry acquisition, while valid
@@ -874,18 +854,18 @@ share the unchanged `query_cursor::drain_after` advancement and batch-retry owne
 **A Managed simple query over the accepted frontier runs off the actor.** A
 simple query whose evidence is wholly the accepted frontier — no pending local
 suffix — is answered in two phases: one short actor turn that checks readiness
-and the shared pre-view memo, and, on a miss, a CAPTURE the handle executes on
+and captures inputs which the handle executes on
 the calling thread after the actor's operation lock is released. The capture
 carries everything the read needs and nothing the actor owns: the projection
 path, the parsed query and view, the parse config and journal format, the
-registry snapshot the actor keyed the query with, and the stamp — acceptance
-sequence, frontier digest, config digest and execution day — the answer is
-valid for. The executor opens its own owned snapshot under the runtime's
+registry snapshot, execution day, and the stamp — acceptance sequence,
+frontier digest and config digest — the answer is valid for. The executor opens
+its own owned snapshot under the runtime's
 query-job owner, the same owner every off-actor read of that file is admitted
-by, so the drain that precedes closing the file reaches it. Its answer lands
-in the memo only while that stamp is still the actor's current stamp (a late
-answer never evicts a newer entry), and every other outcome has one named
-disposition: a `Stale` snapshot re-captures at most twice, then reports
+by, so the drain that precedes closing the file reaches it. The answer is
+base-ordered and the requested view is applied within this operation; it is
+not retained for later requests. Every other outcome has one named disposition:
+a `Stale` snapshot re-captures at most twice, then reports
 `NotReady(PendingEdits)`; `Busy` reports `NotReady(Busy)`; `Cancelled` stays
 cancelled and is not counted as a fallback; a `Failed` read is an error
 (`Unavailable(ReadFailed)`). These routes never traverse the parsed graph.
@@ -899,8 +879,7 @@ actor arm that selects rows. The advanced route reaches that driver through
 `query::resolve_advanced_source` — the one owner of an advanced source's size
 and nesting limits, its parse, its `?current-page` and execution-day binding and
 its `ran`/`ignored` clause report — and its answer is the `@block` answer plus
-that report, reattached from OUTSIDE the memoized rows because two datalog
-spellings of one filter share one memo entry. A refused advanced source (a
+that report, reattached after row construction for this source spelling. A refused advanced source (a
 source limit, or a clause set nothing lowers) keeps its existing SEMANTIC
 answer — the report, zero rows, `supported = false` — and never becomes an
 execution error, a fallback or a scan reporting success over nothing. An absent
@@ -922,8 +901,9 @@ readiness probe, one descriptor statement that carries each admitted block's
 page name, kind, journal day, path, stored result identity and estimated size,
 the payload batches charged for the rows the budget admitted, and — only for a
 non-journal page the answer already admitted — that page file's modification
-time. No page document is loaded, no source text is parsed and no whole-graph
-pass is made, so a query costs what its answer costs and nothing more. The
+time. No page document is loaded, no source text is parsed. Selection may
+inspect substantial database data, including all visible text for an unselective
+regex; only output payload construction is bounded by admitted results. The
 answer's cross-page order is the projection's own `pages.path` under SQLite's
 binary collation, its per-block identity is the stored one, and a journal
 page's recency is read from its display NAME exactly as the walk reads it, so
@@ -959,11 +939,10 @@ the revision it has flushed. A path whose content the actor could not supply
 is `incomplete`, and a lowering or write failure marks the whole overlay
 `failed`. Incomplete work reports temporary readiness; a damaged overlay
 reports a bounded failure and never an answer. The revision the
-actor read when it stamped a query is the stamp's `overlay_revision`, so an
-answer is memoized under, and a capture validated against, the exact pending
-state it saw. The stamp also includes `overlay_instance`: recreating the file
-can reuse revision numbers, but never result or patched-registry memo entries
-from the old instance. A query is a read: it pushes nothing and advances no revision.
+actor read when it stamped a query is the stamp's `overlay_revision`; the
+capture is validated against that pending state. The stamp also includes `overlay_instance`: recreating the file
+can reuse revision numbers, but never a capture or patched registry from the
+old instance. A query is a read: it pushes nothing and advances no revision.
 Coherence with the accepted file follows from acceptance itself — a pending
 path leaves the set only when its batch is accepted, which advances the
 acceptance sequence the capture's `open_managed` validates inside its read
@@ -1014,8 +993,8 @@ protocol once per request when opening a pending projection fails, identifying
 the exact failed instance. Execution releases its snapshots and capacity before
 repair begins. Accepted-file failures and cancellation do not trigger pending
 repair. Queries then recapture; unfinished reconstruction reports typed
-readiness, while another failed read reports unavailability. No failed attempt
-is memoized. Tests remove the real file beneath simple, IR, Explain and advanced
+readiness, while another failed read reports unavailability. A failed attempt
+never supplies an answer. Tests remove the real file beneath simple, IR, Explain and advanced
 routes and compare their repaired SQL answers with the undamaged answers.
 An actual creation failure remains terminal for later requests even after the
 filesystem obstruction is removed; lifecycle cleanup is required before a new
@@ -1222,6 +1201,13 @@ filesystem callbacks. Provider bytes may have arrived while Tine was stopped,
 before an inotify watch existed; graph-local text scanning alone cannot prove
 that shared transport is current. Local-only managed storage never performs
 this provider adoption merely because another device's namespace is present.
+
+A completed local journal drain emits `LocalMutation(Durable)` after the
+main SQLite projection and local checkpoint are complete. The existing watcher
+change event wakes live query consumers even when an earlier post-edit refresh
+ran before projection completion. Pending local drain turns remain `Recovering`
+and do not announce a content change. This notification does not make queries
+wait for any particular saved edit.
 
 Provider traversal and incomplete projection recovery may span several actor
 turns. `Recovering` reports bounded progress only; it is not itself a content

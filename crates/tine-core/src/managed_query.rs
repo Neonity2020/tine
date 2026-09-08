@@ -6,7 +6,7 @@
 //! `query::results::read_results`, with no page document loaded and no source
 //! text read. The difference is WHERE it runs. The Managed projection is owned
 //! by the sync actor, so the actor turn is kept short — it validates the turn,
-//! consults the memo and, on a miss, CAPTURES the immutable inputs below — and
+//! CAPTURES the immutable inputs below — and
 //! the read itself runs on the calling thread after the handle has released
 //! its `operation` mutex. The actor keeps serving saves and navigation while
 //! the statement runs; `QueryJobOwner` bounds how many run at once and drains
@@ -31,12 +31,13 @@
 //! table patched here, off the actor, over exactly the keys the pending pages
 //! can have changed (`crate::managed_registry_patch`).
 //!
-//! Ownership (R4/R5 dossiers): this file's types, the shared memo, the census
+//! Ownership (R4/R5 dossiers): this file's types, the census
 //! and the capture/reply/drain wiring in `sync_runtime.rs` are the manager's
 //! (R4b/R5b); the body of [`execute_managed_query`] and its tests are the
 //! R4a/R5a lanes'.
 
-use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,7 +49,7 @@ use tine_storage::sqlite::{
 
 use crate::config::ParseConfig;
 use crate::date::{JournalDate, JournalFormat};
-use crate::model::{PageKind, RefGroup};
+use crate::model::PageKind;
 use crate::oplog::ContentDigest;
 use crate::query::ir::{Query, ViewSettings};
 use crate::query::registry::Registry;
@@ -60,16 +61,7 @@ use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
 use crate::query::{ConstructionProfile, PreViewGroups};
 use crate::query_jobs::{Admission, JobSlot, QueryJobOwner};
 
-/// The ONE definition of "the full-text index is ready to be queried": the row
-/// the FTS builder stamps when its build completed at this projection's
-/// frontier. Both backends probe it with this exact statement
-/// (`direct_projection::probe_fts_ready` and the Managed executor); a second
-/// spelling would be a second definition.
-pub(crate) const FTS_READY_PROBE_SQL: &str =
-    "SELECT phase FROM search_fts_build WHERE singleton = 1";
-
-/// The graph-wide half of a Managed answer's cache identity (C6/E6), and the
-/// stamp the executor validates its snapshot against.
+/// The stamp the executor validates its snapshot against.
 ///
 /// `acceptance_sequence` + `frontier_digest` are what
 /// `PhysicalProjectionQuerySnapshot::open_managed` checks against the file's
@@ -77,21 +69,19 @@ pub(crate) const FTS_READY_PROBE_SQL: &str =
 /// the handle re-captures. `config_digest` is carried unconditionally: the
 /// journal title format decides a page's kind and day, so even a query with
 /// no property leaf is config-sensitive, and a config edit never moves the
-/// acceptance sequence. `today` is the execution day (§4.4): `(between …)`
-/// resolves against it, so an answer from yesterday is not today's.
+/// acceptance sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedQueryStamp {
     pub(crate) acceptance_sequence: u64,
     pub(crate) frontier_digest: ContentDigest,
     pub(crate) config_digest: ContentDigest,
-    pub(crate) today: i64,
     /// R5b: the pending overlay's latest revision when the actor holds an
     /// undrained local suffix, `None` when the accepted frontier is the whole
-    /// story. Every pending save moves it, so a memo entry or a capture is
-    /// exact for the pending state it was taken under.
+    /// story. Every pending save moves it, so a capture is exact for the
+    /// pending state it was taken under.
     pub(crate) overlay_revision: Option<u64>,
     /// Rebuilding restarts revision numbering. The instance disambiguates
-    /// equal revisions of different files in both result and registry memos.
+    /// equal revisions of different files in the pending registry cache.
     pub(crate) overlay_instance: Option<u64>,
 }
 
@@ -153,9 +143,6 @@ pub(crate) struct ManagedQueryCapture {
     /// The property registry the query is lowered under. Built only when the
     /// query has a `props` leaf; otherwise the empty registry (C6).
     pub(crate) registry: Arc<Registry>,
-    /// The registry generation the answer will be memoized under (0 when the
-    /// query has no `props` leaf).
-    pub(crate) registry_generation: u64,
     pub(crate) props: bool,
     pub(crate) query: Query,
     pub(crate) view: ViewSettings,
@@ -163,9 +150,6 @@ pub(crate) struct ManagedQueryCapture {
     pub(crate) max_rows: usize,
     pub(crate) max_bytes: usize,
     pub(crate) profile: ConstructionProfile,
-    /// `query::simple_query_cache_key` of the resolved IR and bounds — the
-    /// memo key, so two spellings of one query share one entry (I-12).
-    pub(crate) key: String,
     /// WHICH answer this capture is for (RET1). The immutable inputs above are
     /// the same for all three; only the row shape and, for an explanation, the
     /// probe decomposition differ.
@@ -173,9 +157,7 @@ pub(crate) struct ManagedQueryCapture {
     /// §4.4's support report for the binding this capture was taken under.
     ///
     /// It travels with the capture rather than with the rows because it is a
-    /// property of HOW the source was bound: a memoized row set may be shared
-    /// by two executions with different reports, so the report may never be
-    /// memoized beside it.
+    /// property of HOW the source was bound.
     pub(crate) report: crate::query::ir::QueryReport,
 }
 
@@ -1121,26 +1103,14 @@ fn run_before_managed_open_hook() {
     }
 }
 
-/// §5.10's readiness probe on THIS snapshot: one statement,
-/// [`FTS_READY_PROBE_SQL`], ready iff the row's integer is 1.
-///
-/// Deliberately NOT Direct's "an unreadable probe means not ready". Direct
-/// probes a pooled seam it can abandon; this runs on an OWNED snapshot whose
-/// transaction the drain is waiting on, so swallowing an error would turn a
-/// cancelled probe into a full unbounded scan the drain then has to interrupt.
-/// A cancelled probe is `Cancelled`, any other probe error is `Failed`, and
-/// only a successful read of a non-`1` value is "still building".
+/// Translate the common snapshot probe into this adapter's outcome type.
 fn probe_fts_ready(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
 ) -> Result<bool, ManagedQueryOutcome> {
-    match snapshot.run_projection_query(FTS_READY_PROBE_SQL, &[]) {
-        Ok(rows) => Ok(matches!(
-            rows.first().and_then(|row| row.first()),
-            Some(PhysicalQueryValue::Integer(1))
-        )),
-        Err(_) if snapshot.cancellation().is_cancelled() => Err(ManagedQueryOutcome::Cancelled),
-        Err(_) => Err(ManagedQueryOutcome::Failed("search_fts_build phase")),
-    }
+    crate::query::results::probe_fts_ready(snapshot).map_err(|error| match error {
+        ResultReadError::Cancelled => ManagedQueryOutcome::Cancelled,
+        _ => ManagedQueryOutcome::Failed("search_fts_build phase"),
+    })
 }
 
 /// The ONE patched pending registry this runtime retains (R5c).
@@ -1180,13 +1150,11 @@ impl PatchedRegistryCache {
 
 /// Everything the accepted route shares between the actor and the handle:
 /// the job owner (the actor drains it before touching the file), the census,
-/// the memo (the actor turn reads it, the handle and the walk fill it), and
-/// the one patched pending registry.
+/// and the one patched pending registry.
 #[derive(Default)]
 pub(crate) struct ManagedQueryShared {
     pub(crate) jobs: QueryJobOwner,
     pub(crate) census: ManagedQueryCensus,
-    pub(crate) memo: Mutex<ApplicationSimpleQueryMemo>,
     pub(crate) patched_registry: PatchedRegistryCache,
     pub(crate) pending_repair: crate::managed_overlay::PendingOverlayRepair,
     /// Test hook: the outcomes the handle uses INSTEAD of executing the next
@@ -1264,192 +1232,23 @@ impl Default for QueryJobOwner {
     }
 }
 
-/// How many distinct simple-query answers one runtime retains at a time.
-const APPLICATION_SIMPLE_QUERY_MEMO_ENTRIES: usize = 4;
-
-/// The largest answer the memo will retain, counted in emitted result blocks.
-/// A bigger answer is served but never stored, so the retained set stays a
-/// small multiple of this bound rather than of the caller's `max_rows`.
-const APPLICATION_SIMPLE_QUERY_MEMO_MAX_BLOCKS: usize = 4_096;
-
-/// One memoized PRE-VIEW answer: base-ordered groups plus the recency axis,
-/// so `sort-by` and `sample` are applied per request over one shared entry —
-/// the Direct twin is `Graph::derived_memo_pre_view`.
-#[derive(Clone, Debug)]
-pub(crate) struct MemoizedPreView {
-    pub(crate) groups: Arc<Vec<RefGroup>>,
-    pub(crate) recency_by_page: Arc<HashMap<String, i64>>,
-    pub(crate) total: usize,
-    pub(crate) exceeded: bool,
-}
-
-#[derive(Debug)]
-struct ApplicationSimpleQueryMemoEntry {
-    key: String,
-    /// Whether the query has a `props` leaf, so its answer depends on the
-    /// registry's effective types and a generation advance evicts it (C6).
-    props: bool,
-    result: MemoizedPreView,
-}
-
-/// Bounded memo for a Managed simple query's PRE-VIEW answer.
-///
-/// Keyed by the resolved IR (`query::simple_query_cache_key`) and the
-/// [`ManagedQueryStamp`]; every entry goes when the stamp moves — an accepted
-/// batch, a config edit, or the execution day — and the `props` entries go
-/// when the registry generation advances. Since R5b a pending suffix is part
-/// of the stamp (`overlay_revision`) rather than a reason to have none, so a
-/// pending answer is memoized too and every pending save moves the stamp and
-/// clears it. Filled by the executor after a successful read;
-/// NEVER after `Stale`, `Busy`, `Cancelled` or
-/// `Failed`, which are not answers.
-///
-/// It is a cache of a pure function over durable evidence, never authority: a
-/// dropped or absent entry costs one recomputation and nothing else.
-#[derive(Debug, Default)]
-pub(crate) struct ApplicationSimpleQueryMemo {
-    stamp: Option<ManagedQueryStamp>,
-    registry_generation: u64,
-    entries: VecDeque<ApplicationSimpleQueryMemoEntry>,
-}
-
-impl ApplicationSimpleQueryMemo {
-    pub(crate) fn get(
-        &mut self,
-        stamp: &ManagedQueryStamp,
-        registry_generation: u64,
-        key: &str,
-    ) -> Option<MemoizedPreView> {
-        if self.stamp.as_ref() != Some(stamp) {
-            self.stamp = Some(stamp.clone());
-            self.entries.clear();
-            self.registry_generation = registry_generation;
-            return None;
-        }
-        self.note_registry_generation(registry_generation);
-        self.entries
-            .iter()
-            .find(|entry| entry.key == key)
-            .map(|entry| entry.result.clone())
-    }
-
-    /// Drop every `props` entry when the registry generation advanced. The
-    /// non-`props` entries are untouched: their answers cannot depend on an
-    /// effective type they never read (C6).
-    fn note_registry_generation(&mut self, registry_generation: u64) {
-        if self.registry_generation == registry_generation {
-            return;
-        }
-        self.registry_generation = registry_generation;
-        self.entries.retain(|entry| !entry.props);
-    }
-
-    /// Store a base-ordered pre-view answer. Returns the entry as stored (or
-    /// as it would have been stored, when the answer is too large to retain),
-    /// so the caller applies the view to the same shared groups either way.
-    pub(crate) fn insert(
-        &mut self,
-        stamp: &ManagedQueryStamp,
-        registry_generation: u64,
-        key: &str,
-        props: bool,
-        pre: PreViewGroups,
-    ) -> MemoizedPreView {
-        let result = MemoizedPreView {
-            groups: Arc::new(pre.groups),
-            recency_by_page: Arc::new(pre.recency_by_page),
-            total: pre.total,
-            exceeded: pre.exceeded,
-        };
-        if self.stamp.as_ref() != Some(stamp) {
-            self.stamp = Some(stamp.clone());
-            self.entries.clear();
-            self.registry_generation = registry_generation;
-        } else {
-            self.note_registry_generation(registry_generation);
-        }
-        let blocks = result
-            .groups
-            .iter()
-            .map(|group| group.blocks.len())
-            .sum::<usize>();
-        if blocks > APPLICATION_SIMPLE_QUERY_MEMO_MAX_BLOCKS {
-            return result;
-        }
-        self.entries.retain(|entry| entry.key != key);
-        while self.entries.len() >= APPLICATION_SIMPLE_QUERY_MEMO_ENTRIES {
-            self.entries.pop_front();
-        }
-        self.entries.push_back(ApplicationSimpleQueryMemoEntry {
-            key: key.to_owned(),
-            props,
-            result: result.clone(),
-        });
-        result
-    }
-
-    /// The off-actor executor's insert: store the answer only while the memo
-    /// still stands at the capture's stamp. An accepted batch can land between
-    /// capture and insert, and a late result must not evict the entries the
-    /// actor has since filled under the newer stamp (I-20); it is returned
-    /// unstored and served once.
-    pub(crate) fn insert_if_current(
-        &mut self,
-        stamp: &ManagedQueryStamp,
-        registry_generation: u64,
-        key: &str,
-        props: bool,
-        pre: PreViewGroups,
-    ) -> MemoizedPreView {
-        if self.stamp.as_ref() != Some(stamp) {
-            return MemoizedPreView {
-                groups: Arc::new(pre.groups),
-                recency_by_page: Arc::new(pre.recency_by_page),
-                total: pre.total,
-                exceeded: pre.exceeded,
-            };
-        }
-        self.insert(stamp, registry_generation, key, props, pre)
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.stamp = None;
-        self.entries.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn stamp(sequence: u64, config: &str, today: i64) -> ManagedQueryStamp {
+    fn stamp(sequence: u64, config: &str) -> ManagedQueryStamp {
         ManagedQueryStamp {
             acceptance_sequence: sequence,
             frontier_digest: ContentDigest::of(b"frontier"),
             config_digest: ContentDigest::of(config.as_bytes()),
-            today,
             overlay_revision: None,
             overlay_instance: None,
         }
     }
 
-    fn pre(total: usize) -> PreViewGroups {
-        PreViewGroups {
-            groups: Vec::new(),
-            recency_by_page: HashMap::new(),
-            total,
-            exceeded: false,
-        }
-    }
-
     #[test]
     fn a_recreated_overlay_cannot_reuse_the_patched_registry() {
-        let mut first = stamp(1, "config", 0);
+        let mut first = stamp(1, "config");
         first.overlay_revision = Some(2);
         first.overlay_instance = Some(10);
         let second = ManagedQueryStamp {
@@ -1466,114 +1265,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_managed_memo_is_keyed_by_the_config_digest_and_the_execution_day() {
-        let mut memo = ApplicationSimpleQueryMemo::default();
-        let before = stamp(7, "one", 100);
-        memo.insert(&before, 0, "k", false, pre(3));
-        assert_eq!(
-            memo.get(&before, 0, "k").map(|r| r.total),
-            Some(3),
-            "the same evidence under the same rules is the same answer"
-        );
-        // E6: the journal title format decides a page's kind and day, so a
-        // query with no property leaf at all is config-sensitive, and editing
-        // `logseq/config.edn` never moves the acceptance sequence.
-        assert_eq!(
-            memo.get(&stamp(7, "two", 100), 0, "k").map(|r| r.total),
-            None,
-            "a config change under an unchanged sequence must not serve the old answer"
-        );
-        // §4.4: `(between -7d today)` is a different question tomorrow.
-        memo.insert(&before, 0, "k", false, pre(3));
-        assert_eq!(
-            memo.get(&stamp(7, "one", 101), 0, "k").map(|r| r.total),
-            None
-        );
-        // And the frontier digest is part of the identity, not only the sequence.
-        memo.insert(&before, 0, "k", false, pre(3));
-        let other_frontier = ManagedQueryStamp {
-            frontier_digest: ContentDigest::of(b"other"),
-            ..before.clone()
-        };
-        assert_eq!(memo.get(&other_frontier, 0, "k").map(|r| r.total), None);
-    }
-
-    #[test]
-    fn a_registry_generation_advance_evicts_the_managed_memos_props_entries_only() {
-        let mut memo = ApplicationSimpleQueryMemo::default();
-        let s = stamp(7, "one", 100);
-        memo.insert(&s, 4, "props-query", true, pre(1));
-        memo.insert(&s, 4, "task-query", false, pre(2));
-        // A graph-wide effective-type change. Per-page retention cannot see
-        // it: the pages holding the answer did not change, only the key's
-        // type did.
-        assert_eq!(
-            memo.get(&s, 5, "props-query").map(|r| r.total),
-            None,
-            "the typed query is recomputed under the new generation"
-        );
-        assert_eq!(
-            memo.get(&s, 5, "task-query").map(|r| r.total),
-            Some(2),
-            "a query that reads no property atom cannot depend on an effective type"
-        );
-    }
-
-    #[test]
-    fn the_memo_is_bounded_by_entries_and_by_answer_size() {
-        let mut memo = ApplicationSimpleQueryMemo::default();
-        let s = stamp(1, "c", 1);
-        for i in 0..APPLICATION_SIMPLE_QUERY_MEMO_ENTRIES + 2 {
-            memo.insert(&s, 0, &format!("k{i}"), false, pre(i));
-        }
-        assert_eq!(memo.len(), APPLICATION_SIMPLE_QUERY_MEMO_ENTRIES);
-        assert!(
-            memo.get(&s, 0, "k0").is_none(),
-            "the oldest entry is evicted"
-        );
-        assert!(memo.get(&s, 0, "k5").is_some());
-
-        let mut huge = pre(0);
-        huge.groups.push(RefGroup {
-            page: "big".into(),
-            kind: crate::model::PageKind::Page,
-            blocks: (0..APPLICATION_SIMPLE_QUERY_MEMO_MAX_BLOCKS + 1)
-                .map(|_| crate::model::BlockDto::default())
-                .collect(),
-            evidence: Vec::new(),
-        });
-        let served = memo.insert(&s, 0, "huge", false, huge);
-        assert_eq!(
-            served.groups[0].blocks.len(),
-            APPLICATION_SIMPLE_QUERY_MEMO_MAX_BLOCKS + 1
-        );
-        assert!(memo.get(&s, 0, "huge").is_none(), "served but never stored");
-        memo.clear();
-        assert_eq!(memo.len(), 0);
-    }
-
-    #[test]
-    fn a_late_executor_insert_never_evicts_a_newer_memo() {
-        let mut memo = ApplicationSimpleQueryMemo::default();
-        let old = stamp(7, "c", 1);
-        let new = stamp(8, "c", 1);
-        // The actor filled the memo under the newer stamp while an off-actor
-        // execution captured under the older one was still running.
-        memo.insert(&new, 0, "fresh", false, pre(5));
-        let served = memo.insert_if_current(&old, 0, "late", false, pre(9));
-        assert_eq!(served.total, 9, "the late answer is still served once");
-        assert_eq!(
-            memo.get(&new, 0, "fresh").map(|r| r.total),
-            Some(5),
-            "I-20: a late result cannot land on newer state"
-        );
-        assert!(memo.get(&new, 0, "late").is_none());
-        // Under the current stamp it is an ordinary insert.
-        memo.insert_if_current(&new, 0, "late", false, pre(9));
-        assert_eq!(memo.get(&new, 0, "late").map(|r| r.total), Some(9));
-    }
-
     /// The storage contract's account of this route, pinned sentence by
     /// sentence so a rewrite of either side fails here first.
     #[test]
@@ -1588,7 +1279,6 @@ mod tests {
             "one short actor turn",
             "executes on\nthe calling thread after the actor's operation lock is released",
             "the same owner every off-actor read of that file is admitted\nby",
-            "only while that stamp is still the actor's current stamp",
             "re-captures at most twice, then reports",
             "cancelled and is not counted as a fallback",
             "a `Failed` read is an error",
@@ -1684,16 +1374,14 @@ is `Failed` too rather than answered twice",
             path: PathBuf::from("/nonexistent/projection.sqlite"),
             overlay: None,
             graph_root: PathBuf::from("/nonexistent"),
-            stamp: stamp(1, "c", today.ordinal_key()),
+            stamp: stamp(1, "c"),
             config: config.parse_config(),
             journal_format: crate::date::JournalFormat::new(
                 config.journal_file_name_format.as_deref(),
                 config.journal_page_title_format.as_deref(),
             ),
             registry: Arc::new(Registry::empty(&config.parse_config())),
-            registry_generation: 0,
             props: false,
-            key: crate::query::simple_query_cache_key(&query, 10, 100, profile),
             query,
             view,
             today,

@@ -1989,12 +1989,9 @@ pub enum SyncRuntimeTick {
 impl SyncRuntimeTick {
     /// Did this tick commit anything a reader could observe?
     ///
-    /// Only `AdmittedComplete` did: it is the variant produced when the drain
-    /// took a completed batch, while `AdmittedNoop` is the same step with no
-    /// batch to take. Both were previously treated as "the graph changed", so
-    /// every quiet admission woke the frontend with a contentless signal, and a
-    /// wake-up arriving while a page was dirty was read as a conflict against
-    /// nothing.
+    /// Completed watcher, local and provider batches wake readers. Pending
+    /// recovery and quiet admissions do not: progress without new visible
+    /// content must not manufacture frontend refreshes or conflicts.
     ///
     /// This is a claim about content, not about progress: a noop tick is still
     /// real progress for the queue epoch and still updates status.
@@ -2002,7 +1999,9 @@ impl SyncRuntimeTick {
     pub const fn committed_observable_change(&self) -> bool {
         matches!(
             self,
-            Self::AdmittedComplete { .. } | Self::ProviderMutation { .. }
+            Self::AdmittedComplete { .. }
+                | Self::ProviderMutation { .. }
+                | Self::LocalMutation(SyncLocalMutationOutcome::Durable { .. })
         )
     }
 }
@@ -3631,11 +3630,10 @@ enum SimpleQueryTurn {
     /// The editor turn is deferred; the caller reports the state as every
     /// navigation request does.
     Deferred(SyncEditorDeferred),
-    /// The turn answered: a memo hit, an empty candidate plan, or the masked
-    /// walk an actor holding a pending local suffix takes.
+    /// The turn answered a semantic refusal before execution.
     Answered(SyncApplicationBoundedRefGroups),
-    /// The actor holds no pending suffix and the memo missed: everything the
-    /// off-actor executor needs, captured at this turn's accepted frontier.
+    /// Everything the off-actor executor needs, captured at this turn's
+    /// accepted frontier.
     Captured(Box<crate::managed_query::ManagedQueryCapture>),
 }
 
@@ -3644,7 +3642,7 @@ enum SimpleQueryTurn {
 ///
 /// The driver behind it — `RuntimeActor::application_captured_query_turn` and
 /// `SyncRuntimeHandle::application_captured_query` — owns readiness, §4.4's
-/// binding, the memo, the capture and the off-actor execution loop for BOTH
+/// binding, the capture and the off-actor execution loop for BOTH
 /// public routes. Only the front differs: `Ir` arrives already parsed (§7.1
 /// hands the IR over the wire), `Advanced` arrives as the authored datalog
 /// SOURCE, which `query::resolve_advanced_source` — the ONE advanced
@@ -3679,8 +3677,7 @@ enum ManagedQueryTurnInput {
 /// advanced query, and the reply shapes are what distinguishes them.
 enum IrQueryTurn {
     Deferred(SyncEditorDeferred),
-    /// The turn answered: a deferred binding with nothing to count, a memo hit,
-    /// or the walk an actor holding an unsplittable pending suffix takes.
+    /// The turn answered a deferred or refused binding with no SQL execution.
     Answered(SyncApplicationNavigationReply),
     /// Everything the off-actor executor needs, captured at this turn's
     /// accepted frontier.
@@ -3690,9 +3687,8 @@ enum IrQueryTurn {
 /// What one PUBLIC property-registry actor turn produced (RET2), the metadata
 /// twin of [`SimpleQueryTurn`] and [`IrQueryTurn`].
 ///
-/// There is deliberately no `Answered` arm. A result route can answer on the
-/// actor from its memo; a metadata read has no memo, and the only other way to
-/// answer without opening a snapshot would be to serve the last published table
+/// There is deliberately no `Answered` arm. The only way to answer without
+/// opening a snapshot would be to serve the last published table
 /// — which is exactly the stale-metadata behaviour this packet removed.
 enum RegistryTurn {
     Deferred(SyncEditorDeferred),
@@ -3791,8 +3787,7 @@ fn query_unavailable(
 }
 
 /// §7.1's `query_run` result for a `@block` answer: the constructed rows, the
-/// selection's diagnostics, and the binding's report attached from OUTSIDE the
-/// memoized row answer.
+/// selection's diagnostics, and the binding's report attached after the rows.
 fn managed_ir_block_result(
     selection: &crate::query::ir::Query,
     report: &crate::query::ir::QueryReport,
@@ -3814,9 +3809,7 @@ fn managed_ir_block_result(
 ///
 /// The advanced answer IS the `@block` answer: the same groups in the same base
 /// order, the same `total` and `exceeded`, plus §4.4's clause report — which
-/// travels on the binding rather than inside the memoized rows, because two
-/// datalog spellings of one filter share one memo entry and may report
-/// different `ignored` clauses.
+/// travels on the binding rather than inside the rows.
 ///
 /// A refusal (a source-limit or wholly unsupported clause set) is already an
 /// advanced answer and passes through untouched: it is a SEMANTIC answer, not
@@ -3862,26 +3855,18 @@ struct PreparedSimpleQuery {
     props: bool,
     config: crate::config::ParseConfig,
     registry: std::sync::Arc<crate::query::registry::Registry>,
-    registry_generation: u64,
     /// `None` while a pending local suffix is undrained.
     stamp: Option<crate::managed_query::ManagedQueryStamp>,
-    key: String,
 }
 
-/// Apply a request's view to a memoized (or just-memoized) pre-view answer.
+/// Apply a request's view to its operation-scoped pre-view answer.
 fn finish_managed_pre_view(
-    pre: crate::managed_query::MemoizedPreView,
+    pre: crate::query::PreViewGroups,
     view: &crate::query::ir::ViewSettings,
 ) -> SyncApplicationBoundedRefGroups {
-    let bounded = crate::query::apply_cached_view(
-        &pre.groups,
-        &pre.recency_by_page,
-        view,
-        pre.total,
-        pre.exceeded,
-    );
+    let bounded = crate::query::apply_view(pre, view);
     SyncApplicationBoundedRefGroups {
-        groups: Arc::try_unwrap(bounded.groups).unwrap_or_else(|groups| groups.as_ref().clone()),
+        groups: bounded.groups,
         total: bounded.total,
         exceeded: bounded.exceeded,
     }
@@ -3899,7 +3884,7 @@ struct HandleInner {
     application_search_lanes: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>,
     /// The accepted-frontier query route's shared state (R4): the job owner
     /// the actor drains before touching the projection file, the census, and
-    /// the memo. One `Arc`, held by this handle and by the actor.
+    /// the pending registry cache. One `Arc`, held by this handle and by the actor.
     managed_query: Arc<crate::managed_query::ManagedQueryShared>,
     #[cfg(test)]
     workspace_id: WorkspaceId,
@@ -4809,7 +4794,7 @@ impl SyncRuntimeHandle {
             // route. It is intercepted here for the same reason the IR commands
             // are — the actor arm that used to answer it hydrated every page of
             // the graph first — and it reaches the same SQL compiler, the same
-            // shallow payload constructor and the same memo.
+            // shallow payload constructor.
             SyncApplicationNavigationRequest::AdvancedQuery {
                 query,
                 current_page,
@@ -4905,8 +4890,8 @@ impl SyncRuntimeHandle {
     /// The Managed simple-query route (R4, SPEC §5.9).
     ///
     /// Phase one is an actor turn that holds `operation` exactly as every
-    /// navigation request does and returns a deferred turn, an answer (memo hit
-    /// or an invalid-input refusal), or a [`crate::managed_query::ManagedQueryCapture`]. Phase
+    /// navigation request does and returns a deferred turn, an invalid-input
+    /// answer, or a [`crate::managed_query::ManagedQueryCapture`]. Phase
     /// two runs [`crate::managed_query::execute_managed_query`] on the CALLING
     /// thread — the Tauri `spawn_blocking` thread or the test thread, never a
     /// new one — after `application_request` has released `operation`, so the
@@ -4915,9 +4900,7 @@ impl SyncRuntimeHandle {
     ///
     /// `Stale` (an accepted batch landed between capture and open) re-captures
     /// at most [`crate::managed_query::MAX_STALE_RECAPTURES`] times. An answer
-    /// is base-ordered and memoized under the capture's stamp — only while the
-    /// memo still stands at that stamp — before the view is applied; nothing
-    /// else is ever memoized here.
+    /// is base-ordered before the view is applied, then released with the request.
     ///
     /// **RET2: there is no walk under this route any more.** Every disposition
     /// that used to reach the parsed graph is now a TYPED
@@ -4927,7 +4910,7 @@ impl SyncRuntimeHandle {
     /// drained or closed owner is `Cancelled`; a failed read is
     /// `Unavailable(ReadFailed)` and an answer of the wrong shape is
     /// `Unavailable(InvalidSnapshot)`. None of them fabricates an empty result,
-    /// and none of them is memoized.
+    /// and none of them is retained.
     fn application_simple_query(
         &self,
         query: String,
@@ -4973,16 +4956,9 @@ impl SyncRuntimeHandle {
                         return Err(managed_answer_shape_error(&shared.census));
                     };
                     crate::query::base_order_groups(&mut pre.groups);
-                    let stored = shared.memo.lock().unwrap().insert_if_current(
-                        &capture.stamp,
-                        capture.registry_generation,
-                        &capture.key,
-                        capture.props,
-                        pre,
-                    );
                     return Ok(SyncApplicationNavigationOutcome::Loaded {
                         reply: SyncApplicationNavigationReply::SimpleQuery(
-                            finish_managed_pre_view(stored, &capture.view),
+                            finish_managed_pre_view(pre, &capture.view),
                         ),
                     });
                 }
@@ -5010,8 +4986,8 @@ impl SyncRuntimeHandle {
     /// (RET2), over one execution loop.
     ///
     /// The same two phases `application_simple_query` runs. Phase one is a
-    /// short actor turn that binds the input (§4.4), consults the memo and
-    /// either answers or CAPTURES; phase two runs
+    /// short actor turn that binds the input (§4.4) and either answers a
+    /// refusal or CAPTURES; phase two runs
     /// `crate::managed_query::execute_managed_query` on the CALLING thread,
     /// after `application_request` released `operation`, so the actor keeps
     /// serving saves and navigation while the statement runs.
@@ -5022,12 +4998,8 @@ impl SyncRuntimeHandle {
     ///
     /// `Stale`, `Busy`, `Cancelled` and `Failed` are classified exactly as the
     /// simple-query route classifies them (RET2: a typed
-    /// `query::QueryExecutionError`, never a walk). Only a `@block` answer is
-    /// memoized, under the capture's stamp and only while the memo still stands
-    /// at it; `@page` rows and an explanation's counts are not memoized at all,
-    /// and no report is ever stored beside a row set — which is exactly why the
-    /// advanced route's clause report is reattached by
-    /// [`managed_advanced_reply`] from OUTSIDE the memoized rows.
+    /// `query::QueryExecutionError`, never a walk). The advanced route's clause
+    /// report is reattached by [`managed_advanced_reply`] after the rows return.
     fn application_captured_query(
         &self,
         input: ManagedQueryTurnInput,
@@ -5078,17 +5050,10 @@ impl SyncRuntimeHandle {
                                 return Err(managed_answer_shape_error(&shared.census));
                             };
                             crate::query::base_order_groups(&mut pre.groups);
-                            let stored = shared.memo.lock().unwrap().insert_if_current(
-                                &capture.stamp,
-                                capture.registry_generation,
-                                &capture.key,
-                                capture.props,
-                                pre,
-                            );
                             SyncApplicationNavigationReply::QueryRun(managed_ir_block_result(
                                 &capture.query,
                                 &capture.report,
-                                finish_managed_pre_view(stored, &capture.view),
+                                finish_managed_pre_view(pre, &capture.view),
                             ))
                         }
                         ManagedQueryRequest::Pages => {
@@ -5160,8 +5125,8 @@ impl SyncRuntimeHandle {
     /// config and ACCEPTED registry table plus the pending overlay instance and
     /// required revision; phase two runs
     /// [`crate::managed_metadata::execute_managed_metadata`] on the CALLING
-    /// thread with `operation` released. There is no memo hit to serve here and
-    /// no answer the actor can give without opening a snapshot.
+    /// thread with `operation` released. The actor cannot answer without
+    /// opening a snapshot.
     ///
     /// **This route never returns fallback metadata.** Before RET2 a refused
     /// materialized read served the last published table — or an empty one
@@ -5171,7 +5136,7 @@ impl SyncRuntimeHandle {
     /// same [`managed_execution_error`] the result routes use, a failed pending
     /// projection takes exactly the same bounded exact-instance repair after
     /// the capture (and therefore every snapshot and slot handle) is released,
-    /// and nothing about a failure is published or memoized.
+    /// and nothing about a failure is published.
     fn application_captured_registry(
         &self,
     ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
@@ -5685,6 +5650,20 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    /// Drop only the document conversion and hydration caches so performance
+    /// receipts can measure a deliberately cold complete-page walk.
+    #[cfg(test)]
+    fn clear_application_document_caches(&self) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ClearApplicationDocumentCaches {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
     /// Evaluate a simple query through the complete-page evaluator, skipping
     /// the sparse task-query path entirely.
     ///
@@ -5785,23 +5764,6 @@ impl SyncRuntimeHandle {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::ApplicationInventoryScans {
-            reply: reply_sender,
-        })?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    /// Drop the actor's bounded complete-page query memo.
-    ///
-    /// Deliberately separate from the instrumentation reset: a receipt that
-    /// measures repeated cold evaluations calls both, while a test that has to
-    /// observe the memo's own hit calls only the reset.
-    #[cfg(test)]
-    fn clear_application_simple_query_memo(&self) -> Result<(), SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::ClearApplicationSimpleQueryMemo {
             reply: reply_sender,
         })?;
         reply_receiver
@@ -11127,8 +11089,8 @@ enum ActorRequest {
         reply:
             mpsc::Sender<Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError>>,
     },
-    /// The short actor half of a Managed simple query (R4): readiness, memo,
-    /// and either an answer or a capture the handle executes off the actor.
+    /// The short actor half of a Managed simple query (R4): readiness and
+    /// either a refusal answer or a capture the handle executes off the actor.
     ApplicationSimpleQueryTurn {
         query: String,
         max_rows: usize,
@@ -11136,8 +11098,8 @@ enum ActorRequest {
         reply: mpsc::Sender<Result<SimpleQueryTurn, SyncApplicationPageRequestError>>,
     },
     /// The short actor half of §7.1's two IR commands (RET1) and of the public
-    /// advanced datalog query (RET2): readiness, the §4.4 binding, the memo,
-    /// and either an answer or a capture the handle executes off the actor.
+    /// advanced datalog query (RET2): readiness, the §4.4 binding, and either
+    /// a refusal answer or a capture the handle executes off the actor.
     ApplicationCapturedQueryTurn {
         input: Box<ManagedQueryTurnInput>,
         max_rows: usize,
@@ -11263,9 +11225,9 @@ enum ActorRequest {
     #[cfg(test)]
     ResetManagedApplicationQueryInstrumentation { reply: mpsc::Sender<()> },
     #[cfg(test)]
-    ApplicationInventoryScans { reply: mpsc::Sender<usize> },
+    ClearApplicationDocumentCaches { reply: mpsc::Sender<()> },
     #[cfg(test)]
-    ClearApplicationSimpleQueryMemo { reply: mpsc::Sender<()> },
+    ApplicationInventoryScans { reply: mpsc::Sender<usize> },
     #[cfg(test)]
     ApplicationCompletePageSimpleQuery {
         query: String,
@@ -11777,14 +11739,14 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
-            ActorRequest::ApplicationInventoryScans { reply } => {
-                let _ = reply.send(actor.application_inventory_scans.get());
+            ActorRequest::ClearApplicationDocumentCaches { reply } => {
+                actor.clear_application_document_caches();
+                let _ = reply.send(());
                 false
             }
             #[cfg(test)]
-            ActorRequest::ClearApplicationSimpleQueryMemo { reply } => {
-                actor.clear_application_simple_query_memo();
-                let _ = reply.send(());
+            ActorRequest::ApplicationInventoryScans { reply } => {
+                let _ = reply.send(actor.application_inventory_scans.get());
                 false
             }
             #[cfg(test)]
@@ -13793,8 +13755,7 @@ struct RuntimeActor {
     hot_application_save_page: Option<HotApplicationSavePage>,
     /// The accepted-frontier query route's shared state (R4), the same `Arc`
     /// the handle holds: this actor drains `jobs` before it removes, replaces,
-    /// reopens or resets the projection file, reads `memo` in the SimpleQuery
-    /// turn, and fills `memo` after a complete walk. See `managed_query`.
+    /// reopens or resets the projection file. See `managed_query`.
     managed_query: Arc<crate::managed_query::ManagedQueryShared>,
     /// The Managed Storage half of the graph's observed property registry
     /// (§6.1–§6.4): a disposable in-memory snapshot, swapped atomically, built
@@ -14719,6 +14680,12 @@ impl RuntimeActor {
     }
 
     #[cfg(test)]
+    fn clear_application_document_caches(&self) {
+        self.application_projection_cache.borrow_mut().clear();
+        self.application_hydration_cache.borrow_mut().clear();
+    }
+
+    #[cfg(test)]
     fn note_navigation_overlay_pending_path_load(&self) {
         let mut current = self.managed_application_query_instrumentation.get();
         current.navigation_overlay_pending_path_loads = current
@@ -14737,13 +14704,6 @@ impl RuntimeActor {
         self.application_projection_cache
             .borrow_mut()
             .roots(path, page)
-    }
-
-    #[cfg(test)]
-    fn clear_application_simple_query_memo(&self) {
-        self.application_projection_cache.borrow_mut().clear();
-        self.application_hydration_cache.borrow_mut().clear();
-        self.managed_query.memo.lock().unwrap().clear();
     }
 
     #[cfg(test)]
@@ -16880,16 +16840,6 @@ impl RuntimeActor {
                 crate::query::QueryUnavailableReason::UnsupportedRelation,
             ));
         }
-        if let Some(hit) = self.managed_query.memo.lock().unwrap().get(
-            &stamp,
-            prepared.registry_generation,
-            &prepared.key,
-        ) {
-            return Ok(SimpleQueryTurn::Answered(finish_managed_pre_view(
-                hit,
-                &prepared.view,
-            )));
-        }
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
@@ -16904,7 +16854,6 @@ impl RuntimeActor {
                 config: prepared.config,
                 journal_format: self.graph.journal_format.clone(),
                 registry: prepared.registry,
-                registry_generation: prepared.registry_generation,
                 props: prepared.props,
                 query: prepared.query,
                 view: prepared.view,
@@ -16912,7 +16861,6 @@ impl RuntimeActor {
                 max_rows,
                 max_bytes,
                 profile: prepared.profile,
-                key: prepared.key,
                 request: crate::managed_query::ManagedQueryRequest::Blocks,
                 // A `{{query …}}` source has no advanced clause report: OG and
                 // TQL report an empty `ignored` and `supported = true` (M5).
@@ -16927,15 +16875,14 @@ impl RuntimeActor {
 
     /// The per-request inputs both halves of a Managed simple query share:
     /// ONE parse of the source at ONE execution day, the config and registry
-    /// the answer is computed under, the memo key, and the stamp — `None`
+    /// the answer is computed under, and the stamp — `None`
     /// while a pending local suffix makes the accepted frontier not the whole
-    /// story, in which case nothing is memoized or captured.
-    /// The accepted-frontier evidence a memo entry or an off-actor capture is
-    /// stamped with, or `None` while a pending local suffix is undrained.
+    /// story, in which case nothing is captured.
+    /// The accepted-frontier evidence an off-actor capture is stamped with, or
+    /// `None` while a pending local suffix is undrained.
     fn managed_simple_query_stamp(
         &self,
         config: &crate::config::ParseConfig,
-        today: crate::date::JournalDate,
     ) -> Result<Option<crate::managed_query::ManagedQueryStamp>, SyncApplicationPageRequestError>
     {
         match self.managed_query.pending_repair.status() {
@@ -16980,7 +16927,6 @@ impl RuntimeActor {
             acceptance_sequence,
             frontier_digest: database.required_frontier_digest(),
             config_digest: config.digest(),
-            today: today.ordinal_key(),
             overlay_revision,
             overlay_instance,
         }))
@@ -17019,18 +16965,14 @@ impl RuntimeActor {
         // The stamp comes FIRST: it is one materialized-read open, and the
         // registry choice below is keyed by the intent it is prepared for, so
         // computing it after the registry would only invite a second open.
-        let stamp = self.managed_simple_query_stamp(&config, today)?;
-        // C6: the registry generation is part of the key only for a query that
-        // reads property atoms. A query without a `props` leaf never consults an
-        // effective type, so building the registry to key it would be cost with
-        // no meaning.
+        let stamp = self.managed_simple_query_stamp(&config)?;
+        // A query without a `props` leaf never consults an effective type, so
+        // building the registry would be cost with no meaning.
         let registry = if props {
             self.accepted_property_registry()?
         } else {
             std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
         };
-        let registry_generation = if props { registry.generation() } else { 0 };
-        let key = crate::query::simple_query_cache_key(&parsed, max_rows, max_bytes, profile);
         Ok(PreparedSimpleQuery {
             query: parsed,
             view,
@@ -17039,9 +16981,7 @@ impl RuntimeActor {
             props,
             config,
             registry,
-            registry_generation,
             stamp,
-            key,
         })
     }
 
@@ -17055,7 +16995,6 @@ impl RuntimeActor {
     fn prepared_for_walk(&self, mut prepared: PreparedSimpleQuery) -> PreparedSimpleQuery {
         if prepared.props {
             prepared.registry = self.application_property_registry();
-            prepared.registry_generation = prepared.registry.generation();
         }
         prepared
     }
@@ -17087,22 +17026,6 @@ impl RuntimeActor {
                 total: 0,
                 exceeded: false,
             });
-        }
-
-        // Every open of a page carrying this query recomputes an identical
-        // answer from identical durable evidence, at one whole-page hydration
-        // per candidate page. Consult the shared memo first -- but only with
-        // a stamp (`Some`): the accepted frontier plus, since R5b, the pending
-        // overlay's revision. Without an overlay a pending suffix has no
-        // stamp, and the walk neither reads nor fills the memo.
-        if let Some(stamp) = prepared.stamp.as_ref() {
-            if let Some(hit) = self.managed_query.memo.lock().unwrap().get(
-                stamp,
-                prepared.registry_generation,
-                &prepared.key,
-            ) {
-                return Ok(finish_managed_pre_view(hit, &prepared.view));
-            }
         }
 
         let overlay = self.application_navigation_overlay_ready()?;
@@ -17184,9 +17107,8 @@ impl RuntimeActor {
                 page,
             })
             .collect::<Vec<_>>();
-        // The same evaluator as before, split at the view (§5.9): the
-        // PRE-VIEW answer is what the memo holds, base-ordered, so `sort-by`
-        // and `sample` apply per request over one shared entry.
+        // The independent evaluator returns a base-ordered PRE-VIEW answer;
+        // `sort-by` and `sample` are applied per request below.
         let mut pre = crate::query::collect_pred_bounded_over(
             &crate::query::ApplicationQueryPages {
                 pages: &pages,
@@ -17200,22 +17122,7 @@ impl RuntimeActor {
             prepared.profile,
         );
         crate::query::base_order_groups(&mut pre.groups);
-        let stored = match prepared.stamp.as_ref() {
-            Some(stamp) => self.managed_query.memo.lock().unwrap().insert(
-                stamp,
-                prepared.registry_generation,
-                &prepared.key,
-                prepared.props,
-                pre,
-            ),
-            None => crate::managed_query::MemoizedPreView {
-                groups: std::sync::Arc::new(pre.groups),
-                recency_by_page: std::sync::Arc::new(pre.recency_by_page),
-                total: pre.total,
-                exceeded: pre.exceeded,
-            },
-        };
-        Ok(finish_managed_pre_view(stored, &prepared.view))
+        Ok(finish_managed_pre_view(pre, &prepared.view))
     }
 
     fn application_all_query_pages_ready(
@@ -17388,9 +17295,8 @@ impl RuntimeActor {
     /// `application_simple_query_turn`.
     ///
     /// §4.4's binding happens HERE, once, on the actor: `?current-page` and the
-    /// execution day are resolved before anything is keyed, lowered, memoized
-    /// or captured, and the resulting report travels on the capture so that a
-    /// memoized row set is never stored beside one.
+    /// execution day are resolved before lowering or capture, and the resulting
+    /// report travels on the capture.
     ///
     /// The two INPUT shapes differ only in how that one binding is obtained:
     /// §7.1 hands over already-parsed IR, and an advanced source goes through
@@ -17484,18 +17390,14 @@ impl RuntimeActor {
         let props = selection.filter.has_props_leaf()
             || matches!(&request, ManagedQueryRequest::Counts(probes)
                 if probes.iter().any(|probe| probe.filter.has_props_leaf()));
-        let stamp = self.managed_simple_query_stamp(&config, today)?;
-        // C6: the registry generation is part of the key only for a query that
-        // reads property atoms. The CAPTURE path prepares under the ACCEPTED
-        // table, because that is the base the off-actor executor patches.
+        let stamp = self.managed_simple_query_stamp(&config)?;
+        // The CAPTURE path prepares under the ACCEPTED table, because that is
+        // the base the off-actor executor patches.
         let registry = if props {
             self.accepted_property_registry()?
         } else {
             std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
         };
-        let registry_generation = if props { registry.generation() } else { 0 };
-        let key = crate::query::simple_query_cache_key(&selection, max_rows, max_bytes, profile);
-        let memoizable = matches!(request, ManagedQueryRequest::Blocks);
         // No stamp: a pending local suffix with no overlay to read it from.
         // RET2 classifies it exactly as the simple-query turn does — bounded
         // unavailability, never an actor walk.
@@ -17522,23 +17424,6 @@ impl RuntimeActor {
                 crate::query::QueryUnavailableReason::UnsupportedRelation,
             ));
         }
-        if memoizable {
-            if let Some(hit) =
-                self.managed_query
-                    .memo
-                    .lock()
-                    .unwrap()
-                    .get(&stamp, registry_generation, &key)
-            {
-                return Ok(IrQueryTurn::Answered(
-                    SyncApplicationNavigationReply::QueryRun(managed_ir_block_result(
-                        &selection,
-                        resolved.report(),
-                        finish_managed_pre_view(hit, view),
-                    )),
-                ));
-            }
-        }
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
@@ -17553,7 +17438,6 @@ impl RuntimeActor {
                 config,
                 journal_format: self.graph.journal_format.clone(),
                 registry,
-                registry_generation,
                 props,
                 query: selection,
                 view: view.clone(),
@@ -17561,7 +17445,6 @@ impl RuntimeActor {
                 max_rows,
                 max_bytes,
                 profile,
-                key,
                 request,
                 report: resolved.report().clone(),
             },
@@ -17619,15 +17502,10 @@ impl RuntimeActor {
             return Ok(RegistryTurn::Deferred(state));
         }
         let config = self.graph.config.parse_config();
-        // §4.4's execution day is carried for ONE reason: it is part of the
-        // query stamp, and the stamp is what makes a metadata read and a result
-        // query at the same opened state share one patched registry. The
-        // registry itself does not resolve dates.
-        let today = crate::date::JournalDate::today();
         // The stamp comes FIRST, exactly as it does in the query turns, so the
         // pending-repair status and the materialized read are consulted once
         // and in the same order.
-        let stamp = self.managed_simple_query_stamp(&config, today)?;
+        let stamp = self.managed_simple_query_stamp(&config)?;
         let registry = self.accepted_property_registry()?;
         // No stamp: a pending local suffix exists and NO overlay could be
         // created for it. Bounded unavailability, exactly as for a query —
@@ -23301,7 +23179,11 @@ impl RuntimeActor {
                     }
                 }
                 self.queue_clean_provider_publication(completion.batch_id);
-                Some(SyncRuntimeTick::Recovering)
+                Some(SyncRuntimeTick::LocalMutation(
+                    SyncLocalMutationOutcome::Durable {
+                        batch_id: completion.batch_id,
+                    },
+                ))
             }
             ManagedLocalDrainOutcome::Pending(continuation) => {
                 let managed = self
@@ -23353,7 +23235,11 @@ impl RuntimeActor {
                 break;
             }
             match self.tick_clean_foreground_derivative() {
-                Some(SyncRuntimeTick::Recovering) | None => {}
+                Some(SyncRuntimeTick::Recovering)
+                | Some(SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable {
+                    ..
+                }))
+                | None => {}
                 Some(_) => break,
             }
         }

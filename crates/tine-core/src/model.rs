@@ -2856,18 +2856,14 @@ pub struct Graph {
     page_build_flight: std::sync::Mutex<Option<Arc<PageBuildFlight>>>,
     #[cfg(test)]
     page_build_test: PageBuildTestState,
-    /// Memoized results of the pervasive whole-graph scans (run_query / backlinks /
-    /// unlinked_refs), keyed by `(cache_gen, today)` so it self-invalidates on ANY
+    /// Memoized reference results (backlinks and unlinked references), keyed by `(cache_gen, today)` so it self-invalidates on ANY
     /// cache mutation and on a date rollover (relative-date queries depend on
     /// today). Lets a re-render, a second component showing the same query, or
     /// navigating back to a page recompute nothing; never serves a stale result.
     derived_cache: RwLock<Option<DerivedCache>>,
-    /// Memoized advanced-query results. Kept separate from `derived_cache` because
-    /// advanced queries return clause metadata as well as groups.
-    advanced_cache: RwLock<Option<AdvancedCache>>,
     /// The graph's observed property registry (SPEC §6.1–§6.4): a **disposable,
-    /// in-memory, graph-scoped** cache, one per open graph, next to the query
-    /// caches above. Nothing is persisted and nothing is authoritative — the
+    /// in-memory, graph-scoped** cache, one per open graph. Nothing is persisted
+    /// and nothing is authoritative — the
     /// property lines in the Markdown/Org tree are (D-3).
     ///
     /// It is built under ONE snapshot and swapped atomically, refreshed
@@ -3979,33 +3975,12 @@ fn is_date_stem_entry(entry: &PageEntry) -> bool {
         .is_some_and(|s| crate::date::JournalDate::from_file_stem(s).is_some())
 }
 
-/// Gen+today-tagged cache of derived scan results. Reset wholesale whenever the
-/// tag no longer matches — so every entry is always consistent with the current
-/// graph state (no per-entry invalidation to get wrong).
-#[derive(Clone, Copy)]
-struct DerivedMemoStamp {
-    gen: u64,
-    today: i64,
-    config_digest: tine_storage::ContentDigest,
-    /// None means this lookup does not depend on a registry.
-    registry_gen: Option<u64>,
-}
-
 struct DerivedCache {
     gen: u64,
     today: i64,
-    /// **C6, unconditional.** `ParseConfig::digest()` is part of every Rust
-    /// query-cache identity: `journal_page_title_format` also decides
-    /// `PageEntry.kind`/`date_key`, so a `page.journal` / `page.day` / OG
-    /// `(between …)` query is config-sensitive without carrying any `props`
-    /// leaf (E6). A mismatch drops the whole cache.
+    /// The parse configuration under which the reference results were built.
+    /// A mismatch drops the whole cache.
     config_digest: tine_storage::ContentDigest,
-    /// **C6, `props`-only.** The registry generation the `props`-sensitive
-    /// entries were computed at. When it advances, every key in `props_keys` is
-    /// evicted: per-page retention evaluates a query against ONE saved page and
-    /// cannot see a graph-wide effective-type change.
-    registry_gen: u64,
-    props_keys: std::collections::HashSet<String>,
     // `Arc<Vec<RefGroup>>` so serving a memoized result (every dataRev re-render)
     // is a refcount bump, not a deep clone of every matched block (see derived_memo).
     results: std::collections::HashMap<String, (DerivedEntry, usize)>,
@@ -4013,27 +3988,15 @@ struct DerivedCache {
     bytes: usize,
 }
 
-/// One derived-cache value.
-///
-/// §5.9 stores the **pre-view** result of a simple/advanced query — the matched
-/// rows in base order, before `sort-by` and `sample` — so a view-only edit does
-/// not invalidate rows the view has not looked at yet. A `(sort-by modified …)`
-/// applied AFTER the cache still needs the recency axis its construction
-/// measured, so that axis travels with the rows. Every other entry family
-/// (backlinks, unlinked references, block referrers) has no view at all and
-/// carries an empty map.
+/// One cached backlink, unlinked-reference, or block-referrer value.
 #[derive(Clone)]
 struct DerivedEntry {
     result: BoundedRefGroups,
-    recency_by_page: Arc<std::collections::HashMap<String, i64>>,
 }
 
 impl DerivedEntry {
     fn plain(result: BoundedRefGroups) -> DerivedEntry {
-        DerivedEntry {
-            result,
-            recency_by_page: Arc::new(std::collections::HashMap::new()),
-        }
+        DerivedEntry { result }
     }
 }
 
@@ -4067,6 +4030,11 @@ const PROPERTY_REGISTRY_DEBOUNCE: std::time::Duration = std::time::Duration::fro
 /// or a typed [`crate::query::QueryExecutionError`]. An attempt returns an
 /// OWNED answer, so every snapshot handle it opened is already dropped by the
 /// time the dispatcher can decide to repair (R3 §2B).
+type DirectQueryRequest = Option<(
+    Arc<crate::direct_projection::DirectProjection>,
+    crate::query_jobs::QueryJobEpoch,
+)>;
+
 enum DirectAttempt<T> {
     /// The statement answered and its rows were hydrated.
     Answered(T),
@@ -4118,94 +4086,6 @@ fn direct_attempt_from_read<T>(
     }
 }
 
-/// Which half of the C6 cache identity an entry needs.
-///
-/// The config digest is part of EVERY entry's identity (E6); the registry
-/// generation is only part of a `props`-carrying query's, so a `tine.type::`
-/// edit does not evict backlinks and full-text results that cannot depend on it.
-#[derive(Clone, Copy)]
-enum CacheSensitivity {
-    /// A derived-cache key of the shape `<tag>\0…`; the query key shapes carry
-    /// the query source and are parsed once, at insert.
-    Plain,
-    /// The caller already parsed the query and knows the answer (§5.9's
-    /// IR-keyed entries): the key carries serialized IR, not a query source, so
-    /// re-deriving this from the key would mean a second deserialization per
-    /// insert to learn something the caller was holding.
-    Known(bool),
-}
-
-impl CacheSensitivity {
-    /// Whether the entry's query source carries a `props` leaf. Evaluated ONLY
-    /// at insert (never on a cache hit), so a hit costs no parse.
-    fn is_props_sensitive(self, key: &str) -> bool {
-        let source = match self {
-            CacheSensitivity::Plain => match key.split_once('\0') {
-                Some(("q" | "sq", source)) => Some(source),
-                Some(("Q" | "SQ", rest)) => rest.splitn(3, '\0').nth(2),
-                _ => None,
-            },
-            CacheSensitivity::Known(props) => return props,
-        };
-        source.is_some_and(crate::query::query_source_has_props_leaf)
-    }
-}
-
-/// C6's retention rule: when the registry generation advances, every cached
-/// `props` query is evicted, because per-page retention (`page_affects_query`)
-/// evaluates a query against ONE saved page and cannot see a graph-wide
-/// effective-type change.
-fn evict_props_entries_on_registry_advance<T>(
-    results: &mut std::collections::HashMap<String, (T, usize)>,
-    lru: &mut std::collections::VecDeque<String>,
-    bytes: &mut usize,
-    props_keys: &mut std::collections::HashSet<String>,
-    cached_generation: &mut u64,
-    current_generation: u64,
-) {
-    if *cached_generation == current_generation {
-        return;
-    }
-    *cached_generation = current_generation;
-    if props_keys.is_empty() {
-        return;
-    }
-    for key in props_keys.drain() {
-        if let Some((_, entry_bytes)) = results.remove(&key) {
-            *bytes = bytes.saturating_sub(entry_bytes);
-        }
-    }
-    lru.retain(|key| results.contains_key(key));
-}
-
-struct AdvancedCache {
-    gen: u64,
-    today: i64,
-    /// C6, as in [`DerivedCache`].
-    config_digest: tine_storage::ContentDigest,
-    registry_gen: u64,
-    props_keys: std::collections::HashSet<String>,
-    results: std::collections::HashMap<String, (CachedAdvancedResult, usize)>,
-    lru: std::collections::VecDeque<String>,
-    bytes: usize,
-}
-
-/// One advanced-cache value: §5.9's PRE-VIEW result, the matched rows in base
-/// order.
-///
-/// `ran`/`ignored`/`supported` are deliberately NOT stored. They are a report
-/// about the SOURCE, and the key is the RESOLVED IR — two datalog spellings can
-/// lower to one filter and still list different `ignored` clauses, so storing
-/// the report would let one spelling's clause list be shown beside another's
-/// rows. The resolve that produced the key recomputes it on every call, which is
-/// what makes "one question, one entry" safe here.
-#[derive(Clone)]
-struct CachedAdvancedResult {
-    groups: Arc<Vec<RefGroup>>,
-    total: usize,
-    exceeded: bool,
-}
-
 // Query results contain owned DTO subtrees and can be close to graph-sized. A
 // graph-lifetime, key-unbounded memo turns ordinary navigation through many
 // pages' Linked References into unbounded retained memory. Oversized results are
@@ -4215,8 +4095,7 @@ const DERIVED_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DERIVED_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 
 fn result_cache_key_estimated_bytes(key: &str) -> usize {
-    // The HashMap owns one key and the LRU owns another. Account both copies so
-    // a result with an enormous query source cannot bypass the payload budget.
+    // The HashMap owns one key and the LRU owns another. Account both copies.
     key.len().saturating_mul(2).saturating_add(128)
 }
 
@@ -6147,7 +6026,6 @@ impl Graph {
             #[cfg(test)]
             page_build_test: PageBuildTestState::default(),
             derived_cache: RwLock::new(None),
-            advanced_cache: RwLock::new(None),
             direct_projection: std::sync::Mutex::new(None),
             page_list_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),
@@ -6572,8 +6450,10 @@ impl Graph {
         max_bytes: usize,
         profile: crate::query::ConstructionProfile,
     ) -> Result<crate::query::PreViewGroups, crate::query::QueryExecutionError> {
-        self.dispatch_direct_query(|| {
-            self.direct_projection_statement_pre_view(query, today, max_rows, max_bytes, profile)
+        self.dispatch_direct_query(|request| {
+            self.direct_projection_statement_pre_view(
+                request, query, today, max_rows, max_bytes, profile,
+            )
         })
     }
 
@@ -6623,16 +6503,57 @@ impl Graph {
     /// broken projection cannot drive the frontend's retry loop forever.
     fn dispatch_direct_query<T>(
         &self,
-        attempt: impl Fn() -> DirectAttempt<T>,
+        attempt: impl Fn(&DirectQueryRequest) -> DirectAttempt<T>,
     ) -> Result<T, crate::query::QueryExecutionError> {
         use crate::direct_projection::ProjectionProgress;
         use crate::query::{
             QueryExecutionError as Error, QueryReadinessReason as Readiness,
             QueryUnavailableReason as Reason,
         };
-        match attempt() {
+        // A lifecycle drain invalidates this captured request. Hand a live
+        // surface a readiness retry so its NEXT request captures the new
+        // incarnation; never recapture a moving target inside this request.
+        // Capture the lifecycle identity once, before recovery. Ordinary saves
+        // keep the same epoch and do not cancel the request.
+        let request = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|projection| (Arc::clone(projection), projection.query_epoch()));
+        let cancelled = || {
+            let replaced = request
+                .as_ref()
+                .is_some_and(|(projection, epoch)| projection.query_epoch() != *epoch);
+            if !replaced {
+                return Error::Cancelled;
+            }
+            match self.direct_projection_progress() {
+                Some(ProjectionProgress::Ready) => Error::NotReady(Readiness::PendingEdits),
+                Some(ProjectionProgress::Working(reason)) => Error::NotReady(reason),
+                _ => Error::Cancelled,
+            }
+        };
+        let attempt_captured = || {
+            if request
+                .as_ref()
+                .is_some_and(|(projection, epoch)| projection.query_epoch() != *epoch)
+            {
+                return DirectAttempt::Cancelled;
+            }
+            let result = attempt(&request);
+            if request
+                .as_ref()
+                .is_some_and(|(projection, epoch)| projection.query_epoch() != *epoch)
+            {
+                DirectAttempt::Cancelled
+            } else {
+                result
+            }
+        };
+        match attempt_captured() {
             DirectAttempt::Answered(answer) => return Ok(answer),
-            DirectAttempt::Cancelled => return Err(Error::Cancelled),
+            DirectAttempt::Cancelled => return Err(cancelled()),
             DirectAttempt::Unavailable(reason) => return Err(Error::Unavailable(reason)),
             DirectAttempt::Busy => return Err(Error::NotReady(Readiness::Busy)),
             DirectAttempt::NotReady => match self.direct_projection_progress() {
@@ -6650,9 +6571,9 @@ impl Graph {
             DirectAttempt::FailedRead(_) => {}
         }
         self.direct_projection_recover_after_failed_read();
-        match attempt() {
+        match attempt_captured() {
             DirectAttempt::Answered(answer) => Ok(answer),
-            DirectAttempt::Cancelled => Err(Error::Cancelled),
+            DirectAttempt::Cancelled => Err(cancelled()),
             DirectAttempt::Unavailable(reason) => Err(Error::Unavailable(reason)),
             DirectAttempt::Busy => Err(Error::NotReady(Readiness::Busy)),
             DirectAttempt::FailedRead(reason) => Err(Error::Unavailable(reason)),
@@ -6690,6 +6611,7 @@ impl Graph {
     /// call it again after every handle it opened is gone.
     fn direct_projection_statement_pre_view(
         &self,
+        request: &DirectQueryRequest,
         query: &crate::query::ir::Query,
         today: crate::date::JournalDate,
         max_rows: usize,
@@ -6702,32 +6624,17 @@ impl Graph {
             // independent of database readiness, not an availability failure.
             return DirectAttempt::Answered(crate::query::PreViewGroups::default());
         }
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        else {
-            // No projection is attached at all (an export, a test graph, a
-            // headless tool). There is nothing to be ready or to fail, and
-            // nothing a repair could create.
+        let Some((projection, _)) = request.as_ref() else {
             return DirectAttempt::Unavailable(
                 crate::query::QueryUnavailableReason::ProjectionUnavailable,
             );
         };
-        if !projection.ready_at(generation) {
-            return DirectAttempt::NotReady;
-        }
-        // Acquire before reading registry inputs: lowering and output must see
-        // the same SQLite transaction even when a save lands between them.
         let registry_sensitivity = if query.filter.has_props_leaf() {
             crate::direct_projection::RegistrySensitivity::Required
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        let mut job = match projection.open_query_job_for(generation, registry_sensitivity) {
+        let mut job = match projection.open_current_query_job(registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -6736,13 +6643,13 @@ impl Graph {
             }
             crate::direct_projection::QueryJobOpen::Cancelled => return DirectAttempt::Cancelled,
         };
-        let config = self.config.parse_config();
+        let config = Arc::clone(&job.config);
         let registry = if query.filter.has_props_leaf() {
             // §6.2's metadata for THIS answer, read SQL-only from the job's own
             // owned snapshot. A failed read is a failed read: it does not
             // degrade to the cached or the empty registry, which would publish
             // an answer under types nobody declared.
-            match self.query_property_registry_at(generation, &config, &mut job) {
+            match self.query_property_registry_at(&mut job) {
                 Ok(registry) => registry,
                 Err(crate::query::QueryExecutionError::Cancelled) => {
                     return DirectAttempt::Cancelled
@@ -6759,6 +6666,10 @@ impl Graph {
             Arc::new(crate::query::registry::Registry::empty(&config))
         };
         let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let fts_ready = match crate::query::results::probe_fts_ready(&mut job.snapshot) {
+            Ok(ready) => ready,
+            Err(error) => return direct_attempt_from_read(Err(error.into())),
+        };
         let inputs = LoweringInputs {
             today,
             registry: &registry,
@@ -6772,7 +6683,7 @@ impl Graph {
             // `ConstructionBudget` the walk charges.
             cutoff: None,
             compiled: &compiled,
-            fts_ready: projection.fts_ready(generation),
+            fts_ready,
             result_set_rule: RESULT_SET_RULE,
         };
         // §5.9: when the projection is ready, the statement answers. The
@@ -6819,9 +6730,15 @@ impl Graph {
             profile,
             recency: &recency,
         };
-        direct_attempt_from_read(
-            crate::query::results::read_results(&mut job.snapshot, &inputs).map_err(Into::into),
-        )
+        let mut pre = match crate::query::results::read_results(&mut job.snapshot, &inputs) {
+            Ok(pre) => pre,
+            Err(error) => return direct_attempt_from_read(Err(error.into())),
+        };
+        crate::query::base_order_groups(&mut pre.groups);
+        if job.snapshot.cancellation().is_cancelled() {
+            return DirectAttempt::Cancelled;
+        }
+        DirectAttempt::Answered(pre)
     }
 
     /// **SPEC §7.1 `query_run`'s Direct Files execution** (RET1).
@@ -6830,15 +6747,14 @@ impl Graph {
     /// result driver, so a ready warm graph answered a real result by walking
     /// the parsed graph and read no statement at all. It now takes exactly the
     /// same two routes the `{{query …}}` render path takes: `@block` through
-    /// §5.9's IR-keyed pre-view memo and dispatch, `@page` through the page
-    /// statement and the shared page read.
+    /// the shared pre-view dispatch, `@page` through the page statement and the
+    /// shared page read.
     ///
     /// **Post-resolution only.** `resolved` is the bound tree and its ONE
     /// execution-day snapshot (§4.4), so `?current-page` and `:today` are
-    /// resolved once, before anything is keyed, lowered or cached. The support
-    /// report is NOT attached here: it is a property of how this source was
-    /// bound, not of the rows, which is why the rows may be shared by the memo
-    /// and the report may not (`query::run_query_result_ir` attaches it).
+    /// resolved once before lowering. The support report is NOT attached here:
+    /// it is a property of how this source was bound, not of the rows
+    /// (`query::run_query_result_ir` attaches it).
     pub(crate) fn direct_ir_query_result(
         &self,
         resolved: &crate::query::ResolvedQuery,
@@ -6866,24 +6782,15 @@ impl Graph {
             };
             return Ok(result);
         }
-        // The block-anchored tree both engines evaluate, and the tree §5.9's
-        // cache is keyed by — the same `block_anchored_query` rebase
-        // `run_query_bounded` lowers through, never a second one.
+        // The block-anchored tree both engines evaluate — the same
+        // `block_anchored_query` rebase `run_query_bounded` lowers through.
         let query = crate::query::block_anchored_query(query);
-        let bounded = self.derived_memo_pre_view(
+        let bounded = self.direct_query_view(
             &query,
             view,
+            resolved.today(),
             bounds.max_rows,
             bounds.max_bytes,
-            |profile| {
-                self.direct_simple_query_pre_view(
-                    &query,
-                    resolved.today(),
-                    bounds.max_rows,
-                    bounds.max_bytes,
-                    profile,
-                )
-            },
         )?;
         result.total = bounded.total;
         result.exceeded = bounded.exceeded;
@@ -6918,8 +6825,14 @@ impl Graph {
             });
         }
         let today = resolved.today();
-        let counts = self.dispatch_direct_query(|| {
-            self.direct_projection_statement_probe_counts(&plan.probes, view, today, bounds)
+        let counts = self.dispatch_direct_query(|request| {
+            self.direct_projection_statement_probe_counts(
+                request,
+                &plan.probes,
+                view,
+                today,
+                bounds,
+            )
         })?;
         // The evaluator answered a plan it was not given: that is a projection
         // that contradicts itself, not a row that reads as zero (RET2 §5).
@@ -6938,8 +6851,8 @@ impl Graph {
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
     ) -> Result<crate::query::results::PageAnswer, crate::query::QueryExecutionError> {
-        self.dispatch_direct_query(|| {
-            self.direct_projection_statement_page_rows(query, today, bounds)
+        self.dispatch_direct_query(|request| {
+            self.direct_projection_statement_page_rows(request, query, today, bounds)
         })
     }
 
@@ -6952,29 +6865,19 @@ impl Graph {
     /// classification and the recovery stay in `dispatch_direct_query`.
     fn direct_projection_query_job<T>(
         &self,
+        request: &DirectQueryRequest,
         registry_sensitivity: crate::direct_projection::RegistrySensitivity,
         read: impl FnOnce(
             &mut crate::direct_projection::DirectQueryJob,
-            u64,
             bool,
         ) -> Result<T, crate::query::QueryExecutionError>,
     ) -> DirectAttempt<T> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        else {
+        let Some((projection, _)) = request.as_ref() else {
             return DirectAttempt::Unavailable(
                 crate::query::QueryUnavailableReason::ProjectionUnavailable,
             );
         };
-        if !projection.ready_at(generation) {
-            return DirectAttempt::NotReady;
-        }
-        let mut job = match projection.open_query_job_for(generation, registry_sensitivity) {
+        let mut job = match projection.open_current_query_job(registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -6983,7 +6886,11 @@ impl Graph {
             }
             crate::direct_projection::QueryJobOpen::Cancelled => return DirectAttempt::Cancelled,
         };
-        direct_attempt_from_read(read(&mut job, generation, projection.fts_ready(generation)))
+        let fts_ready = match crate::query::results::probe_fts_ready(&mut job.snapshot) {
+            Ok(ready) => ready,
+            Err(error) => return direct_attempt_from_read(Err(error.into())),
+        };
+        direct_attempt_from_read(read(&mut job, fts_ready))
     }
 
     /// The §6.2 lowering inputs one Direct execution runs under: ONE registry
@@ -6998,18 +6905,18 @@ impl Graph {
     fn direct_lowering_registry(
         &self,
         has_properties: bool,
-        generation: u64,
         job: &mut crate::direct_projection::DirectQueryJob,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
-        let config = self.config.parse_config();
+        let config = Arc::clone(&job.config);
         if !has_properties {
             return Ok(Arc::new(crate::query::registry::Registry::empty(&config)));
         }
-        self.query_property_registry_at(generation, &config, job)
+        self.query_property_registry_at(job)
     }
 
     fn direct_projection_statement_page_rows(
         &self,
+        request: &DirectQueryRequest,
         query: &crate::query::ir::Query,
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
@@ -7023,9 +6930,8 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        self.direct_projection_query_job(registry_sensitivity, |job, generation, fts_ready| {
-            let registry =
-                self.direct_lowering_registry(query.filter.has_props_leaf(), generation, job)?;
+        self.direct_projection_query_job(request, registry_sensitivity, |job, fts_ready| {
+            let registry = self.direct_lowering_registry(query.filter.has_props_leaf(), job)?;
             let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
             let statement = lower_query(
                 query,
@@ -7064,6 +6970,7 @@ impl Graph {
     /// uses, never a third counting rule.
     fn direct_projection_statement_probe_counts(
         &self,
+        request: &DirectQueryRequest,
         probes: &[crate::query::ir::Query],
         view: &crate::query::ir::ViewSettings,
         today: crate::date::JournalDate,
@@ -7075,14 +6982,13 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        self.direct_projection_query_job(registry_sensitivity, |job, generation, fts_ready| {
+        self.direct_projection_query_job(request, registry_sensitivity, |job, fts_ready| {
             let profile = crate::query::ConstructionProfile::from_view(view);
             // One lowering per probe, all under ONE registry snapshot: a probe that
             // read a different effective type than its siblings would explain a
             // query nobody ran.
             let registry = self.direct_lowering_registry(
                 probes.iter().any(|probe| probe.filter.has_props_leaf()),
-                generation,
                 job,
             )?;
             let page_anchored = probes
@@ -7453,24 +7359,6 @@ impl Graph {
     pub(crate) fn reset_direct_projection_candidate_probe_test(&self) {
         DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow_mut().clear());
         crate::query::reset_full_graph_query_evaluations();
-    }
-
-    /// Drop both query memos, so the next query is measured cold. The paired
-    /// walk-vs-dispatch receipt has to compare two COMPUTATIONS, not a
-    /// computation against a cache hit.
-    #[cfg(test)]
-    pub(crate) fn clear_query_memos_test(&self) {
-        *self.derived_cache.write().unwrap() = None;
-        *self.advanced_cache.write().unwrap() = None;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn derived_props_entry_count_test(&self) -> usize {
-        self.derived_cache
-            .read()
-            .unwrap()
-            .as_ref()
-            .map_or(0, |cache| cache.props_keys.len())
     }
 
     #[cfg(test)]
@@ -10180,7 +10068,6 @@ impl Graph {
         *self.page_list_cache.write().unwrap() = None;
         *self.find_entry_cache.write().unwrap() = None;
         *self.derived_cache.write().unwrap() = None;
-        *self.advanced_cache.write().unwrap() = None;
     }
 
     fn clear_watcher_identity_failure_after_reconciliation(&self, entry: &PageEntry) {
@@ -10236,7 +10123,6 @@ impl Graph {
         drop(failures_guard);
         drop(cache);
         *self.derived_cache.write().unwrap() = None;
-        *self.advanced_cache.write().unwrap() = None;
     }
 
     /// Validate mutation authority independently from discovery/read authority.
@@ -12575,8 +12461,8 @@ impl Graph {
         }
     }
 
-    /// Current cache generation — bumped on every cache-mutating page change, and
-    /// the key that memoized queries/backlinks/derived results invalidate against.
+    /// Current cache generation — bumped on every cache-mutating page change,
+    /// and the key that memoized backlink/reference results invalidate against.
     /// Exposed for observability and tests (e.g. asserting a no-op save doesn't
     /// needlessly invalidate everything).
     pub fn cache_generation(&self) -> u64 {
@@ -16142,7 +16028,6 @@ impl Graph {
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         drop(guard);
-        *self.advanced_cache.write().unwrap() = None;
     }
 
     /// Update one page in the cache after we write it (no full rebuild). A no-op
@@ -16373,9 +16258,7 @@ impl Graph {
         // graph-wide alias and real-page inputs merely to rediscover that both
         // memo families are absent. A memo installed after this observation is
         // computed against the already-published cache generation and content.
-        if self.derived_cache.read().unwrap().is_none()
-            && self.advanced_cache.read().unwrap().is_none()
-        {
+        if self.derived_cache.read().unwrap().is_none() {
             return;
         }
         // Resolve aliases BEFORE taking the derived lock (page_aliases may take the
@@ -16390,10 +16273,6 @@ impl Graph {
         // declarations without changing any property row, so it marks the
         // snapshot for rebuild before the retention rule reads it (§6.2, C6).
         self.note_property_key_page_saved(&entry.name);
-        // The registry snapshot and parse config the retention rule evaluates
-        // against — resolved BEFORE the derived lock, like the alias inputs above.
-        let parse_config = self.config.parse_config();
-        let registry = self.property_registry();
         // Hold the derived write lock across the WHOLE prune+re-tag. This is
         // deliberately atomic: the keep/evict test (page_affects_*) is re-evaluated
         // against whatever entry is CURRENTLY in the map, so a result a concurrent
@@ -16408,13 +16287,11 @@ impl Graph {
             let mut g = self.derived_cache.write().unwrap();
             let Some(dc) = g.as_mut() else {
                 drop(g);
-                self.scope_advanced_invalidation(entry, previous_doc, doc, newgen, scoped, today);
                 return;
             };
             if !scoped || dc.today != today {
                 *g = None; // full invalidate (alias/page-set/cold-cache, or day rollover)
                 drop(g);
-                self.scope_advanced_invalidation(entry, previous_doc, doc, newgen, scoped, today);
                 return;
             }
             let mut removed_bytes = 0usize;
@@ -16450,21 +16327,6 @@ impl Graph {
                     Some(("br", uuid)) => {
                         crate::query::page_affects_block_referrers(uuid, candidate)
                     }
-                    // §5.9: one query key family, carrying the resolved
-                    // normalized IR after its four structural fields
-                    // (`simple_query_cache_key`). The retention rule reads the
-                    // IR back instead of re-parsing a query source, which is
-                    // what makes the keep/evict decision independent of the
-                    // dialect the query happened to be written in.
-                    Some(("q", rest)) => rest.splitn(5, '\0').nth(4).is_none_or(|ir| {
-                        crate::query::page_affects_query_ir(
-                            ir,
-                            entry,
-                            candidate,
-                            &parse_config,
-                            &registry,
-                        )
-                    }),
                     Some(("B", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|target| {
                         crate::query::page_affects_backlinks(
                             &real_pages,
@@ -16498,69 +16360,6 @@ impl Graph {
             dc.lru.retain(|key| dc.results.contains_key(key));
             dc.gen = newgen; // survivors are valid for the post-bump generation
         }
-        self.scope_advanced_invalidation(entry, previous_doc, doc, newgen, scoped, today);
-    }
-
-    fn scope_advanced_invalidation(
-        &self,
-        entry: &PageEntry,
-        previous_doc: Option<&Document>,
-        doc: &Document,
-        newgen: u64,
-        scoped: bool,
-        today: i64,
-    ) {
-        let parse_config = self.config.parse_config();
-        let registry = self.property_registry();
-        let mut cache = self.advanced_cache.write().unwrap();
-        let Some(advanced) = cache.as_mut() else {
-            return;
-        };
-        if !scoped || advanced.today != today {
-            *cache = None;
-            return;
-        }
-        let mut removed_bytes = 0usize;
-        advanced.results.retain(|key, (result, result_bytes)| {
-            if result
-                .groups
-                .iter()
-                .any(|group| crate::refs::same_page(&group.page, &entry.name))
-            {
-                removed_bytes = removed_bytes.saturating_add(*result_bytes);
-                return false;
-            }
-            // §5.9: the advanced cache is keyed by the SAME resolved normalized
-            // IR the simple cache is (`simple_query_cache_key`), so it is judged
-            // by the SAME retention rule — one question, one keep/evict answer,
-            // whichever dialect asked it. Split only the four structural fields;
-            // the serialized IR that follows them is opaque.
-            let query_ir = key
-                .split_once('\0')
-                .filter(|(tag, _)| *tag == "q")
-                .and_then(|(_, rest)| rest.splitn(5, '\0').nth(4));
-            let page_affects = |candidate: &Document| {
-                query_ir.is_none_or(|ir| {
-                    crate::query::page_affects_query_ir(
-                        ir,
-                        entry,
-                        candidate,
-                        &parse_config,
-                        &registry,
-                    )
-                })
-            };
-            let affects = page_affects(doc) || previous_doc.is_some_and(page_affects);
-            if affects {
-                removed_bytes = removed_bytes.saturating_add(*result_bytes);
-            }
-            !affects
-        });
-        advanced.bytes = advanced.bytes.saturating_sub(removed_bytes);
-        advanced
-            .lru
-            .retain(|key| advanced.results.contains_key(key));
-        advanced.gen = newgen;
     }
 
     /// Drop one page from the cache after deleting its file.
@@ -16569,10 +16368,9 @@ impl Graph {
     /// (R6). Without it and without a cache, the current page-list memo is the
     /// remaining inventory; failing both, the projection is only marked stale.
     fn cache_remove(&self, name: &str, kind: PageKind, known: Option<PageEntry>) {
-        // A page delete is a page-set change (affects namespaces, exists-by-ref,
-        // every backlink/query) — drop the whole derived cache.
+        // A page delete is a page-set change that can affect every backlink
+        // and reference result, so drop the whole derived-reference cache.
         *self.derived_cache.write().unwrap() = None;
-        *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
         let mut removed_entries = Vec::new();
         let cache_built = guard.is_some();
@@ -16675,7 +16473,6 @@ impl Graph {
         // A page delete is a page-set change (affects namespaces, exists-by-ref,
         // every backlink/query) — drop the whole derived cache.
         *self.derived_cache.write().unwrap() = None;
-        *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
@@ -16719,10 +16516,6 @@ impl Graph {
         self.direct_projection_enqueue_delete(newgen, entry.clone());
     }
 
-    /// Memoize a derived whole-graph scan result, keyed by `(cache_gen, today)` +
-    /// `key`. On a tag mismatch the whole cache is dropped, so a hit is always
-    /// consistent with the current graph. `compute` runs with NO lock held (it
-    /// takes the cache read lock itself), so it can't deadlock against `with_pages`.
     /// ONE coherent property-registry snapshot (§6.2). Every reader — the walk's
     /// coercion, the TQL diagnostics, `query_registry` — takes this `Arc`, so a
     /// query sees one generation end to end.
@@ -16764,15 +16557,13 @@ impl Graph {
     /// debounce and document fallback are not eligible sources for this read.
     pub(crate) fn query_property_registry_at(
         &self,
-        source_generation: u64,
-        config: &crate::config::ParseConfig,
         job: &mut crate::direct_projection::DirectQueryJob,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         if job.snapshot.cancellation().is_cancelled() {
             return Err(crate::query::QueryExecutionError::Cancelled);
         }
-        let _ = source_generation; // SQL image identity is owned by the captured job.
-        job.read_registry(config)
+        let config = Arc::clone(&job.config);
+        job.read_registry(&config)
     }
 
     /// A page was saved. When its name IS a property key, the registry's
@@ -16875,32 +16666,6 @@ impl Graph {
         registry
     }
 
-    /// The optional C6 registry term for a query memo, SQL-only (RET2).
-    ///
-    /// `props`-sensitive queries need the CURRENT effective types: an answer
-    /// published under a registry generation it did not use is served again
-    /// after a type declaration that should have evicted it. When the published
-    /// snapshot is already current for this source generation and parse config,
-    /// that IS the table the execution will use (`query_property_registry_at`
-    /// takes the same fast path), so nothing is read. Otherwise ONE owned job
-    /// reads it through the same `DirectQueryJob::read_registry` the execution
-    /// uses, and the execution then hits the published fast path — one table,
-    /// two readers, no second producer (D-14). A property-free lookup returns
-    /// None and never reads the editor registry.
-    fn query_memo_registry_generation(
-        &self,
-        props_sensitive: bool,
-        source_generation: u64,
-    ) -> Result<Option<u64>, crate::query::QueryExecutionError> {
-        if !props_sensitive {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.query_property_registry_current(source_generation)?
-                .generation(),
-        ))
-    }
-
     /// §6.2's registry for the CURRENT source generation, SQL-only and
     /// fallible (RET2).
     ///
@@ -16916,11 +16681,11 @@ impl Graph {
         &self,
         _source_generation: u64,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
-        let config = self.config.parse_config();
-        self.dispatch_direct_query(|| {
+        self.dispatch_direct_query(|request| {
             self.direct_projection_query_job(
+                request,
                 crate::direct_projection::RegistrySensitivity::Required,
-                |job, generation, _| self.query_property_registry_at(generation, &config, job),
+                |job, _| self.query_property_registry_at(job),
             )
         })
     }
@@ -16943,16 +16708,7 @@ impl Graph {
         key: String,
         compute: impl FnOnce() -> crate::query::BoundedGroups,
     ) -> BoundedRefGroups {
-        self.derived_memo_bounded_typed(key, CacheSensitivity::Plain, compute)
-    }
-
-    fn derived_memo_bounded_typed(
-        &self,
-        key: String,
-        sensitivity: CacheSensitivity,
-        compute: impl FnOnce() -> crate::query::BoundedGroups,
-    ) -> BoundedRefGroups {
-        self.derived_memo_entry(key, sensitivity, || {
+        self.derived_memo_entry(key, || {
             let computed = compute();
             DerivedEntry::plain(BoundedRefGroups {
                 groups: Arc::new(computed.groups),
@@ -16963,137 +16719,54 @@ impl Graph {
         .result
     }
 
-    /// §5.9's PRE-VIEW memo: the matched rows in base order, keyed by the
-    /// resolved normalized IR and the construction bounds, with the view applied
-    /// AFTER the cache.
-    ///
-    /// The `Arc` matters here and is the reason base order is inside the cached
-    /// value rather than outside it: a query with no `sort-by` and no `sample` —
-    /// which is nearly all of them — hands back the very `Arc` it stored, so
-    /// every re-render is a refcount bump. Only a query that actually carries a
-    /// view directive pays for a copy, and it pays it for its own view rather
-    /// than for a recomputation.
-    fn derived_memo_pre_view(
+    /// Execute the selection into operation-scoped PRE-VIEW groups, apply this
+    /// request's view, and wrap the final groups at the public transport edge.
+    fn direct_query_view(
         &self,
         query: &crate::query::ir::Query,
         view: &crate::query::ir::ViewSettings,
+        today: crate::date::JournalDate,
         max_rows: usize,
         max_bytes: usize,
-        compute: impl FnOnce(
-            crate::query::ConstructionProfile,
-        )
-            -> Result<crate::query::PreViewGroups, crate::query::QueryExecutionError>,
     ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
-        use std::sync::atomic::Ordering;
         let profile = crate::query::ConstructionProfile::from_view(view);
-        let key = crate::query::simple_query_cache_key(query, max_rows, max_bytes, profile);
-        let props = query.filter.has_props_leaf();
-        let sensitivity = CacheSensitivity::Known(props);
-        let gen = self.cache_gen.load(Ordering::Acquire);
-        // A property-bearing identity acquires metadata BEFORE the cache is
-        // consulted and is SQL-only: a readiness or read failure here is the
-        // query's answer, not a reason to key the entry off a stale table.
-        // Property-free identities carry no registry term.
-        let stamp = DerivedMemoStamp {
-            gen,
-            today: crate::date::JournalDate::today().ordinal_key(),
-            config_digest: self.config.parse_config().digest(),
-            registry_gen: self.query_memo_registry_generation(props, gen)?,
-        };
-        let entry = self.try_derived_memo_entry(key, sensitivity, stamp, || {
-            let mut pre = compute(profile)?;
-            crate::query::base_order_groups(&mut pre.groups);
-            Ok::<_, crate::query::QueryExecutionError>(DerivedEntry {
-                result: BoundedRefGroups {
-                    groups: Arc::new(pre.groups),
-                    total: pre.total,
-                    exceeded: pre.exceeded,
-                },
-                recency_by_page: Arc::new(pre.recency_by_page),
-            })
-        })?;
-        Ok(crate::query::apply_cached_view(
-            &entry.result.groups,
-            &entry.recency_by_page,
-            view,
-            entry.result.total,
-            entry.result.exceeded,
-        ))
+        let pre = self.direct_simple_query_pre_view(query, today, max_rows, max_bytes, profile)?;
+        let bounded = crate::query::apply_view(pre, view);
+        Ok(BoundedRefGroups {
+            groups: Arc::new(bounded.groups),
+            total: bounded.total,
+            exceeded: bounded.exceeded,
+        })
     }
 
-    /// The C6 cache identity: `(cache_gen, today, ParseConfig::digest(),
-    /// registry generation iff the entry is `props`-sensitive)`.
+    /// The reference-cache identity: `(cache_gen, today, ParseConfig::digest())`.
     fn derived_memo_entry(
         &self,
         key: String,
-        sensitivity: CacheSensitivity,
         compute: impl FnOnce() -> DerivedEntry,
     ) -> DerivedEntry {
         use std::sync::atomic::Ordering;
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
         let config_digest = self.config.parse_config().digest();
-        // Backlinks, unlinked references and block referrers carry no `props`
-        // leaf, so they have no registry term and cannot evict property memos.
-        self.try_derived_memo_entry(
-            key,
-            sensitivity,
-            DerivedMemoStamp {
-                gen,
-                today,
-                config_digest,
-                registry_gen: None,
-            },
-            || Ok::<_, std::convert::Infallible>(compute()),
-        )
-        .unwrap_or_else(|never| match never {})
-    }
-
-    /// The shared cache owner accepts errors from query execution. Only a
-    /// successful result is eligible for publication; readiness and cancellation
-    /// cannot poison a later retry with a fabricated empty cache entry.
-    fn try_derived_memo_entry<E>(
-        &self,
-        key: String,
-        sensitivity: CacheSensitivity,
-        stamp: DerivedMemoStamp,
-        compute: impl FnOnce() -> Result<DerivedEntry, E>,
-    ) -> Result<DerivedEntry, E> {
-        let DerivedMemoStamp {
-            gen,
-            today,
-            config_digest,
-            registry_gen,
-        } = stamp;
         {
             let mut g = self.derived_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {
-                if let Some(registry_gen) = registry_gen {
-                    evict_props_entries_on_registry_advance(
-                        &mut dc.results,
-                        &mut dc.lru,
-                        &mut dc.bytes,
-                        &mut dc.props_keys,
-                        &mut dc.registry_gen,
-                        registry_gen,
-                    );
-                }
                 if dc.gen == gen && dc.today == today && dc.config_digest == config_digest {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
                         touch_lru(&mut dc.lru, &key);
-                        return Ok(result);
+                        return result;
                     }
                 }
             }
         }
-        let result = compute()?;
+        let result = compute();
         let result_bytes = ref_groups_estimated_bytes(result.result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
-            return Ok(result);
+            return result;
         }
-        let props = sensitivity.is_props_sensitive(&key);
         let mut g = self.derived_cache.write().unwrap();
         match g.as_mut() {
             Some(dc) if dc.gen == gen && dc.today == today && dc.config_digest == config_digest => {
@@ -17104,33 +16777,23 @@ impl Graph {
                     dc.bytes = dc.bytes.saturating_sub(old_bytes);
                 }
                 dc.bytes = dc.bytes.saturating_add(result_bytes);
-                if props {
-                    dc.props_keys.insert(key.clone());
-                }
                 touch_lru(&mut dc.lru, &key);
                 prune_result_cache(&mut dc.results, &mut dc.lru, &mut dc.bytes);
-                dc.props_keys.retain(|key| dc.results.contains_key(key));
             }
             _ => {
                 let mut results = std::collections::HashMap::new();
                 results.insert(key.clone(), (result.clone(), result_bytes));
-                let mut props_keys = std::collections::HashSet::new();
-                if props {
-                    props_keys.insert(key.clone());
-                }
                 *g = Some(DerivedCache {
                     gen,
                     today,
                     config_digest,
-                    registry_gen: registry_gen.unwrap_or(0),
-                    props_keys,
                     results,
                     lru: std::collections::VecDeque::from([key]),
                     bytes: result_bytes,
                 });
             }
         }
-        Ok(result)
+        result
     }
 
     fn derived_memo(
@@ -17148,97 +16811,6 @@ impl Graph {
             }
         })
         .groups
-    }
-
-    /// The advanced (datalog) twin of [`Graph::try_derived_memo_entry`], on its
-    /// own LRU budget because an advanced result carries the clause report.
-    ///
-    /// RET2 made it fallible for the same reason: only a SUCCESSFUL result is
-    /// eligible for publication, so a readiness, cancellation or read failure
-    /// cannot poison a later retry with a fabricated empty entry.
-    fn advanced_memo_bounded(
-        &self,
-        key: String,
-        props_sensitive: bool,
-        compute: impl FnOnce() -> Result<crate::query::BoundedGroups, crate::query::QueryExecutionError>,
-    ) -> Result<CachedAdvancedResult, crate::query::QueryExecutionError> {
-        use std::sync::atomic::Ordering;
-        let sensitivity = CacheSensitivity::Known(props_sensitive);
-        let gen = self.cache_gen.load(Ordering::Acquire);
-        let today = crate::date::JournalDate::today().ordinal_key();
-        let config_digest = self.config.parse_config().digest();
-        let registry_gen = self.query_memo_registry_generation(props_sensitive, gen)?;
-        {
-            let mut g = self.advanced_cache.write().unwrap();
-            if let Some(dc) = g.as_mut() {
-                if let Some(registry_gen) = registry_gen {
-                    evict_props_entries_on_registry_advance(
-                        &mut dc.results,
-                        &mut dc.lru,
-                        &mut dc.bytes,
-                        &mut dc.props_keys,
-                        &mut dc.registry_gen,
-                        registry_gen,
-                    );
-                }
-                if dc.gen == gen && dc.today == today && dc.config_digest == config_digest {
-                    if let Some((r, _)) = dc.results.get(&key) {
-                        let result = r.clone();
-                        touch_lru(&mut dc.lru, &key);
-                        return Ok(result);
-                    }
-                }
-            }
-        }
-        let computed = compute()?;
-        let result = CachedAdvancedResult {
-            groups: Arc::new(computed.groups),
-            total: computed.total,
-            exceeded: computed.exceeded,
-        };
-        let result_bytes = ref_groups_estimated_bytes(result.groups.as_slice())
-            .saturating_add(result_cache_key_estimated_bytes(&key));
-        if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
-            return Ok(result);
-        }
-        let props = sensitivity.is_props_sensitive(&key);
-        let mut g = self.advanced_cache.write().unwrap();
-        match g.as_mut() {
-            Some(dc) if dc.gen == gen && dc.today == today && dc.config_digest == config_digest => {
-                if let Some((_, old_bytes)) = dc
-                    .results
-                    .insert(key.clone(), (result.clone(), result_bytes))
-                {
-                    dc.bytes = dc.bytes.saturating_sub(old_bytes);
-                }
-                dc.bytes = dc.bytes.saturating_add(result_bytes);
-                if props {
-                    dc.props_keys.insert(key.clone());
-                }
-                touch_lru(&mut dc.lru, &key);
-                prune_result_cache(&mut dc.results, &mut dc.lru, &mut dc.bytes);
-                dc.props_keys.retain(|key| dc.results.contains_key(key));
-            }
-            _ => {
-                let mut results = std::collections::HashMap::new();
-                results.insert(key.clone(), (result.clone(), result_bytes));
-                let mut props_keys = std::collections::HashSet::new();
-                if props {
-                    props_keys.insert(key.clone());
-                }
-                *g = Some(AdvancedCache {
-                    gen,
-                    today,
-                    config_digest,
-                    registry_gen: registry_gen.unwrap_or(0),
-                    props_keys,
-                    results,
-                    lru: std::collections::VecDeque::from([key]),
-                    bytes: result_bytes,
-                });
-            }
-        }
-        Ok(result)
     }
 
     fn run_advanced_query_cached(
@@ -17263,14 +16835,8 @@ impl Graph {
     }
 
     /// **SPEC §5.9's Direct Files entry point for an advanced (datalog) query.**
-    /// Resolve once, key by the resolved normalized IR, dispatch, report.
-    ///
-    /// It is the SAME dispatch and the SAME key shape the `{{query …}}` route
-    /// uses, because §4.4 resolves a datalog source to the SAME IR: an advanced
-    /// `(task ?b #{"TODO"})` and an OG `(task TODO)` are one question, so they
-    /// take one engine and one answer (I-12, I-19). Only the cache MAP differs —
-    /// advanced results carry the clause report and are kept on their own LRU
-    /// budget, as they are today.
+    /// Resolve once, dispatch the resolved normalized IR, and attach the source
+    /// clause report after the rows return.
     ///
     /// The advanced route carries no view directives, so its pre-view result IS
     /// its result and the construction profile is the default one.
@@ -17296,26 +16862,16 @@ impl Graph {
             };
         let query = crate::query::block_anchored_query(&query);
         let profile = crate::query::ConstructionProfile::default();
-        let key = crate::query::simple_query_cache_key(&query, max_rows, max_bytes, profile);
-        let cached = self.advanced_memo_bounded(key, query.filter.has_props_leaf(), || {
-            let mut pre =
-                self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile)?;
-            crate::query::base_order_groups(&mut pre.groups);
-            Ok(crate::query::BoundedGroups {
-                groups: pre.groups,
-                total: pre.total,
-                exceeded: pre.exceeded,
-            })
-        })?;
+        let pre = self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile)?;
         Ok((
             crate::query::AdvancedResult {
-                groups: cached.groups.as_ref().clone(),
+                groups: pre.groups,
                 ran,
                 ignored,
                 supported: true,
             },
-            cached.exceeded,
-            cached.total,
+            pre.exceeded,
+            pre.total,
         ))
     }
 
@@ -17360,7 +16916,7 @@ impl Graph {
         })
     }
 
-    /// Evaluate a `{{query ...}}` body over the graph (memoized).
+    /// Evaluate a `{{query ...}}` body over the current projection.
     pub fn run_query(
         &self,
         query_src: &str,
@@ -17370,23 +16926,8 @@ impl Graph {
             .groups)
     }
 
-    /// **SPEC §5.9's Direct Files entry point.** Parse once, key by the resolved
-    /// normalized IR, dispatch, apply the view.
-    ///
-    /// The four things that changed here, and why each is not a refactor:
-    ///
-    /// 1. **One parse.** The source is parsed ONCE and the IR travels: the
-    ///    dispatch lowers the same tree the walk evaluates, so the two engines
-    ///    cannot be handed different queries (I-12).
-    /// 2. **The key is the IR, not the text.** `(task TODO)`, `(and (task
-    ///    TODO))` and TQL `task = 'TODO'` are one question and now one cache
-    ///    entry.
-    /// 3. **The cached value is pre-view.** Adding `(sort-by …)` to a query
-    ///    re-sorts rows the cache already holds instead of recomputing them.
-    /// 4. **The candidate planner is gone from this path.** It selected a page
-    ///    SUPERSET for the walk; the statement selects the ANSWER. (The planner
-    ///    itself is still alive and still reachable — Managed Storage uses it,
-    ///    and it goes with that route in P1-e.)
+    /// **SPEC §5.9's Direct Files entry point.** Parse once, dispatch the same
+    /// normalized IR to SQL, and apply the view to the operation-scoped result.
     pub fn run_query_bounded(
         &self,
         query_src: &str,
@@ -17412,14 +16953,11 @@ impl Graph {
         // The block-anchored tree both engines evaluate (`block_anchored_query`
         // is the one producer of that rebase).
         let query = crate::query::block_anchored_query(&query);
-        self.derived_memo_pre_view(&query, &view, max_rows, max_bytes, |profile| {
-            self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile)
-        })
+        self.direct_query_view(&query, &view, today, max_rows, max_bytes)
     }
 
     /// Evaluate an advanced (datalog-subset) query, returning the matched groups
-    /// plus which clauses ran vs were ignored. Memoized by query text, effective
-    /// current page, cache generation, and today.
+    /// plus which clauses ran vs were ignored.
     pub fn run_advanced_query(
         &self,
         query_src: &str,
@@ -23861,8 +23399,8 @@ impl Graph {
         // Touch the cache only when the bytes changed, or the page isn't in an
         // already-built cache yet (fold a cold page in). A no-op save of an
         // already-cached page MUST NOT call cache_upsert: it bumps `cache_gen`,
-        // which keys every memoized query/backlink/derived result — so an unchanged
-        // re-save would force a whole-graph requery on every open dashboard.
+        // which keys every memoized backlink/reference result — so an unchanged
+        // re-save would force a whole-graph rescan on every open dashboard.
         // A path-pinned save (`cache == false`, a duplicate-day stray, #21) NEVER
         // touches the `(kind,name)` cache: that slot belongs to the canonical file,
         // and folding the stray's content in would make name-resolution serve it.
