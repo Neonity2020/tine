@@ -550,8 +550,8 @@ fn read_scoped_display_namespace(
 ///
 /// The existing singular `tine.*` merge remains owned by
 /// [`merge_block_property_view`]. This helper reads only scoped additions, so
-/// old notes retain byte-for-byte semantics. It is intentionally not yet wired
-/// into the Tauri `ParsedQuery`; that integration belongs to the manager packet.
+/// old notes retain byte-for-byte semantics. The Tauri `ParsedQuery` flattens
+/// this typed state alongside its unchanged singular `{query, view}` answer.
 pub fn read_scoped_display_settings(
     block_properties: &[(String, String)],
 ) -> ScopedDisplaySettings {

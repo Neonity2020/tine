@@ -46,6 +46,7 @@ import type {
   Query,
   QueryResult,
   RegistrySnapshot,
+  ScopedDisplaySettings,
   Source,
   ViewSettings,
 } from "./queryIr";
@@ -68,6 +69,12 @@ const registrySnapshot = read<RegistrySnapshot>("registry_snapshot");
 const resultBlock = read<QueryResult>("query_result_block");
 const resultPage = read<QueryResult>("query_result_page");
 const diagnostics = read<Diagnostic[]>("diagnostic");
+interface ScopedDisplayFixture {
+  name: string;
+  properties: [string, string][];
+  expected: ScopedDisplaySettings;
+}
+const scopedDisplaySettings = read<ScopedDisplayFixture[]>("scoped_display_settings");
 
 describe("the TypeScript mirror of the Rust query IR", () => {
   it("accepts every golden wire fixture Rust round-trips", () => {
@@ -77,7 +84,7 @@ describe("the TypeScript mirror of the Rust query IR", () => {
     const CLAIMED = new Set([
       "query", "query_page_anchor", "filter", "leaf", "source", "view_settings",
       "bounds", "registry_snapshot", "query_result_block", "query_result_page",
-      "diagnostic",
+      "diagnostic", "scoped_display_settings",
     ]);
     const present = readdirSync(FIXTURE_DIR)
       .filter((f) => f.endsWith(".json"))
@@ -90,6 +97,29 @@ describe("the TypeScript mirror of the Rust query IR", () => {
       + `Add the matching TypeScript shape and bind the fixture in this test — a wire\n`
       + `variant the frontend cannot name is a variant it will silently mis-handle (§3.1).`,
     ).toEqual([]);
+  });
+
+  it("preserves scoped display absence, marked emptiness, and explicit empty members", () => {
+    const byName = (name: string) => scopedDisplaySettings.find((fixture) => fixture.name === name)!;
+    expect(byName("missing scoped properties").expected.page_display).toBeUndefined();
+    expect(byName("marked empty is present").expected.page_display).toEqual({});
+
+    const explicit = byName("explicit empty lists and grouping clear survive").expected.page_display!;
+    expect(explicit.sort).toEqual([]);
+    expect(explicit.group_by).toBe("");
+    expect(explicit.columns).toEqual([]);
+    expect(explicit.aggregates).toEqual([]);
+
+    const malformed = byName(
+      "malformed page member and scope leave valid block state usable",
+    ).expected;
+    expect(malformed.page_display).toBeUndefined();
+    expect(malformed.block_display?.columns).toEqual(["task", "priority"]);
+    expect(malformed.unreadable_settings).toEqual([
+      "tine.page-sample",
+      "tine.page-match-scope",
+    ]);
+    expect(JSON.parse(JSON.stringify(scopedDisplaySettings))).toEqual(scopedDisplaySettings);
   });
 
   it("walks every variant in the corpus without meeting one it does not know", () => {

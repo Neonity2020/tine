@@ -28,6 +28,7 @@
 // consumer is JavaScript.
 
 import type { PageKind, RefGroup } from "../types";
+import type { FriendlyPageMatchScope, QueryDisplayDraft } from "./queryDisplayDraft";
 
 // --------------------------------------------------------------------------
 // Scalars
@@ -221,9 +222,23 @@ export interface Query {
   source: Source;
 }
 
+/** Page/block presentation state read from a saved query's scoped `tine.*`
+ * properties. Every field is optional so an old `{query, view}` response keeps
+ * exactly its old JSON shape. Unreadable authored settings are reported here,
+ * independently of predicate diagnostics. */
+export interface ScopedDisplaySettings {
+  page_presentation?: ViewKind;
+  page_display?: QueryDisplayDraft;
+  block_presentation?: ViewKind;
+  block_display?: QueryDisplayDraft;
+  page_match_scope?: FriendlyPageMatchScope;
+  unreadable_settings?: string[];
+}
+
 /** `query_parse`'s answer. `Query` and `ViewSettings` are SEPARATE values: the
- *  filter never contains presentation (§3.1). */
-export interface ParsedQuery {
+ * filter never contains presentation (§3.1). Scoped display state is flattened
+ * beside that unchanged pair. */
+export interface ParsedQuery extends ScopedDisplaySettings {
   query: Query;
   view: ViewSettings;
 }
