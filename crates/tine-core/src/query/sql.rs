@@ -957,9 +957,8 @@ impl Compiler<'_> {
                 Rel::Props => self.props(*quant, pred, b, "block_id", OWNER_BLOCK),
                 Rel::Children => self.children(*quant, pred, scope),
                 Rel::Page => self.page_relation(*quant, pred, b),
-                // `blocks` is a page-row relation; the block-anchored walk
-                // answers false for it (`eval_block_leaf`'s `Rel::Blocks` arm),
-                // and so does this.
+                // `blocks` applies only to a page row. Re-entering it from a
+                // block goes through that block's explicit `page` relation.
                 Rel::Blocks => "0".to_string(),
             },
         }
@@ -1508,6 +1507,27 @@ impl Compiler<'_> {
         }
     }
 
+    /// Every ordinary block on one physical page, including descendants.
+    ///
+    /// `blocks.page_id` is the ownership edge; page names and aliases never
+    /// participate. Each relation element establishes its own block scope, so
+    /// the existing block lowering supplies task/planning/property/content,
+    /// child, page and path-reference semantics without a second matcher.
+    fn page_blocks(&mut self, quant: Quant, pred: &Filter, p: &str) -> String {
+        let alias = self.alias("pb");
+        let owner = format!("{p}.page_id");
+        self.quantified(&owner, quant, |compiler, invert| {
+            compiler.relation_subquery(
+                &format!("{alias}.page_id"),
+                &format!("blocks {alias}"),
+                &[],
+                pred,
+                Row::Block(BlockScope::anchored(&alias)),
+                invert,
+            )
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Page-row leaves
     // -----------------------------------------------------------------------
@@ -1534,8 +1554,9 @@ impl Compiler<'_> {
             },
             Leaf::Rel { rel, quant, pred } => match rel {
                 Rel::Props => self.props(*quant, pred, p, "page_id", OWNER_PAGE),
-                // A page's own refs, its blocks and its tag table are not walked
-                // by `eval_page`; its `_ => false` arm is reproduced here.
+                Rel::Blocks => self.page_blocks(*quant, pred, p),
+                // A page's own refs and tag table have no accepted page-row
+                // syntax; `eval_page` answers false for those relations too.
                 _ => "0".to_string(),
             },
         }
@@ -2410,6 +2431,10 @@ fn leaf_bounds(leaf: &Leaf, row: BoundRow, inputs: &LoweringInputs<'_>) -> bool 
                     !reads_anchor_context(pred) && bounded(pred, false, BoundRow::Block, inputs)
                 }
                 (BoundRow::Block, Rel::Page) => bounded(pred, false, BoundRow::Page, inputs),
+                // A selective block predicate can drive an index and yield the
+                // owning page ids. Broad predicates still classify unbounded;
+                // `none`/`every` were rejected above as outer complements.
+                (BoundRow::Page, Rel::Blocks) => bounded(pred, false, BoundRow::Block, inputs),
                 _ => false,
             }
         }
@@ -3463,6 +3488,32 @@ mod tests {
         assert!(statement
             .params
             .contains(&PhysicalQueryValue::Blob(vec![7u8; 16])));
+    }
+
+    /// A page `blocks` quantifier inherits the block predicate's real bound:
+    /// a selective task probe can drive page ids, while a broad enumeration
+    /// and either complement quantifier cannot claim an indexed anchor.
+    #[test]
+    fn page_blocks_bounds_only_from_a_selective_positive_block_predicate() {
+        let registry = Registry::none().clone();
+        let task = || Filter::attr(Attr::Task, CmpOp::Eq, Value::text("TODO"));
+        let lower = |quant, pred| {
+            let query = Query::new(
+                Anchor::Page,
+                Filter::rel(Rel::Blocks, quant, pred),
+                Source::Builder,
+            );
+            lower_query(&query, &inputs(&registry))
+        };
+
+        assert!(lower(Quant::Any, task()).positively_bounded);
+        assert!(!lower(Quant::Any, Filter::True).positively_bounded);
+        assert!(!lower(Quant::None, task()).positively_bounded);
+        assert!(!lower(Quant::Every, task()).positively_bounded);
+        assert_eq!(
+            Rel::Blocks.page_locality(),
+            crate::query::ir::PageLocality::Local
+        );
     }
 
     #[test]

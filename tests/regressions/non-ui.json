@@ -2,6 +2,24 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PAGE-BLOCKS-SEMANTICS",
+ "title": "Page queries quantify the ordinary blocks physically owned by each page",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "C2B page Blocks semantic completion" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_quantifies_the_physical_page_forest_with_full_block_semantics",
+   "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_supports_finite_page_blocks_reentry_and_outer_physical_masks",
+   "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_keeps_invalid_and_wrong_scope_inputs_empty",
+   "crates/tine-core/src/query/sql.rs::tests::page_blocks_bounds_only_from_a_selective_positive_block_predicate"
+  ],
+  "scenario": "query-engine.page-blocks-physical-page-semantics",
+  "failBefore": "Manager gate 32038 failed expected TODO page membership on base 464f9808. With the semantic changes and TQL dependency 4c0fd750, gate 43010 passed all four page-block tests; gate 11427 passed 46 SQL tests with eight ignored; gate 99375 passed 402 query tests with twelve ignored."
+ },
+ "notes": "The relation ranges over all ordinary roots and descendants on one page_id, excludes the page preamble, preserves vacuous Every/None, block predicates and nested Page/Blocks re-entry, and admits each outer page once. Equal display names do not merge physical pages. Manager verified fail-before and pass-after at the core layer. This does not claim completed page Display or native delivery."
+},
+{
  "id": "REG-QE-PUBLICATION-WINDOWS-PRIVATE-DIRECTORY",
  "title": "Windows publication query storage does not inherit a permissive temporary-directory ACL",
  "family": "query-engine",

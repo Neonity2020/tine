@@ -35,7 +35,9 @@ use uuid::Uuid;
 
 use crate::date::JournalDate;
 use crate::model::Graph;
-use crate::query::ir::{Anchor, Bounds, QueryRows};
+use crate::query::ir::{
+    Anchor, Attr, Bounds, CmpOp, Filter, Quant, Query, QueryRows, Rel, Source, Value, ViewSettings,
+};
 use crate::query::sql::{
     lower_query, ContentPlan, LoweringInputs, QueryRegexProgram, ResultSetRule, SqlQuery,
     RESULT_SET_RULE,
@@ -167,6 +169,37 @@ impl Corpus {
                 .map(|page| crate::refs::page_key(&page.name))
                 .collect(),
         }
+    }
+
+    /// Page names with multiplicity preserved. The ordinary identity gate uses
+    /// a set because block ids are unique; a page `blocks` relation also has to
+    /// prove that two physical pages with one display name remain two rows.
+    fn walk_page_names(&self, source: &str) -> Vec<String> {
+        let (query, _view) =
+            crate::query::parse_query_text(source, QueryDialect::Tql, self.today());
+        self.walk_page_names_for_query(&query)
+    }
+
+    fn walk_page_names_for_query(&self, query: &Query) -> Vec<String> {
+        let result = crate::query::run_query_result_over(
+            &crate::query::GraphQueryPages(&self.graph),
+            query,
+            &ViewSettings::default(),
+            self.today(),
+            Bounds {
+                max_rows: usize::MAX,
+                max_bytes: usize::MAX,
+            },
+        );
+        let QueryRows::Page { pages } = result.rows else {
+            panic!("the focused query must stay page-anchored");
+        };
+        let mut names = pages
+            .into_iter()
+            .map(|page| crate::refs::page_key(&page.name))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     /// The EXISTING FTS-building signal, read on the SAME materialized read as
@@ -336,6 +369,71 @@ impl Corpus {
         masked_pages: &[[u8; 16]],
     ) -> BTreeSet<String> {
         self.sql_as(source, dialect, fts_ready, masked_pages, RESULT_SET_RULE)
+    }
+
+    /// The SQL page answer with multiplicity preserved, including the outer
+    /// pending-page mask. This is intentionally separate from [`Corpus::sql`],
+    /// whose set result is the right identity for block rows but would hide a
+    /// duplicate display name.
+    fn sql_page_names_with(&self, source: &str, masked_pages: &[[u8; 16]]) -> Vec<String> {
+        let today = self.today();
+        let (query, _view) = crate::query::parse_query_text(source, QueryDialect::Tql, today);
+        self.sql_page_names_for_query(&query, masked_pages)
+    }
+
+    fn sql_page_names_for_query(&self, query: &Query, masked_pages: &[[u8; 16]]) -> Vec<String> {
+        assert_eq!(
+            query.anchor,
+            Anchor::Page,
+            "the focused query must stay page-anchored"
+        );
+        let registry = self.graph.property_registry();
+        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let inputs = LoweringInputs {
+            today: self.today(),
+            registry: &registry,
+            masked_pages,
+            cutoff: None,
+            compiled: &compiled,
+            fts_ready: self.fts_ready(),
+            result_set_rule: RESULT_SET_RULE,
+        };
+        let statement = lower_query(query, &inputs);
+        self.bind_regexes(&statement.regexes);
+        let rows = self
+            .reader
+            .run_projection_query(&statement.sql, &statement.params)
+            .unwrap_or_else(|error| {
+                panic!("the lowered statement must run: {error}\n{}", statement.sql)
+            });
+        let mut names = rows
+            .into_iter()
+            .map(|row| match row.get(1) {
+                Some(PhysicalQueryValue::Text(name)) => crate::refs::page_key(name),
+                other => panic!("a page row selects its name, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// One physical page id selected by its persisted path. Name lookup is
+    /// deliberately insufficient for the duplicate-display-name mask case.
+    fn page_id_at_path(&self, path: &str) -> [u8; 16] {
+        let rows = self
+            .reader
+            .run_projection_query(
+                "SELECT page_id FROM pages WHERE path = ?1",
+                &[PhysicalQueryValue::Text(path.to_string())],
+            )
+            .expect("the page id is readable through the seam");
+        assert_eq!(rows.len(), 1, "{path} must name one physical page");
+        match rows[0].first() {
+            Some(PhysicalQueryValue::Blob(id)) => {
+                id.as_slice().try_into().expect("a 16-byte page id")
+            }
+            other => panic!("{path} has no page row: {other:?}"),
+        }
     }
 
     fn sql_as(
@@ -630,6 +728,249 @@ pub(crate) fn write_fast_corpus(root: &Path) {
         .expect("odd journal");
 }
 
+/// The focused page-`blocks` corpus. It separates root/deep matches, Markdown
+/// and Org, empty-relation quantifiers, duplicate display names, page and block
+/// properties, exact visible-text operators, and the two reference contexts a
+/// nested child predicate can observe.
+fn write_page_blocks_corpus(root: &Path) {
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+
+    std::fs::write(root.join("pages/root.md"), "- TODO root task\n").expect("root");
+    std::fs::write(
+        root.join("pages/deep.md"),
+        "- plain root\n\t- TODO markdown-only deep task\n",
+    )
+    .expect("deep");
+    std::fs::write(
+        root.join("pages/multi.md"),
+        "- TODO first match\n- TODO second match\n",
+    )
+    .expect("multi");
+    std::fs::write(
+        root.join("pages/org.org"),
+        "* plain org root\n** TODO org deep task\n",
+    )
+    .expect("org");
+    std::fs::write(root.join("pages/preamble.md"), "status:: preamble-only\n")
+        .expect("preamble-only");
+    std::fs::write(
+        root.join("pages/props.md"),
+        "status:: active\n\n- ordinary block\n  rating:: gold\n",
+    )
+    .expect("properties");
+    std::fs::write(
+        root.join("pages/planning.md"),
+        "- planned block\n  SCHEDULED: <2026-09-08 Tue>\n",
+    )
+    .expect("planning");
+    std::fs::write(
+        root.join("pages/refs.md"),
+        "- ancestor names [[Inherited]]\n\
+         \t- child inherited target\n\
+         - parent owns [[ParentOwn]]\n\
+         \t- child without parent own\n\
+         - parent for own child\n\
+         \t- child owns [[OwnChild]]\n",
+    )
+    .expect("refs");
+
+    // Same display name, different page_id ownership. Only the first physical
+    // page has a TODO, so a name-based join would incorrectly admit both.
+    std::fs::write(
+        root.join("pages/dup-a.md"),
+        "title:: Shared Title\n\n- TODO duplicate A\n",
+    )
+    .expect("dup a");
+    std::fs::write(
+        root.join("pages/dup-b.md"),
+        "title:: Shared Title\n\n- plain duplicate B\n",
+    )
+    .expect("dup b");
+}
+
+fn expected_page_names(names: &[&str]) -> Vec<String> {
+    let mut names = names
+        .iter()
+        .map(|name| crate::refs::page_key(name))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// C2B's source failure was symmetrical: accepted TQL returned no page from
+/// either engine. These assertions pin independent expected membership first,
+/// then require the walk and SQL to reach it separately.
+#[test]
+fn page_blocks_quantifies_the_physical_page_forest_with_full_block_semantics() {
+    let _serial = serialize();
+    let root = scratch("page-blocks-semantics");
+    write_page_blocks_corpus(&root);
+    let corpus = Corpus::open(root, true);
+
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "@page and any(blocks, task = 'TODO')",
+            &["deep", "multi", "org", "root", "Shared Title"],
+        ),
+        (
+            "@page and every(blocks, task = 'TODO')",
+            &["multi", "preamble", "root", "Shared Title"],
+        ),
+        (
+            "@page and none(blocks, task = 'TODO')",
+            &["planning", "preamble", "props", "refs", "Shared Title"],
+        ),
+        (
+            "@page and not any(blocks, task = 'TODO')",
+            &["planning", "preamble", "props", "refs", "Shared Title"],
+        ),
+        (
+            "@page and any(blocks, not task = 'TODO')",
+            &["deep", "org", "planning", "props", "refs", "Shared Title"],
+        ),
+        (
+            "@page and any(blocks, content like '%deep task%')",
+            &["deep", "org"],
+        ),
+        (
+            "@page and any(blocks, content match 'deep task')",
+            &["deep", "org"],
+        ),
+        (
+            "@page and any(blocks, content regexp 'markdown-only deep task$')",
+            &["deep"],
+        ),
+        (
+            "@page and any(blocks, page_prop('status') = 'active')",
+            &["props"],
+        ),
+        (
+            "@page and any(blocks, prop('rating') = 'gold')",
+            &["props"],
+        ),
+        (
+            "@page and any(blocks, scheduled is not null)",
+            &["planning"],
+        ),
+        (
+            "@page and any(blocks, prop('status') = 'preamble-only')",
+            &[],
+        ),
+        (
+            "@page and any(blocks, content like '%child inherited target%' and ref('Inherited'))",
+            &["refs"],
+        ),
+        (
+            "@page and any(blocks, any(children, ref('OwnChild')))",
+            &["refs"],
+        ),
+        (
+            "@page and name = 'refs'",
+            &["refs"],
+        ),
+        (
+            "@page and any(blocks, content like '%parent owns%' and any(children, ref('ParentOwn')))",
+            &[],
+        ),
+        (
+            "@page and name = 'refs' and none(blocks, content like '%parent owns%' and any(children, ref('ParentOwn')))",
+            &["refs"],
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let (parsed, _) = crate::query::parse_query_text(source, QueryDialect::Tql, corpus.today());
+        assert!(
+            !parsed.is_invalid(),
+            "valid fixture {source}: {:?}",
+            parsed.diagnostics
+        );
+        let expected = expected_page_names(expected);
+        let walk = corpus.walk_page_names(source);
+        let sql = corpus.sql_page_names_with(source, &[]);
+        assert_eq!(walk, expected, "walk membership for {source}");
+        assert_eq!(sql, expected, "SQL membership for {source}");
+    }
+
+    // Multiple matching blocks admit their page once. Equal display names do
+    // not merge physical pages: only dup-a owns a matching task.
+    let task_pages = corpus.walk_page_names("@page and any(blocks, task = 'TODO')");
+    assert_eq!(
+        task_pages
+            .iter()
+            .filter(|name| name.as_str() == "multi")
+            .count(),
+        1
+    );
+    assert_eq!(
+        task_pages
+            .iter()
+            .filter(|name| name.as_str() == "shared title")
+            .count(),
+        1
+    );
+}
+
+/// A block can return to its owning page and quantify that page's blocks again.
+/// This IR-only shape pins the finite Page/Blocks re-entry even though TQL's
+/// shorthand exposes page attributes and page properties rather than a general
+/// `any(page, ...)` spelling.
+#[test]
+fn page_blocks_supports_finite_page_blocks_reentry_and_outer_physical_masks() {
+    let _serial = serialize();
+    let root = scratch("page-blocks-reentry");
+    write_page_blocks_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let task = Filter::attr(Attr::Task, CmpOp::Eq, Value::text("TODO"));
+    let nested = Query::new(
+        Anchor::Page,
+        Filter::rel(
+            Rel::Blocks,
+            Quant::Any,
+            Filter::rel(
+                Rel::Page,
+                Quant::Any,
+                Filter::rel(Rel::Blocks, Quant::Any, task),
+            ),
+        ),
+        Source::Builder,
+    );
+    let expected = expected_page_names(&["deep", "multi", "org", "root", "Shared Title"]);
+    assert_eq!(corpus.walk_page_names_for_query(&nested), expected);
+    assert_eq!(corpus.sql_page_names_for_query(&nested, &[]), expected);
+
+    let source = "@page and any(blocks, task = 'TODO')";
+    let dup_a = corpus.page_id_at_path("pages/dup-a.md");
+    let dup_b = corpus.page_id_at_path("pages/dup-b.md");
+    let without_matching_twin = expected_page_names(&["deep", "multi", "org", "root"]);
+    assert_eq!(
+        corpus.sql_page_names_with(source, &[dup_a]),
+        without_matching_twin,
+        "the outer mask removes exactly the matching physical twin"
+    );
+    assert_eq!(
+        corpus.sql_page_names_with(source, &[dup_b]),
+        expected,
+        "masking the nonmatching twin cannot hide the matching twin"
+    );
+}
+
+#[test]
+fn page_blocks_keeps_invalid_and_wrong_scope_inputs_empty() {
+    let _serial = serialize();
+    let root = scratch("page-blocks-refused");
+    write_page_blocks_corpus(&root);
+    let corpus = Corpus::open(root, true);
+
+    let invalid = "@page and any(blocks, task = )";
+    assert!(corpus.walk_page_names(invalid).is_empty());
+    assert!(corpus.sql_page_names_with(invalid, &[]).is_empty());
+
+    let wrong_scope = "@block and any(blocks, true)";
+    assert!(corpus.walk(wrong_scope, QueryDialect::Tql).is_empty());
+    assert!(corpus.sql(wrong_scope, QueryDialect::Tql).is_empty());
+}
+
 /// Every query shape this wave lowers, in both dialects where both spell it.
 /// The two engines must agree on every one of them.
 pub(crate) const IDENTITY_SHAPES: &[(&str, QueryDialect)] = &[
@@ -796,9 +1137,10 @@ pub(crate) const IDENTITY_SHAPES: &[(&str, QueryDialect)] = &[
     ("@page and prop('type') = 'page'", QueryDialect::Tql),
     ("@page and namespace = 'proj'", QueryDialect::Tql),
     ("@page and not name = 'refs'", QueryDialect::Tql),
-    // `blocks` is a page relation the walk answers false for; the lowering
-    // reproduces that rather than inventing an answer.
+    // Every ordinary block physically owned by the page, including descendants.
     ("@page and any(blocks, task = 'TODO')", QueryDialect::Tql),
+    ("@page and every(blocks, task = 'TODO')", QueryDialect::Tql),
+    ("@page and none(blocks, task = 'TODO')", QueryDialect::Tql),
     // relations and boolean composition, including the two `every` polarities
     ("any(children, task = 'DONE')", QueryDialect::Tql),
     ("none(children, task = 'DONE')", QueryDialect::Tql),
@@ -860,8 +1202,7 @@ pub(crate) const IDENTITY_SHAPES: &[(&str, QueryDialect)] = &[
         "any(children, page.name = 'nested-refs' and ref('Shared'))",
         QueryDialect::Tql,
     ),
-    // `blocks` is a page relation the walk answers false for, nested predicate
-    // and all — the lowering reproduces that rather than inventing an answer.
+    // Page `blocks` retains the existing block reference and child semantics.
     ("@page and any(blocks, ref('Project'))", QueryDialect::Tql),
     (
         "@page and any(blocks, any(children, ref('Project')))",
@@ -1031,6 +1372,9 @@ pub(crate) const PLAN_SHAPES: &[(&str, QueryDialect)] = &[
     ("@page and name like 'proj/%'", QueryDialect::Tql),
     ("@page and day >= '2026-01-01'", QueryDialect::Tql),
     ("@page and prop('type') is not null", QueryDialect::Tql),
+    // The task index drives block membership and yields owning page ids; the
+    // outer page row is then reached by its page-id key.
+    ("@page and any(blocks, task = 'TODO')", QueryDialect::Tql),
     // §5.10: an indexable `content match` IS positively bounded, and no blanket
     // FTS exception permits a permanent full scan of one.
     ("content match 'alpha'", QueryDialect::Tql),

@@ -2409,10 +2409,11 @@ fn run_pred_bounded(
 //
 /// The page-anchored half of the walk (§7.1, K16): `@page` rows as PAGE rows.
 ///
-/// A `@page` query selects pages, so this reads the page index — name, kind,
-/// journal day and the page's own `key:: value` preamble — and never descends
-/// into a document. `@block` delegates to [`run_pred_bounded_over`], whose
-/// block groups are the shipped shape.
+/// A `@page` query selects pages. Page attributes and properties read the page
+/// index — name, kind, journal day and the page's own `key:: value` preamble.
+/// A `blocks` relation additionally walks that page's already-borrowed roots;
+/// no page outside the current physical page participates. `@block` delegates
+/// to [`run_pred_bounded_over`], whose block groups are the shipped shape.
 ///
 /// **Post-resolution only** (§4.4): `query` is the BOUND tree
 /// [`ResolvedQuery::query`] carries and `today` its one execution-day snapshot.
@@ -2495,6 +2496,7 @@ pub(crate) fn collect_page_rows_over(
             page.kind,
             page.journal,
             &page_props,
+            page.roots,
             page.format,
             today,
             &compiled,
@@ -2703,6 +2705,7 @@ pub(crate) fn collect_pred_bounded_over(
             is_journal: page.kind == PageKind::Journal,
             page_name: page.name,
             page_props: &page_props,
+            page_roots: page.roots,
             today,
             compiled: &compiled,
             format: page.format,
@@ -3593,6 +3596,7 @@ fn page_contributes_to_filter(
         is_journal: entry.kind == PageKind::Journal,
         page_name: &entry.name,
         page_props: &page_props,
+        page_roots: &doc.roots,
         today,
         compiled: &compiled,
         mode: atom::CompareMode::Both,
@@ -6026,6 +6030,7 @@ mod tests {
                 is_journal: place.is_journal,
                 page_name: &place.page_name,
                 page_props: &place.page_props,
+                page_roots: std::slice::from_ref(block),
                 today: TODAY,
                 compiled: &compiled,
                 format: crate::query::atom::AtomFormat::Markdown,
