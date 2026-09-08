@@ -22,6 +22,8 @@ pub(crate) mod og;
 pub mod path_refs;
 pub mod print;
 pub mod registry;
+#[allow(dead_code)] // Producer integration follows the independently tested cache component.
+pub(crate) mod registry_cache;
 pub(crate) mod registry_sql;
 pub(crate) mod sort;
 // §5.1–§5.7's compiler. Its two acceptance gates live in `sql_gates_tests.rs`,
