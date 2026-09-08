@@ -756,7 +756,11 @@ await withApp(2, async (browser) => {
         && !message.startsWith("Software rendering is on (")) continue;
     console.log(`narrow setup: dismissing startup notice: ${message}`);
     await toast.$(".toast-close").click();
-    await toast.waitForExist({ reverse: true, timeout: 5_000 });
+    await browser.waitUntil(
+      () => browser.execute((dismissed) => ![...document.querySelectorAll(".toast-msg")]
+        .some((node) => node.textContent === dismissed), message),
+      { timeout: 5_000, timeoutMsg: `the dismissed startup notice remained: ${message}` },
+    );
   }
 
   const rowGeometry = await browser.execute(() => {
