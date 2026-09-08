@@ -2,6 +2,19 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-OVERLAY-RECLOSE-REPLACEMENT",
+ "title": "Repeated teardown of an old overlay cannot delete its replacement",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery lifecycle review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/managed_overlay.rs::tests::closing_a_retired_instance_again_cannot_remove_its_replacement"],
+  "scenario": "query-engine.overlay-reclose-replacement",
+  "failBefore": "overlay-reclose-before.log: repeated close on the old instance deletes the new projection"
+ },
+ "notes": "Teardown completion is serialized per instance. File lifecycle remains at the existing path; no epoch-named files or authority changes."
+},
+{
  "id": "REG-QE-CAPTURE-DRAIN-EPOCH",
  "title": "Projection drains invalidate captures before their workers acquire capacity",
  "family": "query-engine",

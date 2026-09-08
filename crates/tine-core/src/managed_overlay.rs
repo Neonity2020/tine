@@ -140,6 +140,9 @@ pub(crate) enum OverlayOpen {
 
 pub(crate) struct PendingOverlay {
     path: PathBuf,
+    /// Serialize teardown through file removal. A retained old instance must
+    /// never remove a replacement that now owns the same disposable path.
+    close_complete: Mutex<bool>,
     next_revision: AtomicU64,
     sender: Mutex<Option<mpsc::Sender<OverlayUpdate>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -179,6 +182,7 @@ impl PendingOverlay {
         let (sender, receiver) = mpsc::channel();
         let overlay = Arc::new(Self {
             path,
+            close_complete: Mutex::new(false),
             next_revision: AtomicU64::new(1),
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(None),
@@ -344,6 +348,10 @@ impl PendingOverlay {
     /// drains every off-actor query job first (I-21): a reader still holding a
     /// snapshot of this file would otherwise outlive it.
     pub(crate) fn close(&self) {
+        let mut complete = self.close_complete.lock().unwrap();
+        if *complete {
+            return;
+        }
         self.retire();
         let sender = self.sender.lock().unwrap().take();
         if let Some(sender) = sender {
@@ -354,6 +362,7 @@ impl PendingOverlay {
             let _ = worker.join();
         }
         remove_overlay_files(&self.path);
+        *complete = true;
     }
 
     /// The worker: apply the newest state per path per wake-up in ONE SQLite
@@ -539,6 +548,29 @@ mod tests {
         assert_eq!(
             overlay_path_for(Path::new("/graph/.tine/projection.sqlite")),
             PathBuf::from("/graph/.tine/projection.sqlite.pending-overlay.sqlite")
+        );
+    }
+
+    #[test]
+    fn closing_a_retired_instance_again_cannot_remove_its_replacement() {
+        let dir = std::env::temp_dir().join(format!("tine-overlay-reclose-{}", next_instance()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let accepted = dir.join("projection.sqlite");
+        let old = PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        old.close();
+        let replacement =
+            PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        old.close();
+        let survives = replacement.path().exists();
+        let readable = matches!(
+            replacement.open_snapshot(0, Duration::from_millis(10)),
+            OverlayOpen::Snapshot { .. }
+        );
+        replacement.close();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            survives && readable,
+            "old close deleted the replacement projection"
         );
     }
 

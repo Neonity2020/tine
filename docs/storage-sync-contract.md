@@ -900,6 +900,11 @@ the new epoch; ordinary edits do not change it. The regression
 `ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain`
 checks cancellation before snapshot opening and a fresh SQL answer afterward.
 
+Overlay teardown serializes worker join and file removal once per instance.
+Repeated close calls on a retained old instance cannot remove a replacement at
+the same disposable path. This is checked by
+`closing_a_retired_instance_again_cannot_remove_its_replacement`.
+
 **A captured pending query is answered off the actor from BOTH databases.**
 The executor opens the overlay first, at the flushed revision the capture
 required or later, and only then opens the accepted file and validates the
