@@ -22,6 +22,7 @@ pub(crate) mod og;
 pub mod path_refs;
 pub mod print;
 pub mod registry;
+pub(crate) mod registry_sql;
 pub(crate) mod sort;
 // §5.1–§5.7's compiler. Its two acceptance gates live in `sql_gates_tests.rs`,
 // declared from `sql.rs` itself: the production-source scanner every census
