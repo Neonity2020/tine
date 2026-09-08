@@ -28,7 +28,8 @@
 //! the owner never spawns.
 
 use std::collections::BTreeSet;
-use std::sync::{Condvar, Mutex};
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tine_storage::sqlite::PhysicalProjectionQueryCancellation;
 
@@ -83,8 +84,8 @@ pub(crate) struct QueryJobEpoch(u64);
 pub(crate) struct QueryDrainFence(u64);
 
 /// The outcome of asking for a slot.
-pub(crate) enum Admission<'a> {
-    Slot(JobSlot<'a>),
+pub(crate) enum QueryAdmission<O: Deref<Target = QueryJobOwner>> {
+    Slot(QueryJobLease<O>),
     /// The owner is closed, or a drain ran while this job waited.
     Cancelled,
     /// No slot freed within [`QUERY_JOB_WAIT`].
@@ -94,10 +95,15 @@ pub(crate) enum Admission<'a> {
 /// One held capacity slot. Dropping it releases the slot exactly once and
 /// unregisters the snapshot's interrupt handle, on every completion, error and
 /// cancellation path — there is no other release.
-pub(crate) struct JobSlot<'a> {
-    owner: &'a QueryJobOwner,
+pub(crate) struct QueryJobLease<O: Deref<Target = QueryJobOwner>> {
+    owner: O,
     id: u64,
 }
+
+pub(crate) type Admission<'a> = QueryAdmission<&'a QueryJobOwner>;
+pub(crate) type OwnedAdmission = QueryAdmission<Arc<QueryJobOwner>>;
+pub(crate) type JobSlot<'a> = QueryJobLease<&'a QueryJobOwner>;
+pub(crate) type OwnedJobSlot = QueryJobLease<Arc<QueryJobOwner>>;
 
 impl QueryJobOwner {
     pub(crate) fn new(capacity: usize) -> Self {
@@ -138,27 +144,46 @@ impl QueryJobOwner {
     /// Refuse captures invalidated before their worker began waiting as well
     /// as jobs invalidated while queued. No transaction is opened here.
     pub(crate) fn acquire_at_within(&self, epoch: QueryJobEpoch, wait: Duration) -> Admission<'_> {
+        Self::acquire_lease_at(self, epoch, wait)
+    }
+
+    /// An owned lease can travel with an admitted producer capture. It shares
+    /// the borrowed lease's exact capacity, epoch, registration and Drop path.
+    pub(crate) fn acquire_owned_at_within(
+        self: &Arc<Self>,
+        epoch: QueryJobEpoch,
+        wait: Duration,
+    ) -> OwnedAdmission {
+        Self::acquire_lease_at(Arc::clone(self), epoch, wait)
+    }
+
+    fn acquire_lease_at<O: Deref<Target = Self>>(
+        owner: O,
+        epoch: QueryJobEpoch,
+        wait: Duration,
+    ) -> QueryAdmission<O> {
         let deadline = Instant::now() + wait;
-        let mut state = self.state.lock().unwrap();
+        let mut state = owner.state.lock().unwrap();
         loop {
             if state.closed || state.drain_epoch != epoch.0 {
-                return Admission::Cancelled;
+                return QueryAdmission::Cancelled;
             }
-            if state.active.len() < self.capacity {
+            if state.active.len() < owner.capacity {
                 let id = state.next_id;
                 state.next_id += 1;
                 state.active.insert(id);
-                return Admission::Slot(JobSlot { owner: self, id });
+                drop(state);
+                return QueryAdmission::Slot(QueryJobLease { owner, id });
             }
             let now = Instant::now();
             if now >= deadline {
-                return Admission::Busy;
+                return QueryAdmission::Busy;
             }
             #[cfg(test)]
             if let Some(started) = state.waiting_started.take() {
                 started.send(()).unwrap();
             }
-            let (next, _) = self.changed.wait_timeout(state, deadline - now).unwrap();
+            let (next, _) = owner.changed.wait_timeout(state, deadline - now).unwrap();
             state = next;
         }
     }
@@ -223,7 +248,7 @@ impl QueryJobOwner {
     }
 }
 
-impl JobSlot<'_> {
+impl<O: Deref<Target = QueryJobOwner>> QueryJobLease<O> {
     /// Register the opened snapshot's interrupt handle so a drain can reach the
     /// statement it is running. Returns `false` — and cancels the handle — when
     /// a drain happened between admission and this call; the caller must treat
@@ -248,7 +273,7 @@ impl JobSlot<'_> {
     }
 }
 
-impl Drop for JobSlot<'_> {
+impl<O: Deref<Target = QueryJobOwner>> Drop for QueryJobLease<O> {
     fn drop(&mut self) {
         #[cfg(test)]
         {
@@ -287,6 +312,93 @@ mod tests {
             )
             .unwrap();
         path
+    }
+
+    fn owned(owner: &Arc<QueryJobOwner>) -> OwnedJobSlot {
+        match owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO) {
+            OwnedAdmission::Slot(slot) => slot,
+            _ => panic!("owned admission"),
+        }
+    }
+
+    #[test]
+    fn owned_and_borrowed_leases_share_capacity_and_drain_fences() {
+        let owner = Arc::new(QueryJobOwner::new(2));
+        let old_owned = owned(&owner);
+        let old_borrowed = match owner.acquire() {
+            Admission::Slot(slot) => slot,
+            _ => panic!("borrowed admission"),
+        };
+        assert!(matches!(
+            owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO),
+            OwnedAdmission::Busy
+        ));
+        let old_epoch = owner.capture_epoch();
+        let fence = owner.begin_drain();
+        assert!(old_owned.is_cancelled());
+        assert!(old_borrowed.is_cancelled());
+        assert!(matches!(
+            owner.acquire_owned_at_within(old_epoch, Duration::ZERO),
+            OwnedAdmission::Cancelled
+        ));
+        drop(old_borrowed);
+        let new_owned = owned(&owner);
+        let (waiting, observed) = mpsc::channel();
+        owner.state.lock().unwrap().drain_waiting_started = Some(waiting);
+        let drain_owner = Arc::clone(&owner);
+        let (done, finished) = mpsc::channel();
+        let drainer = std::thread::spawn(move || {
+            drain_owner.wait_for_drain(fence);
+            done.send(()).unwrap();
+        });
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(
+            finished.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        std::thread::spawn(move || drop(old_owned)).join().unwrap();
+        finished.recv_timeout(Duration::from_secs(3)).unwrap();
+        drainer.join().unwrap();
+        assert_eq!(owner.active(), 1);
+        assert!(!new_owned.is_cancelled());
+        drop(new_owned);
+        assert_eq!(owner.active(), 0);
+    }
+
+    #[test]
+    fn owned_lease_keeps_owner_alive_across_thread_transfer() {
+        let owner = Arc::new(QueryJobOwner::new(1));
+        let weak = Arc::downgrade(&owner);
+        let slot = owned(&owner);
+        drop(owner);
+        assert!(weak.upgrade().is_some());
+        std::thread::spawn(move || drop(slot)).join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn owned_lease_cancels_late_snapshot_registration_and_releases_once() {
+        let owner = Arc::new(QueryJobOwner::new(1));
+        let slot = owned(&owner);
+        let fence = owner.begin_drain();
+        let path = fixture_projection();
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        assert!(!slot.register(snapshot.cancellation()));
+        assert!(snapshot.cancellation().is_cancelled());
+        assert!(snapshot.run_projection_query("SELECT 1", &[]).is_err());
+        drop(snapshot);
+        drop(slot);
+        owner.wait_for_drain(fence);
+        assert_eq!(owner.active(), 0);
+        let new = owned(&owner);
+        assert!(!new.is_cancelled());
+        drop(new);
+        owner.close();
+        assert!(matches!(
+            owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO),
+            OwnedAdmission::Cancelled
+        ));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
