@@ -5,12 +5,12 @@
 //! primitive for a later committed-registry owner: it is deliberately not
 //! wired to cache publication or dirty-key production in this packet.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::path::Path;
 
 use tine_storage::sqlite::{
-    MaterializationError, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
+    MaterializationError, PhysicalPage, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
 };
 
 use crate::config::ParseConfig;
@@ -46,6 +46,34 @@ const PATCH_DECLARATIONS_SQL: &str =
      LEFT JOIN pages p ON p.page_id = o.page_id \
      WHERE o.normalized_name = ?1 AND o.owner_type = 0 \
      ORDER BY o.owner_type, o.owner_id, o.name, o.ordinal";
+
+const PAGE_METADATA_BATCH_SIZE: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RegistryPropertyMetadata {
+    pub(crate) owner_type: OwnerType,
+    pub(crate) owner_id: [u8; 16],
+    pub(crate) page_id: [u8; 16],
+    pub(crate) source_name: String,
+    pub(crate) normalized_name: String,
+    pub(crate) value: String,
+    pub(crate) ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryPageMetadata {
+    pub(crate) page_id: [u8; 16],
+    pub(crate) page: PageMeta,
+    pub(crate) properties: Vec<RegistryPropertyMetadata>,
+}
+
+pub(crate) type PageRegistryMetadata = BTreeMap<[u8; 16], RegistryPageMetadata>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RegistryChanges {
+    pub(crate) normalized_keys: BTreeSet<String>,
+    pub(crate) declaration_page_names: BTreeSet<String>,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -149,6 +177,255 @@ pub(crate) fn patch_registry_from_snapshot(
             .into_iter()
             .map(|key| (key.clone(), rebuilt.row(&key).cloned())),
     ))
+}
+
+/// Read exactly the requested pages' registry-relevant physical metadata.
+///
+/// Missing pages are omitted so callers can represent creations. The query is
+/// bounded by page count and retains the LEFT JOIN rows needed to reject an
+/// orphan property instead of silently treating it as a missing page.
+pub(crate) fn read_page_registry_metadata(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    ids: &BTreeSet<[u8; 16]>,
+) -> Result<PageRegistryMetadata, QueryExecutionError> {
+    check_cancelled(snapshot)?;
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut pages = BTreeMap::new();
+    let ids = ids.iter().copied().collect::<Vec<_>>();
+    for batch in ids.chunks(PAGE_METADATA_BATCH_SIZE) {
+        let sql = page_metadata_sql(batch.len());
+        let parameters = batch
+            .iter()
+            .map(|id| PhysicalQueryValue::Blob(id.to_vec()))
+            .collect::<Vec<_>>();
+        visit(snapshot, &sql, &parameters, |row| {
+            collect_page_metadata_row(row, &mut pages)
+        })?;
+    }
+    for page in pages.values_mut() {
+        page.properties.sort();
+    }
+    check_cancelled(snapshot)?;
+    Ok(pages)
+}
+
+/// Produce the same registry metadata that inserting `page` writes to the
+/// physical projection. Property ordinals come from owner-local vector order,
+/// exactly as tine-storage's insertion loop assigns them.
+pub(crate) fn registry_metadata_from_physical_page(
+    page: &PhysicalPage,
+) -> Result<RegistryPageMetadata, String> {
+    let page_meta = PageMeta {
+        format: crate::model::Format::from_path(Path::new(&page.path)).into(),
+        name: page.name.clone(),
+    };
+    let mut properties = Vec::new();
+    append_physical_properties(
+        &mut properties,
+        OwnerType::Page,
+        page.page_id,
+        page.page_id,
+        &page.properties,
+    )?;
+    for block in &page.blocks {
+        append_physical_properties(
+            &mut properties,
+            OwnerType::Block,
+            block.block_id,
+            page.page_id,
+            &block.properties,
+        )?;
+    }
+    properties.sort();
+    Ok(RegistryPageMetadata {
+        page_id: page.page_id,
+        page: page_meta,
+        properties,
+    })
+}
+
+/// Compare exact before/after page metadata and return the smallest registry
+/// inputs whose aggregate rows or declaration binding can have changed.
+pub(crate) fn registry_changes(
+    before: &PageRegistryMetadata,
+    after: &PageRegistryMetadata,
+) -> RegistryChanges {
+    let mut changes = RegistryChanges::default();
+    let page_ids = before
+        .keys()
+        .chain(after.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for page_id in page_ids {
+        let old = before.get(&page_id);
+        let new = after.get(&page_id);
+        if old == new {
+            continue;
+        }
+
+        let old_by_key = old.map(properties_by_key).unwrap_or_default();
+        let new_by_key = new.map(properties_by_key).unwrap_or_default();
+        if matches!((old, new), (Some(old), Some(new)) if old.page.format != new.page.format) {
+            changes
+                .normalized_keys
+                .extend(old_by_key.keys().chain(new_by_key.keys()).cloned());
+        } else {
+            changes.normalized_keys.extend(
+                old_by_key
+                    .keys()
+                    .chain(new_by_key.keys())
+                    .filter(|key| old_by_key.get(*key) != new_by_key.get(*key))
+                    .cloned(),
+            );
+        }
+
+        let old_declaration = old.filter(|page| has_page_declaration(page));
+        let new_declaration = new.filter(|page| has_page_declaration(page));
+        let declaration_rows_changed = declaration_rows(old) != declaration_rows(new);
+        let declaration_name_changed = matches!(
+            (old_declaration, new_declaration),
+            (Some(old), Some(new)) if old.page.name != new.page.name
+        );
+        if declaration_rows_changed || declaration_name_changed {
+            if let Some(page) = old_declaration {
+                changes
+                    .declaration_page_names
+                    .insert(page.page.name.clone());
+            }
+            if let Some(page) = new_declaration {
+                changes
+                    .declaration_page_names
+                    .insert(page.page.name.clone());
+            }
+        }
+    }
+    changes
+}
+
+fn page_metadata_sql(count: usize) -> String {
+    debug_assert!(count > 0 && count <= PAGE_METADATA_BATCH_SIZE);
+    let values = (1..=count)
+        .map(|index| format!("(?{index})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH requested(page_id) AS (VALUES {values}) \
+         SELECT o.owner_type, o.owner_id, o.page_id, o.name, o.normalized_name, \
+         o.value, o.ordinal, b.page_id, p.path, p.name, p.text_kind, \
+         requested.page_id, p.page_id \
+         FROM requested \
+         LEFT JOIN pages p ON p.page_id = requested.page_id \
+         LEFT JOIN properties o ON o.page_id = requested.page_id \
+         LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id"
+    )
+}
+
+fn collect_page_metadata_row(
+    row: &[PhysicalQueryValue],
+    pages: &mut PageRegistryMetadata,
+) -> Result<(), String> {
+    let requested_id = blob16(row, 11, "requested.page_id")?;
+    if is_null(row, 12) {
+        if !is_null(row, 0) {
+            return Err("registry property names an absent page".into());
+        }
+        return Ok(());
+    }
+    if blob16(row, 12, "pages.page_id")? != requested_id {
+        return Err("registry page identity mismatch".into());
+    }
+    let meta = decode_page_meta(row, 8, 9, 10)?;
+    let page = pages
+        .entry(requested_id)
+        .or_insert_with(|| RegistryPageMetadata {
+            page_id: requested_id,
+            page: meta.clone(),
+            properties: Vec::new(),
+        });
+    if page.page != meta {
+        return Err("inconsistent registry page metadata".into());
+    }
+    if !is_null(row, 0) {
+        let decoded = decode_owner_row(row)?;
+        let page_id = blob16(row, 2, "properties.page_id")?;
+        if page_id != requested_id {
+            return Err("registry property page identity mismatch".into());
+        }
+        page.properties.push(RegistryPropertyMetadata {
+            owner_type: decoded.owner_type,
+            owner_id: blob16(row, 1, "properties.owner_id")?,
+            page_id,
+            source_name: decoded.source_name,
+            normalized_name: decoded.normalized_name,
+            value: decoded.value,
+            ordinal: decoded.ordinal,
+        });
+    }
+    Ok(())
+}
+
+fn append_physical_properties(
+    out: &mut Vec<RegistryPropertyMetadata>,
+    owner_type: OwnerType,
+    owner_id: [u8; 16],
+    page_id: [u8; 16],
+    properties: &[tine_storage::sqlite::PhysicalProperty],
+) -> Result<(), String> {
+    for (ordinal, property) in properties.iter().enumerate() {
+        out.push(RegistryPropertyMetadata {
+            owner_type,
+            owner_id,
+            page_id,
+            source_name: property.name.clone(),
+            normalized_name: property.normalized_name.clone(),
+            value: property.value.clone(),
+            ordinal: u32::try_from(ordinal)
+                .map_err(|_| "physical property ordinal overflowed".to_owned())?,
+        });
+    }
+    Ok(())
+}
+
+fn properties_by_key(
+    page: &RegistryPageMetadata,
+) -> BTreeMap<String, Vec<&RegistryPropertyMetadata>> {
+    let mut by_key = BTreeMap::<String, Vec<&RegistryPropertyMetadata>>::new();
+    for property in &page.properties {
+        by_key
+            .entry(metadata_key(property))
+            .or_default()
+            .push(property);
+    }
+    by_key
+}
+
+fn metadata_key(property: &RegistryPropertyMetadata) -> String {
+    let source = if property.normalized_name.is_empty() {
+        &property.source_name
+    } else {
+        &property.normalized_name
+    };
+    property_key_norm(source)
+}
+
+fn declaration_rows(page: Option<&RegistryPageMetadata>) -> Vec<&RegistryPropertyMetadata> {
+    page.into_iter()
+        .flat_map(|page| page.properties.iter())
+        .filter(|property| {
+            property.owner_type == OwnerType::Page && metadata_key(property) == DECLARED_TYPE_KEY
+        })
+        .collect()
+}
+
+fn has_page_declaration(page: &RegistryPageMetadata) -> bool {
+    !declaration_rows(Some(page)).is_empty()
+}
+
+fn is_null(row: &[PhysicalQueryValue], at: usize) -> bool {
+    matches!(row.get(at), Some(PhysicalQueryValue::Null))
 }
 
 fn collect_joined_row(
@@ -289,11 +566,14 @@ fn invalid_snapshot() -> QueryExecutionError {
 mod tests {
     use super::*;
     use crate::direct_projection::QueryJobOpen;
-    use crate::model::Graph;
+    use crate::model::{Graph, PageEntry, PageKind};
     use crate::query::ir::{Cardinality, ObservedType};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+    use tine_storage::sqlite::{
+        PhysicalGraphProjectionChange, PhysicalGraphProjectionDatabase, PhysicalProperty,
+    };
     use uuid::Uuid;
 
     static SERIAL: Mutex<()> = Mutex::new(());
@@ -341,8 +621,252 @@ mod tests {
         read_registry(&mut open(database), config).unwrap()
     }
 
+    fn physical_page(name: &str, path: &str, source: &str) -> PhysicalPage {
+        let mut document = match crate::model::Format::from_path(Path::new(path)) {
+            crate::model::Format::Md => crate::doc::parse(source),
+            crate::model::Format::Org => crate::org::parse_org(source),
+        };
+        crate::model::assign_doc_runtime_ids(&mut document.roots, path);
+        crate::direct_projection::physical_page_for_test(
+            &PageEntry {
+                name: name.to_owned(),
+                kind: PageKind::Page,
+                date_key: None,
+                rel_path: path.to_owned(),
+                path: PathBuf::from(path),
+            },
+            &document,
+            &ParseConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn store_pages(tag: &str, pages: &[PhysicalPage]) -> (PathBuf, PathBuf) {
+        let root = scratch(tag);
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("projection.sqlite");
+        let mut projection = PhysicalGraphProjectionDatabase::open_writable(&database).unwrap();
+        projection.initialize_schema().unwrap();
+        projection
+            .apply(&PhysicalGraphProjectionChange {
+                replacements: pages.to_vec(),
+                deletions: Vec::new(),
+                reference_postings: Vec::new(),
+            })
+            .unwrap();
+        drop(projection);
+        (root, database)
+    }
+
+    fn metadata_of(pages: &[PhysicalPage]) -> PageRegistryMetadata {
+        pages
+            .iter()
+            .map(|page| {
+                (
+                    page.page_id,
+                    registry_metadata_from_physical_page(page).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn requested(pages: &[PhysicalPage]) -> BTreeSet<[u8; 16]> {
+        pages.iter().map(|page| page.page_id).collect()
+    }
+
     fn affected(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn touched_page_reader_matches_actual_markdown_and_org_physical_pages() {
+        let _serial = SERIAL.lock().unwrap();
+        let markdown = physical_page(
+            "Markdown Metadata",
+            "pages/metadata.md",
+            "Counted:: page-one\ncounted:: page-two\n\n- markdown block\n  Score:: 1\n  score:: 2\n",
+        );
+        let org = physical_page(
+            "Org Metadata",
+            "pages/metadata.org",
+            ":PROPERTIES:\n:Counted: page-one\n:counted: page-two\n:END:\n\n* org block\n:PROPERTIES:\n:Score: 1\n:score: 2\n:END:\n",
+        );
+        let pages = vec![markdown, org];
+        let (root, database) = store_pages("physical-parity", &pages);
+        let actual = read_page_registry_metadata(&mut open(&database), &requested(&pages)).unwrap();
+        let expected = metadata_of(&pages);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual[&pages[0].page_id].page.format,
+            crate::query::atom::AtomFormat::Markdown
+        );
+        assert_eq!(
+            actual[&pages[1].page_id].page.format,
+            crate::query::atom::AtomFormat::Org
+        );
+        assert!(actual.values().all(|page| {
+            page.properties
+                .iter()
+                .filter(|property| metadata_key(property) == "counted")
+                .map(|property| property.ordinal)
+                .collect::<BTreeSet<_>>()
+                == BTreeSet::from([0, 1])
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_change_diff_is_exact_per_key_and_ignores_ordinary_text() {
+        let _serial = SERIAL.lock().unwrap();
+        let old_page = physical_page(
+            "Diff Page",
+            "pages/diff.md",
+            "Alpha:: one\nBeta:: two\n\n- old visible text\n  Score:: 1\n  score:: 2\n",
+        );
+        let text_only = physical_page(
+            "Diff Page",
+            "pages/diff.md",
+            "Alpha:: one\nBeta:: two\n\n- completely different visible text\n  Score:: 1\n  score:: 2\n",
+        );
+        let before = metadata_of(std::slice::from_ref(&old_page));
+        let after_text = metadata_of(std::slice::from_ref(&text_only));
+        assert_eq!(
+            registry_changes(&before, &after_text),
+            RegistryChanges::default()
+        );
+
+        for mutate in [
+            |property: &mut RegistryPropertyMetadata| property.value = "changed".into(),
+            |property: &mut RegistryPropertyMetadata| property.source_name = "SCORE".into(),
+            |property: &mut RegistryPropertyMetadata| property.ordinal = 99,
+        ] {
+            let mut after = before.clone();
+            let property = after
+                .get_mut(&old_page.page_id)
+                .unwrap()
+                .properties
+                .iter_mut()
+                .find(|property| metadata_key(property) == "score")
+                .unwrap();
+            mutate(property);
+            assert_eq!(
+                registry_changes(&before, &after).normalized_keys,
+                affected(&["score"])
+            );
+        }
+
+        let mut removed = before.clone();
+        removed
+            .get_mut(&old_page.page_id)
+            .unwrap()
+            .properties
+            .retain(|property| metadata_key(property) != "beta");
+        assert_eq!(
+            registry_changes(&before, &removed).normalized_keys,
+            affected(&["beta"])
+        );
+
+        let mut added_page = old_page.clone();
+        added_page.properties.push(PhysicalProperty {
+            name: "Gamma".into(),
+            normalized_name: "gamma".into(),
+            value: "three".into(),
+        });
+        let added = metadata_of(std::slice::from_ref(&added_page));
+        assert_eq!(
+            registry_changes(&before, &added).normalized_keys,
+            affected(&["gamma"])
+        );
+
+        assert_eq!(
+            registry_changes(&PageRegistryMetadata::new(), &before).normalized_keys,
+            affected(&["alpha", "beta", "score"])
+        );
+        assert_eq!(
+            registry_changes(&before, &PageRegistryMetadata::new()).normalized_keys,
+            affected(&["alpha", "beta", "score"])
+        );
+
+        let mut renamed = before.clone();
+        renamed.get_mut(&old_page.page_id).unwrap().page.name = "Renamed".into();
+        assert_eq!(
+            registry_changes(&before, &renamed),
+            RegistryChanges::default()
+        );
+
+        let mut reformatted = before.clone();
+        reformatted.get_mut(&old_page.page_id).unwrap().page.format =
+            crate::query::atom::AtomFormat::Org;
+        assert_eq!(
+            registry_changes(&before, &reformatted).normalized_keys,
+            affected(&["alpha", "beta", "score"])
+        );
+    }
+
+    #[test]
+    fn declaration_changes_report_raw_old_and_new_page_names_separately() {
+        let _serial = SERIAL.lock().unwrap();
+        let declaration = physical_page(
+            "score",
+            "pages/score.md",
+            "tine.type:: number\n\n- declaration page\n",
+        );
+        let mut changed = declaration.clone();
+        changed.properties[0].value = "text".into();
+        let before = metadata_of(std::slice::from_ref(&declaration));
+        let changed_metadata = metadata_of(std::slice::from_ref(&changed));
+        assert_eq!(
+            registry_changes(&before, &changed_metadata).declaration_page_names,
+            affected(&["score"])
+        );
+
+        let mut renamed = changed_metadata.clone();
+        renamed.get_mut(&declaration.page_id).unwrap().page.name = "Points".into();
+        assert_eq!(
+            registry_changes(&changed_metadata, &renamed).declaration_page_names,
+            affected(&["score", "Points"])
+        );
+        assert_eq!(
+            registry_changes(&PageRegistryMetadata::new(), &before).declaration_page_names,
+            affected(&["score"])
+        );
+        assert_eq!(
+            registry_changes(&before, &PageRegistryMetadata::new()).declaration_page_names,
+            affected(&["score"])
+        );
+
+        let mut removed_declaration = declaration.clone();
+        removed_declaration.properties.clear();
+        assert_eq!(
+            registry_changes(
+                &before,
+                &metadata_of(std::slice::from_ref(&removed_declaration))
+            )
+            .declaration_page_names,
+            affected(&["score"])
+        );
+
+        let collision = physical_page("score", "pages/score-collision.md", "tine.type:: text\n");
+        let collision_before = metadata_of(&[declaration.clone(), collision.clone()]);
+        let collision_after = metadata_of(std::slice::from_ref(&collision));
+        assert_eq!(
+            registry_changes(&collision_before, &collision_after).declaration_page_names,
+            affected(&["score"])
+        );
+
+        let block_only = physical_page(
+            "block declaration",
+            "pages/block-declaration.md",
+            "- block\n  tine.type:: number\n",
+        );
+        let mut changed_block = block_only.clone();
+        changed_block.blocks[0].properties[0].value = "text".into();
+        let block_changes = registry_changes(
+            &metadata_of(std::slice::from_ref(&block_only)),
+            &metadata_of(std::slice::from_ref(&changed_block)),
+        );
+        assert_eq!(block_changes.normalized_keys, affected(&["tine.type"]));
+        assert!(block_changes.declaration_page_names.is_empty());
     }
 
     #[test]
@@ -562,5 +1086,115 @@ mod tests {
             "invalid-ordinal",
             "UPDATE properties SET ordinal = -1 WHERE normalized_name = 'score';",
         );
+    }
+
+    fn assert_metadata_rejects_damage(tag: &str, damage: &str) {
+        let page = physical_page(
+            "Damaged Metadata",
+            &format!("pages/{tag}.md"),
+            "Score:: page\n\n- block\n  Score:: block\n",
+        );
+        let page_id = page.page_id;
+        let (root, database) = store_pages(tag, &[page]);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        connection.execute_batch(damage).unwrap();
+        drop(connection);
+        assert!(matches!(
+            read_page_registry_metadata(&mut open(&database), &BTreeSet::from([page_id])),
+            Err(QueryExecutionError::Unavailable(
+                QueryUnavailableReason::InvalidSnapshot
+            ))
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn touched_page_reader_rejects_damaged_owner_page_and_ordinal() {
+        let _serial = SERIAL.lock().unwrap();
+        assert_metadata_rejects_damage(
+            "metadata-owner",
+            "UPDATE properties SET owner_id = randomblob(16) WHERE owner_type = 0;",
+        );
+        assert_metadata_rejects_damage(
+            "metadata-page",
+            "DELETE FROM pages WHERE page_id IN (SELECT page_id FROM properties LIMIT 1);",
+        );
+        assert_metadata_rejects_damage(
+            "metadata-ordinal",
+            "UPDATE properties SET ordinal = -1 WHERE normalized_name = 'score';",
+        );
+    }
+
+    #[test]
+    fn touched_page_reader_is_bounded_statement_free_when_empty_and_cancellable() {
+        let _serial = SERIAL.lock().unwrap();
+        let wanted = physical_page("Wanted", "pages/wanted.md", "Wanted:: valid\n");
+        let unrelated = physical_page("Unrelated", "pages/unrelated.md", "Broken:: corrupt me\n");
+        let (root, database) = store_pages("bounded-page-metadata", &[wanted.clone(), unrelated]);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE properties SET ordinal = -1 WHERE normalized_name = 'broken'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        reset_statement_count();
+        let rows = read_page_registry_metadata(
+            &mut open(&database),
+            &BTreeSet::from([wanted.page_id, [0xff; 16]]),
+        )
+        .unwrap();
+        assert_eq!(rows, metadata_of(std::slice::from_ref(&wanted)));
+        assert_eq!(statement_count(), 1);
+
+        reset_statement_count();
+        assert!(
+            read_page_registry_metadata(&mut open(&database), &BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(statement_count(), 0);
+
+        let mut cancelled = open(&database);
+        cancelled.cancellation().cancel();
+        reset_statement_count();
+        assert!(matches!(
+            read_page_registry_metadata(&mut cancelled, &BTreeSet::new()),
+            Err(QueryExecutionError::Cancelled)
+        ));
+        assert_eq!(statement_count(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn touched_page_reader_batches_more_than_128_requested_pages() {
+        let _serial = SERIAL.lock().unwrap();
+        let pages = (0..129)
+            .map(|index| {
+                physical_page(
+                    &format!("Page {index}"),
+                    &format!("pages/batch-{index}.md"),
+                    "",
+                )
+            })
+            .collect::<Vec<_>>();
+        let (root, database) = store_pages("metadata-batches", &pages);
+        reset_statement_count();
+        let actual = read_page_registry_metadata(&mut open(&database), &requested(&pages)).unwrap();
+        assert_eq!(actual, metadata_of(&pages));
+        assert_eq!(
+            statement_count(),
+            2,
+            "129 page IDs require two bounded batches"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
