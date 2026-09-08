@@ -2596,12 +2596,22 @@ fn managed_task_query_overlay_stays_at_exact_existing_page_seams() {
             "the Managed sparse task runner is retired; {retired} is back"
         );
     }
+    // RET2 correction: the gate itself is deleted crate-wide, so the router
+    // cannot consult it and no later edit can reintroduce the consultation
+    // without reintroducing the gate.
     assert!(
         !simple_query_router.contains("sparse_task_query_eligibility"),
         "the walk must not consult the sparse planner it no longer has a runner for"
     );
-    // The planner itself is NOT retired -- it is Direct Files' query-job
-    // planner -- and neither is the Managed exposed-identity producer.
+    let query = include_str!("query.rs");
+    assert!(
+        !query.contains("fn sparse_task_query_eligibility("),
+        "the sparse eligibility gate is retired; its last consumer is gone"
+    );
+    // The page candidate planner is NOT retired -- Managed's simple-query turn
+    // still answers an unmatchable query from it -- and neither is the Managed
+    // exposed-identity producer.
+    assert!(query.contains("pub(crate) fn simple_query_candidate_plan("));
     assert!(production.contains("fn sparse_task_query_identity("));
 
     let unit = production

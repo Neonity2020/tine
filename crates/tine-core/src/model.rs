@@ -6193,6 +6193,116 @@ impl Graph {
         Ok(())
     }
 
+    /// Attach this graph's OWN disposable query projection over the document
+    /// snapshot it was constructed with.
+    ///
+    /// For a graph built by [`Graph::from_page_snapshot`] — a caller-owned,
+    /// immutable capture in a root the caller exclusively created. The parsed
+    /// cache is already preinstalled, so [`Graph::attach_direct_projection`]
+    /// enqueues exactly those documents, identities and inventory order, with
+    /// this graph's own effective parse configuration; nothing rereads the
+    /// source tree and nothing reaches the live graph's projection.
+    ///
+    /// This is NOT `warm_cache`/`recover`: neither would have a source tree to
+    /// read under a snapshot root, and both would be a second opinion about a
+    /// snapshot the caller already owns.
+    ///
+    /// The returned handle is the one the caller closes and drains before
+    /// removing the directory the database lives in, so it is returned from the
+    /// ATTACH — before any wait can fail — and never from the wait.
+    pub(crate) fn attach_snapshot_query_projection(
+        &self,
+        path: PathBuf,
+    ) -> io::Result<Arc<crate::direct_projection::DirectProjection>> {
+        // The projection keys stored work by SOURCE REVISION, and a snapshot
+        // root holds no source bytes to read one from. Publish the digest of
+        // each EXACT captured document instead — the revision of what this
+        // graph actually serves, never of what the live tree holds now. Done
+        // here rather than in `from_page_snapshot` so a snapshot that never
+        // indexes never pays for the serialization.
+        {
+            let cache = self.cache.read().unwrap();
+            let Some(pages) = cache.as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "snapshot query projection needs a preinstalled document snapshot",
+                ));
+            };
+            // Lock order is cache → disk_revs (see `disk_revs`), and both are
+            // published together so no reader sees one without the other.
+            *self.disk_revs.write().unwrap() = pages
+                .iter()
+                .map(|(entry, document)| {
+                    (entry.path.clone(), content_rev(&doc::serialize(document)))
+                })
+                .collect();
+        }
+        self.attach_direct_projection(path)?;
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "snapshot query projection could not be attached",
+                )
+            })
+    }
+
+    /// Block until this snapshot graph's attached projection has indexed the
+    /// preinstalled snapshot, or `timeout` elapses.
+    ///
+    /// Every non-ready outcome is a bounded `io::Error`, because a snapshot
+    /// graph takes no writes: there is no later generation to wait for, and no
+    /// repair anyone else will schedule. A caller that cannot index cannot
+    /// answer, and a publication that cannot answer must fail before it
+    /// replaces anything.
+    pub(crate) fn await_snapshot_query_projection(
+        &self,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        use crate::direct_projection::ProjectionProgress;
+        let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "snapshot query projection is not attached",
+            ));
+        };
+        let started = std::time::Instant::now();
+        loop {
+            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            match projection.progress_at(generation) {
+                ProjectionProgress::Ready => return Ok(()),
+                ProjectionProgress::Working(_) => {}
+                ProjectionProgress::Stale => {
+                    return Err(io::Error::other(
+                        "snapshot query projection stopped short of its own snapshot",
+                    ))
+                }
+                ProjectionProgress::Stopped => {
+                    return Err(io::Error::other(
+                        "snapshot query projection worker is unavailable",
+                    ))
+                }
+            }
+            if started.elapsed() >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "snapshot query projection did not finish indexing in time",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Attach the Concord base ledger (ADR 0056) rooted at `dir` (an
     /// app-private directory OUTSIDE the graph tree). Idempotent; the first
     /// attach wins. Queues a background prune of unreferenced blobs.
@@ -12335,6 +12445,7 @@ impl Graph {
     /// snapshot. The empty `root` is only a fail-closed fallback: whole-graph
     /// consumers use the preinstalled cache and page list, so they can never
     /// mix these documents with a later revision from the live graph.
+    ///
     pub(crate) fn from_page_snapshot(
         root: impl AsRef<Path>,
         mut pages: Vec<(PageEntry, Arc<Document>)>,

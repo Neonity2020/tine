@@ -2,6 +2,18 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PUBLICATION-WRITER-LIFETIME",
+ "title": "Publication retains temporary query resources through writer close timeout",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 Direct correction manager review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/direct_projection.rs::tests::a_timed_out_close_retains_resources_until_the_writer_really_exits", "crates/tine-core/src/publish.rs::tests::publication_snapshot_query_index_is_owner_private_and_dies_with_its_root"],
+  "scenario": "query-engine.publication-writer-lifetime"
+ },
+ "notes": "Real paused writer cannot release resources merely because a zero-duration wait expires; resources release after exit and late registration cannot leak. The Unix permission fixture does not prove the still-pending Windows private-root correction."
+},
+{
  "id": "REG-QE-ACCEPTED-REGISTRY-FAILURE-STOPS-CAPTURE",
  "title": "Failed accepted property metadata stops Managed query capture before execution",
  "family": "query-engine",

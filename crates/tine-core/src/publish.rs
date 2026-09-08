@@ -2990,10 +2990,45 @@ fn render_query(graph: &Graph, src: &str, ctx: &Ctx, depth: u8) -> String {
 /// runs. Publishing a macro name this tree can write but not export is the
 /// failure Y1 names, and it is why this arm exists.
 fn render_query_named(graph: &Graph, name: &str, argument: &str, ctx: &Ctx, depth: u8) -> String {
-    if !name.eq_ignore_ascii_case("tine-query") {
+    if !macro_name_is_tql(name) {
         return render_query(graph, argument, ctx, depth);
     }
     render_tql_query(graph, argument, ctx, depth)
+}
+
+/// The `{{tine-query …}}` spelling — the ONE publication surface that answers
+/// from the snapshot's query database rather than from the parsed capture.
+///
+/// Shared with [`publication_runs_indexed_queries`] so the decision to build an
+/// index and the decision to use one can never disagree about which macro name
+/// needs it.
+fn macro_name_is_tql(name: &str) -> bool {
+    name.eq_ignore_ascii_case("tine-query")
+}
+
+/// True when this publication authored at least one `{{tine-query …}}` macro.
+///
+/// `{{query …}}`, `#+BEGIN_QUERY` and the query-backed sheet views read the
+/// parsed capture, so a publication without a TQL macro must not pay for an
+/// index it will never read. The authored source decides, read through
+/// [`crate::query::macro_text::query_macro_extents`] — the one owner that
+/// already tells a real macro from a `{{` in prose, a nested options map or a
+/// `[[page]]` ref — never a pattern match over source bytes.
+///
+/// Only the AUTHORIZED pages are scanned: publication renders exactly those,
+/// and every embed it resolves is filtered through the same public capability.
+fn publication_runs_indexed_queries(public: &[(&str, PageKind, Arc<doc::Document>)]) -> bool {
+    fn blocks_run_indexed_queries(blocks: &[DocBlock]) -> bool {
+        blocks.iter().any(|block| {
+            crate::query::macro_text::query_macro_extents(&block.raw)
+                .iter()
+                .any(|extent| macro_name_is_tql(&extent.name))
+                || blocks_run_indexed_queries(&block.children)
+        })
+    }
+    public
+        .iter()
+        .any(|(_, _, document)| blocks_run_indexed_queries(&document.roots))
 }
 
 /// The `{{tine-query …}}` static-export path: parse the COMPLETE raw argument
@@ -4347,9 +4382,86 @@ struct PublishStage {
     identity: FileIdentity,
 }
 
+/// How long a publication waits for its own snapshot query index.
+///
+/// Indexing is proportional to the captured graph, not to a user gesture, so
+/// the bound is generous; it exists only so a worker that never converges
+/// fails the publication instead of hanging it.
+const SNAPSHOT_QUERY_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the publication waits for the snapshot's writer worker to return
+/// before removing the tree its database lives in.
+const SNAPSHOT_QUERY_INDEX_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The temporary tree ONE publication snapshot exclusively created, removed
+/// when it drops.
+///
+/// It is a field rather than a `Drop` on the snapshot itself because
+/// `Drop::drop` runs BEFORE a struct's fields drop: removing the tree from
+/// there would unlink the snapshot's own query database out from under the
+/// graph still holding it. As the LAST field it is removed last, which is the
+/// ordering the contents require.
+struct PublicationSnapshotRoot(PathBuf);
+
+impl Drop for PublicationSnapshotRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The publication snapshot's own disposable query index, closed and drained
+/// when it drops.
+///
+/// Its rows describe the COMPLETE fresh capture, including pages the public
+/// capability will not publish — that is what lets the renderer count honestly
+/// what it omitted — so the database is private state for the length of one
+/// publication and its bytes never leave the owner-private root above.
+struct PublicationSnapshotQueryIndex(Arc<crate::direct_projection::DirectProjection>);
+
+impl Drop for PublicationSnapshotQueryIndex {
+    fn drop(&mut self) {
+        // The graph field dropped first and released its own handle, so this is
+        // the last one: closing here drains every reader AND waits for the
+        // writer worker, so the tree can be removed with nothing open in it.
+        // If this bounded wait expires, the worker's retained root owner keeps
+        // the directory alive until actual connection/lease teardown. Timeout
+        // never authorizes deleting files under an active writer.
+        let _ = self
+            .0
+            .close_and_wait_for_worker(SNAPSHOT_QUERY_INDEX_CLOSE_TIMEOUT);
+    }
+}
+
+/// One publication's immutable document capture, and the disposable machinery
+/// that answers queries over exactly that capture.
+///
+/// **Field order is the teardown contract.** Rust drops fields in declaration
+/// order: the graph releases its projection handle, the index then closes and
+/// drains the worker, and only then is the temporary tree removed.
 struct PublicationGraphSnapshot {
     graph: Graph,
-    root: PathBuf,
+    index: Option<PublicationSnapshotQueryIndex>,
+    root: Arc<PublicationSnapshotRoot>,
+}
+
+/// Create `path` as a directory only its owner may read, write or traverse,
+/// failing if it already exists.
+///
+/// The permission is chosen AT creation rather than relaxed afterwards, so no
+/// window exists in which the publication's private rows are readable by
+/// another account. On Windows the process temporary directory is already the
+/// per-user `%LOCALAPPDATA%\Temp`, whose ACL grants the owner, SYSTEM and
+/// administrators only; Rust exposes no portable API to narrow it further.
+fn create_owner_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
 }
 
 impl PublicationGraphSnapshot {
@@ -4363,11 +4475,12 @@ impl PublicationGraphSnapshot {
                 std::process::id(),
                 SEQ.fetch_add(1, Ordering::Relaxed)
             ));
-            match fs::create_dir(&root) {
+            match create_owner_private_dir(&root) {
                 Ok(()) => {
                     return Ok(Self {
                         graph: Graph::from_page_snapshot(&root, pages),
-                        root,
+                        index: None,
+                        root: Arc::new(PublicationSnapshotRoot(root)),
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -4379,11 +4492,24 @@ impl PublicationGraphSnapshot {
             "could not reserve an immutable publication snapshot root",
         ))
     }
-}
 
-impl Drop for PublicationGraphSnapshot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+    /// Give this snapshot its own query index, over its own documents, inside
+    /// its own temporary root.
+    ///
+    /// Called only once, and only after every setting the parse and the render
+    /// read is final, because the index is built from the graph's effective
+    /// configuration at attach time.
+    ///
+    /// The drain owner is installed the instant the projection exists, so a
+    /// failed WAIT still closes the worker before the root is removed.
+    fn index_queries(&mut self) -> io::Result<()> {
+        debug_assert!(self.index.is_none(), "one query index per publication");
+        let database = self.root.0.join("query-index.sqlite");
+        let projection = self.graph.attach_snapshot_query_projection(database)?;
+        projection.retain_worker_resource(self.root.clone());
+        self.index = Some(PublicationSnapshotQueryIndex(projection));
+        self.graph
+            .await_snapshot_query_projection(SNAPSHOT_QUERY_INDEX_TIMEOUT)
     }
 }
 
@@ -4730,6 +4856,21 @@ pub(crate) fn publish_graph_documents(
     let mut snapshot = snapshot;
     snapshot.graph.config.preferred_workflow = graph.config.preferred_workflow;
     snapshot.graph.config.block_hidden_properties = graph.config.block_hidden_properties.clone();
+    // `{{tine-query …}}` answers through the query database, and the snapshot
+    // graph deliberately has no access to the live graph's: publishing must
+    // read its OWN fresh capture, including pages the public capability will
+    // not publish. So give the snapshot its own disposable index, over exactly
+    // these documents, inside the root it exclusively created — after the
+    // presentation settings above, because the index is built from this
+    // graph's effective configuration.
+    //
+    // A failure here is a publishing IO failure. The staged output has not
+    // replaced the last good publication yet, and a site whose queries all
+    // render "the query index is unavailable" is worse than the site that is
+    // already there.
+    if publication_runs_indexed_queries(&public) {
+        snapshot.index_queries()?;
+    }
 
     // ONE source of truth: a unique, nonempty name→slug map for the exported set.
     // Every filename, cross-page link, block-ref target, and search-index entry is
@@ -5384,14 +5525,7 @@ mod tests {
 
         let graph = Graph::open(&dir);
         let live_id = graph.backlinks("Target")[0].blocks[0].id.clone();
-        let mut snapshot_pages = Vec::new();
-        for entry in graph.list_pages() {
-            let content = fs::read_to_string(&entry.path).unwrap();
-            let mut parsed = doc::parse(&content);
-            crate::model::assign_doc_runtime_ids(&mut parsed.roots, &entry.rel_path);
-            snapshot_pages.push((entry, Arc::new(parsed)));
-        }
-        let snapshot = PublicationGraphSnapshot::new(snapshot_pages).unwrap();
+        let snapshot = PublicationGraphSnapshot::new(capture_snapshot_pages(&graph)).unwrap();
         assert_eq!(snapshot.graph.backlinks("Target")[0].blocks[0].id, live_id);
 
         drop(snapshot);
@@ -5944,6 +6078,244 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The exact capture `publish_graph` makes: every page read fresh from
+    /// disk, parsed, and given its file-owned runtime identity.
+    ///
+    /// Shared by every fixture that needs a `PublicationGraphSnapshot` of its
+    /// own, so a test can never disagree with the production capture about
+    /// which documents, identities or inventory order a snapshot holds.
+    fn capture_snapshot_pages(graph: &Graph) -> Vec<(crate::model::PageEntry, Arc<doc::Document>)> {
+        graph
+            .list_pages()
+            .into_iter()
+            .map(|entry| {
+                let content = fs::read_to_string(&entry.path).unwrap();
+                let mut parsed = doc::parse(&content);
+                crate::model::assign_doc_runtime_ids(&mut parsed.roots, &entry.rel_path);
+                (entry, Arc::new(parsed))
+            })
+            .collect()
+    }
+
+    /// **RET2 correction, the publication half.** The TQL macro answers from a
+    /// database, and the only database it may answer from is the one built over
+    /// the publication's OWN capture.
+    ///
+    /// The two claims are inseparable, so they are one fixture:
+    ///
+    /// * the rows come from SQL — the full-graph evaluator is never entered,
+    ///   which is what makes this a query-ROUTE claim and not merely "some
+    ///   HTML appeared";
+    /// * the index covers the COMPLETE capture, including the private page, so
+    ///   the public-page capability can subtract honestly. A publication that
+    ///   indexed only public pages would render the same visible row with a
+    ///   silently wrong "omitted" count — a privacy claim stated as a number.
+    #[test]
+    fn publish_answers_a_tql_macro_from_sql_and_counts_the_private_matches_it_omitted() {
+        let dir =
+            std::env::temp_dir().join(format!("tine-publish-tql-omission-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "public:: true\n- {{tine-query @block and [[Alpha]]}}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "public:: true\n- TODO tql-public-hit [[Alpha]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Secret.md"),
+            "- TODO tql-private-hit [[Alpha]]\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        crate::query::reset_full_graph_query_evaluations();
+        let (outdir, count) = publish_graph(&graph).unwrap();
+        assert_eq!(count, 2, "only the two public pages are published");
+        let out = Path::new(&outdir);
+        let dashboard = fs::read_to_string(out.join("dashboard.html")).unwrap();
+        let search = fs::read_to_string(out.join("search-index.js")).unwrap();
+
+        assert!(
+            dashboard.contains("tql-public-hit"),
+            "the authorized match must render: {dashboard}"
+        );
+        assert!(
+            dashboard.contains("<span class=\"query-count\">1</span>"),
+            "the visible count is the authorized one: {dashboard}"
+        );
+        assert!(
+            !dashboard.contains("tql-private-hit") && !search.contains("tql-private-hit"),
+            "a private match crossed the public-page capability: {dashboard}"
+        );
+        assert!(
+            dashboard.contains("1 result on non-public pages omitted."),
+            "the private match must be COUNTED, which requires indexing it: {dashboard}"
+        );
+        assert!(
+            !dashboard.contains("query-unsupported"),
+            "the publication refused its own query: {dashboard}"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            0,
+            "the TQL publication route must answer from SQL, never by walking"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The index is built from the CAPTURE, not from the live graph.
+    ///
+    /// The live graph is warmed with the old body first, so a snapshot that
+    /// reached the live graph's parsed cache — or its projection — would answer
+    /// with the stale token. Publication reparses the files itself, and the
+    /// index it builds must describe exactly that reparse. The sibling
+    /// `publish_uses_one_fresh_snapshot_after_external_visibility_rewrite`
+    /// makes the same claim for the walking `{{query …}}` route.
+    #[test]
+    fn publish_indexes_the_captured_documents_not_the_live_graph_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-tql-immutable-capture-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:publishing/all-pages-public? true}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- {{tine-query @block and [[Alpha]]}}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO tql-stale-token [[Alpha]]\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        // An external editor rewrites the source after the live cache was built.
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO tql-current-token [[Alpha]]\n",
+        )
+        .unwrap();
+
+        let (outdir, _) = publish_graph(&graph).unwrap();
+        let dashboard = fs::read_to_string(Path::new(&outdir).join("dashboard.html")).unwrap();
+        assert!(
+            dashboard.contains("tql-current-token"),
+            "the index must describe the fresh capture: {dashboard}"
+        );
+        assert!(
+            !dashboard.contains("tql-stale-token"),
+            "a stale live-graph revision reached the publication index: {dashboard}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The snapshot database is private for its whole life, and its life ends
+    /// with the publication.
+    ///
+    /// It holds rows for pages the publication will NOT publish — that is what
+    /// makes the omitted count honest — so the bytes are private state. The
+    /// permission is taken at creation, before anything is written into the
+    /// tree, and the tree survives exactly as long as the graph and index that
+    /// live in it: `Drop` order, not a manual sequence a later edit can
+    /// reorder.
+    #[test]
+    fn publication_snapshot_query_index_is_owner_private_and_dies_with_its_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-snapshot-index-lifetime-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("pages/Secret.md"),
+            "- TODO private-row-token [[Alpha]]\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        let mut snapshot = PublicationGraphSnapshot::new(capture_snapshot_pages(&graph)).unwrap();
+        let root = snapshot.root.0.clone();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "the private snapshot tree must be owner-only from creation"
+            );
+        }
+
+        snapshot.index_queries().unwrap();
+        let database = root.join("query-index.sqlite");
+        assert!(
+            database.exists(),
+            "the snapshot index lives under the snapshot's own root, never the graph"
+        );
+        assert!(
+            snapshot.index.is_some(),
+            "the drain owner is installed with the projection"
+        );
+
+        // Dropping closes the graph, then closes and drains the projection,
+        // then removes the tree. Nothing is left behind for the next run.
+        drop(snapshot);
+        assert!(
+            !root.exists(),
+            "the publication snapshot tree outlived its publication: {}",
+            root.display()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only an authored `{{tine-query …}}` buys an index.
+    ///
+    /// The other publication query surfaces read the parsed capture, so a
+    /// publication without a TQL macro must not pay for a database it will
+    /// never read — and the decision is the macro owner's, so a `{{` in prose
+    /// or an OG macro cannot buy one by accident.
+    #[test]
+    fn publication_indexes_only_when_a_tql_macro_was_authored() {
+        let page = |source: &str| ("Page", PageKind::Page, Arc::new(doc::parse(source)));
+
+        assert!(!publication_runs_indexed_queries(&[page(
+            "- {{query (task TODO)}}\n- prose with {{tine-query-ish braces\n"
+        )]));
+        assert!(!publication_runs_indexed_queries(&[page(
+            "- #+BEGIN_QUERY\n  {:title \"T\"}\n  #+END_QUERY\n"
+        )]));
+        assert!(publication_runs_indexed_queries(&[page(
+            "- parent\n\t- {{tine-query @block and [[Alpha]]}}\n"
+        )]));
+        // The options map's inner `}` must not end the extent early, which is
+        // exactly what a `{{tine-query.*?}}` scan gets wrong.
+        assert!(publication_runs_indexed_queries(&[page(
+            "- {{TINE-QUERY @block {:title \"T\"}}}\n"
+        )]));
     }
 
     /// §4.3.1: the query transport is the RAW SOURCE SLICE, not lsdoc's

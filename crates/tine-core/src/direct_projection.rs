@@ -328,6 +328,18 @@ struct ProjectionShared {
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
+    /// The writer worker has RETURNED, and every resource it owned — the
+    /// SQLite writer connection and the exclusive writer lease — is closed.
+    ///
+    /// `worker_available` says only that the worker will take no further work;
+    /// it is stored before those two locals drop. A caller that must remove the
+    /// database's directory needs the stronger fact, so this flag is published
+    /// by a guard declared FIRST in `projection_worker` and therefore dropped
+    /// LAST. See [`DirectProjection::close_and_wait_for_worker`].
+    worker_finished: AtomicBool,
+    /// Resources whose destruction must follow the writer connection and
+    /// lease. None closes registration once worker teardown starts.
+    worker_resources: Mutex<Option<Vec<Arc<dyn Send + Sync>>>>,
     /// R6: this session has validated the complete page inventory against
     /// the projection at least once (a full snapshot, or a warm validation's
     /// `Clean` or closing order turn). Until then a live delta keeps the file
@@ -594,6 +606,8 @@ impl DirectProjection {
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            worker_finished: AtomicBool::new(false),
+            worker_resources: Mutex::new(Some(Vec::new())),
             validated: AtomicBool::new(false),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
@@ -1722,22 +1736,83 @@ impl DirectProjection {
     pub(crate) fn fuzzy_candidate_reads(&self) -> u64 {
         self.shared.fuzzy_candidate_reads.load(Ordering::Relaxed)
     }
+
+    /// R3: refuse new jobs, interrupt the active ones and wait for their slots
+    /// before the worker is told to stop, so no snapshot outlives the
+    /// projection that admitted it. Idempotent — `stop` and a closed admission
+    /// owner are both terminal, so a caller that closes explicitly and then
+    /// drops pays a second no-op drain and nothing else.
+    fn close(&self) {
+        self.shared.query_jobs.close();
+        {
+            let mut pending = self.shared.pending.lock().unwrap();
+            pending.stop = true;
+        }
+        self.shared.changed.notify_all();
+    }
+
+    /// Retain a resource until the writer has released its connection and lease.
+    /// The publication root also has a foreground owner until its graph drops.
+    pub(crate) fn retain_worker_resource(&self, resource: Arc<dyn Send + Sync>) {
+        if let Some(resources) = self.shared.worker_resources.lock().unwrap().as_mut() {
+            resources.push(resource);
+        }
+    }
+
+    /// [`DirectProjection::close`], then wait until the writer worker has
+    /// actually RETURNED — up to `timeout`. `true` when it did.
+    ///
+    /// The only caller that needs this is one that owns the database's
+    /// directory and is about to remove it: on Windows an open handle refuses
+    /// the delete, and on every platform a worker still finishing its turn can
+    /// recreate the file under a directory that was just removed. Ordinary
+    /// graph close does NOT wait — an app teardown must not block on SQLite —
+    /// which is why the wait is an explicit call and not part of `Drop`.
+    ///
+    /// A `stop` turn is taken as soon as the worker reaches the top of its
+    /// loop, so the bound is one in-flight apply, never a queue.
+    pub(crate) fn close_and_wait_for_worker(&self, timeout: std::time::Duration) -> bool {
+        self.close();
+        let started = std::time::Instant::now();
+        while !self.shared.worker_finished.load(Ordering::Acquire) {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
 }
 
 impl Drop for DirectProjection {
     fn drop(&mut self) {
-        // R3: the graph is closing. Refuse new jobs, interrupt the active ones
-        // and wait for their slots before the worker is told to stop, so no
-        // snapshot outlives the projection that admitted it.
-        self.shared.query_jobs.close();
-        let mut pending = self.shared.pending.lock().unwrap();
-        pending.stop = true;
-        self.shared.changed.notify_one();
+        self.close();
     }
 }
 
-/// Report a Direct Files projection failure that leaves the parser fallback in
-/// charge.
+/// Publish the worker's exit AFTER every resource it owns has been released.
+///
+/// Declared as the FIRST local in [`projection_worker`], so it drops LAST —
+/// after the writer connection and the exclusive writer lease. `Drop` is the
+/// only correct place for it: the worker has five early returns and one
+/// steady-state one, and a flag stored at each of them is a flag the next arm
+/// forgets.
+struct ProjectionWorkerExit(Arc<ProjectionShared>);
+
+impl Drop for ProjectionWorkerExit {
+    fn drop(&mut self) {
+        self.0.worker_available.store(false, Ordering::Release);
+        let resources = self.0.worker_resources.lock().unwrap().take();
+        drop(resources);
+        self.0.worker_finished.store(true, Ordering::Release);
+        self.0.changed.notify_all();
+    }
+}
+
+const PROJECTION_UPDATE_FAILURE: &str = "is stale; indexed reads are unavailable";
+
+/// Report a Direct Files projection write failure. Each read surface owns its
+/// readiness/error policy; this writer cannot claim that a query will traverse.
 ///
 /// The always-on line names the failure family in fixed words and carries
 /// nothing else. I-5: the detail at both call sites is free-form prose from the
@@ -1746,7 +1821,7 @@ impl Drop for DirectProjection {
 /// `MaterializationError`'s payloads are free-form `String`s produced while
 /// storing parsed page text. I-9: the family still reaches the always-on
 /// record, because a user who is not running under `TINE_DEBUG` otherwise sees
-/// only a silently slower graph. The prose stays on the directed debug channel.
+/// only an unavailable index. The prose stays on the directed debug channel.
 fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
     eprintln!("[tine] Direct Files SQLite projection {family}");
     if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
@@ -1755,6 +1830,9 @@ fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
 }
 
 fn projection_worker(shared: Arc<ProjectionShared>) {
+    // FIRST local, so it is the LAST thing dropped: the writer connection and
+    // the exclusive lease below are both released before the exit is published.
+    let _exit = ProjectionWorkerExit(Arc::clone(&shared));
     let Some(parent) = shared.path.parent() else {
         shared.worker_available.store(false, Ordering::Release);
         shared.changed.notify_all();
@@ -1951,7 +2029,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 }
                 shared.worker_busy.store(false, Ordering::Release);
                 shared.changed.notify_all();
-                report_projection_failure("is stale; using parser fallback", &error);
+                report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
                 continue;
             }
         };
@@ -4117,6 +4195,62 @@ mod tests {
     /// parser scan. Waiting for this already-running bounded delta preserves the
     /// same semantics and avoids the reported multi-second fallback.
     #[test]
+    fn a_timed_out_close_retains_resources_until_the_writer_really_exits() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("worker-resource-lifetime");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/source.md"), "- before\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/query.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        projection.retain_worker_resource(resource);
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "source")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let revision = page.rev.clone();
+        page.blocks[0].raw = "after".into();
+        graph.save_page(&page, revision.as_deref()).unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let closed = projection.close_and_wait_for_worker(Duration::ZERO);
+        let retained = weak.upgrade().is_some();
+        // Release the real worker even if an assertion below fails.
+        resume_tx.send(()).unwrap();
+        assert!(!closed, "the paused writer cannot have finished");
+        assert!(
+            retained,
+            "a wait timeout must not destroy the writer's resources"
+        );
+        assert!(projection.close_and_wait_for_worker(Duration::from_secs(5)));
+        assert!(
+            weak.upgrade().is_none(),
+            "the exited writer must release resources"
+        );
+        // Registration after exit must not retain a resource forever.
+        let late = Arc::new(());
+        let late_weak = Arc::downgrade(&late);
+        projection.retain_worker_resource(late);
+        assert!(late_weak.upgrade().is_none());
+        drop(graph);
+        drop(projection);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn reference_lookup_waits_for_an_inflight_one_page_projection_delta() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("reference-delta-handoff");
@@ -4671,7 +4805,12 @@ mod tests {
     fn storage_contract_names_the_generation_bound_cutover() {
         let contract = include_str!("../../../docs/storage-sync-contract.md");
         assert!(contract.contains("direct-files-projections/<canonical-graph-path-digest>.sqlite"));
-        assert!(contract.contains("sparse_task_query_eligibility"));
+        // RET2 correction: the sparse task-query family is DELETED, so the
+        // contract must say so rather than describe it as a live read family.
+        // Pinned as a retirement, because "the document still mentions it" is
+        // how dead code survives a sweep.
+        assert!(contract.contains("There is no separate sparse task-query read family."));
+        assert!(contract.contains("the RET2 correction deleted the\ngate"));
         assert!(contract.contains("shared\nproperty-facet rows"));
         assert!(contract.contains("PageRef simple-query candidate plan"));
         assert!(contract.contains("same SQL read family in\nboth storage regimes"));
@@ -5533,6 +5672,8 @@ mod tests {
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            worker_finished: AtomicBool::new(false),
+            worker_resources: Mutex::new(Some(Vec::new())),
             validated: AtomicBool::new(false),
             indexed_reads: AtomicU64::new(0),
             statement_reads: AtomicU64::new(0),
@@ -5811,7 +5952,7 @@ mod tests {
         // Exactly what `apply_pending` returns: a `String` naming the
         // graph-relative page it was projecting.
         report_projection_failure(
-            "is stale; using parser fallback",
+            PROJECTION_UPDATE_FAILURE,
             &"parsed page has no exact source revision: pages/planted-apply-marker-Zq7Page.md"
                 .to_owned(),
         );
@@ -5862,6 +6003,9 @@ mod tests {
     #[test]
     fn retired_class_c_projection_apply_failure_emits_no_planted_marker() {
         let marker = "planted-apply-marker-Zq7Page";
+        let ordinary = projection_failure_child_stderr("0");
+        assert!(ordinary.contains(PROJECTION_UPDATE_FAILURE));
+        assert!(!ordinary.contains("using parser fallback"));
         assert!(
             source_of_this_file().contains("parsed page has no exact source revision: {}"),
             "non-vacuity: this probe exists because `apply_pending` names the page it was \
@@ -5869,7 +6013,7 @@ mod tests {
              class before relaxing the probe."
         );
         assert!(
-            !projection_failure_child_stderr("0").contains(marker),
+            !ordinary.contains(marker),
             "I-5: the always-on parser-fallback line still carried the graph-relative page \
              path from `apply_pending`. The always-on line names the failure family only."
         );

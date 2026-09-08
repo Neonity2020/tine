@@ -983,42 +983,6 @@ pub(crate) fn rebase_to_block(filter: &Filter) -> Filter {
     }
 }
 
-/// The token stream without spans, for the shape guards that only classify
-/// tokens (the managed sparse path's strictness checks).
-pub(crate) fn tokens_only(src: &str) -> Vec<Tok> {
-    tokenize(src)
-        .into_iter()
-        .map(|spanned| spanned.tok)
-        .collect()
-}
-
-/// Whether `tokens` is exactly ONE balanced expression that consumes the whole
-/// source — the shape the managed sparse path requires before it will enumerate
-/// a narrowed candidate stream.
-pub(crate) fn is_single_expression(tokens: &[Tok]) -> bool {
-    fn walk(tokens: &[Tok], position: &mut usize) -> bool {
-        match tokens.get(*position) {
-            Some(Tok::LParen) => {
-                *position += 1;
-                while !matches!(tokens.get(*position), Some(Tok::RParen)) {
-                    if !walk(tokens, position) {
-                        return false;
-                    }
-                }
-                *position += 1;
-                true
-            }
-            Some(Tok::RParen) | None => false,
-            Some(_) => {
-                *position += 1;
-                true
-            }
-        }
-    }
-    let mut position = 0;
-    walk(tokens, &mut position) && position == tokens.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

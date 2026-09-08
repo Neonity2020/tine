@@ -641,9 +641,7 @@ unwritable database
 therefore uses the established parser evaluator and cannot block graph open,
 save, or external file observation.
 
-The switched read families are the conservative task-query subset already
-accepted by `sparse_task_query_eligibility` (task markers plus priority,
-scheduled/deadline and presentation directives), literal fuzzy-search candidate
+The switched read families are literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
 inventory used by autocomplete and navigation. They also include the shared
 property-facet rows used by the query builder and editor autocomplete, and the
@@ -653,12 +651,31 @@ both storage regimes and which Direct Files no longer uses for a query at all
 real-page ownership, explicit backlink and safely tokenizable unlinked-reference
 candidate selection, persisted/runtime block-identity lookup, block-referrer
 candidates, and distinct-referrer counts. Once current, these families
-enumerate SQLite task candidates and re-evaluate every returned raw block
-through the existing parser query evaluator, or obtain a generation-bound
+obtain a generation-bound
 candidate/name set before applying the existing parser-owned matching and
 presentation semantics. They no longer use manual whole-graph candidate scans
 or second in-memory alias, reference-candidate, block-identity, referenced-name,
 or block-ref-count semantic caches as their ordinary route.
+
+There is no separate sparse task-query read family. It was a marker-narrowed
+candidate stream that SQLite enumerated and the parser evaluator then
+re-evaluated block by block, admitted by its own `sparse_task_query_eligibility`
+gate. The Managed runner was retired first; the RET2 correction deleted the
+gate, its two source guards and the parser sparse runner once Direct Files
+answered a task query through the ONE lowered statement below instead of
+pre-filtering a walk. A task query is now simply one shape that statement
+answers, and it is admitted by the lowering, not by a second opinion about
+which shapes are enumerable.
+
+TQL publication indexes its immutable captured documents with the existing
+Direct projection producer only when an authorized page contains a TQL macro.
+Setup failure aborts before publication replacement. The snapshot owns its
+temporary root, and the writer retains that owner until its connection and
+exclusive lease have closed. Expiration of the bounded close wait cannot remove
+the root beneath an active writer. A real paused-writer test checks retention
+through timeout, release at exit, and late registration after exit.
+The projection writer reports stale indexed reads without claiming that query
+execution will fall back to traversal; public query adapters own typed recovery.
 Bounded block-referrer results are semantically bounded, not merely count
 bounded: managed candidate discovery covers the complete generation-bound
 candidate set, groups it in the same relative-path/document order as Direct
