@@ -20929,16 +20929,11 @@ fn a_key_page_save_advances_the_registry_generation_and_an_unrelated_save_does_n
     let _ = fs::remove_dir_all(dir);
 }
 
-/// SPEC §5.9 guard (b): a declared-type change on a key page evicts every
-/// cached typed query over that key.
-///
-/// The edit is deliberately a page the query does not participate in, so
-/// per-page retention (`page_affects_query`) keeps the entry and only the
-/// registry generation can evict it. The answer flips because `01` is the
-/// number 1 under a number key and the text `01` under a text key.
+/// A declaration page changes the meaning of a property query on another page.
+/// `01` is the number 1 under a number key and the text `01` under a text key.
 #[test]
-fn a_declared_type_change_evicts_the_cached_typed_query_it_retypes() {
-    let dir = registry_graph("registry-declared-type-eviction");
+fn a_declared_type_change_retypes_the_next_sql_query() {
+    let dir = registry_graph("registry-declared-type-query");
     let graph = ready_graph(&dir);
 
     let matched = |graph: &Graph| -> usize {
@@ -20957,13 +20952,9 @@ fn a_declared_type_change_evicts_the_cached_typed_query_it_retypes() {
     let mut key_page = graph.load_named("score", PageKind::Page).unwrap().unwrap();
     key_page.pre_block = Some("tine.type:: text".to_string());
     graph.save_page(&key_page, key_page.rev.as_deref()).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for_direct_query_projection(&graph);
 
-    assert_eq!(
-        matched(&graph),
-        0,
-        "under a text key `01` is not `1` -- a served stale entry would still say 1"
-    );
+    assert_eq!(matched(&graph), 0, "under a text key `01` is not `1`");
     let _ = fs::remove_dir_all(dir);
 }
 
