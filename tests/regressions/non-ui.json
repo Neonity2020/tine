@@ -26,6 +26,152 @@
  "notes": "Real paused writer cannot release resources merely because a zero-duration wait expires; resources release after exit and late registration cannot leak. Windows permissions have their own platform fixture."
 },
 {
+ "id": "REG-QE-PENDING-REGISTRY-OPENED-SNAPSHOT",
+ "title": "Queued queries use property types from their own opened SQLite snapshot",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager snapshot identity audit" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_registry_cache_follows_the_opened_snapshot_not_the_capture"],
+  "scenario": "query-engine.pending-registry-opened-snapshot",
+  "failBefore": "registry-snapshot-before.log: second queued query returns one numeric match after its snapshot has changed the declaration to text; oracle returns zero"
+ },
+ "notes": "Two identical actor captures execute on different pending revisions. The shared registry cache must follow opened snapshot identity, not the earlier requested revision."
+},
+{
+ "id": "REG-QE-PENDING-REPAIR-PUBLIC-ROUTES",
+ "title": "Pending projection repair retries public SQL routes and terminates failed creation",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 automatic pending query recovery" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_automatically_recovers_the_captured_public_routes", "crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_creation_failure_is_terminal_for_later_queries", "crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_install_uses_authority_after_acceptance"],
+  "scenario": "query-engine.pending-repair-public-routes"
+ },
+ "notes": "Real missing-file recovery for IR, Explain and advanced SQL; persistent file-creation damage returns unavailability without automatic reattempt; acceptance between repair capture and installation cannot resurrect pending rows."
+},
+{
+ "id": "REG-QE-PENDING-REPAIR-ACTOR-PROTOCOL",
+ "title": "Pending projection reconstruction preserves concurrent edits and candidate teardown",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager actor repair protocol" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_restores_a_missing_projection_without_document_hydration", "crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_leaves_actor_edits_responsive_while_old_jobs_drain", "crates/tine-core/src/sync_runtime_tests.rs::ret2_shutdown_cleans_a_registered_but_uninstalled_repair_candidate"],
+  "scenario": "query-engine.pending-repair-actor-protocol"
+ },
+ "notes": "Exercises automatic simple-query repair and explicit lifecycle protocol entry with real SQL afterward. Further acceptance/rename/config replacement interleavings remain campaign gates."
+},
+{
+ "id": "REG-QE-PENDING-REPAIR-OWNERSHIP",
+ "title": "Pending repair candidates have one teardown owner before actor installation",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager repair ownership contract" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/managed_overlay.rs::tests::repair_owner_transfers_one_candidate_and_rejects_old_tokens", "crates/tine-core/src/managed_overlay.rs::tests::retiring_repair_before_registration_closes_the_unpublished_candidate", "crates/tine-core/src/managed_overlay.rs::tests::failed_candidate_creation_is_terminal_until_lifecycle_cleanup"],
+  "scenario": "query-engine.pending-repair-ownership"
+ },
+ "notes": "Real disposable files and exact registration-boundary hook. Covers the owner primitive, not automatic recovery wiring, actor responsiveness, or full shutdown interleavings."
+},
+{
+ "id": "REG-QE-DRAIN-FENCE-ADMISSION",
+ "title": "A split cancellation fence drains old slots without cancelling or waiting for newer work",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery admission contract" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/query_jobs.rs::tests::a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions"],
+  "scenario": "query-engine.drain-fence-admission"
+ },
+ "notes": "New split API, verified with an actual wait-entry barrier and old/new held slots. Existing full-idle replacement calls keep their barrier. Automatic repair wiring remains separate."
+},
+{
+ "id": "REG-QE-MANAGED-ADVANCED-CAPTURED-ROUTE",
+ "title": "The public Managed advanced query is captured SQL, not an actor traversal",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2-Managed-Advanced dossier; Martin 2026-09-07 no-production-traversal amendment; user override Q18" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_advanced_route_reads_statements_and_hydrates_no_page",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_advanced_route_reports_typed_execution_errors_and_never_walks",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_advanced_route_answers_every_shape_exactly_as_the_walk",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_advanced_route_answers_a_pending_suffix_exactly_as_the_walk",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_advanced_memo_is_invalidated_by_edits_and_property_declarations",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_an_actor_edit_turn_completes_while_a_public_advanced_selection_waits"
+  ],
+  "scenario": "query-engine.managed-advanced-captured-route",
+  "failBefore": "evidence/qe/ret2-managed-advanced/fail-before-advanced-route.log: SyncApplicationNavigationRequest::AdvancedQuery over real matching TODOs reported result_page_hydrations=13 and property_registry_builds=1 for a task-only source, and answered successfully while the captured executor was injected Busy"
+ },
+ "notes": "RET2-Managed-Advanced. `application_advanced_query_ready` and its whole-graph `application_all_query_pages_ready` load are deleted; the wire request is intercepted by SyncRuntimeHandle::application_captured_query and shares RET1's capture/retry/execute/memo loop with query_run/query_explain_empty. query::resolve_advanced_source stays the ONE advanced source-limit/parse/bind/report owner; a refused source keeps its semantic answer. query::run_application_advanced_query_pages_bounded is now #[cfg(test)] and survives only as the parity oracle (Q18). Public validator unchanged; no fallback on the route."
+},
+{
+ "id": "REG-QE-OVERLAY-RECLOSE-REPLACEMENT",
+ "title": "Repeated teardown of an old overlay cannot delete its replacement",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery lifecycle review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/managed_overlay.rs::tests::closing_a_retired_instance_again_cannot_remove_its_replacement"],
+  "scenario": "query-engine.overlay-reclose-replacement",
+  "failBefore": "overlay-reclose-before.log: repeated close on the old instance deletes the new projection"
+ },
+ "notes": "Teardown completion is serialized per instance. File lifecycle remains at the existing path; no epoch-named files or authority changes."
+},
+{
+ "id": "REG-QE-CAPTURE-DRAIN-EPOCH",
+ "title": "Projection drains invalidate captures before their workers acquire capacity",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager lifecycle review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain"],
+  "scenario": "query-engine.capture-drain-epoch",
+  "failBefore": "capture-drain-before.log: accepted-only capture executes after its owner was drained"
+ },
+ "notes": "Capture-time epoch is checked under the admission mutex before capacity or snapshots. Fresh captures can execute after drain. This does not by itself implement automatic recovery scheduling."
+},
+{
+ "id": "REG-QE-OVERLAY-INSTANCE-MEMO",
+ "title": "Recreated pending projections cannot reuse cached results or registry types from an older instance",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_recreated_pending_projection_cannot_reuse_an_older_instances_memo", "crates/tine-core/src/managed_query.rs::tests::a_recreated_overlay_cannot_reuse_the_patched_registry"],
+  "scenario": "query-engine.overlay-instance-memo",
+  "failBefore": "overlay-instance-before.log: pending edit plus rebuild returns an old empty answer0 instead of1 because revision numbers repeat"
+ },
+ "notes": "The effective stamp includes the overlay instance as well as revision. No durable schema change. Automatic repair scheduling is a separate unfinished campaign obligation."
+},
+{
+ "id": "REG-QE-OVERLAY-RETIRE-BEFORE-WRITER-WAIT",
+ "title": "Overlay retirement refuses new snapshots before waiting for its writer",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/managed_overlay.rs::tests::close_refuses_new_snapshots_before_waiting_for_the_writer"],
+  "scenario": "query-engine.overlay-retirement",
+  "failBefore": "overlay-retire-before.log: real teardown held at writer-channel boundary still admits a snapshot"
+ },
+ "notes": "Actor drain sites retire the old overlay first. This tests the overlay fence, not every accepted-projection replacement race."
+},
+{
+ "id": "REG-QE-PENDING-REBUILD-NO-APPLICATION-HYDRATION",
+ "title": "Pending projection reconstruction consumes authority materialization without parser or editor pages",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_projection_rebuild_does_not_construct_parser_or_editor_pages"],
+  "scenario": "query-engine.pending-rebuild-materialization",
+  "failBefore": "overlay-producer-before.log: rebuilding one pending page hydrates an application page before extracting the existing authority materialization"
+ },
+ "notes": "Shared pending materialization remains the sole producer. Editing retains its original parser/editor checks; rebuilding uses the materialized page directly and preserves exact query/oracle equality."
+},
+{
  "id": "REG-QE-ACCEPTED-REGISTRY-FAILURE-STOPS-CAPTURE",
  "title": "Failed accepted property metadata stops Managed query capture before execution",
  "family": "query-engine",
@@ -42,18 +188,18 @@
 },
 {
  "id": "REG-QE-FAILED-PENDING-OVERLAY-NOT-BUSY",
- "title": "A vanished or failed pending query projection reports a bounded error instead of endless readiness",
+ "title": "A vanished pending query projection repairs once instead of waiting endlessly",
  "family": "query-engine",
  "sources": { "issues": [], "commits": [], "internal": "RET2 manager review" },
  "platforms": ["all"],
  "layer": "rust-core",
  "status": "covered",
  "coverage": {
-  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::r5a_an_unopenable_overlay_is_a_bounded_failure", "crates/tine-core/src/managed_overlay.rs::tests::open_creates_a_fresh_file_and_close_deletes_it"],
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::r5a_an_unopenable_overlay_is_repaired_once_without_traversal", "crates/tine-core/src/managed_overlay.rs::tests::open_creates_a_fresh_file_and_close_deletes_it"],
   "scenario": "query-engine.failed-pending-overlay",
   "failBefore": "overlay-classification-before.log: vanished file reports NotReady(Busy), expected Unavailable(ReadFailed)"
  },
- "notes": "Only live unfinished work is retryable readiness. Tests also stop the actual overlay worker and verify failed channel detection. Automatic projection reconstruction remains a separate campaign recovery obligation."
+ "notes": "Only live unfinished work is retryable readiness. The original fail-before records the earlier failure-classification step; public queries now repair a vanished overlay once and answer through SQL. Persistent creation failure is covered by REG-QE-PENDING-REPAIR-PUBLIC-ROUTES. Tests also stop the actual overlay worker and verify failed channel detection."
 },
 {
  "id": "REG-QE-P1D-PERSISTENT-CACHE-RECOVERY",

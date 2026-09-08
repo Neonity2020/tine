@@ -90,6 +90,9 @@ pub(crate) struct ManagedQueryStamp {
     /// story. Every pending save moves it, so a memo entry or a capture is
     /// exact for the pending state it was taken under.
     pub(crate) overlay_revision: Option<u64>,
+    /// Rebuilding restarts revision numbering. The instance disambiguates
+    /// equal revisions of different files in both result and registry memos.
+    pub(crate) overlay_instance: Option<u64>,
 }
 
 /// The pending half of a capture (R5b): the overlay the executor opens and
@@ -104,6 +107,7 @@ pub(crate) struct PendingOverlayCapture {
 /// query. Everything the executor reads is HERE; it touches no actor state,
 /// no graph mutex and no live registry after the turn ends.
 pub(crate) struct ManagedQueryCapture {
+    pub(crate) job_epoch: crate::query_jobs::QueryJobEpoch,
     /// The accepted projection's SQLite file.
     pub(crate) path: PathBuf,
     /// The pending overlay to merge with, when the actor held a pending suffix.
@@ -196,8 +200,8 @@ impl ManagedQueryAnswer {
     }
 }
 
-/// What one execution attempt produced. There is no fifth state: an attempt
-/// answers, or the handle re-captures (`Stale`), or the public route reports a
+/// What one execution attempt produced. An attempt answers, requests a bounded
+/// pending repair, or the handle re-captures (`Stale`), or the public route reports a
 /// typed `query::QueryExecutionError` (RET2 — the walk that used to answer the
 /// remaining states is gone). The doc comments on the variants below are the
 /// EXECUTOR's view; `sync_runtime::managed_execution_error` owns how each one
@@ -220,6 +224,9 @@ pub(crate) enum ManagedQueryOutcome {
     /// Managed read surfaces as an error, exactly as a failed materialized
     /// read does today; there is no walk fallback for it. Counted.
     Failed(&'static str),
+    /// Opening this pending projection failed. The handle may rebuild this
+    /// exact disposable instance once, after execution releases its readers.
+    PendingFailed { instance: u64, reason: &'static str },
 }
 
 /// Test-visible counters for the accepted route, owned by the handle so they
@@ -340,7 +347,7 @@ pub(crate) fn execute_managed_query(
 ) -> ManagedQueryOutcome {
     // Capacity BEFORE any transaction (plan §2B): a job waiting for a slot
     // holds its request intent and pins no WAL page.
-    let slot = match owner.acquire_within(wait) {
+    let slot = match owner.acquire_at_within(capture.job_epoch, wait) {
         Admission::Slot(slot) => slot,
         Admission::Busy => return ManagedQueryOutcome::Busy,
         Admission::Cancelled => return ManagedQueryOutcome::Cancelled,
@@ -349,6 +356,11 @@ pub(crate) fn execute_managed_query(
     // transaction BEFORE `slot`'s `Drop` releases the capacity: a drain that
     // observes a free slot can never still be waiting on this transaction.
     let outcome = execute_on_slot(capture, &slot, census, patched);
+    let outcome = if slot.is_cancelled() {
+        ManagedQueryOutcome::Cancelled
+    } else {
+        outcome
+    };
     drop(slot);
     outcome
 }
@@ -590,7 +602,12 @@ fn execute_pending_on_slot(
     {
         OverlayOpen::Snapshot { snapshot, state } => (snapshot, state),
         OverlayOpen::Pending => return ManagedQueryOutcome::Busy,
-        OverlayOpen::Failed(reason) => return ManagedQueryOutcome::Failed(reason),
+        OverlayOpen::Failed(reason) => {
+            return ManagedQueryOutcome::PendingFailed {
+                instance: pending.overlay.instance(),
+                reason,
+            };
+        }
         OverlayOpen::Stale => return ManagedQueryOutcome::Stale,
         OverlayOpen::Closed => return ManagedQueryOutcome::Cancelled,
     };
@@ -634,11 +651,21 @@ fn execute_pending_on_slot(
     // patched HERE, under these two snapshots and this mask, over exactly the
     // keys the pending pages can have changed. A query with no property leaf
     // reads no effective type at all (C6) and carries the empty registry.
-    let registry =
-        match patched_registry(capture, &mut accepted, &mut overlay, &mask, census, patched) {
-            Ok(registry) => registry,
-            Err(outcome) => return outcome,
-        };
+    let mut registry_stamp = capture.stamp.clone();
+    registry_stamp.overlay_instance = Some(state.instance);
+    registry_stamp.overlay_revision = Some(state.flushed_revision);
+    let registry = match patched_registry(
+        capture,
+        &registry_stamp,
+        &mut accepted,
+        &mut overlay,
+        &mask,
+        census,
+        patched,
+    ) {
+        Ok(registry) => registry,
+        Err(outcome) => return outcome,
+    };
     // (4) Readiness PER SOURCE. The overlay's `fts_ready` is 1 by schema
     // seeding, but it is probed with the same statement and the same mapping
     // anyway: a file that says otherwise is damaged, not "still building".
@@ -822,6 +849,7 @@ fn execute_pending_on_slot(
 /// wrong table); a cancelled read is `Cancelled`, exactly as the probes are.
 fn patched_registry(
     capture: &ManagedQueryCapture,
+    snapshot_stamp: &ManagedQueryStamp,
     accepted: &mut PhysicalProjectionQuerySnapshot,
     overlay: &mut PhysicalProjectionQuerySnapshot,
     mask: &[[u8; 16]],
@@ -832,7 +860,7 @@ fn patched_registry(
         return Ok(Arc::clone(&capture.registry));
     }
     let base_generation = capture.registry.generation();
-    if let Some(hit) = cache.get(&capture.stamp, base_generation) {
+    if let Some(hit) = cache.get(snapshot_stamp, base_generation) {
         return Ok(hit);
     }
     let built = crate::managed_registry_patch::patched_pending_registry(
@@ -850,7 +878,7 @@ fn patched_registry(
     })?;
     census.note_registry_patch();
     let built = Arc::new(built);
-    cache.put(&capture.stamp, base_generation, &built);
+    cache.put(snapshot_stamp, base_generation, &built);
     Ok(built)
 }
 
@@ -952,7 +980,7 @@ fn probe_fts_ready(
 /// The ONE patched pending registry this runtime retains (R5c).
 ///
 /// Keyed by `(the capture's stamp, the accepted base's generation)`. The stamp
-/// carries `overlay_revision`, so a new save misses; it carries
+/// carries `overlay_revision` and `overlay_instance`, so a save or rebuild misses; it carries
 /// `acceptance_sequence` and `frontier_digest`, so an accepted batch misses;
 /// it carries `config_digest`, so a config edit misses. The base generation
 /// additionally separates the pre-first-build empty table from the first
@@ -994,6 +1022,7 @@ pub(crate) struct ManagedQueryShared {
     pub(crate) census: ManagedQueryCensus,
     pub(crate) memo: Mutex<ApplicationSimpleQueryMemo>,
     pub(crate) patched_registry: PatchedRegistryCache,
+    pub(crate) pending_repair: crate::managed_overlay::PendingOverlayRepair,
     /// Test hook: the outcomes the handle uses INSTEAD of executing the next
     /// captures, in order. Lets a test drive every handle-side transition
     /// (`Stale` re-capture, the third `Stale`, `Busy`, `Cancelled`, `Failed`)
@@ -1215,6 +1244,7 @@ mod tests {
             config_digest: ContentDigest::of(config.as_bytes()),
             today,
             overlay_revision: None,
+            overlay_instance: None,
         }
     }
 
@@ -1225,6 +1255,25 @@ mod tests {
             total,
             exceeded: false,
         }
+    }
+
+    #[test]
+    fn a_recreated_overlay_cannot_reuse_the_patched_registry() {
+        let mut first = stamp(1, "config", 0);
+        first.overlay_revision = Some(2);
+        first.overlay_instance = Some(10);
+        let second = ManagedQueryStamp {
+            overlay_instance: Some(11),
+            ..first.clone()
+        };
+        let registry = Arc::new(Registry::empty(&ParseConfig::default()));
+        let cache = PatchedRegistryCache::default();
+        cache.put(&first, 0, &registry);
+        assert!(Arc::ptr_eq(&cache.get(&first, 0).unwrap(), &registry));
+        assert!(
+            cache.get(&second, 0).is_none(),
+            "equal revision numbers do not identify the same overlay"
+        );
     }
 
     #[test]
@@ -1441,6 +1490,7 @@ is `Failed` too rather than answered twice",
         let profile = ConstructionProfile::from_view(&view);
         let config = crate::config::Config::default();
         let capture = ManagedQueryCapture {
+            job_epoch: owner.capture_epoch(),
             path: PathBuf::from("/nonexistent/projection.sqlite"),
             overlay: None,
             graph_root: PathBuf::from("/nonexistent"),

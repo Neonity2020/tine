@@ -846,8 +846,19 @@ cancelled and is not counted as a fallback; a `Failed` read is an error
 (`Unavailable(ReadFailed)`). These routes never traverse the parsed graph.
 The independent traversal oracle is test-only. A pending local suffix is part
 of the stamp (the overlay revision below), and the turn captures a page-local
-query with it exactly as it captures an accepted-only one. IR block/page queries
-and Explain use this same captured execution and error classification. An absent
+query with it exactly as it captures an accepted-only one. IR block/page queries,
+Explain AND the public advanced (datalog) query use this same captured execution
+and error classification: EVERY public Managed query command is now one driver,
+one SQL compiler and one shallow payload constructor, and none of them has an
+actor arm that selects rows. The advanced route reaches that driver through
+`query::resolve_advanced_source` — the one owner of an advanced source's size
+and nesting limits, its parse, its `?current-page` and execution-day binding and
+its `ran`/`ignored` clause report — and its answer is the `@block` answer plus
+that report, reattached from OUTSIDE the memoized rows because two datalog
+spellings of one filter share one memo entry. A refused advanced source (a
+source limit, or a clause set nothing lowers) keeps its existing SEMANTIC
+answer — the report, zero rows, `supported = false` — and never becomes an
+execution error, a fallback or a scan reporting success over nothing. An absent
 pending overlay is `Unavailable(ProjectionUnavailable)`, never endless readiness.
 The projection file is closed in exactly three places — the runtime
 actor dropping, a handle closing, and the shared-join install replacing the
@@ -890,8 +901,12 @@ whose latest projection frame is still pending — the same set the actor's
 frame map holds, no more. It is disposable in the strongest sense: it is
 deleted and recreated empty on every runtime open, deleted again on close,
 carries no frontier, no stamp and no authority, and is never read to decide
-anything the accepted file or the journal decides. The actor never writes it:
-every change to the pending set — a frame published, a page's post-save
+anything the accepted file or the journal decides.
+Reconstruction consumes the existing pending materialization directly, without
+parsing application pages or constructing editor DTOs. Before replacing an
+overlay, its instance is retired to new captures, then query jobs are drained,
+then its writer is joined and its files removed.
+The actor never writes it: every change to the pending set — a frame published, a page's post-save
 content, a deletion, a drain retiring the frame — is pushed as one revisioned
 update to a single overlay worker thread, which lowers the newest state per
 path through the same per-page lowering the accepted apply uses and publishes
@@ -901,12 +916,71 @@ is `incomplete`, and a lowering or write failure marks the whole overlay
 reports a bounded failure and never an answer. The revision the
 actor read when it stamped a query is the stamp's `overlay_revision`, so an
 answer is memoized under, and a capture validated against, the exact pending
-state it saw. A query is a read: it pushes nothing and advances no revision.
+state it saw. The stamp also includes `overlay_instance`: recreating the file
+can reuse revision numbers, but never result or patched-registry memo entries
+from the old instance. A query is a read: it pushes nothing and advances no revision.
 Coherence with the accepted file follows from acceptance itself — a pending
 path leaves the set only when its batch is accepted, which advances the
 acceptance sequence the capture's `open_managed` validates inside its read
 transaction, so a snapshot that opens `Current` was captured before any
 pending page it masks could have moved.
+
+The patched registry cache is keyed by the overlay instance and flushed revision
+actually opened, together with accepted/config/base-registry identity. An older
+capture may legally open a later overlay; its requested revision cannot identify
+that later registry. A deterministic test queues two equal captures, changes a
+numeric declaration to text between their executions, and checks that each
+answer uses the type in its own opened snapshot.
+
+Managed captures include the query owner's admission epoch from their actor
+turn. A projection lifecycle drain cancels those captures even when their
+workers have not started waiting for capacity. Newly captured work can enter
+the new epoch; ordinary edits do not change it. The regression
+`ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain`
+checks cancellation before snapshot opening and a fresh SQL answer afterward.
+
+The job owner can split cancellation from waiting: `begin_drain` marks the
+current admission generation cancelled and returns a `QueryDrainFence`;
+`wait_for_drain` waits only for slots admitted before that fence, including
+slots without registered SQLite handles. New admissions remain live and cannot
+extend that fence's wait. Existing `cancel_all_and_drain` callers additionally
+retain their full-idle barrier. The barrier test
+`a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions` pins this
+distinction.
+
+`PendingOverlayRepair` owns the old instance and any uninstalled replacement
+while preparation runs under a capacity guard. Registration transfers teardown
+responsibility before that guard can be released. Retirement prevents later
+registration; cleanup after the drain closes retained instances. A failed
+creation remains terminal until lifecycle cleanup. The owner tests cover
+transfer, stale tokens, retirement before registration and actual creation
+failure.
+
+The actor repair protocol captures a fence and immutable preparation inputs in
+a short begin turn. The handle waits and creates/registers the candidate off
+the actor, releasing its capacity guard before requesting installation. The
+actor announces the latest pending path set and reconstructs one authoritative
+page between requests or during idle work, using the existing materialization
+producer. Retirement covers both the current overlay and an uninstalled repair
+candidate before job drainage; cleanup follows drainage. Tests exercise a real
+missing file, an edit while an old query slot is held, and shutdown before
+candidate installation. Simple and captured public query routes trigger this
+protocol once per request when opening a pending projection fails, identifying
+the exact failed instance. Execution releases its snapshots and capacity before
+repair begins. Accepted-file failures and cancellation do not trigger pending
+repair. Queries then recapture; unfinished reconstruction reports typed
+readiness, while another failed read reports unavailability. No failed attempt
+is memoized. Tests remove the real file beneath simple, IR, Explain and advanced
+routes and compare their repaired SQL answers with the undamaged answers.
+An actual creation failure remains terminal for later requests even after the
+filesystem obstruction is removed; lifecycle cleanup is required before a new
+attempt. Acceptance between begin and install cannot resurrect accepted rows
+in the pending database: installation derives its paths from current authority.
+
+Overlay teardown serializes worker join and file removal once per instance.
+Repeated close calls on a retained old instance cannot remove a replacement at
+the same disposable path. This is checked by
+`closing_a_retired_instance_again_cannot_remove_its_replacement`.
 
 **A captured pending query is answered off the actor from BOTH databases.**
 The executor opens the overlay first, at the flushed revision the capture

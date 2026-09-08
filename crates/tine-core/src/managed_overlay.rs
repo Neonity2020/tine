@@ -140,6 +140,9 @@ pub(crate) enum OverlayOpen {
 
 pub(crate) struct PendingOverlay {
     path: PathBuf,
+    /// Serialize teardown through file removal. A retained old instance must
+    /// never remove a replacement that now owns the same disposable path.
+    close_complete: Mutex<bool>,
     next_revision: AtomicU64,
     sender: Mutex<Option<mpsc::Sender<OverlayUpdate>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -152,6 +155,187 @@ impl std::fmt::Debug for PendingOverlay {
         f.debug_struct("PendingOverlay")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+/// Shared teardown ownership while a replacement is prepared off the actor.
+/// Actor integration must retire this owner before draining query jobs, then
+/// call cleanup before reusing the projection path.
+#[derive(Default)]
+pub(crate) struct PendingOverlayRepair {
+    entry: Mutex<Option<PendingRepairEntry>>,
+}
+
+struct PendingRepairEntry {
+    token: PendingRepairToken,
+    old: Arc<PendingOverlay>,
+    candidate: Option<Arc<PendingOverlay>>,
+    preparing: bool,
+    failed: bool,
+    retired: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRepairToken(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingRepairStatus {
+    Idle,
+    Working,
+    Failed,
+    Retired,
+}
+
+impl PendingOverlayRepair {
+    pub(crate) fn fail(&self, token: PendingRepairToken) {
+        if let Some(entry) = self
+            .entry
+            .lock()
+            .unwrap()
+            .as_mut()
+            .filter(|entry| entry.token == token && !entry.retired)
+        {
+            entry.failed = true;
+        }
+    }
+    pub(crate) fn status(&self) -> PendingRepairStatus {
+        match self.entry.lock().unwrap().as_ref() {
+            None => PendingRepairStatus::Idle,
+            Some(entry) if entry.retired => PendingRepairStatus::Retired,
+            Some(entry) if entry.failed => PendingRepairStatus::Failed,
+            Some(_) => PendingRepairStatus::Working,
+        }
+    }
+
+    /// The actor has checked that this is still its current failed instance.
+    /// An existing attempt, including a terminal failure, is never restarted.
+    pub(crate) fn begin(&self, old: Arc<PendingOverlay>) -> Option<PendingRepairToken> {
+        let mut guard = self.entry.lock().unwrap();
+        if guard.is_some() {
+            return None;
+        }
+        let token = PendingRepairToken(old.instance());
+        old.retire();
+        *guard = Some(PendingRepairEntry {
+            token,
+            old,
+            candidate: None,
+            preparing: false,
+            failed: false,
+            retired: false,
+        });
+        Some(token)
+    }
+
+    /// The caller has waited for the actor's drain fence before acquiring this
+    /// capacity guard. No actor round-trip occurs while the guard is held.
+    /// Every created file is either registered here or closed before return.
+    pub(crate) fn prepare_candidate(
+        &self,
+        token: PendingRepairToken,
+        accepted_path: &Path,
+        config: ParseConfig,
+        _slot: &crate::query_jobs::JobSlot<'_>,
+    ) -> Result<(), PendingRepairStatus> {
+        self.prepare_candidate_inner(token, accepted_path, config, || {})
+    }
+
+    fn prepare_candidate_inner(
+        &self,
+        token: PendingRepairToken,
+        accepted_path: &Path,
+        config: ParseConfig,
+        before_registration: impl FnOnce(),
+    ) -> Result<(), PendingRepairStatus> {
+        let old = {
+            let mut guard = self.entry.lock().unwrap();
+            let entry = guard
+                .as_mut()
+                .filter(|entry| entry.token == token)
+                .ok_or(PendingRepairStatus::Retired)?;
+            if entry.retired || entry.failed || entry.candidate.is_some() {
+                return Err(if entry.failed {
+                    PendingRepairStatus::Failed
+                } else {
+                    PendingRepairStatus::Retired
+                });
+            }
+            if entry.preparing {
+                return Err(PendingRepairStatus::Working);
+            }
+            if overlay_path_for(accepted_path) != entry.old.path {
+                entry.failed = true;
+                return Err(PendingRepairStatus::Failed);
+            }
+            entry.preparing = true;
+            Arc::clone(&entry.old)
+        };
+        old.close();
+        let candidate = match PendingOverlay::open(accepted_path, config, next_instance()) {
+            Ok(candidate) => candidate,
+            Err(_) => {
+                if let Some(entry) = self
+                    .entry
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .filter(|entry| entry.token == token && !entry.retired)
+                {
+                    entry.failed = true;
+                    return Err(PendingRepairStatus::Failed);
+                }
+                return Err(PendingRepairStatus::Retired);
+            }
+        };
+        before_registration();
+        let mut guard = self.entry.lock().unwrap();
+        if let Some(entry) = guard
+            .as_mut()
+            .filter(|entry| entry.token == token && !entry.retired && !entry.failed)
+        {
+            entry.candidate = Some(candidate);
+            return Ok(());
+        }
+        drop(guard);
+        candidate.close();
+        Err(PendingRepairStatus::Retired)
+    }
+
+    /// Transfer the registered candidate to the actor without waiting for IO.
+    pub(crate) fn finish(&self, token: PendingRepairToken) -> Option<Arc<PendingOverlay>> {
+        let mut guard = self.entry.lock().unwrap();
+        let entry = guard.as_ref()?;
+        if entry.token != token || entry.retired || entry.failed || entry.candidate.is_none() {
+            return None;
+        }
+        guard.take()?.candidate
+    }
+
+    /// A short lifecycle turn: invalidate registration before waiting on jobs.
+    pub(crate) fn retire(&self) {
+        if let Some(entry) = self.entry.lock().unwrap().as_mut() {
+            entry.retired = true;
+            entry.old.retire();
+            if let Some(candidate) = &entry.candidate {
+                candidate.retire();
+            }
+        }
+    }
+
+    /// Called only after the lifecycle owner has drained creation/query slots.
+    pub(crate) fn cleanup(&self) {
+        let entry = self.entry.lock().unwrap().take();
+        if let Some(entry) = entry {
+            entry.old.close();
+            if let Some(candidate) = entry.candidate {
+                candidate.close();
+            } else if entry.failed && entry.preparing {
+                // Opening can fail after creating disposable SQLite files.
+                // Cleanup owns this path until it returns; later repeats take
+                // no entry and cannot remove a replacement.
+                remove_overlay_files(entry.old.path());
+            }
+        }
     }
 }
 
@@ -179,6 +363,7 @@ impl PendingOverlay {
         let (sender, receiver) = mpsc::channel();
         let overlay = Arc::new(Self {
             path,
+            close_complete: Mutex::new(false),
             next_revision: AtomicU64::new(1),
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(None),
@@ -199,6 +384,11 @@ impl PendingOverlay {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Immutable identity without cloning the pending-path sets.
+    pub(crate) fn instance(&self) -> u64 {
+        self.state.lock().unwrap().instance
     }
 
     /// The revision a capture taken now must wait for: every update pushed so
@@ -339,6 +529,10 @@ impl PendingOverlay {
     /// drains every off-actor query job first (I-21): a reader still holding a
     /// snapshot of this file would otherwise outlive it.
     pub(crate) fn close(&self) {
+        let mut complete = self.close_complete.lock().unwrap();
+        if *complete {
+            return;
+        }
         self.retire();
         let sender = self.sender.lock().unwrap().take();
         if let Some(sender) = sender {
@@ -349,6 +543,7 @@ impl PendingOverlay {
             let _ = worker.join();
         }
         remove_overlay_files(&self.path);
+        *complete = true;
     }
 
     /// The worker: apply the newest state per path per wake-up in ONE SQLite
@@ -495,6 +690,108 @@ fn remove_overlay_files(path: &Path) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repair_owner_transfers_one_candidate_and_rejects_old_tokens() {
+        let dir = std::env::temp_dir().join(format!("tine-repair-owner-{}", next_instance()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let accepted = dir.join("projection.sqlite");
+        let old = PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        let repair = PendingOverlayRepair::default();
+        let token = repair.begin(Arc::clone(&old)).unwrap();
+        assert!(repair.begin(Arc::clone(&old)).is_none());
+        assert_eq!(repair.status(), PendingRepairStatus::Working);
+        let jobs = crate::query_jobs::QueryJobOwner::new(1);
+        let crate::query_jobs::Admission::Slot(slot) = jobs.acquire() else {
+            panic!("slot")
+        };
+        repair
+            .prepare_candidate(token, &accepted, ParseConfig::default(), &slot)
+            .unwrap();
+        drop(slot);
+        let candidate = repair.finish(token).unwrap();
+        assert_ne!(candidate.instance(), old.instance());
+        assert_eq!(repair.status(), PendingRepairStatus::Idle);
+        assert!(repair.finish(token).is_none());
+        let next = repair.begin(Arc::clone(&candidate)).unwrap();
+        assert_ne!(next, token);
+        assert!(repair.finish(token).is_none());
+        repair.retire();
+        jobs.cancel_all_and_drain();
+        repair.cleanup();
+        assert!(!candidate.path().exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_candidate_creation_is_terminal_until_lifecycle_cleanup() {
+        let dir = std::env::temp_dir().join(format!("tine-repair-failed-{}", next_instance()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let accepted = dir.join("projection.sqlite");
+        let old = PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        let repair = PendingOverlayRepair::default();
+        let token = repair.begin(Arc::clone(&old)).unwrap();
+        old.close();
+        std::fs::create_dir(old.path()).unwrap();
+        let jobs = crate::query_jobs::QueryJobOwner::new(1);
+        let crate::query_jobs::Admission::Slot(slot) = jobs.acquire() else {
+            panic!("slot")
+        };
+        assert_eq!(
+            repair.prepare_candidate(token, &accepted, ParseConfig::default(), &slot),
+            Err(PendingRepairStatus::Failed)
+        );
+        assert_eq!(repair.status(), PendingRepairStatus::Failed);
+        assert!(repair.begin(Arc::clone(&old)).is_none());
+        std::fs::remove_dir(old.path()).unwrap();
+        assert_eq!(
+            repair.prepare_candidate(token, &accepted, ParseConfig::default(), &slot),
+            Err(PendingRepairStatus::Failed)
+        );
+        assert!(
+            !old.path().exists(),
+            "a terminal attempt must not restart itself"
+        );
+        drop(slot);
+        repair.retire();
+        jobs.cancel_all_and_drain();
+        repair.cleanup();
+        assert_eq!(repair.status(), PendingRepairStatus::Idle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retiring_repair_before_registration_closes_the_unpublished_candidate() {
+        let dir = std::env::temp_dir().join(format!("tine-repair-retire-{}", next_instance()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let accepted = dir.join("projection.sqlite");
+        let old = PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        let repair = PendingOverlayRepair::default();
+        let token = repair.begin(Arc::clone(&old)).unwrap();
+        let jobs = crate::query_jobs::QueryJobOwner::new(1);
+        let crate::query_jobs::Admission::Slot(slot) = jobs.acquire() else {
+            panic!("slot")
+        };
+        let result =
+            repair.prepare_candidate_inner(token, &accepted, ParseConfig::default(), || {
+                // Exact boundary: the file exists, but ownership has not yet been
+                // registered. Retirement must prevent publishing it afterward.
+                assert!(old.path().exists());
+                repair.retire();
+            });
+        drop(slot);
+        jobs.cancel_all_and_drain();
+        repair.cleanup();
+        assert_eq!(result, Err(PendingRepairStatus::Retired));
+        assert!(!old.path().exists());
+        let replacement =
+            PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        repair.cleanup();
+        old.close();
+        assert!(replacement.path().exists());
+        replacement.close();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The storage contract's account of the overlay, pinned sentence by
     /// sentence so a rewrite of either side fails here first.
     #[test]
@@ -534,6 +831,29 @@ mod tests {
         assert_eq!(
             overlay_path_for(Path::new("/graph/.tine/projection.sqlite")),
             PathBuf::from("/graph/.tine/projection.sqlite.pending-overlay.sqlite")
+        );
+    }
+
+    #[test]
+    fn closing_a_retired_instance_again_cannot_remove_its_replacement() {
+        let dir = std::env::temp_dir().join(format!("tine-overlay-reclose-{}", next_instance()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let accepted = dir.join("projection.sqlite");
+        let old = PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        old.close();
+        let replacement =
+            PendingOverlay::open(&accepted, ParseConfig::default(), next_instance()).unwrap();
+        old.close();
+        let survives = replacement.path().exists();
+        let readable = matches!(
+            replacement.open_snapshot(0, Duration::from_millis(10)),
+            OverlayOpen::Snapshot { .. }
+        );
+        replacement.close();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            survives && readable,
+            "old close deleted the replacement projection"
         );
     }
 
