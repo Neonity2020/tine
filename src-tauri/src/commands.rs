@@ -2162,6 +2162,8 @@ pub(crate) enum QueryPrintDialect {
 pub(crate) struct ParsedQuery {
     pub(crate) query: tine_core::query::ir::Query,
     pub(crate) view: tine_core::query::ir::ViewSettings,
+    #[serde(default, flatten)]
+    pub(crate) scoped: tine_core::query::ir::ScopedDisplaySettings,
 }
 
 /// The core input a wire dialect parses as. `Advanced` is OG's
@@ -2202,9 +2204,11 @@ fn parse_query_pair(
         tine_core::date::JournalDate::today(),
         registry,
     );
+    let scoped = tine_core::query::view::read_scoped_display_settings(block_properties);
     ParsedQuery {
         query,
         view: tine_core::query::view::merge_block_property_view(&parsed_view, block_properties),
+        scoped,
     }
 }
 
@@ -5910,7 +5914,9 @@ mod query_command_surface_tests {
     //! pinned by `managed_command_surface`, which now classifies all six.
 
     use super::*;
-    use tine_core::query::ir::{Query, ViewSettings};
+    use tine_core::query::ir::{
+        AggFn, DisplayDraft, Field, FriendlyPageMatchScope, Query, SortDir, ViewKind, ViewSettings,
+    };
 
     fn graph_free_registry() -> tine_core::query::registry::Registry {
         tine_core::query::registry::Registry::from_snapshot(
@@ -5963,6 +5969,134 @@ mod query_command_surface_tests {
             !merged.view.sort.is_empty(),
             "the directive survives where no property covers it"
         );
+    }
+
+    #[test]
+    fn query_parse_exposes_independent_scoped_state_without_changing_the_singular_view() {
+        let parsed = parse_query_pair(
+            "(and (task TODO) (sort-by page asc))",
+            QueryTextDialect::Og,
+            &[
+                ("tine.sample".to_string(), "5".to_string()),
+                ("tine.page-view".to_string(), "table".to_string()),
+                ("tine.page-display".to_string(), "1".to_string()),
+                ("tine.page-sort".to_string(), "".to_string()),
+                ("tine.page-group-field".to_string(), "".to_string()),
+                ("tine.page-columns".to_string(), "".to_string()),
+                ("tine.page-col-aggregates".to_string(), "".to_string()),
+                ("tine.block-view".to_string(), "board".to_string()),
+                ("tine.block-display".to_string(), "1".to_string()),
+                ("tine.block-sort".to_string(), "priority desc".to_string()),
+                ("tine.block-columns".to_string(), "content".to_string()),
+                ("tine.block-col-aggregates".to_string(), "count".to_string()),
+                ("tine.page-match-scope".to_string(), "content".to_string()),
+            ],
+            &graph_free_registry(),
+        );
+
+        assert!(!parsed.query.is_invalid(), "{:?}", parsed.query.diagnostics);
+        assert_eq!(parsed.view.sample, Some(5));
+        assert_eq!(parsed.view.sort, vec![(Field::new("page"), SortDir::Asc)]);
+        assert_eq!(parsed.scoped.page_presentation, Some(ViewKind::Table));
+        assert_eq!(
+            parsed.scoped.page_display,
+            Some(DisplayDraft {
+                sort: Some(Vec::new()),
+                group_by: Some(Field::new("")),
+                columns: Some(Vec::new()),
+                aggregates: Some(Vec::new()),
+                sample: None,
+            })
+        );
+        assert_eq!(parsed.scoped.block_presentation, Some(ViewKind::Board));
+        assert_eq!(
+            parsed.scoped.block_display,
+            Some(DisplayDraft {
+                sort: Some(vec![(Field::new("priority"), SortDir::Desc)]),
+                columns: Some(vec![Field::new("content")]),
+                aggregates: Some(vec![(Field::new(""), AggFn::Count)]),
+                ..DisplayDraft::default()
+            })
+        );
+        assert_eq!(
+            parsed.scoped.page_match_scope,
+            Some(FriendlyPageMatchScope::Content)
+        );
+
+        let wire = serde_json::to_value(&parsed).expect("parsed query serializes");
+        assert!(
+            wire.get("scoped").is_none(),
+            "scoped state is flattened: {wire}"
+        );
+        assert_eq!(wire["page_display"]["sort"], serde_json::json!([]));
+        assert_eq!(wire["page_display"]["group_by"], "");
+        assert_eq!(
+            wire["block_display"]["aggregates"],
+            serde_json::json!([["", "count"]])
+        );
+    }
+
+    #[test]
+    fn malformed_scoped_properties_are_reported_without_invalidating_the_query() {
+        let parsed = parse_query_pair(
+            "(task TODO)",
+            QueryTextDialect::Og,
+            &[
+                ("tine.page-view".to_string(), "table".to_string()),
+                ("tine.page-display".to_string(), "1".to_string()),
+                (
+                    "tine.page-col-aggregates".to_string(),
+                    "cost=sum;estimate=median".to_string(),
+                ),
+                ("tine.block-display".to_string(), "1".to_string()),
+                ("tine.block-columns".to_string(), "content".to_string()),
+                (
+                    "tine.page-match-scope".to_string(),
+                    "everywhere".to_string(),
+                ),
+            ],
+            &graph_free_registry(),
+        );
+
+        assert!(!parsed.query.is_invalid(), "{:?}", parsed.query.diagnostics);
+        assert!(parsed.query.diagnostics.is_empty());
+        assert_eq!(parsed.scoped.page_presentation, Some(ViewKind::Table));
+        assert_eq!(parsed.scoped.page_display, None);
+        assert_eq!(
+            parsed.scoped.block_display,
+            Some(DisplayDraft {
+                columns: Some(vec![Field::new("content")]),
+                ..DisplayDraft::default()
+            })
+        );
+        assert_eq!(parsed.scoped.page_match_scope, None);
+        assert_eq!(
+            parsed.scoped.unreadable_settings,
+            vec![
+                "tine.page-col-aggregates".to_string(),
+                "tine.page-match-scope".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn old_query_parse_pairs_keep_their_wire_shape_and_deserialize_with_empty_scoped_state() {
+        let parsed = parse_query_pair(
+            "(task TODO)",
+            QueryTextDialect::Og,
+            &[("tine.sample".to_string(), "5".to_string())],
+            &graph_free_registry(),
+        );
+        let wire = serde_json::to_value(&parsed).expect("old pair serializes");
+        let object = wire.as_object().expect("parsed query is an object");
+        assert_eq!(object.len(), 2, "old input still emits only query and view");
+        assert!(object.contains_key("query"));
+        assert!(object.contains_key("view"));
+
+        let decoded: ParsedQuery = serde_json::from_value(wire).expect("old pair deserializes");
+        assert_eq!(decoded.scoped, Default::default());
+        assert_eq!(decoded.view.sample, Some(5));
+        assert!(!decoded.query.is_invalid());
     }
 
     #[test]

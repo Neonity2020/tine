@@ -6,7 +6,10 @@
 //! query-language behaviour with unit tests, not IPC plumbing (D-4: one
 //! producer). The commands call them and do nothing else.
 
-use crate::query::ir::{AggFn, Field, SortDir, ViewKind, ViewSettings};
+use crate::query::ir::{
+    AggFn, DisplayDraft, Field, FriendlyPageMatchScope, ScopedDisplaySettings, SortDir, ViewKind,
+    ViewSettings,
+};
 
 /// The property namespace §7.6 persists the view under.
 const VIEW_PROPERTY_PREFIX: &str = "tine.";
@@ -370,14 +373,7 @@ fn parse_col_aggregates(value: &str) -> Vec<(Field, AggFn)> {
             if segment.is_empty() {
                 return None;
             }
-            match segment.split_once('=') {
-                Some((field, function)) => {
-                    Some((Field::new(field.trim()), parse_agg_fn(function.trim())?))
-                }
-                None => {
-                    (segment.eq_ignore_ascii_case("count")).then(|| (Field::new(""), AggFn::Count))
-                }
-            }
+            parse_col_aggregate_segment(segment)
         })
         .collect()
 }
@@ -388,6 +384,209 @@ fn parse_agg_fn(value: &str) -> Option<AggFn> {
         "sum" => Some(AggFn::Sum),
         "avg" => Some(AggFn::Avg),
         _ => None,
+    }
+}
+
+/// The two durable mixed-result namespaces. Keeping the suffix table here gives
+/// page and block state one reader and one grammar rather than parallel parsers.
+#[derive(Clone, Copy)]
+enum ScopedDisplayNamespace {
+    Page,
+    Block,
+}
+
+impl ScopedDisplayNamespace {
+    fn prefix(self) -> &'static str {
+        match self {
+            ScopedDisplayNamespace::Page => "page",
+            ScopedDisplayNamespace::Block => "block",
+        }
+    }
+
+    fn key(self, member: &str) -> String {
+        format!("{}-{member}", self.prefix())
+    }
+
+    fn full_key(self, member: &str) -> String {
+        format!("{VIEW_PROPERTY_PREFIX}{}-{member}", self.prefix())
+    }
+}
+
+/// A list field which the scoped property writer can round-trip without
+/// changing its identity. Whitespace inside a field name is valid; separators,
+/// line terminators and NUL are not.
+fn scoped_list_field(field: &Field) -> bool {
+    let value = field.as_str();
+    !value.is_empty() && !value.contains(|c| matches!(c, '=' | ';' | '\0' | '\r' | '\n'))
+}
+
+fn parse_scoped_sort(value: &str) -> Option<Vec<(Field, SortDir)>> {
+    let parsed = parse_sort(value);
+    parsed
+        .iter()
+        .all(|(field, _)| scoped_list_field(field))
+        .then_some(parsed)
+}
+
+fn parse_col_aggregate_segment(segment: &str) -> Option<(Field, AggFn)> {
+    match segment.split_once('=') {
+        Some((field, function)) => Some((Field::new(field.trim()), parse_agg_fn(function.trim())?)),
+        None => segment
+            .eq_ignore_ascii_case("count")
+            .then(|| (Field::new(""), AggFn::Count)),
+    }
+}
+
+/// The scoped form is atomic: one unknown aggregate makes the authored member
+/// unreadable. The singular merge above keeps its historical partial-recognition
+/// behaviour; this stricter boundary applies only to newly namespaced state.
+fn parse_scoped_col_aggregates(value: &str) -> Option<Vec<(Field, AggFn)>> {
+    let mut out = Vec::new();
+    for segment in value.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let aggregate = parse_col_aggregate_segment(segment)?;
+        if aggregate.0.as_str().is_empty() {
+            if aggregate.1 != AggFn::Count {
+                return None;
+            }
+        } else if !scoped_list_field(&aggregate.0) {
+            return None;
+        }
+        out.push(aggregate);
+    }
+    Some(out)
+}
+
+fn read_scoped_display_namespace(
+    block_properties: &[(String, String)],
+    namespace: ScopedDisplayNamespace,
+    unreadable: &mut Vec<String>,
+) -> (Option<ViewKind>, Option<DisplayDraft>) {
+    let view_key = namespace.key("view");
+    let presentation = match raw_property(block_properties, &view_key) {
+        Some(value) => match parse_view_kind(value) {
+            Some(view) => Some(view),
+            None => {
+                unreadable.push(namespace.full_key("view"));
+                None
+            }
+        },
+        None => None,
+    };
+
+    let marker_key = namespace.key("display");
+    let marker = raw_property(block_properties, &marker_key);
+    if marker.is_none() {
+        return (presentation, None);
+    }
+    if marker != Some("1") {
+        unreadable.push(namespace.full_key("display"));
+        return (presentation, None);
+    }
+
+    let mut draft = DisplayDraft::default();
+    let mut valid = true;
+
+    let sort_key = namespace.key("sort");
+    if let Some(value) = raw_property(block_properties, &sort_key) {
+        match parse_scoped_sort(value) {
+            Some(sort) => draft.sort = Some(sort),
+            None => {
+                unreadable.push(namespace.full_key("sort"));
+                valid = false;
+            }
+        }
+    }
+
+    let grouping_key = namespace.key("group-field");
+    if let Some(value) = raw_property(block_properties, &grouping_key) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            draft.group_by = Some(Field::new(""));
+        } else if let Some(group_by) = canonical_group_field(value) {
+            draft.group_by = Some(group_by);
+        } else {
+            unreadable.push(namespace.full_key("group-field"));
+            valid = false;
+        }
+    }
+
+    let columns_key = namespace.key("columns");
+    if let Some(value) = raw_property(block_properties, &columns_key) {
+        match column_list(value) {
+            Some(columns) => draft.columns = Some(columns),
+            None => {
+                unreadable.push(namespace.full_key("columns"));
+                valid = false;
+            }
+        }
+    }
+
+    let aggregates_key = namespace.key("col-aggregates");
+    if let Some(value) = raw_property(block_properties, &aggregates_key) {
+        match parse_scoped_col_aggregates(value) {
+            Some(aggregates) => draft.aggregates = Some(aggregates),
+            None => {
+                unreadable.push(namespace.full_key("col-aggregates"));
+                valid = false;
+            }
+        }
+    }
+
+    let sample_key = namespace.key("sample");
+    if let Some(value) = raw_property(block_properties, &sample_key) {
+        match value.trim().parse::<u32>() {
+            Ok(sample) => draft.sample = Some(sample),
+            Err(_) => {
+                unreadable.push(namespace.full_key("sample"));
+                valid = false;
+            }
+        }
+    }
+
+    (presentation, valid.then_some(draft))
+}
+
+/// Read the page/block display state persisted beside a saved query.
+///
+/// The existing singular `tine.*` merge remains owned by
+/// [`merge_block_property_view`]. This helper reads only scoped additions, so
+/// old notes retain byte-for-byte semantics. The Tauri `ParsedQuery` flattens
+/// this typed state alongside its unchanged singular `{query, view}` answer.
+pub fn read_scoped_display_settings(
+    block_properties: &[(String, String)],
+) -> ScopedDisplaySettings {
+    let mut unreadable_settings = Vec::new();
+    let (page_presentation, page_display) = read_scoped_display_namespace(
+        block_properties,
+        ScopedDisplayNamespace::Page,
+        &mut unreadable_settings,
+    );
+    let (block_presentation, block_display) = read_scoped_display_namespace(
+        block_properties,
+        ScopedDisplayNamespace::Block,
+        &mut unreadable_settings,
+    );
+
+    let page_match_scope = match raw_property(block_properties, "page-match-scope") {
+        Some(value) => match value.trim() {
+            "names" => Some(FriendlyPageMatchScope::Names),
+            "content" => Some(FriendlyPageMatchScope::Content),
+            "both" => Some(FriendlyPageMatchScope::Both),
+            _ => {
+                unreadable_settings.push(format!("{VIEW_PROPERTY_PREFIX}page-match-scope"));
+                None
+            }
+        },
+        None => None,
+    };
+
+    ScopedDisplaySettings {
+        page_presentation,
+        page_display,
+        block_presentation,
+        block_display,
+        page_match_scope,
+        unreadable_settings,
     }
 }
 
@@ -561,6 +760,7 @@ pub(crate) fn explain_empty_plan(resolved: &crate::query::ResolvedQuery) -> Expl
 mod tests {
     use super::*;
     use crate::query::ir::ViewKind;
+    use serde::Deserialize;
 
     fn properties(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -787,5 +987,86 @@ mod tests {
         let merged =
             merge_block_property_view(&ViewSettings::default(), &properties(&[("sample", "9")]));
         assert_eq!(merged.sample, None);
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ScopedDisplayFixture {
+        name: String,
+        properties: Vec<(String, String)>,
+        expected: serde_json::Value,
+    }
+
+    #[test]
+    fn scoped_display_properties_follow_the_golden_contract() {
+        let fixtures: Vec<ScopedDisplayFixture> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/query-ir/scoped_display_settings.json"
+        ))
+        .expect("scoped display fixtures parse");
+        for fixture in fixtures {
+            let actual = read_scoped_display_settings(&fixture.properties);
+            assert_eq!(
+                serde_json::to_value(&actual).expect("scoped display state serializes"),
+                fixture.expected,
+                "{} wire",
+                fixture.name
+            );
+            let expected: ScopedDisplaySettings = serde_json::from_value(fixture.expected)
+                .expect("fixture expected state deserializes");
+            assert_eq!(actual, expected, "{} typed state", fixture.name);
+        }
+    }
+
+    #[test]
+    fn every_page_match_scope_value_is_typed_without_an_execution_default() {
+        for (raw, expected) in [
+            ("names", FriendlyPageMatchScope::Names),
+            ("content", FriendlyPageMatchScope::Content),
+            ("both", FriendlyPageMatchScope::Both),
+        ] {
+            let state =
+                read_scoped_display_settings(&properties(&[("tine.page-match-scope", raw)]));
+            assert_eq!(state.page_match_scope, Some(expected));
+            assert!(state.unreadable_settings.is_empty());
+        }
+        assert_eq!(
+            read_scoped_display_settings(&[]).page_match_scope,
+            None,
+            "absence stays distinct; the execution layer owns the names fallback"
+        );
+    }
+
+    #[test]
+    fn the_singular_merge_boundary_does_not_consume_scoped_properties() {
+        let parsed = ViewSettings {
+            view: Some(ViewKind::List),
+            sort: vec![(Field::new("page"), SortDir::Asc)],
+            columns: vec![Field::new("legacy")],
+            sample: Some(3),
+            ..ViewSettings::default()
+        };
+        let block_properties = properties(&[
+            ("tine.page-view", "table"),
+            ("tine.page-display", "1"),
+            ("tine.page-sort", "name desc"),
+            ("tine.page-columns", "name"),
+            ("tine.page-sample", "9"),
+        ]);
+
+        assert_eq!(
+            merge_block_property_view(&parsed, &block_properties),
+            parsed,
+            "before this reader is wired, the existing singular merge has no scoped answer"
+        );
+        let scoped = read_scoped_display_settings(&block_properties);
+        assert_eq!(scoped.page_presentation, Some(ViewKind::Table));
+        assert_eq!(
+            scoped.page_display,
+            Some(DisplayDraft {
+                sort: Some(vec![(Field::new("name"), SortDir::Desc)]),
+                columns: Some(vec![Field::new("name")]),
+                sample: Some(9),
+                ..DisplayDraft::default()
+            })
+        );
     }
 }
