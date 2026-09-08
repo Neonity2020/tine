@@ -991,6 +991,107 @@ mod tests {
         parse_og(source, JournalDate::from_ordinal(20260904)).0
     }
 
+    #[test]
+    fn authored_same_kind_boolean_groups_are_exact_parse_state() {
+        let and_query = parse("(and (and [[beta]] [[alpha]]) (and [[gamma]] [[delta]]))");
+        assert_eq!(
+            and_query.filter,
+            Filter::And {
+                items: vec![
+                    Filter::And {
+                        items: vec![Filter::page_ref("beta"), Filter::page_ref("alpha")],
+                    },
+                    Filter::And {
+                        items: vec![Filter::page_ref("gamma"), Filter::page_ref("delta")],
+                    },
+                ],
+            }
+        );
+
+        let or_query = parse("(or (or [[beta]] [[alpha]]) (or [[gamma]] [[delta]]))");
+        assert_eq!(
+            or_query.filter,
+            Filter::Or {
+                items: vec![
+                    Filter::Or {
+                        items: vec![Filter::page_ref("beta"), Filter::page_ref("alpha")],
+                    },
+                    Filter::Or {
+                        items: vec![Filter::page_ref("gamma"), Filter::page_ref("delta")],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn authored_groups_survive_not_and_both_anchor_rebases_exactly() {
+        let nested_not = parse("(not (and (and [[a]] [[b]]) [[c]]))");
+        assert_eq!(
+            nested_not.filter,
+            Filter::not(Filter::And {
+                items: vec![
+                    Filter::And {
+                        items: vec![Filter::page_ref("a"), Filter::page_ref("b")],
+                    },
+                    Filter::page_ref("c"),
+                ],
+            })
+        );
+
+        let page_query = parse("(and (and (namespace Alpha) (namespace Beta)) (namespace Gamma))");
+        let namespace = |name: &str| {
+            Filter::attr(
+                Attr::Name,
+                CmpOp::StartsWith,
+                Value::text(format!("{name}/")),
+            )
+        };
+        let page_filter = Filter::And {
+            items: vec![
+                Filter::And {
+                    items: vec![namespace("Alpha"), namespace("Beta")],
+                },
+                namespace("Gamma"),
+            ],
+        };
+        assert_eq!(page_query.anchor, Anchor::Page);
+        assert_eq!(page_query.filter, page_filter);
+        assert_eq!(
+            rebase_to_block(&page_query.filter),
+            Filter::And {
+                items: vec![
+                    Filter::And {
+                        items: vec![
+                            through_page(namespace("Alpha")),
+                            through_page(namespace("Beta")),
+                        ],
+                    },
+                    through_page(namespace("Gamma")),
+                ],
+            }
+        );
+
+        let block_query = parse("(and (and (page Alpha) (page Beta)) \"needle\")");
+        assert_eq!(block_query.anchor, Anchor::Block);
+        assert_eq!(
+            block_query.filter,
+            Filter::And {
+                items: vec![
+                    Filter::And {
+                        items: vec![
+                            through_page(
+                                Filter::attr(Attr::Name, CmpOp::Eq, Value::text("Alpha"),)
+                            ),
+                            through_page(Filter::attr(Attr::Name, CmpOp::Eq, Value::text("Beta"),)),
+                        ],
+                    },
+                    content_like("needle"),
+                ],
+            }
+        );
+    }
+
     /// The parser runs on the ORIGINAL text so `Raw` spans stay exact offsets
     /// into what the author wrote, while OG rewrites the text first. The two
     /// must agree on every shape `pre-transform` touches — that agreement is the
