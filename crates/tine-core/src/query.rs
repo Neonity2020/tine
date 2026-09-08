@@ -8,6 +8,8 @@ pub mod atom;
 mod conformance;
 pub mod derived;
 pub(crate) mod eval;
+mod execution_error;
+pub use execution_error::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
 pub mod ir;
 pub mod macro_text;
 pub(crate) mod og;
