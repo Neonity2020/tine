@@ -1380,7 +1380,11 @@ fn placeholders(count: usize) -> String {
 // a decode failure message travels into a receipt and a log, and a projection
 // row is user content.
 
-fn blob16(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<[u8; 16], String> {
+pub(crate) fn blob16(
+    row: &[PhysicalQueryValue],
+    at: usize,
+    what: &str,
+) -> Result<[u8; 16], String> {
     match row.get(at) {
         Some(PhysicalQueryValue::Blob(bytes)) if bytes.len() == 16 => {
             Ok(bytes.as_slice().try_into().expect("a checked 16-byte id"))
@@ -1392,7 +1396,7 @@ fn blob16(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<[u8; 16],
     }
 }
 
-fn text(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<String, String> {
+pub(crate) fn text(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<String, String> {
     match row.get(at) {
         Some(PhysicalQueryValue::Text(value)) => Ok(value.clone()),
         other => Err(format!("{what} is {}, expected text", spell(other))),
@@ -1407,7 +1411,7 @@ fn opt_text(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<Option<
     }
 }
 
-fn integer(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<i64, String> {
+pub(crate) fn integer(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<i64, String> {
     match row.get(at) {
         Some(PhysicalQueryValue::Integer(value)) => Ok(*value),
         other => Err(format!("{what} is {}, expected an integer", spell(other))),

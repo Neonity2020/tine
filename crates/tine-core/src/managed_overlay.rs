@@ -34,12 +34,10 @@
 //! acceptance sequence — a pending path can only leave the set when its batch
 //! is accepted, which advances that sequence.
 //!
-//! **Availability over refusal.** A worker failure (a lowering error, a SQLite
-//! error, a pending page the actor cannot load) marks the overlay `failed`;
-//! pending captures then fall back to the walk (counted) until the next open.
-//! The walk is the recovery path that is still correct; refusing every query
-//! while typing for a cache that could not be built would be a refusal with no
-//! in-scope scenario (I-8, I-10).
+//! A slow flush or announced page awaiting content yields temporary readiness.
+//! A failed worker or unreadable file yields a bounded execution failure;
+//! waiting cannot repair it, and production queries never traverse instead.
+//! Reopening reconstructs the disposable overlay from authoritative state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -116,7 +114,8 @@ pub(crate) struct OverlayState {
     pub(crate) pending_paths: BTreeSet<String>,
     /// Announced paths whose content has not been written yet. Non-empty only
     /// inside an actor turn (announce and content land in the same turn) or
-    /// while a commit's response is deferred; the executor waits, then walks.
+    /// while a commit's response is deferred; the executor waits, then reports
+    /// temporary readiness if content is still outstanding.
     pub(crate) incomplete: BTreeSet<String>,
     /// Sticky until the next open: the file is not to be trusted.
     pub(crate) failed: Option<&'static str>,
@@ -130,9 +129,10 @@ pub(crate) enum OverlayOpen {
         snapshot: PhysicalProjectionQuerySnapshot,
         state: OverlayState,
     },
-    /// Not flushed to `required` within the wait, incomplete content, or the
-    /// worker failed: the walk answers.
-    Unavailable,
+    /// The live worker has not flushed `required`, or content is outstanding.
+    Pending,
+    /// Waiting cannot repair a failed worker or an unreadable projection.
+    Failed(&'static str),
     /// The overlay moved between the two validations of the open.
     Stale,
     Closed,
@@ -211,9 +211,9 @@ impl PendingOverlay {
         let revision = self.next_revision.fetch_add(1, Ordering::AcqRel);
         let sender = self.sender.lock().unwrap();
         if let Some(sender) = sender.as_ref() {
-            // A closed worker has dropped its receiver; the actor is shutting
-            // down and nothing will read the overlay again.
-            let _ = sender.send(make(revision));
+            if sender.send(make(revision)).is_err() {
+                self.mark_failed("pending overlay worker stopped");
+            }
         }
     }
 
@@ -242,7 +242,7 @@ impl PendingOverlay {
     }
 
     /// Mark the overlay unusable until the next open (a pending page the
-    /// actor could not load). Pending captures walk from here on.
+    /// actor could not load). Pending captures report a bounded failure.
     pub(crate) fn mark_failed(&self, reason: &'static str) {
         let mut state = self.state.lock().unwrap();
         if state.failed.is_none() {
@@ -278,18 +278,27 @@ impl PendingOverlay {
     /// Waits for `required`, reads the state ONCE, then opens with
     /// `open_direct`, whose validator runs before `BEGIN` and again after the
     /// read that pins the snapshot: a flush between the two is `Stale`, so the
-    /// returned `state` is exactly what the transaction sees. Incomplete
-    /// content or a failed worker is `Unavailable` (the walk answers).
+    /// returned `state` is exactly what the transaction sees. Readiness is
+    /// temporary only while a live worker can still publish the missing data.
     pub(crate) fn open_snapshot(&self, required: u64, wait: Duration) -> OverlayOpen {
         let observed = self.wait_flushed(required, wait);
         if observed.closed {
             return OverlayOpen::Closed;
         }
-        if observed.failed.is_some()
-            || observed.flushed_revision < required
-            || !observed.incomplete.is_empty()
+        if let Some(reason) = observed.failed {
+            return OverlayOpen::Failed(reason);
+        }
+        if self
+            .worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
         {
-            return OverlayOpen::Unavailable;
+            return OverlayOpen::Failed("pending overlay worker stopped");
+        }
+        if observed.flushed_revision < required || !observed.incomplete.is_empty() {
+            return OverlayOpen::Pending;
         }
         let validate = || {
             let state = self.state.lock().unwrap();
@@ -314,7 +323,7 @@ impl PendingOverlay {
                 state: observed,
             },
             Err(MaterializationError::Incomplete(_)) => OverlayOpen::Stale,
-            Err(_) => OverlayOpen::Unavailable,
+            Err(_) => OverlayOpen::Failed("pending overlay snapshot"),
         }
     }
 
@@ -499,7 +508,7 @@ mod tests {
             "The actor never writes it",
             "a single overlay worker thread",
             "the same per-page lowering the accepted apply uses",
-            "a damaged overlay costs a walk and never an answer",
+            "reports a bounded failure and never an answer",
             "the stamp's `overlay_revision`",
             "A query is a read: it pushes nothing and advances no revision",
             "a pending\npath leaves the set only when its batch is accepted",
@@ -561,7 +570,7 @@ mod tests {
         assert_eq!(state.incomplete, BTreeSet::from(["pages/a.md".to_owned()]));
         assert!(matches!(
             overlay.open_snapshot(required, Duration::from_millis(10)),
-            OverlayOpen::Unavailable
+            OverlayOpen::Pending
         ));
         overlay.tombstone("pages/a.md");
         overlay.remove("pages/b.md");
@@ -578,15 +587,44 @@ mod tests {
             _ => panic!("expected a snapshot"),
         }
         // A revision the worker has not flushed is not waited for beyond the
-        // budget: the walk answers.
+        // budget: the caller receives temporary readiness.
         assert!(matches!(
             overlay.open_snapshot(required + 1, Duration::from_millis(10)),
-            OverlayOpen::Unavailable
+            OverlayOpen::Pending
         ));
+        // Even a complete file cannot promise future progress after its
+        // worker exits. This is a real stopped thread, not a forced outcome.
+        overlay
+            .sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(OverlayUpdate::Close)
+            .unwrap();
+        overlay
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            overlay.open_snapshot(required, Duration::from_millis(10)),
+            OverlayOpen::Failed("pending overlay worker stopped")
+        ));
+        // A subsequent update also records the disconnected receiver.
+        overlay.announce("pages/stopped.md");
+        assert_eq!(
+            overlay.state().failed,
+            Some("pending overlay worker stopped")
+        );
+        overlay.state.lock().unwrap().failed = None;
         overlay.mark_failed("test");
         assert!(matches!(
             overlay.open_snapshot(required, Duration::from_millis(10)),
-            OverlayOpen::Unavailable
+            OverlayOpen::Failed("test")
         ));
         overlay.close();
         assert!(!overlay_path.exists());

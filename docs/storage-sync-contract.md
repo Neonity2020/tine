@@ -819,16 +819,16 @@ query-job owner, the same owner every off-actor read of that file is admitted
 by, so the drain that precedes closing the file reaches it. Its answer lands
 in the memo only while that stamp is still the actor's current stamp (a late
 answer never evicts a newer entry), and every other outcome has one named
-disposition: a `Stale` snapshot re-captures at most twice, then walks; `Busy`
-(no slot within the wait) walks; `Cancelled` (a drain caught it) walks and is
-not counted as a fallback; and a `Failed` read is an error, as a failed
-materialized read is today, because the walk reads the same file and has
-nothing better to say. The walk is the actor evaluation every simple query ran
-before this route, over the capture it already prepared, so a query is parsed
-and its registry read once. A pending local suffix is not a reason to walk by
-itself: it is part of the stamp (the overlay revision below), and the turn
-captures a page-local, property-free query with it exactly as it captures an
-accepted-only one. The projection file is closed in exactly three places — the runtime
+disposition: a `Stale` snapshot re-captures at most twice, then reports
+`NotReady(PendingEdits)`; `Busy` reports `NotReady(Busy)`; `Cancelled` stays
+cancelled and is not counted as a fallback; a `Failed` read is an error
+(`Unavailable(ReadFailed)`). These routes never traverse the parsed graph.
+The independent traversal oracle is test-only. A pending local suffix is part
+of the stamp (the overlay revision below), and the turn captures a page-local
+query with it exactly as it captures an accepted-only one. IR block/page queries
+and Explain use this same captured execution and error classification. An absent
+pending overlay is `Unavailable(ProjectionUnavailable)`, never endless readiness.
+The projection file is closed in exactly three places — the runtime
 actor dropping, a handle closing, and the shared-join install replacing the
 clean runtime — and each drains the job owner first; the accepted batch apply
 is not one of them, because it writes a checkpoint sidecar, never a WAL
@@ -876,8 +876,8 @@ update to a single overlay worker thread, which lowers the newest state per
 path through the same per-page lowering the accepted apply uses and publishes
 the revision it has flushed. A path whose content the actor could not supply
 is `incomplete`, and a lowering or write failure marks the whole overlay
-`failed`; either makes every open of it `Stale`/`Unavailable` and the query
-walks, so a damaged overlay costs a walk and never an answer. The revision the
+`failed`. Incomplete work reports temporary readiness; a damaged overlay
+reports a bounded failure and never an answer. The revision the
 actor read when it stamped a query is the stamp's `overlay_revision`, so an
 answer is memoized under, and a capture validated against, the exact pending
 state it saw. A query is a read: it pushes nothing and advances no revision.
@@ -901,15 +901,16 @@ base order — `pages.path` under SQLite's binary collation, then preorder —
 under ONE construction budget, and payloads are read per source only for the
 rows that budget admitted. **The answer is the walk's answer**: same rows, same
 order, same `total`, same `exceeded`, same public ids; no page document is
-loaded and nothing is parsed, on either side. Availability is preferred to
-refusal: an overlay that is unflushed, incomplete or failed opens `Unavailable`
-and the query walks as a counted fallback, and a stale stamp re-captures like
-any other. Only a damaged ROW inside a snapshot that opened and validated is
-`Failed`, and a page the mask failed to remove — reachable from both sources —
-is `Failed` too rather than answered twice. A query whose relations leave one
-page (`PageLocality`) still walks on the actor uncaptured; a query with a
-property leaf does not, because the registry it needs is patched off the actor
-too.
+loaded and nothing is parsed, on either side. An unflushed or incomplete overlay
+with a live worker opens `Pending` and reports temporary readiness. A failed or
+stopped worker and an unreadable file open `Failed`, never endless readiness.
+A stale stamp re-captures within the same bound as an accepted query. A damaged
+row inside a validated snapshot is `Failed`, and a page the mask failed to
+remove — reachable from both sources —
+is `Failed` too rather than answered twice. A future relation that leaves one
+page (`PageLocality`) reports `Unavailable(UnsupportedRelation)` until SQL split
+execution supports it. All currently supported relations are page-local. A
+property leaf uses the registry patched off the actor.
 
 **The property registry is patched, never rebuilt, for a pending query.**
 The actor caches ONE registry: the accepted table, keyed by acceptance

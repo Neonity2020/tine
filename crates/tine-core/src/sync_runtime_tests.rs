@@ -2554,17 +2554,24 @@ fn managed_task_query_overlay_stays_at_exact_existing_page_seams() {
         .split("\n#[cfg(test)]\nmod tests")
         .next()
         .expect("production source has its test boundary");
-    let simple_query_router = production
-        .split_once("    fn application_simple_query_walk(")
-        .and_then(|(_, tail)| {
-            tail.split_once("\n    fn application_simple_query_pages_ready(")
-                .map(|(body, _)| body)
-        })
-        .expect("simple query retains a narrow boundary");
+    // RET2 deleted the Managed simple-query WALK ROUTER outright: the public
+    // route is the captured database read and nothing else, so there is no
+    // dispatch left that could choose an actor-side evaluator.
     assert!(
-        simple_query_router.contains("application_simple_query_pages_ready"),
-        "the actor-side walk must retain the one established complete-page evaluator"
+        !production.contains("    fn application_simple_query_walk("),
+        "RET2 retired the Managed simple-query walk router; it is back"
     );
+    let (before_evaluator, evaluator_tail) = production
+        .split_once("    fn application_simple_query_pages_ready(")
+        .expect("the complete-page evaluator survives as the parity oracle");
+    assert!(
+        before_evaluator.trim_end().ends_with("#[cfg(test)]"),
+        "the one complete-page evaluator is now an ORACLE: it must compile only \
+         under test, or the walk-source census would count it as production"
+    );
+    let simple_query_router = evaluator_tail
+        .split_once("\n    fn ")
+        .map_or(evaluator_tail, |(body, _)| body);
     // R4a retired the Managed sparse task-index runner: its accepted-frontier
     // case is the off-actor database route and its pending case is this walk,
     // so the walk has exactly ONE evaluator and no second Managed answer to
@@ -30721,9 +30728,46 @@ fn r4b_census(handle: &SyncRuntimeHandle) -> (usize, usize, usize, usize) {
     )
 }
 
+/// RET2: the EXACT typed error a public Managed query entrypoint returns, plus
+/// the payload the frontend classifies.
+///
+/// Asserting the wire string as well as the variant is what keeps "the
+/// readiness loop retries this one and reports that one" a property of this
+/// test rather than of `backend.ts`: `query-not-ready` is the only kind
+/// `runQueryWhenReady` retries, and a refusal code or a prose message here
+/// would silently turn a transient wait into a permanent error toast.
+#[track_caller]
+fn assert_query_execution_error(
+    label: &str,
+    error: &SyncApplicationPageRequestError,
+    expected: crate::query::QueryExecutionError,
+) {
+    assert_eq!(
+        error,
+        &SyncApplicationPageRequestError::QueryExecution(expected),
+        "{label}: the typed execution error",
+    );
+    assert_eq!(
+        error.backend_wire_string(),
+        expected.backend_wire_string(),
+        "{label}: the entrypoint forwards the canonical encoder",
+    );
+}
+
+/// RET2: a `Busy` executor is a typed `NotReady(Busy)` the frontend retries —
+/// NOT the actor walk it was before this packet.
+///
+/// The census is the load-bearing half: zero statement reads (the executor
+/// never opened a snapshot) AND zero fallback reads (there is no walk left to
+/// count). The recovery leg then proves the refusal fabricated nothing: the
+/// next attempt captures, reads ONE statement, and answers exactly what the
+/// independent Direct Files oracle answers over the same graph — so the error
+/// could not have been an empty success in disguise, and nothing was memoized
+/// under the capture's stamp while the read had not happened.
 #[test]
-fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_falls_back_to_the_walk() {
+fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
+    use crate::query::{QueryExecutionError, QueryReadinessReason};
     let (fixture, handle) = r4b_reopened("r4b-capture-fallback", 0x4b01);
     let oracle = r4b_oracle(&fixture);
     assert!(
@@ -30731,24 +30775,38 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_falls_back_to_the_
         "the fixture must answer the query nonempty"
     );
 
-    // R4b drove this leg with the stub executor, which was always `Busy`.
-    // R4a's executor answers, so the disposition under test is injected: the
-    // handle's job here is the FALLBACK, not the read.
     r4b_inject(&handle, vec![Outcome::Busy]);
+    let error = r4b_query(&handle).unwrap_err();
+    assert_query_execution_error(
+        "Busy",
+        &error,
+        QueryExecutionError::NotReady(QueryReadinessReason::Busy),
+    );
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 0),
+        "a Busy executor is no statement read and NO fallback: RET2 left no walk to fall back to"
+    );
+
+    // The executor's queue is empty now, so this attempt runs for real.
     let first = r4b_query(&handle).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (0, 1, 0, 0),
-        "a Busy executor is one fallback and no statement read"
+        (1, 0, 0, 0),
+        "the retry is one database read; the Busy attempt memoized nothing"
     );
-    assert_managed_simple_query_matches_direct("walk after Busy", first, oracle);
+    assert!(
+        first.total > 0,
+        "an unavailable executor must never have been an empty success"
+    );
+    assert_managed_simple_query_matches_direct("read after Busy", first, oracle);
 
-    // The walk filled the shared memo, so the next turn answers on the actor
+    // That read filled the shared memo, so the next turn answers on the actor
     // and nothing is captured: the census does not move.
     let second = r4b_query(&handle).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (0, 1, 0, 0),
+        (1, 0, 0, 0),
         "a memo hit captures nothing"
     );
     assert_managed_simple_query_matches_direct("memo hit", second, r4b_oracle(&fixture));
@@ -30760,9 +30818,13 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_falls_back_to_the_
 }
 
 /// R5b: a pending local suffix no longer forces the walk. A page-local,
-/// property-free query is CAPTURED with the overlay's revision; the executor
-/// (a stub until R5a) reports `Busy`, the walk answers and it is counted as a
-/// fallback. The overlay projection meanwhile holds exactly the pending page.
+/// property-free query is CAPTURED with the overlay's revision. The overlay
+/// projection meanwhile holds exactly the pending page.
+///
+/// RET2 updated the disposition leg: an injected `Busy` is now typed
+/// `NotReady(Busy)` and counts no fallback, because there is no walk under
+/// this route at all. The pending ANSWER below is unchanged and is still
+/// compared against the independent Direct Files oracle.
 #[test]
 fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
@@ -30830,13 +30892,20 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
         "every pending block carries its stored result identity"
     );
 
-    // Captured: the injected outcome IS consumed. Busy → the walk answers and
-    // the fallback is counted.
-    let oracle = r4b_oracle(&fixture);
+    // Captured: the injected outcome IS consumed. RET2: Busy is typed
+    // readiness, and the pending query is NOT answered by an actor walk.
     r4b_inject(&handle, vec![Outcome::Busy]);
-    let result = r4b_query(&handle).unwrap();
-    assert_managed_simple_query_matches_direct("pending walk after Busy", result, oracle);
-    assert_eq!(r4b_census(&handle), (0, 1, 0, 0), "captured, Busy, walked");
+    let busy = r4b_query(&handle).unwrap_err();
+    assert_query_execution_error(
+        "pending Busy",
+        &busy,
+        crate::query::QueryExecutionError::NotReady(crate::query::QueryReadinessReason::Busy),
+    );
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 0),
+        "captured, Busy, and no fallback"
+    );
     assert_eq!(
         handle
             .inner
@@ -30968,15 +31037,28 @@ fn r5c_a_pending_property_query_is_captured_and_patched() {
     const QUERY: &str = "(property type pending-props-no-such-value)";
     const OTHER: &str = "(property status pending-props-no-such-value)";
 
-    // The oracle: the forced walk over the same pending state. The injected
-    // outcome IS consumed now — through R5b this queue was left untouched,
-    // which is exactly what proved the query never reached the executor.
+    // The oracle: the INDEPENDENT actor-side walk over the same pending state.
+    // Through R5c this was taken by forcing the route's fallback; RET2 deleted
+    // that fallback, so the oracle is now reached only through the test-only
+    // complete-page request — which is the same evaluation, from outside the
+    // route under test.
+    let walked = r4a_oracle(&handle, QUERY, R4B_ROWS, R4B_BYTES);
+
+    // The pending property query IS captured: the injected outcome is
+    // consumed. Through R5b this queue was left untouched, which is exactly
+    // what proved the query never reached the executor. RET2: `Busy` is typed
+    // readiness and counts no fallback.
     r4b_inject(&handle, vec![Outcome::Busy]);
-    let walked = r4a_navigate(&handle, QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    let busy = r4a_navigate(&handle, QUERY, R4B_ROWS, R4B_BYTES).unwrap_err();
+    assert_query_execution_error(
+        "pending property Busy",
+        &busy,
+        crate::query::QueryExecutionError::NotReady(crate::query::QueryReadinessReason::Busy),
+    );
     assert_eq!(
         r4b_census(&handle),
-        (0, 1, 0, 0),
-        "the pending property query reached the executor and fell back to the walk"
+        (0, 0, 0, 0),
+        "the pending property query reached the executor and did not walk"
     );
     assert_eq!(
         handle
@@ -31030,8 +31112,7 @@ fn r5c_a_pending_property_query_is_captured_and_patched() {
         1,
         "the patch cache is keyed by the stamp, not by the query"
     );
-    r4b_inject(&handle, vec![Outcome::Busy]);
-    let other_walk = r4a_navigate(&handle, OTHER, R4B_ROWS, R4B_BYTES).unwrap();
+    let other_walk = r4a_oracle(&handle, OTHER, R4B_ROWS, R4B_BYTES);
     r4a_assert_same("the second property query", &other, &other_walk);
 
     assert!(matches!(
@@ -31040,9 +31121,16 @@ fn r5c_a_pending_property_query_is_captured_and_patched() {
     ));
 }
 
+/// RET2: exhausting `MAX_STALE_RECAPTURES` is `NotReady(PendingEdits)`.
+///
+/// Three accepted batches landing inside one query's capture window means the
+/// frontier is moving under every capture — undrained local editing, which is
+/// exactly what the readiness loop waits out. It is not a broken index and it
+/// is no longer a walk.
 #[test]
-fn r4b_a_stale_snapshot_recaptures_twice_then_walks() {
+fn r4b_a_stale_snapshot_recaptures_twice_then_reports_pending_edits() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
+    use crate::query::{QueryExecutionError, QueryReadinessReason};
     let (fixture, handle) = r4b_reopened("r4b-stale", 0x4b03);
     let oracle = r4b_oracle(&fixture);
     assert!(oracle.total > 0);
@@ -31063,15 +31151,28 @@ fn r4b_a_stale_snapshot_recaptures_twice_then_walks() {
     assert_eq!(answered.total, 0, "the third capture's answer is served");
     assert_eq!(r4b_census(&handle), (0, 0, 0, 2));
 
-    // A third Stale is a fallback: the walk answers, and the caller cannot
-    // tell the difference.
+    // A third Stale is readiness, not a walk: the caller is told to ask again.
     r4b_inject(
         &handle,
         vec![Outcome::Stale, Outcome::Stale, Outcome::Stale],
     );
-    let walked = r4b_query(&handle).unwrap();
-    assert_eq!(r4b_census(&handle), (0, 1, 0, 2));
-    assert_managed_simple_query_matches_direct("walk after three Stale", walked, oracle);
+    let error = r4b_query(&handle).unwrap_err();
+    assert_query_execution_error(
+        "three Stale",
+        &error,
+        QueryExecutionError::NotReady(QueryReadinessReason::PendingEdits),
+    );
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 2),
+        "the two re-captures are counted; the exhaustion is not a fallback"
+    );
+
+    // The retry is answered by the database and equals the independent oracle.
+    let answered = r4b_query(&handle).unwrap();
+    assert_eq!(r4b_census(&handle), (1, 0, 0, 2));
+    assert!(answered.total > 0, "an empty success is impossible here");
+    assert_managed_simple_query_matches_direct("read after three Stale", answered, oracle);
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -31079,26 +31180,40 @@ fn r4b_a_stale_snapshot_recaptures_twice_then_walks() {
     ));
 }
 
+/// RET2: `Busy` and `Cancelled` are two DIFFERENT typed answers, and neither
+/// is a walk. `Busy` is retryable readiness; a drain or a close is
+/// `Cancelled`, which the frontend surfaces as the cancellation it already
+/// knows and never retries in a loop.
 #[test]
-fn r4b_busy_and_cancelled_both_walk_and_only_busy_is_a_fallback() {
+fn r4b_busy_is_not_ready_and_cancelled_is_cancelled() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
+    use crate::query::{QueryExecutionError, QueryReadinessReason};
     let (fixture, handle) = r4b_reopened("r4b-busy-cancelled", 0x4b04);
 
     r4b_inject(&handle, vec![Outcome::Busy]);
-    let busy = r4b_query(&handle).unwrap();
-    assert_eq!(r4b_census(&handle), (0, 1, 0, 0));
-    assert_managed_simple_query_matches_direct("walk after Busy", busy, r4b_oracle(&fixture));
+    let busy = r4b_query(&handle).unwrap_err();
+    assert_query_execution_error(
+        "Busy",
+        &busy,
+        QueryExecutionError::NotReady(QueryReadinessReason::Busy),
+    );
+    assert_eq!(r4b_census(&handle), (0, 0, 0, 0));
 
     r4b_inject(&handle, vec![Outcome::Cancelled]);
-    let cancelled = r4b_query(&handle).unwrap();
+    let cancelled = r4b_query(&handle).unwrap_err();
+    assert_query_execution_error("Cancelled", &cancelled, QueryExecutionError::Cancelled);
     assert_eq!(
         r4b_census(&handle),
         (0, 0, 0, 0),
-        "a drain's cancellation is an answer by the walk, not a fallback"
+        "a drain's cancellation counts nothing and is not a failed read"
     );
+
+    // Neither disposition poisoned the route: the next attempt reads.
+    let answered = r4b_query(&handle).unwrap();
+    assert_eq!(r4b_census(&handle), (1, 0, 0, 0));
     assert_managed_simple_query_matches_direct(
-        "walk after Cancelled",
-        cancelled,
+        "read after Busy and Cancelled",
+        answered,
         r4b_oracle(&fixture),
     );
 
@@ -31108,18 +31223,26 @@ fn r4b_busy_and_cancelled_both_walk_and_only_busy_is_a_fallback() {
     ));
 }
 
+/// SPEC §5.9 M10, as RET2 states it: a FAILED Managed read is
+/// `Unavailable(ReadFailed)` — a bounded, non-retryable public answer carrying
+/// no path, no SQL and no source text (I-5). The executor's `&'static str`
+/// reason stays internal.
 #[test]
 fn r4b_a_failed_managed_read_is_an_error_and_the_next_query_recovers() {
     use crate::managed_query::ManagedQueryOutcome as Outcome;
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
     let (fixture, handle) = r4b_reopened("r4b-failed", 0x4b05);
 
     r4b_inject(&handle, vec![Outcome::Failed("injected")]);
     let error = r4b_query(&handle).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        SyncApplicationPageRequestError::ActorRefusedAt("application_simple_query_managed_read")
-            .to_string(),
-        "SPEC §5.9 M10: a failed Managed read is an error, not a walk"
+    assert_query_execution_error(
+        "Failed",
+        &error,
+        QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed),
+    );
+    assert!(
+        !error.backend_wire_string().contains("injected"),
+        "the executor's internal reason must not reach the wire"
     );
     assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
 
@@ -31582,11 +31705,15 @@ fn r4a_a_real_frontier_advance_between_capture_and_open_is_a_stale_recapture() {
 }
 
 /// A drain reaches a statement mid-flight: the executor reports `Cancelled`,
-/// the walk answers, nothing is counted as a fallback, and the drain does not
-/// return until the job has released its slot (I-21). This is the executor
-/// half of `g_i_managed_query_jobs_drain_before_projection_file_close`: the
-/// three call sites are pinned there, that a live read actually stops is
-/// pinned here.
+/// nothing is counted, and the drain does not return until the job has
+/// released its slot (I-21). This is the executor half of
+/// `g_i_managed_query_jobs_drain_before_projection_file_close`: the three call
+/// sites are pinned there, that a live read actually stops is pinned here.
+///
+/// **RET2's cancelled-read fail-before.** Through RET1 the cancelled read was
+/// answered by the actor walk, so the caller could not tell a drain from an
+/// answer. It is now the typed `Cancelled` the frontend already understands,
+/// produced by a REAL drain of a REAL in-flight statement.
 #[test]
 fn r4a_a_drain_cancels_a_live_read_and_waits_for_its_slot() {
     use std::sync::mpsc;
@@ -31652,15 +31779,24 @@ fn r4a_a_drain_cancels_a_live_read_and_waits_for_its_slot() {
         let _ = resume_tx.send(());
         drainer.join().unwrap();
         assert_eq!(handle.managed_query_jobs().active(), 0, "I-21");
-        query.join().unwrap().unwrap()
+        query.join().unwrap().unwrap_err()
     });
 
+    assert_query_execution_error(
+        "a drained read",
+        &answered,
+        crate::query::QueryExecutionError::Cancelled,
+    );
     assert_eq!(
         r4b_census(&handle),
         (0, 0, 0, 0),
-        "a drain's cancellation is answered by the walk and counted nowhere"
+        "a drain's cancellation is counted nowhere and is not a failed read"
     );
-    r4a_assert_same("walk after a drain", &answered, &oracle);
+    assert!(
+        oracle.total > 0,
+        "the fixture answers this query nonempty, so a cancelled read could \
+         never have been an empty success"
+    );
     let _ = fixture;
 
     assert!(matches!(
@@ -31672,6 +31808,11 @@ fn r4a_a_drain_cancels_a_live_read_and_waits_for_its_slot() {
 /// D-3: a projection that contradicts itself FAILS the read. It never
 /// answers with fewer rows, never falls back to the walk (SPEC §5.9 M10),
 /// and memoizes nothing -- the next query captures and reads again.
+///
+/// RET2: the failure is now the bounded public `Unavailable(ReadFailed)`, and
+/// the "memoizes nothing" half doubles as the memo-error-nonpublication gate:
+/// a failed execution is never stored, so the second attempt fails again for
+/// the same reason instead of serving a cached error or a cached answer.
 #[test]
 fn r4a_a_corrupt_projection_fails_the_read_and_memoizes_nothing() {
     // Both halves of the read, each on its OWN runtime so neither damage can
@@ -31721,12 +31862,12 @@ fn r4a_a_corrupt_projection_fails_the_read_and_memoizes_nothing() {
         assert!(removed > 0, "{label}: the damage must remove a row");
 
         let error = r4a_navigate(&handle, query, R4B_ROWS, R4B_BYTES).unwrap_err();
-        assert_eq!(
-            error,
-            SyncApplicationPageRequestError::ActorRefusedAt(
-                "application_simple_query_managed_read"
+        assert_query_execution_error(
+            &format!("{label}: a damaged Managed read is an error, never fewer rows"),
+            &error,
+            crate::query::QueryExecutionError::Unavailable(
+                crate::query::QueryUnavailableReason::ReadFailed,
             ),
-            "{label}: a damaged Managed read is an error, never fewer rows"
         );
         assert_eq!(
             r4b_census(&handle),
@@ -31742,11 +31883,15 @@ fn r4a_a_corrupt_projection_fails_the_read_and_memoizes_nothing() {
     }
 }
 
-/// Capacity is bounded and exhaustion is not an error: `Busy` walks, and it
-/// IS counted as a fallback, because a query that could not reach the
-/// database is exactly what the Q18 retirement card watches for.
+/// **RET2's headline fail-before for capacity.** Through RET1 a real
+/// exhausted job owner ANSWERED: the route walked the parsed graph on the
+/// actor and counted a fallback. It is now a typed `NotReady(Busy)` the
+/// frontend's readiness loop retries, with no statement read, no fallback and
+/// no traversal — and it is a genuine owner exhaustion, not an injected
+/// outcome.
 #[test]
-fn r4a_an_exhausted_job_owner_is_busy_and_the_walk_answers() {
+fn r4a_an_exhausted_job_owner_is_not_ready() {
+    use crate::query::{QueryExecutionError, QueryReadinessReason};
     let (_fixture, handle) = r4b_reopened("r4a-busy", 0x4a09);
     let oracle = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
     assert!(oracle.total > 0);
@@ -31766,13 +31911,17 @@ fn r4a_an_exhausted_job_owner_is_busy_and_the_walk_answers() {
     assert_eq!(held.len(), crate::query_jobs::DEFAULT_QUERY_JOB_CAPACITY);
 
     handle.reset_managed_query_census();
-    let walked = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    let error = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap_err();
+    assert_query_execution_error(
+        "an exhausted job owner",
+        &error,
+        QueryExecutionError::NotReady(QueryReadinessReason::Busy),
+    );
     assert_eq!(
         r4b_census(&handle),
-        (0, 1, 0, 0),
-        "no slot within the wait is one counted fallback and no statement read"
+        (0, 0, 0, 0),
+        "no slot within the wait is no statement read AND no fallback: nothing walked"
     );
-    r4a_assert_same("walk after Busy", &walked, &oracle);
 
     drop(held);
     handle.clear_application_simple_query_memo().unwrap();
@@ -32075,26 +32224,29 @@ fn r5a_a_pending_page_local_query_is_answered_off_the_actor() {
     assert!(pending.incomplete.is_empty(), "{pending:?}");
     assert_eq!(pending.failed, None);
 
-    // The two spellings of "the walk" agree: the handle's own fallback (an
-    // injected `Busy`), the actor-side complete-page evaluator, and — for this
-    // ordinary `Existing` save, whose file was written in the same turn — the
-    // Direct oracle over the graph FILES.
-    let forced = {
-        r4b_inject(&handle, vec![Outcome::Busy]);
-        let walked = r4b_query(&handle).unwrap();
-        assert_eq!(
-            r4b_census(&handle),
-            (0, 1, 0, 0),
-            "the forced walk answered"
-        );
-        r4b_inject(&handle, vec![]);
-        walked
-    };
+    // RET2: the handle has no fallback left to force, so the one remaining
+    // spelling of "the walk" is the actor-side complete-page ORACLE. An
+    // injected `Busy` now proves only that the pending query was CAPTURED —
+    // the outcome is consumed and the answer is typed readiness, not rows.
+    r4b_inject(&handle, vec![Outcome::Busy]);
+    let busy = r4b_query(&handle).unwrap_err();
+    assert_query_execution_error(
+        "pending Busy",
+        &busy,
+        crate::query::QueryExecutionError::NotReady(crate::query::QueryReadinessReason::Busy),
+    );
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 0),
+        "the captured pending query did not walk"
+    );
+    r4b_inject(&handle, vec![]);
     let actor_walk = r5a_walk(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
-    r4a_assert_same("the two walk spellings agree", &forced, &actor_walk);
+    // For this ordinary `Existing` save, whose file was written in the same
+    // turn, the actor oracle is also Direct's answer over the graph FILES.
     assert_managed_simple_query_matches_direct(
         "the pending walk equals Direct over the files",
-        forced,
+        actor_walk.clone(),
         r4b_oracle(&fixture),
     );
 
@@ -32438,7 +32590,7 @@ fn r5a_a_later_overlay_flush_than_the_capture_required_is_not_stale() {
     // The entry was stored under the OLD stamp and is unreachable at the new
     // one: the next query captures again and the injected outcome is consumed.
     r4b_inject(&handle, vec![Outcome::Busy]);
-    let _ = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    let _ = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
     assert_eq!(
         handle
             .inner
@@ -32498,20 +32650,10 @@ fn r5a_an_accepted_advance_between_the_two_opens_is_a_stale_recapture() {
     ));
 }
 
-/// An overlay that cannot be OPENED costs a WALK, never an answer and never a
-/// refusal: availability over refusal for a cache that could not be built
-/// (`managed_overlay.rs` module doc), which supersedes the R5 design note's
-/// `Failed`. Nothing is memoized, so the next query captures again.
-///
-/// The overlay's three files are removed from inside the executor's own
-/// pre-open hook: the worker keeps its own descriptor, and the read-only
-/// `open_direct` of a path that is no longer there is `Unavailable`. (Marking
-/// the owner `failed` reaches the same disposition through the same branch of
-/// `open_snapshot`, but `PendingOverlay::mark_failed` is actor-side state with
-/// no test accessor on the handle, and `sync_runtime.rs` is not in this lane's
-/// write set.)
+/// A vanished overlay cannot become ready by waiting. Remove its files before
+/// the read-only open and require a bounded failure, with no traversal or memo.
 #[test]
-fn r5a_an_unopenable_overlay_walks_and_counts_a_fallback() {
+fn r5a_an_unopenable_overlay_is_a_bounded_failure() {
     let fixture = r5a_fixture("r5a-overlay-unavailable", 0x5a08);
     let handle = r4a_reopen(&fixture);
     r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a unavailable witness");
@@ -32533,14 +32675,25 @@ fn r5a_an_unopenable_overlay_walks_and_counts_a_fallback() {
 
     handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
-    let answered = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    let error = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
     crate::managed_query::set_before_managed_open_hook(None);
+    // Distinguish this failed read from a live worker waiting to flush.
+    assert_query_execution_error(
+        "an overlay that vanished under the executor",
+        &error,
+        crate::query::QueryExecutionError::Unavailable(
+            crate::query::QueryUnavailableReason::ReadFailed,
+        ),
+    );
     assert_eq!(
         r5a_census(&handle),
-        (0, 0, 1, 0, 0),
-        "an unopenable overlay is one counted fallback and no statement read"
+        (0, 0, 0, 1, 0),
+        "an unopenable overlay reads no statement and no longer counts a fallback"
     );
-    r4a_assert_same("walk after an unopenable overlay", &answered, &walk);
+    assert!(
+        walk.total > 0,
+        "the oracle answers nonempty, so this was never an empty success"
+    );
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -32595,12 +32748,12 @@ fn r5a_a_damaged_overlay_row_fails_the_pending_read() {
         assert!(removed > 0, "{label}: the damage must remove a row");
 
         let error = r4a_navigate(&handle, query, R5A_ROWS, R5A_BYTES).unwrap_err();
-        assert_eq!(
-            error,
-            SyncApplicationPageRequestError::ActorRefusedAt(
-                "application_simple_query_managed_read"
+        assert_query_execution_error(
+            &format!("{label}: a damaged overlay row is an error, never fewer rows"),
+            &error,
+            crate::query::QueryExecutionError::Unavailable(
+                crate::query::QueryUnavailableReason::ReadFailed,
             ),
-            "{label}: a damaged overlay row is an error, never fewer rows"
         );
         assert_eq!(
             r5a_census(&handle),
@@ -32645,10 +32798,12 @@ fn r5a_an_ambiguous_accepted_path_fails_the_pending_read() {
     assert_eq!(changed, 1, "the fixture must gain a duplicate path");
 
     let error = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
-    assert_eq!(
-        error,
-        SyncApplicationPageRequestError::ActorRefusedAt("application_simple_query_managed_read"),
-        "an ambiguous accepted path is an error, never a duplicated or dropped page"
+    assert_query_execution_error(
+        "an ambiguous accepted path is an error, never a duplicated or dropped page",
+        &error,
+        crate::query::QueryExecutionError::Unavailable(
+            crate::query::QueryUnavailableReason::ReadFailed,
+        ),
     );
     assert_eq!(r5a_census(&handle), (0, 0, 0, 1, 0));
 }
@@ -32717,15 +32872,20 @@ fn r5a_a_drain_cancels_a_live_pending_read_and_waits_for_its_slot() {
         let _ = resume_tx.send(());
         drainer.join().unwrap();
         assert_eq!(handle.managed_query_jobs().active(), 0, "I-21");
-        query.join().unwrap().unwrap()
+        query.join().unwrap().unwrap_err()
     });
 
+    assert_query_execution_error(
+        "a drained pending read",
+        &answered,
+        crate::query::QueryExecutionError::Cancelled,
+    );
     assert_eq!(
         r5a_census(&handle),
         (0, 0, 0, 0, 0),
-        "a drain's cancellation is answered by the walk and counted nowhere"
+        "a drain's cancellation is counted nowhere and is not a failed read"
     );
-    r4a_assert_same("walk after a drain", &answered, &walk);
+    assert!(walk.total > 0, "an empty success is impossible here");
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
@@ -32737,10 +32897,12 @@ fn r5a_a_drain_cancels_a_live_pending_read_and_waits_for_its_slot() {
     );
 }
 
-/// Capacity bounds the PENDING route too: no slot within the wait is `Busy`,
-/// the walk answers, and it IS counted as a fallback.
+/// Capacity bounds the PENDING route too. RET2: no slot within the wait is a
+/// typed `NotReady(Busy)`, with nothing walked and nothing counted; a freed
+/// slot puts the next pending query back on the two-source route, answering
+/// exactly the independent oracle.
 #[test]
-fn r5a_an_exhausted_job_owner_walks_while_pending() {
+fn r5a_an_exhausted_job_owner_is_not_ready_while_pending() {
     let fixture = r5a_fixture("r5a-pending-busy", 0x5a0d);
     let handle = r4a_reopen(&fixture);
     r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a busy witness");
@@ -32762,13 +32924,17 @@ fn r5a_an_exhausted_job_owner_walks_while_pending() {
     assert_eq!(held.len(), crate::query_jobs::DEFAULT_QUERY_JOB_CAPACITY);
 
     handle.reset_managed_query_census();
-    let walked = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    let error = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
+    assert_query_execution_error(
+        "an exhausted job owner while pending",
+        &error,
+        crate::query::QueryExecutionError::NotReady(crate::query::QueryReadinessReason::Busy),
+    );
     assert_eq!(
         r5a_census(&handle),
-        (0, 0, 1, 0, 0),
-        "no slot within the wait is one counted fallback and no statement read"
+        (0, 0, 0, 0, 0),
+        "no slot within the wait is no statement read and no fallback"
     );
-    r4a_assert_same("walk after Busy while pending", &walked, &walk);
 
     drop(held);
     handle.clear_application_simple_query_memo().unwrap();
@@ -33746,8 +33912,7 @@ fn r5c_typed_pending_queries_equal_the_forced_walk() {
         .unwrap();
     assert!(matches!(save, SyncApplicationPageSaveOutcome::Saved { .. }));
 
-    r4b_inject(&handle, vec![Outcome::Busy]);
-    let walked = r4a_navigate(&handle, NUMERIC, R5A_ROWS, R5A_BYTES).unwrap();
+    let walked = r4a_oracle(&handle, NUMERIC, R5A_ROWS, R5A_BYTES);
     r4b_inject(&handle, vec![]);
     let read = r4a_navigate(&handle, NUMERIC, R5A_ROWS, R5A_BYTES).unwrap();
     assert_eq!(r5a_census(&handle), (1, 1, 0, 0, 0));
@@ -33765,8 +33930,7 @@ fn r5c_typed_pending_queries_equal_the_forced_walk() {
         vec![r5c_block("TODO typed row\n  freshness:: crisp")],
     );
     const FRESH: &str = "(property freshness crisp)";
-    r4b_inject(&handle, vec![Outcome::Busy]);
-    let walked = r4a_navigate(&handle, FRESH, R5A_ROWS, R5A_BYTES).unwrap();
+    let walked = r4a_oracle(&handle, FRESH, R5A_ROWS, R5A_BYTES);
     assert_eq!(walked.total, 1, "the pending page is the key's only owner");
     r4b_inject(&handle, vec![]);
     let read = r4a_navigate(&handle, FRESH, R5A_ROWS, R5A_BYTES).unwrap();
@@ -33807,10 +33971,12 @@ fn r5c_a_property_row_naming_an_absent_page_fails_the_pending_read() {
     assert_eq!(removed, 1, "the damage must remove the overlay's page row");
 
     let error = r4a_navigate(&handle, "(property lonely still)", R5A_ROWS, R5A_BYTES).unwrap_err();
-    assert_eq!(
-        error,
-        SyncApplicationPageRequestError::ActorRefusedAt("application_simple_query_managed_read"),
-        "a page the patch cannot resolve is an error, never a wrongly typed table"
+    assert_query_execution_error(
+        "a page the patch cannot resolve is an error, never a wrongly typed table",
+        &error,
+        crate::query::QueryExecutionError::Unavailable(
+            crate::query::QueryUnavailableReason::ReadFailed,
+        ),
     );
     assert_eq!(
         r5a_census(&handle),
@@ -35082,4 +35248,471 @@ fn ret1_the_public_ir_route_refuses_exactly_as_the_walk_does() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+// ===== RET2: the public Managed query routes are database-only =====
+//
+// R4b/R4a/R5a above prove the SimpleQuery half of this contract, each in the
+// gate that used to assert the walk. These prove the same contract for §7.1's
+// two PUBLIC IR commands, plus the three dispositions no earlier packet could
+// state: a deferred actor turn, a pending set with no overlay to read it from,
+// and an explanation whose count vector does not match its own plan.
+
+/// One PUBLIC IR execution that is allowed to FAIL, so a gate can assert the
+/// typed error instead of unwrapping an answer.
+fn ret2_ir_navigate(
+    handle: &SyncRuntimeHandle,
+    query: &crate::query::ir::Query,
+    view: &crate::query::ir::ViewSettings,
+    context: &crate::query::ir::ExecutionContext,
+    explain: bool,
+) -> Result<SyncApplicationNavigationReply, SyncApplicationPageRequestError> {
+    let request = if explain {
+        SyncApplicationNavigationRequest::QueryExplainEmpty {
+            query: query.clone(),
+            view: view.clone(),
+            context: context.clone(),
+            max_rows: R4B_ROWS,
+            max_bytes: R4B_BYTES,
+        }
+    } else {
+        SyncApplicationNavigationRequest::QueryRun {
+            query: query.clone(),
+            view: view.clone(),
+            context: context.clone(),
+            max_rows: R4B_ROWS,
+            max_bytes: R4B_BYTES,
+        }
+    };
+    handle
+        .application_navigation(request)
+        .map(|outcome| match outcome {
+            SyncApplicationNavigationOutcome::Loaded { reply } => reply,
+            other => panic!("an IR query returned the wrong outcome: {other:?}"),
+        })
+}
+
+/// **RET2's acceptance bar for §7.1's two public commands.**
+///
+/// Every disposition that RET1 answered by walking the parsed graph is now a
+/// typed `query::QueryExecutionError`, for `query_run` AND for
+/// `query_explain_empty`:
+///
+/// * an exhausted job owner → `NotReady(Busy)`;
+/// * re-captures spent → `NotReady(PendingEdits)`;
+/// * a drained or closed owner → `Cancelled`;
+/// * a failed read → `Unavailable(ReadFailed)`.
+///
+/// The census is what proves "and never walks": zero statement reads and zero
+/// fallback reads on every leg. The last leg proves none of it fabricated an
+/// empty answer — the same execution, run for real, is nonempty and equals the
+/// independent actor-side oracle.
+#[test]
+fn ret2_the_public_ir_route_reports_typed_execution_errors_and_never_walks() {
+    use crate::managed_query::ManagedQueryOutcome as Outcome;
+    use crate::query::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("ret2-ir-errors", 0x4a30);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+
+    for explain in [false, true] {
+        // The independent answer this execution HAS, so every error leg below
+        // is provably not an empty success in disguise.
+        let oracle = ret1_ir_oracle(
+            &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
+        );
+        assert!(
+            ret1_reply_rows(&oracle) > 0,
+            "explain={explain}: the fixture must answer this execution nonempty"
+        );
+
+        for (label, outcomes, expected, failures) in [
+            (
+                "an exhausted job owner",
+                vec![Outcome::Busy],
+                QueryExecutionError::NotReady(QueryReadinessReason::Busy),
+                0,
+            ),
+            (
+                "re-captures spent",
+                vec![Outcome::Stale, Outcome::Stale, Outcome::Stale],
+                QueryExecutionError::NotReady(QueryReadinessReason::PendingEdits),
+                0,
+            ),
+            (
+                "a drained owner",
+                vec![Outcome::Cancelled],
+                QueryExecutionError::Cancelled,
+                0,
+            ),
+            (
+                "a failed read",
+                vec![Outcome::Failed("injected")],
+                QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed),
+                1,
+            ),
+        ] {
+            let recaptures = outcomes.len().saturating_sub(1);
+            r4b_inject(&handle, outcomes);
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
+            let error = ret2_ir_navigate(&handle, &query, &view, &context, explain).unwrap_err();
+            assert_query_execution_error(&format!("{label} (explain={explain})"), &error, expected);
+            assert_eq!(
+                r4b_census(&handle),
+                (0, 0, failures, recaptures),
+                "{label} (explain={explain}): no statement read and NO fallback"
+            );
+            let counters = handle.managed_application_query_instrumentation().unwrap();
+            assert_eq!(
+                (
+                    counters.result_page_hydrations,
+                    counters.metadata_page_hydrations,
+                    counters.full_inventory_passes
+                ),
+                (0, 0, 0),
+                "{label} (explain={explain}): a refused execution hydrates no page and \
+                 walks no inventory: {counters:?}"
+            );
+        }
+
+        // Nothing above poisoned the route or the memo: the same execution,
+        // run for real, reads the database and equals the oracle.
+        r4b_inject(&handle, vec![]);
+        let answered = ret2_ir_navigate(&handle, &query, &view, &context, explain).unwrap();
+        assert!(
+            ret1_reply_rows(&answered) > 0,
+            "explain={explain}: an empty success is impossible here"
+        );
+        ret1_assert_same(
+            &format!("the read after every refusal (explain={explain})"),
+            &answered,
+            &oracle,
+        );
+    }
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// `ExplainPlan::answer` reads its counts BY INDEX and substitutes 0 for a
+/// missing one, so a count vector shorter than the plan's probe list would
+/// print "this conjunct matched nothing" for every conjunct — an explanation
+/// the reader cannot tell from the truth.
+///
+/// RET2 checks the shape before `answer`: a mismatch is
+/// `Unavailable(InvalidSnapshot)` and a counted failed read. The oracle below
+/// shows what was suppressed — the honest explanation has a NONZERO count, so
+/// the zero-padded answer would have been a visible, silent lie.
+#[test]
+fn ret2_an_explanation_whose_counts_do_not_match_its_plan_is_never_zero_padded() {
+    use crate::managed_query::{ManagedQueryAnswer, ManagedQueryOutcome as Outcome};
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("ret2-explain-shape", 0x4a31);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+    // A CONJUNCTION, so the plan decomposes into more than one probe and a
+    // short vector is a shape a caller could actually be handed.
+    let (query, view) = ret1_parse(
+        "(and (task TODO) (content-regex \"a\"))",
+        crate::query::QueryInput::Og,
+    );
+
+    let oracle = ret1_ir_oracle(&handle, &query, &view, &context, true, R4B_ROWS, R4B_BYTES);
+    let honest = match &oracle {
+        SyncApplicationNavigationReply::QueryExplainEmpty(explained) => explained.clone(),
+        other => panic!("not an explanation: {other:?}"),
+    };
+    assert!(honest.rows.len() > 1, "the plan must decompose: {honest:?}");
+    assert!(
+        honest.rows.iter().any(|row| row.alone > 0),
+        "at least one conjunct must match something, or zero-padding would be \
+         indistinguishable from the truth: {honest:?}"
+    );
+
+    for (label, counts) in [
+        ("a short count vector", Vec::new()),
+        ("one count too few", vec![0; honest.rows.len() - 1]),
+        ("one count too many", vec![0; honest.rows.len() + 4]),
+    ] {
+        r4b_inject(
+            &handle,
+            vec![Outcome::Answered(ManagedQueryAnswer::Counts(counts))],
+        );
+        let error = ret2_ir_navigate(&handle, &query, &view, &context, true).unwrap_err();
+        assert_query_execution_error(
+            label,
+            &error,
+            QueryExecutionError::Unavailable(QueryUnavailableReason::InvalidSnapshot),
+        );
+        assert_eq!(
+            r4b_census(&handle),
+            (0, 0, 1, 0),
+            "{label}: a decomposition that contradicts itself is a failed read"
+        );
+    }
+
+    // A count vector of the RIGHT length is served, and the real read still
+    // equals the oracle.
+    r4b_inject(&handle, vec![]);
+    let answered = ret2_ir_navigate(&handle, &query, &view, &context, true).unwrap();
+    ret1_assert_same("the explanation after every mismatch", &answered, &oracle);
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// An answer of the WRONG SHAPE — the executor returned page rows for a
+/// `@block` capture — is `Unavailable(InvalidSnapshot)`, on both public
+/// routes. Structurally impossible, and therefore classified rather than
+/// panicked on or silently reshaped into an empty answer.
+#[test]
+fn ret2_an_answer_of_the_wrong_shape_is_an_invalid_snapshot() {
+    use crate::managed_query::{ManagedQueryAnswer, ManagedQueryOutcome as Outcome};
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r4a_fast_corpus_fixture("ret2-answer-shape", 0x4a32);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+    let expected = QueryExecutionError::Unavailable(QueryUnavailableReason::InvalidSnapshot);
+    let wrong = || {
+        Outcome::Answered(ManagedQueryAnswer::Pages(
+            crate::query::results::PageAnswer {
+                pages: Vec::new(),
+                total: 0,
+                exceeded: false,
+            },
+        ))
+    };
+
+    r4b_inject(&handle, vec![wrong()]);
+    let simple = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap_err();
+    assert_query_execution_error("SimpleQuery", &simple, expected);
+    assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
+
+    r4b_inject(&handle, vec![wrong()]);
+    let ir = ret2_ir_navigate(&handle, &query, &view, &context, false).unwrap_err();
+    assert_query_execution_error("query_run", &ir, expected);
+    assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
+
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// A pending local suffix with NO overlay to read it from is
+/// `Unavailable(ProjectionUnavailable)` on both public routes — bounded, not
+/// endless pending, and not an actor walk.
+///
+/// Before RET2 this state was the R5 "no stamp" branch, which walked the
+/// parsed graph on the actor. The overlay is closed and deleted through the
+/// actor's own `close_pending_overlay`, so this is the real state, not an
+/// injected outcome: the actor still holds the pending frames and now has
+/// nothing that can read them.
+#[test]
+fn ret2_a_pending_suffix_without_an_overlay_is_projection_unavailable() {
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    let _serial = crate::query::sql::sql_gates_tests::serialize();
+    let fixture = r5a_fixture("ret2-no-overlay", 0x5a30);
+    let handle = r4a_reopen(&fixture);
+    let context = crate::query::ir::ExecutionContext::none();
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO ret2 no-overlay witness");
+    assert!(handle.pending_overlay_state().unwrap().is_some());
+
+    handle.close_pending_overlay().unwrap();
+    assert!(
+        handle.pending_overlay_state().unwrap().is_none(),
+        "the pending set is now unreadable"
+    );
+    handle.clear_application_simple_query_memo().unwrap();
+    handle.reset_managed_query_census();
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+
+    let expected = QueryExecutionError::Unavailable(QueryUnavailableReason::ProjectionUnavailable);
+    let simple = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
+    assert_query_execution_error("SimpleQuery without an overlay", &simple, expected);
+    for explain in [false, true] {
+        let ir = ret2_ir_navigate(&handle, &query, &view, &context, explain).unwrap_err();
+        assert_query_execution_error(
+            &format!("the IR route without an overlay (explain={explain})"),
+            &ir,
+            expected,
+        );
+    }
+    assert_eq!(
+        r5a_census(&handle),
+        (0, 0, 0, 0, 0),
+        "nothing was read, nothing fell back, nothing failed"
+    );
+    let counters = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        (
+            counters.result_page_hydrations,
+            counters.metadata_page_hydrations,
+            counters.full_inventory_passes
+        ),
+        (0, 0, 0),
+        "an unavailable projection hydrates no page and walks no inventory: {counters:?}"
+    );
+}
+
+/// The pending SPLIT guard is a FUTURE-relation guard, and this pins that it
+/// is dormant today: every attribute the IR can carry is page-local, so no
+/// currently valid public query can reach
+/// `Unavailable(UnsupportedRelation)`. If a later packet adds a cross-page
+/// relation, this fails first and the guard becomes live rather than silently
+/// routing that relation onto the actor.
+#[test]
+fn ret2_every_public_query_shape_is_page_local() {
+    let today = crate::date::JournalDate::today();
+    for (source, input) in ret1_ir_shapes() {
+        let (query, _) = ret1_parse(&source, input);
+        assert_eq!(
+            query.page_locality(),
+            crate::query::ir::PageLocality::Local,
+            "{source}"
+        );
+    }
+    for source in [
+        R4B_QUERY,
+        "(task TODO)",
+        "(property type note)",
+        "(between -7d today)",
+    ] {
+        let (parsed, _) = crate::query::parse_query_source(source, today);
+        assert_eq!(
+            parsed.page_locality(),
+            crate::query::ir::PageLocality::Local,
+            "{source}"
+        );
+    }
+}
+
+/// The mapping from a deferred actor turn to the public readiness family
+/// (RET2), stated exhaustively over `SyncEditorDeferred`.
+///
+/// The two RETRYABLE deferrals are the readiness `runQueryWhenReady` waits
+/// out. The two that need an operator or a rebound runtime are bounded
+/// `Unavailable`: retrying a revoked actor forever is endless pending, which
+/// is exactly what the frontend must not be asked to do.
+#[test]
+fn ret2_a_deferred_turn_maps_to_the_public_readiness_family() {
+    use crate::query::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
+    let cases = [
+        (
+            SyncEditorDeferred::RetryableExternalWork,
+            QueryExecutionError::NotReady(QueryReadinessReason::Indexing),
+        ),
+        (
+            SyncEditorDeferred::RetryableRetainedPublication {
+                batch_id: "b".into(),
+                phase: SyncLocalMutationPhase::Bindings,
+            },
+            QueryExecutionError::NotReady(QueryReadinessReason::Recovering),
+        ),
+        (
+            SyncEditorDeferred::BlockedRecovery {
+                batch_id: None,
+                phase: SyncLocalMutationPhase::Bindings,
+                retained_publication: true,
+            },
+            QueryExecutionError::Unavailable(QueryUnavailableReason::ProjectionUnavailable),
+        ),
+        (
+            SyncEditorDeferred::Revoked {
+                batch_id: None,
+                phase: SyncLocalMutationPhase::Bindings,
+            },
+            QueryExecutionError::Unavailable(QueryUnavailableReason::ProjectionUnavailable),
+        ),
+    ];
+    for (state, expected) in cases {
+        assert_eq!(
+            deferred_query_execution_error(&state),
+            expected,
+            "{state:?}"
+        );
+    }
+}
+
+/// End to end: an actor whose retained publication cannot settle DEFERS its
+/// read turn, and every public query entrypoint reports that as the typed
+/// readiness the frontend retries — never as prose, and never by walking.
+///
+/// Before RET2 the same state produced
+/// `SyncApplicationNavigationOutcome::Deferred`, which the command layer
+/// turned into "Tine-managed storage is updating page navigation. Try again
+/// when it finishes." — a message `classifyNativeCallError` cannot act on, so
+/// the query block stopped instead of retrying.
+#[test]
+fn ret2_a_deferred_read_turn_is_typed_readiness_on_every_query_entrypoint() {
+    use crate::query::{QueryExecutionError, QueryReadinessReason};
+    let fixture = ActivationFixture::nested_unicode("ret2-deferred", 0xa1783);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let open_request = reopen_request(&fixture.request);
+    let identities = open_request.clean_identities.clone().unwrap();
+    let opened = SyncRuntimeHandle::open_from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanActivation,
+    );
+    let handle = opened.handle.expect("clean actor handle opens");
+
+    // Enough faults that the bounded settlement loop cannot clear the retained
+    // continuation within one turn: every later read turn defers.
+    handle.install_repeated_projection_fault(64).unwrap();
+    let prior = handle
+        .submit_local_mutation(
+            OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xa178_3001)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xa178_3002)),
+                name: LogicalPageName::parse("Ret2 deferred page").unwrap(),
+                path: ManagedPath::parse("Ret2 deferred page.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            prior,
+            SyncLocalMutationOutcome::RetryableRetainedRecovery { .. }
+        ),
+        "{prior:?}"
+    );
+
+    let expected = QueryExecutionError::NotReady(QueryReadinessReason::Recovering);
+    let simple = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap_err();
+    assert_query_execution_error("a deferred SimpleQuery turn", &simple, expected);
+
+    let context = crate::query::ir::ExecutionContext::none();
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+    for explain in [false, true] {
+        let ir = ret2_ir_navigate(&handle, &query, &view, &context, explain).unwrap_err();
+        assert_query_execution_error(
+            &format!("a deferred IR turn (explain={explain})"),
+            &ir,
+            expected,
+        );
+    }
+    assert_eq!(
+        r4b_census(&handle),
+        (0, 0, 0, 0),
+        "a deferred turn reads nothing and walks nothing"
+    );
 }

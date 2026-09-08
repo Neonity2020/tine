@@ -47,10 +47,11 @@ const SOURCE_CONSTRUCTORS: &[&str] = &["GraphQueryPages(", "ApplicationQueryPage
 /// Every production walk, by `(file, enclosing function)`, and the packet that
 /// deletes it.
 ///
-/// * **RET2** — the public IR route's readiness / read-error / cancellation
+/// * **RET2** — the public query routes' readiness / read-error / cancellation
 ///   recovery. RET1 kept these as an internal repair checkpoint; RET2 removes
 ///   them and wires automatic retry instead, which is what makes the public
-///   commands database-only.
+///   commands database-only. RET2-Managed has landed: both `sync_runtime.rs`
+///   rows are gone. The `model.rs` rows are RET2-Direct's and are still here.
 /// * **RET3** — the friendly (`{{query}}` / backlinks / derived) ranking route
 ///   and the export subtree reader, migrated after the public commands.
 /// * **oracle** — a walk that exists to be COMPARED against, or a §8.1
@@ -74,16 +75,11 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
         1,
         "RET2: the `@page` read's readiness/read-error/cancellation recovery",
     ),
-    (
-        "crates/tine-core/src/sync_runtime.rs",
-        "ir_walk_ready",
-        1,
-        "RET2: the ONE walk a Managed IR execution can take. Reached from \
-         `application_ir_query_turn` (no stamp / a non-local query under a \
-         pending suffix / an unopenable capture) and from \
-         `application_ir_query_walk_ready` (busy / repeatedly stale / \
-         cancelled). Deleting those callers deletes this",
-    ),
+    // (`sync_runtime.rs::ir_walk_ready` was here. RET2-Managed deleted
+    // `application_ir_query_walk_ready` and replaced
+    // `application_ir_query_turn`'s no-stamp / non-local branches with typed
+    // `query::QueryExecutionError`s, which left the walk with no production
+    // caller; it is now compiled only under test, as the parity oracle.)
     // ---- RET2/RET3: shared with the older SimpleQuery route ----
     (
         "crates/tine-core/src/model.rs",
@@ -93,13 +89,14 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
          `direct_ir_query_result`); RET3 for the `{{query}}` SimpleQuery \
          callers that also reach it",
     ),
-    (
-        "crates/tine-core/src/sync_runtime.rs",
-        "application_simple_query_pages_ready",
-        1,
-        "RET3: Managed storage's SimpleQuery (`{{query}}`) route; the public \
-         IR commands no longer reach it",
-    ),
+    // (`sync_runtime.rs::application_simple_query_pages_ready` was here, on
+    // RET3's list. RET2-Managed reached it early: Managed `SimpleQuery` is a
+    // PUBLIC query command on the same captured route as the two IR commands,
+    // so its recovery walk was retired with theirs. The actor's
+    // `SyncApplicationNavigationRequest::SimpleQuery` arm is gone too, and the
+    // function is now compiled only under test, as the R4a/R5a parity oracle.
+    // Direct Files' `{{query}}` SimpleQuery route is untouched and is still
+    // RET3's, through `model.rs::direct_simple_query_pre_view` below.)
     // ---- RET3: the friendly / advanced / export routes ----
     (
         "crates/tine-core/src/query.rs",

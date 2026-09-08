@@ -2,6 +2,21 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-FAILED-PENDING-OVERLAY-NOT-BUSY",
+ "title": "A vanished or failed pending query projection reports a bounded error instead of endless readiness",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager review" },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::r5a_an_unopenable_overlay_is_a_bounded_failure", "crates/tine-core/src/managed_overlay.rs::tests::open_creates_a_fresh_file_and_close_deletes_it"],
+  "scenario": "query-engine.failed-pending-overlay",
+  "failBefore": "overlay-classification-before.log: vanished file reports NotReady(Busy), expected Unavailable(ReadFailed)"
+ },
+ "notes": "Only live unfinished work is retryable readiness. Tests also stop the actual overlay worker and verify failed channel detection. Automatic projection reconstruction remains a separate campaign recovery obligation."
+},
+{
  "id": "REG-QE-P1D-PERSISTENT-CACHE-RECOVERY",
  "title": "Failed Direct query repairs persistent projection damage without a source edit",
  "family": "query-engine",
@@ -3644,11 +3659,11 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/sync_runtime.rs::managed_sparse_task_query_maximum_hot_overlay_is_candidate_bounded",
+     "crates/tine-core/src/sync_runtime_tests.rs::r5a_a_pending_page_local_query_is_answered_off_the_actor",
      "crates/tine-core/src/sync_runtime.rs::managed_activation_single_page_block_scale_manual_benchmark"
     ]
    },
-   "notes": "The original terminal combined two independent bookkeeping/scheduling defects. Exact-feed preflight accumulated parser estimates and every touched file's raw bytes as though all files were parsed and retained simultaneously; the estimate itself treated every source byte as a node in every parser, DTO, projection, and index allocation class. Preparation is actually serial and retains only the small semantic admission record. Initial construction had the same false parser estimate. Both paths now retain the hard 64 MiB source/batch and 1,000,000 parsed-node caps, check actual retained growth, and account only the currently live file buffer. Separately, the 16-unit coordinator resume budget made fixed reauthentication/reopen overhead dominate and required thousands of turns for one large page. The measured 256-unit bounded slice completes the full 20,000-block external-import and candidate-bounded query regression within its 64-turn contract while still yielding between slices. The regression also proves the sparse query reads the one matching block and its four ancestors rather than hydrating the page. Catalog maintenance 2026-08-21: references to deleted pre-0.7 runtime-oracle files were removed. Remaining or replacement references name the current clean-runtime semantic contract; the retired implementation is not accepted as release evidence."
+   "notes": "Historical admission fixes removed false cumulative parser-memory estimates and increased bounded coordinator slices. The retained manual benchmark covers 5,000, 10,000 and 20,000-block page admission. Query campaign retirement removed the old sparse candidate-query implementation and its test; the current pending-query fixture proves off-actor SQL selection without page hydration, but does not substitute for the 20,000-block manual admission benchmark. No current claim relies on the retired sparse-query reader."
   },
   {
    "id": "REG-ANDROID-STRUCTURAL-BLOCK-MOVE-312",
@@ -6323,7 +6338,7 @@
   },
   {
    "id": "REG-W4-B4B-DIRECT-INDEXED-QUERY-ROUTING-001",
-   "title": "Direct Files indexed queries evaluate only the shared lowering's candidate pages, and abandon the projection when that candidate set is not selective",
+   "title": "Direct Files queries use SQLite result reads even for unselective predicates",
    "family": "waited-path-query-cost",
    "sources": {
     "issues": [],
@@ -6338,14 +6353,14 @@
    "coverage": {
     "tests": [
      "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
-     "crates/tine-core/src/direct_projection.rs::tests::b4_unselective_candidate_set_abandons_the_projection_for_the_parser_walk",
+     "crates/tine-core/src/direct_projection.rs::tests::an_unselective_shape_answers_through_the_statement_without_a_candidate_superset",
      "crates/tine-core/src/direct_projection.rs::tests::storage_contract_names_the_generation_bound_cutover",
      "crates/tine-core/tests/retirement_candidates.rs::retirement_candidate_markers_are_pinned"
     ],
-    "scenario": "direct-query.selective-indexed-plans-candidate-only",
+    "scenario": "direct-query.sqlite-selection-regardless-of-selectivity",
     "failBefore": "proven — tine-agents/evidence/wave4/b4b-pass2/. Routing, checked at 9bad907f: every newly routed shape (non-sparse Task, BlockProperty, PageProperty, Page, Namespace, Journal, mixed And, complete Or) left the candidate-read counter unchanged and entered the full-graph evaluator. Hatch, checked at 9bad907f with the cutoff neutralised (hatch-fail-before.log): the unselective plan completed a candidate query instead of abandoning — `an abandoned plan must complete no candidate query, left: 2, right: 1`."
    },
-   "notes": "The user outcome: a {{query}} block in Direct mode walked the whole graph after every keystroke even though the projection could answer it. Indexed plans now take the shared Managed/Direct lowering; Empty returns without projection or graph access; All keeps the walk. The lowering returns a page SUPERSET rather than the answer, so an unselective plan names most of the graph and materialising it through SQLite is slower than the walk — measured on the 1,045-file anonymized corpus at 1.08 -> 11.19 ms for non-sparse Task and 0.46 -> 3.31 ms for (journal). A candidate-count escape hatch (more than graph_pages/32, floor 32) therefore abandons the projection and reuses the existing parser-fallback path with a second reason. Both routes return identical groups/total/exceeded. The hatch carries the codebase's first `// RETIREMENT-CANDIDATE:` marker, censused by tests/retirement_candidates.rs; the walk is also the differential correctness oracle for the real lowering that would replace it, so it outlives the hatch."
+   "notes": "Historical Harvest evidence described candidate-page narrowing and a selectivity escape hatch to traversal. The database-owned result campaign supersedes that policy: the current unselective-shape regression requires statement execution without a candidate superset, and selectivity never selects a different evaluator. The historical fail-before evidence remains provenance for the old packet, not a requirement to retain the escape hatch. Remaining Direct readiness/recovery traversal is separately scheduled for RET2 retirement; this row does not claim it is already removed."
   },
   {
    "id": "REG-W4-I5B-DEBUG-FLAG-FRONT-DOOR-001",

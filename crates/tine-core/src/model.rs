@@ -3983,6 +3983,14 @@ fn is_date_stem_entry(entry: &PageEntry) -> bool {
 /// Gen+today-tagged cache of derived scan results. Reset wholesale whenever the
 /// tag no longer matches — so every entry is always consistent with the current
 /// graph state (no per-entry invalidation to get wrong).
+#[derive(Clone, Copy)]
+struct DerivedMemoStamp {
+    gen: u64,
+    today: i64,
+    config_digest: tine_storage::ContentDigest,
+    registry_gen: u64,
+}
+
 struct DerivedCache {
     gen: u64,
     today: i64,
@@ -6583,6 +6591,11 @@ impl Graph {
         profile: crate::query::ConstructionProfile,
     ) -> DispatchedQuery<crate::query::PreViewGroups> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+        if query.is_invalid() {
+            // A refused source never executes; this is a semantic answer,
+            // independent of database readiness, not an availability fallback.
+            return DispatchedQuery::Answered(crate::query::PreViewGroups::default());
+        }
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(projection) = self
             .direct_projection
@@ -6598,10 +6611,27 @@ impl Graph {
         if !projection.ready_at(generation) {
             return DispatchedQuery::NotReady;
         }
-        // §4.4/§6.2: ONE registry snapshot and ONE parse of every `content match`
-        // payload for this execution — the same values the walk reads, never a
-        // second parse (I-12).
-        let registry = self.property_registry();
+        // Acquire before reading registry inputs: lowering and output must see
+        // the same SQLite transaction even when a save lands between them.
+        let mut job = match projection.open_query_job(generation) {
+            crate::direct_projection::QueryJobOpen::Job(job) => job,
+            crate::direct_projection::QueryJobOpen::NotReady => return DispatchedQuery::NotReady,
+            crate::direct_projection::QueryJobOpen::Failed => return DispatchedQuery::FailedRead,
+            crate::direct_projection::QueryJobOpen::Cancelled => return DispatchedQuery::Cancelled,
+        };
+        let config = self.config.parse_config();
+        let registry = if query.filter.has_props_leaf() {
+            match self.query_property_registry_at(generation, &config, &mut job) {
+                Ok(registry) => registry,
+                Err(crate::query::QueryExecutionError::Cancelled) => {
+                    return DispatchedQuery::Cancelled
+                }
+                Err(_) => return DispatchedQuery::FailedRead,
+            }
+        } else {
+            // No property predicate can observe registry types in this plan.
+            Arc::new(crate::query::registry::Registry::empty(&config))
+        };
         let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
         let inputs = LoweringInputs {
             today,
@@ -6640,12 +6670,6 @@ impl Graph {
         // and the identity capture; `read_results` owns the descriptor read,
         // the budget and the payload batches, and installs the statement's
         // compiled-regex program on the job's own connection.
-        let mut job = match projection.open_query_job(generation) {
-            crate::direct_projection::QueryJobOpen::Job(job) => job,
-            crate::direct_projection::QueryJobOpen::NotReady => return DispatchedQuery::NotReady,
-            crate::direct_projection::QueryJobOpen::Failed => return DispatchedQuery::FailedRead,
-            crate::direct_projection::QueryJobOpen::Cancelled => return DispatchedQuery::Cancelled,
-        };
         // The identity policy, captured with the snapshot: a page THIS process
         // lowered answers with its stored live id; a row reused from an earlier
         // session answers with the structural id the fresh parse assigns it.
@@ -6823,6 +6847,8 @@ impl Graph {
         &self,
         read: impl FnOnce(
             &mut crate::direct_projection::DirectQueryJob<'_>,
+            u64,
+            bool,
         ) -> Result<T, crate::query::results::ResultReadError>,
     ) -> DispatchedQuery<T> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
@@ -6844,7 +6870,7 @@ impl Graph {
             crate::direct_projection::QueryJobOpen::Failed => return DispatchedQuery::FailedRead,
             crate::direct_projection::QueryJobOpen::Cancelled => return DispatchedQuery::Cancelled,
         };
-        match read(&mut job) {
+        match read(&mut job, generation, projection.fts_ready(generation)) {
             Ok(answer) => DispatchedQuery::Answered(answer),
             Err(crate::query::results::ResultReadError::Cancelled) => DispatchedQuery::Cancelled,
             Err(crate::query::results::ResultReadError::Sql(_))
@@ -6858,17 +6884,23 @@ impl Graph {
     /// snapshot and ONE parse of every `content match` payload, the same values
     /// the walk reads (I-12). Returned as the two owned pieces the borrow in
     /// `LoweringInputs` needs.
-    fn direct_lowering_inputs(
+    fn direct_lowering_registry(
         &self,
-        query: &crate::query::ir::Query,
-    ) -> (
-        Arc<crate::query::registry::Registry>,
-        crate::query::eval::CompiledLeaves,
-    ) {
-        (
-            self.property_registry(),
-            crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter()),
-        )
+        has_properties: bool,
+        generation: u64,
+        job: &mut crate::direct_projection::DirectQueryJob<'_>,
+    ) -> Result<Arc<crate::query::registry::Registry>, crate::query::results::ResultReadError> {
+        let config = self.config.parse_config();
+        if !has_properties {
+            return Ok(Arc::new(crate::query::registry::Registry::empty(&config)));
+        }
+        self.query_property_registry_at(generation, &config, job)
+            .map_err(|error| match error {
+                crate::query::QueryExecutionError::Cancelled => {
+                    crate::query::results::ResultReadError::Cancelled
+                }
+                _ => crate::query::results::ResultReadError::Corrupt(error.to_string()),
+            })
     }
 
     fn direct_projection_statement_page_rows(
@@ -6878,34 +6910,32 @@ impl Graph {
         bounds: crate::query::ir::Bounds,
     ) -> DispatchedQuery<crate::query::results::PageAnswer> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
-        let fts_ready = {
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            match self.direct_projection.lock().unwrap().as_ref() {
-                Some(projection) => projection.fts_ready(generation),
-                None => return DispatchedQuery::Declined,
-            }
-        };
-        let (registry, compiled) = self.direct_lowering_inputs(query);
-        let statement = lower_query(
-            query,
-            &LoweringInputs {
-                today,
-                registry: &registry,
-                masked_pages: &[],
-                // NOT `max_rows`: the page loop's `exceeded` is decided by the
-                // row AFTER the cap, so a `LIMIT` would hide it.
-                cutoff: None,
-                compiled: &compiled,
-                fts_ready,
-                result_set_rule: RESULT_SET_RULE,
-            },
-        );
-        // A filter that folded to false — an invalid query's zero results
-        // (§3.5), or a leaf that can never hold — has its answer already.
-        if statement.matches_nothing {
+        if query.is_invalid() {
             return DispatchedQuery::Answered(crate::query::results::PageAnswer::default());
         }
-        self.direct_projection_query_job(|job| {
+        self.direct_projection_query_job(|job, generation, fts_ready| {
+            let registry =
+                self.direct_lowering_registry(query.filter.has_props_leaf(), generation, job)?;
+            let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+            let statement = lower_query(
+                query,
+                &LoweringInputs {
+                    today,
+                    registry: &registry,
+                    masked_pages: &[],
+                    // NOT `max_rows`: the page loop's `exceeded` is decided by the
+                    // row AFTER the cap, so a `LIMIT` would hide it.
+                    cutoff: None,
+                    compiled: &compiled,
+                    fts_ready,
+                    result_set_rule: RESULT_SET_RULE,
+                },
+            );
+            // A filter that folded to false — an invalid query's zero results
+            // (§3.5), or a leaf that can never hold — has its answer already.
+            if statement.matches_nothing {
+                return Ok(crate::query::results::PageAnswer::default());
+            }
             crate::query::results::read_page_results(
                 &mut job.snapshot,
                 &statement,
@@ -6929,46 +6959,43 @@ impl Graph {
         bounds: crate::query::ir::Bounds,
     ) -> DispatchedQuery<Vec<usize>> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
-        let fts_ready = {
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            match self.direct_projection.lock().unwrap().as_ref() {
-                Some(projection) => projection.fts_ready(generation),
-                None => return DispatchedQuery::Declined,
-            }
-        };
-        let profile = crate::query::ConstructionProfile::from_view(view);
-        // One lowering per probe, all under ONE registry snapshot: a probe that
-        // read a different effective type than its siblings would explain a
-        // query nobody ran.
-        let registry = self.property_registry();
-        let page_anchored = probes
-            .first()
-            .is_some_and(|probe| probe.anchor == crate::query::ir::Anchor::Page);
-        let lowered = probes
-            .iter()
-            .map(|probe| {
-                let probe = if page_anchored {
-                    probe.clone()
-                } else {
-                    crate::query::block_anchored_query(probe)
-                };
-                let compiled =
-                    crate::query::eval::CompiledLeaves::for_query(&probe.evaluable_filter());
-                lower_query(
-                    &probe,
-                    &LoweringInputs {
-                        today,
-                        registry: &registry,
-                        masked_pages: &[],
-                        cutoff: None,
-                        compiled: &compiled,
-                        fts_ready,
-                        result_set_rule: RESULT_SET_RULE,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        self.direct_projection_query_job(|job| {
+        self.direct_projection_query_job(|job, generation, fts_ready| {
+            let profile = crate::query::ConstructionProfile::from_view(view);
+            // One lowering per probe, all under ONE registry snapshot: a probe that
+            // read a different effective type than its siblings would explain a
+            // query nobody ran.
+            let registry = self.direct_lowering_registry(
+                probes.iter().any(|probe| probe.filter.has_props_leaf()),
+                generation,
+                job,
+            )?;
+            let page_anchored = probes
+                .first()
+                .is_some_and(|probe| probe.anchor == crate::query::ir::Anchor::Page);
+            let lowered = probes
+                .iter()
+                .map(|probe| {
+                    let probe = if page_anchored {
+                        probe.clone()
+                    } else {
+                        crate::query::block_anchored_query(probe)
+                    };
+                    let compiled =
+                        crate::query::eval::CompiledLeaves::for_query(&probe.evaluable_filter());
+                    lower_query(
+                        &probe,
+                        &LoweringInputs {
+                            today,
+                            registry: &registry,
+                            masked_pages: &[],
+                            cutoff: None,
+                            compiled: &compiled,
+                            fts_ready,
+                            result_set_rule: RESULT_SET_RULE,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
             let identity = crate::query::results::ResultIdentity::DirectStructural {
                 session_pages: Arc::clone(&job.session_pages),
                 all_session: false,
@@ -16619,6 +16646,32 @@ impl Graph {
         self.property_registry().generation()
     }
 
+    /// A strict registry for an already-acquired query snapshot. The old UI
+    /// debounce and document fallback are not eligible sources for this read.
+    pub(crate) fn query_property_registry_at(
+        &self,
+        source_generation: u64,
+        config: &crate::config::ParseConfig,
+        job: &mut crate::direct_projection::DirectQueryJob<'_>,
+    ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
+        if job.snapshot.cancellation().is_cancelled() {
+            return Err(crate::query::QueryExecutionError::Cancelled);
+        }
+        {
+            let guard = self.property_registry.read().unwrap();
+            if let Some(state) = guard.as_ref() {
+                if state.source_generation == source_generation
+                    && state.registry.config_digest() == config.digest()
+                    && !state.declarations_dirty
+                {
+                    return Ok(Arc::clone(&state.registry));
+                }
+            }
+        }
+        let built = job.read_registry(config)?;
+        Ok(self.publish_property_registry(built, source_generation))
+    }
+
     /// A page was saved. When its name IS a property key, the registry's
     /// declarations may have changed even though no row did, so mark the
     /// snapshot for rebuild; a non-key save changes nothing here (the page-cache
@@ -16668,21 +16721,29 @@ impl Graph {
             &|page_id: &str| pages.get(page_id).cloned(),
             config,
         );
-        let mut guard = self.property_registry.write().unwrap();
-        let previous = guard.as_ref();
-        let previous_generation = previous.map_or(0, |state| state.registry.generation());
         let built = match built {
             Ok(built) => built,
             // A snapshot-consistency defect (a row naming an absent page) is not
             // a reason to answer with a half-built table: keep the last good
             // snapshot and try again at the next generation.
             Err(_) => {
-                if let Some(state) = previous {
+                if let Some(state) = self.property_registry.read().unwrap().as_ref() {
                     return Arc::clone(&state.registry);
                 }
                 crate::query::registry::Registry::empty(config)
             }
         };
+        self.publish_property_registry(built, source_generation)
+    }
+
+    fn publish_property_registry(
+        &self,
+        built: crate::query::registry::Registry,
+        source_generation: u64,
+    ) -> Arc<crate::query::registry::Registry> {
+        let mut guard = self.property_registry.write().unwrap();
+        let previous = guard.as_ref();
+        let previous_generation = previous.map_or(0, |state| state.registry.generation());
         let digest_changed = previous
             .map(|state| state.registry.config_digest() != built.config_digest())
             .unwrap_or(true);
@@ -16695,6 +16756,13 @@ impl Graph {
             previous_generation
         };
         let registry = Arc::new(built.with_generation(generation));
+        // A later edit does not invalidate the old coherent answer, but that
+        // answer must not replace the registry used by a newer query capture.
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != source_generation
+            || registry.config_digest() != self.config.parse_config().digest()
+        {
+            return registry;
+        }
         *guard = Some(PropertyRegistryState {
             registry: Arc::clone(&registry),
             source_generation,
@@ -16702,6 +16770,20 @@ impl Graph {
             declarations_dirty: false,
         });
         registry
+    }
+
+    fn registry_generation_for_memo(&self, sensitivity: CacheSensitivity, key: &str) -> u64 {
+        if sensitivity.is_props_sensitive(key) {
+            self.property_registry().generation()
+        } else {
+            // A text/task/reference query cannot observe property types. It
+            // must not trigger a whole-registry refresh merely to check a memo.
+            self.property_registry
+                .read()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |state| state.registry.generation())
+        }
     }
 
     fn derived_memo_bounded(
@@ -16783,7 +16865,37 @@ impl Graph {
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
         let config_digest = self.config.parse_config().digest();
-        let registry_gen = self.property_registry().generation();
+        let registry_gen = self.registry_generation_for_memo(sensitivity, &key);
+        self.try_derived_memo_entry(
+            key,
+            sensitivity,
+            DerivedMemoStamp {
+                gen,
+                today,
+                config_digest,
+                registry_gen,
+            },
+            || Ok::<_, std::convert::Infallible>(compute()),
+        )
+        .unwrap_or_else(|never| match never {})
+    }
+
+    /// The shared cache owner accepts errors from query execution. Only a
+    /// successful result is eligible for publication; readiness and cancellation
+    /// cannot poison a later retry with a fabricated empty cache entry.
+    fn try_derived_memo_entry<E>(
+        &self,
+        key: String,
+        sensitivity: CacheSensitivity,
+        stamp: DerivedMemoStamp,
+        compute: impl FnOnce() -> Result<DerivedEntry, E>,
+    ) -> Result<DerivedEntry, E> {
+        let DerivedMemoStamp {
+            gen,
+            today,
+            config_digest,
+            registry_gen,
+        } = stamp;
         {
             let mut g = self.derived_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {
@@ -16799,16 +16911,16 @@ impl Graph {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
                         touch_lru(&mut dc.lru, &key);
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
         }
-        let result = compute();
+        let result = compute()?;
         let result_bytes = ref_groups_estimated_bytes(result.result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
-            return result;
+            return Ok(result);
         }
         let props = sensitivity.is_props_sensitive(&key);
         let mut g = self.derived_cache.write().unwrap();
@@ -16847,7 +16959,7 @@ impl Graph {
                 });
             }
         }
-        result
+        Ok(result)
     }
 
     fn derived_memo(
@@ -16877,7 +16989,7 @@ impl Graph {
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
         let config_digest = self.config.parse_config().digest();
-        let registry_gen = self.property_registry().generation();
+        let registry_gen = self.registry_generation_for_memo(sensitivity, &key);
         {
             let mut g = self.advanced_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {

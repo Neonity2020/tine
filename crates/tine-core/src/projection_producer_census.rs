@@ -1995,9 +1995,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // IR route) add no `tine_storage` token at all: they decode through this
     // module's existing row helpers and reuse the snapshots their callers
     // already own.
+    // RET2 (2026-09-08): DirectQueryJob::read_registry adds a scoped
+    // MaterializationError import and Corrupt decoding/classification sites.
+    // It streams narrow registry metadata on the existing read-only snapshot;
+    // no writable storage entrypoint or write-crossing table entry changed.
+    // This is a new reviewed surface change, not an inherited test failure.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "9f1774d5021d44c533036f73074b2fc21f8f26431455e6a5fbebd5fe7855e839",
+        "f01051e75f980068945b7a975972c17a661048ef999b5532056806f1f7ae8ed2",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

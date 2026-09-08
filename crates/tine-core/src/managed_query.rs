@@ -23,8 +23,8 @@
 //! ([`crate::query::results::read_results_merged`]), so the answer is exactly
 //! what the actor walk would have produced over the same pending state — same
 //! rows, same order, same `total` and `exceeded`, same public ids — and it
-//! still loads no page document and parses nothing. The walk stays as the
-//! recovery path (`Busy`, `Cancelled`, a third `Stale`) and as the oracle.
+//! still loads no page document and parses nothing. Traversal remains only as
+//! the independent test oracle; readiness and cancellation are typed outcomes.
 //!
 //! R5c lifts the last pending exclusion: a query with a property leaf is
 //! captured too, and the registry it is lowered under is the actor's ACCEPTED
@@ -197,7 +197,11 @@ impl ManagedQueryAnswer {
 }
 
 /// What one execution attempt produced. There is no fifth state: an attempt
-/// answers, or the handle re-captures (`Stale`), or the walk answers.
+/// answers, or the handle re-captures (`Stale`), or the public route reports a
+/// typed `query::QueryExecutionError` (RET2 — the walk that used to answer the
+/// remaining states is gone). The doc comments on the variants below are the
+/// EXECUTOR's view; `sync_runtime::managed_execution_error` owns how each one
+/// is classified for a caller.
 #[derive(Debug)]
 pub(crate) enum ManagedQueryOutcome {
     /// The statement answered from the snapshot; pre-view, un-ordered.
@@ -205,10 +209,10 @@ pub(crate) enum ManagedQueryOutcome {
     /// The file's stamp no longer matches the capture: an accepted batch
     /// landed between the turn and the open. Not a failure — re-capture.
     Stale,
-    /// No slot freed within the owner's wait. The walk answers; counted.
+    /// No slot freed, or the pending overlay has not flushed within the wait.
     Busy,
     /// The owner cancelled the job (a drain before a file replacement, or
-    /// close). The walk answers; nothing is counted and nothing is recovered.
+    /// close). Nothing is counted and nothing is recovered.
     Cancelled,
     /// A read was attempted and did not answer: an unopenable file, a seam
     /// refusal or a projection that contradicts itself. The reason names a
@@ -232,6 +236,13 @@ pub(crate) struct ManagedQueryCensus {
     pub(crate) pending_reads: AtomicUsize,
     /// Queries the walk answered because the executor reported `Busy`, or
     /// `Stale` more times than the handle re-captures.
+    ///
+    /// **RET2 left this counter with no producer, deliberately.** The public
+    /// Managed routes no longer have a walk to fall back to: `Busy` and an
+    /// exhausted re-capture are now typed `NotReady` answers the frontend
+    /// retries. The field stays because it is the WITNESS — every gate that
+    /// asserts a census reads it, and a future packet that quietly reconnects
+    /// the oracle would have to increment it here first.
     pub(crate) fallback_reads: AtomicUsize,
     /// Executions that reported `Failed`; the caller received an error.
     pub(crate) failed_reads: AtomicUsize,
@@ -262,10 +273,6 @@ impl ManagedQueryCensus {
 
     pub(crate) fn note_pending_read(&self) {
         self.pending_reads.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn note_fallback_read(&self) {
-        self.fallback_reads.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_failed_read(&self) {
@@ -304,7 +311,7 @@ impl ManagedQueryCensus {
 }
 
 /// How many times the handle re-captures after a `Stale` execution before it
-/// takes the walk. Two accepted batches landing inside one query's capture
+/// reports pending readiness. Two accepted batches landing inside one query's capture
 /// window is a burst; three is a runtime that is not going to settle for this
 /// answer.
 pub(crate) const MAX_STALE_RECAPTURES: usize = 2;
@@ -553,7 +560,7 @@ fn answer_total(answer: &ManagedQueryAnswer) -> usize {
 /// exactly the queueing the slot exists to prevent (`query_jobs.rs`: "a job
 /// that is waiting for a slot holds its request intent and nothing else", plan
 /// §2B). A flush is ONE in-process worker turn; a wait that long has already
-/// told us the worker is not going to answer in time, and the walk will.
+/// told us to yield capacity and report temporary readiness.
 pub(crate) const OVERLAY_FLUSH_WAIT: Duration =
     Duration::from_millis(crate::query_jobs::QUERY_JOB_WAIT.as_millis() as u64 / 10);
 
@@ -574,19 +581,16 @@ fn execute_pending_on_slot(
 ) -> ManagedQueryOutcome {
     use crate::managed_overlay::OverlayOpen;
 
-    // (1) The OVERLAY first, at exactly one published state. `Unavailable` —
-    // not flushed within the budget, incomplete content, or a worker that
-    // failed — is `Busy`: the walk answers and a fallback is counted.
-    // Availability over refusal (`managed_overlay.rs` module doc) is R5b's
-    // shipped disposition and supersedes the R5 design note's `Failed`; a cache
-    // that could not be built costs a walk, and only a damaged ROW inside a
-    // successfully opened, validated snapshot is `Failed` (D-3).
+    // (1) The OVERLAY first, at exactly one published state. Only unfinished
+    // work is retryable readiness. A failed worker or unreadable file cannot
+    // become ready by waiting and must surface a bounded execution failure.
     let (mut overlay, state) = match pending
         .overlay
         .open_snapshot(pending.required_revision, OVERLAY_FLUSH_WAIT)
     {
         OverlayOpen::Snapshot { snapshot, state } => (snapshot, state),
-        OverlayOpen::Unavailable => return ManagedQueryOutcome::Busy,
+        OverlayOpen::Pending => return ManagedQueryOutcome::Busy,
+        OverlayOpen::Failed(reason) => return ManagedQueryOutcome::Failed(reason),
         OverlayOpen::Stale => return ManagedQueryOutcome::Stale,
         OverlayOpen::Closed => return ManagedQueryOutcome::Cancelled,
     };
@@ -1077,8 +1081,8 @@ struct ApplicationSimpleQueryMemoEntry {
 /// when the registry generation advances. Since R5b a pending suffix is part
 /// of the stamp (`overlay_revision`) rather than a reason to have none, so a
 /// pending answer is memoized too and every pending save moves the stamp and
-/// clears it. Filled by the executor after a successful read and by the walk
-/// after a complete evaluation; NEVER after `Stale`, `Busy`, `Cancelled` or
+/// clears it. Filled by the executor after a successful read;
+/// NEVER after `Stale`, `Busy`, `Cancelled` or
 /// `Failed`, which are not answers.
 ///
 /// It is a cache of a pure function over durable evidence, never authority: a
@@ -1346,10 +1350,10 @@ mod tests {
             "executes on\nthe calling thread after the actor's operation lock is released",
             "the same owner every off-actor read of that file is admitted\nby",
             "only while that stamp is still the actor's current stamp",
-            "re-captures at most twice, then walks",
-            "`Cancelled` (a drain caught it) walks and is\nnot counted as a fallback",
+            "re-captures at most twice, then reports",
+            "cancelled and is not counted as a fallback",
             "a `Failed` read is an error",
-            "A pending local suffix is not a reason to walk by\nitself",
+            "These routes never traverse the parsed graph",
             "closed in exactly three places",
             "writes a checkpoint sidecar, never a WAL\ncheckpoint",
         ] {
@@ -1386,10 +1390,8 @@ base order",
             "**The answer is the walk's answer**",
             "no page document is
 loaded and nothing is parsed",
-            "opens `Unavailable`
-and the query walks as a counted fallback",
-            "Only a damaged ROW inside a snapshot that opened and validated is
-`Failed`",
+            "with a live worker opens `Pending` and reports temporary readiness",
+            "stopped worker and an unreadable file open `Failed`, never endless readiness",
             "reachable from both sources —
 is `Failed` too rather than answered twice",
         ] {

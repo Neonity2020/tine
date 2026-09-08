@@ -1,6 +1,57 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+#[test]
+fn query_execution_errors_are_not_memoized_as_empty_results() {
+    use crate::query::{
+        QueryExecutionError as Error, QueryReadinessReason, QueryUnavailableReason,
+    };
+    let root = scratch("query-error-memo");
+    let graph = Graph::open(&root);
+    let stamp = DerivedMemoStamp {
+        gen: graph.cache_generation(),
+        today: crate::date::JournalDate::today().ordinal_key(),
+        config_digest: graph.config.parse_config().digest(),
+        registry_gen: 0,
+    };
+    for (index, error) in [
+        Error::NotReady(QueryReadinessReason::Indexing),
+        Error::Unavailable(QueryUnavailableReason::ReadFailed),
+        Error::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = format!("query-error-{index}");
+        let failed = graph.try_derived_memo_entry(
+            key.clone(),
+            CacheSensitivity::Known(false),
+            stamp,
+            || Err(error),
+        );
+        assert!(matches!(failed, Err(actual) if actual == error));
+        let retried = std::cell::Cell::new(false);
+        let success = graph
+            .try_derived_memo_entry(key.clone(), CacheSensitivity::Known(false), stamp, || {
+                retried.set(true);
+                Ok::<_, Error>(DerivedEntry::plain(BoundedRefGroups {
+                    groups: Arc::new(Vec::new()),
+                    total: 0,
+                    exceeded: false,
+                }))
+            })
+            .unwrap();
+        assert!(retried.get(), "failure must leave a later attempt runnable");
+        let cached = graph
+            .try_derived_memo_entry(key, CacheSensitivity::Known(false), stamp, || {
+                Err(Error::Cancelled)
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&success.result.groups, &cached.result.groups));
+    }
+    crate::test_support::remove_dir_all(root);
+}
+
 // DUP mapping semantics (2026-08-25 duplication audit): both tree walkers
 // delegate every block to the one shared field mapping, so identical DTO
 // input must produce identical parseable trees (identity, format flag,

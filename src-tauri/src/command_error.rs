@@ -69,6 +69,13 @@ pub(crate) enum CoreCommandError {
     SyncRuntimeRequest(tine_core::sync_runtime::SyncRuntimeRequestError),
     FastCommit(tine_core::fast_commit::FastCommitError),
     MergeRefused(tine_core::sync_diff::MergeRefused),
+    /// RET2: the bounded availability of ONE query execution, independent of
+    /// which backend produced it. Managed storage reaches the wire through
+    /// `SyncApplicationPageRequestError::QueryExecution`, which forwards the
+    /// same encoder; this variant is what lets a Direct Files producer hand the
+    /// core error over directly, so the two backends cannot drift into two
+    /// spellings of "the query index is not ready".
+    QueryExecution(tine_core::query::QueryExecutionError),
 }
 
 pub(crate) trait IntoCommandErrorProse {
@@ -276,6 +283,7 @@ impl fmt::Display for CoreCommandError {
             Self::SyncRuntimeRequest(error) => error.fmt(formatter),
             Self::FastCommit(error) => error.fmt(formatter),
             Self::MergeRefused(error) => error.fmt(formatter),
+            Self::QueryExecution(error) => error.fmt(formatter),
         }
     }
 }
@@ -284,6 +292,10 @@ impl CoreCommandError {
     fn wire(&self) -> String {
         match self {
             Self::SyncApplicationPageRequest(error) => error.backend_wire_string(),
+            // The canonical encoder, not a second spelling of it: the same
+            // `query-not-ready` / `query-unavailable` / `operation-cancelled`
+            // payloads `backend.ts` already classifies.
+            Self::QueryExecution(error) => error.backend_wire_string(),
             _ => self.to_string(),
         }
     }
@@ -346,6 +358,7 @@ core_conversion!(
 );
 core_conversion!(tine_core::fast_commit::FastCommitError, FastCommit);
 core_conversion!(tine_core::sync_diff::MergeRefused, MergeRefused);
+core_conversion!(tine_core::query::QueryExecutionError, QueryExecution);
 
 #[cfg(test)]
 mod tests {
@@ -655,5 +668,92 @@ mod tests {
             proven.insert(row.format_family);
         }
         assert_eq!(proven.len(), PHASE_B_PRODUCER_MANIFEST.len());
+    }
+
+    /// RET2: one query-execution error, two producers, ONE wire payload.
+    ///
+    /// Managed storage reaches the boundary as
+    /// `SyncApplicationPageRequestError::QueryExecution`; a Direct Files
+    /// producer hands the core error over directly. Both are `Core`, both go
+    /// through `QueryExecutionError::backend_wire_string`, and what arrives is
+    /// exactly the tagged JSON `backend.ts` classifies — `query-not-ready`
+    /// (retried by `runQueryWhenReady`), `query-unavailable` (reported once,
+    /// with a bounded message and no path, SQL or source text) and
+    /// `operation-cancelled`. A prose message here would silently disable the
+    /// frontend's readiness retry.
+    #[test]
+    fn ret2_query_execution_reaches_the_wire_through_one_encoder() {
+        use tine_core::query::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
+        use tine_core::sync_runtime::SyncApplicationPageRequestError;
+
+        let cases = [
+            (
+                QueryExecutionError::NotReady(QueryReadinessReason::PendingEdits),
+                r#"{"kind":"query-not-ready","reason_code":"pending_edits"}"#,
+            ),
+            (
+                QueryExecutionError::NotReady(QueryReadinessReason::Busy),
+                r#"{"kind":"query-not-ready","reason_code":"busy"}"#,
+            ),
+            (
+                QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed),
+                r#"{"detail":{"message":"The query index could not be read."},"kind":"query-unavailable","reason_code":"read_failed"}"#,
+            ),
+            (
+                QueryExecutionError::Unavailable(QueryUnavailableReason::InvalidSnapshot),
+                r#"{"detail":{"message":"The query index returned inconsistent results."},"kind":"query-unavailable","reason_code":"invalid_snapshot"}"#,
+            ),
+            (
+                QueryExecutionError::Cancelled,
+                r#"{"kind":"operation-cancelled"}"#,
+            ),
+        ];
+        for (error, wire) in cases {
+            let direct = CommandError::from(error);
+            assert_eq!(variant_name(&direct), "Core");
+            assert_eq!(
+                tauri::ipc::InvokeError::from(direct).0,
+                wire,
+                "the Direct producer's payload",
+            );
+            let managed =
+                CommandError::from(SyncApplicationPageRequestError::QueryExecution(error));
+            assert_eq!(variant_name(&managed), "Core");
+            assert_eq!(
+                tauri::ipc::InvokeError::from(managed).0,
+                wire,
+                "the Managed producer's payload must be byte-identical",
+            );
+        }
+    }
+
+    /// Every OTHER application-page refusal keeps the wire it had before RET2
+    /// added a variant to the enum.
+    #[test]
+    fn ret2_preserves_the_other_application_page_error_wires() {
+        use tine_core::sync_runtime::{SyncApplicationPageRequestError, SyncEditorRefusalCode};
+
+        let cases: [(SyncApplicationPageRequestError, &str); 3] = [
+            (
+                SyncApplicationPageRequestError::ActorUnavailable,
+                "sync actor is unavailable",
+            ),
+            (
+                SyncApplicationPageRequestError::ActorRefusedAt("application_navigation"),
+                "sync actor refused application page intent at application_navigation",
+            ),
+            (
+                SyncApplicationPageRequestError::ActorRefusedWithCode(
+                    SyncEditorRefusalCode::FallbackReadmission,
+                ),
+                r#"{"kind":"managed-actor-refusal","reason_code":"fallback.readmission"}"#,
+            ),
+        ];
+        for (error, wire) in cases {
+            assert_eq!(
+                tauri::ipc::InvokeError::from(CommandError::from(error)).0,
+                wire
+            );
+        }
     }
 }

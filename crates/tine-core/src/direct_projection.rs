@@ -64,6 +64,16 @@ fn direct_registry_page_key(page_id: [u8; 16]) -> String {
     format!("page:{}", hex16(page_id))
 }
 
+#[cfg(test)]
+thread_local! {
+    static REGISTRY_READ_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_registry_read_attempts() -> u64 {
+    REGISTRY_READ_ATTEMPTS.with(|count| count.replace(0))
+}
+
 fn hex16(id: [u8; 16]) -> String {
     let mut out = String::with_capacity(32);
     for byte in id {
@@ -391,6 +401,112 @@ pub(crate) struct DirectQueryJob<'a> {
     /// The pages whose rows this process lowered (see
     /// `ProjectionShared::session_pages`), as of the snapshot.
     pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+}
+
+impl DirectQueryJob<'_> {
+    /// Registry input and selection share this owned transaction. This scans
+    /// metadata, not result payload; inference remains build_registry's job.
+    pub(crate) fn read_registry(
+        &mut self,
+        config: &ParseConfig,
+    ) -> Result<crate::query::registry::Registry, crate::query::QueryExecutionError> {
+        #[cfg(test)]
+        REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
+        use crate::query::registry::{OwnerRow, OwnerType, PageMeta};
+        use crate::query::results::{blob16, integer, text};
+        use crate::query::{QueryExecutionError as Error, QueryUnavailableReason as Reason};
+        use std::ops::ControlFlow;
+        use tine_storage::sqlite::MaterializationError;
+
+        let mut pages = HashMap::new();
+        let mut rows = Vec::new();
+        let read = (|| -> Result<(), MaterializationError> {
+            self.snapshot.visit_projection_query(
+                "SELECT page_id, path, name, text_kind FROM pages",
+                &[],
+                |row| {
+                    let decode = || -> Result<_, String> {
+                        let id = blob16(row, 0, "pages.page_id")?;
+                        let path = text(row, 1, "pages.path")?;
+                        let name = text(row, 2, "pages.name")?;
+                        if !matches!(integer(row, 3, "pages.text_kind")?, 0 | 1) {
+                            return Err("invalid registry page kind".into());
+                        }
+                        Ok((
+                            direct_registry_page_key(id),
+                            PageMeta {
+                                format: Format::from_path(Path::new(&path)).into(),
+                                name,
+                            },
+                        ))
+                    };
+                    let (id, meta) = decode().map_err(MaterializationError::Corrupt)?;
+                    if pages.insert(id, meta).is_some() {
+                        return Err(MaterializationError::Corrupt(
+                            "duplicate registry page".into(),
+                        ));
+                    }
+                    Ok(ControlFlow::Continue(()))
+                },
+            )?;
+            self.snapshot.visit_projection_query(
+                "SELECT o.owner_type, o.owner_id, o.page_id, o.name, o.normalized_name, \
+                 o.value, o.ordinal, b.page_id FROM properties o \
+                 LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id \
+                 ORDER BY o.owner_type, o.owner_id, o.name, o.ordinal",
+                &[],
+                |row| {
+                    let decode = || -> Result<OwnerRow, String> {
+                        let owner_id = blob16(row, 1, "properties.owner_id")?;
+                        let page_id = blob16(row, 2, "properties.page_id")?;
+                        let (owner_type, prefix) = match integer(row, 0, "properties.owner_type")? {
+                            0 if owner_id == page_id => (OwnerType::Page, "p"),
+                            1 if blob16(row, 7, "blocks.page_id")? == page_id => {
+                                (OwnerType::Block, "b")
+                            }
+                            _ => return Err("invalid registry property ownership".into()),
+                        };
+                        let page_id = direct_registry_page_key(page_id);
+                        if !pages.contains_key(&page_id) {
+                            return Err("registry property names an absent page".into());
+                        }
+                        Ok(OwnerRow {
+                            owner_type,
+                            owner_id: format!("{prefix}:{}", hex16(owner_id)),
+                            page_id,
+                            source_name: text(row, 3, "properties.name")?,
+                            normalized_name: text(row, 4, "properties.normalized_name")?,
+                            value: text(row, 5, "properties.value")?,
+                            ordinal: u32::try_from(integer(row, 6, "properties.ordinal")?)
+                                .map_err(|_| "invalid registry property ordinal".to_owned())?,
+                        })
+                    };
+                    rows.push(decode().map_err(MaterializationError::Corrupt)?);
+                    Ok(ControlFlow::Continue(()))
+                },
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = read {
+            return Err(if self.snapshot.cancellation().is_cancelled() {
+                Error::Cancelled
+            } else if matches!(error, MaterializationError::Corrupt(_)) {
+                Error::Unavailable(Reason::InvalidSnapshot)
+            } else {
+                Error::Unavailable(Reason::ReadFailed)
+            });
+        }
+        let registry = crate::query::registry::build_registry(
+            rows.into_iter(),
+            &|page| pages.get(page).cloned(),
+            config,
+        )
+        .map_err(|_| Error::Unavailable(Reason::InvalidSnapshot))?;
+        if self.snapshot.cancellation().is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok(registry)
+    }
 }
 
 #[cfg(test)]
@@ -1108,6 +1224,8 @@ impl DirectProjection {
         HashMap<String, crate::query::registry::PageMeta>,
     )> {
         use crate::query::registry::{OwnerRow, OwnerType, PageMeta};
+        #[cfg(test)]
+        REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
 
         if !self.ready_at(cache_generation) {
             return None;
@@ -4817,6 +4935,122 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    #[test]
+    fn query_registry_snapshot_preserves_old_reads_without_publishing_over_new_edits() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("registry-snapshot");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        let source = root.join("pages/Source.md");
+        std::fs::write(&source, "score:: 1\n- TODO task\n  score:: 2\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let old_generation = graph.cache_generation();
+        let QueryJobOpen::Job(mut old_job) = projection.open_query_job(old_generation) else {
+            panic!("initial snapshot must be ready");
+        };
+        let config = graph.config.parse_config();
+        let old = old_job.read_registry(&config).unwrap();
+        assert!(!old.rows().is_empty());
+        let legacy = graph.property_registry();
+        assert!(
+            old.rows_equal(&legacy),
+            "the shared inference producer must agree"
+        );
+
+        std::fs::write(&source, "score:: word\n- TODO task\n  score:: another\n").unwrap();
+        graph.invalidate_cache();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        let new_generation = graph.cache_generation();
+        assert_ne!(old_generation, new_generation);
+        let QueryJobOpen::Job(mut new_job) = projection.open_query_job(new_generation) else {
+            panic!("updated snapshot must be ready");
+        };
+        let new = graph
+            .query_property_registry_at(new_generation, &config, &mut new_job)
+            .unwrap();
+        assert!(!old.rows_equal(&new), "the property type changed");
+        let retained = graph
+            .query_property_registry_at(old_generation, &config, &mut old_job)
+            .unwrap();
+        assert!(
+            old.rows_equal(&retained),
+            "later edits preserve the acquired read"
+        );
+        assert!(
+            new.rows_equal(&graph.property_registry()),
+            "old readers cannot overwrite the new registry"
+        );
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "registry reads retain no Documents"
+        );
+    }
+
+    #[test]
+    fn query_registry_snapshot_rejects_orphaned_property_owners() {
+        use crate::query::{QueryExecutionError, QueryUnavailableReason};
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("registry-orphan");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Source.md"), "- TODO task\n  score:: 2\n").unwrap();
+        let graph = Graph::open(&root);
+        let database = root.join("private/projection.sqlite");
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let damage = rusqlite::Connection::open(&database).unwrap();
+        damage.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        damage.execute("DELETE FROM blocks", []).unwrap();
+        drop(damage);
+        let projection = graph.direct_projection_test().unwrap();
+        // The old row adapter accepted this impossible owner: pin the failure
+        // scenario independently of the new visitor's implementation.
+        assert!(!projection
+            .property_owner_rows(graph.cache_generation())
+            .unwrap()
+            .0
+            .is_empty());
+        let QueryJobOpen::Job(mut job) = projection.open_query_job(graph.cache_generation()) else {
+            panic!("the schema still opens before corrupt ownership is inspected");
+        };
+        assert!(matches!(
+            job.read_registry(&graph.config.parse_config()),
+            Err(QueryExecutionError::Unavailable(
+                QueryUnavailableReason::InvalidSnapshot
+            ))
+        ));
+        assert!(!graph.has_parsed_cache_test());
+    }
+
+    #[test]
+    fn task_query_does_not_refresh_property_registry() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("task-no-registry");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Source.md"), "- TODO task\n  score:: 2\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        take_registry_read_attempts();
+        let result = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert_eq!(result.total, 1);
+        assert_eq!(
+            take_registry_read_attempts(),
+            0,
+            "a task query must not scan property metadata to check its memo"
+        );
+        assert!(!graph.has_parsed_cache_test());
     }
 
     /// **R6 §1, cold.** A fresh projection streams its build: every page is
