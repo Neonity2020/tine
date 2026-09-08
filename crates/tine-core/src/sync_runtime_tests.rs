@@ -10,7 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[path = "live_write_benchmark.rs"]
+#[cfg(test)]
+#[path = "live_write_benchmark_tests.rs"]
 mod live_write_benchmark;
 
 fn production_function_and_constructor_census() -> (
@@ -1747,11 +1748,12 @@ fn managed_save_refusals_cannot_be_constructed_without_a_site_name() {
     // The four arms of the two total error mappers plus the two
     // `editor_refusal_*` promoters. Each one only re-shapes a refusal that
     // some other site already decided; none of them is an origin.
-    const PERMITTED_PASS_THROUGH: [&str; 4] = [
+    const PERMITTED_PASS_THROUGH: [&str; 5] = [
         "SyncEditorRequestError::ActorRefused => SyncApplicationPageRequestError::ActorRefused,",
         "| SyncApplicationPageRequestError::ActorRefused => SyncEditorRequestError::ActorRefused,",
         "SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),",
         "SyncEditorRequestError::ActorRefused | SyncEditorRequestError::ActorRefusedAt(_) => {",
+        "| SyncApplicationPageRequestError::ActorRefused => {",
     ];
 
     let mut unattributed = Vec::new();
@@ -7510,14 +7512,18 @@ fn over_limit_restore_rediffs_case(label: &str, seed: u128) {
                 content: format!("changed before restore {chunk_ordinal}"),
             })
             .collect();
-        assert!(matches!(
-            actor.submit_local_mutation(OperationTransaction::new(operations).unwrap()),
-            SyncLocalMutationOutcome::Durable { .. }
-                | SyncLocalMutationOutcome::RetryableRetainedRecovery {
-                    batch_id: Some(_),
-                    ..
-                }
-        ));
+        let outcome = actor.submit_local_mutation(OperationTransaction::new(operations).unwrap());
+        assert!(
+            matches!(
+                outcome,
+                SyncLocalMutationOutcome::Durable { .. }
+                    | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: Some(_),
+                        ..
+                    }
+            ),
+            "retained-block edit chunk {chunk_ordinal}: {outcome:?}"
+        );
         phase(&format!("edit-chunk-{chunk_ordinal}-complete"));
     }
 
@@ -24246,11 +24252,6 @@ fn managed_cross_page_move_100_and_10000_page_manual_benchmark() {
                     after.engine.authenticated_page_identity_lookups,
                     "block-only move derivative must use exact SQLite page rows rather than the legacy authenticated scratch catalog",
                 );
-            assert_eq!(
-                    after_derivative.forbidden.graph_wide_catalog_validations,
-                    after.forbidden.graph_wide_catalog_validations,
-                    "block-only move derivative must reuse the retained catalog shape proof rather than validating the graph-sized catalog",
-                );
             last_derivative_detail = Some(after_derivative.derivative_stages);
             derivative_samples.push(derivative_started.elapsed());
         }
@@ -24349,9 +24350,8 @@ fn managed_page_mutations_100_and_10000_page_manual_benchmark() {
                         forbidden.archive_object_reads,
                         forbidden.projection_receipt_loads,
                         forbidden.graph_wide_catalog_decodes,
-                        forbidden.graph_wide_catalog_validations,
                     ),
-                    (0, 0, 0, 0, 0),
+                    (0, 0, 0, 0),
                     "{label} performed forbidden global/derivative work: {forbidden:?}"
                 );
                 assert_eq!(

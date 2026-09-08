@@ -1717,7 +1717,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.18.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.19.0\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -2067,9 +2067,16 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // open, bounded record read, exact preserve/create/replace publications,
     // nofollow lease revalidation and their import. No removals, new codec or
     // additional raw publication path; the directory open is registered above.
+    // P4 live retirable units: reviewed the complete 439 -> 444 row multiset.
+    // Full addresses use the shared AuthenticatedMapKey in checkpoint, cold,
+    // identity, receiver and SQLite seams. The live/sealed document maps now
+    // use one shared full-key map: the nested membership descriptor/read and
+    // its extra map writers are removed. Empty-root calls fall from 10 to 4.
+    // No physical write crossing or raw mutation site changed; both tables
+    // above remain unchanged. The certified dependency is v0.19.0.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "a434d79551ba12c6c3a1d56c5b2ce7948d0086121262a93af88ff24dc6e1758b",
+        "9795ea7ad956d44e84f54480e5537ae2c3fe0eb39ac972ac8a07c17deb2c2e76",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

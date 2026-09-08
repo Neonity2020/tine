@@ -63,7 +63,7 @@ pub const FAST_COMMIT_JOURNAL_DIR: &str = "fast-commit-journal-v1";
 ///
 /// Each field is incremented at the *real* boundary — the SQLite tail drain, an
 /// archive object read, a projection receipt load, a graph-wide catalog decode
-/// or validation, and an application page load — so asserting that a commit leaves them at
+/// and an application page load — so asserting that a commit leaves them at
 /// zero is a statement about reachable code, not about this module's own
 /// bookkeeping.
 ///
@@ -81,8 +81,6 @@ pub struct ForbiddenCommitWork {
     pub projection_receipt_loads: usize,
     /// Whole page-catalog CRDT documents decoded out of scratch.
     pub graph_wide_catalog_decodes: usize,
-    /// Whole page-catalog CRDT documents converted to values to re-prove shape.
-    pub graph_wide_catalog_validations: usize,
     /// Application page DTOs rebuilt from graph text.
     pub application_page_loads: usize,
 }
@@ -97,8 +95,6 @@ impl ForbiddenCommitWork {
                 - earlier.projection_receipt_loads,
             graph_wide_catalog_decodes: self.graph_wide_catalog_decodes
                 - earlier.graph_wide_catalog_decodes,
-            graph_wide_catalog_validations: self.graph_wide_catalog_validations
-                - earlier.graph_wide_catalog_validations,
             application_page_loads: self.application_page_loads - earlier.application_page_loads,
         }
     }
@@ -108,7 +104,6 @@ impl ForbiddenCommitWork {
             && self.archive_object_reads == 0
             && self.projection_receipt_loads == 0
             && self.graph_wide_catalog_decodes == 0
-            && self.graph_wide_catalog_validations == 0
             && self.application_page_loads == 0
     }
 }
@@ -120,7 +115,6 @@ thread_local! {
             archive_object_reads: 0,
             projection_receipt_loads: 0,
             graph_wide_catalog_decodes: 0,
-            graph_wide_catalog_validations: 0,
             application_page_loads: 0,
         })
     };
@@ -152,13 +146,6 @@ pub(crate) fn note_archive_object_read() {
 pub(crate) fn note_graph_wide_catalog_decode() {
     note_forbidden(|counters| {
         counters.graph_wide_catalog_decodes = counters.graph_wide_catalog_decodes.saturating_add(1);
-    });
-}
-
-pub(crate) fn note_graph_wide_catalog_validation() {
-    note_forbidden(|counters| {
-        counters.graph_wide_catalog_validations =
-            counters.graph_wide_catalog_validations.saturating_add(1);
     });
 }
 
@@ -851,7 +838,6 @@ mod tests {
             "note_sqlite_drain",
             "note_archive_object_read",
             "note_graph_wide_catalog_decode",
-            "note_graph_wide_catalog_validation",
             "note_application_page_load",
             "note_graph_text_inventory",
             "note_effective_identity_rebuild",
@@ -1587,8 +1573,6 @@ mod benchmark {
                         + performed.projection_receipt_loads,
                     graph_wide_catalog_decodes: forbidden.graph_wide_catalog_decodes
                         + performed.graph_wide_catalog_decodes,
-                    graph_wide_catalog_validations: forbidden.graph_wide_catalog_validations
-                        + performed.graph_wide_catalog_validations,
                     application_page_loads: forbidden.application_page_loads
                         + performed.application_page_loads,
                 };
