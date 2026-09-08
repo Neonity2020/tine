@@ -38,6 +38,11 @@ pub(crate) struct EvalCtx<'a> {
     pub(crate) is_journal: bool,
     pub(crate) page_name: &'a str,
     pub(crate) page_props: &'a [(String, String)],
+    /// Every ordinary block physically owned by this page, as the backend's
+    /// borrowed document forest. Page `blocks` quantifiers traverse this same
+    /// forest; the preamble is represented separately by `page_props` and is
+    /// therefore never admitted as a block-row element.
+    pub(crate) page_roots: &'a [DocBlock],
     pub(crate) today: JournalDate,
     pub(crate) compiled: &'a CompiledLeaves,
     /// The page's on-disk format: the atomizer parses a property value with the
@@ -257,13 +262,46 @@ pub(crate) fn eval_page(filter: &Filter, ctx: &EvalCtx) -> bool {
             },
             Leaf::Rel { rel, quant, pred } => match rel {
                 Rel::Props => eval_props(*quant, pred, ctx.page_props, ctx),
-                // A page's own refs, its blocks and its tag table are not walked
-                // by this evaluator: the OG DSL cannot express them and the
-                // page-anchored walk of Wave A reads only the page index.
+                Rel::Blocks => eval_page_blocks(*quant, pred, ctx),
+                // A page's own refs and tag table are not walked by this
+                // evaluator: no accepted page-row syntax reads them.
                 _ => false,
             },
         },
     }
+}
+
+/// Quantify over every ordinary block physically owned by this page.
+///
+/// The shared depth-first path-ref walk establishes each block as a fresh
+/// anchor, so its `refs` predicate sees that block's own refs, its ancestors'
+/// refs and this page's name. A nested `children` predicate continues to use
+/// [`eval_block`]'s existing rule of retaining the anchor's ancestor context.
+/// Result-parent suppression does not participate: this relation asks about
+/// every element independently and admits the outer page at most once.
+fn eval_page_blocks(quant: Quant, pred: &Filter, ctx: &EvalCtx) -> bool {
+    let mut answer = match quant {
+        Quant::Any => false,
+        Quant::Every | Quant::None => true,
+    };
+    let mut path_refs = PathRefCounts::new();
+    super::walk_path_refs(
+        ctx.page_roots,
+        &mut path_refs,
+        uses_path_refs(pred),
+        &mut |block, ancestor_refs| match quant {
+            Quant::Any => {
+                answer |= eval_block(pred, block, ancestor_refs, ctx);
+            }
+            Quant::Every => {
+                answer &= eval_block(pred, block, ancestor_refs, ctx);
+            }
+            Quant::None => {
+                answer &= !eval_block(pred, block, ancestor_refs, ctx);
+            }
+        },
+    );
+    answer
 }
 
 /// `Any` false / `Every` true on an empty collection (OData §5.1.1.13, Q5).
@@ -982,8 +1020,9 @@ pub(crate) fn like_matches(haystack: &str, pattern: &str) -> bool {
     matches(&parts, &haystack, 0)
 }
 
-/// Does this page row satisfy a `@page`-anchored query? Used by the page-anchored
-/// walk, which reads the page index and loads no document (K16).
+/// Does this page row satisfy a `@page`-anchored query? Page attributes and
+/// properties read the index facets; a `blocks` relation traverses the borrowed
+/// roots supplied by the page source without constructing another document.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn page_row_matches(
     query: &Filter,
@@ -991,6 +1030,7 @@ pub(crate) fn page_row_matches(
     kind: PageKind,
     journal: Option<i64>,
     page_props: &[(String, String)],
+    page_roots: &[DocBlock],
     format: AtomFormat,
     today: JournalDate,
     compiled: &CompiledLeaves,
@@ -1002,6 +1042,7 @@ pub(crate) fn page_row_matches(
         is_journal: kind == PageKind::Journal,
         page_name: name,
         page_props,
+        page_roots,
         today,
         compiled,
         format,
