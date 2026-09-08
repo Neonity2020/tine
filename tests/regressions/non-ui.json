@@ -7146,6 +7146,30 @@
    "status": "reported",
    "coverage": {"tests": []},
    "notes": "Reported, not reproduced end-to-end: recorded 2026-09-07 while retiring the W6 red corpus, from source reading rather than a failing test (the tests that used to assert this contract were deleted — they asserted the pre-05db8c67 Direct-save admission walk, not this path). The two-pass initial shadow capture at crates/tine-core/src/model.rs:10593-10613 refuses with io::ErrorKind::Interrupted(\"managed inventory changed during initial shadow capture\") when its two passes disagree, which an external editor or a sync client writing into the graph can cause. On the DIRECT save path that refusal is retried four times and then surfaced as DirectSaveFailureCode::PrecheckInterrupted (model.rs:10643-10661), a retryable class. On the MANAGED activation path it is not: oplog::import::inventory_initial_shadow (crates/tine-core/src/oplog/import.rs:2230-2252) maps every io error that is not a \"bound exceeded\" InvalidData to InventoryError::UnsafeEntry, which becomes ImportBlockReason::UnsafeInput (import.rs:4749) and ImportPlanStatus::Blocked. So a transient two-pass disagreement is reported to the user as unsafe INPUT — a permanent-shaped block naming their graph as the problem — rather than as a retryable interruption. No test asserts either shape today. Needs a card and a reproducing test; the fix would be in crates/tine-core/src/oplog/import.rs, outside this packet’s write set."
-  }
+  },
+{
+ "id": "REG-QE-RET3-EXPORT-SUBTREE-BUDGET-RECURSION",
+ "title": "A database-read export subtree drops a later ancestor sibling once any earlier descendant does not fit",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET3 SQL export core packet, base 37b15bc1" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/query/export_results_tests.rs::a_child_that_cannot_fit_stops_its_parent_but_not_its_grandparents_next_child", "crates/tine-core/src/query/export_results_tests.rs::the_node_budget_is_recursive_too", "crates/tine-core/src/query/export_results_tests.rs::export_core_answers_exactly_what_the_walk_export_answers"],
+  "scenario": "query-engine.ret3-export-subtree-budget-recursion"
+ },
+ "notes": "block_to_bounded_dto spends its node and byte budgets RECURSIVELY, not as one global preorder prefix: when a child does not fit, only that parent stops taking further children, and an ancestor\u2019s later sibling can still be admitted. Reading the same subtree out of the SQLite projection replaces the oracle\u2019s recursion with an explicit stack (crates/tine-core/src/query/export_results.rs admit_subtree), where the natural mistranscription is to break the whole traversal on the first rejection. Mutation-checked on 2026-09-08: replacing the frame pop with a global break turned exactly the named budget test red while the rest of the module stayed green, so the gate is necessary and not redundant with parity. The parity sweep was then widened to run every macro alone as well as all macros under one shared budget \u2014 under the combined budget alone the earlier macros exhausted the cap before the shape could appear, and the sweep did not see the mutation."
+},
+{
+ "id": "REG-QE-EXPORT-ROOT-PUBLIC-ID-CONFLATION",
+ "title": "An export root resolves to the first block advertising a public id, not the block that was selected",
+ "family": "query-correctness",
+ "sources": { "issues": [], "commits": [], "internal": "RET3 SQL export core packet, base 37b15bc1" },
+ "platforms": ["all"], "layer": "rust-core", "status": "reproduced",
+ "coverage": {
+  "tests": ["crates/tine-core/src/query/export_results_tests.rs::a_root_is_the_physical_block_that_was_selected_not_the_first_block_that_shares_its_id", "crates/tine-core/src/query/export_results_tests.rs::equal_display_names_do_not_merge_two_physical_subtrees"],
+  "scenario": "query-correctness.export-root-public-id-conflation"
+ },
+ "notes": "Measured on 37b15bc1, 2026-09-08. The walk-backed hydrate_selected_export_queries resolves each export root by scanning the named page for the FIRST block whose uuid OR id:: property equals the root\u2019s public id, so a decoy block carrying another block\u2019s structural id in its id:: property wins and the export emits the decoy\u2019s subtree instead of the selected one; equal page display names are ambiguous the same way. The named tests pin the correct physical answer for the new database-read core (which carries a ResultLocator of source index plus physical page and block id from selection through hydration) AND assert that the oracle really does answer wrongly, so the divergence is recorded rather than copied. Not fixed here: the remaining wrong answer is in the public walk adapters, outside this packet\u2019s write set."
+}
 ]
 }

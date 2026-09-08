@@ -39,6 +39,14 @@ pub(crate) mod sql;
 // outside `cfg(test)` the module says "not called yet" once, here.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod results;
+// RET3's database-owned export subtree construction: located selection over the
+// shared result collector, and bounded subtree hydration over the SAME caller
+// owned snapshots. Like `sql` and `results` it is what the public Direct and
+// Managed export adapters will call rather than something a release build
+// reaches yet — that migration is the manager's next packet, and until it lands
+// the module says "not called yet" once, here.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod export_results;
 pub(crate) mod tql;
 pub mod view;
 
@@ -2866,13 +2874,35 @@ fn finish_query_groups(
     opts: &QueryOpts,
     budget: ConstructionBudget,
 ) -> BoundedGroups {
-    let mut groups = groups;
-    base_order_groups(&mut groups);
     BoundedGroups {
-        groups: apply_view_directives(groups, &recency_by_page, opts),
+        groups: finish_result_view_groups(
+            groups.into_iter().map(ResultViewGroup::from).collect(),
+            &recency_by_page,
+            opts,
+        )
+        .into_iter()
+        .map(RefGroup::from)
+        .collect(),
         total: budget.total,
         exceeded: budget.exceeded,
     }
+}
+
+/// **Base order, then the view directives — the ONE finisher**, for ordinary
+/// result entries and for RET3's physically located ones alike.
+///
+/// `base_order_result_view_groups` and `apply_result_view_directives` are the
+/// same two owners either path already used; naming their composition once is
+/// what stops a located caller from growing its own "sort then coalesce"
+/// spelling that drifts from the ordinary one.
+pub(crate) fn finish_result_view_groups<B: ResultViewBlock>(
+    groups: Vec<ResultViewGroup<B>>,
+    recency_by_page: &std::collections::HashMap<String, i64>,
+    opts: &QueryOpts,
+) -> Vec<ResultViewGroup<B>> {
+    let mut groups = groups;
+    base_order_result_view_groups(&mut groups);
+    apply_result_view_directives(groups, recency_by_page, opts)
 }
 
 /// SPEC §3.5's BASE ORDER (M13): page display name, then kind rank (journal 0,
@@ -5356,11 +5386,27 @@ struct SelectedExportRoot {
     id: String,
 }
 
+/// One query macro's selection, over whichever ROOT shape the caller keeps.
+///
+/// The walk-backed oracle keeps `SelectedExportRoot` (a display name, a kind
+/// and a public id, which is all a source re-scan can use). RET3's database
+/// export keeps a root that carries its exact physical locator instead, so
+/// duplicate public ids and equal display names cannot collapse two different
+/// physical subtrees. `key` and `total` mean the same thing on both.
 #[derive(Debug)]
-struct SelectedExportQuery {
-    key: String,
-    total: usize,
-    roots: Vec<SelectedExportRoot>,
+pub(crate) struct SelectedExportQueryOf<R> {
+    pub(crate) key: String,
+    pub(crate) total: usize,
+    pub(crate) roots: Vec<R>,
+}
+
+type SelectedExportQuery = SelectedExportQueryOf<SelectedExportRoot>;
+
+/// What ONE evaluated query macro contributed, before root admission.
+pub(crate) struct ExportSelectionAnswer<B> {
+    pub(crate) groups: Vec<ResultViewGroup<B>>,
+    pub(crate) total: usize,
+    pub(crate) exceeded: bool,
 }
 
 /// One page as export hydration sees it. Built by each backend's
@@ -5481,46 +5527,98 @@ fn emit_selected_export_queries(
         .collect()
 }
 
+/// **The ONE export SELECTION budget** (RET3): the macro cap, the global root
+/// pool and the per-query totals, over whichever entry type the evaluation
+/// produced.
+///
+/// Every rule here is the oracle's, transcribed once rather than twice:
+///
+/// * `max_queries` and `max_roots` clamp to at least 1;
+/// * specs past the macro cap are NEVER evaluated (`take(query_limit)`), and
+///   the caller reports the rest as `omitted_queries`;
+/// * an EXCEEDED selection contributes no roots and still reports its `total`;
+/// * `max_roots` is one pool shared across macros in INPUT order, not a
+///   per-macro allowance.
+///
+/// `evaluate` may fail — the database route's selection is a read that can
+/// return [`crate::query::results::ResultReadError`] — and the first failure
+/// stops the whole selection. The walk-backed oracle instantiates `E` with
+/// `Infallible`, so its behaviour is unchanged.
+pub(crate) fn select_export_queries_over<B, R, E>(
+    specs: &[QueryExportSpec],
+    max_queries: usize,
+    max_roots: usize,
+    mut evaluate: impl FnMut(&QueryExportSpec) -> Result<ExportSelectionAnswer<B>, E>,
+    mut root: impl FnMut(&str, PageKind, B) -> R,
+) -> Result<(usize, Vec<SelectedExportQueryOf<R>>), E> {
+    let query_limit = max_queries.max(1);
+    let mut remaining_roots = max_roots.max(1);
+    let mut selected = Vec::new();
+    for spec in specs.iter().take(query_limit) {
+        let answer = evaluate(spec)?;
+        let total = answer.total;
+        let mut roots = Vec::new();
+        let groups = if answer.exceeded {
+            Vec::new()
+        } else {
+            answer.groups
+        };
+        'query: for group in groups {
+            let ResultViewGroup {
+                page,
+                kind,
+                blocks,
+                evidence: _,
+            } = group;
+            for block in blocks {
+                if remaining_roots == 0 {
+                    break 'query;
+                }
+                roots.push(root(&page, kind, block));
+                remaining_roots -= 1;
+            }
+        }
+        selected.push(SelectedExportQueryOf {
+            key: spec.key.clone(),
+            total,
+            roots,
+        });
+    }
+    Ok((query_limit, selected))
+}
+
 fn select_export_queries(
     specs: &[QueryExportSpec],
     max_queries: usize,
     max_roots: usize,
     mut evaluate: impl FnMut(&QueryExportSpec) -> BoundedGroups,
 ) -> (usize, Vec<SelectedExportQuery>) {
-    let query_limit = max_queries.max(1);
-    let mut remaining_roots = max_roots.max(1);
-    let mut selected = Vec::new();
-    for spec in specs.iter().take(query_limit) {
-        let bounded = evaluate(spec);
-        let total = bounded.total;
-        let mut roots = Vec::new();
-        for group in if bounded.exceeded {
-            &[]
-        } else {
-            bounded.groups.as_slice()
-        } {
-            for block in &group.blocks {
-                if remaining_roots == 0 {
-                    break;
-                }
-                roots.push(SelectedExportRoot {
-                    page: group.page.clone(),
-                    kind: group.kind,
-                    id: block.id.clone(),
-                });
-                remaining_roots -= 1;
-            }
-            if remaining_roots == 0 {
-                break;
-            }
-        }
-        selected.push(SelectedExportQuery {
-            key: spec.key.clone(),
-            total,
-            roots,
-        });
-    }
-    (query_limit, selected)
+    select_export_queries_over(
+        specs,
+        max_queries,
+        max_roots,
+        |spec| {
+            let bounded = evaluate(spec);
+            Ok::<_, std::convert::Infallible>(ExportSelectionAnswer {
+                groups: bounded
+                    .groups
+                    .into_iter()
+                    .map(ResultViewGroup::from)
+                    .collect(),
+                total: bounded.total,
+                exceeded: bounded.exceeded,
+            })
+        },
+        |page, kind, block: BlockDto| SelectedExportRoot {
+            page: page.to_owned(),
+            kind,
+            // The source re-scan's only handle on the block. RET3's located
+            // route keeps the physical locator instead, exactly because this
+            // one cannot tell two identically-named results apart.
+            id: block.id,
+        },
+    )
+    .expect("the walk-backed selection cannot fail")
 }
 
 /// Evaluate and hydrate several Copy / Export query macros under one cumulative
@@ -5578,8 +5676,8 @@ pub(crate) fn export_application_query_subtrees(
 /// The construction ceiling one exported query macro may reach while SELECTING
 /// its roots, before the caller's own node/byte budget bounds hydration. One
 /// definition: the two storage modes previously carried a private copy each.
-const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
-const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
+pub(crate) const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
 
 /// The ONE query-export driver: selection ceiling, simple/advanced dispatch,
 /// root selection under the global root budget, and hydration.
@@ -5752,13 +5850,13 @@ pub fn is_advanced(query_src: &str) -> bool {
 /// (Q15) and this is the one adapter between them (it replaced `collect_opts`,
 /// which read sort/sample back out of the filter tree).
 #[derive(Debug, Default, Clone)]
-struct QueryOpts {
+pub(crate) struct QueryOpts {
     sample: Option<usize>,
     sort: Vec<(String, bool)>, // ordered (field, ascending) clauses
 }
 
 impl QueryOpts {
-    fn from_view(view: &ViewSettings) -> QueryOpts {
+    pub(crate) fn from_view(view: &ViewSettings) -> QueryOpts {
         QueryOpts {
             sample: view.sample.map(|n| n as usize),
             sort: view
