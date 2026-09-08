@@ -3043,6 +3043,20 @@ fn render_tql_query(graph: &Graph, argument: &str, ctx: &Ctx, depth: u8) -> Stri
         // print export already behaves.
         &crate::query::ir::ExecutionContext::none(),
     );
+    // RET2: the TQL macro's execution is the SAME database route the app takes,
+    // so it can now report a typed availability failure instead of walking the
+    // parsed graph behind the export's back. A static page says so in the same
+    // bounded shape as its other two refusals rather than publishing an empty
+    // result that reads as "nothing matched".
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return format!(
+                "<div class=\"query query-unsupported\" role=\"alert\">{}</div>",
+                esc(&error.to_string()),
+            )
+        }
+    };
     if result.exceeded {
         return format!(
             "<div class=\"query query-too-large\">Query has {} matches; narrow it before publishing.</div>",

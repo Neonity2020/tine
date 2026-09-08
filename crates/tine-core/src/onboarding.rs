@@ -930,10 +930,23 @@ mod tests {
         let showcase = copy_guide_into_graph(&graph, "Feature showcase")
             .unwrap()
             .name;
+        // RET2: a public Direct query answers from the projection or reports a
+        // typed failure, so the guide fixture attaches and initializes one
+        // exactly as the app does rather than relying on a parsed-graph walk.
+        graph
+            .attach_direct_projection(dir.join("private/projection.sqlite"))
+            .expect("the disposable projection attaches");
         graph.warm_cache();
 
-        let result =
-            graph.run_query_bounded("(task TODO DOING NOW LATER)", 20_000, 32 * 1024 * 1024);
+        let result = loop {
+            match graph.run_query_bounded("(task TODO DOING NOW LATER)", 20_000, 32 * 1024 * 1024) {
+                Ok(result) => break result,
+                Err(crate::query::QueryExecutionError::NotReady(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("the guide query route refused: {error}"),
+            }
+        };
         let pages: HashSet<&str> = result
             .groups
             .iter()

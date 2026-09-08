@@ -1732,6 +1732,28 @@ fn a_tql_macro_title_edit_preserves_the_form_and_writes_the_new_map_once() {
 
 /// A two-page graph whose blocks reference each other, so an advanced query
 /// bound to `?current-page` has a different, non-empty answer on each page.
+/// Open a conformance fixture graph the way the app opens a Direct graph: with
+/// its disposable SQLite projection attached and initialized. RET2 retired the
+/// parsed-graph walk from every public query, so a fixture that only called
+/// `Graph::open` would now be asking a question the projection cannot answer
+/// and would get a typed `Unavailable`, not a walked answer.
+fn ready_conformance_graph(dir: &std::path::Path) -> Graph {
+    let graph = Graph::open(dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .expect("the disposable projection attaches");
+    graph.warm_cache();
+    let started = std::time::Instant::now();
+    while !graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the conformance projection did not converge"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    graph
+}
+
 fn binding_graph(label: &str) -> (Graph, PathBuf) {
     let dir =
         std::env::temp_dir().join(format!("tine-query-binding-{label}-{}", std::process::id()));
@@ -1749,8 +1771,7 @@ fn binding_graph(label: &str) -> (Graph, PathBuf) {
         "- links to [[Alpha]]\n- links to [[Beta]] and more\n",
     )
     .expect("page");
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
+    let graph = ready_conformance_graph(&dir);
     (graph, dir)
 }
 
@@ -1815,14 +1836,16 @@ fn one_parse_answers_differently_on_two_current_pages() {
         &view,
         bounds,
         &crate::query::ir::ExecutionContext::on_page("Alpha"),
-    );
+    )
+    .expect("the ready projection answers the public IR route");
     let on_beta = crate::query::run_query_result_ir(
         &graph,
         &query,
         &view,
         bounds,
         &crate::query::ir::ExecutionContext::on_page("Beta"),
-    );
+    )
+    .expect("the ready projection answers the public IR route");
 
     assert_eq!(
         block_lines(&on_beta),
@@ -1851,7 +1874,8 @@ fn one_parse_answers_differently_on_two_current_pages() {
         &view,
         bounds,
         &crate::query::ir::ExecutionContext::on_page("Alpha"),
-    );
+    )
+    .expect("the ready projection answers the public IR route");
     assert_eq!(block_lines(&again), block_lines(&on_alpha));
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1868,7 +1892,8 @@ fn a_missing_runtime_input_is_strict_no_results_with_a_report() {
         &ViewSettings::default(),
         Bounds::unbounded(),
         &crate::query::ir::ExecutionContext::none(),
-    );
+    )
+    .expect("the ready projection answers the public IR route");
     assert!(block_lines(&result).is_empty(), "{:?}", result.rows);
     assert!(
         !result.report.supported,
@@ -1935,8 +1960,10 @@ fn run_explain_and_export_agree_on_results_and_report() {
     let bounds = Bounds::unbounded();
     let context = crate::query::ir::ExecutionContext::on_page("Beta");
 
-    let run = crate::query::run_query_result_ir(&graph, &query, &view, bounds, &context);
-    let explained = crate::query::explain_empty_query(&graph, &query, &view, bounds, &context);
+    let run = crate::query::run_query_result_ir(&graph, &query, &view, bounds, &context)
+        .expect("the ready projection answers the public IR route");
+    let explained = crate::query::explain_empty_query(&graph, &query, &view, bounds, &context)
+        .expect("the ready projection answers the public explanation");
     let exported = crate::query::export_query_subtrees(
         &graph,
         &[crate::query::QueryExportSpec {
@@ -1981,7 +2008,8 @@ fn explain_empty_reports_a_failed_resolution_without_misleading_counts() {
         &ViewSettings::default(),
         Bounds::unbounded(),
         &crate::query::ir::ExecutionContext::none(),
-    );
+    )
+    .expect("the ready projection answers the public explanation");
     assert!(explained.rows.is_empty(), "{:?}", explained.rows);
     assert!(!explained.report.supported);
     assert!(
@@ -2068,8 +2096,7 @@ fn match_graph(label: &str) -> (Graph, PathBuf) {
          - ABC uppercase run\n",
     )
     .expect("page");
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
+    let graph = ready_conformance_graph(&dir);
     (graph, dir)
 }
 
@@ -2087,7 +2114,8 @@ fn match_rows(graph: &Graph, tql: &str) -> Vec<String> {
         &view,
         Bounds::unbounded(),
         &crate::query::ir::ExecutionContext::none(),
-    );
+    )
+    .expect("the ready projection answers the public IR route");
     block_lines(&result)
 }
 
@@ -2266,12 +2294,14 @@ fn the_legacy_search_head_and_content_match_are_the_same_leaf() {
     let context = crate::query::ir::ExecutionContext::none();
     let view = ViewSettings::default();
     assert_eq!(
-        block_lines(&crate::query::run_query_result_ir(
-            &graph, &og, &view, bounds, &context
-        )),
-        block_lines(&crate::query::run_query_result_ir(
-            &graph, &tql, &view, bounds, &context
-        )),
+        block_lines(
+            &crate::query::run_query_result_ir(&graph, &og, &view, bounds, &context)
+                .expect("the ready projection answers the public IR route")
+        ),
+        block_lines(
+            &crate::query::run_query_result_ir(&graph, &tql, &view, bounds, &context)
+                .expect("the ready projection answers the public IR route")
+        ),
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -2341,8 +2371,7 @@ fn every_displayed_search_example_holds_for_content_match() {
             format!("- yes {matching}\n- no {non_matching}\n"),
         )
         .expect("page");
-        let graph = Graph::open(&dir);
-        graph.warm_cache();
+        let graph = ready_conformance_graph(&dir);
         let escaped = query.replace('\'', "''");
         let rows = match_rows(&graph, &format!("@block and content match '{escaped}'"));
         assert_eq!(

@@ -1910,7 +1910,7 @@ pub(crate) async fn run_query(
                 &query,
                 RESULT_BRIDGE_MAX_ROWS,
                 RESULT_BRIDGE_MAX_BYTES,
-            )),
+            )?),
         }
     })
     .await
@@ -2092,7 +2092,7 @@ pub(crate) async fn run_advanced_query(
                         current_page.as_deref(),
                         RESULT_BRIDGE_MAX_ROWS,
                         RESULT_BRIDGE_MAX_BYTES,
-                    );
+                    )?;
                 tine_core::sync_runtime::SyncApplicationBoundedAdvancedResult {
                     result,
                     total,
@@ -2261,7 +2261,11 @@ fn query_registry_snapshot(
                 )),
             }
         }
-        None => Ok(slot.legacy_graph()?.property_registry().snapshot()),
+        // RET2: SQL-only and fallible. The legacy `property_registry()` read
+        // walks every parsed document when the projection is not ready, which
+        // is exactly the unrequested whole-graph work a metadata read must not
+        // do — and it answered with a stale table rather than saying so.
+        None => Ok(slot.legacy_graph()?.query_registry_snapshot_ready()?),
     }
 }
 
@@ -2282,14 +2286,16 @@ pub(crate) async fn query_parse(
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         // managed-command-routing: managed -- the sparse/legacy dispatch lives
         // in `query_registry_snapshot`, shared with `query_registry`.
-        // The registry only ever adds suggestions to a diagnostic. A storage
-        // mode that cannot answer must not turn a parse into a failure, so a
-        // refusal degrades to the empty registry rather than propagating.
-        let snapshot =
-            query_registry_snapshot(&slot).unwrap_or(tine_core::query::ir::RegistrySnapshot {
-                rows: Vec::new(),
-                generation: 0,
-            });
+        //
+        // **RET2 removed the `unwrap_or(empty snapshot)` that used to sit
+        // here.** The registry decides `UnknownIdent` SUGGESTIONS, and an empty
+        // table produces a parse that confidently reports a declared property
+        // as unknown — a wrong answer the caller could not distinguish from a
+        // real one, because the refusal never reached it. A metadata read that
+        // cannot answer is now the parse's answer, and the frontend's existing
+        // readiness owner retries it under the same binding/generation
+        // cancellation as every other query read.
+        let snapshot = query_registry_snapshot(&slot)?;
         let registry = tine_core::query::registry::Registry::from_snapshot(&snapshot);
         Ok(parse_query_pair(
             &text,
@@ -2390,7 +2396,7 @@ pub(crate) async fn query_run(
             },
             None => {
                 let graph = slot.legacy_graph()?;
-                tine_core::query::run_query_result_ir(&graph, &query, &view, bounds, &context)
+                tine_core::query::run_query_result_ir(&graph, &query, &view, bounds, &context)?
             }
         };
         query_result_or_error(result)
@@ -2436,7 +2442,7 @@ pub(crate) async fn query_explain_empty(
                 let graph = slot.legacy_graph()?;
                 Ok(tine_core::query::explain_empty_query(
                     &graph, &query, &view, bounds, &context,
-                ))
+                )?)
             }
         }
     })
@@ -6088,19 +6094,20 @@ mod query_command_surface_tests {
             "- TODO a task with no project\n- a project mention [[Project]]\n",
         )
         .unwrap();
-        let graph = tine_core::model::Graph::open(&dir);
-        graph.warm_cache();
+        let graph = ready_query_graph(&dir);
         let bounds = tine_core::query::ir::Bounds::unbounded();
 
         let conjunction = parsed("(and (task TODO) [[Project]])", QueryTextDialect::Og);
         let context = tine_core::query::ir::ExecutionContext::none();
-        let explained = tine_core::query::explain_empty_query(
-            &graph,
-            &conjunction.query,
-            &conjunction.view,
-            bounds,
-            &context,
-        );
+        let explained = when_ready(|| {
+            tine_core::query::explain_empty_query(
+                &graph,
+                &conjunction.query,
+                &conjunction.view,
+                bounds,
+                &context,
+            )
+        });
         let lines = &explained.rows;
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
@@ -6118,13 +6125,15 @@ mod query_command_surface_tests {
         );
 
         let single = parsed("(task TODO)", QueryTextDialect::Og);
-        let explained = tine_core::query::explain_empty_query(
-            &graph,
-            &single.query,
-            &single.view,
-            bounds,
-            &context,
-        );
+        let explained = when_ready(|| {
+            tine_core::query::explain_empty_query(
+                &graph,
+                &single.query,
+                &single.view,
+                bounds,
+                &context,
+            )
+        });
         let lines = &explained.rows;
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(lines[0].without, None, "there is no `other` to be without");
@@ -6133,15 +6142,53 @@ mod query_command_surface_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Open a fixture graph the way the app opens a Direct graph: with its
+    /// disposable SQLite projection attached and initialized, and its answer
+    /// awaited through the same typed readiness the frontend retries on.
+    ///
+    /// RET2 made the public Direct query route projection-only and fallible, so
+    /// a command-layer fixture that only called `Graph::open` would now be
+    /// asking a question the projection cannot answer.
+    fn ready_query_graph(dir: &std::path::Path) -> tine_core::model::Graph {
+        let graph = tine_core::model::Graph::open(dir);
+        graph.warm_cache();
+        graph
+            .attach_direct_projection(dir.join("private/projection.sqlite"))
+            .expect("the disposable projection attaches");
+        graph.warm_cache();
+        graph
+    }
+
+    fn when_ready<T>(
+        mut attempt: impl FnMut() -> Result<T, tine_core::query::QueryExecutionError>,
+    ) -> T {
+        let started = std::time::Instant::now();
+        loop {
+            match attempt() {
+                Ok(answer) => return answer,
+                Err(tine_core::query::QueryExecutionError::NotReady(_)) => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(15),
+                        "the query index never became ready"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(other) => panic!("the public query route refused: {other}"),
+            }
+        }
+    }
+
     fn parse_and_run(graph: &tine_core::model::Graph, text: &str) -> Vec<String> {
         let parsed = parsed(text, QueryTextDialect::Tql);
-        let result = tine_core::query::run_query_result_ir(
-            graph,
-            &parsed.query,
-            &parsed.view,
-            tine_core::query::ir::Bounds::unbounded(),
-            &tine_core::query::ir::ExecutionContext::none(),
-        );
+        let result = when_ready(|| {
+            tine_core::query::run_query_result_ir(
+                graph,
+                &parsed.query,
+                &parsed.view,
+                tine_core::query::ir::Bounds::unbounded(),
+                &tine_core::query::ir::ExecutionContext::none(),
+            )
+        });
         match result.rows {
             tine_core::query::ir::QueryRows::Page { pages } => {
                 pages.into_iter().map(|page| page.name).collect()
@@ -6237,8 +6284,7 @@ mod query_command_surface_tests {
         std::fs::create_dir_all(dir.join("journals")).unwrap();
         std::fs::write(dir.join("pages/Proj%2FSub.md"), "- under a namespace\n").unwrap();
         std::fs::write(dir.join("pages/Other.md"), "- elsewhere\n").unwrap();
-        let graph = tine_core::model::Graph::open(&dir);
-        graph.warm_cache();
+        let graph = ready_query_graph(&dir);
 
         assert_eq!(
             parse_and_run(&graph, "@page and name like 'proj/%'"),

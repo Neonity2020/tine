@@ -2,11 +2,7 @@ use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::oplog::query_lowering::drain_after;
-use crate::query::{
-    run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
-    ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
-    PropertyFacetAccumulator, SimpleQueryCandidatePlan,
-};
+use crate::query::PropertyFacetAccumulator;
 use crate::query_jobs::{Admission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
@@ -523,17 +519,44 @@ impl DirectQueryJob<'_> {
 /// the two the job owner adds).
 pub(crate) enum QueryJobOpen<'a> {
     Job(DirectQueryJob<'a>),
-    /// Not ready at this generation, the generation moved while the snapshot
-    /// was being pinned, or no slot freed within the wait. Nothing is wrong;
-    /// the walk answers and the fallback is counted.
+    /// Not ready at this generation, or the generation moved while the
+    /// snapshot was being pinned. Nothing is wrong with the projection;
+    /// `ProjectionProgress` decides whether readiness is on its way.
     NotReady,
+    /// No capacity slot freed within the admission wait (R3). Distinct from
+    /// `NotReady`: the projection IS ready and other jobs are draining, so the
+    /// caller owes a retry and never a repair.
+    Busy,
     /// The snapshot could not be opened or the regex program could not be
     /// installed: a failed read, owed recovery.
     Failed,
-    /// A drain or close cancelled the job before it ran. The walk answers; no
-    /// recovery is owed and no fallback is counted against a projection that
-    /// is being replaced on purpose.
+    /// A drain or close cancelled the job before it ran. No recovery is owed
+    /// against a projection that is being replaced on purpose.
     Cancelled,
+}
+
+/// Whether a query that found the projection NOT READY can expect readiness to
+/// arrive on its own, needs one repair, or must stop retrying (RET2).
+///
+/// The vocabulary is deliberately the queue's own: this reads the existing
+/// `pending` queue plus `worker_available` / `worker_failed` / `worker_busy`
+/// and translates them into the three answers the public boundary can act on.
+/// It adds no state of its own, because a second opinion about whether the
+/// worker is making progress is exactly the twin D-14 forbids.
+pub(crate) enum ProjectionProgress {
+    /// Ready at this generation by the time the question was asked: the two
+    /// reads straddled a save. Retryable.
+    Ready,
+    /// Queued or in-flight work will publish readiness. Retryable, with the
+    /// reason the queue is holding it.
+    Working(crate::query::QueryReadinessReason),
+    /// Nothing is queued, the worker is idle, and the projection is stale at
+    /// this generation. Only a repair can make it ready.
+    Stale,
+    /// The worker thread is gone — it never started, lost the writer lease, or
+    /// returned. No repair this graph can schedule will be picked up, so a
+    /// retry loop here would never end.
+    Stopped,
 }
 
 /// What one attempt to answer through the D-15 statement seam produced
@@ -929,232 +952,6 @@ impl DirectProjection {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn sparse_task_query(
-        &self,
-        graph_root: &Path,
-        journal_format: &crate::date::JournalFormat,
-        cache_generation: u64,
-        pages: &[(PageEntry, Arc<Document>)],
-        query_src: &str,
-        max_rows: usize,
-        max_bytes: usize,
-        config: &crate::config::ParseConfig,
-        registry: &crate::query::registry::Registry,
-    ) -> Option<BoundedGroups> {
-        let eligibility = sparse_task_query_eligibility(query_src)?;
-        if !self.shared.ready.load(Ordering::Acquire)
-            || self.shared.ready_generation.load(Ordering::Acquire) != cache_generation
-        {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
-        let mut by_block = BTreeMap::new();
-        let uses_recency = eligibility.uses_recency;
-        for marker in eligibility.markers {
-            drain_after(
-                |after, batch| read.task_candidate_locators_after(&marker, after, batch),
-                |row| (row.page_id, row.block_id),
-                |row| {
-                    by_block.entry(row.block_id).or_insert(row);
-                    Ok(())
-                },
-                |_, _| None,
-            )
-            .ok()?;
-        }
-        if self.shared.ready_generation.load(Ordering::Acquire) != cache_generation
-            || !self.shared.ready.load(Ordering::Acquire)
-        {
-            return None;
-        }
-        let mut page_recencies = HashMap::<String, i64>::new();
-        struct CandidateMetadata {
-            block_id: String,
-            parent_identity: Option<String>,
-            order: Vec<String>,
-            page: ApplicationSparseQueryPage,
-        }
-        let metadata = by_block
-            .into_values()
-            .map(|row| {
-                let recency = if uses_recency {
-                    *page_recencies
-                        .entry(row.page_path.clone())
-                        .or_insert_with(|| {
-                            page_recency(
-                                graph_root,
-                                &row.page_name,
-                                &row.page_path,
-                                row.page_text_kind,
-                                journal_format,
-                            )
-                        })
-                } else {
-                    i64::MIN
-                };
-                CandidateMetadata {
-                    block_id: Uuid::from_bytes(row.block_id).to_string(),
-                    parent_identity: row.parent.map(|id| Uuid::from_bytes(id).to_string()),
-                    order: vec![row.order, Uuid::from_bytes(row.block_id).to_string()],
-                    page: ApplicationSparseQueryPage {
-                        name: row.page_name,
-                        path: row.page_path.clone(),
-                        kind: page_kind_from_sql(row.page_text_kind)?,
-                        is_org: Format::from_path(Path::new(&row.page_path)) == Format::Org,
-                        recency,
-                    },
-                }
-                .into()
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let documents = pages
-            .iter()
-            .map(|(entry, document)| (entry.rel_path.as_str(), document.as_ref()))
-            .collect::<HashMap<_, _>>();
-        let candidates = metadata
-            .iter()
-            .map(|candidate| {
-                let document = documents.get(candidate.page.path.as_str())?;
-                let block = block_at_order(&document.roots, &candidate.order[0])?;
-                (block.uuid == candidate.block_id).then_some(ParserSparseQueryCandidate {
-                    block,
-                    identity: &candidate.block_id,
-                    page: &candidate.page,
-                    parent_identity: candidate.parent_identity.as_deref(),
-                    dfs_order: &candidate.order,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let result = run_parser_sparse_task_query_bounded(
-            &candidates,
-            query_src,
-            max_rows,
-            max_bytes,
-            config,
-            registry,
-        )
-        .ok()?;
-        let current = (self.shared.ready.load(Ordering::Acquire)
-            && self.shared.ready_generation.load(Ordering::Acquire) == cache_generation)
-            .then_some(result);
-        #[cfg(test)]
-        if current.is_some() {
-            self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
-        }
-        current
-    }
-
-    /// Abandon the projection read when the lowering's candidate set is not
-    /// selective enough to beat the parser walk it would replace.
-    ///
-    /// The walk costs one cheap in-memory predicate per page of the whole
-    /// graph, so its cost is proportional to the graph. The projection route
-    /// costs a SQL scan plus, per candidate, a SQLite point read, a page DTO
-    /// construction and a document clone — each far more expensive than one
-    /// walk step. So the route only wins while the candidate set is a small
-    /// FRACTION of the graph, which is why the cutoff scales with the graph
-    /// rather than being an absolute count.
-    ///
-    /// `1/32` is taken from the measured corpus (1,049 pages, 14,538 blocks;
-    /// `tine-agents/evidence/wave4/b4b/`). Every class the route made faster
-    /// there produced at most 3 candidates (0.29% of the graph); the two
-    /// classes it made dramatically slower produced 91 and 104 (8.7% and 9.9%,
-    /// costing 1.08 -> 11.19 ms and 0.46 -> 3.31 ms). `1/32` sits about 10x
-    /// above every measured winner and about 2.8x below every measured loser.
-    /// The floor keeps small graphs — including test fixtures — on the route,
-    /// where the absolute cost of materializing a few candidates is trivial.
-    ///
-    /// Abandoning is the safe direction: it returns exactly today's behaviour.
-    /// A cutoff set too low forfeits a speedup; one set too high reintroduces a
-    /// 10x stall on the typing path.
-    fn candidate_cutoff(graph_page_count: usize) -> usize {
-        const SELECTIVE_FRACTION: usize = 32;
-        const SMALL_GRAPH_FLOOR: usize = 32;
-        (graph_page_count / SELECTIVE_FRACTION).max(SMALL_GRAPH_FLOOR)
-    }
-
-    pub(crate) fn simple_query_candidate_paths(
-        &self,
-        cache_generation: u64,
-        plan: &SimpleQueryCandidatePlan,
-        graph_page_count: usize,
-    ) -> Option<std::collections::BTreeSet<PathBuf>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
-        let lowered = crate::oplog::query_lowering::lower_simple_query_candidate_plan(
-            &read,
-            plan,
-            &std::collections::HashSet::new(),
-        )
-        .ok()?;
-
-        // RETIREMENT-CANDIDATE: the candidate-count escape hatch below, together
-        // with the Direct whole-graph parser walk it hands the query back to.
-        //
-        // WHAT MAY BE DELETED: this `candidate_cutoff` test and the
-        // `run_query`/`run_query_bounded` fallback arms that call
-        // `Graph::direct_projection_note_fallback_read` after it fires. Deleting
-        // them makes every ready `SimpleQueryCandidatePlan::Indexed` plan
-        // unconditionally candidate-only.
-        //
-        // CONDITION FOR DELETION: the hatch exists only because
-        // `lower_simple_query_candidate_plan` returns a page SUPERSET rather
-        // than the answer — `and` takes the first leaf instead of intersecting,
-        // `Page`/`Namespace`/`Journal` full-scan `navigation_pages`, values never
-        // push down, and the block ids SQL already returned are discarded at the
-        // trait boundary. When the lowering returns the ANSWER, the candidate set
-        // is selective by construction, this test can never fire, and it goes.
-        // That work is card `PVTI_lAHOAAbLVc4BhPsyzg5VyLk`, not this packet.
-        //
-        // WHAT CURRENTLY BLOCKS DELETION — read this before deleting the walk
-        // along with the hatch: the parser walk is not merely the fallback, it is
-        // the CORRECTNESS ORACLE for the real lowering that would replace it, and
-        // no external oracle exists (Logseq's DB version evaluates in in-memory
-        // DataScript with SQLite as a mere datom store; Dataview is frozen; Bases
-        // is closed). The walk answers every query from the parsed documents in
-        // ~1 ms over the 1,045-file anonymized graph, so the acceptance gate for
-        // a real lowering is DIFFERENTIAL AGAINST THE WALK — the shape
-        // `crate::query::results_tests::the_database_result_equals_the_walk_on_every_shape_and_bound`
-        // (and its `_over_a_real_corpus` acceptance twin) already uses. The walk
-        // therefore outlives the lowering by at least one release as a
-        // test-only oracle; it is NOT deletable the moment SQL
-        // works. Retire the hatch first, keep the walk, and retire the walk only
-        // after a release of differential agreement.
-        if lowered.page_ids.len() > Self::candidate_cutoff(graph_page_count) {
-            return None;
-        }
-
-        let mut paths = std::collections::BTreeSet::new();
-        for page_id in lowered.page_ids {
-            let page = read
-                .page_with_header_validation(page_id, |_, kind| match kind {
-                    0 | 1 => Ok(()),
-                    _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
-                        format!("unknown Direct Files text kind {kind}"),
-                    )),
-                })
-                .ok()??;
-            paths.insert(PathBuf::from(page.path));
-        }
-        let current = self.ready_at(cache_generation).then_some(paths);
-        #[cfg(test)]
-        if current.is_some() {
-            self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
-        }
-        current
-    }
-
     pub(crate) fn property_facets(
         &self,
         cache_generation: u64,
@@ -1345,7 +1142,10 @@ impl DirectProjection {
         let slot = match self.shared.query_jobs.acquire() {
             Admission::Slot(slot) => slot,
             Admission::Cancelled => return QueryJobOpen::Cancelled,
-            Admission::Busy => return QueryJobOpen::NotReady,
+            // RET2: capacity, not readiness. The projection is ready and other
+            // jobs are draining, so this is the one `NotReady` the public
+            // boundary may retry without ever considering a repair.
+            Admission::Busy => return QueryJobOpen::Busy,
         };
         let validate = || {
             if self.ready_at(cache_generation) {
@@ -1805,6 +1605,51 @@ impl DirectProjection {
             && self.shared.ready_generation.load(Ordering::Acquire) == generation
     }
 
+    /// RET2's readiness lifecycle: why this generation is not ready, and what
+    /// the caller may do about it.
+    ///
+    /// The order of the tests is the order of authority.
+    ///
+    /// * `worker_available` is stored `false` exactly where the worker thread
+    ///   gives up for good — no parent directory, an unopenable database, a
+    ///   writer lease another instance owns, or a `stop` turn. Nothing this
+    ///   graph enqueues afterwards is ever taken, so retrying is endless by
+    ///   construction and the caller owes a bounded error instead.
+    /// * A queued turn is progress even when the LAST turn failed:
+    ///   `worker_failed` stays set until the next successful turn, and the
+    ///   repair that clears it is exactly the `full`/`rebuild` work below.
+    /// * A failed worker with an EMPTY queue is the stale-idle case: the turn
+    ///   failed, `requires_full_rebuild` latched inside the worker, and until
+    ///   a complete source inventory arrives every further delta turn refuses.
+    ///   That is a repair, not a wait.
+    pub(crate) fn progress_at(&self, generation: u64) -> ProjectionProgress {
+        use crate::query::QueryReadinessReason as Reason;
+        if self.ready_at(generation) {
+            return ProjectionProgress::Ready;
+        }
+        let pending = self.shared.pending.lock().unwrap();
+        if pending.stop || !self.shared.worker_available.load(Ordering::Acquire) {
+            return ProjectionProgress::Stopped;
+        }
+        if pending.rebuild || pending.needs_full || pending.full.is_some() {
+            return ProjectionProgress::Working(Reason::Recovering);
+        }
+        if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
+            return ProjectionProgress::Working(Reason::Indexing);
+        }
+        if !pending.deltas.is_empty() {
+            return ProjectionProgress::Working(Reason::PendingEdits);
+        }
+        if self.shared.worker_failed.load(Ordering::Acquire) {
+            // The queue is empty and the last turn failed: nothing is coming.
+            return ProjectionProgress::Stale;
+        }
+        if self.shared.worker_busy.load(Ordering::Acquire) {
+            return ProjectionProgress::Working(Reason::Busy);
+        }
+        ProjectionProgress::Stale
+    }
+
     /// Test diagnostic: the queue and readiness state in one line, for a
     /// convergence failure that would otherwise be a bare timeout.
     #[cfg(test)]
@@ -1843,6 +1688,14 @@ impl DirectProjection {
         self.shared.indexed_reads.load(Ordering::Relaxed)
     }
 
+    /// Close this projection's query-job admission, the way `Drop` does when a
+    /// graph is closing. Every later `open_query_job` is `Cancelled`, which is
+    /// the ONE §5.9 state a public query must never repair or retry.
+    #[cfg(test)]
+    pub(crate) fn close_query_jobs_test(&self) {
+        self.shared.query_jobs.close();
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_next_statement_failure(&self) {
         self.shared
@@ -1869,21 +1722,6 @@ impl DirectProjection {
     pub(crate) fn fuzzy_candidate_reads(&self) -> u64 {
         self.shared.fuzzy_candidate_reads.load(Ordering::Relaxed)
     }
-}
-
-fn block_at_order<'a>(roots: &'a [DocBlock], order: &str) -> Option<&'a DocBlock> {
-    let mut siblings = roots;
-    let mut found = None;
-    for component in order.split('/') {
-        if component.len() != 8 {
-            return None;
-        }
-        let index = usize::try_from(u32::from_str_radix(component, 16).ok()?).ok()?;
-        let block = siblings.get(index)?;
-        found = Some(block);
-        siblings = &block.children;
-    }
-    found
 }
 
 impl Drop for DirectProjection {
@@ -2798,16 +2636,6 @@ pub(crate) fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
     }
 }
 
-fn page_recency(
-    root: &Path,
-    name: &str,
-    relative_path: &str,
-    kind: i64,
-    journal_format: &crate::date::JournalFormat,
-) -> i64 {
-    journal_format.page_recency_secs(kind == 1, name, &root.join(relative_path))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2843,6 +2671,32 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Run `attempt` until it answers, retrying ONLY typed readiness.
+    ///
+    /// RET2's public Direct route answers from SQL or returns a typed error;
+    /// `NotReady` is the one error a caller may retry, and this is the same
+    /// signal `src/queryReadiness.ts` loops on. `Unavailable` and `Cancelled`
+    /// fail the fixture immediately.
+    fn when_ready<T>(
+        mut attempt: impl FnMut() -> Result<T, crate::query::QueryExecutionError>,
+    ) -> T {
+        let started = Instant::now();
+        loop {
+            match attempt() {
+                Ok(answer) => return answer,
+                Err(crate::query::QueryExecutionError::NotReady(reason)) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(15),
+                        "the query index never became ready ({})",
+                        reason.as_str()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(other) => panic!("the public query route refused: {other}"),
+            }
+        }
     }
 
     fn wait_ready(graph: &Graph) {
@@ -2888,7 +2742,9 @@ mod tests {
             "(and (task TODO) (sort-by priority desc))",
         ] {
             let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
+            let indexed = graph
+                .run_query_bounded(query, 100, 1_000_000)
+                .expect("the ready projection answers the public bounded route");
             assert_eq!(
                 signature(&indexed.groups),
                 signature(&oracle.groups),
@@ -2905,7 +2761,9 @@ mod tests {
         assert_eq!(graph.direct_projection_fallback_reads_test(), 0);
         assert!(graph.direct_projection_statement_reads_test() >= 3);
         let statement_reads = graph.direct_projection_statement_reads_test();
-        let repeated = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let repeated = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             signature(&repeated.groups),
             signature(
@@ -2930,7 +2788,9 @@ mod tests {
         wait_ready(&graph);
         for query in ["(task TODO)", "(task DONE)"] {
             let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
+            let indexed = graph
+                .run_query_bounded(query, 100, 1_000_000)
+                .expect("the ready projection answers the public bounded route");
             assert_eq!(
                 signature(&indexed.groups),
                 signature(&oracle.groups),
@@ -2941,7 +2801,9 @@ mod tests {
         graph.delete_page("org", PageKind::Page).unwrap();
         wait_ready(&graph);
         let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000);
-        let indexed = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let indexed = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2976,7 +2838,9 @@ mod tests {
             "(and \"points\" (page-ref Target))",
         ] {
             let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-            let indexed = graph.run_query_bounded(query, 100, 1_000_000);
+            let indexed = graph
+                .run_query_bounded(query, 100, 1_000_000)
+                .expect("the ready projection answers the public bounded route");
             assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
             assert_eq!(
                 (indexed.total, indexed.exceeded),
@@ -3026,7 +2890,9 @@ mod tests {
             let statements_before = graph.direct_projection_statement_reads_test();
             let fallback_before = graph.direct_projection_fallback_reads_test();
             graph.reset_direct_projection_candidate_probe_test();
-            let actual = graph.run_query_bounded(query, 100, 1_000_000);
+            let actual = graph
+                .run_query_bounded(query, 100, 1_000_000)
+                .expect("the ready projection answers the public bounded route");
             assert_eq!(
                 signature(&actual.groups),
                 signature(&oracle.groups),
@@ -3057,7 +2923,9 @@ mod tests {
         let statements_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         graph.reset_direct_projection_candidate_probe_test();
-        let empty = graph.run_query_bounded("(", 100, 1_000_000);
+        let empty = graph
+            .run_query_bounded("(", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert!(empty.groups.is_empty());
         assert_eq!(
             crate::query::full_graph_query_evaluations(),
@@ -3075,19 +2943,48 @@ mod tests {
             "a refused source must not record fallback access"
         );
 
-        let fallback_before = graph.direct_projection_fallback_reads_test();
-        graph.direct_projection_mark_stale_test();
+        // Staleness splits the two families RET2 deliberately treats
+        // differently. The property-facet read is NOT a public query and keeps
+        // its parser fallback; the public query route has no fallback left and
+        // owes readiness instead.
         let fallback_query = "(and (page-ref Target) (not (page Missing)))";
         let oracle = crate::query::run_query_bounded(&graph, fallback_query, 100, 1_000_000);
-        let fallback = graph.run_query_bounded(fallback_query, 100, 1_000_000);
-        assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
+        assert!(
+            oracle.total > 0,
+            "the stale-state query must have a real answer"
+        );
+
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        graph.direct_projection_mark_stale_test();
         assert_eq!(
             graph.property_facets(),
             crate::query::property_facets(&graph)
         );
         assert!(
-            graph.direct_projection_fallback_reads_test() >= fallback_before + 2,
-            "stale PageRef and facet reads must record parser fallbacks"
+            graph.direct_projection_fallback_reads_test() >= fallback_before + 1,
+            "a stale facet read must still record a parser fallback"
+        );
+
+        let fallback_before = graph.direct_projection_fallback_reads_test();
+        let walks_before = crate::query::full_graph_query_evaluations();
+        // The worker may already have caught up, so accept either verdict --
+        // but ONLY the two the route is allowed to give.
+        match graph.run_query_bounded(fallback_query, 100, 1_000_000) {
+            Ok(_) => assert!(graph.direct_projection_ready_test()),
+            Err(crate::query::QueryExecutionError::NotReady(_)) => {}
+            other => panic!("a stale projection owes readiness, got {other:?}"),
+        }
+        let fallback = when_ready(|| graph.run_query_bounded(fallback_query, 100, 1_000_000));
+        assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            walks_before,
+            "a stale public query must not traverse the graph"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallback_before,
+            "the public query route has no fallback left to record"
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -3111,14 +3008,20 @@ mod tests {
         drop(damaged);
         let query = "(page-ref Target)";
         let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
-        let answer = graph.run_query_bounded(query, 100, 1_000_000);
+        // RET2: a damaged table is a failed read, so the route repairs once and
+        // retries the SAME statement. The repair is asynchronous, so the public
+        // answer may be `NotReady(Recovering)` until the rebuild lands — which
+        // is the signal the frontend retries on, and never a walked answer.
+        let answer = when_ready(|| graph.run_query_bounded(query, 100, 1_000_000));
         assert_eq!(signature(&answer.groups), signature(&oracle.groups));
         wait_ready(&graph);
         let statements_before = graph.direct_projection_statement_reads_test();
         // A different memo key must reach the repaired SQL table.
         let next = "(and (page-ref Target) (task TODO))";
         let oracle = crate::query::run_query_bounded(&graph, next, 100, 1_000_000);
-        let answer = graph.run_query_bounded(next, 100, 1_000_000);
+        let answer = graph
+            .run_query_bounded(next, 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(signature(&answer.groups), signature(&oracle.groups));
         assert_eq!(
             graph.direct_projection_statement_reads_test(),
@@ -3327,21 +3230,152 @@ mod tests {
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 
-    /// **SPEC §5.9's failed-read shape.** A read that was ATTEMPTED and did not
-    /// answer owes two things, and today's code is why they are asserted rather
-    /// than assumed: `run_query`'s sparse-task arm fell back with a bare
-    /// `map_or_else` and never called `note_fallback_read`, so a failed read
-    /// scheduled no recovery and the projection could sit unusable until the
-    /// user happened to save a page.
+    /// **RET2's cancellation shape.** A cancelled snapshot means the caller's
+    /// own work was withdrawn — the graph is closing, or a drain superseded the
+    /// request. It is the ONE §5.9 state that must NOT be repaired and must NOT
+    /// be retried: repairing would schedule a rebuild nobody asked for, and
+    /// retrying would race the very drain that cancelled the first attempt.
+    ///
+    /// The fixture matches on the typed error rather than on a bare `is_err`,
+    /// because `Cancelled` and `Unavailable` differ in exactly the way the
+    /// frontend acts on: one is silent, the other is shown.
+    #[test]
+    fn a_cancelled_query_job_refuses_without_repairing_or_walking() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("cancelled-query-job");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/tasks.md"),
+            "- TODO ship it\n  status:: active\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        // The projection answers a DIFFERENT query first, so the route is known
+        // to be healthy going in. It has to be a different one: a memoized
+        // answer is returned without ever opening a query job, so reusing this
+        // source below would test the memo and not the cancellation.
+        let warm =
+            when_ready(|| graph.run_query_bounded("(property status active)", 100, 1_000_000));
+        assert!(warm.total > 0, "the warm-up query must match something");
+
+        // Non-vacuity for the cancelled query itself, from the independent
+        // oracle: the refusal below is not a correct empty answer.
+        let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000);
+        assert!(
+            oracle.total > 0,
+            "the cancelled query must have a real answer"
+        );
+
+        let projection = graph.direct_projection_test().expect("a projection");
+        let generation_before = graph.cache_generation();
+        let walks_before = crate::query::full_graph_query_evaluations();
+        projection.close_query_jobs_test();
+
+        let refused = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert!(
+            matches!(refused, Err(crate::query::QueryExecutionError::Cancelled)),
+            "a cancelled job is reported as cancelled, not repaired away: {refused:?}"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            walks_before,
+            "a cancelled query must not traverse the graph"
+        );
+        // A repair would have marked the projection stale and enqueued a full
+        // rebuild. Readiness at the same generation is what proves neither
+        // happened.
+        assert_eq!(graph.cache_generation(), generation_before);
+        assert!(
+            graph.direct_projection_ready_test(),
+            "cancellation must not schedule a rebuild of a healthy projection"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **RET2's readiness shape.** A projection that is genuinely behind the
+    /// parsed cache answers `NotReady`, carrying the reason the queue is in —
+    /// never a walked answer and never a false empty one. This is the signal
+    /// `src/queryReadiness.ts` retries on, so getting the CLASS wrong (a
+    /// terminal `Unavailable` for a transient lag) is a user-visible defect.
+    #[test]
+    fn a_projection_behind_the_parsed_cache_reports_readiness_not_an_answer() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("behind-parsed-cache");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/tasks.md"), "- TODO ship it\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        // Non-vacuity: there IS a matching TODO, and the ready projection finds
+        // it, so an unready refusal below is not a correct empty answer.
+        let answered = when_ready(|| graph.run_query_bounded("(task TODO)", 100, 1_000_000));
+        assert!(
+            answered.total > 0,
+            "the fixture must have something to match"
+        );
+
+        // Move the parsed cache ahead of the projection WITHOUT waiting: the
+        // save bumps the cache generation and the worker has not caught up.
+        let walks_before = crate::query::full_graph_query_evaluations();
+        let mut page = graph.load_named("tasks", PageKind::Page).unwrap().unwrap();
+        page.blocks[0].raw = "TODO ship it soon".into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+
+        // The race is real, so accept either verdict — but ONLY the two the
+        // route is allowed to give: the projection had already caught up, or it
+        // says so in words the frontend retries on.
+        match graph.run_query_bounded("(task TODO)", 100, 1_000_000) {
+            Ok(answer) => assert!(
+                graph.direct_projection_ready_test(),
+                "an answer may only come from a caught-up projection: {}",
+                answer.total
+            ),
+            Err(crate::query::QueryExecutionError::NotReady(_)) => {}
+            other => panic!("a projection behind the cache owes readiness, got {other:?}"),
+        }
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            walks_before,
+            "an unready projection must not traverse the graph"
+        );
+
+        // And readiness is transient by construction: the same query answers
+        // once the worker converges, with the edited row.
+        let after = when_ready(|| graph.run_query_bounded("(task TODO)", 100, 1_000_000));
+        assert_eq!(after.total, 1);
+        assert_eq!(after.groups[0].blocks[0].raw, "TODO ship it soon");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **SPEC §5.9's failed-read shape, RET2.** A read that was ATTEMPTED and
+    /// did not answer owes a repair and a RETRY OF THE SAME STATEMENT — not a
+    /// walk. The walk is gone from the public route, so the obligation the old
+    /// shape discharged by falling back is now discharged by
+    /// `direct_projection_recover_after_failed_read` followed by a second SQL
+    /// attempt inside the same public call.
     ///
     /// **In-scope scenario** (AGENTS §5): a torn or truncated projection file
     /// after a crash or power loss, a disk error, or a projection whose page set
     /// has drifted from the parsed cache. The projection is disposable derived
-    /// state (D-3), so the answer is recovery and never refusal — the user's
-    /// query is answered by the walk, no refusal reaches them, and `ready`
-    /// returns WITHOUT a user edit.
+    /// state (D-3), so the answer is still recovery and not refusal — the user
+    /// gets the RIGHT rows, from SQL, without a user edit and without the graph
+    /// ever being traversed.
     #[test]
-    fn a_failed_statement_read_answers_by_walking_and_schedules_its_own_recovery() {
+    fn a_failed_statement_read_repairs_and_retries_the_same_statement() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("failed-read-recovers");
         std::fs::create_dir_all(root.join("pages")).unwrap();
@@ -3361,25 +3395,36 @@ mod tests {
 
         let query = "(page-ref Target)";
         let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
+        assert!(oracle.total > 0, "the fixture must have something to match");
+        // The counter that used to prove the failed read: the query route has
+        // no fallback left to count, so it must NOT move here. It still counts
+        // the property-facet fallback, which RET2 did not touch.
         let fallbacks_before = graph.direct_projection_fallback_reads_test();
         graph.reset_direct_projection_candidate_probe_test();
         graph.direct_projection_inject_read_failure_test();
 
-        let answered = graph.run_query_bounded(query, 100, 1_000_000);
+        let walks_before = crate::query::full_graph_query_evaluations();
+        let statements_before_failure = graph.direct_projection_statement_reads_test();
+
+        let answered = when_ready(|| graph.run_query_bounded(query, 100, 1_000_000));
         assert_eq!(
             signature(&answered.groups),
             signature(&oracle.groups),
-            "a failed read must be answered by the walk, not refused"
-        );
-        assert_eq!(
-            graph.direct_projection_fallback_reads_test(),
-            fallbacks_before + 1,
-            "a failed read must be counted exactly once"
+            "a failed read must be answered by a repaired SQL retry, not refused"
         );
         assert_eq!(
             crate::query::full_graph_query_evaluations(),
-            1,
-            "the walk answers the failed read exactly once"
+            walks_before,
+            "the public route never walks the graph, not even to survive a failed read"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallbacks_before,
+            "the query route has no fallback left to take"
+        );
+        assert!(
+            graph.direct_projection_statement_reads_test() > statements_before_failure,
+            "the retry must go through the statement seam again"
         );
 
         // The recovery obligation: `mark_stale` alone would only clear `ready`
@@ -3387,15 +3432,14 @@ mod tests {
         // the already-parsed cache, so it needs no reparse, no disk read, and no
         // user action — `ready` comes back on its own.
         wait_ready(&graph);
-        // A DIFFERENT query, because the walk's answer for the first one is now
-        // in the derived cache under the same IR key — correctly, since the two
-        // engines answer identically, so a cached walk result is a cached
-        // answer and not a stale route.
+        // A DIFFERENT query, because the first one's answer is now in the
+        // derived cache under its IR key and would be served without touching
+        // the statement seam at all.
         let after = "(property status active)";
         let after_oracle = crate::query::run_query_bounded(&graph, after, 100, 1_000_000);
         let statements_before = graph.direct_projection_statement_reads_test();
         let fallbacks_before = graph.direct_projection_fallback_reads_test();
-        let recovered = graph.run_query_bounded(after, 100, 1_000_000);
+        let recovered = when_ready(|| graph.run_query_bounded(after, 100, 1_000_000));
         assert_eq!(
             signature(&recovered.groups),
             signature(&after_oracle.groups)
@@ -3470,7 +3514,9 @@ mod tests {
         let feed = "(task TODO)";
         let oracle = crate::query::run_query_bounded(&graph, feed, 100, 1_000_000);
         graph.reset_direct_projection_candidate_probe_test();
-        let dispatched = graph.run_query_bounded(feed, 100, 1_000_000);
+        let dispatched = graph
+            .run_query_bounded(feed, 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             signature(&dispatched.groups),
             signature(&oracle.groups),
@@ -3510,7 +3556,9 @@ mod tests {
         let routed = "(and (task TODO) (page Alpha))";
         let routed_oracle = crate::query::run_query_bounded(&graph, routed, 100, 1_000_000);
         graph.reset_direct_projection_candidate_probe_test();
-        let routed_dispatched = graph.run_query_bounded(routed, 100, 1_000_000);
+        let routed_dispatched = graph
+            .run_query_bounded(routed, 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             signature(&routed_dispatched.groups),
             signature(&routed_oracle.groups),
@@ -3583,30 +3631,27 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
 
-        // The shape the hatch existed for: its candidate set is most of the
-        // graph. The fixture is pinned through the SURVIVING candidate lowering
+        // The shape the retired hatch existed for: `(journal)` matches most of
+        // the graph. The fixture is pinned through the ANSWER's own page count
         // so a fixture that stopped being unselective fails here rather than
-        // silently testing nothing.
+        // silently testing nothing — the candidate lowering that used to pin it
+        // is gone along with the hatch and the walk it fell back to.
         let unselective = "(journal)";
-        let raw = graph
-            .direct_projection_candidate_paths_test(
-                &crate::query::simple_query_candidate_plan(unselective),
-                usize::MAX,
-            )
-            .expect("the lowering answers the unselective plan");
-        assert!(
-            raw.len() > 32,
-            "fixture must exceed the old cutoff; got {} candidates",
-            raw.len()
-        );
 
         // Run the oracle BEFORE resetting the probes, so the oracle's own walk
         // is not counted as the production invocation's route evidence.
         let oracle = crate::query::run_query_bounded(&graph, unselective, 500, 4_000_000);
+        assert!(
+            oracle.groups.len() > 32,
+            "fixture must exceed the old cutoff; got {} pages",
+            oracle.groups.len()
+        );
         let statements_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         graph.reset_direct_projection_candidate_probe_test();
-        let dispatched = graph.run_query_bounded(unselective, 500, 4_000_000);
+        let dispatched = graph
+            .run_query_bounded(unselective, 500, 4_000_000)
+            .expect("the ready projection answers the public bounded route");
 
         assert_eq!(
             signature(&dispatched.groups),
@@ -3650,7 +3695,9 @@ mod tests {
         let statements_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         graph.reset_direct_projection_candidate_probe_test();
-        let routed = graph.run_query_bounded(selective, 500, 4_000_000);
+        let routed = graph
+            .run_query_bounded(selective, 500, 4_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             signature(&routed.groups),
             signature(&selective_oracle.groups)
@@ -3728,16 +3775,15 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
 
-        // The real graph is the only place the candidate-count escape hatch can
-        // be observed end to end: `(journal)` lowers to a candidate set the size
-        // of the journal directory, which no synthetic fixture reproduces at
-        // scale. Both sides of the hatch are asserted, and the oracle equality
-        // below holds on BOTH — that equality is what makes the parser walk the
-        // correctness oracle the retirement marker names.
+        // RET2 deleted the candidate-count escape hatch and the parser walk it
+        // handed the query back to, so there are no longer two sides to assert.
+        // What the real corpus still proves, and no synthetic fixture does at
+        // scale, is that EVERY shape below — including `(journal)`, whose
+        // candidate set is the size of the journal directory — is answered by
+        // one statement, equals the parser oracle row for row, and never
+        // reaches the full-graph evaluator.
         let graph_page_count = graph.with_pages(|pages| pages.len());
-        let cutoff = DirectProjection::candidate_cutoff(graph_page_count);
-        let mut routed = 0usize;
-        let mut abandoned = 0usize;
+        let mut answered = 0usize;
         for query in [
             "(page-ref \"B4 Indexed Target\")",
             "(and (task TODO) (page \"B4 Indexed Source\"))",
@@ -3749,87 +3795,45 @@ mod tests {
             "(and (property b4-facet yes) (page \"B4 Indexed Source\"))",
             "(or (page \"B4 Indexed Source\") (page \"B4 Indexed Target\"))",
         ] {
-            let plan = crate::query::simple_query_candidate_plan(query);
             let oracle = crate::query::run_query_bounded(&graph, query, 20_000, 32 * 1024 * 1024);
-            // `usize::MAX` asks for the raw lowering result; the production
-            // cutoff then decides whether that set is worth materializing.
-            let raw_paths = graph
-                .direct_projection_candidate_paths_test(&plan, usize::MAX)
-                .unwrap();
-            let hatch_fires = raw_paths.len() > cutoff;
-            // Probe the production cutoff itself, before any counter is
-            // captured, so the probe's own read cannot skew the assertions.
-            let routed_paths =
-                graph.direct_projection_candidate_paths_test(&plan, graph_page_count);
-            assert_eq!(
-                routed_paths.is_none(),
-                hatch_fires,
-                "{query}: {} candidates against cutoff {cutoff} must decide the route",
-                raw_paths.len()
-            );
-            let indexed_before = graph.direct_projection_indexed_reads_test();
+            let statements_before = graph.direct_projection_statement_reads_test();
             let fallback_before = graph.direct_projection_fallback_reads_test();
             graph.reset_direct_projection_candidate_probe_test();
-            let indexed = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
+            let indexed = when_ready(|| graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
             assert_eq!(
                 signature(&indexed.groups),
                 signature(&oracle.groups),
-                "{query}: routed result must equal the parser oracle (hatch_fires={hatch_fires})"
+                "{query}: the answer must equal the parser oracle"
             );
             assert_eq!(
                 (indexed.total, indexed.exceeded),
                 (oracle.total, oracle.exceeded)
             );
-            if hatch_fires {
-                abandoned += 1;
-                assert_eq!(
-                    graph.direct_projection_indexed_reads_test(),
-                    indexed_before,
-                    "{query}: an abandoned candidate set must not count an indexed read"
-                );
-                assert_eq!(
-                    graph.direct_projection_fallback_reads_test(),
-                    fallback_before + 1,
-                    "{query}: an abandoned candidate set must note exactly one fallback read"
-                );
-                assert_eq!(
-                    crate::query::full_graph_query_evaluations(),
-                    1,
-                    "{query}: an abandoned candidate set must take the parser walk"
-                );
-                assert!(
-                    graph
-                        .direct_projection_candidate_evaluated_paths_test()
-                        .is_empty(),
-                    "{query}: an abandoned candidate set must materialize no pages"
-                );
-            } else {
-                routed += 1;
-                assert_eq!(
-                    graph.direct_projection_indexed_reads_test(),
-                    indexed_before + 1
-                );
-                assert_eq!(
-                    graph.direct_projection_fallback_reads_test(),
-                    fallback_before
-                );
-                assert_eq!(crate::query::full_graph_query_evaluations(), 0);
-                assert_eq!(
-                    graph
-                        .direct_projection_candidate_evaluated_paths_test()
-                        .into_iter()
-                        .collect::<std::collections::BTreeSet<_>>(),
-                    raw_paths
-                );
-            }
+            answered += 1;
+            assert_eq!(
+                graph.direct_projection_statement_reads_test(),
+                statements_before + 1,
+                "{query}: exactly one statement must answer"
+            );
+            assert_eq!(
+                graph.direct_projection_fallback_reads_test(),
+                fallback_before,
+                "{query}: the query route has no fallback left to take"
+            );
+            assert_eq!(
+                crate::query::full_graph_query_evaluations(),
+                0,
+                "{query}: the public route must not enter the full-graph evaluator"
+            );
+            assert!(
+                graph.direct_projection_hydrated_pages_test().len() <= indexed.groups.len(),
+                "{query}: a dispatched query hydrates only the pages its result names"
+            );
         }
-        // Neither branch may go vacuous: a corpus that never routes proves
-        // nothing about the projection, and one that never abandons proves
-        // nothing about the hatch.
-        assert!(
-            routed > 0 && abandoned > 0,
-            "the corpus gate must exercise both sides of the hatch \
-             (routed={routed}, abandoned={abandoned}, cutoff={cutoff}, pages={graph_page_count})"
+        // Non-vacuity: a corpus that answered nothing proves nothing.
+        assert_eq!(
+            answered, 9,
+            "every shape must have been answered (pages={graph_page_count})"
         );
         assert!(
             graph.property_facets() == crate::query::property_facets(&graph),
@@ -3844,20 +3848,29 @@ mod tests {
                 ),
             "corpus autocomplete facets differ from the parser oracle"
         );
-        // One indexed read per routed query, plus the two facet families above.
-        assert!(graph.direct_projection_indexed_reads_test() >= (routed + 2) as u64);
-
+        // A stale projection owes readiness, not a walked answer; the worker
+        // catches up on its own and the same statement then answers.
         let fallback_before = graph.direct_projection_fallback_reads_test();
+        let walks_before = crate::query::full_graph_query_evaluations();
         graph.direct_projection_mark_stale_test();
-        let fallback_query = "(and (page-ref \"B4 Indexed Target\") \"synthetic\")";
-        let oracle =
-            crate::query::run_query_bounded(&graph, fallback_query, 20_000, 32 * 1024 * 1024);
-        let fallback = graph.run_query_bounded(fallback_query, 20_000, 32 * 1024 * 1024);
+        let stale_query = "(and (page-ref \"B4 Indexed Target\") \"synthetic\")";
+        let oracle = crate::query::run_query_bounded(&graph, stale_query, 20_000, 32 * 1024 * 1024);
+        let recovered =
+            when_ready(|| graph.run_query_bounded(stale_query, 20_000, 32 * 1024 * 1024));
         assert!(
-            signature(&fallback.groups) == signature(&oracle.groups),
-            "corpus stale fallback differs from the parser oracle"
+            signature(&recovered.groups) == signature(&oracle.groups),
+            "corpus stale recovery differs from the parser oracle"
         );
-        assert!(graph.direct_projection_fallback_reads_test() > fallback_before);
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            walks_before,
+            "a stale public query must not traverse the graph"
+        );
+        assert_eq!(
+            graph.direct_projection_fallback_reads_test(),
+            fallback_before,
+            "the query route has no fallback left to record"
+        );
 
         let pages = graph.with_pages(|pages| pages.len());
         println!(
@@ -4318,8 +4331,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// **RET2's missing-projection shape.** A projection that could not be
+    /// created at all is not a reason to walk the graph: the public query route
+    /// refuses with a typed `Unavailable(ProjectionUnavailable)`, which is the
+    /// bounded signal the frontend surfaces instead of a spinner that never
+    /// ends. The primitives that are NOT part of the query route — search and
+    /// the reference-name inventory — keep their own semantics unchanged, which
+    /// is what makes this a query-route claim and not a graph-wide one.
     #[test]
-    fn unavailable_projection_keeps_direct_files_query_semantics() {
+    fn unavailable_projection_refuses_the_public_query_and_keeps_other_semantics() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("fallback");
         std::fs::create_dir_all(root.join("pages")).unwrap();
@@ -4337,9 +4357,27 @@ mod tests {
             .unwrap();
         graph.warm_cache();
         std::thread::sleep(Duration::from_millis(30));
+        // Non-vacuity: the graph DOES hold a matching TODO, so a refusal here
+        // cannot be confused with a correct empty answer.
         let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000);
-        let fallback = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
-        assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
+        assert!(oracle.total > 0, "the fixture must have something to match");
+
+        let walks_before = crate::query::full_graph_query_evaluations();
+        let refused = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert!(
+            matches!(
+                refused,
+                Err(crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::ProjectionUnavailable
+                ))
+            ),
+            "a projection that could not be created refuses, it does not walk: {refused:?}"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            walks_before,
+            "the refusal must not traverse the graph"
+        );
         assert_eq!(graph.direct_projection_indexed_reads_test(), 0);
         assert_eq!(
             signature(&graph.search("cly", 20)),
@@ -4378,13 +4416,26 @@ mod tests {
             !fallback.direct_projection_ready_test(),
             "a second graph instance must not publish into the first instance's ready database"
         );
+        // Non-vacuity: the graph matches, so the second instance's refusal is
+        // not a correct empty answer wearing a hat.
         let oracle = crate::query::run_query_bounded(&fallback, "(task TODO)", 100, 1_000_000);
-        let actual = fallback.run_query_bounded("(task TODO)", 100, 1_000_000);
-        assert_eq!(signature(&actual.groups), signature(&oracle.groups));
+        assert!(oracle.total > 0, "the fixture must have something to match");
+        let walks_before = crate::query::full_graph_query_evaluations();
+        let refused = fallback.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert!(
+            refused.is_err(),
+            "an instance that cannot publish into the owner's database refuses \
+             rather than walking: {refused:?}"
+        );
+        assert_eq!(
+            crate::query::full_graph_query_evaluations(),
+            walks_before,
+            "the refusal must not traverse the graph"
+        );
         assert_eq!(fallback.direct_projection_indexed_reads_test(), 0);
 
         let owner_oracle = crate::query::run_query_bounded(&owner, "(task TODO)", 100, 1_000_000);
-        let owner_actual = owner.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let owner_actual = when_ready(|| owner.run_query_bounded("(task TODO)", 100, 1_000_000));
         assert_eq!(
             signature(&owner_actual.groups),
             signature(&owner_oracle.groups)
@@ -4484,6 +4535,7 @@ mod tests {
                 signature(
                     &graph
                         .run_query_bounded("(task TODO)", 100, 1_000_000)
+                        .expect("the ready projection answers the public bounded route")
                         .groups
                 ),
                 signature(
@@ -4717,12 +4769,16 @@ mod tests {
             crate::query::run_query_bounded(&oracle_graph, "(task TODO)", 20_000, 32 << 20);
         let oracle_elapsed = oracle_started.elapsed();
         let query_started = Instant::now();
-        let indexed = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
+        let indexed = graph
+            .run_query_bounded("(task TODO)", 20_000, 32 << 20)
+            .expect("the ready projection answers the public bounded route");
         let indexed_elapsed = query_started.elapsed();
         assert_eq!(signature(&indexed.groups), signature(&oracle.groups));
         let indexed_reads = graph.direct_projection_indexed_reads_test();
         let memo_started = Instant::now();
-        let repeated = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
+        let repeated = graph
+            .run_query_bounded("(task TODO)", 20_000, 32 << 20)
+            .expect("the ready projection answers the public bounded route");
         let memo_elapsed = memo_started.elapsed();
         assert_eq!(signature(&repeated.groups), signature(&oracle.groups));
         assert_eq!(graph.direct_projection_indexed_reads_test(), indexed_reads);
@@ -4852,7 +4908,8 @@ mod tests {
                 max_bytes: 1_000_000,
             },
             &crate::query::ir::ExecutionContext::default(),
-        );
+        )
+        .expect("the ready projection answers the public IR route");
         assert!(
             result.total > 0,
             "fixture must exercise actual result construction"
@@ -4901,7 +4958,9 @@ mod tests {
         let oracle = Graph::open(&root);
         let statements = graph.direct_projection_statement_reads_test();
         let fallbacks = graph.direct_projection_fallback_reads_test();
-        let indexed = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let indexed = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             signature(&indexed.groups),
             signature(
@@ -5043,7 +5102,9 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
         take_registry_read_attempts();
-        let result = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let result = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(result.total, 1);
         assert_eq!(
             take_registry_read_attempts(),
@@ -5092,6 +5153,7 @@ mod tests {
             signature(
                 &graph
                     .run_query_bounded("(task TODO)", 1_000, 8_000_000)
+                    .expect("the ready projection answers the public bounded route")
                     .groups
             ),
             signature(
@@ -5129,7 +5191,9 @@ mod tests {
         assert_eq!(graph.page_build_parses_test(), 0);
         assert!(!graph.has_parsed_cache_test());
         let oracle = Graph::open(&root);
-        let indexed = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let indexed = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             signature(&indexed.groups),
             signature(
@@ -5181,6 +5245,7 @@ mod tests {
             signature(
                 &graph
                     .run_query_bounded("(task TODO)", 100, 1_000_000)
+                    .expect("the ready projection answers the public bounded route")
                     .groups
             ),
             signature(
@@ -5215,7 +5280,9 @@ mod tests {
         graph.save_page(&page, baseline.as_deref()).unwrap();
         wait_ready(&graph);
         assert!(!graph.has_parsed_cache_test());
-        let live = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let live = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         let query_id = &live
             .groups
             .iter()
@@ -5259,7 +5326,9 @@ mod tests {
             external_id, &kept.id,
             "incompatible source does not reuse the old map"
         );
-        let sql = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let sql = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             &sql.groups
                 .iter()
@@ -5288,7 +5357,9 @@ mod tests {
         let query = "(and (task TODO) (not (journal)))";
         // Admission happens before output sorting. A new page appends to this
         // session even when its filename sorts before the existing pages.
-        let expected = graph.run_query_bounded(query, 1, 1_000_000);
+        let expected = graph
+            .run_query_bounded(query, 1, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_ne!(expected.groups[0].page, "aaa-added");
         // Page creation may have warmed another feature's cache. Evict it
         // before repair so this gate measures recovery's own source ownership.
@@ -5305,7 +5376,9 @@ mod tests {
         );
         graph.clear_query_memos_test();
         let before = graph.direct_projection_statement_reads_test();
-        let actual = graph.run_query_bounded(query, 1, 1_000_000);
+        let actual = graph
+            .run_query_bounded(query, 1, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(graph.direct_projection_statement_reads_test(), before + 1);
         assert_eq!(signature(&actual.groups), signature(&expected.groups));
     }
@@ -5344,7 +5417,9 @@ mod tests {
         graph.direct_projection_recover_after_failed_read();
         wait_ready(&graph);
         assert!(!graph.has_parsed_cache_test());
-        let result = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let result = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         let block = result
             .groups
             .iter()
@@ -5384,7 +5459,9 @@ mod tests {
         graph.save_page(&page, baseline.as_deref()).unwrap();
         wait_ready(&graph);
         assert!(projection.session_pages_test().contains(&one));
-        let live = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let live = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         let live_id = live
             .groups
             .iter()
@@ -5421,7 +5498,9 @@ mod tests {
         assert_eq!(graph.warm_stream_parses_test(), parses + 1);
         assert!(!graph.has_parsed_cache_test());
         let statements = graph.direct_projection_statement_reads_test();
-        let after = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        let after = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the ready projection answers the public bounded route");
         assert_eq!(
             graph.direct_projection_statement_reads_test(),
             statements + 1
@@ -5585,7 +5664,9 @@ mod tests {
         assert_eq!(parses, 0, "clean reopen must not parse any page");
         assert!(!graph.has_parsed_cache_test());
         let query_started = Instant::now();
-        let indexed = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
+        let indexed = graph
+            .run_query_bounded("(task TODO)", 20_000, 32 << 20)
+            .expect("the ready projection answers the public bounded route");
         let indexed_elapsed = query_started.elapsed();
         let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 << 20);
         assert_eq!(signature(&indexed.groups), signature(&oracle.groups));

@@ -332,7 +332,13 @@ async function warmQueryMacros(
   const parsed = await Promise.all(macros.map(async (macro) => {
     const argument = macro.raw ?? macroArg(macro.args);
     try {
-      const { query } = await backend().parseQuery(argument, macroTextDialect(macro.name));
+      // The macro parse takes the SAME readiness owner the export batch below
+      // takes: `query_parse`'s registry read is SQL-only now, so a not-ready
+      // index is a retry, not a silent fall back to the literal macro text.
+      const { query } = await runQueryWhenReady(
+        () => backend().parseQuery(argument, macroTextDialect(macro.name)),
+        owner,
+      );
       return { macro, source: query.source };
     } catch {
       // A parse that rejects must not silently export as an OG query: fall back

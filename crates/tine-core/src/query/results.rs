@@ -200,6 +200,21 @@ impl std::fmt::Display for ResultReadError {
     }
 }
 
+/// The ONE translation from a projection read failure into the public bounded
+/// vocabulary (RET2). Free-form `MaterializationError` payloads and corruption
+/// descriptions name columns and paths, so they stay on the directed diagnostic
+/// channel and never cross this boundary (I-5).
+impl From<ResultReadError> for crate::query::QueryExecutionError {
+    fn from(error: ResultReadError) -> Self {
+        use crate::query::QueryUnavailableReason as Reason;
+        match error {
+            ResultReadError::Cancelled => Self::Cancelled,
+            ResultReadError::Sql(_) => Self::Unavailable(Reason::ReadFailed),
+            ResultReadError::Corrupt(_) => Self::Unavailable(Reason::InvalidSnapshot),
+        }
+    }
+}
+
 /// Construct one query's ordered public result from the projection alone.
 ///
 /// The caller owns capacity, snapshot acquisition and validation, the identity

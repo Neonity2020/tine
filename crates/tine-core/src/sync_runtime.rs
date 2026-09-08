@@ -4835,21 +4835,18 @@ impl SyncRuntimeHandle {
                                 capture.today,
                             );
                             let plan = crate::query::view::explain_empty_plan(&resolved);
-                            // RET2: `ExplainPlan::answer` reads its counts by
-                            // INDEX and substitutes 0 for a missing one, so a
-                            // short count vector would print an explanation
-                            // saying every conjunct matched nothing — an answer
-                            // the user cannot tell from the truth. Check the
-                            // shape BEFORE `answer`: a mismatch is a snapshot
-                            // that contradicts its own decomposition, never
-                            // zero-valued explanatory rows. (An empty plan
-                            // never captures at all, and `0 == 0` stays valid.)
-                            if counts.len() != plan.probes.len() {
+                            // RET2-Direct moved the count-shape check INTO
+                            // `ExplainPlan::answer`, so the rule that a short
+                            // count vector is a contradicting snapshot — and
+                            // never an explanation saying every conjunct
+                            // matched nothing — lives in one place for both
+                            // backends. This arm keeps its own classification
+                            // of that failure. (An empty plan never captures at
+                            // all, and `0 == 0` stays valid.)
+                            let Ok(explained) = plan.answer(&resolved, &counts) else {
                                 return Err(managed_answer_shape_error(&shared.census));
-                            }
-                            SyncApplicationNavigationReply::QueryExplainEmpty(
-                                plan.answer(&resolved, &counts),
-                            )
+                            };
+                            SyncApplicationNavigationReply::QueryExplainEmpty(explained)
                         }
                     };
                     return Ok(SyncApplicationNavigationOutcome::Loaded { reply });
@@ -11313,6 +11310,7 @@ fn run_actor_loop(
             }
             #[cfg(test)]
             ActorRequest::ClosePendingOverlay { reply } => {
+                actor.retire_pending_overlay();
                 actor.managed_query.jobs.cancel_all_and_drain();
                 actor.close_pending_overlay();
                 let _ = reply.send(());
@@ -13282,6 +13280,17 @@ impl RuntimeActor {
         Some((overlay.path().to_path_buf(), state))
     }
 
+    /// Stop captures of this instance before draining jobs which already own it.
+    fn retire_pending_overlay(&self) {
+        if let Some(overlay) = self
+            .managed_local
+            .as_ref()
+            .and_then(|managed| managed.pending_overlay.as_ref())
+        {
+            overlay.retire();
+        }
+    }
+
     /// Stop and delete the pending overlay. Every off-actor query job has been
     /// drained by the caller (I-21); the overlay's own close joins its worker.
     fn close_pending_overlay(&mut self) {
@@ -13301,6 +13310,7 @@ impl Drop for RuntimeActor {
         // truncates its WAL) when this actor drops; every off-actor query job
         // must be gone first. Idempotent, so the handle's `close` and this
         // drain compose in either order.
+        self.retire_pending_overlay();
         self.managed_query.jobs.cancel_all_and_drain();
         self.close_pending_overlay();
     }
@@ -16395,7 +16405,10 @@ impl RuntimeActor {
             let plan = crate::query::view::explain_empty_plan(resolved);
             if plan.probes.is_empty() {
                 return Err(SyncApplicationNavigationReply::QueryExplainEmpty(
-                    plan.answer(resolved, &[]),
+                    // The guard above IS the central check's precondition: an
+                    // empty plan is answered by an empty count vector.
+                    plan.answer(resolved, &[])
+                        .expect("an empty plan is answered by an empty count vector"),
                 ));
             }
             return Ok((
@@ -24253,6 +24266,7 @@ impl RuntimeActor {
         // marker does not name. Every off-actor query job over the old file
         // is cancelled and drained first (R4), and the pending overlay that
         // sits next to the old file goes with it (R5b).
+        self.retire_pending_overlay();
         self.managed_query.jobs.cancel_all_and_drain();
         self.close_pending_overlay();
         self.clean.take();

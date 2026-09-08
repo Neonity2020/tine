@@ -59,7 +59,6 @@ const LOGSEQ_TEXT_EXTENSIONS: [&str; 3] = ["md", "markdown", "org"];
 
 #[cfg(test)]
 thread_local! {
-    static DIRECT_CANDIDATE_EVALUATED_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     /// §5.3's hydration census: the pages a DISPATCHED query loaded a `Document`
     /// for. The claim it makes observable is I-13/I-15's — "pages loaded equals
     /// result pages" — which production also enforces by refusing a mismatched
@@ -4055,26 +4054,67 @@ const PROPERTY_REGISTRY_DEBOUNCE: std::time::Duration = std::time::Duration::fro
 
 /// Which of SPEC §5.9's states one dispatched query attempt reached.
 ///
-/// Generic in what a READY statement produced, because §5.9's four states are a
+/// Generic in what a READY statement produced, because §5.9's states are a
 /// property of the projection and not of the row shape: `@block` pre-view
 /// groups, `@page` rows and an explanation's probe counts all reach the
-/// projection the same way and owe the same note and the same recovery
-/// (`Graph::dispatched_or_walk` is the one place that pays them).
-enum DispatchedQuery<T> {
+/// projection the same way and owe the same classification
+/// (`Graph::dispatch_direct_query` is the one place that pays them).
+///
+/// **RET2.** Every arm that is not `Answered` used to hand the query to the
+/// parsed-graph walk. There is no walk here any more: the arms say what the
+/// projection did, and the dispatcher turns each into either ONE bounded repair
+/// or a typed [`crate::query::QueryExecutionError`]. An attempt returns an
+/// OWNED answer, so every snapshot handle it opened is already dropped by the
+/// time the dispatcher can decide to repair (R3 §2B).
+enum DirectAttempt<T> {
     /// The statement answered and its rows were hydrated.
     Answered(T),
-    /// No statement was run: the compiler declined this shape (a leaf family
-    /// this wave does not lower), or no projection is attached at all. Nothing
-    /// failed, so nothing is counted and nothing is scheduled.
-    Declined,
-    /// The projection is not ready at this cache generation.
+    /// The projection is not ready at this cache generation. Whether that is
+    /// worth retrying, worth repairing, or terminal is
+    /// [`crate::direct_projection::ProjectionProgress`]'s answer, not this
+    /// arm's: the attempt only knows it could not read.
     NotReady,
-    /// A read was attempted and did not answer. Counted, and recovered.
-    FailedRead,
+    /// Capacity admission refused this attempt (R3): other jobs hold every
+    /// slot. Work IS progressing, so this is retryable and never repaired.
+    Busy,
+    /// A read was attempted and did not answer. Repairable exactly once, and
+    /// the reason travels so a contradiction (`InvalidSnapshot`) and a refused
+    /// statement (`ReadFailed`) stay distinguishable at the public boundary.
+    FailedRead(crate::query::QueryUnavailableReason),
+    /// Nothing was attempted and no repair can change that: no projection is
+    /// attached at all (`ProjectionUnavailable`), or the compiler could not
+    /// lower this shape (`UnsupportedRelation`). The second is a
+    /// FUTURE-relation arm and not a live route — `query::sql::lower_query` is
+    /// total today — but it is the arm a non-total lowering must take, because
+    /// the alternative shapes (a fabricated empty answer, or a switch back to
+    /// the evaluator) are both forbidden.
+    Unavailable(crate::query::QueryUnavailableReason),
     /// The projection cancelled the job — a rebuild drained it, or the graph
-    /// closed. Nothing is wrong with the projection: the walk answers, nothing
-    /// is counted as a fallback and no recovery is scheduled (R3 §2B).
+    /// closed. Nothing is wrong with the projection, so it is NEVER repaired
+    /// and never retried: the caller asked for a read that no longer has a
+    /// subject (R3 §2B).
     Cancelled,
+}
+
+/// The ONE translation from an attempted read into a dispatch state
+/// (D-3, §5.9/M9).
+///
+/// A seam refusal and a projection that contradicts itself are both "the read
+/// was attempted and did not answer", so both are repaired — but they stay
+/// distinguishable at the public boundary, because "the index could not be
+/// read" and "the index returned inconsistent results" are different things to
+/// tell a user. `From<ResultReadError>` in `query::results` is the one place
+/// the free-form payload is dropped (I-5).
+fn direct_attempt_from_read<T>(
+    read: Result<T, crate::query::QueryExecutionError>,
+) -> DirectAttempt<T> {
+    use crate::query::QueryExecutionError as Error;
+    match read {
+        Ok(answer) => DirectAttempt::Answered(answer),
+        Err(Error::Cancelled) => DirectAttempt::Cancelled,
+        Err(Error::NotReady(_)) => DirectAttempt::NotReady,
+        Err(Error::Unavailable(reason)) => DirectAttempt::FailedRead(reason),
+    }
 }
 
 /// Which half of the C6 cache identity an entry needs.
@@ -6345,93 +6385,6 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
     }
 
-    fn direct_projection_sparse_task_query(
-        &self,
-        query_src: &str,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Option<crate::query::BoundedGroups> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let pages = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
-        let registry = self.property_registry();
-        let result = projection.sparse_task_query(
-            &self.root,
-            &self.journal_format,
-            generation,
-            &pages,
-            query_src,
-            max_rows,
-            max_bytes,
-            &self.config.parse_config(),
-            &registry,
-        )?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
-    }
-
-    fn direct_projection_candidate_query(
-        &self,
-        plan: &crate::query::SimpleQueryCandidatePlan,
-        query_src: &str,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Option<crate::query::BoundedGroups> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        // The candidate-count escape hatch scales with the graph, so the
-        // projection needs the graph's page count to apply it. `None` here
-        // covers both "the projection could not answer" and "its candidate set
-        // was not selective enough to be worth materializing"; either way the
-        // caller notes one fallback read and takes the parser walk.
-        let graph_page_count = self
-            .cache
-            .read()
-            .unwrap()
-            .as_ref()
-            .map_or(0, |pages| pages.len());
-        let paths = projection.simple_query_candidate_paths(generation, plan, graph_page_count)?;
-        #[cfg(test)]
-        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|recorded| {
-            *recorded.borrow_mut() = paths.iter().cloned().collect();
-        });
-        let pages = self.direct_projection_pages_for_paths(generation, paths)?;
-        let pages = pages
-            .into_iter()
-            .map(|(entry, document)| {
-                let page = page_dto_checked(&entry, &document).ok()?;
-                Some(crate::query::ApplicationQueryPage {
-                    page,
-                    roots: Arc::new(document.roots.clone()),
-                    recency: self.journal_format.page_recency_secs(
-                        entry.kind == PageKind::Journal,
-                        &entry.name,
-                        &entry.path,
-                    ),
-                    journal: entry.date_key,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let result = crate::query::run_application_query_pages_bounded(
-            &pages,
-            query_src,
-            max_rows,
-            max_bytes,
-            self.config.parse_config(),
-            self.property_registry(),
-        );
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
-    }
-
     fn direct_projection_property_facets(
         &self,
         autocomplete: bool,
@@ -6485,40 +6438,21 @@ impl Graph {
     /// **SPEC §5.9's Direct Files dispatch, in ONE place.**
     ///
     /// Every route out of a simple or advanced query goes through here — ready,
-    /// declined, not ready, failed — so that a future arm cannot
-    /// forget the two obligations a fallback carries. Today's code is why that
-    /// matters and not a stylistic preference: `run_query`'s sparse-task arm and
-    /// `run_query_bounded`'s fell back with a bare `map_or_else`/`unwrap_or_else`
-    /// and never called `note_fallback_read`, so a FAILED sparse read scheduled
-    /// no recovery and the projection could sit unusable until the next save.
+    /// not ready, busy, failed, cancelled — so that a future arm cannot answer
+    /// a public query with anything but the projection. Today's code is why
+    /// that matters and not a stylistic preference: `run_query`'s sparse-task
+    /// arm and `run_query_bounded`'s fell back with a bare
+    /// `map_or_else`/`unwrap_or_else` and never called `note_fallback_read`, so
+    /// a FAILED sparse read scheduled no recovery and the projection could sit
+    /// unusable until the next save.
     ///
-    /// The three §5.9 states, and what each owes:
-    ///
-    /// * **ready** — the statement answers. Full stop: there is no fourth route
-    ///   and no cost test in front of it (§5.9's first line, "exactly today's
-    ///   shapes … no third route", and §5.10's refusal of "a new walk route" for
-    ///   the transient FTS-building class). The walk survives only as the
-    ///   recovery path and the test oracle, and its retirement is carded (Q18);
-    ///   a dispatch that permanently needed it for some class of queries would
-    ///   make that retirement unreachable. A slow unbounded shape is a reason to
-    ///   make the statement faster or to add an index, never a reason to keep a
-    ///   second engine alive. `SqlQuery::positively_bounded` stays §5.7's
-    ///   plan-gate concept and a diagnostic; it is not an input here.
-    /// * **not ready** (open reconciliation, a full rebuild, or the
-    ///   milliseconds after each save while the delta applies) — the walk
-    ///   answers over the SAME IR. The fallback is counted, and nothing is
-    ///   scheduled: the worker is already on its way, and asking for a
-    ///   whole-graph snapshot on every keystroke after a save is the unrequested
-    ///   whole-graph work this campaign exists to delete (I-13).
-    /// * **failed read** — the walk answers AND full-snapshot recovery is
-    ///   scheduled through `direct_projection_enqueue_full`, the same call the
-    ///   open path makes. `mark_stale` alone would only clear `ready` and strand
-    ///   the projection (M9). **In-scope scenario** (AGENTS §5): a torn or
-    ///   truncated projection file after a crash or power loss, a disk error, or
-    ///   a projection whose page set has drifted from the parsed cache. The
-    ///   projection is disposable derived state (D-3), so the answer is recovery
-    ///   and never refusal — the user's query is answered by the walk either
-    ///   way, and no refusal reaches them.
+    /// **RET2 retired the walk from this route.** Martin, 2026-09-07: the
+    /// in-memory walk "needs to be only present as an oracle and needs to be
+    /// retired as soon as we are confident the sqlite works". The old Q18
+    /// waiting requirement is overridden. What replaces each arm is
+    /// [`Graph::dispatch_direct_query`]: one bounded repair, then a typed
+    /// `query::QueryExecutionError`, never a second engine and never a
+    /// fabricated empty answer.
     fn direct_simple_query_pre_view(
         &self,
         query: &crate::query::ir::Query,
@@ -6526,62 +6460,123 @@ impl Graph {
         max_rows: usize,
         max_bytes: usize,
         profile: crate::query::ConstructionProfile,
-    ) -> crate::query::PreViewGroups {
-        let walk = |graph: &Graph| {
-            crate::query::collect_pred_bounded_over(
-                &crate::query::GraphQueryPages(graph),
-                query,
-                today,
-                max_rows,
-                max_bytes,
-                profile,
-            )
-        };
-        self.dispatched_or_walk(
-            self.direct_projection_statement_pre_view(query, today, max_rows, max_bytes, profile),
-            || walk(self),
-        )
+    ) -> Result<crate::query::PreViewGroups, crate::query::QueryExecutionError> {
+        self.dispatch_direct_query(|| {
+            self.direct_projection_statement_pre_view(query, today, max_rows, max_bytes, profile)
+        })
     }
 
-    /// **The ONE §5.9 fallback owner.**
-    ///
-    /// Every arm below except `Answered` is production traversal that the
-    /// readiness/recovery/retry packet (RET2) retires. It is not retired HERE
-    /// because there is not yet a typed pending state to return through the
-    /// command boundary, nor an automatic retry behind it: `NotReady` is reached
-    /// on every keystroke while a save's delta applies, and a graph with no
-    /// projection attached (an export, a headless tool, a test graph) reaches
-    /// `Declined` with no database to ask at all. Deleting the arms before then
-    /// would return a fabricated empty result, which the approved
-    /// no-production-traversal amendment forbids.
+    /// **The ONE Direct query dispatcher (RET2).**
     ///
     /// It is generic over the answer so that adding a row shape cannot add a
-    /// fallback branch: `@page` rows and explanation probe counts route through
-    /// exactly these five arms, and RET2 deletes four of them once, here.
-    fn dispatched_or_walk<T>(&self, dispatched: DispatchedQuery<T>, walk: impl FnOnce() -> T) -> T {
-        match dispatched {
-            DispatchedQuery::Answered(answer) => answer,
-            // The compiler declined this shape, or there is no projection to
-            // ask. Nothing failed and nothing is stale, so there is no fallback
-            // to count and no recovery to schedule.
-            DispatchedQuery::Declined => walk(),
-            DispatchedQuery::NotReady => {
-                self.direct_projection_note_fallback_read();
-                walk()
-            }
-            DispatchedQuery::FailedRead => {
-                self.direct_projection_note_fallback_read();
-                self.direct_projection_recover_after_failed_read();
-                walk()
-            }
-            DispatchedQuery::Cancelled => walk(),
+    /// route: `@block` pre-view groups, `@page` rows and an explanation's probe
+    /// counts take exactly these arms, once, here.
+    ///
+    /// `attempt` is a CALLABLE statement attempt rather than an already-computed
+    /// state, and that is load-bearing: it returns an owned answer, so by the
+    /// time this function can decide to repair, every snapshot handle the failed
+    /// attempt opened has been dropped. The old code could not repair-then-retry
+    /// for that exact reason and walked instead.
+    ///
+    /// The arms:
+    ///
+    /// * **answered** — the statement answers. Full stop: there is no second
+    ///   route and no cost test in front of it (§5.9's first line, "exactly
+    ///   today's shapes … no third route", and §5.10's refusal of "a new walk
+    ///   route" for the transient FTS-building class). A slow unbounded shape is
+    ///   a reason to make the statement faster or to add an index, never a
+    ///   reason to keep a second engine alive. `SqlQuery::positively_bounded`
+    ///   stays §5.7's plan-gate concept and a diagnostic; it is not an input.
+    /// * **cancelled** — a drain, a rebuild or a graph close took the snapshot
+    ///   away. It NEVER repairs and never retries: the read has no subject any
+    ///   more, and repairing on a cancellation would turn every rebuild into a
+    ///   second rebuild.
+    /// * **unavailable** — no projection is attached (an export, a headless
+    ///   tool, a graph opened without one), or the lowering refused the shape.
+    ///   No repair can produce a database that was never attached, so it is a
+    ///   bounded typed error and not an invitation to parse the graph.
+    /// * **busy** — capacity admission refused. Work is progressing; retry.
+    /// * **not ready** — [`crate::direct_projection::ProjectionProgress`]
+    ///   decides. Working → retryable `NotReady`. Stopped → bounded
+    ///   `Unavailable`, because a worker that is gone will never pick up a
+    ///   repair and a retry loop against it would never end. Stale → repair.
+    /// * **failed read** — repair. **In-scope scenario** (AGENTS §5): a torn or
+    ///   truncated projection file after a crash or power loss, a disk error, or
+    ///   a projection whose page set has drifted from the parsed cache. The
+    ///   projection is disposable derived state (D-3), so the answer is recovery
+    ///   — but the recovery is now the SQL retry, not a walk.
+    ///
+    /// Exactly ONE repair per request. After it, a still-unready projection is
+    /// reported as `NotReady(Recovering)` only while the queue is actually
+    /// working; a repair that did not take is `Unavailable`, so a permanently
+    /// broken projection cannot drive the frontend's retry loop forever.
+    fn dispatch_direct_query<T>(
+        &self,
+        attempt: impl Fn() -> DirectAttempt<T>,
+    ) -> Result<T, crate::query::QueryExecutionError> {
+        use crate::direct_projection::ProjectionProgress;
+        use crate::query::{
+            QueryExecutionError as Error, QueryReadinessReason as Readiness,
+            QueryUnavailableReason as Reason,
+        };
+        match attempt() {
+            DirectAttempt::Answered(answer) => return Ok(answer),
+            DirectAttempt::Cancelled => return Err(Error::Cancelled),
+            DirectAttempt::Unavailable(reason) => return Err(Error::Unavailable(reason)),
+            DirectAttempt::Busy => return Err(Error::NotReady(Readiness::Busy)),
+            DirectAttempt::NotReady => match self.direct_projection_progress() {
+                // A save landed between the readiness test and this one.
+                Some(ProjectionProgress::Ready) => {
+                    return Err(Error::NotReady(Readiness::PendingEdits))
+                }
+                Some(ProjectionProgress::Working(reason)) => return Err(Error::NotReady(reason)),
+                Some(ProjectionProgress::Stopped) | None => {
+                    return Err(Error::Unavailable(Reason::ProjectionUnavailable))
+                }
+                // Idle and stale: nothing is coming, so repair.
+                Some(ProjectionProgress::Stale) => {}
+            },
+            DirectAttempt::FailedRead(_) => {}
+        }
+        self.direct_projection_recover_after_failed_read();
+        match attempt() {
+            DirectAttempt::Answered(answer) => Ok(answer),
+            DirectAttempt::Cancelled => Err(Error::Cancelled),
+            DirectAttempt::Unavailable(reason) => Err(Error::Unavailable(reason)),
+            DirectAttempt::Busy => Err(Error::NotReady(Readiness::Busy)),
+            DirectAttempt::FailedRead(reason) => Err(Error::Unavailable(reason)),
+            DirectAttempt::NotReady => match self.direct_projection_progress() {
+                Some(ProjectionProgress::Ready) => Err(Error::NotReady(Readiness::PendingEdits)),
+                Some(ProjectionProgress::Working(reason)) => Err(Error::NotReady(reason)),
+                Some(ProjectionProgress::Stopped) | None => {
+                    Err(Error::Unavailable(Reason::ProjectionUnavailable))
+                }
+                // The repair did not take: another repair holds the recovery
+                // lock, or the enqueue was refused. Retrying cannot be the
+                // answer twice in a row for the same request.
+                Some(ProjectionProgress::Stale) => Err(Error::Unavailable(Reason::ReadFailed)),
+            },
         }
     }
 
+    /// The readiness lifecycle of the attached projection, or `None` when no
+    /// projection is attached at all.
+    fn direct_projection_progress(&self) -> Option<crate::direct_projection::ProjectionProgress> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        Some(projection.progress_at(generation))
+    }
+
     /// The statement half of [`Graph::direct_simple_query_pre_view`]: lower,
-    /// run, hydrate. It performs no fallback of its own — it only reports which
-    /// §5.9 state it reached, so the note and the recovery live in exactly one
-    /// place.
+    /// run, hydrate. It performs no repair of its own — it only reports which
+    /// §5.9 state it reached, so the classification and the recovery live in
+    /// exactly one place, and it returns an OWNED answer so the dispatcher can
+    /// call it again after every handle it opened is gone.
     fn direct_projection_statement_pre_view(
         &self,
         query: &crate::query::ir::Query,
@@ -6589,12 +6584,12 @@ impl Graph {
         max_rows: usize,
         max_bytes: usize,
         profile: crate::query::ConstructionProfile,
-    ) -> DispatchedQuery<crate::query::PreViewGroups> {
+    ) -> DirectAttempt<crate::query::PreViewGroups> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
         if query.is_invalid() {
             // A refused source never executes; this is a semantic answer,
-            // independent of database readiness, not an availability fallback.
-            return DispatchedQuery::Answered(crate::query::PreViewGroups::default());
+            // independent of database readiness, not an availability failure.
+            return DirectAttempt::Answered(crate::query::PreViewGroups::default());
         }
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(projection) = self
@@ -6605,28 +6600,43 @@ impl Graph {
             .map(Arc::clone)
         else {
             // No projection is attached at all (an export, a test graph, a
-            // headless tool). There is nothing to be ready or to fail.
-            return DispatchedQuery::Declined;
+            // headless tool). There is nothing to be ready or to fail, and
+            // nothing a repair could create.
+            return DirectAttempt::Unavailable(
+                crate::query::QueryUnavailableReason::ProjectionUnavailable,
+            );
         };
         if !projection.ready_at(generation) {
-            return DispatchedQuery::NotReady;
+            return DirectAttempt::NotReady;
         }
         // Acquire before reading registry inputs: lowering and output must see
         // the same SQLite transaction even when a save lands between them.
         let mut job = match projection.open_query_job(generation) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
-            crate::direct_projection::QueryJobOpen::NotReady => return DispatchedQuery::NotReady,
-            crate::direct_projection::QueryJobOpen::Failed => return DispatchedQuery::FailedRead,
-            crate::direct_projection::QueryJobOpen::Cancelled => return DispatchedQuery::Cancelled,
+            crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
+            crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
+            crate::direct_projection::QueryJobOpen::Failed => {
+                return DirectAttempt::FailedRead(crate::query::QueryUnavailableReason::ReadFailed)
+            }
+            crate::direct_projection::QueryJobOpen::Cancelled => return DirectAttempt::Cancelled,
         };
         let config = self.config.parse_config();
         let registry = if query.filter.has_props_leaf() {
+            // §6.2's metadata for THIS answer, read SQL-only from the job's own
+            // owned snapshot. A failed read is a failed read: it does not
+            // degrade to the cached or the empty registry, which would publish
+            // an answer under types nobody declared.
             match self.query_property_registry_at(generation, &config, &mut job) {
                 Ok(registry) => registry,
                 Err(crate::query::QueryExecutionError::Cancelled) => {
-                    return DispatchedQuery::Cancelled
+                    return DirectAttempt::Cancelled
                 }
-                Err(_) => return DispatchedQuery::FailedRead,
+                Err(crate::query::QueryExecutionError::Unavailable(reason)) => {
+                    return DirectAttempt::FailedRead(reason)
+                }
+                Err(crate::query::QueryExecutionError::NotReady(_)) => {
+                    return DirectAttempt::NotReady
+                }
             }
         } else {
             // No property predicate can observe registry types in this plan.
@@ -6651,18 +6661,20 @@ impl Graph {
         };
         // §5.9: when the projection is ready, the statement answers. The
         // compiler is TOTAL — it has no "unsupported" answer to return — so
-        // there is no shape-based route back to the walk left to take, and
+        // there is no shape-based route left to take, and
         // `statement.positively_bounded` is deliberately NOT consulted either:
         // it is §5.7's plan-gate concept, and reading it here would be the
         // fourth route ("ready but unbounded") that §5.9's first line and §5.10
-        // both forbid.
+        // both forbid. Should a later relation family stop being lowerable, its
+        // route is `DirectAttempt::Unavailable(UnsupportedRelation)` — never a
+        // fabricated empty answer and never a switch to the evaluator.
         let statement = lower_query(query, &inputs);
         // A filter that folded to false — an invalid query's zero results
         // (§3.5), or a leaf that can never hold — has an answer already. Reading
         // the projection to be told `0 rows` is the same answer at the price of
         // a round trip (I-15).
         if statement.matches_nothing {
-            return DispatchedQuery::Answered(crate::query::PreViewGroups::default());
+            return DirectAttempt::Answered(crate::query::PreViewGroups::default());
         }
         // R3: the answer is constructed from ONE owned read snapshot of the
         // projection and nothing else — no page document, no parsed cache
@@ -6691,17 +6703,9 @@ impl Graph {
             profile,
             recency: &recency,
         };
-        match crate::query::results::read_results(&mut job.snapshot, &inputs) {
-            Ok(pre) => DispatchedQuery::Answered(pre),
-            Err(crate::query::results::ResultReadError::Cancelled) => DispatchedQuery::Cancelled,
-            // A seam refusal or a projection that contradicts itself: the read
-            // was attempted and did not answer, so it is counted and recovered
-            // (D-3, §5.9/M9). The message names columns, never values.
-            Err(crate::query::results::ResultReadError::Sql(_))
-            | Err(crate::query::results::ResultReadError::Corrupt(_)) => {
-                DispatchedQuery::FailedRead
-            }
-        }
+        direct_attempt_from_read(
+            crate::query::results::read_results(&mut job.snapshot, &inputs).map_err(Into::into),
+        )
     }
 
     /// **SPEC §7.1 `query_run`'s Direct Files execution** (RET1).
@@ -6724,7 +6728,7 @@ impl Graph {
         resolved: &crate::query::ResolvedQuery,
         view: &crate::query::ir::ViewSettings,
         bounds: crate::query::ir::Bounds,
-    ) -> crate::query::ir::QueryResult {
+    ) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
         let query = resolved.query();
         let mut result = crate::query::ir::QueryResult {
             rows: crate::query::ir::QueryRows::Page { pages: Vec::new() },
@@ -6738,13 +6742,13 @@ impl Graph {
             exceeded: false,
         };
         if query.anchor == crate::query::ir::Anchor::Page {
-            let answer = self.direct_page_rows(query, resolved.today(), bounds);
+            let answer = self.direct_page_rows(query, resolved.today(), bounds)?;
             result.total = answer.total;
             result.exceeded = answer.exceeded;
             result.rows = crate::query::ir::QueryRows::Page {
                 pages: answer.pages,
             };
-            return result;
+            return Ok(result);
         }
         // The block-anchored tree both engines evaluate, and the tree §5.9's
         // cache is keyed by — the same `block_anchored_query` rebase
@@ -6764,14 +6768,14 @@ impl Graph {
                     profile,
                 )
             },
-        );
+        )?;
         result.total = bounded.total;
         result.exceeded = bounded.exceeded;
         result.rows = crate::query::ir::QueryRows::Block {
             groups: Arc::try_unwrap(bounded.groups)
                 .unwrap_or_else(|groups| groups.as_ref().clone()),
         };
-        result
+        Ok(result)
     }
 
     /// **SPEC §7.1 `query_explain_empty`'s Direct Files execution** (RET1).
@@ -6786,71 +6790,58 @@ impl Graph {
         resolved: &crate::query::ResolvedQuery,
         view: &crate::query::ir::ViewSettings,
         bounds: crate::query::ir::Bounds,
-    ) -> crate::query::ir::ExplainEmptyResult {
+    ) -> Result<crate::query::ir::ExplainEmptyResult, crate::query::QueryExecutionError> {
         let plan = crate::query::view::explain_empty_plan(resolved);
         if plan.probes.is_empty() {
-            return plan.answer(resolved, &[]);
+            // A refused binding has nothing honest to count. The empty plan and
+            // the empty count vector agree, which is what `answer` validates.
+            return plan.answer(resolved, &[]).map_err(|_| {
+                crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                )
+            });
         }
         let today = resolved.today();
-        let walk = || {
-            plan.probes
-                .iter()
-                .map(|probe| {
-                    crate::query::run_query_result_over(
-                        &crate::query::GraphQueryPages(self),
-                        probe,
-                        view,
-                        today,
-                        bounds,
-                    )
-                    .total
-                })
-                .collect::<Vec<_>>()
-        };
-        let counts = self.dispatched_or_walk(
-            self.direct_projection_statement_probe_counts(&plan.probes, view, today, bounds),
-            walk,
-        );
-        plan.answer(resolved, &counts)
+        let counts = self.dispatch_direct_query(|| {
+            self.direct_projection_statement_probe_counts(&plan.probes, view, today, bounds)
+        })?;
+        // The evaluator answered a plan it was not given: that is a projection
+        // that contradicts itself, not a row that reads as zero (RET2 §5).
+        plan.answer(resolved, &counts).map_err(|_| {
+            crate::query::QueryExecutionError::Unavailable(
+                crate::query::QueryUnavailableReason::InvalidSnapshot,
+            )
+        })
     }
 
-    /// §5.9's dispatch for an `@page` answer: the page statement when the
-    /// projection is ready, this graph's page walk otherwise.
+    /// §5.9's dispatch for an `@page` answer: the page statement, or a typed
+    /// execution error. There is no page walk behind it any more (RET2).
     fn direct_page_rows(
         &self,
         query: &crate::query::ir::Query,
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
-    ) -> crate::query::results::PageAnswer {
-        let walk = || {
-            crate::query::collect_page_rows_over(
-                &crate::query::GraphQueryPages(self),
-                query,
-                today,
-                bounds,
-            )
-        };
-        self.dispatched_or_walk(
-            self.direct_projection_statement_page_rows(query, today, bounds),
-            walk,
-        )
+    ) -> Result<crate::query::results::PageAnswer, crate::query::QueryExecutionError> {
+        self.dispatch_direct_query(|| {
+            self.direct_projection_statement_page_rows(query, today, bounds)
+        })
     }
 
     /// The statement half of [`Graph::direct_page_rows`], and of
     /// [`Graph::direct_ir_explain_empty`]'s counting: ONE query job, then the
     /// caller's reads over its snapshot.
     ///
-    /// It performs no fallback of its own — it reports which §5.9 state it
+    /// It performs no repair of its own — it reports which §5.9 state it
     /// reached, exactly as `direct_projection_statement_pre_view` does, so the
-    /// note and the recovery stay in `dispatched_or_walk`.
+    /// classification and the recovery stay in `dispatch_direct_query`.
     fn direct_projection_query_job<T>(
         &self,
         read: impl FnOnce(
             &mut crate::direct_projection::DirectQueryJob<'_>,
             u64,
             bool,
-        ) -> Result<T, crate::query::results::ResultReadError>,
-    ) -> DispatchedQuery<T> {
+        ) -> Result<T, crate::query::QueryExecutionError>,
+    ) -> DirectAttempt<T> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(projection) = self
             .direct_projection
@@ -6859,48 +6850,45 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         else {
-            return DispatchedQuery::Declined;
+            return DirectAttempt::Unavailable(
+                crate::query::QueryUnavailableReason::ProjectionUnavailable,
+            );
         };
         if !projection.ready_at(generation) {
-            return DispatchedQuery::NotReady;
+            return DirectAttempt::NotReady;
         }
         let mut job = match projection.open_query_job(generation) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
-            crate::direct_projection::QueryJobOpen::NotReady => return DispatchedQuery::NotReady,
-            crate::direct_projection::QueryJobOpen::Failed => return DispatchedQuery::FailedRead,
-            crate::direct_projection::QueryJobOpen::Cancelled => return DispatchedQuery::Cancelled,
-        };
-        match read(&mut job, generation, projection.fts_ready(generation)) {
-            Ok(answer) => DispatchedQuery::Answered(answer),
-            Err(crate::query::results::ResultReadError::Cancelled) => DispatchedQuery::Cancelled,
-            Err(crate::query::results::ResultReadError::Sql(_))
-            | Err(crate::query::results::ResultReadError::Corrupt(_)) => {
-                DispatchedQuery::FailedRead
+            crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
+            crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
+            crate::direct_projection::QueryJobOpen::Failed => {
+                return DirectAttempt::FailedRead(crate::query::QueryUnavailableReason::ReadFailed)
             }
-        }
+            crate::direct_projection::QueryJobOpen::Cancelled => return DirectAttempt::Cancelled,
+        };
+        direct_attempt_from_read(read(&mut job, generation, projection.fts_ready(generation)))
     }
 
     /// The §6.2 lowering inputs one Direct execution runs under: ONE registry
     /// snapshot and ONE parse of every `content match` payload, the same values
-    /// the walk reads (I-12). Returned as the two owned pieces the borrow in
+    /// the oracle reads (I-12). Returned as the owned piece the borrow in
     /// `LoweringInputs` needs.
+    ///
+    /// SQL-only, from the caller's already-owned job: the legacy
+    /// `Graph::property_registry()` walk and its ~250 ms UI debounce are not
+    /// eligible sources for an execution's metadata, and a failed read is
+    /// propagated rather than degraded to the cached or empty table.
     fn direct_lowering_registry(
         &self,
         has_properties: bool,
         generation: u64,
         job: &mut crate::direct_projection::DirectQueryJob<'_>,
-    ) -> Result<Arc<crate::query::registry::Registry>, crate::query::results::ResultReadError> {
+    ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         let config = self.config.parse_config();
         if !has_properties {
             return Ok(Arc::new(crate::query::registry::Registry::empty(&config)));
         }
         self.query_property_registry_at(generation, &config, job)
-            .map_err(|error| match error {
-                crate::query::QueryExecutionError::Cancelled => {
-                    crate::query::results::ResultReadError::Cancelled
-                }
-                _ => crate::query::results::ResultReadError::Corrupt(error.to_string()),
-            })
     }
 
     fn direct_projection_statement_page_rows(
@@ -6908,10 +6896,10 @@ impl Graph {
         query: &crate::query::ir::Query,
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
-    ) -> DispatchedQuery<crate::query::results::PageAnswer> {
+    ) -> DirectAttempt<crate::query::results::PageAnswer> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
         if query.is_invalid() {
-            return DispatchedQuery::Answered(crate::query::results::PageAnswer::default());
+            return DirectAttempt::Answered(crate::query::results::PageAnswer::default());
         }
         self.direct_projection_query_job(|job, generation, fts_ready| {
             let registry =
@@ -6942,6 +6930,7 @@ impl Graph {
                 crate::query::results::BackendOrder::Direct,
                 bounds.max_rows,
             )
+            .map_err(Into::into)
         })
     }
 
@@ -6957,7 +6946,7 @@ impl Graph {
         view: &crate::query::ir::ViewSettings,
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
-    ) -> DispatchedQuery<Vec<usize>> {
+    ) -> DirectAttempt<Vec<usize>> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
         self.direct_projection_query_job(|job, generation, fts_ready| {
             let profile = crate::query::ConstructionProfile::from_view(view);
@@ -7015,7 +7004,8 @@ impl Graph {
                         statement,
                         crate::query::results::BackendOrder::Direct,
                         bounds.max_rows,
-                    )?
+                    )
+                    .map_err(crate::query::QueryExecutionError::from)?
                     .total
                 } else {
                     crate::query::results::read_results(
@@ -7029,7 +7019,8 @@ impl Graph {
                             profile,
                             recency: &recency,
                         },
-                    )?
+                    )
+                    .map_err(crate::query::QueryExecutionError::from)?
                     .total
                 });
             }
@@ -7328,27 +7319,11 @@ impl Graph {
             .map_or(0, |projection| projection.fallback_reads())
     }
 
-    /// The candidate set the lowering produces, with the escape hatch driven
-    /// explicitly: `graph_page_count` sets the cutoff exactly as production
-    /// does, so a test can observe both the routed and the abandoned side.
-    /// Pass `usize::MAX` for the raw, uncapped lowering result.
-    #[cfg(test)]
-    pub(crate) fn direct_projection_candidate_paths_test(
-        &self,
-        plan: &crate::query::SimpleQueryCandidatePlan,
-        graph_page_count: usize,
-    ) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()?
-            .simple_query_candidate_paths(generation, plan, graph_page_count)
-    }
-
+    /// Reset the two route probes a query test reads: the hydration census and
+    /// the full-graph evaluator counter. RET2 retired the third — the candidate
+    /// page set — along with the candidate route that populated it.
     #[cfg(test)]
     pub(crate) fn reset_direct_projection_candidate_probe_test(&self) {
-        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|paths| paths.borrow_mut().clear());
         DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow_mut().clear());
         crate::query::reset_full_graph_query_evaluations();
     }
@@ -7377,13 +7352,6 @@ impl Graph {
         if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
             projection.inject_next_statement_failure();
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_projection_candidate_evaluated_paths_test(
-        &self,
-    ) -> Vec<std::path::PathBuf> {
-        DIRECT_CANDIDATE_EVALUATED_PATHS.with(|paths| paths.borrow().clone())
     }
 
     #[cfg(test)]
@@ -16772,18 +16740,98 @@ impl Graph {
         registry
     }
 
-    fn registry_generation_for_memo(&self, sensitivity: CacheSensitivity, key: &str) -> u64 {
-        if sensitivity.is_props_sensitive(key) {
-            self.property_registry().generation()
-        } else {
-            // A text/task/reference query cannot observe property types. It
-            // must not trigger a whole-registry refresh merely to check a memo.
-            self.property_registry
-                .read()
-                .unwrap()
-                .as_ref()
-                .map_or(0, |state| state.registry.generation())
+    /// The C6 registry term of a memo identity, from the PUBLISHED snapshot
+    /// alone.
+    ///
+    /// A text/task/reference query cannot observe property types, so it must
+    /// not trigger a registry refresh merely to check a memo (I-13,
+    /// `task_query_does_not_refresh_property_registry`). RET2 removed the other
+    /// branch: a `props`-sensitive query's term is
+    /// [`Graph::query_memo_registry_generation`], which is SQL-only — the
+    /// legacy `property_registry()` refresh is a document walk when the
+    /// projection is not ready and a ~250 ms debounced snapshot when it is, and
+    /// neither is an eligible source for the identity an answer is published
+    /// under.
+    fn published_registry_generation(&self) -> u64 {
+        self.property_registry
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |state| state.registry.generation())
+    }
+
+    /// The C6 registry term for a query memo, SQL-only (RET2).
+    ///
+    /// `props`-sensitive queries need the CURRENT effective types: an answer
+    /// published under a registry generation it did not use is served again
+    /// after a type declaration that should have evicted it. When the published
+    /// snapshot is already current for this source generation and parse config,
+    /// that IS the table the execution will use (`query_property_registry_at`
+    /// takes the same fast path), so nothing is read. Otherwise ONE owned job
+    /// reads it through the same `DirectQueryJob::read_registry` the execution
+    /// uses, and the execution then hits the published fast path — one table,
+    /// two readers, no second producer (D-14).
+    fn query_memo_registry_generation(
+        &self,
+        props_sensitive: bool,
+        source_generation: u64,
+    ) -> Result<u64, crate::query::QueryExecutionError> {
+        if !props_sensitive {
+            return Ok(self.published_registry_generation());
         }
+        Ok(self
+            .query_property_registry_current(source_generation)?
+            .generation())
+    }
+
+    /// §6.2's registry for the CURRENT source generation, SQL-only and
+    /// fallible (RET2).
+    ///
+    /// The published snapshot is returned when it already describes this source
+    /// generation and parse config and no property-key page was saved since —
+    /// which is the same fast path `query_property_registry_at` takes inside a
+    /// job, so a reader that comes here and an execution that comes there share
+    /// ONE table (D-4/D-14, no second producer). Otherwise one owned query job
+    /// reads it through `DirectQueryJob::read_registry`.
+    ///
+    /// It never falls back to `Graph::property_registry`: that refresh walks
+    /// parsed documents when the projection is not ready and serves a ~250 ms
+    /// debounced snapshot when it is, so it can answer with metadata no
+    /// execution used.
+    pub(crate) fn query_property_registry_current(
+        &self,
+        source_generation: u64,
+    ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
+        let config = self.config.parse_config();
+        {
+            let guard = self.property_registry.read().unwrap();
+            if let Some(state) = guard.as_ref() {
+                if state.source_generation == source_generation
+                    && state.registry.config_digest() == config.digest()
+                    && !state.declarations_dirty
+                {
+                    return Ok(Arc::clone(&state.registry));
+                }
+            }
+        }
+        self.dispatch_direct_query(|| {
+            self.direct_projection_query_job(|job, generation, _| {
+                self.query_property_registry_at(generation, &config, job)
+            })
+        })
+    }
+
+    /// **SPEC §7.1 `query_registry`'s Direct Files answer** (RET2).
+    ///
+    /// The command used to read `Graph::property_registry().snapshot()`, whose
+    /// not-ready branch iterates every parsed document. It is the projection's
+    /// answer or a typed failure now, exactly like every other public query
+    /// read on this backend.
+    pub fn query_registry_snapshot_ready(
+        &self,
+    ) -> Result<crate::query::ir::RegistrySnapshot, crate::query::QueryExecutionError> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        Ok(self.query_property_registry_current(generation)?.snapshot())
     }
 
     fn derived_memo_bounded(
@@ -16827,30 +16875,45 @@ impl Graph {
         view: &crate::query::ir::ViewSettings,
         max_rows: usize,
         max_bytes: usize,
-        compute: impl FnOnce(crate::query::ConstructionProfile) -> crate::query::PreViewGroups,
-    ) -> BoundedRefGroups {
+        compute: impl FnOnce(
+            crate::query::ConstructionProfile,
+        )
+            -> Result<crate::query::PreViewGroups, crate::query::QueryExecutionError>,
+    ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
+        use std::sync::atomic::Ordering;
         let profile = crate::query::ConstructionProfile::from_view(view);
         let key = crate::query::simple_query_cache_key(query, max_rows, max_bytes, profile);
-        let sensitivity = CacheSensitivity::Known(query.filter.has_props_leaf());
-        let entry = self.derived_memo_entry(key, sensitivity, || {
-            let mut pre = compute(profile);
+        let props = query.filter.has_props_leaf();
+        let sensitivity = CacheSensitivity::Known(props);
+        let gen = self.cache_gen.load(Ordering::Acquire);
+        // The metadata half of the identity is acquired BEFORE the cache is
+        // consulted and is SQL-only: a readiness or read failure here is the
+        // query's answer, not a reason to key the entry off a stale table.
+        let stamp = DerivedMemoStamp {
+            gen,
+            today: crate::date::JournalDate::today().ordinal_key(),
+            config_digest: self.config.parse_config().digest(),
+            registry_gen: self.query_memo_registry_generation(props, gen)?,
+        };
+        let entry = self.try_derived_memo_entry(key, sensitivity, stamp, || {
+            let mut pre = compute(profile)?;
             crate::query::base_order_groups(&mut pre.groups);
-            DerivedEntry {
+            Ok::<_, crate::query::QueryExecutionError>(DerivedEntry {
                 result: BoundedRefGroups {
                     groups: Arc::new(pre.groups),
                     total: pre.total,
                     exceeded: pre.exceeded,
                 },
                 recency_by_page: Arc::new(pre.recency_by_page),
-            }
-        });
-        crate::query::apply_cached_view(
+            })
+        })?;
+        Ok(crate::query::apply_cached_view(
             &entry.result.groups,
             &entry.recency_by_page,
             view,
             entry.result.total,
             entry.result.exceeded,
-        )
+        ))
     }
 
     /// The C6 cache identity: `(cache_gen, today, ParseConfig::digest(),
@@ -16865,7 +16928,9 @@ impl Graph {
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
         let config_digest = self.config.parse_config().digest();
-        let registry_gen = self.registry_generation_for_memo(sensitivity, &key);
+        // Backlinks, unlinked references and block referrers carry no `props`
+        // leaf, so the published generation is their whole registry term.
+        let registry_gen = self.published_registry_generation();
         self.try_derived_memo_entry(
             key,
             sensitivity,
@@ -16979,17 +17044,24 @@ impl Graph {
         .groups
     }
 
+    /// The advanced (datalog) twin of [`Graph::try_derived_memo_entry`], on its
+    /// own LRU budget because an advanced result carries the clause report.
+    ///
+    /// RET2 made it fallible for the same reason: only a SUCCESSFUL result is
+    /// eligible for publication, so a readiness, cancellation or read failure
+    /// cannot poison a later retry with a fabricated empty entry.
     fn advanced_memo_bounded(
         &self,
         key: String,
-        sensitivity: CacheSensitivity,
-        compute: impl FnOnce() -> crate::query::BoundedGroups,
-    ) -> CachedAdvancedResult {
+        props_sensitive: bool,
+        compute: impl FnOnce() -> Result<crate::query::BoundedGroups, crate::query::QueryExecutionError>,
+    ) -> Result<CachedAdvancedResult, crate::query::QueryExecutionError> {
         use std::sync::atomic::Ordering;
+        let sensitivity = CacheSensitivity::Known(props_sensitive);
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
         let config_digest = self.config.parse_config().digest();
-        let registry_gen = self.registry_generation_for_memo(sensitivity, &key);
+        let registry_gen = self.query_memo_registry_generation(props_sensitive, gen)?;
         {
             let mut g = self.advanced_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {
@@ -17005,12 +17077,12 @@ impl Graph {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
                         touch_lru(&mut dc.lru, &key);
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
         }
-        let computed = compute();
+        let computed = compute()?;
         let result = CachedAdvancedResult {
             groups: Arc::new(computed.groups),
             total: computed.total,
@@ -17019,7 +17091,7 @@ impl Graph {
         let result_bytes = ref_groups_estimated_bytes(result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
-            return result;
+            return Ok(result);
         }
         let props = sensitivity.is_props_sensitive(&key);
         let mut g = self.advanced_cache.write().unwrap();
@@ -17058,34 +17130,17 @@ impl Graph {
                 });
             }
         }
-        result
-    }
-
-    fn advanced_memo(
-        &self,
-        key: String,
-        compute: impl FnOnce() -> Vec<RefGroup>,
-    ) -> Arc<Vec<RefGroup>> {
-        self.advanced_memo_bounded(key, CacheSensitivity::Known(false), || {
-            let groups = compute();
-            let total = groups.iter().map(|group| group.blocks.len()).sum();
-            crate::query::BoundedGroups {
-                groups,
-                total,
-                exceeded: false,
-            }
-        })
-        .groups
+        Ok(result)
     }
 
     fn run_advanced_query_cached(
         &self,
         query_src: &str,
         current_page: Option<&str>,
-    ) -> Arc<crate::query::AdvancedResult> {
+    ) -> Result<Arc<crate::query::AdvancedResult>, crate::query::QueryExecutionError> {
         let (result, _, _) =
-            self.advanced_query_cached(query_src, current_page, usize::MAX, usize::MAX);
-        Arc::new(result)
+            self.advanced_query_cached(query_src, current_page, usize::MAX, usize::MAX)?;
+        Ok(Arc::new(result))
     }
 
     pub fn run_advanced_query_bounded_cached(
@@ -17094,7 +17149,8 @@ impl Graph {
         current_page: Option<&str>,
         max_rows: usize,
         max_bytes: usize,
-    ) -> (crate::query::AdvancedResult, bool, usize) {
+    ) -> Result<(crate::query::AdvancedResult, bool, usize), crate::query::QueryExecutionError>
+    {
         self.advanced_query_cached(query_src, current_page, max_rows, max_bytes)
     }
 
@@ -17116,10 +17172,13 @@ impl Graph {
         current_page: Option<&str>,
         max_rows: usize,
         max_bytes: usize,
-    ) -> (crate::query::AdvancedResult, bool, usize) {
+    ) -> Result<(crate::query::AdvancedResult, bool, usize), crate::query::QueryExecutionError>
+    {
         let (query, today, ran, ignored) =
             match crate::query::resolve_advanced_source(query_src, current_page) {
-                crate::query::ResolvedAdvanced::Refused(result) => return (result, false, 0),
+                // A refused source is a SEMANTIC answer (§3.5): it never
+                // executes, so it is independent of index availability.
+                crate::query::ResolvedAdvanced::Refused(result) => return Ok((result, false, 0)),
                 crate::query::ResolvedAdvanced::Executable {
                     query,
                     today,
@@ -17130,18 +17189,17 @@ impl Graph {
         let query = crate::query::block_anchored_query(&query);
         let profile = crate::query::ConstructionProfile::default();
         let key = crate::query::simple_query_cache_key(&query, max_rows, max_bytes, profile);
-        let sensitivity = CacheSensitivity::Known(query.filter.has_props_leaf());
-        let cached = self.advanced_memo_bounded(key, sensitivity, || {
+        let cached = self.advanced_memo_bounded(key, query.filter.has_props_leaf(), || {
             let mut pre =
-                self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile);
+                self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile)?;
             crate::query::base_order_groups(&mut pre.groups);
-            crate::query::BoundedGroups {
+            Ok(crate::query::BoundedGroups {
                 groups: pre.groups,
                 total: pre.total,
                 exceeded: pre.exceeded,
-            }
-        });
-        (
+            })
+        })?;
+        Ok((
             crate::query::AdvancedResult {
                 groups: cached.groups.as_ref().clone(),
                 ran,
@@ -17150,7 +17208,7 @@ impl Graph {
             },
             cached.exceeded,
             cached.total,
-        )
+        ))
     }
 
     /// Backlinks for a page: blocks across the graph that reference it,
@@ -17195,9 +17253,13 @@ impl Graph {
     }
 
     /// Evaluate a `{{query ...}}` body over the graph (memoized).
-    pub fn run_query(&self, query_src: &str) -> Arc<Vec<RefGroup>> {
-        self.run_query_bounded(query_src, usize::MAX, usize::MAX)
-            .groups
+    pub fn run_query(
+        &self,
+        query_src: &str,
+    ) -> Result<Arc<Vec<RefGroup>>, crate::query::QueryExecutionError> {
+        Ok(self
+            .run_query_bounded(query_src, usize::MAX, usize::MAX)?
+            .groups)
     }
 
     /// **SPEC §5.9's Direct Files entry point.** Parse once, key by the resolved
@@ -17222,15 +17284,17 @@ impl Graph {
         query_src: &str,
         max_rows: usize,
         max_bytes: usize,
-    ) -> BoundedRefGroups {
+    ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
         if !crate::query::query_source_within_limit(query_src)
             || !crate::query::query_nesting_within_limit(query_src)
         {
-            return BoundedRefGroups {
+            // A refused INPUT (§3.5) is a semantic answer, not an availability
+            // failure: it is the same empty result at every readiness state.
+            return Ok(BoundedRefGroups {
                 groups: Arc::new(Vec::new()),
                 total: 0,
                 exceeded: false,
-            };
+            });
         }
         // §4.4: the ONE execution-day snapshot for this answer, taken here and
         // handed to both the lowering and the walk. A rollover between two
@@ -17252,10 +17316,11 @@ impl Graph {
         &self,
         query_src: &str,
         current_page: Option<&str>,
-    ) -> crate::query::AdvancedResult {
-        self.run_advanced_query_cached(query_src, current_page)
+    ) -> Result<crate::query::AdvancedResult, crate::query::QueryExecutionError> {
+        Ok(self
+            .run_advanced_query_cached(query_src, current_page)?
             .as_ref()
-            .clone()
+            .clone())
     }
 
     /// Unlinked references: plain-text mentions of a page that aren't links

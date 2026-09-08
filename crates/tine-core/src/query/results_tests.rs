@@ -653,7 +653,8 @@ fn a_huge_page_with_one_match_costs_one_descriptor_row_and_one_payload_row() {
     corpus.graph.clear_query_memos_test();
     let today = corpus
         .graph
-        .run_query_bounded(source, usize::MAX, usize::MAX);
+        .run_query_bounded(source, usize::MAX, usize::MAX)
+        .expect("the ready projection answers");
     assert_eq!(
         today
             .groups
@@ -1840,6 +1841,7 @@ fn public_run_differences(
 
     let run = measured(corpus, |graph| {
         crate::query::run_query_result_ir(graph, &query, &view, bounds, context)
+            .expect("the ready projection answers the public IR route")
     });
 
     // The oracle, built only now: a `GraphQueryPages` constructed before the
@@ -1907,6 +1909,7 @@ fn public_explain_differences(
 
     let explained = measured(corpus, |graph| {
         crate::query::explain_empty_query(graph, &query, &view, bounds, context)
+            .expect("the ready projection answers the public explanation")
     });
 
     let resolved = crate::query::resolve_for_execution(&query, context, today);
@@ -2244,6 +2247,17 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
         ExecutionContext::on_page("one"),
     ];
 
+    // RET2: a `props`-sensitive memo stamps itself with the CURRENT property
+    // registry generation, and that generation is now read from SQL instead of
+    // by walking parsed documents. On a warm reopen nothing is published yet,
+    // so the FIRST such query pays one extra owned read and every later one
+    // takes the published fast path. That one-time per-session cost is not the
+    // per-execution cost this gate measures, so it is paid here explicitly —
+    // through the same public command the frontend uses.
+    graph
+        .query_registry_snapshot_ready()
+        .expect("the reopened projection answers the public registry read");
+
     let mut differences = Vec::new();
     let mut answered = 0usize;
     for (source, input) in ret1_context_shapes() {
@@ -2254,9 +2268,11 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
             graph.clear_query_memos_test();
             graph.reset_direct_projection_candidate_probe_test();
             let before = graph.direct_projection_statement_reads_test();
-            let result = crate::query::run_query_result_ir(&graph, &query, &view, bounds, context);
+            let result = crate::query::run_query_result_ir(&graph, &query, &view, bounds, context)
+                .expect("the ready projection answers the public IR route");
             let explained =
-                crate::query::explain_empty_query(&graph, &query, &view, bounds, context);
+                crate::query::explain_empty_query(&graph, &query, &view, bounds, context)
+                    .expect("the ready projection answers the public explanation");
             let statement_reads = graph.direct_projection_statement_reads_test() - before;
             let walks = crate::query::full_graph_query_evaluations();
             let hydrated = graph.direct_projection_hydrated_pages_test().len();
@@ -2329,7 +2345,8 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
     let (query, view) = ret1_parse("@page and name = 'shared title'", QueryInput::Tql, today);
     graph.clear_query_memos_test();
     let shared =
-        crate::query::run_query_result_ir(&graph, &query, &view, bounds, &ExecutionContext::none());
+        crate::query::run_query_result_ir(&graph, &query, &view, bounds, &ExecutionContext::none())
+            .expect("the ready projection answers the public IR route");
     let shared_rows = match &shared.rows {
         crate::query::ir::QueryRows::Page { pages } => pages.len(),
         other => panic!("a `@page` query must answer with page rows, got {other:?}"),
@@ -2350,7 +2367,10 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
     let rows_of = |source: &str, input: QueryInput, context: &ExecutionContext| {
         let (query, view) = ret1_parse(source, input, today);
         graph.clear_query_memos_test();
-        match crate::query::run_query_result_ir(&graph, &query, &view, bounds, context).rows {
+        match crate::query::run_query_result_ir(&graph, &query, &view, bounds, context)
+            .expect("the ready projection answers the public IR route")
+            .rows
+        {
             crate::query::ir::QueryRows::Block { groups } => {
                 groups.iter().map(|group| group.blocks.len()).sum::<usize>()
             }
@@ -2472,9 +2492,11 @@ fn the_public_ir_route_refuses_without_walking_and_keeps_its_report() {
         let (query, view) = ret1_parse(source, input, today);
         let run = measured(&corpus, |graph| {
             crate::query::run_query_result_ir(graph, &query, &view, bounds, &context)
+                .expect("the ready projection answers the public IR route")
         });
         let explained = measured(&corpus, |graph| {
             crate::query::explain_empty_query(graph, &query, &view, bounds, &context)
+                .expect("the ready projection answers the public explanation")
         });
 
         let rows = match &run.answer.rows {

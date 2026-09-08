@@ -48,67 +48,52 @@ const SOURCE_CONSTRUCTORS: &[&str] = &["GraphQueryPages(", "ApplicationQueryPage
 /// deletes it.
 ///
 /// * **RET2** — the public query routes' readiness / read-error / cancellation
-///   recovery. RET1 kept these as an internal repair checkpoint; RET2 removes
-///   them and wires automatic retry instead, which is what makes the public
-///   commands database-only. RET2-Managed has landed: both `sync_runtime.rs`
-///   rows are gone. The `model.rs` rows are RET2-Direct's and are still here.
+///   recovery. RET1 kept these as an internal repair checkpoint; RET2 removed
+///   them and wired one bounded repair plus a typed
+///   `query::QueryExecutionError` instead, which is what makes the public
+///   commands database-only. **Both halves have landed and the list is empty:**
+///   RET2-Managed took the two `sync_runtime.rs` rows, RET2-Direct took the
+///   three `model.rs` rows.
 /// * **RET3** — the friendly (`{{query}}` / backlinks / derived) ranking route
 ///   and the export subtree reader, migrated after the public commands.
 /// * **oracle** — a walk that exists to be COMPARED against, or a §8.1
 ///   counterfactual mode. These stay: the amendment retires production
 ///   traversal, not the oracle the parity gates need.
 const PINNED: &[(&str, &str, usize, &str)] = &[
-    // ---- RET2: the public IR route's own recovery walks ----
-    // (`model.rs::direct_ir_query_result` is deliberately absent: the block
-    // route reaches its recovery through `direct_simple_query_pre_view` and
-    // owns no walk of its own.)
-    (
-        "crates/tine-core/src/model.rs",
-        "direct_ir_explain_empty",
-        1,
-        "RET2: explain-empty's probe counts fall back to the walk when the \
-         projection is not ready / the read fails / the read is cancelled",
-    ),
-    (
-        "crates/tine-core/src/model.rs",
-        "direct_page_rows",
-        1,
-        "RET2: the `@page` read's readiness/read-error/cancellation recovery",
-    ),
-    // (`sync_runtime.rs::ir_walk_ready` was here. RET2-Managed deleted
-    // `application_ir_query_walk_ready` and replaced
+    // ---- RET2: no rows. The public IR route has no walk behind it. ----
+    // (`model.rs::direct_ir_explain_empty`, `model.rs::direct_page_rows` and
+    // `model.rs::direct_simple_query_pre_view` were here. RET2-Direct replaced
+    // `Graph::dispatched_or_walk` with `Graph::dispatch_direct_query`: one
+    // bounded repair through the existing streamed recovery, then a retry of
+    // the SAME statement, then a typed `query::QueryExecutionError`. Cancelled
+    // never repairs; a missing projection is `ProjectionUnavailable`; a stopped
+    // worker is bounded rather than an endless retry. `model.rs` builds no
+    // walk source at all any more, which is why it names no function below.)
+    //
+    // (`sync_runtime.rs::ir_walk_ready` and
+    // `sync_runtime.rs::application_simple_query_pages_ready` were here too.
+    // RET2-Managed deleted `application_ir_query_walk_ready` and replaced
     // `application_ir_query_turn`'s no-stamp / non-local branches with typed
-    // `query::QueryExecutionError`s, which left the walk with no production
-    // caller; it is now compiled only under test, as the parity oracle.)
-    // ---- RET2/RET3: shared with the older SimpleQuery route ----
-    (
-        "crates/tine-core/src/model.rs",
-        "direct_simple_query_pre_view",
-        1,
-        "RET2 for the public IR block route (which reaches it through \
-         `direct_ir_query_result`); RET3 for the `{{query}}` SimpleQuery \
-         callers that also reach it",
-    ),
-    // (`sync_runtime.rs::application_simple_query_pages_ready` was here, on
-    // RET3's list. RET2-Managed reached it early: Managed `SimpleQuery` is a
-    // PUBLIC query command on the same captured route as the two IR commands,
-    // so its recovery walk was retired with theirs. The actor's
-    // `SyncApplicationNavigationRequest::SimpleQuery` arm is gone too, and the
-    // function is now compiled only under test, as the R4a/R5a parity oracle.
-    // Direct Files' `{{query}}` SimpleQuery route is untouched and is still
-    // RET3's, through `model.rs::direct_simple_query_pre_view` below.)
+    // `query::QueryExecutionError`s; both functions are now compiled only under
+    // test, as the parity oracles.)
+    //
+    // Direct Files' `{{query}}` friendly ranking route still walks, but it does
+    // so through `query.rs::run_query_bounded` below, which is RET3's.
     // ---- RET3: the friendly / advanced / export routes ----
     (
         "crates/tine-core/src/query.rs",
         "run_query_bounded",
         1,
-        "RET3: `{{query}}` ranking over Direct Files",
+        "RET3: `{{query}}` ranking over Direct Files. Remaining production \
+         consumer after RET2-Direct: `publish.rs`'s static OG-macro export \
+         (`Graph::run_query_bounded` no longer reaches it — it dispatches).",
     ),
     (
         "crates/tine-core/src/query.rs",
         "run_pred_bounded",
         1,
-        "RET3: the pre-view block constructor's Direct Files entry",
+        "RET3: the pre-view block constructor's Direct Files entry, reached \
+         through `run_query_result`",
     ),
     (
         "crates/tine-core/src/query.rs",
@@ -121,7 +106,9 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
         "crates/tine-core/src/query.rs",
         "run_advanced_query_bounded",
         1,
-        "RET3: advanced datalog over Direct Files",
+        "RET3: advanced datalog over Direct Files. Remaining production \
+         consumer after RET2-Direct: `publish.rs`'s static export \
+         (`Graph::run_advanced_query_bounded_cached` dispatches instead).",
     ),
     (
         "crates/tine-core/src/query.rs",
@@ -139,7 +126,8 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
         "crates/tine-core/src/query.rs",
         "export_query_subtrees",
         1,
-        "RET3: the export reader over Direct Files",
+        "RET3: the export reader over Direct Files, reached by the \
+         `export_query_subtrees` command's Direct arm",
     ),
     (
         "crates/tine-core/src/query.rs",

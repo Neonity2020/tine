@@ -7,12 +7,15 @@
 //! temporary, and — much worse — can be silently deleted along with the code it
 //! was warning about. Both are deliberate acts, so both fail here first.
 //!
-//! This is the first deliberate use of the convention, so the exemplar is the
-//! `simple_query_candidate_paths` hatch in `direct_projection.rs`. Copy its
-//! shape: WHAT may be deleted, the CONDITION that makes it deletable, and WHAT
-//! CURRENTLY BLOCKS deletion — the last being the part a future sweep actually
-//! needs, because a marker that only says "delete me eventually" tells the
-//! sweep nothing about whether now is the time.
+//! The convention's first deliberate use was the `simple_query_candidate_paths`
+//! hatch in `direct_projection.rs`, and it worked exactly as intended: RET2
+//! deleted the Direct query walk, the hatch's stated CONDITION was met, and the
+//! hatch, its marker and this row all went with it. The surviving exemplar is
+//! the pre-SQL candidate planner in `query.rs`. Copy its shape: WHAT may be
+//! deleted, the CONDITION that makes it deletable, and WHAT CURRENTLY BLOCKS
+//! deletion — the last being the part a future sweep actually needs, because a
+//! marker that only says "delete me eventually" tells the sweep nothing about
+//! whether now is the time.
 //!
 //! Pinned by `(file, marker text)` and never by line number: a line-anchored
 //! pin reddens on every unrelated packet that edits the file above it, which is
@@ -29,10 +32,6 @@ const MARKER: &str = "// RETIREMENT-CANDIDATE:";
 /// The exact `(file, first line of the marker)` set. Adding or removing a row
 /// is the deliberate act this guard exists to force.
 const PINNED: &[(&str, &str)] = &[
-    (
-        "crates/tine-core/src/direct_projection.rs",
-        "// RETIREMENT-CANDIDATE: the candidate-count escape hatch below, together",
-    ),
     (
         "crates/tine-core/src/query.rs",
         "// RETIREMENT-CANDIDATE: the pre-SQL candidate planner for the walk.",
@@ -84,8 +83,7 @@ fn retirement_candidate_markers_are_pinned() {
          Adding a marker and deleting one are both deliberate acts, so both \
          update this list. If you deleted the code, delete its row. If you \
          added a marker, add its row and copy the exemplar's shape: \
-         `crates/tine-core/src/direct_projection.rs`, on the candidate-count \
-         escape hatch in `simple_query_candidate_paths`.\n\
+         `crates/tine-core/src/query.rs`, on the pre-SQL candidate planner.\n\
          \n\
          I-12: this census uses the one production-source scanner \
          (`tests/support/production_source.rs`); do not add a second walker."
@@ -126,19 +124,26 @@ fn every_retirement_candidate_states_condition_and_blocker() {
     }
 }
 
-/// The one blocker this packet's marker records: the parser walk is the
-/// correctness ORACLE for the lowering that would replace it, so it outlives
-/// that lowering by at least one release. A sweep that deletes the walk the
-/// moment SQL works removes the only way to prove SQL right.
+/// The one blocker the walk's marker records: the parser walk is the
+/// correctness ORACLE for the lowering that replaced it, so it outlives that
+/// lowering by at least one release. A sweep that deletes the walk the moment
+/// SQL works removes the only way to prove SQL right.
 ///
 /// Martin, 2026-09-03, card `PVTI_lAHOAAbLVc4BhPsyzg5VyLk`. Asserted rather
 /// than merely written, because this is exactly the reasoning a later reader
 /// would otherwise have to reconstruct — and would get wrong.
+///
+/// RET2 is why the reasoning is now asserted on the WALK's marker rather than
+/// on the Direct candidate hatch that used to carry it: the hatch and the
+/// Direct walk fallback it guarded are both deleted, and the oracle claim is
+/// the part of that note that had to survive them.
 #[test]
-fn the_query_hatch_marker_records_the_walk_as_the_correctness_oracle() {
+fn the_walk_marker_records_itself_as_the_correctness_oracle() {
     let root = repo_root();
-    let source = compiled_source(&root.join("crates/tine-core/src/direct_projection.rs"));
-    let start = source.find(MARKER).expect("the exemplar marker");
+    let source = compiled_source(&root.join("crates/tine-core/src/query.rs"));
+    let start = source
+        .find("// RETIREMENT-CANDIDATE: the in-memory query walk.")
+        .expect("the walk marker");
     let note = source[start..]
         .lines()
         .take_while(|line| line.trim().starts_with("//"))
@@ -154,9 +159,9 @@ fn the_query_hatch_marker_records_the_walk_as_the_correctness_oracle() {
     ] {
         assert!(
             note.contains(required),
-            "the query hatch's {MARKER} note must record `{required}`: the \
-             walk is not merely the fallback, it is the acceptance gate for \
-             the lowering that replaces it, and retiring the hatch is NOT \
+            "the walk's {MARKER} note must record `{required}`: the walk is \
+             not merely a fallback, it is the acceptance gate for the \
+             lowering that replaced it, and shipping that lowering is NOT \
              permission to retire the walk."
         );
     }

@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 use tine_core::{ActivationIntent, Graph, PageDto};
 
+#[path = "support/ready_query.rs"]
+mod ready_query;
+
 /// Make `dto` an EDITOR's DTO, the way the frontend does.
 ///
 /// Since GH #254 increment 3 a loaded page and a live editor are different
@@ -1670,8 +1673,11 @@ fn query_between_filters_by_journal_date() {
     .unwrap();
 
     let g = Graph::open(&root);
-    let groups = g
-        .run_query("(and (task TODO) (and [[scs]] (between [[Jan 1st, 2021]] [[Jan 1st, 2100]])))");
+    ready_query::attach_projection(&g, &root);
+    let groups = ready_query::run_query(
+        &g,
+        "(and (task TODO) (and [[scs]] (between [[Jan 1st, 2021]] [[Jan 1st, 2100]])))",
+    );
     let raws: Vec<String> = groups
         .iter()
         .flat_map(|gr| gr.blocks.iter().map(|b| b.raw.clone()))
@@ -1919,8 +1925,8 @@ fn query_and_not_includes_everything_except_excluded() {
     )
     .unwrap();
     let g = Graph::open(&root);
-    let raws: Vec<String> = g
-        .run_query("(and (task TODO) (not [[X]]))")
+    ready_query::attach_projection(&g, &root);
+    let raws: Vec<String> = ready_query::run_query(&g, "(and (task TODO) (not [[X]]))")
         .iter()
         .flat_map(|gr| gr.blocks.iter().map(|b| b.raw.clone()))
         .collect();
@@ -2626,7 +2632,8 @@ fn deleted_journal_is_not_served_from_stale_cache() {
 #[test]
 fn query_open_tasks() {
     let g = demo_graph();
-    let groups = g.run_query("(task TODO DOING)");
+    ready_query::attach_scratch_projection(&g, "query-open-tasks");
+    let groups = ready_query::run_query(&g, "(task TODO DOING)");
     let raws: Vec<String> = groups
         .iter()
         .flat_map(|gr| gr.blocks.iter().map(|b| b.raw.clone()))
@@ -2664,11 +2671,10 @@ fn agenda_query_excludes_finished_tasks() {
     )
     .unwrap();
     let g = Graph::open(&root);
-    g.warm_cache();
+    ready_query::attach_projection(&g, &root);
     let q = "(and (or (between scheduled -36500d +36500d) (between deadline -36500d +36500d)) \
              (not (task DONE CANCELED CANCELLED)))";
-    let raws: Vec<String> = g
-        .run_query(q)
+    let raws: Vec<String> = ready_query::run_query(&g, q)
         .iter()
         .flat_map(|gr| gr.blocks.iter().map(|b| b.raw.clone()))
         .collect();

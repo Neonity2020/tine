@@ -63,6 +63,7 @@ import type { PageKind, RefGroup } from "../types";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { graphBinding } from "../persistence";
 import { createReadyQueryResource } from "../createReadyQueryResource";
+import { runQueryWhenCurrent } from "../queryReadiness";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
@@ -297,9 +298,25 @@ export function QueryMacro(props: {
     name: macroName(),
     properties: blockDirectives(),
   }));
+  // **Readiness, not sorted groups (RET2-Direct).** `query_parse` reads the
+  // property registry for its `UnknownIdent` suggestions, and that read is now
+  // SQL-only and fallible: it used to swallow every failure into an empty
+  // registry, which reported a declared property as unknown. So the parse
+  // retries typed `query-not-ready` the way every other query read does, gated
+  // on its OWN request still being current.
+  //
+  // The retry rides INSIDE the existing resource rather than replacing it with
+  // `createReadyQueryResource`: that owner also re-keys on the graph epoch and
+  // blanks its rows across a rebind, which would re-parse on every repaint and
+  // drop the reading the display derivations read through `latest`. Nothing
+  // about the result presentation, group ordering or the scroll harness is
+  // involved here.
   const [parsedSnapshot] = createResource(parseRequest, async (request) => ({
     request,
-    reading: await backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+    reading: await runQueryWhenCurrent(
+      () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+      () => parseRequest() === request,
+    ),
   }));
   // Keep each reading paired with the exact inputs it describes. A displayed
   // reading can intentionally lag a local edit while its replacement loads.
@@ -355,20 +372,34 @@ export function QueryMacro(props: {
     if (!pageName) return null; // no focused page: leave verbatim, like templates
     return arg().replace(/<%\s*current page\s*%>/gi, `[[${pageName}]]`);
   });
-  const [executionParsed] = createResource(
-    () => {
-      const argument = executionArg();
-      return argument === null
-        ? undefined
-        : { argument, name: macroName(), properties: blockDirectives() };
-    },
-    (request) =>
-      backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
-  );
+  const executionRequest = createMemo(() => {
+    const argument = executionArg();
+    return argument === null
+      ? undefined
+      : { argument, name: macroName(), properties: blockDirectives() };
+  });
+  // The execution-side parse takes the SAME readiness owner the executions
+  // below take: `query_parse` reads the property registry, that read is now
+  // SQL-only and fallible, and an unretried refusal here would leave a
+  // `<% current page %>` macro with no runnable form at all.
+  const [executionParsed] = createReadyQueryResource(executionRequest, async (request) => ({
+    request,
+    reading: await backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+  }));
+  /** The execution reading, paired with the exact substituted argument it
+   *  describes (GH #301). A reading for the PREVIOUS page is not a runnable
+   *  form for this one: dispatching it would run a query the presentation has
+   *  already moved off, and a readiness retry — which can hold the replacement
+   *  for as long as the projection needs — widens exactly that window. The
+   *  displayed rows are unaffected: `groupResource` keeps its own `latest`. */
+  const executionReading = (): ParsedQuery | undefined => {
+    const snapshot = executionParsed.latest;
+    return snapshot && snapshot.request.argument === executionArg() ? snapshot.reading : undefined;
+  };
   /** The reading the EXECUTION runs. Every authoring and display derivation keeps
    *  the literal dyvar and therefore keeps using `parsed`. */
   const runnable = (): ParsedQuery | undefined =>
-    executionArg() === null ? parsed.latest : executionParsed.latest;
+    executionArg() === null ? parsed.latest : executionReading();
   const executableForm = createMemo(() => {
     const source = runnable()?.query.source;
     return (source ? sourceOriginal(source) : null) ?? "";
@@ -457,7 +488,10 @@ export function QueryMacro(props: {
       // save still materializes its full effective view, including text-only
       // directives that a reprint would otherwise discard.
       try {
-        const fresh = await backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties);
+        const fresh = await runQueryWhenCurrent(
+          () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+          () => graphEpoch() === epochAtStart && doc.byId[props.blockId!]?.raw === rawAtStart,
+        );
         const rebased = { ...fresh.view };
         for (const key of ["view", "sort", "group_by", "columns", "aggregates", "sample"] as const) {
           const empty = key === "sort" || key === "columns" || key === "aggregates" ? [] : null;

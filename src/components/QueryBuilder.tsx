@@ -50,6 +50,8 @@ import {
   type RegistryAccess,
 } from "./QuerySheet";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
+import { createReadyQueryResource } from "../createReadyQueryResource";
+import { runQueryWhenCurrent } from "../queryReadiness";
 import { graphBinding } from "../persistence";
 import { QueryDisplay } from "./QueryDisplay";
 import type { QueryDisplayControl } from "../editor/queryViewProperties";
@@ -500,7 +502,14 @@ function QueryTextPane(props: {
   const run = async (source: string, mine: number) => {
     let parsed: ParsedQuery;
     try {
-      parsed = await backend().parseQuery(source, props.dialect);
+      // RET2-Direct: `query_parse` reads the property registry SQL-only and can
+      // report typed readiness. The pane's own revision gate IS this read's
+      // cancellation identity, so the shared readiness owner reuses it rather
+      // than the pane inventing a second policy.
+      parsed = await runQueryWhenCurrent(
+        () => backend().parseQuery(source, props.dialect),
+        () => accepts(mine),
+      );
     } catch (error) {
       // The rejection path takes the SAME gate as the success path. A failure
       // for text the user has already replaced is as wrong to render as a
@@ -913,7 +922,13 @@ export function QueryBuilder(props: {
   const registryScope = () => sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
   const registryKey = () =>
     sheetOpen() || displayOpen() ? `${dataRev()}\0${declarationRevision()}` : undefined;
-  const [registrySnapshot] = createResource(
+  //  - **Readiness is the shared owner's, not this component's (RET2-Direct).**
+  //    `query_registry` is SQL-only on both backends now and reports typed
+  //    `query-not-ready` while the index is indexing, recovering or applying a
+  //    save, instead of answering from a debounced document walk. The retry and
+  //    its binding/epoch cancellation are `createReadyQueryResource`'s, exactly
+  //    as for `query_run`; nothing mode-specific is decided here.
+  const [registrySnapshot] = createReadyQueryResource(
     () => {
       const key = registryKey();
       return key === undefined ? undefined : { scope: registryScope(), key };
@@ -1013,7 +1028,10 @@ export function QueryBuilder(props: {
     let parsed: ParsedQuery;
     try {
       const text = await backend().printQuery(next, current.view, "tql");
-      parsed = await backend().parseQuery(text, "tql");
+      parsed = await runQueryWhenCurrent(
+        () => backend().parseQuery(text, "tql"),
+        () => mine === anchorRevision,
+      );
     } catch (error) {
       if (mine !== anchorRevision) return;
       setPreviewError(errorMessage(error));

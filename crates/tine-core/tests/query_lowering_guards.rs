@@ -165,7 +165,6 @@ fn hand_written_cursor_drains_are_pinned() {
 
     let direct = &source[DIRECT];
     for symbol in [
-        "sparse_task_query",
         "property_facets",
         "referenced_page_names",
         "fuzzy_candidate_paths",
@@ -188,10 +187,14 @@ fn hand_written_cursor_drains_are_pinned() {
     // `loop {}`, which the per-symbol assertions above still forbid.
     // 12 → 13: R6's `page_inventory` (the warm-session `list_pages` source)
     // drains the page map through `drain_after` like the twelve before it.
+    // 13 → 12: RET2 deleted `sparse_task_query` — the Direct sparse-task
+    // candidate route — along with the query walk it handed its candidates to.
+    // Its `task_candidate_locators_after` drain went with it, and so did its
+    // row in the per-symbol list above. No surviving consumer changed.
     assert_eq!(
         direct.matches("drain_after(").count(),
-        13,
-        "I-12: the thirteen owned Direct cursor consumers must each delegate to drain_after"
+        12,
+        "I-12: the twelve owned Direct cursor consumers must each delegate to drain_after"
     );
 
     for allowed in NON_OWNED_DRAINS {

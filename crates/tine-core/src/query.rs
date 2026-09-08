@@ -2366,15 +2366,29 @@ fn run_pred_bounded(
 // `changed` condvar for `ready_at(gen)` and the "indexing…" pending render that
 // replace today's silent walk fallback.
 //
-// WHAT CURRENTLY BLOCKS DELETION: the walk is still the ONLY answer in three
-// live situations — a Direct Files projection that is not ready (open
-// reconciliation, full rebuild, and the milliseconds after every save while the
-// delta applies), a Direct Files projection whose read failed (D-3 recovery),
-// and Managed Storage's unaccepted local overlay, whose pages have no
-// materialized rows at all. It is also the differential oracle the SQL lowering
-// is proven against in gate 1 (SPEC §8.1), so it cannot go before that lowering
-// has shipped and been observed. Deleting it earlier would turn each of those
-// windows into "no results" rather than "slower results".
+// WHAT CURRENTLY BLOCKS DELETION — read this before deleting the walk: RET2
+// removed the two Direct Files situations that used to be listed here. A Direct
+// projection that is not ready and one whose read failed no longer walk; they
+// return `QueryExecutionError::NotReady` (the frontend retries) or
+// `Unavailable` (the frontend says so), and a failed read repairs once and
+// retries the SAME statement. What remains is ONE live answer — Managed
+// Storage's unaccepted local overlay, whose pages have no materialized rows at
+// all — and the reason the walk outlives even that.
+//
+// That reason: the walk is not merely a fallback, it is the CORRECTNESS ORACLE
+// for the SQL lowering that replaced it, and no external oracle exists
+// (Logseq's DB version evaluates in in-memory DataScript with SQLite as a mere
+// datom store; Dataview is frozen; Bases is closed). The walk answers every
+// query from the parsed documents in ~1 ms over the 1,045-file anonymized
+// graph, so the lowering's acceptance gate is
+// DIFFERENTIAL AGAINST THE WALK — the shape
+// `crate::query::results_tests::the_database_result_equals_the_walk_on_every_shape_and_bound`
+// (and its `_over_a_real_corpus` acceptance twin) already uses. The walk
+// therefore outlives the lowering by at least one release as a test-only
+// oracle; it is NOT deletable the moment SQL works, and it was not deletable
+// when RET2 made SQL the only public Direct answer. Retire it only after a
+// release of differential agreement. Card `PVTI_lAHOAAbLVc4BhPsyzg5VyLk`
+// tracked the hatch that used to sit in front of it; this marker outlives it.
 //
 /// The page-anchored half of the walk (§7.1, K16): `@page` rows as PAGE rows.
 ///
@@ -3002,11 +3016,18 @@ pub(crate) struct ApplicationQueryPage {
 // RETIREMENT-CANDIDATE: the pre-SQL candidate planner for the walk.
 //
 // WHAT MAY BE DELETED: `SimpleQueryCandidateSource`, `SimpleQueryCandidatePlan`,
-// `simple_query_candidate_plan`, `SparseTaskQueryEligibility` and
-// `sparse_task_query_eligibility`, together with the two consumers that exist
-// only to feed them — `direct_projection`'s `simple_query_candidate_paths` and
-// managed storage's candidate-page selection. Nothing else reads them: they are
-// a page PRE-FILTER for the walk, never an answer.
+// `simple_query_candidate_plan`, `SparseTaskQueryEligibility`,
+// `sparse_task_query_eligibility` and the parser sparse-task runner
+// (`ParserSparseQueryCandidate`, `ApplicationSparseQueryError`,
+// `run_parser_sparse_task_query_bounded`), together with the one consumer that
+// still exists only to feed them — managed storage's candidate-page selection.
+// Nothing else reads them: they are a page PRE-FILTER for the walk, never an
+// answer. RET2 deleted the OTHER consumer, `direct_projection`'s
+// `simple_query_candidate_paths`, along with the Direct walk it pre-filtered;
+// the eligibility gate and the sparse runner it fed therefore already have no
+// production consumer on either backend and are held here only by the living
+// contract in `docs/storage-sync-contract.md` and the census assertions that
+// name them.
 //
 // CONDITION FOR DELETION: the same card as the walk itself,
 // `PVTI_lAHOAAbLVc4BhPsyzg5gS_0`, one step earlier. A planner that narrows which
@@ -3017,13 +3038,15 @@ pub(crate) struct ApplicationQueryPage {
 // `run_query_result` reaches SQL for a query shape, that shape's candidate plan
 // is dead code.
 //
-// WHAT CURRENTLY BLOCKS DELETION: the walk is still the answer (see the marker
-// on `run_pred_bounded_over`), and on a large graph the walk without this
-// planner reads every page of the graph for every keystroke in a query block.
-// The planner is what keeps `(task TODO)` and `[[Page]]` — the two shapes almost
-// every real query uses — off the full-graph path. Deleting it before the
-// lowering ships would not remove a code path; it would make the shipped
-// product visibly slower on exactly the queries people write.
+// WHAT CURRENTLY BLOCKS DELETION: the walk is still Managed Storage's answer
+// for an unaccepted local overlay (see the marker on `run_pred_bounded_over`),
+// and on a large graph the walk without this planner reads every page of the
+// graph for every keystroke in a query block. The planner is what keeps
+// `(task TODO)` and `[[Page]]` — the two shapes almost every real query uses —
+// off the full-graph path THERE. On Direct Files it blocks nothing any more.
+// Deleting it before Managed's lowering ships would not remove a code path; it
+// would make the shipped product visibly slower on exactly the queries people
+// write.
 //
 /// One reconstructible, page-complete candidate source for a managed simple
 /// query. These facts only choose pages; the exact current parser DTO remains
@@ -3772,16 +3795,16 @@ pub fn run_query_result_ir(
     view: &ViewSettings,
     bounds: ir::Bounds,
     context: &ir::ExecutionContext,
-) -> ir::QueryResult {
+) -> Result<ir::QueryResult, QueryExecutionError> {
     // §4.4: resolve ONCE — the current page, the execution day and the support
     // report — before anything is keyed, lowered or cached.
     let resolved = resolve_for_execution(query, context, JournalDate::today());
-    let mut result = graph.direct_ir_query_result(&resolved, view, bounds);
+    let mut result = graph.direct_ir_query_result(&resolved, view, bounds)?;
     // The report is attached HERE, after the execution and after any cache
     // retrieval, because it is a property of how this source was BOUND and not
     // of the rows: the rows may be shared, the report may not.
     result.report = resolved.report().clone();
-    result
+    Ok(result)
 }
 
 /// Explain one IR query over Direct Files through the captured database read.
@@ -3791,7 +3814,7 @@ pub fn explain_empty_query(
     view: &ViewSettings,
     bounds: ir::Bounds,
     context: &ir::ExecutionContext,
-) -> ir::ExplainEmptyResult {
+) -> Result<ir::ExplainEmptyResult, QueryExecutionError> {
     let resolved = resolve_for_execution(query, context, JournalDate::today());
     graph.direct_ir_explain_empty(&resolved, view, bounds)
 }

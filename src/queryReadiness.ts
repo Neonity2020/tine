@@ -42,6 +42,35 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** The same owner, for a caller that already has a monotonic revision instead of
+ * a resource: an imperative read (`query_parse` inside an authoring session, an
+ * export warm-up) publishes only while `isCurrent()` holds, so the readiness
+ * retry reuses THAT gate rather than growing a second cancellation policy
+ * beside it. Readiness policy stays in `runQueryWhenReady` and is not
+ * duplicated, and nothing here is mode-specific. */
+export function runQueryWhenCurrent<T>(
+  load: () => Promise<T>,
+  isCurrent: () => boolean,
+  onPending: (error: QueryNotReadyError | null) => void = () => {},
+): Promise<T> {
+  // The FIRST attempt is eager. `runQueryWhenReady` defers every attempt by a
+  // microtask so a synchronous abort can win the race, which is right for a
+  // resource that owns an `AbortController` — but an imperative caller has no
+  // controller to race, and the deferral lets a superseded intermediate state
+  // issue a read of its own before this one has even started. Readiness policy
+  // is still `runQueryWhenReady`'s alone: it owns every retry after the first
+  // refusal, and nothing here is mode-specific.
+  return load().catch((error) => {
+    if (!(error instanceof QueryNotReadyError) || !isCurrent()) throw error;
+    onPending(error);
+    return runQueryWhenReady(load, {
+      signal: new AbortController().signal,
+      isCurrent,
+      onPending,
+    });
+  });
+}
+
 /** Retry typed readiness only. The native producer must report a failed rebuild
  * as terminal; this operation does not convert a real failure into indexing. */
 export async function runQueryWhenReady<T>(

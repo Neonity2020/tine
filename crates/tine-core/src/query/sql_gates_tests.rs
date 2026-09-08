@@ -2143,16 +2143,18 @@ fn the_walk_and_the_dispatch_are_timed_against_each_other_on_a_real_corpus() {
         corpus.graph.clear_query_memos_test();
         let dispatched = corpus
             .graph
-            .run_query_bounded(source, usize::MAX, usize::MAX);
+            .run_query_bounded(source, usize::MAX, usize::MAX)
+            .expect("the ready corpus projection answers");
         let dispatch_us = {
             let start = Instant::now();
             for _ in 0..REPEATS {
                 corpus.graph.clear_query_memos_test();
-                std::hint::black_box(corpus.graph.run_query_bounded(
-                    source,
-                    usize::MAX,
-                    usize::MAX,
-                ));
+                std::hint::black_box(
+                    corpus
+                        .graph
+                        .run_query_bounded(source, usize::MAX, usize::MAX)
+                        .expect("the ready corpus projection answers"),
+                );
             }
             (start.elapsed() / REPEATS).as_micros()
         };

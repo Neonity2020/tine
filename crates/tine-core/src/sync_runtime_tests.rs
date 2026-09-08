@@ -3876,7 +3876,12 @@ fn crash_replayed_task_overlay_falls_back_instead_of_answering_stale_sqlite() {
     assert_managed_simple_query_matches_direct(
         "crash-replayed incomplete task overlay",
         managed,
-        Graph::open(&fixture.graph_root).run_query_bounded("(task TODO)", MAX_ROWS, MAX_BYTES),
+        direct_oracle_answer(crate::query::run_query_bounded(
+            &Graph::open(&fixture.graph_root),
+            "(task TODO)",
+            MAX_ROWS,
+            MAX_BYTES,
+        )),
     );
     // R4a: the drained cold open holds no pending suffix, so the accepted
     // frontier IS the whole story and the query is answered from the database
@@ -24993,6 +24998,22 @@ fn managed_query_gate_samples() -> usize {
         .unwrap_or(2)
 }
 
+/// The Direct oracle's own bounded answer, in the shape the mode-differential
+/// assertion consumes.
+///
+/// RET2 made `Graph::run_query_bounded` a projection-only, fallible route, so
+/// a Managed test that wants an INDEPENDENT Direct answer calls the oracle free
+/// function instead of the dispatcher. The oracle owns its rows outright; the
+/// assertion helper reads them behind the `Arc` the dispatcher would have
+/// published, so this is a shape adapter and nothing more.
+fn direct_oracle_answer(bounded: crate::query::BoundedGroups) -> crate::model::BoundedRefGroups {
+    crate::model::BoundedRefGroups {
+        groups: std::sync::Arc::new(bounded.groups),
+        total: bounded.total,
+        exceeded: bounded.exceeded,
+    }
+}
+
 fn assert_managed_simple_query_matches_direct(
     label: &str,
     mut managed: SyncApplicationBoundedRefGroups,
@@ -25033,8 +25054,12 @@ fn managed_query_search_manual_receipt(
     let direct = Graph::open(&fixture.graph_root);
     let total_pages = direct.list_pages().len();
     assert!(total_pages > 0, "{label} fixture has no pages");
-    let direct_indexed = direct.run_query_bounded(indexed, MAX_ROWS, MAX_BYTES);
-    let direct_regex_all = direct.run_query_bounded(regex_all, MAX_ROWS, MAX_BYTES);
+    let direct_indexed = direct_oracle_answer(crate::query::run_query_bounded(
+        &direct, indexed, MAX_ROWS, MAX_BYTES,
+    ));
+    let direct_regex_all = direct_oracle_answer(crate::query::run_query_bounded(
+        &direct, regex_all, MAX_ROWS, MAX_BYTES,
+    ));
     let direct_graph_search = direct.run_graph_search(graph_search_source, 0, MAX_ROWS, false);
     if let Some(expected_total_pages) = expected_total_pages {
         assert_eq!(
@@ -25549,7 +25574,12 @@ fn clean_runtime_task_query_is_answered_from_the_database_without_hydrating_page
     assert_managed_simple_query_matches_direct(
         "clean runtime task query",
         managed,
-        Graph::open(&fixture.graph_root).run_query_bounded(query, MAX_ROWS, MAX_BYTES),
+        direct_oracle_answer(crate::query::run_query_bounded(
+            &Graph::open(&fixture.graph_root),
+            query,
+            MAX_ROWS,
+            MAX_BYTES,
+        )),
     );
 
     let counters = handle.managed_application_query_instrumentation().unwrap();
@@ -25655,7 +25685,12 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
     assert_managed_simple_query_matches_direct(
         "cold accepted-frontier query",
         cold,
-        Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+        direct_oracle_answer(crate::query::run_query_bounded(
+            &Graph::open(&fixture.graph_root),
+            &query,
+            MAX_ROWS,
+            MAX_BYTES,
+        )),
     );
 
     let (repeat, counters, census) = run("memoized query");
@@ -25726,7 +25761,12 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
     assert_managed_simple_query_matches_direct(
         "query while the save is pending",
         pending,
-        Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+        direct_oracle_answer(crate::query::run_query_bounded(
+            &Graph::open(&fixture.graph_root),
+            &query,
+            MAX_ROWS,
+            MAX_BYTES,
+        )),
     );
 
     // Once the batch is accepted the frontier IS the whole story again. The
@@ -25747,7 +25787,12 @@ fn clean_runtime_complete_page_query_memo_is_dropped_by_the_next_accepted_batch(
     assert_managed_simple_query_matches_direct(
         "query after an accepted batch",
         after_save,
-        Graph::open(&fixture.graph_root).run_query_bounded(&query, MAX_ROWS, MAX_BYTES),
+        direct_oracle_answer(crate::query::run_query_bounded(
+            &Graph::open(&fixture.graph_root),
+            &query,
+            MAX_ROWS,
+            MAX_BYTES,
+        )),
     );
 
     assert!(matches!(
@@ -29428,7 +29473,7 @@ fn c7b_query_driver_parity() {
     let mut direct_simple = Vec::new();
     for query in simple_queries {
         for (rows, bytes) in bounds {
-            let result = direct.run_query_bounded(query, rows, bytes);
+            let result = crate::query::run_query_bounded(&direct, query, rows, bytes);
             direct_simple.push(c7b_comparable((
                 &*result.groups,
                 result.total,
@@ -29468,8 +29513,7 @@ fn c7b_query_driver_parity() {
     ));
 
     // Non-vacuity: a parity oracle over two empty answers proves nothing.
-    let simple_rows = direct
-        .run_query_bounded("[[Topic]]", ROWS, BYTES)
+    let simple_rows = crate::query::run_query_bounded(&direct, "[[Topic]]", ROWS, BYTES)
         .groups
         .iter()
         .map(|group| group.blocks.len())
@@ -30077,7 +30121,7 @@ fn c7b_measure_managed_and_direct_reads() {
 
         let (calls, bytes) = c7b_alloc::snapshot();
         let started = std::time::Instant::now();
-        let result = direct.run_query_bounded("[[Topic]]", ROWS, BYTES);
+        let result = crate::query::run_query_bounded(&direct, "[[Topic]]", ROWS, BYTES);
         let micros = started.elapsed().as_micros();
         let (calls_after, bytes_after) = c7b_alloc::snapshot();
         assert!(result.total >= PAGES, "the measured workload must be real");
@@ -30702,7 +30746,12 @@ fn r4b_query(
 }
 
 fn r4b_oracle(fixture: &ActivationFixture) -> crate::model::BoundedRefGroups {
-    Graph::open(&fixture.graph_root).run_query_bounded(R4B_QUERY, R4B_ROWS, R4B_BYTES)
+    direct_oracle_answer(crate::query::run_query_bounded(
+        &Graph::open(&fixture.graph_root),
+        R4B_QUERY,
+        R4B_ROWS,
+        R4B_BYTES,
+    ))
 }
 
 /// Arm the next captures with `outcomes`, on a cleared memo and census, so
@@ -34099,7 +34148,12 @@ fn r5c_a_second_pending_save_repatches_and_the_drain_rebuilds_the_accepted_table
     assert_managed_simple_query_matches_direct(
         "the drained answer",
         drained,
-        Graph::open(&fixture.graph_root).run_query_bounded(QUERY, R5A_ROWS, R5A_BYTES),
+        direct_oracle_answer(crate::query::run_query_bounded(
+            &Graph::open(&fixture.graph_root),
+            QUERY,
+            R5A_ROWS,
+            R5A_BYTES,
+        )),
     );
     assert!(matches!(
         handle.clean_shutdown().unwrap(),

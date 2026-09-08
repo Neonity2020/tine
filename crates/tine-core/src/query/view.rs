@@ -430,7 +430,11 @@ pub(crate) fn explain_empty(
             crate::query::run_query_result_over(source, probe, view, resolved.today(), bounds).total
         })
         .collect::<Vec<_>>();
+    // The oracle counts every probe of the plan it was handed, in order, so the
+    // central length check cannot fail here. It is still the same check: the
+    // oracle does not get a private path around it.
     plan.answer(resolved, &counts)
+        .expect("the oracle counts exactly one row per probe of its own plan")
 }
 
 /// The DECOMPOSITION half of [`explain_empty`], separated from the evaluator so
@@ -451,19 +455,37 @@ pub(crate) struct ExplainPlan {
     rows: Vec<(String, usize, Option<usize>)>,
 }
 
+/// The plan and the counts disagree: the evaluator answered a different plan
+/// than it was given (RET2).
+///
+/// It carries no payload on purpose. Every caller maps it onto its own
+/// backend's bounded availability vocabulary — `InvalidSnapshot` on both — and
+/// a length is not something a user can act on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExplainCountMismatch;
+
 impl ExplainPlan {
-    /// The rows, given one count per [`ExplainPlan::probes`] entry in order.
+    /// The rows, given EXACTLY one count per [`ExplainPlan::probes`] entry, in
+    /// order.
     ///
-    /// A `counts` slice shorter than the plan can only mean the evaluator
-    /// answered a different plan than it was given; that reads as `0` rather
-    /// than panicking, exactly as a refused binding does.
+    /// **RET2 made the length check central and fallible.** A `counts` slice
+    /// that does not match the plan can only mean the evaluator answered a
+    /// different plan than it was given; reading a missing count as `0` printed
+    /// "0 rows match this conjunct" — a confident, wrong explanation of why a
+    /// query was empty, indistinguishable from a real zero. An empty plan with
+    /// an empty vector is the one valid empty case (a refused binding has
+    /// nothing honest to count), and it is accepted by the same rule rather
+    /// than by an exception.
     pub(crate) fn answer(
         &self,
         resolved: &crate::query::ResolvedQuery,
         counts: &[usize],
-    ) -> crate::query::ir::ExplainEmptyResult {
+    ) -> Result<crate::query::ir::ExplainEmptyResult, ExplainCountMismatch> {
+        if counts.len() != self.probes.len() {
+            return Err(ExplainCountMismatch);
+        }
         let at = |index: usize| counts.get(index).copied().unwrap_or(0);
-        crate::query::ir::ExplainEmptyResult {
+        Ok(crate::query::ir::ExplainEmptyResult {
             rows: self
                 .rows
                 .iter()
@@ -475,7 +497,7 @@ impl ExplainPlan {
                 .collect(),
             diagnostics: resolved.query().diagnostics.clone(),
             report: resolved.report().clone(),
-        }
+        })
     }
 }
 

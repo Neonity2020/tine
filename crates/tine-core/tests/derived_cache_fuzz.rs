@@ -10,6 +10,9 @@
 use std::sync::Arc;
 use tine_core::{BlockDto, Graph, PageKind, RefGroup};
 
+#[path = "support/ready_query.rs"]
+mod ready_query;
+
 // --- deterministic PRNG (xorshift64) so a failure reproduces from its seed ----
 struct Rng(u64);
 impl Rng {
@@ -96,7 +99,14 @@ fn gen_pre(r: &mut Rng, page_idx: usize) -> Option<String> {
 // Order-sensitive fingerprint (page order + within-page block order both matter,
 // e.g. for sorted queries). uuid-free: compares block first-lines, since the two
 // graphs assign generated uuids independently.
-fn fingerprint(g: &Graph) -> String {
+/// RET2: the LIVE graph answers `{{query}}` through the real dispatched route
+/// (projection attached, memo warm) while the FRESH graph answers through the
+/// public walk oracle. That is a strictly sharper differential than the old
+/// warm-walk-vs-cold-walk pair: a memoized SQL answer that an edit should have
+/// invalidated now disagrees with an independent evaluator, not with a second
+/// instance of itself. Backlinks and unlinked references have no dispatched
+/// route yet (RET3) and stay on the memoized reference readers on both sides.
+fn fingerprint(g: &Graph, dispatched: bool) -> String {
     let fmt = |label: String, groups: Arc<Vec<RefGroup>>| {
         let body = groups
             .iter()
@@ -123,7 +133,12 @@ fn fingerprint(g: &Graph) -> String {
         ));
     }
     for q in QUERIES {
-        out.push(fmt(format!("q:{q}"), g.run_query(q)));
+        let groups = if dispatched {
+            ready_query::run_query(g, q)
+        } else {
+            Arc::new(tine_core::query::run_query(g, q))
+        };
+        out.push(fmt(format!("q:{q}"), groups));
     }
     out.join("\n")
 }
@@ -156,9 +171,10 @@ fn run_seed(seed: u64) {
         std::fs::write(root.join("pages").join(format!("{p}.md")), s).unwrap();
     }
 
-    // The LIVE graph keeps its cache warm across every edit.
+    // The LIVE graph keeps its cache warm across every edit, and answers
+    // queries through the attached projection exactly as the app does.
     let live = Graph::open(&root);
-    live.warm_cache();
+    ready_query::attach_projection(&live, &root);
 
     for iter in 0..200 {
         // Apply one random CONTENT edit to a random page through the real save path.
@@ -187,8 +203,8 @@ fn run_seed(seed: u64) {
         // Oracle: warm live cache must equal a cold fresh graph on the same files.
         let fresh = Graph::open(&root);
         fresh.warm_cache();
-        let live_fp = fingerprint(&live);
-        let fresh_fp = fingerprint(&fresh);
+        let live_fp = fingerprint(&live, true);
+        let fresh_fp = fingerprint(&fresh, false);
         if live_fp != fresh_fp {
             // Find the first diverging probe line for a readable failure.
             let diff = live_fp

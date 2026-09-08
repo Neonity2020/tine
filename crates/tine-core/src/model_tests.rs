@@ -2222,6 +2222,53 @@ fn quick_switch_includes_referenced_pages() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Open a fixture graph the way the app opens a Direct graph: with its
+/// disposable SQLite projection attached and initialized.
+///
+/// RET2 retired the parsed-graph walk from every public Direct query, so a
+/// fixture that only called `Graph::open` would now ask a question the
+/// projection cannot answer and get a typed `Unavailable` rather than a walked
+/// answer. Fixtures that deliberately test the walk call the oracle free
+/// functions in `crate::query` directly instead.
+fn ready_graph(dir: &Path) -> Graph {
+    let graph = Graph::open(dir);
+    // The parsed cache FIRST, then the projection. `warm_cache` prefers the
+    // projection when one is attached and then retains no parsed graph at all
+    // (R6), and a session with no parsed cache has no per-page derived
+    // retention to speak of — so a fixture about the memo scope has to be the
+    // ordinary open-parse-project session, not the warm-reopen one.
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .expect("the disposable projection attaches");
+    graph.warm_cache();
+    wait_for_direct_query_projection(&graph);
+    graph
+}
+
+/// Run `attempt` until it answers, retrying ONLY typed readiness.
+///
+/// `Unavailable` and `Cancelled` fail the fixture immediately: a fixture that
+/// slept through them would hide exactly the regression RET2's typed
+/// vocabulary exists to expose.
+fn when_ready<T>(mut attempt: impl FnMut() -> Result<T, crate::query::QueryExecutionError>) -> T {
+    let started = Instant::now();
+    loop {
+        match attempt() {
+            Ok(answer) => return answer,
+            Err(crate::query::QueryExecutionError::NotReady(reason)) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "the query index never became ready ({})",
+                    reason.as_str()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(other) => panic!("the public query route refused: {other}"),
+        }
+    }
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tine-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -9998,16 +10045,17 @@ fn advanced_query_runs_supported_subset_flags_rest() {
     )
     .unwrap();
     fs::write(dir.join("pages").join("Note.md"), "- TODO not a journal\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     // (task ?b #{"TODO"}) maps to the existing Task predicate.
-    let r = g.run_advanced_query(r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#, None);
+    let r = when_ready(|| {
+        g.run_advanced_query(r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#, None)
+    });
     assert!(r.supported);
     assert!(r.ran.contains(&"task".to_string()));
     let total: usize = r.groups.iter().map(|grp| grp.blocks.len()).sum();
     assert_eq!(total, 2, "both TODO blocks match");
     // A clause outside the subset (a raw [?e :a ?v] join) → nothing supported.
-    let u = g.run_advanced_query("[:find ?b :where [?b :block/foo ?v]]", None);
+    let u = when_ready(|| g.run_advanced_query("[:find ?b :where [?b :block/foo ?v]]", None));
     assert!(!u.supported);
     assert!(u.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -10023,8 +10071,7 @@ fn advanced_current_page_input_filters_real_graph_blocks() {
         "- TODO pinned [[Focus A]]\n- TODO pinned [[Focus B]]\n- DONE [[Focus A]]\n",
     )
     .unwrap();
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
+    let graph = ready_graph(&dir);
     let query = r#"[:find (pull ?b [*])
                         :in $ ?current-page
                         :where
@@ -10033,7 +10080,7 @@ fn advanced_current_page_input_filters_real_graph_blocks() {
                         (task ?b #{"TODO"})]
                        :inputs [:current-page]"#;
 
-    let result = graph.run_advanced_query(query, Some("Focus A"));
+    let result = when_ready(|| graph.run_advanced_query(query, Some("Focus A")));
     assert!(result.supported, "ignored={:?}", result.ignored);
     assert!(result.ignored.is_empty(), "{:?}", result.ignored);
     assert_eq!(result.ran, vec!["current-page-ref", "task"]);
@@ -10065,11 +10112,10 @@ fn advanced_query_covers_widened_clause_subset() {
     .unwrap();
     // Default file-name format is Legacy (`%2F`), so encode the namespace slash.
     fs::write(dir.join("pages").join("Proj%2FSub.md"), "- nested note\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
 
     let count = |src: &str| -> usize {
-        let r = g.run_advanced_query(src, None);
+        let r = when_ready(|| g.run_advanced_query(src, None));
         assert!(r.supported, "expected supported: {src} (ran={:?})", r.ran);
         r.groups.iter().map(|grp| grp.blocks.len()).sum()
     };
@@ -10098,7 +10144,7 @@ fn advanced_query_covers_widened_clause_subset() {
     );
 
     // Unknown heads still land in `ignored`, never guessed.
-    let r = g.run_advanced_query("[:find ?b :where (bogus ?b)]", None);
+    let r = when_ready(|| g.run_advanced_query("[:find ?b :where (bogus ?b)]", None));
     assert!(r.ignored.contains(&"bogus".to_string()));
     let _ = fs::remove_dir_all(&dir);
 }
@@ -10114,14 +10160,13 @@ fn advanced_query_skeleton_ignores_comment_hints() {
         "- TODO ship it\n- DOING wire it\n- DONE done\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     let skeleton = "[:find (pull ?b [*])\n \
              :where\n \
              ;; supported: (priority ?b \"A\") (page-ref ?b \"Nope\") (property ?b :k \"v\")\n \
              ;; (scheduled ?b) (deadline ?b) (page ?b \"Nowhere\")\n \
              (task ?b #{\"TODO\" \"DOING\"})]";
-    let r = g.run_advanced_query(skeleton, None);
+    let r = when_ready(|| g.run_advanced_query(skeleton, None));
     assert!(r.supported, "ran: {:?} ignored: {:?}", r.ran, r.ignored);
     // Only the task clause ran — the commented priority/page-ref/etc. did not.
     assert_eq!(r.ran, vec!["task".to_string()]);
@@ -10151,12 +10196,16 @@ fn persisted_query_sources_cannot_reach_unbounded_cache_keys_or_parser_recursion
     let nested = format!("{}(task TODO){}", "(and ".repeat(1_000), ")".repeat(1_000));
     assert!(crate::query::query_source_within_limit(&nested));
     assert!(!crate::query::query_nesting_within_limit(&nested));
-    let simple = g.run_query_bounded(&nested, 20_000, 32 * 1024 * 1024);
+    let simple = g
+        .run_query_bounded(&nested, 20_000, 32 * 1024 * 1024)
+        .expect("a refused query source is answered before any dispatch");
     assert!(simple.groups.is_empty());
     assert!(g.derived_cache.read().unwrap().is_none());
 
     let advanced = format!("[:find (pull ?b [*]) :where {nested}]");
-    let result = g.run_advanced_query(&advanced, None);
+    let result = g
+        .run_advanced_query(&advanced, None)
+        .expect("a refused query source is answered before any dispatch");
     assert!(!result.supported);
     assert_eq!(result.ignored, vec!["query-nesting-too-deep"]);
     assert!(g.advanced_cache.read().unwrap().is_none());
@@ -10190,8 +10239,7 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
         "alias:: Scratch\n- ordinary note\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     let q = r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#;
 
     // §5.9: the advanced cache is keyed by the RESOLVED NORMALIZED IR and stores
@@ -10213,24 +10261,24 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
             .clone()
     };
 
-    let first_result = g.run_advanced_query_cached(q, None);
+    let first_result = when_ready(|| g.run_advanced_query_cached(q, None));
     let first = cached_rows(usize::MAX, usize::MAX);
-    let _ = g.run_advanced_query_cached(q, None);
+    let _ = when_ready(|| g.run_advanced_query_cached(q, None));
     let second = cached_rows(usize::MAX, usize::MAX);
     assert!(
         Arc::ptr_eq(&first, &second),
         "identical advanced query should be served from the memo cache"
     );
     assert_eq!(first_result.groups.len(), 1);
-    let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
+    let _ = when_ready(|| g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024));
     let bounded_first = cached_rows(20_000, 32 * 1024 * 1024);
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let _ = g.run_advanced_query_cached(q, None);
+    let _ = when_ready(|| g.run_advanced_query_cached(q, None));
     let after_unrelated = cached_rows(usize::MAX, usize::MAX);
-    let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
+    let _ = when_ready(|| g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024));
     let bounded_after_unrelated = cached_rows(20_000, 32 * 1024 * 1024);
     assert!(
         Arc::ptr_eq(&first, &after_unrelated),
@@ -10241,7 +10289,7 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.pre_block = Some("alias:: Renamed Scratch\n".into());
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let _ = g.run_advanced_query_cached(q, None);
+    let _ = when_ready(|| g.run_advanced_query_cached(q, None));
     let after_alias_change = cached_rows(usize::MAX, usize::MAX);
     assert!(
         !Arc::ptr_eq(&first, &after_alias_change),
@@ -10252,9 +10300,9 @@ fn advanced_query_reuses_cached_result_until_graph_changes() {
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DONE");
     g.save_page(&dto, dto.rev.as_deref()).unwrap();
 
-    let third_result = g.run_advanced_query_cached(q, None);
+    let third_result = when_ready(|| g.run_advanced_query_cached(q, None));
     let third = cached_rows(usize::MAX, usize::MAX);
-    let _ = g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024);
+    let _ = when_ready(|| g.run_advanced_query_bounded_cached(q, None, 20_000, 32 * 1024 * 1024));
     let bounded_after_affected = cached_rows(20_000, 32 * 1024 * 1024);
     assert!(
         !Arc::ptr_eq(&first, &third),
@@ -10327,17 +10375,17 @@ fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
         "alias:: Scratch\n- ordinary note\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
 
-    let first = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
-    let second = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+    let todo_tasks = || when_ready(|| g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024));
+    let first = todo_tasks();
+    let second = todo_tasks();
     assert!(Arc::ptr_eq(&first.groups, &second.groups));
 
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still an ordinary note".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_unrelated = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+    let after_unrelated = todo_tasks();
     assert!(
         Arc::ptr_eq(&first.groups, &after_unrelated.groups),
         "an unrelated edit must retain the scoped bounded-query memo"
@@ -10346,7 +10394,7 @@ fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
     let mut tasks = g.load_named("Tasks", PageKind::Page).unwrap().unwrap();
     tasks.blocks[0].raw = "DONE ship".into();
     g.save_page(&tasks, tasks.rev.as_deref()).unwrap();
-    let after_affected = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+    let after_affected = todo_tasks();
     assert!(!Arc::ptr_eq(&first.groups, &after_affected.groups));
     assert!(after_affected.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -10371,11 +10419,11 @@ fn a_page_edit_evicts_only_the_memo_of_the_query_that_page_can_answer() {
     )
     .unwrap();
     fs::write(dir.join("pages").join("Errand.md"), "- TODO buy milk\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
 
-    let tagged = || g.run_query_bounded("(page-tags work)", 20_000, 32 * 1024 * 1024);
-    let tasks = || g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+    let tagged =
+        || when_ready(|| g.run_query_bounded("(page-tags work)", 20_000, 32 * 1024 * 1024));
+    let tasks = || when_ready(|| g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024));
 
     let tagged_first = tagged();
     let tasks_first = tasks();
@@ -10532,16 +10580,16 @@ fn overflowed_bounded_memo_recomputes_when_an_omitted_match_stops_matching() {
     fs::write(dir.join("pages").join("A.md"), "- TODO first\n").unwrap();
     fs::write(dir.join("pages").join("B.md"), "- TODO second\n").unwrap();
     fs::write(dir.join("pages").join("Notes.md"), "- unrelated\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
 
-    let first = g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024);
+    let tasks = || when_ready(|| g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024));
+    let first = tasks();
     assert!(first.exceeded);
     assert_eq!(first.total, 2);
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
-    let after_unrelated = g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024);
+    let after_unrelated = tasks();
     assert!(Arc::ptr_eq(&first.groups, &after_unrelated.groups));
     assert!(after_unrelated.exceeded);
     assert_eq!(after_unrelated.total, 2);
@@ -10552,7 +10600,7 @@ fn overflowed_bounded_memo_recomputes_when_an_omitted_match_stops_matching() {
     page.blocks[0].raw = "DONE no longer matches".into();
     g.save_page(&page, page.rev.as_deref()).unwrap();
 
-    let after = g.run_query_bounded("(task TODO)", 1, 32 * 1024 * 1024);
+    let after = tasks();
     assert!(!Arc::ptr_eq(&first.groups, &after.groups));
     assert!(!after.exceeded);
     assert_eq!(after.total, 1);
@@ -10563,17 +10611,18 @@ fn overflowed_bounded_memo_recomputes_when_an_omitted_match_stops_matching() {
 fn advanced_cache_invalidation_preserves_nul_inside_opaque_query_source() {
     let dir = scratch("advanced-cache-nul-query");
     fs::write(dir.join("pages").join("P.md"), "- DONE ship\n").unwrap();
-    let g = Graph::open(&dir);
-    g.warm_cache();
+    let g = ready_graph(&dir);
     let query = "[:find (pull ?b [*]) :where \0 (task ?b #{\"TODO\"})]";
-    let first = g.run_advanced_query_cached(query, None);
+    let first = when_ready(|| g.run_advanced_query_cached(query, None));
     assert!(first.groups.is_empty());
 
     let mut page = g.load_named("P", PageKind::Page).unwrap().unwrap();
     page.blocks[0].raw = "TODO ship".into();
     g.save_page(&page, page.rev.as_deref()).unwrap();
-    let warm = g.run_advanced_query_cached(query, None);
-    let fresh = Graph::open(&dir).run_advanced_query(query, None);
+    let warm = when_ready(|| g.run_advanced_query_cached(query, None));
+    // The independent oracle: a fresh walk of the same graph, from the free
+    // function, with no memo and no projection of its own to agree with.
+    let fresh = crate::query::run_advanced_query(&Graph::open(&dir), query, None);
     assert_eq!(warm.groups.len(), 1);
     assert_eq!(warm.groups.len(), fresh.groups.len());
     let _ = fs::remove_dir_all(&dir);
@@ -10583,13 +10632,24 @@ fn advanced_cache_invalidation_preserves_nul_inside_opaque_query_source() {
 fn derived_and_advanced_memos_are_lru_bounded() {
     let dir = scratch("memo-lru-bound");
     let g = Graph::open(&dir);
+    // The LRU budget is a property of the memo tables themselves, so the
+    // compute closure answers directly and no projection is involved. RET2
+    // made the advanced memo fallible and props-aware; a props-blind key reads
+    // only the published registry generation, so this stays a pure cache test.
+    let empty = || {
+        Ok(crate::query::BoundedGroups {
+            groups: Vec::new(),
+            total: 0,
+            exceeded: false,
+        })
+    };
     for i in 0..(DERIVED_CACHE_MAX_ENTRIES + 20) {
         let _ = g.derived_memo(format!("test\0{i}"), Vec::new);
-        let _ = g.advanced_memo(format!("test\0{i}"), Vec::new);
+        let _ = g.advanced_memo_bounded(format!("test\0{i}"), false, empty);
     }
     let oversized_key = "x".repeat(DERIVED_CACHE_MAX_ENTRY_BYTES / 2 + 1);
     let _ = g.derived_memo(oversized_key.clone(), Vec::new);
-    let _ = g.advanced_memo(oversized_key.clone(), Vec::new);
+    let _ = g.advanced_memo_bounded(oversized_key.clone(), false, empty);
     let derived = g.derived_cache.read().unwrap();
     let advanced = g.advanced_cache.read().unwrap();
     assert_eq!(
@@ -13165,8 +13225,11 @@ fn direct_query_bench_edit(graph: &Graph, serial: usize) {
 
 fn direct_query_bench_sample(graph: &Graph, query: &str) -> Duration {
     let started = Instant::now();
+    // RET2: an unready projection refuses with a typed error instead of
+    // walking, so an immediate-after-edit sample measures the refusal — which
+    // is exactly what the app measures at that instant too.
     let result = graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024);
-    std::hint::black_box((result.total, result.exceeded));
+    std::hint::black_box(result.map(|answer| (answer.total, answer.exceeded)).ok());
     started.elapsed()
 }
 
@@ -13301,9 +13364,10 @@ fn direct_query_latency_manual_benchmark() {
                 .direct_projection_fallback_reads_test()
                 .saturating_sub(fallback_before);
             let full_graph_evaluations = crate::query::full_graph_query_evaluations();
-            let evaluated_pages = graph
-                .direct_projection_candidate_evaluated_paths_test()
-                .len();
+            // RET2 retired the candidate route, so there is no candidate page
+            // set left to report; the hydration census is what the dispatched
+            // query still materializes.
+            let evaluated_pages = graph.direct_projection_hydrated_pages_test().len();
             println!(
                 "b4_query_sample class={class} run={} sample={} candidateQueriesCompleted={candidate_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
                 std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
@@ -13347,7 +13411,9 @@ fn direct_query_latency_manual_benchmark() {
             crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 * 1024 * 1024);
         let candidate_before = graph.direct_projection_indexed_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
-        let actual = graph.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        let actual = graph
+            .run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024)
+            .expect("the converged projection answers the public bounded route");
         let oracle_equal = (actual.total, actual.exceeded) == (oracle.total, oracle.exceeded)
             && serde_json::to_vec(actual.groups.as_ref()).unwrap()
                 == serde_json::to_vec(&oracle.groups).unwrap();
@@ -20902,12 +20968,10 @@ fn a_key_page_save_advances_the_registry_generation_and_an_unrelated_save_does_n
 #[test]
 fn a_declared_type_change_evicts_the_cached_typed_query_it_retypes() {
     let dir = registry_graph("registry-declared-type-eviction");
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
+    let graph = ready_graph(&dir);
 
     let matched = |graph: &Graph| -> usize {
-        graph
-            .run_query_bounded("(property score 1)", usize::MAX, usize::MAX)
+        when_ready(|| graph.run_query_bounded("(property score 1)", usize::MAX, usize::MAX))
             .groups
             .iter()
             .map(|group| group.blocks.len())
@@ -20951,16 +21015,14 @@ fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
     .unwrap();
 
     let day_rows = |graph: &Graph| -> usize {
-        graph
-            .run_query_bounded("(between -10y +10y)", usize::MAX, usize::MAX)
+        when_ready(|| graph.run_query_bounded("(between -10y +10y)", usize::MAX, usize::MAX))
             .groups
             .iter()
             .map(|group| group.blocks.len())
             .sum()
     };
 
-    let before = Graph::open(&dir);
-    before.warm_cache();
+    let before = ready_graph(&dir);
     assert_eq!(
         day_rows(&before),
         0,
@@ -20974,8 +21036,7 @@ fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
         "{:journal/page-title-format \"dd-MM-yyyy\"}\n",
     )
     .unwrap();
-    let after = Graph::open(&dir);
-    after.warm_cache();
+    let after = ready_graph(&dir);
     let after_digest = after.config.parse_config().digest();
     assert_ne!(
         before_digest, after_digest,

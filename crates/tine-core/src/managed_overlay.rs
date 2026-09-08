@@ -327,10 +327,19 @@ impl PendingOverlay {
         }
     }
 
+    /// Refuse new snapshots before the query owner drains existing readers.
+    /// This does not stop the writer or remove its file; those operations can
+    /// wait off the actor after the instance has become unavailable to captures.
+    pub(crate) fn retire(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.changed.notify_all();
+    }
+
     /// Stop the worker, join it, and delete the file. Idempotent. The caller
     /// drains every off-actor query job first (I-21): a reader still holding a
     /// snapshot of this file would otherwise outlive it.
     pub(crate) fn close(&self) {
+        self.retire();
         let sender = self.sender.lock().unwrap().take();
         if let Some(sender) = sender {
             let _ = sender.send(OverlayUpdate::Close);
@@ -339,11 +348,6 @@ impl PendingOverlay {
         if let Some(worker) = worker {
             let _ = worker.join();
         }
-        {
-            let mut state = self.state.lock().unwrap();
-            state.closed = true;
-        }
-        self.changed.notify_all();
         remove_overlay_files(&self.path);
     }
 
@@ -635,6 +639,54 @@ mod tests {
         // Idempotent; pushes after close are dropped, not panics.
         overlay.close();
         overlay.announce("pages/c.md");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_refuses_new_snapshots_before_waiting_for_the_writer() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-overlay-retire-{}-{}",
+            std::process::id(),
+            next_instance()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let overlay = PendingOverlay::open(
+            &dir.join("projection.sqlite"),
+            ParseConfig::default(),
+            next_instance(),
+        )
+        .unwrap();
+        // Stop teardown at its writer-channel boundary, without blocking the
+        // state/snapshot owner. New captures must already see retirement.
+        let sender = overlay.sender.lock().unwrap();
+        let refused = std::thread::scope(|scope| {
+            let closing = scope.spawn(|| overlay.close());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut state = overlay.state.lock().unwrap();
+            while !state.closed && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                state = overlay.changed.wait_timeout(state, remaining).unwrap().0;
+            }
+            drop(state);
+            let refused = matches!(
+                overlay.open_snapshot(0, Duration::ZERO),
+                OverlayOpen::Closed
+            );
+            assert!(
+                overlay.path().exists(),
+                "the writer has not been stopped or its file removed"
+            );
+            // Always release the writer boundary before reporting a failure,
+            // so the fail-before control cannot deadlock its scoped join.
+            drop(sender);
+            closing.join().unwrap();
+            refused
+        });
+        assert!(
+            refused,
+            "closing overlay admitted a new snapshot while teardown waited for its writer"
+        );
+        assert!(!overlay.path().exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

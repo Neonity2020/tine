@@ -5,7 +5,6 @@ import {
   Switch,
   createEffect,
   createMemo,
-  createResource,
   createSignal,
   createUniqueId,
   onCleanup,
@@ -480,7 +479,10 @@ function AdvancedModal(props: {
   // boundary between that IR and the text the workspace materializes
   // (`savedQueryRaw` writes `{{query <dsl>}}`). The frontend does not parse or
   // print here — it asks.
-  const [builderSession] = createResource(dsl, async (text): Promise<BuilderSession> => {
+  // RET2-Direct: `query_parse` can report typed readiness, so this pair takes
+  // the shared readiness owner and its binding/epoch cancellation, exactly as
+  // the workspace's execution resource does.
+  const [builderSession] = createReadyQueryResource(dsl, async (text): Promise<BuilderSession> => {
     const parsed = await backend().parseQuery(text, "og");
     return { query: parsed.query, view: parsed.view };
   });
