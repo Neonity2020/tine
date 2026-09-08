@@ -10,7 +10,7 @@ use tine_core::oplog::{
     ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
     ObjectDescriptor, ObjectKind, ObjectStore, OperationBatch, OperationObject, PreparedBatch,
     ProjectionEndpointId, SemanticEffectDigest, SessionId, StoreError, WorkspaceId,
-    MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
+    WriterIncarnationId, MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
 };
 use uuid::Uuid;
 
@@ -82,7 +82,11 @@ fn test_manifest(
         author_device_id,
         author_session_id,
         BatchOrigin::LocalMutation,
-        BatchCausalDot::new(CausalPeerId::from_device_id(author_device_id), 1).unwrap(),
+        BatchCausalDot::new(
+            CausalPeerId::from_key(WriterIncarnationId::from_uuid(author_device_id.as_uuid())),
+            1,
+        )
+        .unwrap(),
         causal_dependency_heads,
         dependency_frontier,
         semantic_effect_digest,
@@ -640,7 +644,7 @@ fn unknown_versions_fields_digest_forms_and_canonical_order_fail_closed() {
     let current: Value = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(current["manifest_encoding_version"], json!(4));
     assert_eq!(current["protocol_version"], json!(2));
-    assert_eq!(current["operation_schema_version"], json!(7));
+    assert_eq!(current["operation_schema_version"], json!(8));
     assert_eq!(current["object_envelope_schema_version"], json!(2));
     assert_eq!(current["managed_entity_set_version"], json!(2));
 

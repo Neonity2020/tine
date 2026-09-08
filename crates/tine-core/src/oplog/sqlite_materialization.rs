@@ -23,7 +23,7 @@ use super::{
     AcceptedBatchEvent, BatchCausalDot, BatchId, BlockId, BlockOwner, CausalPeerId, ContentDigest,
     DeviceId, DocumentId, LogicalPageName, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
     ManagedTextKind, PageId, PageState, PolicyGeneratedAnchorReason, ReferenceSourceLocatorV1,
-    SemanticEffect,
+    SemanticEffect, WriterIncarnationId,
 };
 
 pub const MAX_MATERIALIZATION_QUERY_ROWS: usize = storage::MAX_MATERIALIZATION_QUERY_ROWS;
@@ -1462,8 +1462,7 @@ pub(crate) fn lower_validated_change(
             block_id: delta.block_id.as_uuid().into_bytes(),
             home_document_id: delta.home_document_id.as_uuid().into_bytes(),
             batch_id: Some(change.batch_id.as_uuid().into_bytes()),
-            causal_peer_id: causal_dot
-                .map(|dot| dot.peer_id().as_device_id().as_uuid().into_bytes()),
+            causal_peer_id: causal_dot.map(|dot| dot.peer_id().key().as_uuid().into_bytes()),
             causal_counter: causal_dot.map(BatchCausalDot::counter),
         })
         .collect::<BTreeSet<_>>()
@@ -1480,8 +1479,7 @@ pub(crate) fn lower_validated_change(
                 block_id: delta.block_id.as_uuid().into_bytes(),
                 home_document_id: delta.home_document_id.as_uuid().into_bytes(),
                 batch_id: Some(change.batch_id.as_uuid().into_bytes()),
-                causal_peer_id: causal_dot
-                    .map(|dot| dot.peer_id().as_device_id().as_uuid().into_bytes()),
+                causal_peer_id: causal_dot.map(|dot| dot.peer_id().key().as_uuid().into_bytes()),
                 causal_counter: causal_dot.map(BatchCausalDot::counter),
             })
         })
@@ -2839,7 +2837,7 @@ fn block_home_claim_row_from_storage(
         (None, None) => None,
         (Some(peer), Some(counter)) => Some(
             BatchCausalDot::new(
-                CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_bytes(peer))),
+                CausalPeerId::from_key(WriterIncarnationId::from_uuid(Uuid::from_bytes(peer))),
                 counter,
             )
             .map_err(|error| MaterializationError::Corrupt(error.to_string()))?,
@@ -2881,7 +2879,7 @@ fn logseq_uuid_introduction_row_from_storage(
         (None, None) => None,
         (Some(peer), Some(counter)) => Some(
             BatchCausalDot::new(
-                CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_bytes(peer))),
+                CausalPeerId::from_key(WriterIncarnationId::from_uuid(Uuid::from_bytes(peer))),
                 counter,
             )
             .map_err(|error| MaterializationError::Corrupt(error.to_string()))?,

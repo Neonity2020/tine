@@ -13,7 +13,8 @@ use crate::oplog::{
     PreparedBatch, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore,
     SemanticEffect, SemanticEffectDigest, SemanticError, SemanticOperation, SessionId,
     ShardedHotEngine, StoreError, ValidatedBatch, WorkspaceId, WorkspaceStatus,
-    MANAGED_ENTITY_SET_VERSION, OPERATION_SCHEMA_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
+    WriterIncarnationId, MANAGED_ENTITY_SET_VERSION, OPERATION_SCHEMA_VERSION,
+    SEMANTIC_EFFECT_SCHEMA_VERSION,
 };
 use crate::Graph;
 use loro::{ExportMode, LoroDoc};
@@ -91,6 +92,9 @@ fn author(batch: u128, peer: u64) -> AuthorBatch {
         author_device_id: DeviceId::from_uuid(uuid(1_000 + peer as u128)),
         author_session_id: SessionId::from_uuid(uuid(2_000 + peer as u128)),
         crdt_peer_id: CrdtPeerId::from_u64(peer),
+        causal_peer_id: CausalPeerId::from_key(WriterIncarnationId::fixture_for_device(
+            DeviceId::from_uuid(uuid(1_000 + peer as u128)),
+        )),
     }
 }
 
@@ -2133,7 +2137,13 @@ fn rebuild(
         manifest.author_device_id(),
         manifest.author_session_id(),
         BatchOrigin::BootstrapImport,
-        BatchCausalDot::new(CausalPeerId::from_device_id(manifest.author_device_id()), 1).unwrap(),
+        BatchCausalDot::new(
+            CausalPeerId::from_key(WriterIncarnationId::fixture_for_device(
+                manifest.author_device_id(),
+            )),
+            1,
+        )
+        .unwrap(),
         causal_dependency_heads,
         frontier,
         SemanticEffectDigest::of(semantic.payload()),
@@ -2170,7 +2180,13 @@ fn rebuild_as(
         manifest.author_device_id(),
         manifest.author_session_id(),
         BatchOrigin::BootstrapImport,
-        BatchCausalDot::new(CausalPeerId::from_device_id(manifest.author_device_id()), 1).unwrap(),
+        BatchCausalDot::new(
+            CausalPeerId::from_key(WriterIncarnationId::fixture_for_device(
+                manifest.author_device_id(),
+            )),
+            1,
+        )
+        .unwrap(),
         causal_dependency_heads,
         frontier,
         SemanticEffectDigest::of(semantic.payload()),
@@ -8172,4 +8188,733 @@ history through {forbidden}"
             .local_completed_projection_intent_ids()
             .contains(&dropped.id().unwrap()));
     }
+}
+
+// Persistent CRDT writer lanes (rebaselining prerequisite P1).
+//
+// The rebaselining design bounds resident state by `P` = participating peer
+// identities. A fresh peer per batch makes `P` grow with edit count and keeps
+// that growth inside every shallow snapshot and every later manifest's before
+// vector, so sealing can never retire it. These tests hold the engine half of
+// the repair: one persistent lane per (device, role), and receiver-side lane
+// ownership that is derived from first admitted use, installed atomically with
+// the batch that used it, and enforced on every later use.
+// ---------------------------------------------------------------------------
+
+/// One author batch that deliberately does NOT tie its device to its peer, so a
+/// test can construct the duplicated-writer-identity case that
+/// `author()` cannot express. Its causal writer incarnation is the device's
+/// stable fixture incarnation, i.e. "this device never lost its record".
+fn author_on_lane(batch: u128, device: u128, peer: u64) -> AuthorBatch {
+    author_on_incarnation(batch, device, peer, b"stable")
+}
+
+/// The same, with an EXPLICIT writer incarnation label.
+///
+/// This is how a fixture expresses what production expresses by saving a random
+/// `WriterIncarnationId`: the enrolled device is unchanged, while a distinct
+/// label is a distinct authoring incarnation — exactly what a lost or torn
+/// private writer record produces. Two labels are two causal chains.
+fn author_on_incarnation(batch: u128, device: u128, peer: u64, incarnation: &[u8]) -> AuthorBatch {
+    AuthorBatch {
+        batch_id: BatchId::from_uuid(uuid(batch)),
+        author_device_id: DeviceId::from_uuid(uuid(device)),
+        author_session_id: SessionId::from_uuid(uuid(2_000 + device)),
+        crdt_peer_id: CrdtPeerId::from_u64(peer),
+        causal_peer_id: CausalPeerId::from_key(WriterIncarnationId::fixture_labelled(
+            &[&device.to_be_bytes()[..], incarnation].concat(),
+        )),
+    }
+}
+
+fn block_in(
+    engine: &ShardedHotEngine,
+    author: AuthorBatch,
+    block: crate::oplog::BlockId,
+    page_id: PageId,
+    home_document_id: DocumentId,
+    order: &str,
+    content: &str,
+) -> PreparedBatch {
+    engine
+        .prepare_fixture_transaction(
+            author,
+            &tx(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id,
+                },
+                page_id,
+                parent: None,
+                order: order.into(),
+                content: content.into(),
+            }]),
+        )
+        .unwrap()
+}
+
+/// A long local burst on ONE lane leaves exactly one writer entry in the edited
+/// document, with strictly increasing counters. This is the property the whole
+/// repair exists for: under the retired fresh-peer-per-batch rule the same
+/// program leaves one entry per batch, forever, even after a shallow cut.
+#[test]
+fn a_local_burst_on_one_writer_lane_keeps_one_peer_and_strictly_increasing_counters() {
+    let ids = Ids::new();
+    let dir = TestDir::new("writer-lane-burst");
+    let archive = store(&dir, ids);
+    let (mut engine, _) = seed_engine(ids, &archive);
+    let lane = 0xA11E_0001_u64;
+    let device = 5_001_u128;
+
+    let mut previous_counter = 0_i32;
+    for index in 0..64_u128 {
+        let prepared = block_in(
+            &engine,
+            author_on_lane(70_000 + index, device, lane),
+            crate::oplog::BlockId::from_uuid(uuid(80_000 + index)),
+            ids.page_a,
+            ids.home_a,
+            &format!("b{index:04}"),
+            &format!("burst {index}"),
+        );
+        let batch = ready(&archive, &prepared);
+        assert!(
+            matches!(
+                engine.stage_ready(batch).disposition,
+                BatchDisposition::Accepted { .. }
+            ),
+            "burst batch {index} is accepted on the persistent lane"
+        );
+        let document = engine
+            .accepted_document_version_vector_for_test(ids.home_a)
+            .unwrap();
+        let counter = document
+            .iter()
+            .find(|(peer, _)| **peer == lane)
+            .map(|(_, counter)| *counter)
+            .expect("the lane advanced the edited document");
+        assert!(
+            counter > previous_counter,
+            "lane counters must strictly increase: {previous_counter} -> {counter}"
+        );
+        previous_counter = counter;
+    }
+
+    let peers = engine
+        .accepted_document_peer_ids_for_test(ids.home_a)
+        .unwrap();
+    assert_eq!(
+        peers.iter().filter(|peer| peer.as_u64() == lane).count(),
+        1,
+        "one lane entry after 64 batches, not one per batch: {peers:?}"
+    );
+    // The genesis author plus this one lane. A fresh peer per batch would have
+    // left 65 entries here and in every later manifest before-vector.
+    assert!(peers.len() <= 2, "unexpected writer growth: {peers:?}");
+    assert_eq!(engine.crdt_lane_count(), 2, "genesis author plus one lane");
+}
+
+/// Another author's lane is refused, in either delivery order, and the refusal
+/// happens before any live CRDT document changes. Exactly one of two forks of
+/// the same lane identity survives — the duplicated-writer-identity case.
+#[test]
+fn a_foreign_or_forked_writer_lane_is_refused_without_changing_any_document() {
+    for reversed in [false, true] {
+        let ids = Ids::new();
+        let dir = TestDir::new(if reversed {
+            "writer-lane-foreign-reversed"
+        } else {
+            "writer-lane-foreign"
+        });
+        let archive = store(&dir, ids);
+        let (mut engine, _) = seed_engine(ids, &archive);
+        let lane = 0xA11E_0002_u64;
+
+        // Two devices claim the same CRDT writer lane, in unrelated documents,
+        // so neither batch depends on the other's state.
+        let owner = block_in(
+            &engine,
+            author_on_lane(71_001, 5_101, lane),
+            crate::oplog::BlockId::from_uuid(uuid(81_001)),
+            ids.page_a,
+            ids.home_a,
+            "z1",
+            "owner edit",
+        );
+        // The impostor is prepared on a peer engine that has not yet seen the
+        // owner, exactly as a cloned device identity would produce it.
+        let impostor = block_in(
+            &seed_engine(ids, &archive).0,
+            author_on_lane(71_002, 5_102, lane),
+            crate::oplog::BlockId::from_uuid(uuid(81_002)),
+            ids.page_c,
+            ids.home_c,
+            "z2",
+            "impostor edit",
+        );
+        let (first, second) = if reversed {
+            (&impostor, &owner)
+        } else {
+            (&owner, &impostor)
+        };
+        let first_device = first.manifest().author_device_id();
+
+        let accepted = ready(&archive, first);
+        assert!(matches!(
+            engine.stage_ready(accepted).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let owned = engine
+            .crdt_lane_owner(CrdtPeerId::from_u64(lane))
+            .expect("first admitted use binds the lane");
+        assert_eq!(owned.device_id, first_device);
+
+        let target_document = if reversed { ids.home_a } else { ids.home_c };
+        let before_pages = engine
+            .accepted_document_peer_ids_for_test(target_document)
+            .unwrap();
+
+        let refused = ready(&archive, second);
+        let disposition = engine.stage_ready(refused).disposition;
+        match disposition {
+            BatchDisposition::Rejected {
+                error: EngineError::CrdtLaneNotOwned { peer_id, owned, .. },
+            } => {
+                assert_eq!(peer_id, CrdtPeerId::from_u64(lane));
+                assert_eq!(owned.device_id, first_device);
+            }
+            other => panic!("a foreign writer lane must be refused, found {other:?}"),
+        }
+        // Whole-batch atomicity: no CRDT fragment of the refused batch became
+        // accepted, and the ownership binding did not move.
+        assert_eq!(
+            engine
+                .accepted_document_peer_ids_for_test(target_document)
+                .unwrap(),
+            before_pages
+        );
+        assert_eq!(
+            engine
+                .crdt_lane_owner(CrdtPeerId::from_u64(lane))
+                .unwrap()
+                .device_id,
+            first_device
+        );
+        // The refused original stays in the archive for recovery.
+        assert!(matches!(
+            archive.inspect_batch(second.manifest().batch_id()).unwrap(),
+            BatchInspection::Ready(_)
+        ));
+    }
+}
+
+/// Incoming edits cannot turn a reserved baseline identity into a device lane.
+#[test]
+fn delivered_batches_cannot_claim_reserved_genesis_writer_peers() {
+    for lane in [0x5449_4e45_4745_4e31, 0x5449_4e45_4745_4e32] {
+        let ids = Ids::new();
+        let dir = TestDir::new("writer-lane-reserved-genesis");
+        let archive = store(&dir, ids);
+        let (mut engine, _) = seed_engine(ids, &archive);
+        let before = engine
+            .accepted_document_version_vector_for_test(ids.home_a)
+            .unwrap();
+        let lane_count = engine.crdt_lane_count();
+        let peer_count = engine.causal_peer_count();
+        let prepared = block_in(
+            &engine,
+            author_on_lane(71_101, 5_111, lane),
+            crate::oplog::BlockId::from_uuid(uuid(81_101)),
+            ids.page_a,
+            ids.home_a,
+            "z1",
+            "reserved peer edit",
+        );
+        let outcome = engine.stage_ready(ready(&archive, &prepared)).disposition;
+        assert!(
+            matches!(
+                outcome,
+                BatchDisposition::Rejected {
+                    error: EngineError::CrdtLaneUnauthorizedOrigin { .. },
+                }
+            ),
+            "delivered reserved writer peer {lane:x} must be refused: {outcome:?}"
+        );
+        assert_eq!(
+            engine
+                .accepted_document_version_vector_for_test(ids.home_a)
+                .unwrap(),
+            before
+        );
+        assert_eq!(engine.crdt_lane_count(), lane_count);
+        assert_eq!(engine.causal_peer_count(), peer_count);
+        assert!(matches!(
+            archive
+                .inspect_batch(prepared.manifest().batch_id())
+                .unwrap(),
+            BatchInspection::Ready(_)
+        ));
+    }
+}
+
+/// One device's ordinary lane and its external-import lane are separate
+/// identities, and neither may be advanced under the other's role.
+#[test]
+fn one_device_keeps_separate_local_and_external_import_lanes() {
+    let ids = Ids::new();
+    let dir = TestDir::new("writer-lane-roles");
+    let archive = store(&dir, ids);
+    let (mut engine, _) = seed_engine(ids, &archive);
+    let seed_lane_count = engine.crdt_lane_count();
+    let device = 5_201_u128;
+    let local_lane = 0xA11E_0003_u64;
+
+    let local = block_in(
+        &engine,
+        author_on_lane(72_001, device, local_lane),
+        crate::oplog::BlockId::from_uuid(uuid(82_001)),
+        ids.page_a,
+        ids.home_a,
+        "r1",
+        "local edit",
+    );
+    let batch = ready(&archive, &local);
+    assert!(matches!(
+        engine.stage_ready(batch).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let owner = engine
+        .crdt_lane_owner(CrdtPeerId::from_u64(local_lane))
+        .unwrap();
+    assert_eq!(owner.device_id, DeviceId::from_uuid(uuid(device)));
+    assert_eq!(owner.role, crate::oplog::writer_lane::WriterRole::Local);
+
+    // The same device cannot reuse its ordinary lane as an import lane: role
+    // separation is what keeps external-editor provenance separable, and it is
+    // enforced by the same accepted-state binding, at draft time, before any
+    // batch material is assembled.
+    let reused = engine.prepare_fixture_transaction_with_origin(
+        author_on_lane(72_002, device, local_lane),
+        BatchOrigin::ExternalReconciliation {
+            import_id: crate::oplog::ImportId::from_digest([9; 32]),
+        },
+        &tx(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            content: "import edit".into(),
+        }]),
+    );
+    match reused {
+        Err(EngineError::CrdtLaneNotOwned { owned, claimed, .. }) => {
+            assert_eq!(owned.role, crate::oplog::writer_lane::WriterRole::Local);
+            assert_eq!(
+                claimed.role,
+                crate::oplog::writer_lane::WriterRole::External
+            );
+            assert_eq!(owned.device_id, claimed.device_id);
+        }
+        Err(other) => panic!("role separation must be enforced, found {other:?}"),
+        Ok(_) => panic!("role separation must be enforced"),
+    }
+
+    // The ordinary lane itself keeps working under its own role: refusal was
+    // about the role, not about the lane having been used before.
+    let again = block_in(
+        &engine,
+        author_on_lane(72_003, device, local_lane),
+        crate::oplog::BlockId::from_uuid(uuid(82_003)),
+        ids.page_a,
+        ids.home_a,
+        "r3",
+        "second local edit",
+    );
+    let batch = ready(&archive, &again);
+    assert!(matches!(
+        engine.stage_ready(batch).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert_eq!(
+        engine.crdt_lane_count(),
+        seed_lane_count + 1,
+        "reusing the admitted local lane must not register another lane; genesis retains its own \
+         owner"
+    );
+}
+
+/// Manager `p1-causal-loss-review/regression-test.rs`, incorporated with
+/// explicit fixture incarnation selection.
+///
+/// One enrolled device publishes work, then loses its private writer record and
+/// reopens an OLDER graph copy that cannot see that work. The rebuild mints a
+/// fresh writer incarnation (here: an explicit distinct fixture label, which is
+/// what the durable record's random `WriterIncarnationId` produces in
+/// production), so the two independently prepared publications must NOT land on
+/// one `BatchCausalDot` — which is precisely the alias the manager's isolated
+/// control reproduced. Both branches then deliver in either arrival order, keep
+/// their exact original IDs, and bind to the SAME enrolled author device.
+#[test]
+fn manager_lost_writer_record_and_stale_archive_preserve_both_original_branches() {
+    for reversed in [false, true] {
+        let ids = Ids::new();
+        let dir = TestDir::new(if reversed {
+            "manager-lost-writer-causal-chain-reversed"
+        } else {
+            "manager-lost-writer-causal-chain"
+        });
+        let archive = store(&dir, ids);
+        let (mut original, genesis) = seed_engine(ids, &archive);
+        let device = 5_501_u128;
+        let old_prefix = block_in(
+            &original,
+            author_on_incarnation(75_001, device, 0xA11E_0015, b"before-loss"),
+            crate::oplog::BlockId::from_uuid(uuid(85_001)),
+            ids.page_a,
+            ids.home_a,
+            "r1",
+            "acknowledged before private state loss",
+        );
+        assert!(matches!(
+            original
+                .stage_ready(ready(&archive, &old_prefix))
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+
+        // Reopening an OLDER graph copy with the writer record lost mints a
+        // fresh Loro lane AND a fresh causal writer incarnation, while the
+        // enrolled device identity is unchanged.
+        let mut stale_rebuild = ids.engine();
+        assert!(matches!(
+            stale_rebuild.stage_ready(genesis.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let new_work = block_in(
+            &stale_rebuild,
+            author_on_incarnation(75_002, device, 0xA11E_0016, b"after-loss"),
+            crate::oplog::BlockId::from_uuid(uuid(85_002)),
+            ids.page_a,
+            ids.home_a,
+            "r2",
+            "acknowledged after private state loss",
+        );
+        assert_ne!(
+            old_prefix.manifest().causal_dot(),
+            new_work.manifest().causal_dot(),
+            "independent acknowledged publications by fresh lanes must not share one Tine causal \
+             identity after private record loss"
+        );
+        assert_ne!(
+            old_prefix.manifest().causal_dot().peer_id(),
+            new_work.manifest().causal_dot().peer_id(),
+            "the fresh incarnation is a distinct causal peer, not a reused counter"
+        );
+        assert_eq!(
+            old_prefix.manifest().author_device_id(),
+            new_work.manifest().author_device_id(),
+            "only the lost writer incarnation changes; the enrolled author device does not"
+        );
+
+        let mut receiver = ids.engine();
+        assert!(matches!(
+            receiver.stage_ready(genesis.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let seed_lane_count = receiver.crdt_lane_count();
+        let seed_incarnations = receiver.causal_peer_count();
+        let (first, second) = if reversed {
+            (&new_work, &old_prefix)
+        } else {
+            (&old_prefix, &new_work)
+        };
+        assert!(matches!(
+            receiver.stage_ready(ready(&archive, first)).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let result = receiver.stage_ready(ready(&archive, second)).disposition;
+        assert!(
+            matches!(result, BatchDisposition::Accepted { .. }),
+            "fresh CRDT lanes after private record loss must not alias the old Tine causal dot; \
+             reversed={reversed}, old={:?}, new={:?}, result={result:?}",
+            old_prefix.manifest().causal_dot(),
+            new_work.manifest().causal_dot()
+        );
+
+        // Both originals are present with their exact IDs; neither branch had
+        // to wait for the other, and neither erased the other's obligations.
+        let accepted = receiver.status().accepted_batch_ids().unwrap();
+        for prepared in [&old_prefix, &new_work] {
+            assert!(
+                accepted.contains(&prepared.manifest().batch_id()),
+                "the original batch id survives delivery: {:?}",
+                prepared.manifest().batch_id()
+            );
+        }
+        let peers = receiver
+            .accepted_document_peer_ids_for_test(ids.home_a)
+            .unwrap();
+        for lane in [0xA11E_0015_u64, 0xA11E_0016_u64] {
+            assert!(
+                peers.contains(&CrdtPeerId::from_u64(lane)),
+                "both the retired and the fresh lane advanced the document: {peers:?}"
+            );
+            let owner = receiver
+                .crdt_lane_owner(CrdtPeerId::from_u64(lane))
+                .unwrap_or_else(|| panic!("lane {lane:x} is bound by its first admitted use"));
+            assert_eq!(owner.device_id, DeviceId::from_uuid(uuid(device)));
+            assert_eq!(owner.role, crate::oplog::writer_lane::WriterRole::Local);
+        }
+        // Both incarnations bind to the one enrolled author device, and the
+        // rebuild costs exactly one additional writer identity — the
+        // bounded-by-incarnations `P` term, not a per-batch term.
+        for prepared in [&old_prefix, &new_work] {
+            assert_eq!(
+                receiver.causal_peer_owner(prepared.manifest().causal_dot().peer_id()),
+                Some(DeviceId::from_uuid(uuid(device))),
+                "a causal writer incarnation binds to its enrolled author device"
+            );
+        }
+        assert_eq!(receiver.crdt_lane_count(), seed_lane_count + 2);
+        assert_eq!(
+            receiver.causal_peer_count(),
+            seed_incarnations + 2,
+            "one real writer incarnation change costs exactly one P entry"
+        );
+    }
+}
+
+/// The other half of the same boundary: WITHIN one incarnation, a conflicting
+/// same-dot claim is a fork and is refused before any live fragment, ownership
+/// or effect change — while an ordinary duplicate replay of the original bytes
+/// still succeeds. Sparse counter containment cannot tell these apart; the
+/// exact accepted per-peer tip can.
+#[test]
+fn a_same_incarnation_same_dot_fork_is_refused_and_the_original_bytes_are_retained() {
+    let ids = Ids::new();
+    let dir = TestDir::new("same-dot-fork");
+    let archive = store(&dir, ids);
+    let (mut author, genesis) = seed_engine(ids, &archive);
+    let device = 5_601_u128;
+
+    let original = block_in(
+        &author,
+        author_on_incarnation(76_001, device, 0xA11E_0017, b"one"),
+        crate::oplog::BlockId::from_uuid(uuid(86_001)),
+        ids.page_a,
+        ids.home_a,
+        "f1",
+        "original bytes",
+    );
+    assert!(matches!(
+        author.stage_ready(ready(&archive, &original)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // A second engine that never saw the original prepares a DIFFERENT batch on
+    // the SAME incarnation, so it lands on the same (peer, counter). This is
+    // what a duplicated or forged private writer record produces.
+    let mut forker = ids.engine();
+    assert!(matches!(
+        forker.stage_ready(genesis.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let fork = block_in(
+        &forker,
+        author_on_incarnation(76_002, device, 0xA11E_0017, b"one"),
+        crate::oplog::BlockId::from_uuid(uuid(86_002)),
+        ids.page_a,
+        ids.home_a,
+        "f2",
+        "forked bytes",
+    );
+    assert_eq!(
+        fork.manifest().causal_dot(),
+        original.manifest().causal_dot(),
+        "the fixture really does construct a same-dot conflict"
+    );
+    assert_ne!(fork.manifest().batch_id(), original.manifest().batch_id());
+
+    let mut receiver = ids.engine();
+    assert!(matches!(
+        receiver.stage_ready(genesis).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let original_ready = ready(&archive, &original);
+    assert!(matches!(
+        receiver.stage_ready(original_ready.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let before = receiver.canonical_snapshot().unwrap();
+    let accepted_before = receiver.status().accepted_batch_ids().unwrap();
+
+    let refused = receiver.stage_ready(ready(&archive, &fork)).disposition;
+    assert!(
+        matches!(
+            refused,
+            BatchDisposition::Rejected {
+                error: EngineError::CausalDotFork { .. }
+            }
+        ),
+        "a conflicting same-dot claim is a fork, not a duplicate: {refused:?}"
+    );
+    // Nothing accepted moved, and no fragment of any accepted document changed.
+    assert_eq!(receiver.canonical_snapshot().unwrap(), before);
+    assert_eq!(
+        receiver.status().accepted_batch_ids().unwrap(),
+        accepted_before
+    );
+    // The rejected original bytes are preserved in the archive, unmodified.
+    assert!(matches!(
+        archive.inspect_batch(fork.manifest().batch_id()).unwrap(),
+        BatchInspection::Ready(_)
+    ));
+    // And a normal duplicate replay of the real original still succeeds.
+    assert!(matches!(
+        receiver.stage_ready(original_ready).disposition,
+        BatchDisposition::DuplicateAccepted { .. }
+    ));
+}
+
+/// A foreign device claiming an incarnation this graph already bound is refused
+/// through the same accepted-ownership machinery, atomically and before any
+/// visible change. The incarnation stays bound to its original author.
+#[test]
+fn a_foreign_device_cannot_claim_an_already_bound_causal_writer_incarnation() {
+    let ids = Ids::new();
+    let dir = TestDir::new("foreign-causal-key");
+    let archive = store(&dir, ids);
+    let (mut author, genesis) = seed_engine(ids, &archive);
+    let owner_device = 5_701_u128;
+    let thief_device = 5_702_u128;
+    let incarnation = b"shared-label";
+
+    let owned = block_in(
+        &author,
+        author_on_incarnation(77_001, owner_device, 0xA11E_0018, incarnation),
+        crate::oplog::BlockId::from_uuid(uuid(87_001)),
+        ids.page_a,
+        ids.home_a,
+        "t1",
+        "owner edit",
+    );
+    assert!(matches!(
+        author.stage_ready(ready(&archive, &owned)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // A different enrolled device authors under the SAME causal key. Its Loro
+    // lane is its own, so only the causal identity is stolen.
+    let mut thief = ids.engine();
+    assert!(matches!(
+        thief.stage_ready(genesis.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let mut stolen_author = author_on_incarnation(77_002, thief_device, 0xA11E_0019, b"thief");
+    stolen_author.causal_peer_id = owned.manifest().causal_dot().peer_id();
+    let stolen = block_in(
+        &thief,
+        stolen_author,
+        crate::oplog::BlockId::from_uuid(uuid(87_002)),
+        ids.page_a,
+        ids.home_a,
+        "t2",
+        "stolen causal key",
+    );
+    assert_eq!(
+        stolen.manifest().causal_dot().peer_id(),
+        owned.manifest().causal_dot().peer_id()
+    );
+    assert_ne!(
+        stolen.manifest().author_device_id(),
+        owned.manifest().author_device_id()
+    );
+
+    let mut receiver = ids.engine();
+    assert!(matches!(
+        receiver.stage_ready(genesis).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        receiver.stage_ready(ready(&archive, &owned)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let before = receiver.canonical_snapshot().unwrap();
+    let refused = receiver.stage_ready(ready(&archive, &stolen)).disposition;
+    assert!(
+        matches!(
+            refused,
+            BatchDisposition::Rejected {
+                error: EngineError::CausalPeerNotOwned { .. }
+            }
+        ),
+        "another author may not advance a bound writer incarnation: {refused:?}"
+    );
+    assert_eq!(receiver.canonical_snapshot().unwrap(), before);
+    assert_eq!(
+        receiver.causal_peer_owner(owned.manifest().causal_dot().peer_id()),
+        Some(DeviceId::from_uuid(uuid(owner_device))),
+        "the refused claim did not rebind the incarnation"
+    );
+    assert!(matches!(
+        archive.inspect_batch(stolen.manifest().batch_id()).unwrap(),
+        BatchInspection::Ready(_)
+    ));
+}
+
+/// Lane ownership is rebuilt by full accepted replay: a receiver that opened
+/// without a checkpoint still knows who owns every lane.
+#[test]
+fn writer_lane_ownership_is_rebuilt_by_full_accepted_replay() {
+    let ids = Ids::new();
+    let dir = TestDir::new("writer-lane-restore");
+    let archive = store(&dir, ids);
+    let (mut engine, genesis_batch) = seed_engine(ids, &archive);
+    let lane = 0xA11E_0004_u64;
+    let device = 5_301_u128;
+
+    let owner = block_in(
+        &engine,
+        author_on_lane(73_001, device, lane),
+        crate::oplog::BlockId::from_uuid(uuid(83_001)),
+        ids.page_a,
+        ids.home_a,
+        "s1",
+        "owner edit",
+    );
+    let batch = ready(&archive, &owner);
+    assert!(matches!(
+        engine.stage_ready(batch).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let expected = engine.crdt_lane_owner(CrdtPeerId::from_u64(lane)).unwrap();
+
+    // Full accepted replay rebuilds the same map from original bytes. (The
+    // checkpoint-restored half of the same property is proved separately, on
+    // the checkpoint state section itself.)
+    let mut replayed = ids.engine();
+    let genesis_ready = match archive
+        .inspect_batch(genesis_batch.manifest().batch_id())
+        .unwrap()
+    {
+        BatchInspection::Ready(batch) => batch,
+        other => panic!("genesis remains Ready: {other:?}"),
+    };
+    assert!(matches!(
+        replayed.stage_ready(genesis_ready).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let owner_ready = match archive.inspect_batch(owner.manifest().batch_id()).unwrap() {
+        BatchInspection::Ready(batch) => batch,
+        other => panic!("owner batch remains Ready: {other:?}"),
+    };
+    assert!(matches!(
+        replayed.stage_ready(owner_ready).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert_eq!(
+        replayed.crdt_lane_owner(CrdtPeerId::from_u64(lane)),
+        Some(expected),
+        "full accepted replay rebuilds lane ownership"
+    );
 }

@@ -7153,6 +7153,19 @@ fn activate_clean_runtime_resources_retaining_archive(
         &graph,
         &mut runtime,
     )?;
+    // Genesis activation: accepted history is the immutable baseline and the
+    // journal has just been created, so the proved own prefix is zero and this
+    // endpoint's lane record is minted here, before any authoring.
+    let writer_lanes = qualify_clean_writer_lanes(
+        &request.application_runtime_root,
+        &binding,
+        endpoint,
+        runtime.engine(),
+        &store,
+    )?;
+    runtime
+        .install_writer_lanes(writer_lanes)
+        .map_err(CleanOpenError::from)?;
     let projection_turns = open_projection_turn_journal(
         &request.application_runtime_root,
         binding.workspace_id(),
@@ -7730,7 +7743,22 @@ fn open_clean_runtime_resources_with_progress(
     );
     // Repair -> actor assembly boundary: the pre-actor window ends with zero
     // buffered entries, independent of how long actor construction takes.
-    let runtime = completion_guard.finish()?;
+    let mut runtime = completion_guard.finish()?;
+    // Every journal frame and every accepted manifest is now inside the engine,
+    // so the reconstructed own-dot chain is this reopen's exact durable prefix.
+    // A normal restart continues the retained lanes here; only a rebuild that
+    // cannot cover that prefix mints a new incarnation, durably, before the
+    // runtime becomes writable.
+    let writer_lanes = qualify_clean_writer_lanes(
+        &request.application_runtime_root,
+        &binding,
+        endpoint,
+        runtime.engine(),
+        &store,
+    )?;
+    runtime
+        .install_writer_lanes(writer_lanes)
+        .map_err(CleanOpenError::from)?;
     trace.phase(SyncRuntimeCleanOpenStage::CompletionFlush, stage_progress);
     let archive = store.instrumentation();
     counters.archive_directory_enumerations = archive.directory_enumerations;
@@ -12006,6 +12034,106 @@ fn clean_undrained_object_repair_coverage(
         }
     }
     Ok(covered)
+}
+
+/// This device's own durable prefix, as the writer-lane record's coverage
+/// proof sees it.
+///
+/// `proved_own_counter` is the reconstructed gap-free `BatchCausalDot` chain
+/// for this device across restored accepted history AND the drained local
+/// journal, so it covers both commit paths. The durability question is only
+/// ever asked about the single reserved batch that the chain does not already
+/// cover, and it is asked of the archive: a local batch that reached the
+/// journal is already inside the chain, so an archive-absent reserved batch
+/// provably never became durable on either path.
+use crate::oplog::writer_lane::WriterLanes;
+
+struct CleanWriterLanePrefix<'a> {
+    engine: &'a ShardedHotEngine,
+    archive: &'a ObjectStore,
+}
+
+impl crate::oplog::writer_lane::WriterLanePrefixProof for CleanWriterLanePrefix<'_> {
+    /// Asked about the SAVED causal writer incarnation, never about the
+    /// enrolled device: a rebuilt device may have published under an earlier
+    /// incarnation whose chain this copy neither owns nor continues.
+    fn proved_own_counter(&self, peer: crate::oplog::CausalPeerId) -> u64 {
+        self.engine.own_causal_dot_high_water(peer)
+    }
+
+    /// The reserved dot is freed only by proving that this EXACT publication
+    /// never happened. A committed manifest under the reserved `BatchId` whose
+    /// fingerprint is not the reserved one answers a different question than
+    /// the one asked, so it is undecidable rather than present-or-absent.
+    fn reserved_batch_durability(
+        &self,
+        tip: crate::oplog::writer_lane::WriterLaneTip,
+    ) -> crate::oplog::writer_lane::ReservedBatchDurability {
+        use crate::oplog::writer_lane::ReservedBatchDurability;
+        let manifest = match self.archive.inspect_batch(tip.batch_id) {
+            Ok(crate::oplog::BatchInspection::Absent) => return ReservedBatchDurability::Absent,
+            Ok(crate::oplog::BatchInspection::Staged { manifest, .. }) => manifest,
+            Ok(crate::oplog::BatchInspection::Ready(batch)) => batch.manifest().clone(),
+            // Cannot decide: the dot stays spent.
+            Err(_) => return ReservedBatchDurability::Undecidable,
+        };
+        match manifest.encode() {
+            Ok(bytes) if ContentDigest::of(&bytes) == tip.manifest_digest => {
+                ReservedBatchDurability::Present
+            }
+            _ => ReservedBatchDurability::Undecidable,
+        }
+    }
+}
+
+/// Qualify this device's persistent CRDT writer lanes for one clean runtime.
+///
+/// Called only after accepted history is restored and the foreground journal is
+/// drained, because that state IS the own-prefix coverage proof. The record
+/// lives in the device-private application runtime root next to the journals —
+/// app-data keyed by graph, never the graph directory and never `.tine-sync`
+/// (D-11): a writer lane must not travel with the graph.
+fn qualify_clean_writer_lanes(
+    application_runtime_root: &Path,
+    binding: &ActorRuntimeBinding,
+    endpoint: ProjectionEndpointBinding,
+    engine: &ShardedHotEngine,
+    archive: &ObjectStore,
+) -> Result<WriterLanes, String> {
+    use crate::oplog::writer_lane::{WriterLaneBinding, WriterLaneStore, WRITER_LANE_NAMESPACE};
+
+    if !application_runtime_root.exists() {
+        fs::create_dir_all(application_runtime_root)
+            .map_err(|error| format!("cannot create CRDT writer lane root: {error}"))?;
+    }
+    let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
+        .map_err(|error| format!("cannot retain CRDT writer lane root: {error}"))?;
+    ensure_directory_nofollow(&root, WRITER_LANE_NAMESPACE).map_err(CleanOpenError::from)?;
+    let namespace =
+        open_dir_nofollow(&root, WRITER_LANE_NAMESPACE).map_err(CleanOpenError::from)?;
+    let lane_binding = WriterLaneBinding {
+        workspace_id: binding.workspace_id(),
+        lineage: binding.lineage_digest(),
+        device_id: binding.device_id(),
+        endpoint_id: endpoint.endpoint_id(),
+    };
+    let directory_name = lane_binding.directory_name();
+    ensure_directory_nofollow(&namespace, &directory_name).map_err(CleanOpenError::from)?;
+    let directory = open_dir_nofollow(&namespace, &directory_name).map_err(CleanOpenError::from)?;
+    let proof = CleanWriterLanePrefix { engine, archive };
+    let store = WriterLaneStore::open(directory, lane_binding, &proof)
+        .map_err(|error| format!("cannot qualify CRDT writer lanes: {error}"))?;
+    if runtime_debug_diagnostics_enabled() {
+        eprintln!(
+            "CRDT writer lanes qualified: disposition={:?} incarnation={} incarnation_id={} \
+             proved_own_counter={}",
+            store.disposition(),
+            store.incarnation(),
+            store.incarnation_id(),
+            engine.own_causal_dot_high_water(store.causal_peer()),
+        );
+    }
+    Ok(WriterLanes::Durable(store))
 }
 
 fn open_clean_foreground_journal(

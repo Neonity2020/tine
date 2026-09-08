@@ -1507,7 +1507,9 @@ mod tests {
         let (_, name_ref) = encode_exact_name_blob(&name).unwrap();
         let batch = BatchId::from_uuid(Uuid::from_u128(0xa500));
         let dot = BatchCausalDot::new(
-            CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(0xa501))),
+            CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                DeviceId::from_uuid(Uuid::from_u128(0xa501)),
+            )),
             1,
         )
         .unwrap();

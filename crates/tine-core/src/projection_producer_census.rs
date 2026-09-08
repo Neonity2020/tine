@@ -1196,9 +1196,12 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/publish.rs", "open.create_new", 1),
         ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 7),
         (
+            // +1 (5 -> 6): the clean open/activation path ensures the
+            // device-private application runtime root exists before qualifying
+            // this endpoint's persistent CRDT writer lanes (P1).
             "crates/tine-core/src/sync_runtime.rs",
             "fs.create_dir_all",
-            5,
+            6,
         ),
         (
             "crates/tine-core/src/sync_runtime.rs",
@@ -1678,6 +1681,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             1,
         ),
         (
+            // New row: the device-private CRDT writer-lane record reaches the
+            // audited durable publication family through the same shared
+            // primitive as every other authority (D-7), and never through a
+            // bespoke temp+rename (P1).
+            "crates/tine-core/src/oplog/writer_lane.rs",
+            "durable_directory.open",
+            1,
+        ),
+        (
             "crates/tine-core/src/sync_runtime.rs",
             "durable_directory.open",
             4,
@@ -1705,7 +1717,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.17.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.18.0\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -2050,9 +2062,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 10 receiver history), no removals or changes elsewhere. The cold resolver
     // adds the two durable-directory opens registered above; receiver rows use
     // the existing ObjectStore publication boundary.
+    // P1 writer incarnation record: reviewed the complete 432 -> 439 row
+    // multiset. Seven additions, all in writer_lane.rs: one shared directory
+    // open, bounded record read, exact preserve/create/replace publications,
+    // nofollow lease revalidation and their import. No removals, new codec or
+    // additional raw publication path; the directory open is registered above.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "777e2a4d6601dca2e439da79da90cddc0f40ae31ac1005a9904714e7a81f23f9",
+        "a434d79551ba12c6c3a1d56c5b2ce7948d0086121262a93af88ff24dc6e1758b",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

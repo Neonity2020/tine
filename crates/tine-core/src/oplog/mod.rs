@@ -123,7 +123,7 @@ pub(crate) use hot_engine::{inject_managed_local_append_fault_for_test, ManagedL
 pub use identity::{
     BatchId, BlockId, CanonicalArchiveResourceId, CanonicalGraphResourceId, CrdtPeerId, DeviceId,
     DocumentId, DocumentKey, ImportId, LogseqUuid, PageId, ProjectionEndpointId,
-    ProjectionReceiptStoreId, SessionId, WorkspaceId,
+    ProjectionReceiptStoreId, SessionId, WorkspaceId, WriterIncarnationId,
 };
 pub use import::{
     classify_conflict_copy, inventory_affected, inventory_initial_shadow, BlockImportMatch,
@@ -259,11 +259,11 @@ mod external_surface_tests {
         let digest = Sha256::digest(public_uses.join("\n").as_bytes());
         assert_eq!(
             format!("{digest:x}"),
-            // Re-pinned for the approved retirable-document foundation:
-            // `DocumentKey` joins the identity re-exports. Extraction against
+            // Re-pinned for the retirable-document and writer foundations:
+            // `WriterIncarnationId` joins the identity re-exports. Extraction against
             // the preceding foundation proves that this is the only added
             // name, none are removed, and there are still 20 declarations.
-            "5c1ed5ffbbbf617aab3747c79d95f5677e2e137996539de4a5846d0e542e5d09",
+            "7ff09377a7cd953dfdc3c69da89923ea7a693638f3de2ffd770d508cd85f5484",
             "the exact public oplog re-export surface changed"
         );
 
@@ -279,3 +279,5 @@ mod external_surface_tests {
         );
     }
 }
+
+pub(crate) mod writer_lane;

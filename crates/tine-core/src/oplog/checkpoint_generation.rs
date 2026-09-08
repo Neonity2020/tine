@@ -24,7 +24,7 @@ use super::hot_engine::{
 use super::object_store::ObjectStore;
 use super::{
     BatchCausalDot, BatchId, BlobDescription, CausalPeerId, ContentDigest, DeviceId,
-    DocumentDependencies, DocumentId,
+    DocumentDependencies, DocumentId, WriterIncarnationId,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -902,12 +902,7 @@ impl<Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore>
         {
             return Err("sealed cutoff repeats an accepted batch".into());
         }
-        let peer_id = row
-            .causal_dot
-            .peer_id()
-            .as_device_id()
-            .as_uuid()
-            .into_bytes();
+        let peer_id = row.causal_dot.peer_id().key().as_uuid().into_bytes();
         let prior_tip = self.cutoff.causal_tips.get(&peer_id).copied();
         let expected_tip = prior_tip
             .map(|tip| tip.value_digest())
@@ -1033,18 +1028,13 @@ fn append_accepted_row<
         batch_id,
         manifest_fingerprint: row.evidence.manifest_fingerprint(),
         event_binding_digest: row.evidence.event_binding_digest(),
-        causal_peer_id: row
-            .causal_dot
-            .peer_id()
-            .as_device_id()
-            .as_uuid()
-            .into_bytes(),
+        causal_peer_id: row.causal_dot.peer_id().key().as_uuid().into_bytes(),
         causal_counter: row.causal_dot.counter(),
         canonical_causal_clock: row
             .canonical_causal_clock
             .iter()
             .map(|(peer, counter)| SealedAcceptedCausalClockEntryV2 {
-                peer_id: peer.as_device_id().as_uuid().into_bytes(),
+                peer_id: peer.key().as_uuid().into_bytes(),
                 counter: *counter,
             })
             .collect(),
@@ -1536,7 +1526,7 @@ pub(crate) fn open_checkpoint(
             Err(_) => return Ok(invalid("clean checkpoint evidence is invalid")),
             Ok(_) => return Ok(invalid("clean checkpoint evidence binding failed")),
         };
-        let peer = CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes(
+        let peer = CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
             causal.causal_peer_id,
         )));
         let causal_dot = match BatchCausalDot::new(peer, causal.causal_counter) {
@@ -1548,7 +1538,7 @@ pub(crate) fn open_checkpoint(
             .iter()
             .map(|entry| {
                 (
-                    CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes(
+                    CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
                         entry.peer_id,
                     ))),
                     entry.counter,
@@ -1848,6 +1838,14 @@ mod tests {
         generation_rows_with_dots(&(1..=count).map(|counter| (19, counter)).collect::<Vec<_>>())
     }
 
+    /// Explicit, stable fixture writer incarnation. Fixtures have no durable
+    /// writer-lane record to read a real one from; production always does.
+    fn fixture_incarnation(seed: u128) -> CausalPeerId {
+        CausalPeerId::from_key(WriterIncarnationId::fixture_for_device(
+            DeviceId::from_uuid(uuid::Uuid::from_u128(seed)),
+        ))
+    }
+
     fn generation_rows_with_dots(dots: &[(u128, u64)]) -> Vec<CleanCheckpointAcceptedRow> {
         let mut prior = AcceptedFrontierRoot::empty();
         let mut entries = Vec::new();
@@ -1855,7 +1853,7 @@ mod tests {
             .enumerate()
             .map(|(index, &(peer_id, counter))| {
                 let sequence = index as u64 + 1;
-                let peer = CausalPeerId::from_device_id(DeviceId::from_uuid(
+                let peer = CausalPeerId::from_key(WriterIncarnationId::from_uuid(
                     uuid::Uuid::from_u128(peer_id),
                 ));
                 let batch_id = BatchId::from_uuid(uuid::Uuid::from_u128(sequence as u128));
@@ -1940,6 +1938,7 @@ mod tests {
                         author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(500)),
                         author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(501)),
                         crdt_peer_id: CrdtPeerId::from_u64(502),
+                        causal_peer_id: fixture_incarnation(500),
                     },
                     &transaction,
                 )
@@ -2192,6 +2191,7 @@ mod tests {
                         author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(500)),
                         author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(501)),
                         crdt_peer_id: CrdtPeerId::from_u64(502),
+                        causal_peer_id: fixture_incarnation(500),
                     },
                     &transaction,
                 )
@@ -2536,6 +2536,7 @@ mod tests {
             author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(peer as u128)),
             author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(peer as u128 + 1)),
             crdt_peer_id: CrdtPeerId::from_u64(peer),
+            causal_peer_id: fixture_incarnation(peer as u128),
         };
         let commit = |engine: &mut ShardedHotEngine, batch, peer, operations| {
             let transaction = OperationTransaction::new(operations).unwrap();
@@ -3529,10 +3530,12 @@ mod tests {
 
     #[test]
     fn tine_and_storage_share_the_exact_causal_record_address() {
-        let low =
-            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x11; 16])));
-        let author =
-            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
+        let low = CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
+            [0x11; 16],
+        )));
+        let author = CausalPeerId::from_key(WriterIncarnationId::from_uuid(
+            uuid::Uuid::from_bytes([0x44; 16]),
+        ));
         let (root_key, root_digest) =
             authenticated_causal_clock_root(&[(low, 3), (author, 7)]).unwrap();
         let engine_address = accepted_causal_record_digest(
@@ -3659,8 +3662,9 @@ mod tests {
     #[test]
     fn checkpoint_payload_uses_the_shared_sealed_roster_round_trip() {
         let evidence = evidence();
-        let peer =
-            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
+        let peer = CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
+            [0x44; 16],
+        )));
         let capture = CleanCheckpointCapture {
             base_sequence: 0,
             target_sequence: 1,
@@ -3697,8 +3701,9 @@ mod tests {
     fn checkpoint_payload_extends_the_durable_frontier_from_one_row_delta() {
         let first = evidence();
         let second = evidence_after(&first);
-        let peer =
-            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
+        let peer = CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
+            [0x44; 16],
+        )));
         let first_capture = CleanCheckpointCapture {
             base_sequence: 0,
             target_sequence: 1,
@@ -3758,8 +3763,9 @@ mod tests {
         let workspace = crate::oplog::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xa564));
         let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
         let publisher = CleanCheckpointPublisher::new(store, 0);
-        let peer =
-            CausalPeerId::from_device_id(DeviceId::from_uuid(uuid::Uuid::from_bytes([0x44; 16])));
+        let peer = CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
+            [0x44; 16],
+        )));
         let row = CleanCheckpointAcceptedRow {
             no_op: false,
             evidence: evidence(),

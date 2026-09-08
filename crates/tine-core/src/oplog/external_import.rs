@@ -874,7 +874,13 @@ mod tests {
             BatchOrigin::ExternalReconciliation {
                 import_id: observation.import_id,
             },
-            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
+                1,
+            )
+            .unwrap(),
             Vec::new(),
             FrontierV2::default(),
             SemanticEffectDigest::of(semantic_payload),
@@ -922,7 +928,13 @@ mod tests {
             device,
             SessionId::from_uuid(Uuid::from_u128(9)),
             origin,
-            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
+                1,
+            )
+            .unwrap(),
             Vec::new(),
             FrontierV2::default(),
             SemanticEffectDigest::of(semantic_payload),

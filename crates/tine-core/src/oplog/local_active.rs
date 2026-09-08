@@ -38,7 +38,11 @@ use super::object_store::StoreError;
 use super::sqlite::{
     LeasedWorkspaceProjection, ProjectionError, SqliteFrontier, WorkspaceLeaseIdentity,
 };
-use super::{DeviceId, ProjectionEndpointBinding, ProjectionIntentId, SessionId, WorkspaceId};
+use super::writer_lane::{WriterLaneError, WriterLaneTip, WriterLanes, WriterRole};
+use super::{
+    BatchId, CausalPeerId, CrdtPeerId, DeviceId, ProjectionEndpointBinding, ProjectionIntentId,
+    SessionId, WorkspaceId,
+};
 
 /// A private seal. Sibling modules can name the sealed types but can never
 /// construct one, because this module is the only place `Seal` is reachable.
@@ -169,6 +173,15 @@ pub(crate) struct AdmittedLocalAuthorAuthority<'a> {
     workspace_id: WorkspaceId,
     device_id: DeviceId,
     session_id: SessionId,
+    /// This runtime's persistent ordinary/seal CRDT writer lane. It is vended
+    /// from the durable device-private lane record, never derived here, and it
+    /// is deliberately the same value for every batch, import and seal of one
+    /// writer incarnation.
+    crdt_peer_id: CrdtPeerId,
+    /// This runtime's persisted causal writer incarnation, vended from the same
+    /// durable record as the Loro lanes. Every batch of this incarnation —
+    /// ordinary, seal or external import — shares it.
+    causal_peer_id: CausalPeerId,
     generation: LocalAuthorGeneration,
     _admission: std::marker::PhantomData<&'a LocalRuntimeAdmission<'a>>,
     _seal: seal::Seal,
@@ -185,6 +198,14 @@ impl AdmittedLocalAuthorAuthority<'_> {
 
     pub(crate) const fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    pub(crate) const fn crdt_peer_id(&self) -> CrdtPeerId {
+        self.crdt_peer_id
+    }
+
+    pub(crate) const fn causal_peer_id(&self) -> CausalPeerId {
+        self.causal_peer_id
     }
 
     pub(crate) const fn generation(&self) -> &LocalAuthorGeneration {
@@ -253,12 +274,84 @@ impl LocalRuntimeAdmission<'_> {
             workspace_id: engine.workspace_id(),
             device_id: endpoint.device_id(),
             session_id,
+            crdt_peer_id: self.writer_lane_peer(WriterRole::Local)?,
+            causal_peer_id: self.writer_lane_causal_peer()?,
             generation: engine
                 .local_author_generation()
                 .map_err(RuntimePromotionError::Engine)?,
             _admission: std::marker::PhantomData,
             _seal: seal::Seal,
         })
+    }
+
+    /// This runtime's persistent CRDT writer lane for `role`.
+    ///
+    /// External reconciliation reaches its own lane here rather than minting a
+    /// fresh peer per `ImportId`; `ImportId` keeps every other role it had, so
+    /// import batch/session/observation identity and idempotence are untouched.
+    pub(crate) fn writer_lane_peer(
+        &self,
+        role: WriterRole,
+    ) -> Result<CrdtPeerId, RuntimePromotionError> {
+        match &self.provenance {
+            AdmissionProvenance::Clean(admission) => admission.writer_lanes.peer(role),
+        }
+        .map_err(RuntimePromotionError::WriterLane)
+    }
+
+    /// This runtime's persisted causal writer incarnation.
+    ///
+    /// The two CRDT roles stay distinct Loro lanes, but they share ONE Tine
+    /// causal chain, so ordinary/local/external/seal batches of one incarnation
+    /// carry sequential counters on one peer.
+    pub(crate) fn writer_lane_causal_peer(&self) -> Result<CausalPeerId, RuntimePromotionError> {
+        match &self.provenance {
+            AdmissionProvenance::Clean(admission) => admission.writer_lanes.causal_peer(),
+        }
+        .map_err(RuntimePromotionError::WriterLane)
+    }
+
+    /// Durably reserve the exact batch about to become outwardly visible.
+    ///
+    /// This is called immediately before the trusted local journal append and
+    /// immediately before the external archive manifest commit — the two exact
+    /// durable-publication boundaries — and re-proves workspace authority
+    /// first, so a runtime that lost its lease cannot reserve.
+    pub(crate) fn reserve_writer_lane(
+        &self,
+        role: WriterRole,
+        peer: CrdtPeerId,
+        tip: WriterLaneTip,
+        causal_counter: u64,
+        proved_own_counter: u64,
+    ) -> Result<(), RuntimePromotionError> {
+        self.reprove_workspace_authority(WorkspaceAuthorityBoundary::Publication)?;
+        match &self.provenance {
+            AdmissionProvenance::Clean(admission) => {
+                admission
+                    .writer_lanes
+                    .reserve(role, peer, tip, causal_counter, proved_own_counter)
+            }
+        }
+        .map_err(RuntimePromotionError::WriterLane)
+    }
+
+    /// The exact batch and own causal counter this device currently has
+    /// reserved, bound to the manifest fingerprint it must carry.
+    pub(crate) fn pending_writer_lane_reservation(&self) -> Option<(WriterLaneTip, u64)> {
+        match &self.provenance {
+            AdmissionProvenance::Clean(admission) => admission.writer_lanes.pending_reservation(),
+        }
+    }
+
+    /// Record that a reserved batch is proved never to have become durable, so
+    /// its causal counter is available again.
+    pub(crate) fn note_writer_lane_reservation_absent(&self, batch_id: BatchId) {
+        match &self.provenance {
+            AdmissionProvenance::Clean(admission) => {
+                admission.writer_lanes.note_reservation_absent(batch_id);
+            }
+        }
     }
 
     /// Re-derive archive-rooted workspace authority immediately before one
@@ -305,6 +398,8 @@ pub(crate) enum RuntimePromotionError {
     /// The current operation could not perform the identity check. Retryable on
     /// this runtime because no replacement was proved and no latch was set.
     WorkspaceAuthorityCheckUnavailable(WorkspaceAuthorityRefusal),
+    /// This runtime cannot vend or continue its persistent CRDT writer lane.
+    WriterLane(WriterLaneError),
 }
 
 impl fmt::Display for RuntimePromotionError {
@@ -317,11 +412,18 @@ impl fmt::Display for RuntimePromotionError {
             Self::Sqlite(error) => error.fmt(formatter),
             Self::WorkspaceAuthorityRevoked(refusal) => refusal.fmt(formatter),
             Self::WorkspaceAuthorityCheckUnavailable(refusal) => refusal.fmt(formatter),
+            Self::WriterLane(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for RuntimePromotionError {}
+
+impl From<WriterLaneError> for RuntimePromotionError {
+    fn from(error: WriterLaneError) -> Self {
+        Self::WriterLane(error)
+    }
+}
 
 impl From<WorkspaceAuthorityRefusal> for RuntimePromotionError {
     fn from(refusal: WorkspaceAuthorityRefusal) -> Self {
@@ -568,6 +670,10 @@ pub(crate) struct CleanRuntimeAdmission<'a> {
     endpoint: ProjectionEndpointBinding,
     engine_authority: super::hot_engine::EngineAuthority,
     workspace: WorkspaceLeaseIdentity<'a>,
+    /// Shared, never exclusive: the coordinator holds the engine and database
+    /// mutably while this same window reaches the lane reservation boundary.
+    /// Exclusivity comes from `workspace` above, not from a second lock file.
+    writer_lanes: &'a WriterLanes,
     revocation: &'a RuntimeRevocationLatch,
     _seal: seal::Seal,
 }
@@ -625,6 +731,7 @@ pub(crate) struct CleanLocalRuntime {
     endpoint: ProjectionEndpointBinding,
     engine: Box<ShardedHotEngine>,
     projection: LeasedWorkspaceProjection,
+    writer_lanes: WriterLanes,
     revocation: RuntimeRevocationLatch,
 }
 
@@ -669,8 +776,38 @@ impl CleanLocalRuntime {
             endpoint,
             engine: Box::new(engine),
             projection,
+            writer_lanes: WriterLanes::Deferred,
             revocation: RuntimeRevocationLatch::default(),
         })
+    }
+
+    /// Install the persistent CRDT writer lanes this runtime authors on.
+    ///
+    /// The clean open path calls this only after it has restored accepted
+    /// history and drained its local journal, because that state is the lane's
+    /// own-prefix coverage proof. Until then every lane request fails, so no
+    /// authoring can precede qualification.
+    pub(crate) fn install_writer_lanes(
+        &mut self,
+        writer_lanes: WriterLanes,
+    ) -> Result<(), RuntimePromotionError> {
+        let [(_, local), (_, external)] = writer_lanes
+            .owned_peers()
+            .map_err(RuntimePromotionError::WriterLane)?;
+        if local == external || local.as_u64() == 0 || external.as_u64() == 0 {
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "clean runtime writer lanes are not two distinct nonzero peers".into(),
+                ),
+            ));
+        }
+        self.writer_lanes = writer_lanes;
+        Ok(())
+    }
+
+    /// This runtime's writer lanes.
+    pub(crate) const fn writer_lanes(&self) -> &WriterLanes {
+        &self.writer_lanes
     }
 
     pub(crate) fn engine(&self) -> &ShardedHotEngine {
@@ -752,11 +889,29 @@ impl CleanLocalRuntime {
                 ),
             ));
         }
+        // Engine/projection fixtures build a clean runtime directly, with no
+        // device-private application runtime root to hold a lane record. They
+        // still author on stable per-(endpoint, role) lanes so they exercise
+        // the same admission, but nothing is durable — which is exactly why a
+        // fixture can never stand in as evidence of restart continuation. A
+        // production build has no such fallback: an unqualified runtime simply
+        // cannot vend a lane.
+        #[cfg(test)]
+        if !self.writer_lanes.is_qualified() {
+            let binding = super::writer_lane::WriterLaneBinding {
+                workspace_id: self.engine.workspace_id(),
+                lineage: self.engine.lineage_digest(),
+                device_id: self.endpoint.device_id(),
+                endpoint_id: self.endpoint.endpoint_id(),
+            };
+            self.writer_lanes = WriterLanes::fixture(binding);
+        }
         let Self {
             session_id,
             endpoint,
             engine,
             projection,
+            writer_lanes,
             revocation,
         } = self;
         let (database, workspace) = projection.database_and_lease_identity();
@@ -766,6 +921,7 @@ impl CleanLocalRuntime {
             endpoint: *endpoint,
             engine_authority: engine.runtime_authority().clone(),
             workspace,
+            writer_lanes,
             revocation,
             _seal: seal::Seal,
         };

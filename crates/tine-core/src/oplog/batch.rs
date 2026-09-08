@@ -5,7 +5,7 @@ use tine_storage::DurableBatchContract;
 
 use super::{
     BatchId, DeviceId, DocumentId, FrontierV2, ImportId, SessionId, WorkspaceId,
-    MANAGED_ENTITY_SET_VERSION,
+    WriterIncarnationId, MANAGED_ENTITY_SET_VERSION,
 };
 
 pub use tine_storage::{ContentDigest, LineageDigest, ObjectKind, SemanticEffectDigest};
@@ -15,7 +15,11 @@ pub use tine_storage::formats::{
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
-pub const OPERATION_SCHEMA_VERSION: u32 = 7;
+/// Bumped to 8 for persisted causal writer incarnations: a manifest's
+/// `BatchCausalDot` now names a `WriterIncarnationId`, not the enrolled
+/// `DeviceId`. One current format only — there is no reader for version 7
+/// (D-1).
+pub const OPERATION_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +45,10 @@ impl DurableBatchContract for CoreDurableBatchContract {
     type DocumentId = DocumentId;
     type BatchId = BatchId;
     type DeviceId = DeviceId;
+    /// One sequential authoring incarnation, independent of the enrolled
+    /// device. Persisted point-index keys carry this full UUID; nothing
+    /// truncates or hashes it (see `WriterIncarnationId`).
+    type CausalPeerKey = WriterIncarnationId;
     type SessionId = SessionId;
     type Origin = BatchOrigin;
     type DependencyFrontier = FrontierV2;
@@ -259,7 +267,13 @@ mod tests {
             device,
             SessionId::from_uuid(Uuid::from_u128(5)),
             BatchOrigin::LocalMutation,
-            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
+                1,
+            )
+            .unwrap(),
             Vec::new(),
             FrontierV2::default(),
             SemanticEffectDigest::of(b"semantic"),

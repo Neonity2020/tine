@@ -948,12 +948,9 @@ fn lower_physical_accepted_batch(
     let post_frontier_root = lower_physical_frontier_root(&event.post_frontier_root)?;
     let affected_documents_bytes = canonical_affected_documents_bytes(&event.affected_documents)?;
     let causal_dependency_heads_bytes = encode_batch_ids(&event.causal_dependency_heads)?;
-    let causal_peer_id = event
-        .causal_dot
-        .peer_id()
-        .as_device_id()
-        .as_uuid()
-        .into_bytes();
+    // The persisted point-index key is the exact full writer-incarnation
+    // UUID; nothing hashes or truncates it.
+    let causal_peer_id = event.causal_dot.peer_id().key().as_uuid().into_bytes();
     Ok(storage_frontier::PhysicalAcceptedBatch {
         batch_id: event.batch_id.as_uuid().into_bytes(),
         manifest_digest: event.manifest_digest,
@@ -6336,7 +6333,7 @@ impl StoredBatch {
     }
 
     fn causal_dot(&self) -> Result<BatchCausalDot, ProjectionError> {
-        let peer = CausalPeerId::from_device_id(super::DeviceId::from_uuid(decode_uuid(
+        let peer = CausalPeerId::from_key(super::WriterIncarnationId::from_uuid(decode_uuid(
             &self.causal_peer_id,
         )?));
         let counter = u64::try_from(self.causal_counter)
@@ -7882,7 +7879,7 @@ fn validate_owned_lease_directory(
     Ok(())
 }
 
-fn lock_capability_lease_file(
+pub(super) fn lock_capability_lease_file(
     directory: &CapDir,
     name: &str,
     display_path: &Path,
@@ -7980,7 +7977,10 @@ pub(crate) struct LeaseFileIdentity(());
 
 /// The identity of the file this *held handle* refers to.
 #[cfg(unix)]
-fn held_file_identity(file: &File, path: &Path) -> Result<LeaseFileIdentity, ProjectionError> {
+pub(super) fn held_file_identity(
+    file: &File,
+    path: &Path,
+) -> Result<LeaseFileIdentity, ProjectionError> {
     let metadata = file.metadata().map_err(|error| {
         ProjectionError::UnsafePath(format!(
             "cannot read the held SQLite applier lease {}: {error}",
@@ -7994,7 +7994,10 @@ fn held_file_identity(file: &File, path: &Path) -> Result<LeaseFileIdentity, Pro
 }
 
 #[cfg(windows)]
-fn held_file_identity(file: &File, path: &Path) -> Result<LeaseFileIdentity, ProjectionError> {
+pub(super) fn held_file_identity(
+    file: &File,
+    path: &Path,
+) -> Result<LeaseFileIdentity, ProjectionError> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
@@ -8025,7 +8028,10 @@ fn held_file_identity(file: &File, path: &Path) -> Result<LeaseFileIdentity, Pro
 }
 
 #[cfg(not(any(unix, windows)))]
-fn held_file_identity(_file: &File, path: &Path) -> Result<LeaseFileIdentity, ProjectionError> {
+pub(super) fn held_file_identity(
+    _file: &File,
+    path: &Path,
+) -> Result<LeaseFileIdentity, ProjectionError> {
     Err(ProjectionError::UnsafePath(format!(
         "stable lease file identity is unsupported on this target: {}",
         path.display()
@@ -9644,6 +9650,11 @@ mod tests {
             author_device_id: DeviceId::from_uuid(uuid(value + 10_000)),
             author_session_id: SessionId::from_uuid(uuid(value + 20_000)),
             crdt_peer_id: CrdtPeerId::from_u64(value as u64),
+            causal_peer_id: CausalPeerId::from_key(
+                crate::oplog::WriterIncarnationId::fixture_for_device(DeviceId::from_uuid(uuid(
+                    value + 10_000,
+                ))),
+            ),
         }
     }
 
@@ -9653,6 +9664,11 @@ mod tests {
             author_device_id: DeviceId::from_uuid(uuid(seed + 60_000)),
             author_session_id: SessionId::from_uuid(uuid(seed + 70_000)),
             crdt_peer_id: CrdtPeerId::from_u64((seed + 80_000) as u64),
+            causal_peer_id: CausalPeerId::from_key(
+                crate::oplog::WriterIncarnationId::fixture_for_device(DeviceId::from_uuid(uuid(
+                    seed + 60_000,
+                ))),
+            ),
         }
     }
 
@@ -9661,6 +9677,11 @@ mod tests {
             batch_id: batch(seed + 50_000 + index as u128),
             author_device_id: DeviceId::from_uuid(uuid(seed + 60_000 + index as u128)),
             author_session_id: SessionId::from_uuid(uuid(seed + 70_000 + index as u128)),
+            causal_peer_id: CausalPeerId::from_key(
+                crate::oplog::WriterIncarnationId::fixture_for_device(DeviceId::from_uuid(uuid(
+                    seed + 60_000 + index as u128,
+                ))),
+            ),
             crdt_peer_id: CrdtPeerId::from_u64(
                 (seed + 80_000 + index as u128)
                     .try_into()
@@ -10206,7 +10227,13 @@ mod tests {
             device,
             SessionId::from_uuid(uuid(batch_id.as_uuid().as_u128() + 40_000)),
             BatchOrigin::BootstrapImport,
-            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
+                1,
+            )
+            .unwrap(),
             causal_dependencies,
             dependency_frontier,
             SemanticEffectDigest::of(&effect),

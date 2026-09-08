@@ -9526,6 +9526,753 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
     ));
 }
 
+// ---------------------------------------------------------------------------
+// Persistent CRDT writer lanes on the RUNNING clean-runtime path (P1).
+//
+// The store's own tests prove the record's algebra against a fabricated proof.
+// These prove the live thing: a real activation, real application saves, a real
+// clean cold open, a real checkpoint open — and the durable record read straight
+// off the device-private application runtime root, because that record, not any
+// in-memory value, is what a restart continues from.
+// ---------------------------------------------------------------------------
+
+/// The one retained lane record for a fixture's single device.
+fn lane_record(
+    fixture: &ActivationFixture,
+) -> (
+    String,
+    Vec<u8>,
+    crate::oplog::writer_lane::WriterLaneRecordView,
+) {
+    let mut records =
+        crate::oplog::writer_lane::retained_lane_records(&fixture.request.application_runtime_root);
+    assert_eq!(
+        records.len(),
+        1,
+        "one device authors one lane record: {records:?}"
+    );
+    let (name, bytes, view) = records.remove(0);
+    let view = view.expect("the retained lane record decodes");
+    (name, bytes, view)
+}
+
+/// The highest own causal dot this record has put in flight: the confirmed
+/// floor, or the live reservation above it. A record written at reservation
+/// time necessarily lags its own reservation by one, because the reservation
+/// IS the dot whose outcome is not yet known.
+fn lane_own_high_water(view: &crate::oplog::writer_lane::WriterLaneRecordView) -> u64 {
+    view.reserved
+        .map_or(view.confirmed_own_counter, |(_, counter)| {
+            counter.max(view.confirmed_own_counter)
+        })
+}
+
+fn lane_record_path(fixture: &ActivationFixture, name: &str) -> PathBuf {
+    let namespace = fixture
+        .request
+        .application_runtime_root
+        .join("crdt-writer-lanes");
+    let lane = std::fs::read_dir(&namespace)
+        .unwrap()
+        .flatten()
+        .next()
+        .expect("the lane namespace holds this workspace/lineage directory")
+        .path();
+    lane.join(name)
+}
+
+/// Manager correction D, on the live path: an ordinary restart AND a checkpoint
+/// restart both continue the same two saved lanes. A checkpoint open that
+/// observed an empty ephemeral causal map as counter zero would rotate the
+/// lane and restart the device's own dot chain; this asserts it does neither,
+/// while `checkpoint_opens == 1` proves the reopen really came from a
+/// checkpoint rather than a full replay.
+#[test]
+fn clean_and_checkpoint_reopens_continue_one_persistent_writer_lane() {
+    let fixture = ActivationFixture::nested_unicode("writer-lane-live-reopen", 0xa178_c000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("writer-lane fixture activates");
+    drive_initial_feed(&handle);
+
+    // Genesis activation mints the lanes before any authoring can happen.
+    let (_, _, minted) = lane_record(&fixture);
+    assert_eq!(minted.incarnation, 0);
+    assert_ne!(minted.local_peer, minted.external_peer);
+
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let (page, revision) = save_application_block_text(&handle, page, revision, "lane edit one");
+    let (_, _) = save_application_block_text(&handle, page, revision, "lane edit two");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let (_, _, authored) = lane_record(&fixture);
+    assert_eq!(authored.local_peer, minted.local_peer);
+    assert_eq!(authored.incarnation, 0);
+    assert_eq!(
+        authored.incarnation_id, minted.incarnation_id,
+        "authoring uses the saved causal writer incarnation; it never mints one per batch"
+    );
+    assert!(
+        lane_own_high_water(&authored) >= 1,
+        "acknowledged local commits advance the device's own causal chain: {authored:?}"
+    );
+
+    // Force the first restart through full replay: foreground saves may have
+    // already published a disposable clean checkpoint. Original archive bytes
+    // and the acknowledged journal are preserved; the fixture removes only the
+    // derived checkpoint directory while no runtime holds it (D-3).
+    let checkpoint_directory = clean_operation_archive_directory(&fixture.request.archive_root)
+        .join("clean-open-checkpoint-v1");
+    if checkpoint_directory.exists() {
+        fs::remove_dir_all(&checkpoint_directory).unwrap();
+    }
+    let mut first_counters = None;
+    let first =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                first_counters = Some(counters);
+            }
+        });
+    assert_eq!(first.status, SyncRuntimeOpenStatus::Active);
+    let first_handle = first.handle.expect("the first clean cold open succeeds");
+    let first_counters = first_counters.expect("the first clean open reports counters");
+    assert_eq!(
+        first_counters.full_replay_opens, 1,
+        "the first restart is a full accepted replay: {first_counters:?}"
+    );
+    let (restored, revision) = load_application_exact(&first_handle, "Root.md");
+    assert_eq!(restored.blocks[0].raw, "lane edit two");
+    let (_, _, reopened) = lane_record(&fixture);
+    assert_eq!(reopened.local_peer, minted.local_peer);
+    assert_eq!(reopened.external_peer, minted.external_peer);
+    assert_eq!(reopened.incarnation, 0);
+    assert_eq!(
+        reopened.incarnation_id, minted.incarnation_id,
+        "a healthy restart continues the SAME causal writer incarnation"
+    );
+    assert_eq!(
+        lane_own_high_water(&reopened),
+        lane_own_high_water(&authored),
+        "an ordinary restart neither loses nor invents own causal dots"
+    );
+
+    // More acknowledged work on the SAME lane, then a checkpointed restart.
+    let (_, _) = save_application_block_text(&first_handle, restored, revision, "lane edit three");
+    drain_managed_local(&first_handle);
+    let (_, _, before_checkpoint) = lane_record(&fixture);
+    assert!(lane_own_high_water(&before_checkpoint) > lane_own_high_water(&authored));
+    drop(first_handle);
+
+    let mut second_counters = None;
+    let second =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                second_counters = Some(counters);
+            }
+        });
+    assert_eq!(second.status, SyncRuntimeOpenStatus::Active);
+    let second_handle = second.handle.expect("the checkpointed clean open succeeds");
+    let second_counters = second_counters.expect("the checkpointed open reports counters");
+    assert_eq!(
+        second_counters.checkpoint_opens, 1,
+        "this reopen must be the checkpoint path, not a full replay: {second_counters:?}"
+    );
+    let (checkpointed, revision) = load_application_exact(&second_handle, "Root.md");
+    assert_eq!(checkpointed.blocks[0].raw, "lane edit three");
+
+    let (_, _, after_checkpoint) = lane_record(&fixture);
+    assert_eq!(
+        after_checkpoint.local_peer, minted.local_peer,
+        "a checkpoint reopen must not rotate the writer lane"
+    );
+    assert_eq!(after_checkpoint.incarnation, 0);
+    assert_eq!(
+        after_checkpoint.incarnation_id, minted.incarnation_id,
+        "a checkpoint reopen must not retire the causal writer incarnation"
+    );
+    assert_eq!(
+        lane_own_high_water(&after_checkpoint),
+        lane_own_high_water(&before_checkpoint),
+        "a checkpoint reopen must not restart this device's own causal chain at zero"
+    );
+
+    // Authoring still continues on that same lane after the checkpoint open.
+    let (_, _) =
+        save_application_block_text(&second_handle, checkpointed, revision, "lane edit four");
+    drain_managed_local(&second_handle);
+    let (_, _, continued) = lane_record(&fixture);
+    assert_eq!(continued.local_peer, minted.local_peer);
+    assert_eq!(continued.incarnation, 0);
+    assert_eq!(continued.incarnation_id, minted.incarnation_id);
+    assert!(lane_own_high_water(&continued) > lane_own_high_water(&after_checkpoint));
+    assert!(matches!(
+        second_handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Manager correction B/E plus the causal-identity correction, on the live
+/// path: a lost record and an undecodable record, each after an ACKNOWLEDGED
+/// edit. Neither may hand back the two Loro lanes the acknowledged edit already
+/// published under, neither may hand back the CAUSAL writer incarnation those
+/// dots were spent on, neither may lose that edit, and the original bytes of a
+/// damaged record are preserved.
+///
+/// The recovered record deliberately does NOT try to re-derive the old
+/// incarnation's counter: the whole point of retiring the incarnation is that
+/// the new one starts its own chain at zero, so no dot can ever alias an older
+/// one whose bytes this device can no longer see. The enrolled device identity
+/// is untouched throughout — only the incarnation changes.
+#[test]
+fn lost_or_damaged_lane_record_rebuilds_without_reissuing_a_published_lane() {
+    for (case, damage) in [("lost", None), ("torn", Some(&b"torn record"[..]))]
+        .into_iter()
+        .enumerate()
+        .map(|(index, case)| (index, case))
+    {
+        let (label, bytes) = damage;
+        let fixture = ActivationFixture::nested_unicode(
+            &format!("writer-lane-live-{label}"),
+            0xa178_d000 + case as u128 * 0x100,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("damage fixture activates");
+        drive_initial_feed(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let (_, _) = save_application_block_text(&handle, page, revision, "acknowledged edit");
+        drain_managed_local(&handle);
+        drop(handle);
+
+        let (name, original, published) = lane_record(&fixture);
+        assert!(lane_own_high_water(&published) >= 1);
+        let path = lane_record_path(&fixture, &name);
+
+        match bytes {
+            None => std::fs::remove_file(&path).unwrap(),
+            Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+        }
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(
+            reopened.status,
+            SyncRuntimeOpenStatus::Active,
+            "an acknowledged commit never becomes a permanent reopen failure (I-10)"
+        );
+        let handle = reopened.handle.expect("the damaged-record reopen succeeds");
+        let (restored, revision) = load_application_exact(&handle, "Root.md");
+        assert_eq!(
+            restored.blocks[0].raw, "acknowledged edit",
+            "{label}: the acknowledged edit survives lane-record damage"
+        );
+
+        let (_, rebuilt_bytes, rebuilt) = lane_record(&fixture);
+        assert_ne!(
+            rebuilt.local_peer, published.local_peer,
+            "{label}: a record that cannot qualify its published prefix must not reissue its lane"
+        );
+        assert_ne!(
+            rebuilt.external_peer, published.external_peer,
+            "{label}: both lanes are replaced"
+        );
+        assert_ne!(rebuilt_bytes, original);
+        assert_ne!(
+            rebuilt.incarnation_id, published.incarnation_id,
+            "{label}: a lost or torn record must never reissue the causal writer incarnation \
+             whose dots are already published"
+        );
+        assert_eq!(
+            rebuilt.confirmed_own_counter, 0,
+            "{label}: the replacement incarnation starts its OWN chain rather than adopting a \
+             counter it cannot prove: {rebuilt:?}"
+        );
+        if let Some(bytes) = bytes {
+            let superseded = lane_record_path(
+                &fixture,
+                &format!(
+                    "{name}.superseded-{}",
+                    crate::oplog::ContentDigest::of(bytes)
+                ),
+            );
+            assert_eq!(
+                std::fs::read(&superseded).unwrap(),
+                bytes,
+                "{label}: undecodable original bytes are preserved as a backup (D-1/D-3)"
+            );
+        }
+
+        // Newly authored work on the replacement lane still commits, above
+        // every own dot the old lane already spent.
+        let (_, _) = save_application_block_text(&handle, restored, revision, "post-repair edit");
+        drain_managed_local(&handle);
+        let (_, _, after) = lane_record(&fixture);
+        assert_eq!(after.local_peer, rebuilt.local_peer);
+        assert_eq!(
+            after.incarnation_id, rebuilt.incarnation_id,
+            "{label}: post-repair authoring stays on the ONE replacement incarnation"
+        );
+        assert!(
+            lane_own_high_water(&after) > 0,
+            "{label}: the replacement incarnation really authors on its own chain: {after:?}"
+        );
+        let (final_page, _) = load_application_exact(&handle, "Root.md");
+        assert_eq!(final_page.blocks[0].raw, "post-repair edit");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+}
+
+/// Restore a device directory from an earlier copy the way a file-level backup
+/// restore does: file CONTENT goes back, while a directory that still exists
+/// keeps its identity. The device-private projection receipt store is bound to
+/// the identity of the directory it was created in, so a "restore" that
+/// recreated those directories would be a different store rather than an older
+/// one, and the runtime would rightly refuse to open it.
+fn restore_tree_in_place(source: &Path, target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    let mut restored = HashSet::new();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        restored.insert(entry.file_name());
+        let child = target.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            if child.is_file() {
+                fs::remove_file(&child).unwrap();
+            }
+            restore_tree_in_place(&entry.path(), &child);
+        } else {
+            if child.is_dir() {
+                fs::remove_dir_all(&child).unwrap();
+            }
+            fs::copy(entry.path(), &child).unwrap();
+        }
+    }
+    for entry in fs::read_dir(target).unwrap() {
+        let entry = entry.unwrap();
+        if restored.contains(&entry.file_name()) {
+            continue;
+        }
+        if entry.file_type().unwrap().is_dir() {
+            fs::remove_dir_all(entry.path()).unwrap();
+        } else {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+}
+
+/// The exact bytes a fixture published for one batch, straight off its
+/// provider outbox.
+fn outbox_manifest_bytes(fixture: &ActivationFixture, batch_id: BatchId) -> Vec<u8> {
+    fs::read(
+        fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{batch_id}.manifest")),
+    )
+    .unwrap()
+}
+
+fn outbox_manifest(fixture: &ActivationFixture, batch_id: BatchId) -> OperationBatch {
+    OperationBatch::decode(&outbox_manifest_bytes(fixture, batch_id)).unwrap()
+}
+
+/// The archived manifest bytes this device holds for a batch, read from the
+/// clean operation archive rather than from any outbox relay.
+fn archived_manifest_bytes(fixture: &ActivationFixture, batch_id: BatchId) -> Vec<u8> {
+    ObjectStore::open(
+        &clean_operation_archive_directory(&fixture.request.archive_root),
+        fixture.request.identities.workspace_id,
+    )
+    .unwrap()
+    .read_manifest_bytes(batch_id)
+    .unwrap()
+}
+
+/// The causal-identity correction on a REAL two-device clean runtime, not an
+/// engine fixture.
+///
+/// One device publishes an epoch of work, the OTHER device acknowledges and
+/// retains it, and then the author is restored from a copy of its own device
+/// directory that is OLDER than that epoch, with its device-private writer
+/// record lost or torn. The older copy cannot see the work it already
+/// published, so nothing on this device can prove that own prefix. Recovery
+/// must therefore retire the causal writer incarnation instead of resuming its
+/// counters: the replacement starts its own chain at zero and immediately
+/// reuses counters the retired chain already spent, so ONLY the distinct
+/// incarnation keeps the two epochs apart. Nothing about the device, the
+/// endpoint or the enrolment moves.
+///
+/// The delivery-order sweep runs on the RECOVERED device, because that is where
+/// aliasing would occur: its own now-unknown older work returns from the peer
+/// either before or after it authors the replacement epoch, and both orders must
+/// admit both originals under their original ids. (The pure-receiver order sweep
+/// is proved at the engine level by
+/// `manager_lost_writer_record_and_stale_archive_preserve_both_original_branches`.)
+#[test]
+fn a_lost_writer_record_keeps_an_older_published_epoch_causally_apart() {
+    /// The single batch a fixture published since `before`.
+    fn published_since(fixture: &ActivationFixture, before: &BTreeSet<String>) -> BatchId {
+        let published: Vec<BatchId> = outbox_manifest_ids(fixture)
+            .difference(before)
+            .map(|name| outbox_manifest_batch_id(fixture, name))
+            .collect();
+        assert_eq!(
+            published.len(),
+            1,
+            "this turn must publish exactly one batch: {published:?}"
+        );
+        published[0]
+    }
+
+    fn run_case(
+        label: &str,
+        seed: u128,
+        torn: bool,
+        old_history_first: bool,
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        let damage = if torn { "torn" } else { "lost" };
+        let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+        let base_path = "notes/lost-writer-epoch-base.md";
+        let old_path = "Root.md";
+        let visible_paths = [base_path, old_path];
+
+        let (base_batch, base_page_id, base_block_id, base_document_id) = submit_shared_page(
+            &first_handle,
+            seed + 0x20,
+            "Lost Writer Epoch Base",
+            base_path,
+            "shared base text",
+        );
+        publish_shared_batch(&first_handle, &first, base_batch);
+        settle_shared_provider(&first_handle);
+        deliver_provider_to_receiver(&first, &second, &second_handle);
+
+        // The older copy is taken from a SAFELY shut-down device, before the
+        // epoch it will turn out to be older than — a restored backup.
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(first_handle);
+        let older_copy = PathBuf::from(format!("{}-older-copy", first.root.display()));
+        copy_tree_for_probe(&first.root, &older_copy);
+
+        // Epoch one: authored, acknowledged, published, and retained by the
+        // other device, which never loses it.
+        let first_handle = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let (_, _, published_record) = lane_record(&first);
+        let before_old = outbox_manifest_ids(&first);
+        let (old_page, old_revision) = load_application_exact(&first_handle, old_path);
+        let _ =
+            save_application_block_text(&first_handle, old_page, old_revision, "old epoch text");
+        drain_managed_local(&first_handle);
+        settle_shared_provider(&first_handle);
+        let old_batch = published_since(&first, &before_old);
+        let old_manifest_bytes = outbox_manifest_bytes(&first, old_batch);
+        let old_manifest = outbox_manifest(&first, old_batch);
+        assert_eq!(
+            old_manifest.causal_dot().peer_id().key(),
+            published_record.incarnation_id,
+            "{damage}: the published epoch names the SAVED causal writer incarnation"
+        );
+        deliver_offline_provider_history(&first, &second, &second_handle, old_batch);
+        assert!(
+            String::from_utf8(fs::read(second.graph_root.join(old_path)).unwrap())
+                .unwrap()
+                .contains("old epoch text"),
+            "{damage}: the other device must hold the acknowledged old work"
+        );
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(first_handle);
+
+        // Restore the older copy over the whole device: archive, journals,
+        // projection, graph text and outbox all go back before epoch one.
+        restore_tree_in_place(&older_copy, &first.root);
+        assert!(
+            !first
+                .request
+                .provider_root
+                .join(format!("outbox/manifests/{old_batch}.manifest"))
+                .exists()
+                && !String::from_utf8(fs::read(first.graph_root.join(old_path)).unwrap())
+                    .unwrap()
+                    .contains("old epoch text"),
+            "{damage}: the older copy must not contain the epoch it predates"
+        );
+
+        let (name, original_bytes, restored_record) = lane_record(&first);
+        assert_eq!(
+            restored_record.incarnation_id, published_record.incarnation_id,
+            "{damage}: the older copy still carries the incarnation that published epoch one"
+        );
+        let record_path = lane_record_path(&first, &name);
+        if torn {
+            fs::write(&record_path, b"torn writer record").unwrap();
+        } else {
+            fs::remove_file(&record_path).unwrap();
+        }
+
+        let first_handle = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let (_, rebuilt_bytes, rebuilt) = lane_record(&first);
+        assert_ne!(
+            rebuilt.incarnation_id, published_record.incarnation_id,
+            "{damage}: an unprovable own prefix must retire the causal writer incarnation"
+        );
+        assert_ne!(rebuilt.local_peer, published_record.local_peer);
+        assert_ne!(rebuilt.external_peer, published_record.external_peer);
+        assert_ne!(rebuilt_bytes, original_bytes);
+        assert_eq!(
+            rebuilt.confirmed_own_counter, 0,
+            "{damage}: the replacement incarnation starts its OWN chain: {rebuilt:?}"
+        );
+        if torn {
+            let superseded = lane_record_path(
+                &first,
+                &format!(
+                    "{name}.superseded-{}",
+                    crate::oplog::ContentDigest::of(b"torn writer record")
+                ),
+            );
+            assert_eq!(
+                fs::read(&superseded).unwrap(),
+                b"torn writer record",
+                "{damage}: undecodable original bytes are preserved as a backup (D-1/D-3)"
+            );
+        }
+
+        if old_history_first {
+            deliver_offline_provider_history(&second, &first, &first_handle, old_batch);
+            assert!(
+                String::from_utf8(fs::read(first.graph_root.join(old_path)).unwrap())
+                    .unwrap()
+                    .contains("old epoch text"),
+                "{damage}: unknown own older work is admissible under its original identity"
+            );
+        }
+
+        // Epoch two: an ordinary LOCAL batch carrying two operations, then
+        // EXTERNAL editor work. Both belong to the one replacement incarnation.
+        let new_local_batch = submit_durable(
+            &first_handle,
+            vec![
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: BlockId::from_uuid(Uuid::from_u128(seed + 0x60)),
+                        home_document_id: base_document_id,
+                    },
+                    page_id: base_page_id,
+                    parent: None,
+                    order: "c".into(),
+                    content: "new epoch local text".into(),
+                },
+                SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: base_block_id,
+                        home_document_id: base_document_id,
+                    },
+                    content: "base text rewritten by the replacement epoch".into(),
+                },
+            ],
+        );
+        publish_shared_batch(&first_handle, &first, new_local_batch);
+        settle_shared_provider(&first_handle);
+
+        let before_external = outbox_manifest_ids(&first);
+        let mut external_body = fs::read(first.graph_root.join(base_path)).unwrap();
+        external_body.extend_from_slice(b"- new epoch external text\n");
+        let _ = admit_shared_page(&first_handle, &first, base_path, &external_body);
+        let new_external_batch = published_since(&first, &before_external);
+
+        if !old_history_first {
+            deliver_offline_provider_history(&second, &first, &first_handle, old_batch);
+            assert!(
+                String::from_utf8(fs::read(first.graph_root.join(old_path)).unwrap())
+                    .unwrap()
+                    .contains("old epoch text"),
+                "{damage}: unknown own older work is admissible under its original identity"
+            );
+        }
+        deliver_offline_provider_history(&first, &second, &second_handle, new_local_batch);
+        deliver_offline_provider_history(&first, &second, &second_handle, new_external_batch);
+
+        // ONE enrolled author device; TWO causal writer incarnations; ONE
+        // sequential chain shared by the local and the external batch.
+        let new_local_manifest = outbox_manifest(&first, new_local_batch);
+        let new_external_manifest = outbox_manifest(&first, new_external_batch);
+        for manifest in [&new_local_manifest, &new_external_manifest] {
+            assert_eq!(
+                manifest.author_device_id(),
+                old_manifest.author_device_id(),
+                "{damage}: only the writer incarnation may change, never the enrolled author"
+            );
+            assert_eq!(
+                manifest.causal_dot().peer_id().key(),
+                rebuilt.incarnation_id,
+                "{damage}: every origin of one incarnation authors on its saved identity"
+            );
+            assert_ne!(
+                manifest.causal_dot().peer_id(),
+                old_manifest.causal_dot().peer_id(),
+                "{damage}: the retired epoch keeps its own causal identity"
+            );
+        }
+
+        // The sharpest statement of the correction: the replacement chain
+        // deliberately REUSES counters the retired chain already spent. Only
+        // the distinct writer incarnation keeps those batches apart; a causal
+        // peer derived from the enrolled device would alias them outright.
+        let base_manifest = outbox_manifest(&first, base_batch);
+        assert_eq!(
+            base_manifest.causal_dot().peer_id(),
+            old_manifest.causal_dot().peer_id(),
+            "{damage}: the base and the lost epoch were authored by ONE incarnation"
+        );
+        assert_eq!(
+            base_manifest.causal_dot().counter(),
+            new_local_manifest.causal_dot().counter(),
+            "{damage}: the replacement chain restarts over counters the retired chain spent"
+        );
+        assert_eq!(
+            new_external_manifest.causal_dot().counter(),
+            new_local_manifest.causal_dot().counter() + 1,
+            "{damage}: the ordinary and external batches are consecutive on ONE chain"
+        );
+
+        // Both epochs descend from the SHARED base rather than one from the
+        // other: concurrent siblings of one device, not a forked chain.
+        assert!(new_local_manifest
+            .causal_dependency_heads()
+            .contains(&base_batch));
+        assert!(!old_manifest
+            .causal_dependency_heads()
+            .contains(&new_local_batch));
+
+        let converged = assert_converged_and_reopen_stable(
+            &first,
+            &second,
+            first_handle,
+            second_handle,
+            &visible_paths,
+        );
+        let base_text = String::from_utf8(
+            converged[base_path]
+                .clone()
+                .expect("the base page survives on both devices"),
+        )
+        .unwrap();
+        for fragment in [
+            "base text rewritten by the replacement epoch",
+            "new epoch local text",
+            "new epoch external text",
+        ] {
+            assert!(
+                base_text.contains(fragment),
+                "{damage}: a whole batch lands or none of it does; {fragment:?} missing from \
+                 {base_text:?}"
+            );
+        }
+        assert!(String::from_utf8(
+            converged[old_path]
+                .clone()
+                .expect("the retained old epoch survives on both devices")
+        )
+        .unwrap()
+        .contains("old epoch text"));
+
+        // Original identities AND original bytes: both devices hold the exact
+        // manifest the retired incarnation published, under its original id.
+        for fixture in [&first, &second] {
+            assert_eq!(
+                archived_manifest_bytes(fixture, old_batch),
+                old_manifest_bytes,
+                "{damage}: the original bytes of the retired epoch are preserved verbatim"
+            );
+        }
+
+        // Continuation after the required checkpoint/replay reopen: the
+        // replacement incarnation is still the one that authors, it keeps
+        // advancing its own chain, and the work it authors on the RETURNED
+        // page proves the retired epoch is genuinely in this device's ancestry
+        // under its original batch id.
+        let (_, _, after_reopen) = lane_record(&first);
+        assert_eq!(
+            after_reopen.incarnation_id, rebuilt.incarnation_id,
+            "{damage}: admitting the returned epoch must not rotate the replacement incarnation"
+        );
+        let continued_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let before_continuation = outbox_manifest_ids(&first);
+        let (continued_page, continued_revision) =
+            load_application_exact(&continued_handle, old_path);
+        let _ = save_application_block_text(
+            &continued_handle,
+            continued_page,
+            continued_revision,
+            "continuation text",
+        );
+        drain_managed_local(&continued_handle);
+        settle_shared_provider(&continued_handle);
+        let continuation_batch = published_since(&first, &before_continuation);
+        let continuation_manifest = outbox_manifest(&first, continuation_batch);
+        assert_eq!(
+            continuation_manifest.author_device_id(),
+            old_manifest.author_device_id()
+        );
+        assert!(
+            continuation_manifest
+                .causal_dependency_heads()
+                .contains(&old_batch),
+            "{damage}: the returned epoch is genuinely in ancestry under its original id: {:?}",
+            continuation_manifest.causal_dependency_heads()
+        );
+        assert_eq!(
+            continuation_manifest.causal_dot().peer_id().key(),
+            rebuilt.incarnation_id,
+            "{damage}: a reopen continues the SAME replacement incarnation"
+        );
+        assert!(
+            continuation_manifest.causal_dot().counter()
+                > new_external_manifest.causal_dot().counter(),
+            "{damage}: the replacement chain advances sequentially across reopens"
+        );
+        let (_, _, continued_record) = lane_record(&first);
+        assert_eq!(continued_record.incarnation_id, rebuilt.incarnation_id);
+        assert!(lane_own_high_water(&continued_record) > lane_own_high_water(&after_reopen));
+        assert!(matches!(
+            continued_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        converged
+    }
+
+    for (index, torn) in [false, true].into_iter().enumerate() {
+        let damage = if torn { "torn" } else { "lost" };
+        let seed = 0xa178_e000 + index as u128 * 0x1000;
+        let old_first = run_case(
+            &format!("writer-epoch-{damage}-old-first"),
+            seed,
+            torn,
+            true,
+        );
+        let new_first = run_case(
+            &format!("writer-epoch-{damage}-new-first"),
+            seed + 0x800,
+            torn,
+            false,
+        );
+        assert_eq!(
+            old_first, new_first,
+            "{damage}: both delivery orders must converge to the same visible graph text"
+        );
+    }
+}
+
 #[test]
 fn second_clean_cold_open_restores_checkpoint_instead_of_full_replay() {
     let fixture = ActivationFixture::nested_unicode("clean-checkpoint-second-open", 0xa178_5000);
@@ -34542,7 +35289,11 @@ fn cold_archive_republication_uses_accepted_names_and_preserves_original_bytes()
         fixture.request.identities.session_id,
         crate::oplog::BatchOrigin::LocalMutation,
         crate::oplog::BatchCausalDot::new(
-            crate::oplog::CausalPeerId::from_device_id(fixture.request.identities.device_id),
+            crate::oplog::CausalPeerId::from_key(
+                crate::oplog::WriterIncarnationId::fixture_for_device(
+                    fixture.request.identities.device_id,
+                ),
+            ),
             1,
         )
         .unwrap(),

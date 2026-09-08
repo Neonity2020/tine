@@ -1647,7 +1647,9 @@ mod tests {
             SessionId::from_uuid(uuid(31)),
             BatchOrigin::LocalMutation,
             BatchCausalDot::new(
-                CausalPeerId::from_device_id(device),
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
                 u64::try_from(seed).unwrap() + 1,
             )
             .unwrap(),

@@ -114,7 +114,6 @@ const SHARD_PAGE_PREAMBLE: &str = "page_preamble";
 const SHARD_PAGE_PREAMBLE_VALUE: &str = "value";
 const TOMBSTONE: &str = "tombstone";
 pub(crate) const MAX_TRANSACTION_OPERATIONS: usize = 100_000;
-const LOCAL_AUTHOR_PEER_PROBE_BUDGET: u64 = 8;
 const MAX_PREAUTHORING_CAPTURE_PATHS: usize = MAX_TRANSACTION_OPERATIONS * 2;
 const MAX_PREAUTHORING_CAPTURE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREAUTHORING_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
@@ -890,6 +889,55 @@ impl RunLocalAuthenticatedMap {
         self.root
             .as_ref()
             .map_or_else(authenticated_map_empty_digest, |root| root.digest)
+    }
+}
+
+/// One causal writer incarnation's tip in this engine, in ONE map.
+///
+/// Two counters, deliberately, because the two questions are different:
+///
+/// * `counter` is everything this engine covers for the peer — accepted history
+///   AND the durable local-journal prefix that has not expanded yet. Drafting
+///   and own-prefix qualification continue from here, so a rapid burst keeps
+///   producing gap-free dots.
+/// * `accepted_counter` is the part that is TERMINAL in accepted history
+///   (accepted or quarantined). Only that part proves a counter is occupied by
+///   a published original, which is what the same-dot fork refusal needs: the
+///   journal prefix is this device's own work on its way to acceptance and must
+///   not be mistaken for a competing claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CausalChainTip {
+    counter: u64,
+    batch_id: BatchId,
+    accepted_counter: u64,
+    accepted_batch: Option<BatchId>,
+}
+
+impl CausalChainTip {
+    /// Record one dot this engine now covers, from either source.
+    fn observe(&mut self, counter: u64, batch_id: BatchId, accepted: bool) {
+        if counter >= self.counter {
+            self.counter = counter;
+            self.batch_id = batch_id;
+        }
+        if accepted && counter >= self.accepted_counter {
+            self.accepted_counter = counter;
+            self.accepted_batch = Some(batch_id);
+        }
+    }
+
+    fn first(counter: u64, batch_id: BatchId, accepted: bool) -> Self {
+        let mut tip = Self {
+            counter,
+            batch_id,
+            accepted_counter: 0,
+            accepted_batch: None,
+        };
+        if accepted {
+            tip.accepted_counter = counter;
+            tip.accepted_batch = Some(batch_id);
+        }
+        tip
     }
 }
 
@@ -2246,6 +2294,27 @@ pub struct AuthorBatch {
     pub author_device_id: DeviceId,
     pub author_session_id: SessionId,
     pub crdt_peer_id: CrdtPeerId,
+    /// This device's persisted causal writer incarnation. Deliberately NOT
+    /// derived from `author_device_id`: the enrolled device is unchanged across
+    /// a private-state loss, the causal chain is not.
+    pub causal_peer_id: CausalPeerId,
+}
+
+/// Accepted-state ownership of one persistent CRDT writer lane.
+///
+/// A device's private lane record says which peer that device writes as; it can
+/// never be a receiver's proof, because a receiver has no authenticated read of
+/// another device's private directory and must not acquire one (D-2). This is
+/// the receiver half: the binding is derived from a lane's FIRST admitted use,
+/// installed atomically with the whole batch that used it, and thereafter
+/// enforced on every use. It is bounded by writer incarnations, exactly like
+/// `P` in the generation-root accounting, and it is restored through checkpoint
+/// state or rebuilt by full accepted replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CrdtLaneOwner {
+    pub(crate) device_id: DeviceId,
+    pub(crate) role: super::writer_lane::WriterRole,
 }
 
 #[cfg(test)]
@@ -5978,11 +6047,24 @@ struct CommittedLocalOverlay {
     work: Cell<ManagedLocalWork>,
 }
 
+/// Everything one candidate batch's acceptance installs about writer identity.
+///
+/// Prepared before any live document, ownership or effect changes; committed in
+/// the same step that publishes the batch, so identity and acceptance are one
+/// atomic transition and a refused batch leaves no trace.
+struct AdmittedWriterBindings {
+    lanes: Vec<(CrdtPeerId, CrdtLaneOwner)>,
+    /// `(incarnation, enrolled author device)` of this batch's causal dot.
+    causal_peer: Option<(CausalPeerId, DeviceId)>,
+}
+
 struct ValidatedManagedLocalCandidate {
     pages: BTreeMap<PageId, MaterializedPage>,
     documents: BTreeMap<DocumentId, LoroDoc>,
     document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     block_claims: Vec<(u128, ImmutableHomeClaim)>,
+    /// Installed in the same step that publishes the committed overlay entry.
+    lane_bindings: AdmittedWriterBindings,
     update_bytes: usize,
 }
 
@@ -6287,7 +6369,10 @@ pub(crate) struct DeferredAbsenceObservation {
     pub(crate) path: ManagedPath,
 }
 
-const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 1;
+// v3 carries both CRDT lane and causal incarnation ownership. Exactly one schema has an
+// implementation (D-1): a checkpoint written by any other version is refused
+// and the engine falls back to accepted replay, which rebuilds the same map.
+const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 3;
 
 /// One accepted-roster row captured coherently by the engine actor. The
 /// checkpoint module feeds these rows through tine-storage's canonical sealed
@@ -6398,6 +6483,15 @@ struct CleanCheckpointStateV1 {
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     ephemeral_block_claims: BTreeMap<u128, BTreeSet<ImmutableHomeClaim>>,
+    /// Accepted writer-lane ownership. Restoring it is what lets a
+    /// checkpoint-opened runtime still refuse a foreign lane without replaying
+    /// accepted history; a full replay rebuilds exactly the same map.
+    crdt_lane_owners: BTreeMap<CrdtPeerId, CrdtLaneOwner>,
+    /// Accepted ownership of every causal writer incarnation. Same shape and
+    /// the same reason as `crdt_lane_owners`: a checkpoint-opened runtime must
+    /// still refuse a foreign device authoring under an incarnation this graph
+    /// already bound, and a full replay rebuilds exactly the same map.
+    causal_peer_owners: BTreeMap<CausalPeerId, DeviceId>,
     logseq_claim_root: LogseqClaimIndexRoot,
     ephemeral_logseq_claims: BTreeMap<LogseqUuid, LogseqClaimRecord>,
     portable_path_root: PortablePathIndexRoot,
@@ -6478,7 +6572,7 @@ pub struct ShardedHotEngine {
     /// `clean_projection_heads`, this does not need an attached endpoint and
     /// can therefore be built incrementally during cold replay.
     clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
-    ephemeral_causal_chain: RefCell<BTreeMap<CausalPeerId, (u64, BatchId)>>,
+    ephemeral_causal_chain: RefCell<BTreeMap<CausalPeerId, CausalChainTip>>,
     /// Process-local freshness generation for speculative local author work.
     ///
     /// This is intentionally not derived from archive-backed roots: author
@@ -6577,6 +6671,16 @@ pub struct ShardedHotEngine {
     conflict_history_index: RefCell<ConflictHistoryIndex>,
     conflict_resolution_history_loads: Cell<usize>,
     conflict_resolution_evaluation_active: Cell<bool>,
+    /// Accepted ownership of every CRDT writer lane this engine has admitted.
+    /// Bounded by writer incarnations, never by batches: one entry per
+    /// (device, role) lane that has actually authored something.
+    crdt_lane_owners: BTreeMap<CrdtPeerId, CrdtLaneOwner>,
+    /// Accepted ownership of every causal writer incarnation this engine has
+    /// admitted, bound at the incarnation's FIRST admitted use to the enrolled
+    /// author device on that batch's manifest. Bounded by writer incarnations
+    /// exactly like `crdt_lane_owners`, restored from checkpoint state and
+    /// rebuilt identically by full accepted replay — no second tree.
+    causal_peer_owners: BTreeMap<CausalPeerId, DeviceId>,
     accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
     /// Number of accepted documents whose direct frontier names each batch.
     /// This makes provider-head publication proportional to the number of
@@ -6711,6 +6815,8 @@ impl ShardedHotEngine {
             clean_projection_heads: BTreeMap::new(),
             clean_projection_head_batches: BTreeMap::new(),
             ephemeral_causal_chain: RefCell::new(BTreeMap::new()),
+            crdt_lane_owners: BTreeMap::new(),
+            causal_peer_owners: BTreeMap::new(),
             author_mutation_generation: Cell::new(0),
             history_failure: None,
             archive_fingerprints: BTreeMap::new(),
@@ -7772,6 +7878,8 @@ impl ShardedHotEngine {
                 .iter()
                 .map(|(key, claims)| (*key, claims.clone()))
                 .collect(),
+            crdt_lane_owners: self.crdt_lane_owners.clone(),
+            causal_peer_owners: self.causal_peer_owners.clone(),
             logseq_claim_root: self.logseq_claim_root,
             ephemeral_logseq_claims: self.ephemeral_logseq_claims.clone(),
             portable_path_root: self.portable_path_root,
@@ -7799,6 +7907,8 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         let capture_work = [
             state.ephemeral_block_claims.len(),
+            state.crdt_lane_owners.len(),
+            state.causal_peer_owners.len(),
             state.ephemeral_logseq_claims.len(),
             state.ephemeral_portable_paths.len(),
             state.portable_path_conflicts.len(),
@@ -7927,15 +8037,12 @@ impl ShardedHotEngine {
             accepted_batch_entries.insert(batch_id, causal_record_digest);
             causal_clocks.insert(batch_id, row.canonical_causal_clock);
             causal_dots.insert(batch_id, row.causal_dot);
-            match causal_chain.get(&row.causal_dot.peer_id()) {
-                Some((counter, _)) if *counter >= row.causal_dot.counter() => {}
-                _ => {
-                    causal_chain.insert(
-                        row.causal_dot.peer_id(),
-                        (row.causal_dot.counter(), batch_id),
-                    );
-                }
-            }
+            causal_chain
+                .entry(row.causal_dot.peer_id())
+                .and_modify(|tip: &mut CausalChainTip| {
+                    tip.observe(row.causal_dot.counter(), batch_id, true);
+                })
+                .or_insert_with(|| CausalChainTip::first(row.causal_dot.counter(), batch_id, true));
             archive_fingerprints.insert(batch_id, row.evidence.manifest_fingerprint());
             accepted_sequence.insert(sequence, batch_id);
             previous_root = row.evidence.post_frontier_root().clone();
@@ -8002,6 +8109,8 @@ impl ShardedHotEngine {
         self.statuses = statuses;
         self.staged_batches.clear();
         self.ephemeral_block_claims = state.ephemeral_block_claims.into_iter().collect();
+        self.crdt_lane_owners = state.crdt_lane_owners;
+        self.causal_peer_owners = state.causal_peer_owners;
         self.logseq_claim_root = state.logseq_claim_root;
         self.ephemeral_logseq_claims = state.ephemeral_logseq_claims;
         self.portable_path_root = state.portable_path_root;
@@ -10890,6 +10999,239 @@ impl ShardedHotEngine {
         self.current_path_cursor_book.borrow_mut().active.clear();
     }
 
+    /// Pre-check that this device may author on `peer` before a draft is built.
+    ///
+    /// Under lanes, presence of the peer in an affected document is REQUIRED
+    /// rather than forbidden, so the only remaining question is ownership.
+    fn require_authored_lane_ownership(
+        &self,
+        device_id: DeviceId,
+        origin: BatchOrigin,
+        peer_id: CrdtPeerId,
+    ) -> Result<(), EngineError> {
+        let Some(role) = super::writer_lane::WriterRole::for_origin(origin) else {
+            return Ok(());
+        };
+        self.check_lane_owner(peer_id, CrdtLaneOwner { device_id, role })
+    }
+
+    fn check_lane_owner(
+        &self,
+        peer_id: CrdtPeerId,
+        claimed: CrdtLaneOwner,
+    ) -> Result<(), EngineError> {
+        match self.crdt_lane_owners.get(&peer_id) {
+            None => Ok(()),
+            Some(owner) if *owner == claimed => Ok(()),
+            Some(owner) => Err(EngineError::CrdtLaneNotOwned {
+                peer_id,
+                claimed,
+                owned: *owner,
+            }),
+        }
+    }
+
+    /// Prove that every CRDT writer lane a candidate batch advances belongs to
+    /// that batch's accepted author, and collect the bindings its acceptance
+    /// installs.
+    ///
+    /// This runs before any document replacement is prepared, so a refused
+    /// batch cannot already have mutated a live CRDT document; the bindings it
+    /// returns are committed in the same step that publishes the batch, so
+    /// ownership and acceptance are one atomic transition.
+    fn prepare_crdt_lane_ownership(
+        &self,
+        manifest: &OperationBatch,
+        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+    ) -> Result<AdmittedWriterBindings, EngineError> {
+        // The causal identity question is asked for EVERY origin, including
+        // bootstrap: a delivered batch may not merge its dots into another
+        // device's causal ancestry, and it may not fork a chain this graph has
+        // already accepted. Both are answered here, before a single document is
+        // cloned or any ownership is installed.
+        let causal_peer = self.prepare_causal_peer_admission(manifest)?;
+        // Bootstrap import is the graph's genesis baseline, admitted only
+        // through the distinct bootstrap trust path and at most once. It
+        // predates every writer lane, so it neither claims nor binds one;
+        // lane ownership begins with the first admitted local or
+        // external-import batch.
+        let Some(role) = super::writer_lane::WriterRole::for_origin(manifest.origin()) else {
+            return Ok(AdmittedWriterBindings {
+                lanes: Vec::new(),
+                causal_peer,
+            });
+        };
+        let mut bindings = BTreeMap::new();
+        for (document_id, update) in updates {
+            for peer_id in crdt_update_advanced_lanes(*document_id, &update.raw_update)? {
+                if super::writer_lane::RESERVED_PEERS.contains(&peer_id.as_u64()) {
+                    return Err(EngineError::CrdtLaneUnauthorizedOrigin {
+                        peer_id,
+                        detail: "zero and immutable baseline peers are never writer lanes".into(),
+                    });
+                }
+                let claimed = CrdtLaneOwner {
+                    device_id: manifest.author_device_id(),
+                    role,
+                };
+                self.check_lane_owner(peer_id, claimed)?;
+                bindings.insert(peer_id, claimed);
+            }
+        }
+        Ok(AdmittedWriterBindings {
+            lanes: bindings.into_iter().collect(),
+            causal_peer,
+        })
+    }
+
+    /// Prove that this batch may author under the causal writer incarnation it
+    /// claims, and collect the binding its acceptance installs.
+    ///
+    /// Two distinct in-scope refusals (I-8, D-2(b) — this is delivered content,
+    /// not our own established private state):
+    ///
+    /// 1. **Foreign incarnation.** The incarnation is already bound to another
+    ///    enrolled author device. Accepting would splice one device's dots into
+    ///    another's causal ancestry.
+    /// 2. **Same-dot fork.** A NEW batch claims `(peer, counter)` at or below
+    ///    that peer's gap-free accepted tip. Per-peer chains are downward
+    ///    closed, so every counter up to the tip is already occupied by an
+    ///    accepted original. A sparse clock alone cannot see this —
+    ///    `AcceptedBatchCausalContainment::contains` compares counters — which
+    ///    is exactly why the exact tip is consulted here.
+    ///
+    /// A duplicate delivery of an ORIGINAL is not a fork and never reaches
+    /// this: `stage_ready_internal` answers a known `BatchId` with its retained
+    /// fingerprint before staging. The remaining originals this engine already
+    /// knows at that exact dot — its own journal prefix, and the accepted
+    /// roster it retains for the sealed checkpoint — are recognized here too,
+    /// so re-validating one's own durable work stays admissible.
+    fn prepare_causal_peer_admission(
+        &self,
+        manifest: &OperationBatch,
+    ) -> Result<Option<(CausalPeerId, DeviceId)>, EngineError> {
+        let dot = manifest.causal_dot();
+        let peer_id = dot.peer_id();
+        let author = manifest.author_device_id();
+        match self.causal_peer_owners.get(&peer_id) {
+            Some(owner) if *owner != author => {
+                return Err(EngineError::CausalPeerNotOwned {
+                    peer_id,
+                    claimed: author,
+                    owned: *owner,
+                })
+            }
+            _ => {}
+        }
+        if let Some(tip) = self.ephemeral_causal_chain.borrow().get(&peer_id).copied() {
+            let batch_id = manifest.batch_id();
+            // The counters this peer has TERMINAL accepted originals for are
+            // gap-free, so any of them is already answered by exact batch
+            // identity before staging. A batch that reaches here claiming one
+            // is therefore not that original.
+            let known_original = tip.accepted_batch == Some(batch_id)
+                || self.clean_checkpoint_causal_dots.get(&batch_id) == Some(&dot);
+            if dot.counter() <= tip.accepted_counter && !known_original {
+                return Err(EngineError::CausalDotFork {
+                    peer_id,
+                    counter: dot.counter(),
+                    claimed: batch_id,
+                    accepted_tip: tip.accepted_counter,
+                });
+            }
+        }
+        Ok(Some((peer_id, author)))
+    }
+
+    fn commit_crdt_lane_ownership(&mut self, bindings: AdmittedWriterBindings) {
+        self.crdt_lane_owners.extend(bindings.lanes);
+        if let Some((peer_id, device_id)) = bindings.causal_peer {
+            self.causal_peer_owners.insert(peer_id, device_id);
+        }
+    }
+
+    /// Accepted ownership of one causal writer incarnation, for receipts and
+    /// tests.
+    pub(crate) fn causal_peer_owner(&self, peer_id: CausalPeerId) -> Option<DeviceId> {
+        self.causal_peer_owners.get(&peer_id).copied()
+    }
+
+    /// How many causal writer incarnations this engine has admitted. This is
+    /// the `P` term the bounded-growth accounting counts on the Tine side: it
+    /// grows with real writer incarnations, never with batches or sessions.
+    pub(crate) fn causal_peer_count(&self) -> usize {
+        self.causal_peer_owners.len()
+    }
+
+    /// One accepted document's version vector, as (peer, exclusive end).
+    #[cfg(test)]
+    pub(crate) fn accepted_document_version_vector_for_test(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<BTreeMap<u64, i32>, EngineError> {
+        let document = self.clone_current_hot_document(document_id, 1)?;
+        Ok(document
+            .oplog_vv()
+            .iter()
+            .map(|(peer, end)| (*peer, *end))
+            .collect())
+    }
+
+    /// Peers present in one accepted document's version vector.
+    ///
+    /// This is the exact quantity the rebaselining bound cares about: a fresh
+    /// peer per batch makes it grow with edit count even inside a shallow
+    /// snapshot, and a persistent lane keeps it at one entry per writer.
+    #[cfg(test)]
+    pub(crate) fn accepted_document_peer_ids_for_test(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Vec<CrdtPeerId>, EngineError> {
+        let document = self.clone_current_hot_document(document_id, 1)?;
+        Ok(document
+            .oplog_vv()
+            .iter()
+            .map(|(peer, _)| CrdtPeerId::from_u64(*peer))
+            .collect())
+    }
+
+    /// Accepted ownership of one lane, for receipts and tests.
+    pub(crate) fn crdt_lane_owner(&self, peer_id: CrdtPeerId) -> Option<CrdtLaneOwner> {
+        self.crdt_lane_owners.get(&peer_id).copied()
+    }
+
+    /// How many writer lanes this engine has admitted. This is the `P` term the
+    /// bounded-growth accounting counts, and it must not grow with batches.
+    pub(crate) fn crdt_lane_count(&self) -> usize {
+        self.crdt_lane_owners.len()
+    }
+
+    /// The highest gap-free `BatchCausalDot` counter `peer` has authored that
+    /// current engine state covers, including the durable local journal prefix
+    /// that has not yet expanded into accepted history.
+    ///
+    /// This is the writer lane's own-prefix coverage proof: every CRDT
+    /// operation this incarnation durably published rides inside a batch
+    /// carrying this dot, and admission already refuses a non-gap-free dot, so
+    /// one integer answers "is my own durable prefix covered" without any
+    /// history walk. It is keyed by the saved causal writer incarnation, never
+    /// by the enrolled device, so a rebuilt device asks about the chain it
+    /// actually owns.
+    pub(crate) fn own_causal_dot_high_water(&self, peer: CausalPeerId) -> u64 {
+        let accepted = self
+            .ephemeral_causal_chain
+            .borrow()
+            .get(&peer)
+            .map_or(0, |tip| tip.counter);
+        let journaled = self
+            .local_overlay
+            .entries
+            .last()
+            .filter(|entry| entry.causal_dot.peer_id() == peer)
+            .map_or(0, |entry| entry.causal_dot.counter());
+        accepted.max(journaled)
+    }
+
     fn derive_ephemeral_causal_clock(
         &self,
         manifest: &OperationBatch,
@@ -10924,7 +11266,7 @@ impl ShardedHotEngine {
                     .ephemeral_causal_chain
                     .borrow()
                     .get(&causal_dot.peer_id())
-                    .is_some_and(|(counter, _)| *counter == prior_counter)
+                    .is_some_and(|tip| tip.counter == prior_counter)
             {
                 clock
                     .entry(causal_dot.peer_id())
@@ -11531,10 +11873,26 @@ impl ShardedHotEngine {
         author: AuthorBatch,
         transaction: &OperationTransaction,
     ) -> Result<PreparedBatch, EngineError> {
+        self.prepare_fixture_transaction_with_origin(
+            author,
+            super::BatchOrigin::LocalMutation,
+            transaction,
+        )
+    }
+
+    /// Test-only fixture for an origin other than a local mutation, so a test
+    /// can construct the cross-role writer-lane cases.
+    #[cfg(test)]
+    pub(crate) fn prepare_fixture_transaction_with_origin(
+        &self,
+        author: AuthorBatch,
+        origin: super::BatchOrigin,
+        transaction: &OperationTransaction,
+    ) -> Result<PreparedBatch, EngineError> {
         let prepared = self
             .prepare_transaction_core(
                 author,
-                super::BatchOrigin::LocalMutation,
+                origin,
                 transaction,
                 TransactionCapture::None,
                 None,
@@ -11590,46 +11948,36 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::AuthorDraftStale);
         }
-        let mut prepared_editor_projection = prepared_editor_projection;
-        for attempt in 0..LOCAL_AUTHOR_PEER_PROBE_BUDGET {
-            let crdt_peer_id = CrdtPeerId::local_mutation_candidate(
-                self.workspace_id,
-                authority.device_id(),
-                authority.session_id(),
-                batch_id,
-                attempt,
-            );
-            if crdt_peer_id.as_u64() == 0 {
-                continue;
-            }
-            let author = AuthorBatch {
-                batch_id,
-                author_device_id: authority.device_id(),
-                author_session_id: authority.session_id(),
-                crdt_peer_id,
-            };
-            match self.draft_author_transaction_with_observation(
-                author,
-                BatchOrigin::LocalMutation,
-                transaction,
-                None,
-                prepared_editor_projection.take(),
-                claim_source,
-                page_home_hints,
-            ) {
-                Ok(draft) => {
-                    #[cfg(test)]
-                    LAST_ADMITTED_LOCAL_AUTHOR.with(|observed| observed.set(Some(author)));
-                    return Ok((batch_id, draft));
-                }
-                Err(EngineError::CrdtPeerCollision(collision)) if collision == crdt_peer_id => {}
-                Err(error) => return Err(error),
-            }
+        // One persistent lane, not a fresh peer per batch: the peer is vended
+        // by the admitted authority from this device's durable writer-lane
+        // record. Reuse of an already-present peer is now REQUIRED — it is what
+        // keeps a repeatedly edited document's version vector O(writers)
+        // instead of O(edits) — so there is no collision probe left to run.
+        let crdt_peer_id = authority.crdt_peer_id();
+        if crdt_peer_id.as_u64() == 0 {
+            return Err(EngineError::InvalidTransaction(
+                "the admitted local writer lane has no CRDT peer".into(),
+            ));
         }
-        Err(EngineError::InvalidTransaction(format!(
-            "no collision-free nonzero CRDT peer in the bounded \
-             {LOCAL_AUTHOR_PEER_PROBE_BUDGET}-candidate promoted-local probe"
-        )))
+        let author = AuthorBatch {
+            batch_id,
+            author_device_id: authority.device_id(),
+            author_session_id: authority.session_id(),
+            crdt_peer_id,
+            causal_peer_id: authority.causal_peer_id(),
+        };
+        let draft = self.draft_author_transaction_with_observation(
+            author,
+            BatchOrigin::LocalMutation,
+            transaction,
+            None,
+            prepared_editor_projection,
+            claim_source,
+            page_home_hints,
+        )?;
+        #[cfg(test)]
+        LAST_ADMITTED_LOCAL_AUTHOR.with(|observed| observed.set(Some(author)));
+        Ok((batch_id, draft))
     }
 
     /// Raw-author compatibility helper for engine/projection fixtures.
@@ -12097,6 +12445,12 @@ impl ShardedHotEngine {
         // intent to these documents. Re-rendering the same page here would be
         // a repeated proof of established private state; recovered or foreign
         // records still take the full validation path.
+        // The retained-draft fast path takes the same lane gate as full
+        // validation: this device's own draft is not exempt from proving that
+        // it advanced only its own lane.
+        let lane_bindings = self
+            .prepare_crdt_lane_ownership(manifest, &record.crdt_updates)
+            .map_err(ManagedLocalRecordError::Engine)?;
         let candidate = ValidatedManagedLocalCandidate {
             pages: retained_projections
                 .into_iter()
@@ -12105,6 +12459,7 @@ impl ShardedHotEngine {
             documents,
             document_heads,
             block_claims,
+            lane_bindings,
             update_bytes,
         };
         let mut work = self.local_overlay.work.get();
@@ -12215,6 +12570,7 @@ impl ShardedHotEngine {
                 .or_default()
                 .insert(claim);
         }
+        self.commit_crdt_lane_ownership(candidate.lane_bindings);
         // The same point transition for the run-local page-name index. The
         // foreground draft already refused a page-name conflict against
         // accepted history layered under this overlay
@@ -12260,12 +12616,14 @@ impl ShardedHotEngine {
         // N+1 with dot N as its authenticated direct predecessor.
         let dot = manifest.causal_dot();
         let mut chain = self.ephemeral_causal_chain.borrow_mut();
-        let entry = chain
+        // Journal-durable, not yet accepted: it advances what this engine
+        // covers, and deliberately does NOT make the counter "occupied by a
+        // published original" — the drain accepts this very batch below the
+        // overlay a moment later.
+        chain
             .entry(dot.peer_id())
-            .or_insert((0, manifest.batch_id()));
-        if dot.counter() >= entry.0 {
-            *entry = (dot.counter(), manifest.batch_id());
-        }
+            .and_modify(|tip| tip.observe(dot.counter(), manifest.batch_id(), false))
+            .or_insert_with(|| CausalChainTip::first(dot.counter(), manifest.batch_id(), false));
         drop(chain);
         self.local_overlay
             .entry_by_batch
@@ -12355,6 +12713,12 @@ impl ShardedHotEngine {
                 "only trusted local-mutation batches enter the managed-local prefix".into(),
             ));
         }
+        // Same gate as accepted admission, before any hot document is touched:
+        // the journal prefix is durable authority, so a record whose CRDT bytes
+        // advance a foreign lane must never reach the committed overlay either.
+        let lane_bindings = self
+            .prepare_crdt_lane_ownership(manifest, updates)
+            .map_err(ManagedLocalRecordError::Engine)?;
         if effect.blocks().iter().any(|delta| {
             let identity = |state: &BlockState| (state.logseq_uuid, state.logseq_identity_origin);
             match (&delta.before, &delta.after) {
@@ -12505,6 +12869,7 @@ impl ShardedHotEngine {
             documents: after_documents,
             document_heads: post_heads,
             block_claims,
+            lane_bindings,
             update_bytes,
         })
     }
@@ -14819,13 +15184,14 @@ impl ShardedHotEngine {
         });
 
         let affected: Vec<DocumentId> = working.keys().copied().collect();
-        if matches!(origin, BatchOrigin::ExternalReconciliation { .. })
-            && before_vectors
-                .values()
-                .any(|vector| vector.get(&author.crdt_peer_id.as_u64()).is_some())
-        {
-            return Err(EngineError::CrdtPeerCollision(author.crdt_peer_id));
-        }
+        // The external-reconciliation draft used to be refused whenever its
+        // peer already appeared in an affected document's before-vector. That
+        // check WAS the fresh-peer-per-import invariant, and it structurally
+        // forbids a persistent import lane; continuation qualification now
+        // lives in the durable lane record (own-prefix coverage) and in
+        // receiver-side lane ownership admission, which apply to every origin
+        // rather than only to imports.
+        self.require_authored_lane_ownership(author.author_device_id, origin, author.crdt_peer_id)?;
         #[cfg(test)]
         let after_snapshots_started = Instant::now();
         let after_snapshots = snapshot_engine_documents(self.catalog_document_id, &working, true)?;
@@ -15003,20 +15369,20 @@ impl ShardedHotEngine {
             .iter()
             .map(OperationObject::descriptor)
             .collect::<Result<Vec<_>, _>>()?;
-        let peer = CausalPeerId::from_device_id(author.author_device_id);
+        let peer = author.causal_peer_id;
+        // A journal prefix authored by a RETIRED incarnation is not this
+        // chain's predecessor: after a real rotation the new incarnation starts
+        // its own chain rather than continuing someone else's counters. In
+        // steady state the last entry is this incarnation's own previous batch.
         let overlay_prior = (origin == BatchOrigin::LocalMutation)
             .then(|| self.local_overlay.entries.last())
             .flatten()
+            .filter(|entry| entry.causal_dot.peer_id() == peer)
             .map(|entry| {
-                if entry.causal_dot.peer_id() != peer {
-                    return Err(EngineError::InvalidTransaction(
-                        "one local journal prefix cannot mix author devices".into(),
-                    ));
-                }
                 let counter = entry.causal_dot.counter().checked_add(1).ok_or_else(|| {
                     EngineError::InvalidTransaction("causal counter overflow".into())
                 })?;
-                Ok((BatchCausalDot::new(peer, counter)?, entry.batch_id))
+                Ok::<_, EngineError>((BatchCausalDot::new(peer, counter)?, entry.batch_id))
             })
             .transpose()?;
         let (dot, prior_batch) = match overlay_prior {
@@ -15024,7 +15390,7 @@ impl ShardedHotEngine {
             None => {
                 let prior = self.ephemeral_causal_chain.borrow().get(&peer).copied();
                 let counter = prior
-                    .map(|(counter, _)| counter)
+                    .map(|tip| tip.counter)
                     .unwrap_or(0)
                     .checked_add(1)
                     .ok_or_else(|| {
@@ -15032,7 +15398,7 @@ impl ShardedHotEngine {
                     })?;
                 (
                     BatchCausalDot::new(peer, counter)?,
-                    prior.map(|(_, batch_id)| batch_id),
+                    prior.map(|tip| tip.batch_id),
                 )
             }
         };
@@ -18984,10 +19350,12 @@ impl ShardedHotEngine {
             if let Some(batch) = self.archive.get(&batch_id) {
                 let dot = batch.manifest().causal_dot();
                 let mut chain = self.ephemeral_causal_chain.borrow_mut();
-                let entry = chain.entry(dot.peer_id()).or_insert((0, batch_id));
-                if dot.counter() >= entry.0 {
-                    *entry = (dot.counter(), batch_id);
-                }
+                // Terminal in accepted history: this counter is now occupied by
+                // a published original, which is exactly the fork evidence.
+                chain
+                    .entry(dot.peer_id())
+                    .and_modify(|tip| tip.observe(dot.counter(), batch_id, true))
+                    .or_insert_with(|| CausalChainTip::first(dot.counter(), batch_id, true));
             }
         }
         self.staged_batches.remove(&batch_id);
@@ -19565,6 +19933,12 @@ impl ShardedHotEngine {
             }
         }
         self.validate_dependency_witnesses(&frontier, &updates)?;
+        // Lane ownership is proved here, before a single document is cloned or
+        // reconstructed: a batch that claims another author's lane, or forks a
+        // lane it does own, is rejected while its bytes are still only archive
+        // material. Its original bytes stay in the archive for recovery.
+        let lane_bindings =
+            self.prepare_crdt_lane_ownership(self.archive[&batch_id].manifest(), &updates)?;
         let semantic_payload = semantic_payload.expect("Ready batch has one semantic effect");
         let declared_effect = SemanticEffect::decode(&semantic_payload)?;
         Self::record_validation_phase(&mut self.validation_phase_nanos, 0, &mut phase_started);
@@ -19981,6 +20355,7 @@ impl ShardedHotEngine {
         if quarantined {
             self.commit_identity_publication(identity);
             self.commit_terminal_publication(terminal);
+            self.commit_crdt_lane_ownership(lane_bindings);
             self.commit_terminal_replacements(batch_id, &updates, replacements)?;
             if let Some(conflicts) = page_name_conflicts {
                 self.page_name_conflicts = conflicts;
@@ -20031,6 +20406,7 @@ impl ShardedHotEngine {
             )?
         };
         self.commit_identity_publication(identity);
+        self.commit_crdt_lane_ownership(lane_bindings);
         self.commit_logseq_claim_updates(
             logseq_claim_candidate.expect("visible batch prepared Logseq claim updates"),
         );
@@ -24065,7 +24441,7 @@ fn batch_fingerprint_from_manifest(manifest: &OperationBatch) -> ContentDigest {
     )
 }
 
-fn prepared_manifest_fingerprint(batch: &PreparedBatch) -> ContentDigest {
+pub(crate) fn prepared_manifest_fingerprint(batch: &PreparedBatch) -> ContentDigest {
     ContentDigest::of(
         &batch
             .manifest()
@@ -24491,7 +24867,7 @@ fn authenticated_map_root(
 
 pub(crate) fn causal_clock_counter_digest(peer: CausalPeerId, counter: u64) -> ContentDigest {
     tine_storage::sealed_accepted_index::causal_clock_counter_digest(
-        peer.as_device_id().as_uuid().into_bytes(),
+        peer.key().as_uuid().into_bytes(),
         counter,
     )
 }
@@ -24511,7 +24887,7 @@ pub(crate) fn authenticated_causal_clock_root(
         .iter()
         .map(|(peer, counter)| {
             (
-                peer.as_device_id().as_uuid().into_bytes(),
+                peer.key().as_uuid().into_bytes(),
                 causal_clock_counter_digest(*peer, *counter),
             )
         })
@@ -24532,7 +24908,7 @@ pub(crate) fn accepted_causal_record_digest(
         batch_id.as_uuid().into_bytes(),
         manifest_fingerprint,
         event_binding_digest,
-        dot.peer_id().as_device_id().as_uuid().into_bytes(),
+        dot.peer_id().key().as_uuid().into_bytes(),
         dot.counter(),
         clock_root_key.map(
             |key| tine_storage::sealed_accepted_index::AuthenticatedMapLinkV1 {
@@ -24690,6 +25066,31 @@ fn decode_crdt_update_payload(
         ));
     }
     Ok(payload)
+}
+
+/// Which CRDT writer lanes one update payload advances.
+///
+/// `validate_update_base` has already proved that every peer named in the
+/// update's partial end vector starts exactly at the base document's counter
+/// for that peer and ends strictly above it, so the end vector's peers are
+/// precisely the lanes this payload advances — no diffing, and no way for an
+/// already covered replay to smuggle a lane in.
+fn crdt_update_advanced_lanes(
+    document_id: DocumentId,
+    update: &[u8],
+) -> Result<Vec<CrdtPeerId>, EngineError> {
+    let metadata = LoroDoc::decode_import_blob_meta(update, true).map_err(loro_error)?;
+    if metadata.mode != EncodedBlobMode::Updates {
+        return Err(EngineError::InvalidCrdt(format!(
+            "CRDT payload for {document_id} uses {}, expected update mode",
+            metadata.mode
+        )));
+    }
+    Ok(metadata
+        .partial_end_vv
+        .iter()
+        .map(|(peer, _)| CrdtPeerId::from_u64(*peer))
+        .collect())
 }
 
 fn validate_update_base(
@@ -26619,6 +27020,41 @@ pub enum EngineError {
     },
     BatchCollision(BatchId),
     CrdtPeerCollision(CrdtPeerId),
+    /// A batch advanced a CRDT writer lane that accepted state already binds to
+    /// a different author device or origin role. In-scope scenario (I-8): a
+    /// duplicated or cloned writer identity, or a delivered batch whose CRDT
+    /// bytes claim another device's lane.
+    CrdtLaneNotOwned {
+        peer_id: CrdtPeerId,
+        claimed: CrdtLaneOwner,
+        owned: CrdtLaneOwner,
+    },
+    /// A lane batch advanced the zero peer or a reserved baseline peer.
+    CrdtLaneUnauthorizedOrigin {
+        peer_id: CrdtPeerId,
+        detail: String,
+    },
+    /// A batch claimed a causal writer incarnation that accepted state already
+    /// binds to a different enrolled author device. In-scope scenario (I-8): a
+    /// delivered batch whose manifest claims another device's causal chain, so
+    /// that its dots would be merged into that device's ancestry.
+    CausalPeerNotOwned {
+        peer_id: CausalPeerId,
+        claimed: DeviceId,
+        owned: DeviceId,
+    },
+    /// A NEW batch claimed a `(causal peer, counter)` at or below a gap-free
+    /// accepted tip of that same peer. Every counter up to the tip is already
+    /// occupied by an accepted original, so this is a fork of one writer
+    /// incarnation's chain, not a duplicate delivery of the original (which is
+    /// answered earlier, by exact batch identity). In-scope scenario (I-8): a
+    /// duplicated or forged private writer record.
+    CausalDotFork {
+        peer_id: CausalPeerId,
+        counter: u64,
+        claimed: BatchId,
+        accepted_tip: u64,
+    },
     SelfDependency(BatchId),
     MissingDependency(BatchId),
     RejectedDependency(BatchId),
@@ -26713,6 +27149,44 @@ impl fmt::Display for EngineError {
             Self::CrdtPeerCollision(peer_id) => {
                 write!(f, "CRDT peer {peer_id} collides in an affected document")
             }
+            Self::CrdtLaneNotOwned {
+                peer_id,
+                claimed,
+                owned,
+            } => write!(
+                f,
+                "CRDT writer lane {peer_id} is owned by the {} lane of device {}; device {} \
+                 cannot advance it as its {} lane",
+                owned.role.describe(),
+                owned.device_id,
+                claimed.device_id,
+                claimed.role.describe(),
+            ),
+            Self::CrdtLaneUnauthorizedOrigin { peer_id, detail } => {
+                write!(f, "CRDT writer lane {peer_id} is not admissible: {detail}")
+            }
+            Self::CausalPeerNotOwned {
+                peer_id,
+                claimed,
+                owned,
+            } => write!(
+                f,
+                "causal writer incarnation {} is owned by device {owned}; device {claimed} \
+                 cannot author under it",
+                peer_id.key(),
+            ),
+            Self::CausalDotFork {
+                peer_id,
+                counter,
+                claimed,
+                accepted_tip,
+            } => write!(
+                f,
+                "batch {claimed} forks causal writer incarnation {} at counter {counter}: that \
+                 counter is already occupied by an accepted original, whose gap-free tip is \
+                 {accepted_tip}",
+                peer_id.key(),
+            ),
             Self::SelfDependency(batch_id) => write!(f, "batch {batch_id} depends on itself"),
             Self::MissingDependency(batch_id) => write!(f, "missing dependency {batch_id}"),
             Self::RejectedDependency(batch_id) => write!(f, "dependency {batch_id} was rejected"),
@@ -27082,7 +27556,7 @@ pub(crate) mod validation_tests {
             author.author_device_id,
             author.author_session_id,
             crate::oplog::BatchOrigin::LocalMutation,
-            BatchCausalDot::new(CausalPeerId::from_device_id(author.author_device_id), 1).unwrap(),
+            BatchCausalDot::new(author.causal_peer_id, 1).unwrap(),
             batch_dependency_heads,
             frontier,
             SemanticEffectDigest::of(&effect_bytes),
@@ -27129,6 +27603,13 @@ pub(crate) mod validation_tests {
             author_device_id: DeviceId::from_uuid(Uuid::from_u128(batch + 1_000)),
             author_session_id: SessionId::from_uuid(Uuid::from_u128(batch + 2_000)),
             crdt_peer_id: CrdtPeerId::from_u64(peer),
+            // Fixtures carry an EXPLICIT stable incarnation; production always
+            // reads the saved one out of the durable writer-lane record.
+            causal_peer_id: CausalPeerId::from_key(
+                crate::oplog::WriterIncarnationId::fixture_for_device(DeviceId::from_uuid(
+                    Uuid::from_u128(batch + 1_000),
+                )),
+            ),
         }
     }
 
@@ -27176,7 +27657,7 @@ pub(crate) mod validation_tests {
         accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
         accepted_tip_refcounts: BTreeMap<BatchId, usize>,
         clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
-        ephemeral_causal_chain: BTreeMap<CausalPeerId, (u64, BatchId)>,
+        ephemeral_causal_chain: BTreeMap<CausalPeerId, CausalChainTip>,
         ephemeral_causal_clocks: BTreeMap<BatchId, Vec<(CausalPeerId, u64)>>,
         clean_checkpoint_causal_dots: BTreeMap<BatchId, BatchCausalDot>,
         clean_checkpoint_required_objects: BTreeSet<ContentDigest>,
@@ -28970,7 +29451,9 @@ pub(crate) mod validation_tests {
             .validate_and_prepare_semantic_roles_and_block_homes(
                 BatchId::from_uuid(Uuid::from_u128(115_012)),
                 BatchCausalDot::new(
-                    CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(115_013))),
+                    CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                        DeviceId::from_uuid(Uuid::from_u128(115_013)),
+                    )),
                     1,
                 )
                 .unwrap(),
@@ -30799,6 +31282,58 @@ pub(crate) mod validation_tests {
         }
     }
 
+    /// The checkpoint state section must carry accepted writer-lane ownership,
+    /// and its schema number must have moved when the section changed.
+    ///
+    /// This is a source guard rather than a round trip because capture needs a
+    /// full lazy-genesis-plus-archive runtime; the behavioural half — that a
+    /// receiver which opened by REPLAY refuses a foreign lane — is proved by
+    /// `writer_lane_ownership_is_rebuilt_by_full_accepted_replay`.
+    #[test]
+    fn clean_checkpoint_state_carries_writer_lane_ownership() {
+        let source = include_str!("hot_engine.rs")
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
+            .next()
+            .expect("the hot-engine production half remains identifiable");
+        assert_eq!(
+            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 3,
+            "adding writer-lane ownership to the checkpoint state changes its schema"
+        );
+        let state_start = source
+            .find("struct CleanCheckpointStateV1 {")
+            .expect("checkpoint state section remains present");
+        let state_end = source[state_start..]
+            .find("\n}\n")
+            .expect("checkpoint state section remains bounded")
+            + state_start;
+        assert!(
+            source[state_start..state_end]
+                .contains("crdt_lane_owners: BTreeMap<CrdtPeerId, CrdtLaneOwner>"),
+            "the checkpoint state section must carry accepted writer-lane ownership"
+        );
+        assert!(
+            source.contains("crdt_lane_owners: self.crdt_lane_owners.clone(),"),
+            "capture must serialize accepted writer-lane ownership"
+        );
+        assert!(
+            source.contains("self.crdt_lane_owners = state.crdt_lane_owners;"),
+            "restore must reinstall accepted writer-lane ownership"
+        );
+        assert!(
+            source[state_start..state_end]
+                .contains("causal_peer_owners: BTreeMap<CausalPeerId, DeviceId>"),
+            "the checkpoint state must carry accepted causal incarnation ownership"
+        );
+        assert!(
+            source.contains("causal_peer_owners: self.causal_peer_owners.clone(),"),
+            "capture must serialize accepted causal incarnation ownership"
+        );
+        assert!(
+            source.contains("self.causal_peer_owners = state.causal_peer_owners;"),
+            "restore must reinstall accepted causal incarnation ownership"
+        );
+    }
+
     #[test]
     fn no_store_page_name_preparation_source_guard_uses_direct_causal_heads() {
         let source = include_str!("hot_engine.rs");
@@ -31753,6 +32288,11 @@ mod replay_benchmark {
                     6_000_000 + batch_index as u128,
                 )),
                 crdt_peer_id: peer,
+                causal_peer_id: CausalPeerId::from_key(
+                    crate::oplog::WriterIncarnationId::fixture_for_device(DeviceId::from_uuid(
+                        Uuid::from_u128(5_000_000 + batch_index as u128),
+                    )),
+                ),
             };
             let mut operations =
                 Vec::with_capacity((batch_end - batch_start) * (BLOCKS_PER_PAGE + 1));

@@ -7414,7 +7414,13 @@ mod tests {
             device_id,
             SessionId::from_uuid(Uuid::from_u128(0x5ef0)),
             origin,
-            BatchCausalDot::new(CausalPeerId::from_device_id(device_id), 1).unwrap(),
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device_id,
+                )),
+                1,
+            )
+            .unwrap(),
             Vec::new(),
             FrontierV2::new(Vec::new()).unwrap(),
             SemanticEffectDigest::of(&payload),

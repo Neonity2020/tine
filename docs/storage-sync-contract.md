@@ -2886,6 +2886,125 @@ identity, its predecessor `FrontierV2`, or its prior intent, all of which the
 original record still carries verbatim and `begin_restore` reads back by exact
 sweep id. Historical restoreability alone never keeps a record active.
 
+### 3.2e Persistent CRDT writer lanes
+
+Every CRDT operation a device publishes is authored by a *writer lane*, not by a
+fresh per-batch peer. One device holds exactly two lanes per admitted endpoint:
+`Local` (every ordinary mutation and maintenance seal) and `External` (external
+editor reconciliation). Lanes are reused across transactions, imports, seals and
+ordinary restarts, which is what keeps a repeatedly edited document's version
+vector — and every later manifest's before-vector, and every shallow snapshot —
+O(writers) instead of O(edits). `ImportId` keeps its batch, session and
+observation roles; only the CRDT peer stops being per-import.
+
+Alongside those two Loro peers the same record saves a third identity: one
+**causal writer incarnation** (`WriterIncarnationId`, a UUID). It is the
+`CausalPeerKey` of `CoreDurableBatchContract`, so a manifest's `BatchCausalDot`
+names an incarnation, never the enrolled `DeviceId`. Device, endpoint and
+enrolment identity are untouched by any of this: `OperationBatch::author_device_id`
+still carries the one enrolled device, and one device may own several
+incarnations over its lifetime. Every batch of one incarnation — ordinary,
+local-journal, external and seal alike — shares that incarnation's single
+sequential counter chain; the two Loro roles stay distinct within it.
+
+**Allocation.** Every one of the three identities is allocated at random and
+then saved, never derived. A derived identity would let a rebuild that has lost
+the record recreate the very lane — or the very causal chain — whose published
+prefix it can no longer qualify. Production never hashes a `DeviceId` into an
+incarnation and never allocates one per batch, session or import; only tests may
+pin explicit stable fixture incarnations. The two deterministic lazy-genesis
+peers and the zero peer are never allocated.
+
+**Where the record lives.** One postcard record of at most 1 KiB per device, in
+the device-private application runtime root under `crdt-writer-lanes/lanes-<workspace>-<lineage>/writer-lanes-<device>.postcard`.
+It is app-data keyed by graph: it must not travel with the graph and it is never
+in the graph directory or in `.tine-sync` (D-11). It is not a receiver-visible
+proof of anything.
+
+**Exclusion.** No archive lease covers this namespace — two honest concurrent
+graph copies of one workspace hold two independent archive-rooted
+`WorkspaceRuntimeLease`s and would both reach the same record. Exclusion is
+therefore taken here, with the existing platform lease helper on
+`writer-lanes-<device>.lock`, and re-proved (held handle identity versus the
+currently named file) before every peer vend and every reservation. Exact-byte
+replacement is a torn-write guard, never a cross-process compare-and-swap.
+
+**Prefix durability.** The record carries a monotone `confirmed_own_counter` —
+the highest `BatchCausalDot` counter proved durable **for the saved
+incarnation**, qualified by that `CausalPeerId` and not by the device — plus at
+most one `reservation` bound to the exact `(BatchId, manifest digest)` of the
+batch about to become outwardly visible. The reservation is published before the
+trusted local journal append and before the external archive manifest commit, so
+it covers both commit paths with one barrier. It is idempotent for the same
+batch. Cost: one `replace_exact` of a fixed-size record per publishing turn —
+one temp-file `sync_all` plus one directory fsync — and nothing at all on a
+retry of an already reserved batch.
+
+**Continuation and rotation.** On open, authoritative accepted history plus the
+drained local journal supply the covered own counter **for the saved
+incarnation**; the accepted path and the trusted local-journal path each keep
+their own durability question. At most one dot can be ambiguous, and it is
+resolved by asking the archive about the exact reserved manifest fingerprint.
+Provably absent frees the dot. Anything else — durable but unrestored,
+unanswerable, a different manifest under the reserved id, or more than one
+unaccounted dot — spends it.
+
+A covered record continues its saved lanes and its saved incarnation. An
+uncovered one is **retired whole**: a fresh incarnation and two fresh Loro peers
+are saved (incarnation ordinal + 1, `confirmed_own_counter` back to zero) before
+any new authoring. Recovery is a new causal identity, never a reused counter, so
+the unprovable older prefix keeps its own identity forever and the replacement
+chain may freely restart over counters the retired chain already spent. That is
+what makes it safe to author immediately: there is no retained floor, no refused
+publication, no permanent wait for a missing offline device, and no dropped
+pending work — pending original bytes still drain and replay through the one
+existing path. The cost of a rotation is exactly one extra causal peer `P`, paid
+only for a real writer incarnation. A missing record mints a fresh incarnation
+on the same terms; an undecodable one is preserved under
+`<record>.superseded-<digest>` and rebuilt (D-1/D-3). Repeating the reopen over
+unchanged unprovable state mints one incarnation per open, not one per batch.
+Reading, repair and reopen are never blocked by any of this (I-10).
+
+**Ownership admission (receiver side).** A private lane record is not receiver
+authority. Each admitted batch's CRDT payloads are read for the peers they
+advance — `validate_update_base` has already proved each carried range starts at
+the base document's counter for that peer and ends strictly above it, so the
+update's partial end vector *is* the set of lanes it advances. Those peers are
+bound to `(author device, origin role)` on first admitted use, atomically with
+the batch that used it, and enforced on every later use, on both the accepted
+path and the trusted local-journal prefix, before any live document is touched.
+A batch claiming another device's lane, or the same device's other role, is
+refused whole (`EngineError::CrdtLaneNotOwned`) with its original bytes intact
+in the archive. Bootstrap import predates every lane: it neither claims nor binds
+one.
+
+Incoming ordinary and external batches may not advance the zero peer or either
+immutable lazy-genesis peer. Receiver admission uses the same reserved-peer set
+as private writer allocation and record validation, and refuses the whole batch
+before installing any document or ownership binding. Rejected originals remain
+available through the archive.
+
+The causal writer incarnation is admitted by the same machinery, in the same
+place, before any live fragment, ownership or effect changes. On first admitted
+use the batch's `CausalPeerId` is bound to its enrolled author device; a later
+batch of a *different* author claiming that incarnation is refused whole
+(`EngineError::CausalPeerNotOwned`). Ownership alone is not enough, because a
+sparse accepted clock covers counters without naming exact `BatchId`s: a
+gap-free accepted tip for that incarnation additionally refuses any batch whose
+claimed counter is at or below the tip unless it is the known original for that
+dot (`EngineError::CausalDotFork`). Ordinary duplicate replay of the original
+bytes therefore still succeeds, while conflicting bytes or a conflicting
+`BatchId` on an already-spent dot are rejected with the original accepted
+fragment untouched and the rejected bytes retained. Both maps are bounded by
+writer incarnations, are carried in the clean checkpoint state section
+(schema 3), and are rebuilt identically by full accepted replay — one tree, no
+second index.
+
+**Schema.** This is one coherent current format with no reader for the previous
+one (D-1): `OPERATION_SCHEMA_VERSION` 8, writer-lane record schema 2, clean
+checkpoint state schema 3. Every persisted point-index key encoding carries the
+full 16-byte incarnation UUID; none of them truncates or hashes it.
+
 ### 2.10a Durability barriers by artifact class
 
 Platform durability policy is stated **per artifact class**, never globally.

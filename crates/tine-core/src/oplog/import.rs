@@ -8103,6 +8103,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_412)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_413),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 material,
             )
@@ -8146,6 +8149,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_414)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_415),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 replacement_material,
             )
@@ -8183,6 +8189,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_416)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_417),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 removal_material,
             )
@@ -8236,6 +8245,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_420)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_421),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 chain_material,
             )
@@ -8268,6 +8280,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_422)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_423),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 reuse_material,
             )
@@ -8302,6 +8317,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_424)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_425),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 cycle_material,
             )

@@ -128,6 +128,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Managed Storage reuses durable writer identities across edits and restarts.
+  If its writer record is lost or damaged, new edits use a fresh causal identity
+  so an older offline branch can still arrive with its original edits intact.
+
 - Managed Storage validates the exact peer-counter ranges in incoming CRDT
   updates, rejecting replayed ranges even when their starting frontier matches.
 

@@ -396,6 +396,14 @@ impl AuthorityFixture {
             author_device_id: DeviceId::from_uuid(uuid(101)),
             author_session_id: SessionId::from_uuid(uuid(batch + 10_000)),
             crdt_peer_id: CrdtPeerId::from_u64(peer),
+            // `peer` identifies the WRITER in this fixture, so it selects the
+            // writer incarnation too. Two concurrent authors are two
+            // incarnations by construction: one sequential causal chain cannot
+            // describe two independent concurrent writers, and pretending it
+            // could is the identity assignment this packet removes.
+            causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                crate::oplog::WriterIncarnationId::fixture_labelled(&peer.to_be_bytes()),
+            ),
         };
         let draft = self
             .engine

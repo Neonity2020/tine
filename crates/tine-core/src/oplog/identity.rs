@@ -87,6 +87,29 @@ opaque_uuid_id!(
     /// Sharding-neutral identity of a causal document.
     DocumentId
 );
+opaque_uuid_id!(
+    /// Opaque identity of ONE sequential authoring incarnation of one device.
+    ///
+    /// This is the product's `DurableBatchContract::CausalPeerKey`: every
+    /// `BatchCausalDot` this device publishes names an incarnation, never the
+    /// enrolled `DeviceId`. The two are deliberately independent.
+    ///
+    /// * The enrolled device stays on `OperationBatch::author_device_id` and
+    ///   keeps every device/endpoint/enrollment authority it had.
+    /// * The incarnation is allocated at random and then SAVED in the durable
+    ///   device-private writer-lane record (`oplog::writer_lane`), together
+    ///   with the two owned Loro peers. Ordinary, local, external-import and
+    ///   seal batches of one incarnation share one sequential Tine causal
+    ///   chain.
+    ///
+    /// Losing that record, or being unable to prove the saved incarnation's own
+    /// durable prefix, therefore mints a NEW incarnation before any new
+    /// authoring. The unknowable older prefix keeps its own causal identity
+    /// instead of having its counters reused, which is exactly what stops a
+    /// rebuild from aliasing a `BatchCausalDot` an offline peer still holds.
+    /// A derived value could not do that; a random saved one structurally can.
+    WriterIncarnationId
+);
 
 /// Full identity of one retirable CRDT document. Membership facts are addressed
 /// by both entity document UUIDs; they are never truncated into a synthetic UUID.
@@ -99,6 +122,36 @@ pub enum DocumentKey {
         block_document_id: DocumentId,
         page_document_id: DocumentId,
     },
+}
+
+impl WriterIncarnationId {
+    /// Derive one FIXTURE writer incarnation from a device identity.
+    ///
+    /// Engine/projection/wire fixtures hold no device-private application
+    /// runtime root, so they have nowhere to save a real incarnation. They get
+    /// an EXPLICIT stable fixture identity instead, which keeps one fixture's
+    /// causal chain stable across its own reopens and keeps two fixture devices
+    /// distinct. Production never reaches this: it always reads the saved
+    /// random incarnation out of the durable writer-lane record, and a
+    /// production fallback that hashed `DeviceId` would reintroduce exactly the
+    /// aliasing this type exists to prevent.
+    #[cfg(test)]
+    pub(crate) fn fixture_for_device(device_id: DeviceId) -> Self {
+        Self::from_uuid(derived_uuid(
+            b"tine/writer-lane/fixture-incarnation/v1\0",
+            &[device_id.as_uuid().as_bytes()],
+        ))
+    }
+
+    /// Derive one FIXTURE writer incarnation from an arbitrary explicit label.
+    /// Same rules as [`Self::fixture_for_device`]: fixtures only.
+    #[cfg(test)]
+    pub(crate) fn fixture_labelled(label: &[u8]) -> Self {
+        Self::from_uuid(derived_uuid(
+            b"tine/writer-lane/fixture-incarnation-label/v1\0",
+            &[label],
+        ))
+    }
 }
 
 /// Opaque, engine-neutral identity of a CRDT peer within a causal document.
@@ -117,45 +170,34 @@ impl CrdtPeerId {
         self.0
     }
 
-    /// Derive one deterministic candidate for the synthetic external-import
-    /// author. Zero rejection, collision probing, and selection are deliberately
-    /// left to the importer that owns the target CRDT document.
-    pub(crate) fn external_import_candidate(
-        workspace_id: WorkspaceId,
-        import_id: ImportId,
-        attempt: u64,
-    ) -> Self {
-        Self(derived_u64(
-            b"tine/import/crdt-peer-id/v1\0",
-            &[
-                workspace_id.as_uuid().as_bytes(),
-                import_id.as_bytes(),
-                &attempt.to_be_bytes(),
-            ],
-        ))
-    }
-
-    /// Derive one candidate for a promoted local mutation.
+    /// Derive one FIXTURE identity for a persistent CRDT writer lane.
     ///
-    /// The batch identity is freshly minted by the admitted runtime path, so
-    /// this domain-separated value is fresh for that mutation while remaining
-    /// reproducible across the bounded collision probe. The authoring engine
-    /// still rejects zero and every peer already present in an affected causal
-    /// document before a draft is returned.
-    pub(crate) fn local_mutation_candidate(
+    /// Production lanes are allocated at random and then saved in the durable
+    /// device-private writer-lane record (`oplog::writer_lane`), precisely so
+    /// that losing that record cannot recreate an identity whose published
+    /// prefix nobody can qualify. A derived value is therefore deliberately NOT
+    /// the production allocator and never an authority — this exists only for
+    /// engine/projection fixtures, which hold no device-private runtime root
+    /// and need lanes that stay stable across one fixture's own reopens.
+    /// Receiver-side authority is, in every case, the accepted lane-ownership
+    /// binding the engine builds from admitted batches.
+    #[cfg(test)]
+    pub(crate) fn writer_lane_candidate(
         workspace_id: WorkspaceId,
         device_id: DeviceId,
-        session_id: SessionId,
-        batch_id: BatchId,
+        endpoint_id: ProjectionEndpointId,
+        role_tag: u8,
+        incarnation: u64,
         attempt: u64,
     ) -> Self {
         Self(derived_u64(
-            b"tine/local-mutation/crdt-peer-id/v1\0",
+            b"tine/writer-lane/crdt-peer-id/v1\0",
             &[
                 workspace_id.as_uuid().as_bytes(),
                 device_id.as_uuid().as_bytes(),
-                session_id.as_uuid().as_bytes(),
-                batch_id.as_uuid().as_bytes(),
+                endpoint_id.as_uuid().as_bytes(),
+                &[role_tag],
+                &incarnation.to_be_bytes(),
                 &attempt.to_be_bytes(),
             ],
         ))
@@ -669,7 +711,6 @@ mod tests {
         let home = DocumentId::for_unmatched_import_page(workspace, b"pages/nested/naive.md");
         let session = SessionId::for_external_import_author(workspace, import);
         let observation = DocumentId::for_external_import_observation(workspace, import);
-        let peer = CrdtPeerId::external_import_candidate(workspace, import, 7);
 
         assert_eq!(
             home,
@@ -683,26 +724,17 @@ mod tests {
             observation,
             DocumentId::for_external_import_observation(workspace, import)
         );
-        assert_eq!(
-            peer,
-            CrdtPeerId::external_import_candidate(workspace, import, 7)
-        );
 
         let rendered = [
             home.to_string(),
             session.to_string(),
             observation.to_string(),
-            peer.to_string(),
         ];
         for (left_index, left) in rendered.iter().enumerate() {
             for right in rendered.iter().skip(left_index + 1) {
                 assert_ne!(left, right, "derivation domains must remain separate");
             }
         }
-        assert_ne!(
-            peer,
-            CrdtPeerId::external_import_candidate(workspace, import, 8)
-        );
 
         assert_eq!(home.to_string(), "737b3bff-157d-8cfe-a3e8-be0ca069e2d6");
         assert_eq!(session.to_string(), "5e69f6b5-0b83-8916-904c-36f09da566e1");
@@ -710,7 +742,41 @@ mod tests {
             observation.to_string(),
             "54588e2e-938c-8f75-bc5c-f9ddbcf4ddb7"
         );
-        assert_eq!(peer.as_u64(), 2_725_213_283_319_468_303);
+    }
+
+    /// The candidate is a per-(workspace, device, endpoint, role, incarnation)
+    /// value, not a per-batch or per-import one: that is precisely what bounds
+    /// P to writer incarnations instead of history. `attempt` only feeds the
+    /// bounded collision probe, and `incarnation` is what a coverage-losing
+    /// rebuild advances.
+    #[test]
+    fn writer_lane_candidates_separate_role_incarnation_and_endpoint() {
+        let workspace = workspace();
+        let device = DeviceId::from_uuid(Uuid::from_u128(0x11));
+        let endpoint = ProjectionEndpointId::from_uuid(Uuid::from_u128(0x22));
+        let other_endpoint = ProjectionEndpointId::from_uuid(Uuid::from_u128(0x23));
+        let base = CrdtPeerId::writer_lane_candidate(workspace, device, endpoint, 0, 0, 0);
+
+        assert_eq!(
+            base,
+            CrdtPeerId::writer_lane_candidate(workspace, device, endpoint, 0, 0, 0)
+        );
+        for divergent in [
+            CrdtPeerId::writer_lane_candidate(workspace, device, endpoint, 1, 0, 0),
+            CrdtPeerId::writer_lane_candidate(workspace, device, endpoint, 0, 1, 0),
+            CrdtPeerId::writer_lane_candidate(workspace, device, endpoint, 0, 0, 1),
+            CrdtPeerId::writer_lane_candidate(workspace, device, other_endpoint, 0, 0, 0),
+            CrdtPeerId::writer_lane_candidate(
+                workspace,
+                DeviceId::from_uuid(Uuid::from_u128(0x12)),
+                endpoint,
+                0,
+                0,
+                0,
+            ),
+        ] {
+            assert_ne!(base, divergent);
+        }
     }
 
     #[test]
