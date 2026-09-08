@@ -958,6 +958,64 @@ pub struct ViewSettings {
     pub sample: Option<u32>,
 }
 
+/// The non-presentation half of a page- or block-result display override.
+///
+/// Every member is optional because authored scoped properties have two kinds
+/// of absence. A missing `tine.<scope>-display` marker means there is no draft
+/// and the singular settings are inherited. A marker with no members is an
+/// empty draft and clears those inherited settings. The list members retain a
+/// third state, `Some(vec![])`, for an explicitly authored empty property.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Vec<(Field, SortDir)>>,
+    /// `Some(Field(""))` is the durable explicit grouping clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<Field>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<Field>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregates: Option<Vec<(Field, AggFn)>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<u32>,
+}
+
+/// Which source of page membership a Friendly mixed search requests.
+///
+/// Absence is retained by [`ScopedDisplaySettings`] as compatibility state. It
+/// is the command/execution layer's job to resolve that absence to the historic
+/// names-and-aliases behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FriendlyPageMatchScope {
+    Names,
+    Content,
+    Both,
+}
+
+/// Typed scoped state read from a query block's `tine.*` properties.
+///
+/// This is deliberately separate from [`ViewSettings`]: the existing singular
+/// merge remains the compatibility answer, while callers may independently
+/// resolve page and block overrides. Unreadable property names are metadata,
+/// not query diagnostics, so malformed display bytes cannot invalidate the
+/// query predicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedDisplaySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_presentation: Option<ViewKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_display: Option<DisplayDraft>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_presentation: Option<ViewKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_display: Option<DisplayDraft>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_match_scope: Option<FriendlyPageMatchScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_settings: Vec<String>,
+}
+
 /// The two construction limits every result bridge already enforces
 /// (`RESULT_BRIDGE_MAX_ROWS` / `RESULT_BRIDGE_MAX_BYTES`) — and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
