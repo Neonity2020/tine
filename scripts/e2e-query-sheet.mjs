@@ -746,14 +746,15 @@ await withApp(2, async (browser) => {
   await openSheet(browser);
   await selectP6Rows(browser, [0]);
 
-  // This native harness deliberately forces software rendering. Acknowledge
-  // only its known sticky hardware reminder through the visible Dismiss
-  // control before probing the bottom sheet beneath it. Other notifications,
-  // including query/save errors, remain present and can fail reachability.
+  // A fresh profile offers the Guide; this harness may also show the reminder
+  // for its deliberately forced software rendering. Acknowledge only those
+  // named startup notices through Dismiss before probing the controls beneath.
+  // Query/save errors remain visible and can still fail reachability.
   for (const toast of await browser.$$(".toast")) {
     const message = await toast.$(".toast-msg").getText();
-    if (!message.startsWith("Software rendering is on (")) continue;
-    console.log(`narrow setup: dismissing forced-rendering reminder: ${message}`);
+    if (message !== "New: in-app Guide — learn Sheets, formulas & queries."
+        && !message.startsWith("Software rendering is on (")) continue;
+    console.log(`narrow setup: dismissing startup notice: ${message}`);
     await toast.$(".toast-close").click();
     await toast.waitForExist({ reverse: true, timeout: 5_000 });
   }
