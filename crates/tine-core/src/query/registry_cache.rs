@@ -405,4 +405,41 @@ mod tests {
             &cache.published.as_ref().unwrap().registry
         ));
     }
+    #[test]
+    fn snapshot_build_and_cache_hit_keep_cancellation_and_config_checks() {
+        let root =
+            std::env::temp_dir().join(format!("tine-registry-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("projection.sqlite");
+        let database =
+            tine_storage::sqlite::PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        drop(database);
+        let config = ParseConfig::default();
+        let mut cache = CommittedRegistryCache::new(1, &config);
+        let full = cache.capture(1, &config).unwrap();
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        let built = full.build(&mut snapshot, &config).unwrap();
+        assert!(built.rows().is_empty());
+        let published = cache.publish(full, built).unwrap();
+        drop(snapshot);
+
+        cache.committed(2, keys(&[]), keys(&[])).unwrap();
+        let hit = cache.capture(2, &config).unwrap();
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        assert!(Arc::ptr_eq(
+            &hit.build(&mut snapshot, &config).unwrap(),
+            &published
+        ));
+        let mut changed = config.clone();
+        changed.hidden_properties.push("score".into());
+        assert!(hit.build(&mut snapshot, &changed).is_err());
+        snapshot.cancellation().cancel();
+        assert!(matches!(
+            hit.build(&mut snapshot, &config),
+            Err(QueryExecutionError::Cancelled)
+        ));
+        drop(snapshot);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
