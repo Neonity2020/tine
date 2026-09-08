@@ -3612,6 +3612,20 @@ enum IrQueryTurn {
     Captured(Box<crate::managed_query::ManagedQueryCapture>),
 }
 
+/// What one PUBLIC property-registry actor turn produced (RET2), the metadata
+/// twin of [`SimpleQueryTurn`] and [`IrQueryTurn`].
+///
+/// There is deliberately no `Answered` arm. A result route can answer on the
+/// actor from its memo; a metadata read has no memo, and the only other way to
+/// answer without opening a snapshot would be to serve the last published table
+/// — which is exactly the stale-metadata behaviour this packet removed.
+enum RegistryTurn {
+    Deferred(SyncEditorDeferred),
+    /// Everything the off-actor metadata read needs, captured at this turn's
+    /// accepted frontier and pending revision.
+    Captured(Box<crate::managed_metadata::ManagedMetadataCapture>),
+}
+
 /// An executor that answered a different request shape than it was captured
 /// for, or a probe decomposition whose count vector does not match it.
 /// Structurally impossible — the request decides the row shape — so it is
@@ -4736,6 +4750,14 @@ impl SyncRuntimeHandle {
                     max_bytes,
                 )
             }
+            // RET2: SPEC §7.1's `query_registry` is intercepted HERE for the
+            // same reason. It is not a query — it carries no IR and no bounds —
+            // but it is the type information every query is lowered under, and
+            // the actor arm that used to answer it hydrated every pending page
+            // and could serve a stale or empty table after a failed build.
+            SyncApplicationNavigationRequest::PropertyRegistry => {
+                return self.application_captured_registry()
+            }
             request => request,
         };
         let lane = match &request {
@@ -5054,6 +5076,80 @@ impl SyncRuntimeHandle {
                     continue;
                 }
                 outcome => return Err(managed_execution_error(&shared.census, outcome)),
+            }
+        }
+    }
+
+    /// **The PUBLIC property-registry route** (RET2): SPEC §7.1's
+    /// `query_registry`, over the same two phases and the same shared
+    /// snapshot/mask/registry acquisition every captured Managed query uses.
+    ///
+    /// Phase one is a short actor turn that captures the accepted path, stamp,
+    /// config and ACCEPTED registry table plus the pending overlay instance and
+    /// required revision; phase two runs
+    /// [`crate::managed_metadata::execute_managed_metadata`] on the CALLING
+    /// thread with `operation` released. There is no memo hit to serve here and
+    /// no answer the actor can give without opening a snapshot.
+    ///
+    /// **This route never returns fallback metadata.** Before RET2 a refused
+    /// materialized read served the last published table — or an empty one
+    /// before the first build — as if it were the answer, so a damaged
+    /// projection silently changed what every `prop(…)` filter meant. Now
+    /// `Stale`, `Busy`, `Cancelled` and `Failed` are classified by exactly the
+    /// same [`managed_execution_error`] the result routes use, a failed pending
+    /// projection takes exactly the same bounded exact-instance repair after
+    /// the capture (and therefore every snapshot and slot handle) is released,
+    /// and nothing about a failure is published or memoized.
+    fn application_captured_registry(
+        &self,
+    ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
+        use crate::managed_metadata::ManagedMetadataOutcome;
+        use crate::managed_query::ManagedQueryOutcome;
+        let shared = &self.inner.managed_query;
+        let mut recaptures = 0;
+        let mut repaired_pending = false;
+        loop {
+            let turn = self.application_request(|reply| {
+                ActorRequest::ApplicationCapturedRegistryTurn { reply }
+            })?;
+            let capture = match turn {
+                RegistryTurn::Deferred(state) => {
+                    return Err(SyncApplicationPageRequestError::QueryExecution(
+                        deferred_query_execution_error(&state),
+                    ));
+                }
+                RegistryTurn::Captured(capture) => capture,
+            };
+            // `operation` was released when `application_request` returned.
+            match shared.execute_metadata(&capture) {
+                ManagedMetadataOutcome::Answered(snapshot) => {
+                    return Ok(SyncApplicationNavigationOutcome::Loaded {
+                        reply: SyncApplicationNavigationReply::PropertyRegistry(snapshot),
+                    });
+                }
+                ManagedMetadataOutcome::NotAnswered(ManagedQueryOutcome::Stale)
+                    if recaptures < crate::managed_query::MAX_STALE_RECAPTURES =>
+                {
+                    recaptures += 1;
+                    shared.census.note_stale_recapture();
+                    continue;
+                }
+                ManagedMetadataOutcome::NotAnswered(ManagedQueryOutcome::PendingFailed {
+                    instance,
+                    ..
+                }) if !repaired_pending => {
+                    shared.census.note_failed_read();
+                    repaired_pending = true;
+                    // The capture owns the overlay handle the repair replaces;
+                    // it goes before the actor round trip, exactly as it does
+                    // on the result routes.
+                    drop(capture);
+                    self.repair_pending_projection(instance)?;
+                    continue;
+                }
+                ManagedMetadataOutcome::NotAnswered(outcome) => {
+                    return Err(managed_execution_error(&shared.census, outcome))
+                }
             }
         }
     }
@@ -10901,6 +10997,13 @@ enum ActorRequest {
         max_bytes: usize,
         reply: mpsc::Sender<Result<IrQueryTurn, SyncApplicationPageRequestError>>,
     },
+    /// The short actor half of §7.1's `query_registry` (RET2): readiness, the
+    /// accepted table's own fallible acquisition, and the capture the handle
+    /// reads off the actor. It takes no parameters — the registry snapshot has
+    /// none.
+    ApplicationCapturedRegistryTurn {
+        reply: mpsc::Sender<Result<RegistryTurn, SyncApplicationPageRequestError>>,
+    },
     LoadApplicationPage {
         request: SyncApplicationPageLoadRequest,
         reply:
@@ -11257,6 +11360,11 @@ fn run_actor_loop(
                 reply,
             } => {
                 let result = actor.application_captured_query_turn(&input, max_rows, max_bytes);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ApplicationCapturedRegistryTurn { reply } => {
+                let result = actor.application_captured_registry_turn();
                 let _ = reply.send(result);
                 false
             }
@@ -14906,11 +15014,6 @@ impl RuntimeActor {
                 )?;
                 SyncApplicationNavigationReply::PropertyFacets { facets, exceeded }
             }
-            SyncApplicationNavigationRequest::PropertyRegistry => {
-                SyncApplicationNavigationReply::PropertyRegistry(
-                    self.application_property_registry_snapshot_ready()?,
-                )
-            }
             // RET1/RET2: EVERY public Managed query command — §7.1's two IR
             // commands, `{{query}}`'s SimpleQuery, and the advanced datalog
             // query — is the handle's two-phase captured route
@@ -14924,10 +15027,17 @@ impl RuntimeActor {
             // and `AdvancedQuery`'s arm, which loaded EVERY page of the graph
             // through `application_all_query_pages_ready` before evaluating a
             // single clause, was the last one of that shape.
+            //
+            // RET2-Managed-Metadata added `PropertyRegistry` to the same group:
+            // §7.1's `query_registry` is the type information those commands
+            // are lowered under, and its actor arm hydrated every pending page
+            // through the merged registry builder and could serve a stale or
+            // empty table after a failed build.
             SyncApplicationNavigationRequest::SimpleQuery { .. }
             | SyncApplicationNavigationRequest::QueryRun { .. }
             | SyncApplicationNavigationRequest::QueryExplainEmpty { .. }
-            | SyncApplicationNavigationRequest::AdvancedQuery { .. } => {
+            | SyncApplicationNavigationRequest::AdvancedQuery { .. }
+            | SyncApplicationNavigationRequest::PropertyRegistry => {
                 return Err(SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_navigation_query_is_captured",
                 ))
@@ -16289,12 +16399,23 @@ impl RuntimeActor {
         published
     }
 
-    /// The registry snapshot the Managed walk coerces against (the merged table
-    /// while a suffix is pending). A refusal from the materialized read is
-    /// never a reason to answer with a half-built table: the last published
-    /// ACCEPTED snapshot stands — a coherent, honest, older answer, never a
-    /// merged table from some other pending revision — and an empty one is the
-    /// honest answer before the first build.
+    /// The registry the REMAINING merged-table readers coerce against (the
+    /// merged table while a suffix is pending). A refusal from the materialized
+    /// read is never a reason to answer with a half-built table: the last
+    /// published ACCEPTED snapshot stands — a coherent, honest, older answer,
+    /// never a merged table from some other pending revision — and an empty one
+    /// is the honest answer before the first build.
+    ///
+    /// **RET2-Managed-Metadata retired its PUBLIC consumer.** SPEC §7.1's
+    /// `query_registry` used to be `application_property_registry().snapshot()`,
+    /// which is exactly how the frontend's query type information could be a
+    /// stale or empty table after a read that actually failed. It is now the
+    /// captured off-actor read (`application_captured_registry`), which returns
+    /// a typed error instead. What is left here is one production consumer —
+    /// `application_export_query_subtrees_ready`, whose own migration is a later
+    /// packet — and the `#[cfg(test)]` walk oracles the parity gates compare
+    /// against. The fallback policy stays theirs and is deliberately NOT the
+    /// public route's.
     fn application_property_registry(&self) -> std::sync::Arc<crate::query::registry::Registry> {
         self.serve_application_property_registry(self.application_property_registry_ready())
     }
@@ -16401,20 +16522,7 @@ impl RuntimeActor {
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let overlay = match stamp.overlay_revision {
-            Some(required_revision) => {
-                let overlay = self
-                    .managed_local
-                    .as_ref()
-                    .and_then(|managed| managed.pending_overlay.clone())
-                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                Some(crate::managed_query::PendingOverlayCapture {
-                    required_revision,
-                    overlay,
-                })
-            }
-            None => None,
-        };
+        let overlay = self.pending_overlay_capture(&stamp)?;
         Ok(SimpleQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
                 job_epoch: self.managed_query.jobs.capture_epoch(),
@@ -16811,16 +16919,6 @@ impl RuntimeActor {
         ))
     }
 
-    /// SPEC §7.1 `query_registry`: the wire snapshot of the Managed registry.
-    /// The refusal policy is `application_property_registry`'s -- a refused
-    /// materialized read serves the last published table, never a half-built
-    /// one -- so this is the snapshot and nothing more.
-    fn application_property_registry_snapshot_ready(
-        &self,
-    ) -> Result<crate::query::ir::RegistrySnapshot, SyncApplicationPageRequestError> {
-        Ok(self.application_property_registry().snapshot())
-    }
-
     /// The selection tree and the row-shape request ONE IR execution runs
     /// under, or the complete answer when a refused binding leaves nothing
     /// honest to count (§Q14/N19).
@@ -17058,20 +17156,7 @@ impl RuntimeActor {
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let overlay = match stamp.overlay_revision {
-            Some(required_revision) => {
-                let overlay = self
-                    .managed_local
-                    .as_ref()
-                    .and_then(|managed| managed.pending_overlay.clone())
-                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                Some(crate::managed_query::PendingOverlayCapture {
-                    required_revision,
-                    overlay,
-                })
-            }
-            None => None,
-        };
+        let overlay = self.pending_overlay_capture(&stamp)?;
         Ok(IrQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
                 job_epoch: self.managed_query.jobs.capture_epoch(),
@@ -17093,6 +17178,91 @@ impl RuntimeActor {
                 key,
                 request,
                 report: resolved.report().clone(),
+            },
+        )))
+    }
+
+    /// The pending half of ANY capture this actor takes: the overlay the
+    /// off-actor read must open and the exact revision it must carry.
+    ///
+    /// One spelling for all three captured routes. `None` is "the accepted
+    /// frontier is the whole story"; a stamp that names a pending revision with
+    /// no overlay to read it from is the actor being unavailable for this read,
+    /// never a read that silently drops the suffix.
+    fn pending_overlay_capture(
+        &self,
+        stamp: &crate::managed_query::ManagedQueryStamp,
+    ) -> Result<Option<crate::managed_query::PendingOverlayCapture>, SyncApplicationPageRequestError>
+    {
+        let Some(required_revision) = stamp.overlay_revision else {
+            return Ok(None);
+        };
+        let overlay = self
+            .managed_local
+            .as_ref()
+            .and_then(|managed| managed.pending_overlay.clone())
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        Ok(Some(crate::managed_query::PendingOverlayCapture {
+            required_revision,
+            overlay,
+        }))
+    }
+
+    /// Phase one of the PUBLIC property-registry route (RET2, SPEC §7.1
+    /// `query_registry`): see `SyncRuntimeHandle::application_captured_registry`
+    /// for the whole route.
+    ///
+    /// A SHORT turn, and deliberately the same short turn the query routes
+    /// take: the readiness check, the query stamp (so a metadata read and a
+    /// result query taken at the same moment describe the same accepted
+    /// frontier, the same config and the same pending revision), the ACCEPTED
+    /// table through its existing cached fallible acquisition, and the pending
+    /// overlay handle. It performs NO whole-registry scan of its own beyond the
+    /// accepted cache's existing cold build, and it reconstructs no pending
+    /// page: the pending suffix is patched in off the actor, under the
+    /// snapshots the executor opens.
+    ///
+    /// `accepted_property_registry` is the fallible acquisition, not
+    /// `application_property_registry`: a failed metadata read must be an
+    /// error, because serving the last published table would answer today's
+    /// question with a table for another frontier.
+    fn application_captured_registry_turn(
+        &mut self,
+    ) -> Result<RegistryTurn, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
+            return Ok(RegistryTurn::Deferred(state));
+        }
+        let config = self.graph.config.parse_config();
+        // §4.4's execution day is carried for ONE reason: it is part of the
+        // query stamp, and the stamp is what makes a metadata read and a result
+        // query at the same opened state share one patched registry. The
+        // registry itself does not resolve dates.
+        let today = crate::date::JournalDate::today();
+        // The stamp comes FIRST, exactly as it does in the query turns, so the
+        // pending-repair status and the materialized read are consulted once
+        // and in the same order.
+        let stamp = self.managed_simple_query_stamp(&config, today)?;
+        let registry = self.accepted_property_registry()?;
+        // No stamp: a pending local suffix exists and NO overlay could be
+        // created for it. Bounded unavailability, exactly as for a query —
+        // never the accepted table served as if the suffix did not exist.
+        let Some(stamp) = stamp else {
+            return Err(query_unavailable(
+                crate::query::QueryUnavailableReason::ProjectionUnavailable,
+            ));
+        };
+        let database = self
+            .active_database()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let overlay = self.pending_overlay_capture(&stamp)?;
+        Ok(RegistryTurn::Captured(Box::new(
+            crate::managed_metadata::ManagedMetadataCapture {
+                job_epoch: self.managed_query.jobs.capture_epoch(),
+                path: database.path().to_path_buf(),
+                overlay,
+                stamp,
+                config,
+                registry,
             },
         )))
     }

@@ -26,6 +26,7 @@ pub mod graph_text_scope;
 pub mod html_sanitize;
 pub mod journal_feed;
 pub mod logbook;
+mod managed_metadata;
 mod managed_overlay;
 mod managed_query;
 mod managed_registry_patch;

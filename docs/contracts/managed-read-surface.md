@@ -27,6 +27,8 @@ adapter call edges.
 | application_block_referrers_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Merges Managed referrer index and hydrated pages. |
 | application_captured_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed driver for EVERY captured public query command — SPEC §7.1's two IR commands and the advanced datalog query: captured execution with `operation` released; bounded stale recapture, typed readiness, cancellation and failure, no traversal. |
 | application_captured_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Actor half of `query_run`/`query_explain_empty`/advanced datalog: §4.4 binding (IR directly, advanced through the ONE `query::resolve_advanced_source`), readiness, memo hit or a capture for off-actor SQL execution. |
+| application_captured_registry | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed driver for SPEC §7.1's PUBLIC `query_registry`: captured execution with `operation` released, over the SAME `managed_query::open_managed_read` acquisition a result query uses; bounded stale recapture, typed readiness/cancellation/read failure, exact-instance pending repair, and never fallback metadata. |
+| application_captured_registry_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Actor half of `query_registry`: readiness, the query stamp, the ACCEPTED table's own fallible cached acquisition and the pending overlay handle — a capture for the off-actor metadata read, with no merged rebuild and no pending page reconstruction on the actor. |
 | application_editor_blocks | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Sole Managed save-request block DTO constructor. |
 | application_editor_blocks_existing | `crates/tine-core/src/sync_runtime.rs` | adapter | application_editor_blocks | Existing-save exposed-key policy delegates to the shared builder. |
 | application_editor_blocks_new | `crates/tine-core/src/sync_runtime.rs` | adapter | application_editor_blocks | New-save generated-key policy delegates to the shared builder. |
@@ -67,10 +69,9 @@ adapter call edges.
 | application_preview_block_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed bounded-subtree preview boundary. |
 | application_projection_roots | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Owns the cached complete DocBlock view for a Managed page. |
 | application_property_facets_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed property-facet index plus overlay. |
-| application_property_registry | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Owns the Managed-only refusal policy for the property registry: a refused materialized read serves the last published snapshot rather than a half-built table (D-3 recovery). |
+| application_property_registry | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Owns the Managed-only refusal policy for the property registry: a refused materialized read serves the last published snapshot rather than a half-built table (D-3 recovery). RET2-Managed-Metadata retired its PUBLIC consumer; the remaining production consumer is `application_export_query_subtrees_ready`, plus the `#[cfg(test)]` walk oracles. |
 | application_property_registry_cache_key | `crates/tine-core/src/sync_runtime.rs` | necessary | — | The evidence stamp a registry snapshot was built from — accepted frontier pair plus `ParseConfig::digest()` — so an unchanged graph reuses the snapshot instead of rebuilding it per query (SPEC §6.2). Managed-only: it encodes the acceptance-sequence/pending-suffix rule the Direct Files side has no analogue for. |
-| application_property_registry_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed property-registry snapshot: the materialized owner-row stream masked by the unaccepted local overlay, merged with the overlay's own rows (SPEC §6.2 C4). |
-| application_property_registry_snapshot_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | SPEC §7.1 `query_registry` on the Managed side: the wire snapshot of the merged registry, carrying `application_property_registry`'s refusal policy (the last published table, never a half-built one). |
+| application_property_registry_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed property-registry snapshot: the materialized owner-row stream masked by the unaccepted local overlay, merged with the overlay's own rows (SPEC §6.2 C4). Since RET2-Managed-Metadata it serves query export and the test-only walk oracles only; the public `query_registry` request is the captured off-actor read (`application_captured_registry`). |
 | application_query_page_recency | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Computes recency from Managed path and graph config. |
 | application_query_plan_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed query-plan/index preparation boundary. |
 | application_request | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed application request boundary. |
@@ -106,6 +107,7 @@ adapter call edges.
 | application_advanced_query_ready | `crates/tine-core/src/sync_runtime.rs` | application_captured_query_turn | RET2-Managed-Advanced |
 | application_simple_query_pages_ready | `crates/tine-core/src/sync_runtime.rs` | execute_managed_query | RET2 |
 | application_query_page_journal | `crates/tine-core/src/sync_runtime.rs` | managed_query::execute_managed_query | RET2 |
+| application_property_registry_snapshot_ready | `crates/tine-core/src/sync_runtime.rs` | application_captured_registry_turn | RET2-Managed-Metadata |
 
 ## UUID ownership policy
 

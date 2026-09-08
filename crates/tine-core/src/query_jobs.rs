@@ -226,11 +226,9 @@ impl JobSlot<'_> {
         true
     }
 
-    /// Whether a drain has cancelled this job since it was admitted. The
-    /// production read observes cancellation through the snapshot's own sticky
-    /// flag (the next statement fails `Cancelled`); this is the slot's view,
-    /// for the drain tests.
-    #[cfg(test)]
+    /// Whether a drain has cancelled this job since it was admitted.
+    /// Snapshot statements also observe a sticky cancellation flag. This final
+    /// slot check covers cancellation after the last statement has completed.
     pub(crate) fn is_cancelled(&self) -> bool {
         self.id < self.owner.state.lock().unwrap().cancelled_below
     }

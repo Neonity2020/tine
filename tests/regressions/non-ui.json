@@ -2,6 +2,28 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PUBLIC-REGISTRY-CAPTURED-READ",
+ "title": "The public property-registry request reads the database and never serves stale or empty metadata",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 Managed public registry packet" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_registry_never_serves_stale_metadata_after_read_damage",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_registry_reads_snapshots_and_hydrates_no_page",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_registry_snapshot_equals_the_merged_oracle_over_every_shape",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_registry_reports_typed_execution_errors_and_never_falls_back",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_the_public_registry_reports_a_real_exhausted_job_owner",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_a_registry_drain_after_construction_cancels_the_answer_and_releases_handles",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_public_registry_captures_follow_the_opened_snapshot_not_the_capture",
+   "crates/tine-core/src/sync_runtime_tests.rs::ret2_an_acceptance_between_registry_capture_and_open_recaptures"
+  ],
+  "scenario": "query-engine.public-registry-captured-read",
+  "failBefore": "fail-before.log: with a pending property/type edit the public PropertyRegistry request ANSWERED after real accepted-projection read damage (rows=4 generation=1 equals_pre_edit_table=true), and the same request hydrated the pending page document and rebuilt the merged table on the actor (navigation_overlay_pending_path_loads=1, result_page_hydrations=1, property_registry_builds=1, registry_patches=0)"
+ },
+ "notes": "SPEC 7.1 query_registry was a serialized actor turn over the merged registry builder: it hydrated pending pages and, on a refused build, served the last published or empty table as if it were the answer. It is now the same captured off-actor read a result query takes, sharing managed_query::open_managed_read, with typed readiness/cancellation/read-failure and no published or memoized failure."
+},
+{
  "id": "REG-QE-PENDING-REGISTRY-OPENED-SNAPSHOT",
  "title": "Queued queries use property types from their own opened SQLite snapshot",
  "family": "query-engine",
