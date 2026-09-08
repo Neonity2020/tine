@@ -743,8 +743,6 @@ await withApp(2, async (browser) => {
     );
   }
   await openPage(browser, "P6 controls");
-  await openSheet(browser);
-  await selectP6Rows(browser, [0]);
 
   // A fresh profile offers the Guide; this harness may also show the reminder
   // for its deliberately forced software rendering. Acknowledge only those
@@ -762,6 +760,9 @@ await withApp(2, async (browser) => {
       { timeout: 5_000, timeoutMsg: `the dismissed startup notice remained: ${message}` },
     );
   }
+
+  await openSheet(browser);
+  await selectP6Rows(browser, [0]);
 
   const rowGeometry = await browser.execute(() => {
     const row = document.querySelector('.qs-sheet > .qs-rows > [data-qs-parent=""][data-row-index="0"]');
