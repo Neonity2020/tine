@@ -38,6 +38,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP = process.env.TINE_APP || path.join(ROOT, "target/release/tine");
 const TD = process.env.TAURI_DRIVER || (process.env.CARGO_HOME ? path.join(process.env.CARGO_HOME, "bin", "tauri-driver") : "tauri-driver");
 const DRIVER_BASE = Number(process.env.E2E_DRIVER_PORT || 4496);
+const disabledAlphaP6 = "- {{tine-query @block and off(content like '%alpha%') and content like '%beta%' and content like '%gamma%' and content like '%delta%'}}";
+const savedDisabledGroupP6 = "- {{tine-query @block and content like '%beta%' and off(not (content like '%gamma%' or content like '%delta%')) and content like '%alpha%'}}";
 const NATIVE_BASE = Number(process.env.E2E_NATIVE_PORT || 4497);
 const TMP_ROOT = path.resolve(process.env.E2E_TMP_ROOT || process.env.TMPDIR || "/tmp");
 fs.mkdirSync(TMP_ROOT, { recursive: true });
@@ -167,6 +169,9 @@ async function p6Root(browser) {
     return items.map((element) => ({
       identity: identify(element),
       group: element.querySelector(":scope > .qs-group > .qs-group-header .qs-group-op")?.textContent?.trim() ?? null,
+      ownEnabled: element.matches(".qs-row")
+        ? element.querySelector(":scope > .qs-enabled")?.getAttribute("aria-checked") ?? null
+        : element.querySelector(":scope > .qs-group > .qs-group-header .qs-enabled")?.getAttribute("aria-checked") ?? null,
       children: [...element.querySelectorAll(":scope > .qs-group > .qs-rows > [data-qs-parent]")].map(identify),
     }));
   });
@@ -179,6 +184,42 @@ async function waitForP6Root(browser, predicate, message) {
     return predicate(latest);
   }, { timeout: 10_000, timeoutMsg: message });
   return latest;
+}
+
+/** An edit made inside the sheet must preserve that editing session, including
+ *  a printer dialect change. Observe a resting replacement explicitly so an
+ *  unexpected dismissal cannot be hidden by the harness reopening it. */
+async function settleP6SheetAfterSourceChange(browser, predicate, message) {
+  let lifecycle = null;
+  let latestShell = null;
+  try {
+    await browser.waitUntil(async () => {
+      latestShell = await browser.execute(() => ({
+        sheet: !!document.querySelector(".qs-sheet"),
+        gear: !!document.querySelector(".qs-gear"),
+        expanded: document.querySelector(".qs-gear")?.getAttribute("aria-expanded") ?? null,
+      }));
+      if (latestShell.sheet) {
+        const items = await p6Root(browser);
+        if (!predicate(items)) return false;
+        lifecycle = "kept-open";
+        return true;
+      }
+      if (latestShell.gear && latestShell.expanded === "false") {
+        lifecycle = "unexpectedly-closed";
+        return true;
+      }
+      return false;
+    }, { timeout: 10_000, timeoutMsg: message });
+  } catch (error) {
+    const root = await p6Root(browser);
+    const sheet = await browser.execute(() => document.querySelector(".qs-sheet")?.outerHTML ?? null);
+    throw new Error(`${String(error)}; shell=${JSON.stringify(latestShell)}; root=${JSON.stringify(root)}; sheet=${sheet}`);
+  }
+  if (lifecycle === "unexpectedly-closed") {
+    fail(`an in-sheet edit dismissed its editor: ${JSON.stringify(latestShell)}`);
+  }
+  return lifecycle;
 }
 
 async function selectP6Rows(browser, indices) {
@@ -461,13 +502,24 @@ await withApp(0, async (browser) => {
   // restores it. Root replacement must clear the selection that named the old
   // revision rather than silently moving that selection to a different row.
   await firstEnabled.click();
-  await waitForP6Source(browser, (line) => /\(off\s+"alpha"\)/i.test(line), "disabling alpha never reached the query file");
+  await waitForP6Source(browser, (line) => line === disabledAlphaP6, "disabling alpha did not persist as the engine's TQL Off form");
+  const disableLifecycle = await settleP6SheetAfterSourceChange(
+    browser,
+    (items) => items.map((item) => item.identity).join(",") === "alpha,beta,gamma,delta"
+      && items[0]?.ownEnabled === "false",
+    "the saved TQL root did not expose disabled alpha",
+  );
   const disabled = await browser.$(`${firstRow} .qs-enabled`);
   if ((await disabled.getAttribute("aria-checked")) !== "false") fail("alpha's own enabled switch did not read disabled after save");
   if ((await browser.$$(".qs-sheet .qs-select:checked")).length !== 0) fail("a saved root replacement retained a stale selection");
   await browser.keys(["Control", "z"]);
   await waitForP6Source(browser, (line) => line === initialP6, "one Ctrl+Z did not restore the enabled query bytes");
-  await waitForP6Root(browser, (items) => items.map((item) => item.identity).join(",") === "alpha,beta,gamma,delta", "undo did not restore the flat P6 rows");
+  const undoLifecycle = await settleP6SheetAfterSourceChange(
+    browser,
+    (items) => items.map((item) => item.identity).join(",") === "alpha,beta,gamma,delta"
+      && items[0]?.ownEnabled === "true",
+    "undo did not restore the enabled flat P6 rows",
+  );
 
   // The handle's arrow operation is the accessible equivalent of drag. Focus
   // follows the MOVED alpha row, so the second Down continues from its new
@@ -592,8 +644,18 @@ await withApp(0, async (browser) => {
   await (await browser.$(`${finalGroup} > .qs-group-header .qs-enabled`)).click();
   await waitForP6Source(
     browser,
-    (line) => /\(and\s+"beta"\s+\(off\s+\(not\s+\(or\s+"gamma"\s+"delta"\)\)\)\s+"alpha"\)/i.test(line),
+    (line) => line === savedDisabledGroupP6,
     "disabling the final none-of group never reached the file",
+  );
+  const finalDisableLifecycle = await settleP6SheetAfterSourceChange(
+    browser,
+    (items) => items.length === 3
+      && items[0]?.identity === "beta"
+      && items[1]?.group === "none of"
+      && items[1]?.ownEnabled === "false"
+      && items[1]?.children.join(",") === "gamma,delta"
+      && items[2]?.identity === "alpha",
+    "the saved TQL root did not expose the disabled none-of group",
   );
   const disabledGroupState = await browser.execute((selector) => {
     const group = document.querySelector(selector);
@@ -626,7 +688,7 @@ await withApp(0, async (browser) => {
   if (bounded.rows > 8 || bounded.groups > 3) fail(`the sheet grew with the nesting: ${JSON.stringify(bounded)}`);
   if (bounded.chips < 1) fail("the folded subtree has no ⟨advanced⟩ row to edit or remove");
   await browser.keys(["Escape"]);
-  console.log(`sheet: resting=${JSON.stringify(resting)} after=${JSON.stringify(after)} narrow=${JSON.stringify(narrow)} p6=${JSON.stringify({ flat, allGrouped, anyGrouped, noneGrouped, savedP6 })} deep=${JSON.stringify(bounded)}`);
+  console.log(`sheet: resting=${JSON.stringify(resting)} after=${JSON.stringify(after)} narrow=${JSON.stringify(narrow)} p6=${JSON.stringify({ flat, allGrouped, anyGrouped, noneGrouped, savedP6, lifecycle: { disableLifecycle, undoLifecycle, finalDisableLifecycle } })} deep=${JSON.stringify(bounded)}`);
 });
 
 // --- 8. restart: what landed on disk still says what the sheet said ---------
@@ -652,7 +714,7 @@ await withApp(1, async (browser) => {
   "the saved P6 query did not reopen as beta / none-of(gamma,delta) / alpha");
   await waitForP6Source(
     browser,
-    (line) => /\(and\s+"beta"\s+\(off\s+\(not\s+\(or\s+"gamma"\s+"delta"\)\)\)\s+"alpha"\)/i.test(line),
+    (line) => line === savedDisabledGroupP6,
     "the reopened P6 structure was absent from the file",
   );
   const reopenedDisabled = await browser.execute(() => ({
