@@ -744,13 +744,15 @@ await withApp(2, async (browser) => {
   }
   await openPage(browser, "P6 controls");
 
-  // A fresh profile offers the Guide; this harness may also show the reminder
-  // for its deliberately forced software rendering. Acknowledge only those
-  // named startup notices through Dismiss before probing the controls beneath.
+  // The fresh profile offers the Guide; withApp deliberately tears down its
+  // earlier sessions, so the restart also reports that unclean exit. Software
+  // rendering is forced by this harness. Acknowledge only these named setup
+  // notices through Dismiss, before opening a popover an outside click closes.
   // Query/save errors remain visible and can still fail reachability.
   for (const toast of await browser.$$(".toast")) {
     const message = await toast.$(".toast-msg").getText();
     if (message !== "New: in-app Guide — learn Sheets, formulas & queries."
+        && message !== "Tine did not close cleanly last time. A privacy-safe diagnostic report is available."
         && !message.startsWith("Software rendering is on (")) continue;
     console.log(`narrow setup: dismissing startup notice: ${message}`);
     await toast.$(".toast-close").click();
