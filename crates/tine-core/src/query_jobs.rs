@@ -62,6 +62,8 @@ struct JobState {
     waiting_started: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)]
     drain_waiting_started: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    before_release: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 pub(crate) struct QueryJobOwner {
@@ -111,6 +113,8 @@ impl QueryJobOwner {
                 waiting_started: None,
                 #[cfg(test)]
                 drain_waiting_started: None,
+                #[cfg(test)]
+                before_release: None,
             }),
             changed: Condvar::new(),
             capacity: capacity.max(1),
@@ -204,6 +208,16 @@ impl QueryJobOwner {
     }
 
     #[cfg(test)]
+    pub(crate) fn pause_next_release_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, observed) = std::sync::mpsc::channel();
+        let (resume, proceed) = std::sync::mpsc::channel();
+        self.state.lock().unwrap().before_release = Some((reached, proceed));
+        (observed, resume)
+    }
+
+    #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
         self.state.lock().unwrap().active.len()
     }
@@ -236,6 +250,14 @@ impl JobSlot<'_> {
 
 impl Drop for JobSlot<'_> {
     fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            let pause = self.owner.state.lock().unwrap().before_release.take();
+            if let Some((reached, proceed)) = pause {
+                reached.send(()).unwrap();
+                proceed.recv().unwrap();
+            }
+        }
         let mut state = self.owner.state.lock().unwrap();
         state.handles.retain(|(id, _)| *id != self.id);
         state.active.remove(&self.id);
