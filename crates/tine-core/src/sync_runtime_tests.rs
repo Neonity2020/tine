@@ -31765,6 +31765,46 @@ fn r4a_a_real_frontier_advance_between_capture_and_open_is_a_stale_recapture() {
     ));
 }
 
+/// A captured request is already bound to the old projection lifecycle even
+/// when its worker has not acquired capacity yet. A replacement drain must
+/// invalidate that capture, including when the replacement has the same stamp.
+#[test]
+fn ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain() {
+    let (_fixture, handle) = r4b_reopened("ret2-capture-drain", 0x4a51);
+    let capture = match handle
+        .application_request(|reply| ActorRequest::ApplicationSimpleQueryTurn {
+            query: R4B_QUERY.to_owned(),
+            max_rows: R4B_ROWS,
+            max_bytes: R4B_BYTES,
+            reply,
+        })
+        .unwrap()
+    {
+        SimpleQueryTurn::Captured(capture) => capture,
+        _ => panic!("the first accepted-only query must capture"),
+    };
+    assert!(capture.overlay.is_none());
+    let shared = &handle.inner.managed_query;
+    shared.jobs.cancel_all_and_drain();
+    let outcome = shared.execute(&capture);
+    let cancelled = matches!(
+        outcome,
+        crate::managed_query::ManagedQueryOutcome::Cancelled
+    );
+    let fresh = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
+    let oracle = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
+    r4a_assert_same("a new capture can execute after the drain", &fresh, &oracle);
+    assert!(fresh.total > 0);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    assert!(
+        cancelled,
+        "a pre-drain capture must never enter a new admission epoch"
+    );
+}
+
 /// A drain reaches a statement mid-flight: the executor reports `Cancelled`,
 /// nothing is counted, and the drain does not return until the job has
 /// released its slot (I-21). This is the executor half of

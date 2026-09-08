@@ -16028,6 +16028,7 @@ impl RuntimeActor {
         };
         Ok(SimpleQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
+                job_epoch: self.managed_query.jobs.capture_epoch(),
                 path: database.path().to_path_buf(),
                 overlay,
                 graph_root: self.graph.root.clone(),
@@ -16588,6 +16589,7 @@ impl RuntimeActor {
         };
         Ok(IrQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
+                job_epoch: self.managed_query.jobs.capture_epoch(),
                 path: database.path().to_path_buf(),
                 overlay,
                 graph_root: self.graph.root.clone(),

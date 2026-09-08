@@ -107,6 +107,7 @@ pub(crate) struct PendingOverlayCapture {
 /// query. Everything the executor reads is HERE; it touches no actor state,
 /// no graph mutex and no live registry after the turn ends.
 pub(crate) struct ManagedQueryCapture {
+    pub(crate) job_epoch: crate::query_jobs::QueryJobEpoch,
     /// The accepted projection's SQLite file.
     pub(crate) path: PathBuf,
     /// The pending overlay to merge with, when the actor held a pending suffix.
@@ -343,7 +344,7 @@ pub(crate) fn execute_managed_query(
 ) -> ManagedQueryOutcome {
     // Capacity BEFORE any transaction (plan §2B): a job waiting for a slot
     // holds its request intent and pins no WAL page.
-    let slot = match owner.acquire_within(wait) {
+    let slot = match owner.acquire_at_within(capture.job_epoch, wait) {
         Admission::Slot(slot) => slot,
         Admission::Busy => return ManagedQueryOutcome::Busy,
         Admission::Cancelled => return ManagedQueryOutcome::Cancelled,
@@ -1464,6 +1465,7 @@ is `Failed` too rather than answered twice",
         let profile = ConstructionProfile::from_view(&view);
         let config = crate::config::Config::default();
         let capture = ManagedQueryCapture {
+            job_epoch: owner.capture_epoch(),
             path: PathBuf::from("/nonexistent/projection.sqlite"),
             overlay: None,
             graph_root: PathBuf::from("/nonexistent"),

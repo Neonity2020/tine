@@ -35,9 +35,8 @@ use tine_storage::sqlite::PhysicalProjectionQueryCancellation;
 pub(crate) const DEFAULT_QUERY_JOB_CAPACITY: usize = 2;
 
 /// How long a job waits for a slot before it gives up. A slot that stays busy
-/// this long is a statement that should have been interrupted, not a queue
-/// worth extending; the caller answers through its recovery path (the walk)
-/// and counts the fallback, exactly as it does for a not-ready projection.
+/// this long produces typed busy readiness; it never selects a different
+/// evaluator.
 pub(crate) const QUERY_JOB_WAIT: Duration = Duration::from_secs(30);
 
 struct JobState {
@@ -67,6 +66,11 @@ pub(crate) struct QueryJobOwner {
     changed: Condvar,
     capacity: usize,
 }
+
+/// The admission generation captured with immutable query inputs. Ordinary
+/// edits do not change it; projection lifecycle drains do.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryJobEpoch(u64);
 
 /// The outcome of asking for a slot.
 pub(crate) enum Admission<'a> {
@@ -110,11 +114,20 @@ impl QueryJobOwner {
     }
 
     pub(crate) fn acquire_within(&self, wait: Duration) -> Admission<'_> {
+        self.acquire_at_within(self.capture_epoch(), wait)
+    }
+
+    pub(crate) fn capture_epoch(&self) -> QueryJobEpoch {
+        QueryJobEpoch(self.state.lock().unwrap().drain_epoch)
+    }
+
+    /// Refuse captures invalidated before their worker began waiting as well
+    /// as jobs invalidated while queued. No transaction is opened here.
+    pub(crate) fn acquire_at_within(&self, epoch: QueryJobEpoch, wait: Duration) -> Admission<'_> {
         let deadline = Instant::now() + wait;
         let mut state = self.state.lock().unwrap();
-        let epoch = state.drain_epoch;
         loop {
-            if state.closed || state.drain_epoch != epoch {
+            if state.closed || state.drain_epoch != epoch.0 {
                 return Admission::Cancelled;
             }
             if state.active < self.capacity {

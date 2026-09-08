@@ -893,6 +893,13 @@ acceptance sequence the capture's `open_managed` validates inside its read
 transaction, so a snapshot that opens `Current` was captured before any
 pending page it masks could have moved.
 
+Managed captures include the query owner's admission epoch from their actor
+turn. A projection lifecycle drain cancels those captures even when their
+workers have not started waiting for capacity. Newly captured work can enter
+the new epoch; ordinary edits do not change it. The regression
+`ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain`
+checks cancellation before snapshot opening and a fresh SQL answer afterward.
+
 **A captured pending query is answered off the actor from BOTH databases.**
 The executor opens the overlay first, at the flushed revision the capture
 required or later, and only then opens the accepted file and validates the

@@ -2,6 +2,19 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-CAPTURE-DRAIN-EPOCH",
+ "title": "Projection drains invalidate captures before their workers acquire capacity",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager lifecycle review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain"],
+  "scenario": "query-engine.capture-drain-epoch",
+  "failBefore": "capture-drain-before.log: accepted-only capture executes after its owner was drained"
+ },
+ "notes": "Capture-time epoch is checked under the admission mutex before capacity or snapshots. Fresh captures can execute after drain. This does not by itself implement automatic recovery scheduling."
+},
+{
  "id": "REG-QE-OVERLAY-INSTANCE-MEMO",
  "title": "Recreated pending projections cannot reuse cached results or registry types from an older instance",
  "family": "query-engine",
