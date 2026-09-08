@@ -2,6 +2,18 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PENDING-REPAIR-PUBLIC-ROUTES",
+ "title": "Pending projection repair retries public SQL routes and terminates failed creation",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 automatic pending query recovery" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_automatically_recovers_the_captured_public_routes", "crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_creation_failure_is_terminal_for_later_queries", "crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_install_uses_authority_after_acceptance"],
+  "scenario": "query-engine.pending-repair-public-routes"
+ },
+ "notes": "Real missing-file recovery for IR, Explain and advanced SQL; persistent file-creation damage returns unavailability without automatic reattempt; acceptance between repair capture and installation cannot resurrect pending rows."
+},
+{
  "id": "REG-QE-PENDING-REPAIR-ACTOR-PROTOCOL",
  "title": "Pending projection reconstruction preserves concurrent edits and candidate teardown",
  "family": "query-engine",
@@ -11,7 +23,7 @@
   "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_restores_a_missing_projection_without_document_hydration", "crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_leaves_actor_edits_responsive_while_old_jobs_drain", "crates/tine-core/src/sync_runtime_tests.rs::ret2_shutdown_cleans_a_registered_but_uninstalled_repair_candidate"],
   "scenario": "query-engine.pending-repair-actor-protocol"
  },
- "notes": "Exercises explicit protocol entry and real SQL afterward. Automatic query-failure retry is not yet connected. Further acceptance/rename/config replacement interleavings remain campaign gates."
+ "notes": "Exercises automatic simple-query repair and explicit lifecycle protocol entry with real SQL afterward. Further acceptance/rename/config replacement interleavings remain campaign gates."
 },
 {
  "id": "REG-QE-PENDING-REPAIR-OWNERSHIP",
@@ -139,18 +151,18 @@
 },
 {
  "id": "REG-QE-FAILED-PENDING-OVERLAY-NOT-BUSY",
- "title": "A vanished or failed pending query projection reports a bounded error instead of endless readiness",
+ "title": "A vanished pending query projection repairs once instead of waiting endlessly",
  "family": "query-engine",
  "sources": { "issues": [], "commits": [], "internal": "RET2 manager review" },
  "platforms": ["all"],
  "layer": "rust-core",
  "status": "covered",
  "coverage": {
-  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::r5a_an_unopenable_overlay_is_a_bounded_failure", "crates/tine-core/src/managed_overlay.rs::tests::open_creates_a_fresh_file_and_close_deletes_it"],
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::r5a_an_unopenable_overlay_is_repaired_once_without_traversal", "crates/tine-core/src/managed_overlay.rs::tests::open_creates_a_fresh_file_and_close_deletes_it"],
   "scenario": "query-engine.failed-pending-overlay",
   "failBefore": "overlay-classification-before.log: vanished file reports NotReady(Busy), expected Unavailable(ReadFailed)"
  },
- "notes": "Only live unfinished work is retryable readiness. Tests also stop the actual overlay worker and verify failed channel detection. Automatic projection reconstruction remains a separate campaign recovery obligation."
+ "notes": "Only live unfinished work is retryable readiness. The original fail-before records the earlier failure-classification step; public queries now repair a vanished overlay once and answer through SQL. Persistent creation failure is covered by REG-QE-PENDING-REPAIR-PUBLIC-ROUTES. Tests also stop the actual overlay worker and verify failed channel detection."
 },
 {
  "id": "REG-QE-P1D-PERSISTENT-CACHE-RECOVERY",

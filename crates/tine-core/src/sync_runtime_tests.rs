@@ -31109,17 +31109,94 @@ fn ret2_pending_repair_restores_a_missing_projection_without_document_hydration(
         .reset_managed_application_query_instrumentation()
         .unwrap();
     fs::remove_file(&path).unwrap();
-    assert!(r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).is_err());
-    // Exercise the real handle/actor protocol explicitly. Automatic failure
-    // retry in the common query driver is a subsequent integration step.
-    handle.repair_pending_projection(old.instance).unwrap();
+    let actual = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
     let (_, repaired) = r5a_overlay(&handle);
     assert_ne!(old.instance, repaired.instance);
-    let actual = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
     r4a_assert_same("repaired pending projection", &actual, &expected);
     let work = handle.managed_application_query_instrumentation().unwrap();
     assert_eq!(work.metadata_page_hydrations, 0, "{work:?}");
     assert_eq!(work.result_page_hydrations, 0, "{work:?}");
+}
+
+#[test]
+fn ret2_pending_repair_automatically_recovers_the_captured_public_routes() {
+    let fixture = r5a_fixture("ret2-repair-public", 0x5a52);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO public repair witness");
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+    let context = crate::query::ir::ExecutionContext::none();
+    for route in 0..3 {
+        let run = || match route {
+            0 | 1 => serde_json::to_value(
+                ret2_ir_navigate(&handle, &query, &view, &context, route == 1).unwrap(),
+            )
+            .unwrap(),
+            _ => serde_json::to_value(
+                ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R5A_ROWS, R5A_BYTES)
+                    .unwrap(),
+            )
+            .unwrap(),
+        };
+        let expected = run();
+        let (path, old) = r5a_overlay(&handle);
+        handle.clear_application_simple_query_memo().unwrap();
+        handle.reset_managed_query_census();
+        fs::remove_file(path).unwrap();
+        assert_eq!(run(), expected, "public route {route}");
+        assert_ne!(r5a_overlay(&handle).1.instance, old.instance);
+        let census = handle.managed_query_census();
+        assert_eq!(census.failed_reads, 1, "{census:?}");
+        assert_eq!(census.fallback_reads, 0, "{census:?}");
+    }
+}
+
+#[test]
+fn ret2_pending_repair_creation_failure_is_terminal_for_later_queries() {
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    let fixture = r5a_fixture("ret2-repair-persistent", 0x5a53);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO persistent repair witness");
+    let (path, _) = r5a_overlay(&handle);
+    handle.clear_application_simple_query_memo().unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let expected = QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed);
+    let error = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
+    assert_query_execution_error("creation refused", &error, expected);
+    assert_eq!(
+        handle.inner.managed_query.pending_repair.status(),
+        crate::managed_overlay::PendingRepairStatus::Failed
+    );
+    // Removing the fault cannot silently start another attempt on the next
+    // frontend request. Only an explicit lifecycle reset may reopen it.
+    fs::remove_dir(&path).unwrap();
+    let error = ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R5A_ROWS, R5A_BYTES)
+        .unwrap_err();
+    assert_query_execution_error("later request", &error, expected);
+    assert!(!path.exists());
+}
+
+#[test]
+fn ret2_pending_repair_install_uses_authority_after_acceptance() {
+    let fixture = r5a_fixture("ret2-repair-acceptance", 0x5a54);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO acceptance repair witness");
+    let (_, old) = r5a_overlay(&handle);
+    let start = handle
+        .application_request(|reply| ActorRequest::BeginPendingProjectionRepair {
+            instance: old.instance,
+            reply,
+        })
+        .unwrap()
+        .unwrap();
+    drain_managed_local(&handle);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    handle.complete_pending_projection_repair(start).unwrap();
+    assert!(r5a_overlay(&handle).1.pending_paths.is_empty());
+    let actual = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    let expected = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    assert!(actual.total > 0);
+    r4a_assert_same("accepted during pending repair", &actual, &expected);
 }
 
 #[test]
@@ -32870,10 +32947,10 @@ fn r5a_an_accepted_advance_between_the_two_opens_is_a_stale_recapture() {
     ));
 }
 
-/// A vanished overlay cannot become ready by waiting. Remove its files before
-/// the read-only open and require a bounded failure, with no traversal or memo.
+/// A vanished overlay cannot become ready by waiting. Remove all of its files
+/// between capture and open, then require one repair and an exact SQL answer.
 #[test]
-fn r5a_an_unopenable_overlay_is_a_bounded_failure() {
+fn r5a_an_unopenable_overlay_is_repaired_once_without_traversal() {
     let fixture = r5a_fixture("r5a-overlay-unavailable", 0x5a08);
     let handle = r4a_reopen(&fixture);
     r5a_pending_append(&handle, "notes/Delta.md", "TODO r5a unavailable witness");
@@ -32895,20 +32972,14 @@ fn r5a_an_unopenable_overlay_is_a_bounded_failure() {
 
     handle.clear_application_simple_query_memo().unwrap();
     handle.reset_managed_query_census();
-    let error = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap_err();
+    let answer = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
     crate::managed_query::set_before_managed_open_hook(None);
-    // Distinguish this failed read from a live worker waiting to flush.
-    assert_query_execution_error(
-        "an overlay that vanished under the executor",
-        &error,
-        crate::query::QueryExecutionError::Unavailable(
-            crate::query::QueryUnavailableReason::ReadFailed,
-        ),
-    );
+    let answer = answer.unwrap();
+    r4a_assert_same("overlay vanished between capture and open", &answer, &walk);
     assert_eq!(
         r5a_census(&handle),
-        (0, 0, 0, 1, 0),
-        "an unopenable overlay reads no statement and no longer counts a fallback"
+        (1, 1, 0, 1, 0),
+        "one failed open, followed by one pending SQL read and no traversal"
     );
     assert!(
         walk.total > 0,

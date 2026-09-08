@@ -3658,7 +3658,7 @@ fn managed_execution_error(
         ManagedQueryOutcome::Cancelled => {
             SyncApplicationPageRequestError::QueryExecution(QueryExecutionError::Cancelled)
         }
-        ManagedQueryOutcome::Failed(_) => {
+        ManagedQueryOutcome::Failed(_) | ManagedQueryOutcome::PendingFailed { .. } => {
             census.note_failed_read();
             query_unavailable(QueryUnavailableReason::ReadFailed)
         }
@@ -4808,9 +4808,8 @@ impl SyncRuntimeHandle {
     /// The Managed simple-query route (R4, SPEC §5.9).
     ///
     /// Phase one is an actor turn that holds `operation` exactly as every
-    /// navigation request does and returns either an answer (deferred turn,
-    /// memo hit, `Plan::Empty`, or the masked walk an actor holding a pending
-    /// suffix takes) or a [`crate::managed_query::ManagedQueryCapture`]. Phase
+    /// navigation request does and returns a deferred turn, an answer (memo hit
+    /// or `Plan::Empty`), or a [`crate::managed_query::ManagedQueryCapture`]. Phase
     /// two runs [`crate::managed_query::execute_managed_query`] on the CALLING
     /// thread — the Tauri `spawn_blocking` thread or the test thread, never a
     /// new one — after `application_request` has released `operation`, so the
@@ -4841,6 +4840,7 @@ impl SyncRuntimeHandle {
         use crate::managed_query::ManagedQueryOutcome;
         let shared = &self.inner.managed_query;
         let mut recaptures = 0;
+        let mut repaired_pending = false;
         loop {
             let turn =
                 self.application_request(|reply| ActorRequest::ApplicationSimpleQueryTurn {
@@ -4896,6 +4896,13 @@ impl SyncRuntimeHandle {
                     shared.census.note_stale_recapture();
                     continue;
                 }
+                ManagedQueryOutcome::PendingFailed { instance, .. } if !repaired_pending => {
+                    shared.census.note_failed_read();
+                    repaired_pending = true;
+                    drop(capture);
+                    self.repair_pending_projection(instance)?;
+                    continue;
+                }
                 outcome => return Err(managed_execution_error(&shared.census, outcome)),
             }
         }
@@ -4943,6 +4950,7 @@ impl SyncRuntimeHandle {
             }
         };
         let mut recaptures = 0;
+        let mut repaired_pending = false;
         loop {
             let turn =
                 self.application_request(|reply| ActorRequest::ApplicationCapturedQueryTurn {
@@ -5036,6 +5044,13 @@ impl SyncRuntimeHandle {
                 {
                     recaptures += 1;
                     shared.census.note_stale_recapture();
+                    continue;
+                }
+                ManagedQueryOutcome::PendingFailed { instance, .. } if !repaired_pending => {
+                    shared.census.note_failed_read();
+                    repaired_pending = true;
+                    drop(capture);
+                    self.repair_pending_projection(instance)?;
                     continue;
                 }
                 outcome => return Err(managed_execution_error(&shared.census, outcome)),
@@ -16466,7 +16481,7 @@ impl RuntimeActor {
         }
         // R5b: a pending suffix is part of the stamp, not a reason to have
         // none — its overlay revision. Without an overlay (creation failed)
-        // the pending state has no stamp and every pending query walks.
+        // the pending state has no stamp and the query reports unavailability.
         let (overlay_instance, overlay_revision) = match self.managed_local.as_ref() {
             Some(managed) if !managed.latest_projection_frames.is_empty() => {
                 match managed.pending_overlay.as_ref() {

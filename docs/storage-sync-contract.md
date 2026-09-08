@@ -918,7 +918,7 @@ slots without registered SQLite handles. New admissions remain live and cannot
 extend that fence's wait. Existing `cancel_all_and_drain` callers additionally
 retain their full-idle barrier. The barrier test
 `a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions` pins this
-distinction. Automatic pending recovery scheduling is a separate integration.
+distinction.
 
 `PendingOverlayRepair` owns the old instance and any uninstalled replacement
 while preparation runs under a capacity guard. Registration transfers teardown
@@ -936,8 +936,18 @@ page between requests or during idle work, using the existing materialization
 producer. Retirement covers both the current overlay and an uninstalled repair
 candidate before job drainage; cleanup follows drainage. Tests exercise a real
 missing file, an edit while an old query slot is held, and shutdown before
-candidate installation. The protocol is not yet triggered automatically by the
-common query failure handler.
+candidate installation. Simple and captured public query routes trigger this
+protocol once per request when opening a pending projection fails, identifying
+the exact failed instance. Execution releases its snapshots and capacity before
+repair begins. Accepted-file failures and cancellation do not trigger pending
+repair. Queries then recapture; unfinished reconstruction reports typed
+readiness, while another failed read reports unavailability. No failed attempt
+is memoized. Tests remove the real file beneath simple, IR, Explain and advanced
+routes and compare their repaired SQL answers with the undamaged answers.
+An actual creation failure remains terminal for later requests even after the
+filesystem obstruction is removed; lifecycle cleanup is required before a new
+attempt. Acceptance between begin and install cannot resurrect accepted rows
+in the pending database: installation derives its paths from current authority.
 
 Overlay teardown serializes worker join and file removal once per instance.
 Repeated close calls on a retained old instance cannot remove a replacement at

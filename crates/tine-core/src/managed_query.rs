@@ -200,8 +200,8 @@ impl ManagedQueryAnswer {
     }
 }
 
-/// What one execution attempt produced. There is no fifth state: an attempt
-/// answers, or the handle re-captures (`Stale`), or the public route reports a
+/// What one execution attempt produced. An attempt answers, requests a bounded
+/// pending repair, or the handle re-captures (`Stale`), or the public route reports a
 /// typed `query::QueryExecutionError` (RET2 — the walk that used to answer the
 /// remaining states is gone). The doc comments on the variants below are the
 /// EXECUTOR's view; `sync_runtime::managed_execution_error` owns how each one
@@ -224,6 +224,9 @@ pub(crate) enum ManagedQueryOutcome {
     /// Managed read surfaces as an error, exactly as a failed materialized
     /// read does today; there is no walk fallback for it. Counted.
     Failed(&'static str),
+    /// Opening this pending projection failed. The handle may rebuild this
+    /// exact disposable instance once, after execution releases its readers.
+    PendingFailed { instance: u64, reason: &'static str },
 }
 
 /// Test-visible counters for the accepted route, owned by the handle so they
@@ -353,6 +356,11 @@ pub(crate) fn execute_managed_query(
     // transaction BEFORE `slot`'s `Drop` releases the capacity: a drain that
     // observes a free slot can never still be waiting on this transaction.
     let outcome = execute_on_slot(capture, &slot, census, patched);
+    let outcome = if slot.is_cancelled() {
+        ManagedQueryOutcome::Cancelled
+    } else {
+        outcome
+    };
     drop(slot);
     outcome
 }
@@ -594,7 +602,12 @@ fn execute_pending_on_slot(
     {
         OverlayOpen::Snapshot { snapshot, state } => (snapshot, state),
         OverlayOpen::Pending => return ManagedQueryOutcome::Busy,
-        OverlayOpen::Failed(reason) => return ManagedQueryOutcome::Failed(reason),
+        OverlayOpen::Failed(reason) => {
+            return ManagedQueryOutcome::PendingFailed {
+                instance: pending.overlay.instance(),
+                reason,
+            };
+        }
         OverlayOpen::Stale => return ManagedQueryOutcome::Stale,
         OverlayOpen::Closed => return ManagedQueryOutcome::Cancelled,
     };
