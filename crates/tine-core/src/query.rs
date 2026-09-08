@@ -2878,15 +2878,71 @@ fn finish_query_groups(
 /// have ALREADY been through it — which is what lets a query with no `sort-by`
 /// and no `sample` return the cached `Arc` itself rather than a copy of it.
 pub(crate) fn base_order_groups(groups: &mut [RefGroup]) {
-    groups.sort_by(|a, b| {
-        a.page.cmp(&b.page).then_with(|| {
-            let rank = |kind| match kind {
-                PageKind::Journal => 0,
-                PageKind::Page => 1,
-            };
-            rank(a.kind).cmp(&rank(b.kind))
-        })
-    });
+    groups.sort_by(|a, b| compare_result_pages(&a.page, a.kind, &b.page, b.kind));
+}
+
+fn compare_result_pages(
+    a: &str,
+    a_kind: PageKind,
+    b: &str,
+    b_kind: PageKind,
+) -> std::cmp::Ordering {
+    let rank = |kind| match kind {
+        PageKind::Journal => 0,
+        PageKind::Page => 1,
+    };
+    a.cmp(b).then_with(|| rank(a_kind).cmp(&rank(b_kind)))
+}
+
+/// An internal result entry may retain snapshot-owned physical identity. Views
+/// inspect its DTO, but move the complete entry without reconstructing identity.
+pub(crate) trait ResultViewBlock {
+    fn dto(&self) -> &BlockDto;
+}
+
+impl ResultViewBlock for BlockDto {
+    fn dto(&self) -> &BlockDto {
+        self
+    }
+}
+
+impl<T> ResultViewBlock for (BlockDto, T) {
+    fn dto(&self) -> &BlockDto {
+        &self.0
+    }
+}
+
+pub(crate) struct ResultViewGroup<B> {
+    pub(crate) page: String,
+    pub(crate) kind: PageKind,
+    pub(crate) blocks: Vec<B>,
+    pub(crate) evidence: Vec<crate::model::ReferenceBlockEvidence>,
+}
+
+impl From<RefGroup> for ResultViewGroup<BlockDto> {
+    fn from(group: RefGroup) -> Self {
+        Self {
+            page: group.page,
+            kind: group.kind,
+            blocks: group.blocks,
+            evidence: group.evidence,
+        }
+    }
+}
+
+impl From<ResultViewGroup<BlockDto>> for RefGroup {
+    fn from(group: ResultViewGroup<BlockDto>) -> Self {
+        Self {
+            page: group.page,
+            kind: group.kind,
+            blocks: group.blocks,
+            evidence: group.evidence,
+        }
+    }
+}
+
+pub(crate) fn base_order_result_view_groups<B>(groups: &mut [ResultViewGroup<B>]) {
+    groups.sort_by(|a, b| compare_result_pages(&a.page, a.kind, &b.page, b.kind));
 }
 
 /// The VIEW half: `sort-by` then `sample`, over already base-ordered rows.
@@ -2896,6 +2952,22 @@ pub(crate) fn apply_view_directives(
     recency_by_page: &std::collections::HashMap<String, i64>,
     opts: &QueryOpts,
 ) -> Vec<RefGroup> {
+    apply_result_view_directives(
+        groups.into_iter().map(ResultViewGroup::from).collect(),
+        recency_by_page,
+        opts,
+    )
+    .into_iter()
+    .map(RefGroup::from)
+    .collect()
+}
+
+/// The sole view implementation for ordinary and physically located entries.
+pub(crate) fn apply_result_view_directives<B: ResultViewBlock>(
+    groups: Vec<ResultViewGroup<B>>,
+    recency_by_page: &std::collections::HashMap<String, i64>,
+    opts: &QueryOpts,
+) -> Vec<ResultViewGroup<B>> {
     let mut groups = groups;
     // sort-by is GLOBAL (like Logseq): order every matched block across all pages on
     // one axis, so e.g. priority-A tasks float to the very top regardless of which
@@ -2912,9 +2984,9 @@ pub(crate) fn apply_view_directives(
         // stable tiebreaker so equal-key blocks keep DOCUMENT order in both
         // directions: a plain `reverse()` for `desc` would flip a page's blocks
         // upside-down under its heading.
-        let mut flat: Vec<(Vec<SortDecor>, usize, RefGroup)> = Vec::new();
+        let mut flat: Vec<(Vec<SortDecor>, usize, ResultViewGroup<B>)> = Vec::new();
         for g in groups {
-            let RefGroup {
+            let ResultViewGroup {
                 page,
                 kind,
                 blocks,
@@ -2930,7 +3002,7 @@ pub(crate) fn apply_view_directives(
                             // the day they represent, others by file mtime.
                             SortDecor::Num(recency_by_page.get(&page).copied().unwrap_or(i64::MIN))
                         } else {
-                            SortDecor::Text(sort_key(&b, &page, field))
+                            SortDecor::Text(sort_key(b.dto(), &page, field))
                         }
                     })
                     .collect();
@@ -2938,7 +3010,7 @@ pub(crate) fn apply_view_directives(
                 flat.push((
                     keys,
                     idx,
-                    RefGroup {
+                    ResultViewGroup {
                         page: page.clone(),
                         kind,
                         blocks: vec![b],
@@ -2964,7 +3036,7 @@ pub(crate) fn apply_view_directives(
         });
         // Merge adjacent one-block groups that share a page (and kind) into a single
         // group, so consecutive same-page results render under one heading.
-        let mut merged: Vec<RefGroup> = Vec::with_capacity(flat.len());
+        let mut merged: Vec<ResultViewGroup<B>> = Vec::with_capacity(flat.len());
         for (_, _, g) in flat {
             match merged.last_mut() {
                 Some(last) if last.page == g.page && last.kind == g.kind => {
@@ -6973,6 +7045,94 @@ mod tests {
         let profile = ConstructionProfile::from_view(&view);
         assert!(profile.want_recency);
         assert_eq!(profile.sample_admission_cap, None);
+    }
+
+    #[test]
+    fn located_view_keeps_distinct_physical_roots_through_sort_coalescing_and_sample() {
+        // No Clone/Eq implementation: sorting carries ownership, never joins
+        // back by exposed IDs, which are intentionally identical here.
+        struct Locator(u8);
+        let block = |priority: &str, locator| {
+            (
+                BlockDto {
+                    id: "same-public-id".into(),
+                    raw: "same visible text".into(),
+                    priority: Some(priority.into()),
+                    properties: vec![("owner".into(), "Bo".into())],
+                    ..BlockDto::default()
+                },
+                Locator(locator),
+            )
+        };
+        let groups = vec![
+            ResultViewGroup {
+                page: "Same".into(),
+                kind: PageKind::Page,
+                blocks: vec![block("B", 11), block("A", 12)],
+                evidence: vec![],
+            },
+            ResultViewGroup {
+                page: "Same".into(),
+                kind: PageKind::Page,
+                blocks: vec![block("A", 21), block("C", 22)],
+                evidence: vec![],
+            },
+        ];
+        let opts = QueryOpts::from_view(&ViewSettings {
+            sort: vec![
+                (ir::Field::new("priority"), SortDir::Asc),
+                (ir::Field::new("owner"), SortDir::Desc),
+            ],
+            sample: Some(3),
+            ..ViewSettings::default()
+        });
+        let output = apply_result_view_directives(groups, &HashMap::new(), &opts);
+        assert_eq!(output.len(), 1, "adjacent display headings still coalesce");
+        let physical: Vec<_> = output
+            .into_iter()
+            .flat_map(|g| g.blocks)
+            .map(|(_, locator)| locator.0)
+            .collect();
+        assert_eq!(
+            physical,
+            [12, 21, 11],
+            "ties retain physical input order before sampling"
+        );
+    }
+
+    #[test]
+    fn located_view_base_order_and_unsorted_sampling_preserve_physical_groups() {
+        let group = |name: &str, kind, locator| ResultViewGroup {
+            page: name.into(),
+            kind,
+            blocks: vec![(
+                BlockDto {
+                    id: "same".into(),
+                    ..BlockDto::default()
+                },
+                locator,
+            )],
+            evidence: vec![],
+        };
+        let mut groups = vec![
+            group("Z", PageKind::Page, 4),
+            group("Same", PageKind::Page, 1),
+            group("Same", PageKind::Page, 2),
+            group("Same", PageKind::Journal, 3),
+        ];
+        base_order_result_view_groups(&mut groups);
+        let opts = QueryOpts::from_view(&ViewSettings {
+            sample: Some(3),
+            ..ViewSettings::default()
+        });
+        let output = apply_result_view_directives(groups, &HashMap::new(), &opts);
+        assert_eq!(output.len(), 3, "unsorted physical groups remain separate");
+        let physical: Vec<_> = output
+            .into_iter()
+            .flat_map(|g| g.blocks)
+            .map(|(_, locator)| locator)
+            .collect();
+        assert_eq!(physical, [3, 1, 2]);
     }
 
     #[test]
