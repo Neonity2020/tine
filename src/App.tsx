@@ -1235,6 +1235,15 @@ export function App(): JSX.Element {
     onCleanup(() => unsub());
   });
   onMount(() => {
+    let disposed = false;
+    let unsub = () => {};
+    void backend().onQueryProjectionChanged(bumpDataRev).then((u) => {
+      if (disposed) u();
+      else unsub = u;
+    });
+    onCleanup(() => { disposed = true; unsub(); });
+  });
+  onMount(() => {
     let unsub = () => {};
     void backend()
       .onSparseV2Changed(() => void handleSparseV2Changed())

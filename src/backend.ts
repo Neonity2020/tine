@@ -1156,6 +1156,8 @@ export interface Backend {
    *  nothing. */
   onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void>;
   /** Subscribe to an admitted aggregate managed-storage change. */
+  /** A committed query image changed; does not reload or replace live editors. */
+  onQueryProjectionChanged(cb: () => void): Promise<() => void>;
   onSparseV2Changed(cb: () => void): Promise<() => void>;
   /** Subscribe to deduplicated managed-sync reconciliation failures. */
   onManagedSyncError(cb: (message: string) => void): Promise<() => void>;
@@ -2269,6 +2271,12 @@ class TauriBackend implements Backend {
   async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
+  }
+  async onQueryProjectionChanged(cb: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<number>("query-projection-changed", (event) => {
+      if (event.payload === this.bindingGeneration) cb();
+    });
   }
   async onSparseV2Changed(cb: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");

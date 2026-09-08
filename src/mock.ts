@@ -2309,6 +2309,9 @@ export function mockBackend(): Backend {
     async onGraphConfigChanged(): Promise<() => void> {
       return () => {};
     },
+    async onQueryProjectionChanged(): Promise<() => void> {
+      return () => {};
+    },
     async onSparseV2Changed(): Promise<() => void> {
       return () => {};
     },

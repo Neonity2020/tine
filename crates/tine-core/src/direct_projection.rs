@@ -312,6 +312,9 @@ struct ProjectionShared {
     changed: Condvar,
     ready: AtomicBool,
     ready_generation: AtomicU64,
+    /// Presentation invalidation only; never a requested edit or read target.
+    commit_notification: AtomicU64,
+    commit_waker: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
     /// The D-15 statement seam, opened lazily beside the typed reader above.
     ///
@@ -672,6 +675,14 @@ pub(crate) struct DirectProjection {
 }
 
 impl DirectProjection {
+    /// Subscribe the existing application watcher before observing the latest
+    /// published image, so a commit cannot fall between registration and read.
+    pub(crate) fn observe_commits(&self, wake: std::sync::mpsc::Sender<()>) -> u64 {
+        let mut notifier = self.shared.commit_waker.lock().unwrap();
+        *notifier = Some(wake);
+        self.shared.commit_notification.load(Ordering::Acquire)
+    }
+
     pub(crate) fn start(path: PathBuf) -> std::io::Result<Self> {
         let shared = Arc::new(ProjectionShared {
             path,
@@ -679,6 +690,8 @@ impl DirectProjection {
             changed: Condvar::new(),
             ready: AtomicBool::new(false),
             ready_generation: AtomicU64::new(0),
+            commit_notification: AtomicU64::new(0),
+            commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
             statement_seam: Mutex::new(None),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
@@ -2267,6 +2280,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         }
                     }
                 }
+                drop(registry);
                 Ok(applied)
             })()
         };
@@ -2329,6 +2343,15 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         }
         drop(pending);
         shared.changed.notify_all();
+        // Source-change events may have preceded this commit. Wake the existing
+        // application watcher after every serving-image publication, without
+        // retaining a query or requiring any edit to be covered by its read.
+        if shared.validated.load(Ordering::Acquire) && !applied.stream_open {
+            shared.commit_notification.fetch_add(1, Ordering::Release);
+            if let Some(wake) = shared.commit_waker.lock().unwrap().as_ref() {
+                let _ = wake.send(());
+            }
+        }
     }
 }
 
@@ -3168,6 +3191,17 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
         let projection = graph.direct_projection_test().unwrap();
+        // A producer-queued capture drains the preceding publication before
+        // registering this test's observer; wait_ready alone sees readiness
+        // before the final notification instructions execute.
+        let QueryJobOpen::Job(initial) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("initial complete image");
+        };
+        drop(initial);
+        let (commit_wake, commits) = std::sync::mpsc::channel();
+        let before_revision = projection.observe_commits(commit_wake.clone());
         let entry = graph.list_pages().into_iter().next().unwrap();
         let (paused, observed) = std::sync::mpsc::channel();
         let (resume, resumed) = std::sync::mpsc::channel();
@@ -3212,19 +3246,54 @@ mod tests {
         wait_ready(&graph);
         assert!(
             capture_queued,
-            "covered target must enter the bounded capture queue"
+            "current read must enter the bounded capture queue"
         );
-        let QueryJobOpen::Job(job) = result else {
-            panic!("queued C must not reject the earlier covered query");
+        let QueryJobOpen::Job(mut job) = result else {
+            panic!("queued C must not reject the earlier coherent query");
         };
-        let QueryJobOpen::Job(current) = projection.open_query_job(graph.cache_generation()) else {
+        let QueryJobOpen::Job(mut current) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
             panic!("final C snapshot");
         };
         assert!(
             job.query_revision < current.query_revision,
             "capture must occur between B and C"
         );
+        for (snapshot, expected) in [
+            (&mut job.snapshot, "TODO save B"),
+            (&mut current.snapshot, "TODO save C"),
+        ] {
+            let mut matching = 0;
+            snapshot
+                .visit_projection_query(
+                    "SELECT block_id FROM block_text WHERE content = ?1",
+                    &[tine_storage::sqlite::PhysicalQueryValue::Text(
+                        expected.into(),
+                    )],
+                    |_| {
+                        matching += 1;
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                matching, 1,
+                "each snapshot must retain its exact semantic result"
+            );
+        }
         assert!(!job.is_cancelled());
+        let notified = commits.recv_timeout(Duration::from_secs(1)).is_ok();
+        let published = projection.observe_commits(commit_wake);
+        assert!(
+            notified,
+            "a later committed image must wake the application watcher"
+        );
+        assert!(published > before_revision);
+        assert!(
+            published >= before_revision + 2,
+            "both B and C commits publish invalidations"
+        );
         drop(current);
         drop(job);
         assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
@@ -5589,7 +5658,7 @@ mod tests {
             "Clearing readiness\nalone would strand the projection until another edit.",
             "Cancellation is excluded\nfrom repair",
             // Answer ownership belongs to the read operation, not a producer cache.
-            "Direct simple and advanced queries construct an\noperation-scoped answer from the acquired SQLite snapshot.",
+            "Direct and Managed simple and advanced queries\nconstruct an operation-scoped answer from their acquired SQLite snapshots.",
             "The producer retains\nno query answers and manages no answer-cache invalidation.",
             // Navigation and Friendly remain separately scoped migration work.
             "Friendly graph\nsearch likewise still ranks and produces evidence from parser-projected blocks",
@@ -6567,6 +6636,8 @@ mod tests {
             changed: Condvar::new(),
             ready: AtomicBool::new(false),
             ready_generation: AtomicU64::new(0),
+            commit_notification: AtomicU64::new(0),
+            commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
             statement_seam: Mutex::new(None),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
@@ -6665,6 +6736,17 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
         let projection = graph.direct_projection_test().unwrap();
+        // A producer-queued capture drains the preceding publication before
+        // registering this test's observer; wait_ready alone sees readiness
+        // before the final notification instructions execute.
+        let QueryJobOpen::Job(initial) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("initial complete image");
+        };
+        drop(initial);
+        let (commit_wake, commits) = std::sync::mpsc::channel();
+        projection.observe_commits(commit_wake);
         let entry = graph.list_pages().into_iter().next().unwrap();
         let id = page_id(&entry.rel_path);
         assert!(!projection.session_pages_test().contains(&id));
@@ -6689,6 +6771,10 @@ mod tests {
             )
             .unwrap();
         let identity_pending = !projection.session_pages_test().contains(&id);
+        let notification_pending = matches!(
+            commits.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
         let owner = &projection.shared.query_jobs;
         let OwnedAdmission::Slot(slot) =
             owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO)
@@ -6716,6 +6802,11 @@ mod tests {
         let captured = result.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(committed, 1);
         assert!(identity_pending);
+        assert!(
+            notification_pending,
+            "raw SQL commit must not publish incoherent identity"
+        );
+        commits.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(remained_queued);
         let QueryJobOpen::Job(mut job) = captured else {
             panic!("published capture");

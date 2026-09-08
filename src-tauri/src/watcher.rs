@@ -2212,6 +2212,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             baseline: bool,
         }
 
+        // Last observed disposable image per live window binding. This only
+        // coalesces UI invalidations; no query ever waits on these revisions.
+        let mut query_images: HashMap<String, (u64, Option<u64>)> = HashMap::new();
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
         let mut sparse_graphs: HashMap<String, WatchedSparse> = HashMap::new();
         // Windows whose configuration still needs re-reading: named by an event
@@ -2233,11 +2236,13 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             let inotify = watch_mode(&app) != "poll";
             let entries = app.state::<AppState>().graphs.read().unwrap().entries();
             let live: HashSet<String> = entries.iter().map(|(label, _)| label.clone()).collect();
+            query_images.retain(|label, _| live.contains(label));
             graphs.retain(|label, _| live.contains(label));
             sparse_graphs.retain(|label, _| live.contains(label));
             for (label, slot) in entries {
                 let asset_root = asset_root_for_slot(&app, &slot);
                 if let Some(handle) = slot.sparse_runtime().cloned() {
+                    query_images.remove(&label);
                     graphs.remove(&label);
                     match sparse_graphs.get_mut(&label) {
                         Some(current)
@@ -2294,6 +2299,13 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     graphs.remove(&label);
                     continue;
                 };
+                let image = legacy_graph.observe_direct_projection_commits(tx.clone());
+                let observed = (slot.binding_generation, image);
+                if query_images.insert(label.clone(), observed) != Some(observed) && image.is_some()
+                {
+                    let _ =
+                        app.emit_to(&label, "query-projection-changed", slot.binding_generation);
+                }
                 match graphs.get_mut(&label) {
                     Some(current) if current.root == root => {
                         if current.pending_observation_epoch.is_some_and(|ticket| {

@@ -892,3 +892,12 @@ a saved-edit freshness token.
 Tests: `src/queryResultGrace.test.tsx` and
 `src/components/QueryMacro.test.tsx`; native scroll and mounted-row geometry:
 `scripts/e2e-query-result-scroll.mjs`.
+
+Direct projection commits wake the existing application watcher after SQL,
+identity and registry publication. The watcher coalesces an opaque notification
+counter per graph binding and emits `query-projection-changed`; the frontend
+filters retired bindings and increments ordinary dataRev without reloading
+editors. This covers an early coherent read followed by a later commit, including
+a database replacement whose physical SQLite revision happens to repeat.
+The counter is never a query target, result key or saved-edit acknowledgment.
+Managed uses its existing completed local/provider drain notifications.

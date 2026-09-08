@@ -6072,6 +6072,20 @@ impl Graph {
         Ok(())
     }
 
+    /// Register the application's existing watcher wake channel and observe the
+    /// last committed-image notification. This is notification state only; query reads
+    /// never compare it with an edit or wait for it to advance.
+    pub fn observe_direct_projection_commits(
+        &self,
+        wake: std::sync::mpsc::Sender<()>,
+    ) -> Option<u64> {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|projection| projection.observe_commits(wake))
+    }
+
     /// Attach this graph's OWN disposable query projection over the document
     /// snapshot it was constructed with.
     ///

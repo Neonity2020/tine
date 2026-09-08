@@ -762,6 +762,16 @@ ordinary queued edits do not make the committed image unusable. Full-text
 readiness is read from the same transaction. Closure and replacement continue
 to use the existing query-job lifecycle and cancellation owner.
 
+**Committed-image refresh.** A Direct serving-image publication increments an
+opaque notification counter after SQL, session identity, registry and readiness
+publication, then wakes the existing application watcher control channel. The
+watcher observes it per window binding and emits `query-projection-changed`.
+The frontend rejects retired bindings and bumps ordinary dataRev, without
+reloading live editors or changing page inventory. No query waits on or consumes
+this counter; it is not a saved-edit target or answer-cache key. This covers
+an early coherent query followed by later queued writes and rebuilds whose
+physical SQLite revisions repeat. Inotify mode needs no periodic poll.
+
 **Query answer ownership.** Direct and Managed simple and advanced queries
 construct an operation-scoped answer from their acquired SQLite snapshots. The producer retains
 no query answers and manages no answer-cache invalidation. SQLite owns database

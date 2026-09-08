@@ -642,12 +642,12 @@ pub(crate) fn prepare_direct_files_open(
         Ok(path) => {
             if let Err(error) = graph.attach_direct_projection(path) {
                 crate::debug::diag(format!(
-                    "Direct Files SQLite projection unavailable; parser fallback remains active: {error}"
+                    "Direct Files SQLite projection unavailable; indexed reads are unavailable: {error}"
                 ));
             }
         }
         Err(error) => crate::debug::diag(format!(
-            "Direct Files SQLite projection path unavailable; parser fallback remains active: {error}"
+            "Direct Files SQLite projection path unavailable; indexed reads are unavailable: {error}"
         )),
     }
     // Concord base ledger (ADR 0056): Direct Files only, app-private, outside
