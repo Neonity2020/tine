@@ -909,6 +909,14 @@ retain their full-idle barrier. The barrier test
 `a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions` pins this
 distinction. Automatic pending recovery scheduling is a separate integration.
 
+`PendingOverlayRepair` owns the old instance and any uninstalled replacement
+while preparation runs under a capacity guard. Registration transfers teardown
+responsibility before that guard can be released. Retirement prevents later
+registration; cleanup after the drain closes retained instances. A failed
+creation remains terminal until lifecycle cleanup. The owner tests cover
+transfer, stale tokens, retirement before registration and actual creation
+failure. This primitive does not yet schedule automatic query recovery.
+
 Overlay teardown serializes worker join and file removal once per instance.
 Repeated close calls on a retained old instance cannot remove a replacement at
 the same disposable path. This is checked by

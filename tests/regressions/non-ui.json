@@ -2,6 +2,18 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PENDING-REPAIR-OWNERSHIP",
+ "title": "Pending repair candidates have one teardown owner before actor installation",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager repair ownership contract" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/managed_overlay.rs::tests::repair_owner_transfers_one_candidate_and_rejects_old_tokens", "crates/tine-core/src/managed_overlay.rs::tests::retiring_repair_before_registration_closes_the_unpublished_candidate", "crates/tine-core/src/managed_overlay.rs::tests::failed_candidate_creation_is_terminal_until_lifecycle_cleanup"],
+  "scenario": "query-engine.pending-repair-ownership"
+ },
+ "notes": "Real disposable files and exact registration-boundary hook. Covers the owner primitive, not automatic recovery wiring, actor responsiveness, or full shutdown interleavings."
+},
+{
  "id": "REG-QE-DRAIN-FENCE-ADMISSION",
  "title": "A split cancellation fence drains old slots without cancelling or waiting for newer work",
  "family": "query-engine",
