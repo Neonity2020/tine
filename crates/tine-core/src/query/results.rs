@@ -49,11 +49,11 @@ use tine_storage::sqlite::{
 
 use crate::direct_projection::page_kind_from_sql;
 use crate::model::{
-    block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, PageKind,
-    RefGroup, ShallowBlockFacets,
+    block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, BlockDto,
+    PageKind, RefGroup, ShallowBlockFacets,
 };
 use crate::query::sql::{descriptor_statement, page_statement, SqlQuery};
-use crate::query::{ConstructionBudget, ConstructionProfile, PreViewGroups};
+use crate::query::{ConstructionBudget, ConstructionProfile, PreViewGroups, ResultViewGroup};
 
 // The gates. `#[path]` keeps the file beside this one so the shared
 // production-source scanner sees a `*_tests.rs` sibling include and blanks it
@@ -106,6 +106,74 @@ pub(crate) enum ResultIdentity {
         session_pages: Arc<HashSet<[u8; 16]>>,
         all_session: bool,
     },
+}
+
+/// WHERE one admitted result physically lives, inside THIS batch.
+///
+/// The one thing the public answer cannot carry (RET3): `BlockDto::id` is a
+/// PUBLIC id and `RefGroup::page` is a DISPLAY name, so two different physical
+/// blocks may expose the same pair. Export subtree construction has to read the
+/// exact block that was selected, on the exact snapshot it was selected from,
+/// which is what this triple names.
+///
+/// **It is a batch-scoped coordinate, not a handle.** `source` indexes the
+/// `&mut [ResultSource]`/`&mut [ExportSubtreeSource]` slice this batch passed
+/// in; the two ids are physical row ids of THAT snapshot. It is `Copy`, never
+/// crosses IPC or a memo boundary, and is meaningless once the caller releases
+/// its snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ResultLocator {
+    pub(crate) source: usize,
+    pub(crate) page_id: [u8; 16],
+    pub(crate) block_id: [u8; 16],
+}
+
+/// What one admitted row is stored AS in its group.
+///
+/// The result collector is one implementation, one set of statements and one
+/// admission rule; only the shape of the value it keeps differs. An ordinary
+/// reader keeps the `BlockDto` alone, so it retains not one byte of locator;
+/// export keeps the DTO beside its [`ResultLocator`]. `carry` is called once
+/// per admitted row and its locator argument is dropped unread on the ordinary
+/// path, which monomorphisation removes entirely.
+pub(crate) trait ResultCarrier {
+    type Block;
+    fn carry(dto: BlockDto, locator: ResultLocator) -> Self::Block;
+}
+
+/// The ordinary reader's carrier: the public DTO and nothing else.
+pub(crate) struct PlainResults;
+
+impl ResultCarrier for PlainResults {
+    type Block = BlockDto;
+    fn carry(dto: BlockDto, _locator: ResultLocator) -> BlockDto {
+        dto
+    }
+}
+
+/// The export reader's carrier: the same DTO plus the physical coordinate the
+/// subtree read needs. `ResultViewBlock` is implemented for `(BlockDto, T)`, so
+/// the ALREADY ACCEPTED shared view owner sorts, coalesces and samples these
+/// entries without a second view implementation.
+pub(crate) struct LocatedResults;
+
+impl ResultCarrier for LocatedResults {
+    type Block = (BlockDto, ResultLocator);
+    fn carry(dto: BlockDto, locator: ResultLocator) -> (BlockDto, ResultLocator) {
+        (dto, locator)
+    }
+}
+
+/// [`PreViewGroups`] with every entry's physical locator retained (RET3).
+///
+/// The same four fields, the same base order, the same `total`/`exceeded` and
+/// the same recency map: only the block type differs, because the locator is
+/// attached at admission rather than recovered afterwards.
+pub(crate) struct LocatedPreViewGroups {
+    pub(crate) groups: Vec<ResultViewGroup<(BlockDto, ResultLocator)>>,
+    pub(crate) recency_by_page: std::collections::HashMap<String, i64>,
+    pub(crate) total: usize,
+    pub(crate) exceeded: bool,
 }
 
 /// Everything one result read needs besides the snapshot itself.
@@ -269,23 +337,74 @@ pub(crate) fn read_results_merged(
     sources: &mut [ResultSource<'_>],
     shared: &ResultReadShared<'_>,
 ) -> Result<PreViewGroups, ResultReadError> {
+    let carried = read_results_carried::<PlainResults>(sources, shared)?;
+    Ok(PreViewGroups {
+        // A field move per GROUP, never a conversion per block: the ordinary
+        // carrier's block vector IS `Vec<BlockDto>` already.
+        groups: carried.groups.into_iter().map(RefGroup::from).collect(),
+        recency_by_page: carried.recency_by_page,
+        total: carried.total,
+        exceeded: carried.exceeded,
+    })
+}
+
+/// The SAME merged construction, with each admitted entry's physical locator
+/// retained (RET3).
+///
+/// Statement for statement and admission rule for admission rule this is
+/// [`read_results_merged`]: one shared collector, one shared payload decoder,
+/// one shared corruption vocabulary. The locator is attached in
+/// [`emit_batch`], where the descriptor's source, physical page id and physical
+/// block id are all still in hand — never inferred afterwards from a public id,
+/// a display name, raw text or a DTO comparison.
+///
+/// The locators are valid ONLY for the `sources` slice passed here, for as long
+/// as the caller holds those snapshots.
+pub(crate) fn read_located_results_merged(
+    sources: &mut [ResultSource<'_>],
+    shared: &ResultReadShared<'_>,
+) -> Result<LocatedPreViewGroups, ResultReadError> {
+    let carried = read_results_carried::<LocatedResults>(sources, shared)?;
+    Ok(LocatedPreViewGroups {
+        groups: carried.groups,
+        recency_by_page: carried.recency_by_page,
+        total: carried.total,
+        exceeded: carried.exceeded,
+    })
+}
+
+/// The ONE merged result construction, over whichever carrier the caller wants
+/// its admitted rows kept in.
+fn read_results_carried<C: ResultCarrier>(
+    sources: &mut [ResultSource<'_>],
+    shared: &ResultReadShared<'_>,
+) -> Result<CarriedGroups<C>, ResultReadError> {
     // Per CONNECTION, not per statement: the compiled-regex table is snapshot
     // state, so each source installs its own statement's program (they compile
     // the same leaves, so the two programs agree).
     for source in sources.iter_mut() {
         install_regexes(source.snapshot, source.statement)?;
     }
-    let mut pages = PageGroups::default();
+    let mut pages = PageGroups::<C>::default();
     let mut budget = ConstructionBudget::new(shared.max_rows, shared.max_bytes);
     let admitted = read_descriptors_merged(sources, shared, &mut pages, &mut budget)?;
     // The payload of the rows the budget admitted, per source over its OWN
     // snapshot. A group's blocks all come from one source (the pages are
     // disjoint), so per-source batching keeps each page's `owner_id, ordinal`
     // order exactly as one source produces it.
-    for (source, admitted) in sources.iter_mut().zip(admitted.iter()) {
-        read_payload(source.snapshot, &mut pages, admitted)?;
+    for (at, (source, admitted)) in sources.iter_mut().zip(admitted.iter()).enumerate() {
+        read_payload(source.snapshot, &mut pages, admitted, at)?;
     }
     Ok(pages.finish(shared, budget))
+}
+
+/// [`PreViewGroups`] before the carrier is known — what
+/// [`read_results_carried`] answers.
+struct CarriedGroups<C: ResultCarrier> {
+    groups: Vec<ResultViewGroup<C::Block>>,
+    recency_by_page: HashMap<String, i64>,
+    total: usize,
+    exceeded: bool,
 }
 
 /// One `@page` answer, in the SAME shape the retired page walk returned.
@@ -565,7 +684,7 @@ fn install_regexes(
 /// A snapshot error, classified. Cancellation surfaces through the snapshot as
 /// an ordinary `Incomplete`, so the cancellation flag — not the message — is
 /// what distinguishes "the owner stopped this job" from "the read failed".
-fn sql_or_cancelled(
+pub(crate) fn sql_or_cancelled(
     snapshot: &PhysicalProjectionQuerySnapshot,
     error: MaterializationError,
 ) -> ResultReadError {
@@ -580,6 +699,11 @@ fn sql_or_cancelled(
 /// text, tags and properties of a row nobody admits are never read.
 struct Descriptor {
     block_id: [u8; 16],
+    /// The PHYSICAL page this row's block belongs to. Beside `page` (the
+    /// group's index), not instead of it: the payload's ownership check and
+    /// the export locator both name the physical id, while the group index is
+    /// where the DTO is pushed.
+    page_id: [u8; 16],
     page: usize,
     /// The public id this row will carry, already resolved through the captured
     /// identity policy.
@@ -592,11 +716,11 @@ struct Descriptor {
 }
 
 /// One result page: the group under construction plus the two fields the
-/// recency axis needs, kept out of `RefGroup` because they are inputs and not
+/// recency axis needs, kept out of the group because they are inputs and not
 /// part of the answer.
-struct PageGroup {
+struct PageGroup<C: ResultCarrier> {
     page_id: [u8; 16],
-    group: RefGroup,
+    group: ResultViewGroup<C::Block>,
     journal_day: Option<i64>,
     path: String,
 }
@@ -607,13 +731,23 @@ struct PageGroup {
 /// name stay two groups here exactly as they are two pages in the walk;
 /// `base_order_groups`/`finish_query_groups` merges them for display later, the
 /// same way and in the same place as today.
-#[derive(Default)]
-struct PageGroups {
-    order: Vec<PageGroup>,
+struct PageGroups<C: ResultCarrier> {
+    order: Vec<PageGroup<C>>,
     by_page: HashMap<[u8; 16], usize>,
 }
 
-impl PageGroups {
+// Derived `Default` would demand `C: Default`, which no carrier is: the
+// carrier is a type-level switch and never a value.
+impl<C: ResultCarrier> Default for PageGroups<C> {
+    fn default() -> Self {
+        Self {
+            order: Vec::new(),
+            by_page: HashMap::new(),
+        }
+    }
+}
+
+impl<C: ResultCarrier> PageGroups<C> {
     /// The group for one page, created on first appearance so the group order
     /// is the descriptor order.
     fn slot(
@@ -630,7 +764,7 @@ impl PageGroups {
         let at = self.order.len();
         self.order.push(PageGroup {
             page_id,
-            group: RefGroup {
+            group: ResultViewGroup {
                 page: name.to_owned(),
                 kind,
                 blocks: Vec::new(),
@@ -646,7 +780,7 @@ impl PageGroups {
     /// The pre-view answer: groups that admitted nothing are dropped (the walk
     /// pushes a group only for a non-empty `matched`), and the recency axis is
     /// measured once per surviving page and only when the view needs it.
-    fn finish(self, inputs: &ResultReadShared<'_>, budget: ConstructionBudget) -> PreViewGroups {
+    fn finish(self, inputs: &ResultReadShared<'_>, budget: ConstructionBudget) -> CarriedGroups<C> {
         let mut groups = Vec::with_capacity(self.order.len());
         let mut recency_by_page = HashMap::new();
         for page in self.order {
@@ -666,7 +800,7 @@ impl PageGroups {
             }
             groups.push(page.group);
         }
-        PreViewGroups {
+        CarriedGroups {
             groups,
             recency_by_page,
             total: budget.total,
@@ -713,10 +847,10 @@ mod descriptor_column {
 /// only early exit is the `(sample N)` cap's `ControlFlow::Break`, and it stops
 /// BOTH the streamed source and the remaining buffered rows at once, so the
 /// truncation point is exactly the walk's.
-fn read_descriptors_merged(
+fn read_descriptors_merged<C: ResultCarrier>(
     sources: &mut [ResultSource<'_>],
     shared: &ResultReadShared<'_>,
-    pages: &mut PageGroups,
+    pages: &mut PageGroups<C>,
     budget: &mut ConstructionBudget,
 ) -> Result<Vec<Vec<Descriptor>>, ResultReadError> {
     let mut admitted: Vec<Vec<Descriptor>> = (0..sources.len()).map(|_| Vec::new()).collect();
@@ -1039,11 +1173,11 @@ fn decode_descriptor(
 /// Offer one decoded descriptor to the budget, in MERGED order.
 ///
 /// The four rules, in `collect_sql_matched_blocks`' own order.
-fn admit_decoded(
+fn admit_decoded<C: ResultCarrier>(
     page: &DescriptorPage,
     row: DecodedDescriptor,
     inputs: &ResultReadShared<'_>,
-    pages: &mut PageGroups,
+    pages: &mut PageGroups<C>,
     budget: &mut ConstructionBudget,
     admitted: &mut Vec<Descriptor>,
 ) -> std::ops::ControlFlow<()> {
@@ -1073,6 +1207,7 @@ fn admit_decoded(
     }
     admitted.push(Descriptor {
         block_id: row.block_id,
+        page_id: page.page_id,
         page: at,
         result_id: row.result_id,
         estimated_bytes: row.estimated_bytes,
@@ -1090,7 +1225,7 @@ fn admit_decoded(
 /// subtract the stored id's bytes, add the canonical UUID's 36. The arithmetic
 /// is checked because a stored estimate smaller than its own identity term is a
 /// contradiction, and a saturating subtraction would hide it.
-fn resolve_identity(
+pub(crate) fn resolve_identity(
     identity: &ResultIdentity,
     page_id: [u8; 16],
     path: &str,
@@ -1118,20 +1253,55 @@ fn resolve_identity(
     Ok((resolved, estimate))
 }
 
-/// Read the payload of the ADMITTED ids and construct their DTOs.
+/// Which consumer a payload batch belongs to.
+///
+/// The statements, the batch size and every validation are identical; only the
+/// test-only census counter differs, so a gate can report SELECTION payload
+/// (the shallow rows a view is built from) separately from EXPORT OUTPUT
+/// payload (the admitted descendants of a subtree), which is the whole claim
+/// RET3's export core makes about its work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadChannel {
+    Selection,
+    ExportOutput,
+}
+
+/// What one ADMITTED row tells the shared payload reader about itself.
+///
+/// Borrowed rather than owned: an ordinary read already holds these six facts
+/// on its `Descriptor` and must not pay a second `String` for them.
+pub(crate) struct PayloadFacts<'a> {
+    pub(crate) block_id: [u8; 16],
+    pub(crate) page_id: [u8; 16],
+    pub(crate) result_id: &'a str,
+    pub(crate) estimated_bytes: usize,
+    pub(crate) tag_count: usize,
+    pub(crate) property_count: usize,
+}
+
+/// **The ONE shallow payload reader**, for ordinary results and for export
+/// output alike.
 ///
 /// Three bound statements per batch of [`PAYLOAD_BATCH`] ids, all through the
-/// SAME snapshot. Never one statement per block (that is the N+1 this packet
-/// exists to remove) and never a tags×properties join (that is a cross product
-/// whose row count is the product of two independent facets).
-fn read_payload(
+/// SAME snapshot. Never one statement per block (that is the N+1 R3 removed)
+/// and never a tags×properties join (that is a cross product whose row count is
+/// the product of two independent facets).
+///
+/// Every check is a "the projection contradicts itself" check and every one of
+/// them abandons the WHOLE read rather than the row: exact coverage, page
+/// ownership, the stored tag/property counts, and the stored estimate against
+/// the estimate of the DTO actually built. `emit` receives the row's index in
+/// `rows` and its finished DTO, in admission order.
+pub(crate) fn read_admitted_payload<R>(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
-    pages: &mut PageGroups,
-    admitted: &[Descriptor],
+    rows: &[R],
+    channel: PayloadChannel,
+    facts: impl for<'r> Fn(&'r R) -> PayloadFacts<'r>,
+    mut emit: impl FnMut(usize, BlockDto),
 ) -> Result<(), ResultReadError> {
-    for (index, batch) in admitted.chunks(PAYLOAD_BATCH).enumerate() {
+    for (index, batch) in rows.chunks(PAYLOAD_BATCH).enumerate() {
         #[cfg(test)]
-        run_before_payload_batch_hook(index);
+        run_before_payload_batch_hook(channel, index);
         #[cfg(not(test))]
         let _ = index;
         // Between batches, not inside one: a cancelled job stops at the next
@@ -1141,13 +1311,14 @@ fn read_payload(
         }
         let ids = batch
             .iter()
-            .map(|descriptor| PhysicalQueryValue::Blob(descriptor.block_id.to_vec()))
+            .map(|row| PhysicalQueryValue::Blob(facts(row).block_id.to_vec()))
             .collect::<Vec<_>>();
-        let facets = read_block_facets(snapshot, &ids)?;
+        let block_facets = read_block_facets(snapshot, &ids, channel)?;
         let tags = read_owner_strings(
             snapshot,
             &ids,
             OwnerList::Tags,
+            channel,
             "SELECT owner_id, tag FROM tags \
              WHERE owner_type = {owner} AND owner_id IN ({ids}) \
              ORDER BY owner_id, ordinal",
@@ -1157,6 +1328,7 @@ fn read_payload(
             snapshot,
             &ids,
             OwnerList::Properties,
+            channel,
             "SELECT owner_id, name, value FROM properties \
              WHERE owner_type = {owner} AND owner_id IN ({ids}) \
              ORDER BY owner_id, ordinal",
@@ -1167,9 +1339,56 @@ fn read_payload(
                 ))
             },
         )?;
-        emit_batch(pages, batch, facets, tags, properties).map_err(ResultReadError::Corrupt)?;
+        emit_batch(
+            batch,
+            index * PAYLOAD_BATCH,
+            &facts,
+            &mut emit,
+            block_facets,
+            tags,
+            properties,
+        )
+        .map_err(ResultReadError::Corrupt)?;
     }
     Ok(())
+}
+
+/// The ordinary reader's use of [`read_admitted_payload`]: build each admitted
+/// DTO into its own page group, carrying the locator the carrier wants.
+fn read_payload<C: ResultCarrier>(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    pages: &mut PageGroups<C>,
+    admitted: &[Descriptor],
+    source: usize,
+) -> Result<(), ResultReadError> {
+    read_admitted_payload(
+        snapshot,
+        admitted,
+        PayloadChannel::Selection,
+        |descriptor: &Descriptor| PayloadFacts {
+            block_id: descriptor.block_id,
+            page_id: descriptor.page_id,
+            result_id: &descriptor.result_id,
+            estimated_bytes: descriptor.estimated_bytes,
+            tag_count: descriptor.tag_count,
+            property_count: descriptor.property_count,
+        },
+        |at, dto| {
+            let descriptor = &admitted[at];
+            // Attached HERE, while the source, the physical page id and the
+            // physical block id are all still in hand. Nothing downstream
+            // recovers identity by comparing exposed ids or rendered text.
+            let locator = ResultLocator {
+                source,
+                page_id: descriptor.page_id,
+                block_id: descriptor.block_id,
+            };
+            pages.order[descriptor.page]
+                .group
+                .blocks
+                .push(C::carry(dto, locator));
+        },
+    )
 }
 
 /// Which owner-keyed facet list a payload statement reads. Only the census
@@ -1206,6 +1425,7 @@ struct BlockFacets {
 fn read_block_facets(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     ids: &[PhysicalQueryValue],
+    channel: PayloadChannel,
 ) -> Result<HashMap<[u8; 16], BlockFacets>, ResultReadError> {
     let sql = format!(
         "SELECT b.block_id, b.page_id, b.collapsed, b.heading_level, t.content, \
@@ -1218,14 +1438,16 @@ fn read_block_facets(
         placeholders(ids.len())
     );
     #[cfg(test)]
-    note(|census| census.payload_statements += 1);
+    note(|census| *payload_statements(census, channel) += 1);
+    #[cfg(not(test))]
+    let _ = channel;
     let rows = snapshot
         .run_projection_query(&sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     let mut facets = HashMap::with_capacity(rows.len());
     for row in &rows {
         #[cfg(test)]
-        note(|census| census.payload_block_rows += 1);
+        note(|census| *payload_block_rows(census, channel) += 1);
         let decoded = decode_block_facets(row)?;
         if facets.insert(decoded.0, decoded.1).is_some() {
             return Err(ResultReadError::Corrupt(
@@ -1284,6 +1506,7 @@ fn read_owner_strings<T>(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     ids: &[PhysicalQueryValue],
     list: OwnerList,
+    channel: PayloadChannel,
     shape: &str,
     decode: impl Fn(&[PhysicalQueryValue]) -> Result<T, String>,
 ) -> Result<HashMap<[u8; 16], Vec<T>>, ResultReadError> {
@@ -1291,9 +1514,9 @@ fn read_owner_strings<T>(
         .replace("{owner}", &OWNER_BLOCK.to_string())
         .replace("{ids}", &placeholders(ids.len()));
     #[cfg(test)]
-    note(|census| census.payload_statements += 1);
+    note(|census| *payload_statements(census, channel) += 1);
     #[cfg(not(test))]
-    let _ = list;
+    let _ = (list, channel);
     let rows = snapshot
         .run_projection_query(&sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
@@ -1301,8 +1524,8 @@ fn read_owner_strings<T>(
     for row in &rows {
         #[cfg(test)]
         note(|census| match list {
-            OwnerList::Tags => census.payload_tag_rows += 1,
-            OwnerList::Properties => census.payload_property_rows += 1,
+            OwnerList::Tags => *payload_tag_rows(census, channel) += 1,
+            OwnerList::Properties => *payload_property_rows(census, channel) += 1,
         });
         let decoded = (|| {
             let owner = blob16(row, 0, "owner_id")?;
@@ -1314,7 +1537,7 @@ fn read_owner_strings<T>(
     Ok(owners)
 }
 
-/// Validate one batch and emit its DTOs into their groups, in admission order.
+/// Validate one batch and emit its DTOs, in admission order.
 ///
 /// Every check here is a "the projection contradicts itself" check, and every
 /// one of them abandons the WHOLE result rather than the row: exact coverage
@@ -1323,19 +1546,21 @@ fn read_owner_strings<T>(
 /// finally the stored estimate against the estimate of the DTO that was
 /// actually built. That last one is what proves the metadata and the payload
 /// describe the same block.
-fn emit_batch(
-    pages: &mut PageGroups,
-    batch: &[Descriptor],
-    mut facets: HashMap<[u8; 16], BlockFacets>,
+fn emit_batch<R>(
+    batch: &[R],
+    first: usize,
+    facts: &impl for<'r> Fn(&'r R) -> PayloadFacts<'r>,
+    emit: &mut impl FnMut(usize, BlockDto),
+    mut block_facets: HashMap<[u8; 16], BlockFacets>,
     mut tags: HashMap<[u8; 16], Vec<String>>,
     mut properties: HashMap<[u8; 16], Vec<(String, String)>>,
 ) -> Result<(), String> {
-    for descriptor in batch {
-        let Some(facet) = facets.remove(&descriptor.block_id) else {
+    for (at, row) in batch.iter().enumerate() {
+        let descriptor = facts(row);
+        let Some(facet) = block_facets.remove(&descriptor.block_id) else {
             return Err("an admitted block has no payload row".to_string());
         };
-        let page = &mut pages.order[descriptor.page];
-        if facet.page_id != page.page_id {
+        if facet.page_id != descriptor.page_id {
             return Err("a payload block row names a different page".to_string());
         }
         let tags = tags.remove(&descriptor.block_id).unwrap_or_default();
@@ -1347,7 +1572,7 @@ fn emit_batch(
             return Err("stored property_count disagrees with the property rows".to_string());
         }
         let dto = shallow_block_facets_dto(ShallowBlockFacets {
-            id: descriptor.result_id.clone(),
+            id: descriptor.result_id.to_owned(),
             raw: facet.raw,
             collapsed: facet.collapsed,
             heading_level: facet.heading_level,
@@ -1365,9 +1590,9 @@ fn emit_batch(
         if block_dto_estimated_bytes(&dto) != descriptor.estimated_bytes {
             return Err("the emitted result does not match its stored estimate".to_string());
         }
-        page.group.blocks.push(dto);
+        emit(first + at, dto);
     }
-    if !facets.is_empty() {
+    if !block_facets.is_empty() {
         return Err("a payload block row belongs to no admitted block".to_string());
     }
     if !tags.is_empty() {
@@ -1382,7 +1607,7 @@ fn emit_batch(
 /// `?1, ?2, … ?n`. Two shapes at most reach the connection — a full batch and
 /// the final remainder — so `prepare_cached` holds both and neither is
 /// recompiled per batch.
-fn placeholders(count: usize) -> String {
+pub(crate) fn placeholders(count: usize) -> String {
     (1..=count)
         .map(|at| format!("?{at}"))
         .collect::<Vec<_>>()
@@ -1446,7 +1671,7 @@ fn opt_integer(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<Opti
 
 /// A non-negative count, as `usize`. The DDL constrains all four of these to be
 /// `>= 0`, so a negative one is damage rather than a supported value.
-fn count(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<usize, String> {
+pub(crate) fn count(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<usize, String> {
     let value = integer(row, at, what)?;
     usize::try_from(value).map_err(|_| format!("{what} is negative"))
 }
@@ -1483,6 +1708,48 @@ pub(crate) struct ResultReadCensus {
     /// payload at all, so a gate that asserts "one page row, zero payload
     /// statements" is asserting the whole cost of the answer.
     pub(crate) page_rows: usize,
+    /// The SAME four counters for RET3's export OUTPUT payload — the admitted
+    /// descendants of a subtree. Separate fields, not a second census, because
+    /// the claim "no payload was read for a rejected descendant" is only
+    /// legible beside the selection payload the same batch already paid for.
+    pub(crate) export_payload_statements: usize,
+    pub(crate) export_payload_block_rows: usize,
+    pub(crate) export_payload_tag_rows: usize,
+    pub(crate) export_payload_property_rows: usize,
+}
+
+/// The four census counters, chosen by channel. One accessor per counter, so a
+/// new channel cannot silently reuse another's field.
+#[cfg(test)]
+fn payload_statements(census: &mut ResultReadCensus, channel: PayloadChannel) -> &mut usize {
+    match channel {
+        PayloadChannel::Selection => &mut census.payload_statements,
+        PayloadChannel::ExportOutput => &mut census.export_payload_statements,
+    }
+}
+
+#[cfg(test)]
+fn payload_block_rows(census: &mut ResultReadCensus, channel: PayloadChannel) -> &mut usize {
+    match channel {
+        PayloadChannel::Selection => &mut census.payload_block_rows,
+        PayloadChannel::ExportOutput => &mut census.export_payload_block_rows,
+    }
+}
+
+#[cfg(test)]
+fn payload_tag_rows(census: &mut ResultReadCensus, channel: PayloadChannel) -> &mut usize {
+    match channel {
+        PayloadChannel::Selection => &mut census.payload_tag_rows,
+        PayloadChannel::ExportOutput => &mut census.export_payload_tag_rows,
+    }
+}
+
+#[cfg(test)]
+fn payload_property_rows(census: &mut ResultReadCensus, channel: PayloadChannel) -> &mut usize {
+    match channel {
+        PayloadChannel::Selection => &mut census.payload_property_rows,
+        PayloadChannel::ExportOutput => &mut census.export_payload_property_rows,
+    }
 }
 
 // Thread-local rather than the process-global atomics beside
@@ -1499,6 +1766,10 @@ thread_local! {
             payload_tag_rows: 0,
             payload_property_rows: 0,
             page_rows: 0,
+            export_payload_statements: 0,
+            export_payload_block_rows: 0,
+            export_payload_tag_rows: 0,
+            export_payload_property_rows: 0,
         }) };
 }
 
@@ -1561,6 +1832,8 @@ pub(crate) fn buffered_descriptor_bytes() -> (usize, usize) {
 thread_local! {
     static BEFORE_PAYLOAD_BATCH: std::cell::RefCell<Option<Box<dyn Fn(usize)>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_EXPORT_PAYLOAD_BATCH: std::cell::RefCell<Option<Box<dyn Fn(usize)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1568,14 +1841,26 @@ pub(crate) fn set_before_payload_batch_hook(hook: Option<Box<dyn Fn(usize)>>) {
     BEFORE_PAYLOAD_BATCH.with(|slot| *slot.borrow_mut() = hook);
 }
 
+/// The same barrier for RET3's export OUTPUT payload batches. A separate slot
+/// rather than a channel argument, so an export gate cannot accidentally cancel
+/// a selection read it did not mean to touch.
 #[cfg(test)]
-fn run_before_payload_batch_hook(batch: usize) {
-    // Cloned out of the slot's borrow first: the hook may cancel, block on a
+pub(crate) fn set_before_export_payload_batch_hook(hook: Option<Box<dyn Fn(usize)>>) {
+    BEFORE_EXPORT_PAYLOAD_BATCH.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_before_payload_batch_hook(channel: PayloadChannel, batch: usize) {
+    let slot = match channel {
+        PayloadChannel::Selection => &BEFORE_PAYLOAD_BATCH,
+        PayloadChannel::ExportOutput => &BEFORE_EXPORT_PAYLOAD_BATCH,
+    };
+    // Taken out of the slot's borrow first: the hook may cancel, block on a
     // barrier, or otherwise run for a while, and holding a `RefCell` borrow
     // across that would make the hook unable to touch its own slot.
-    let hook = BEFORE_PAYLOAD_BATCH.with(|slot| slot.borrow().is_some());
-    if hook {
-        BEFORE_PAYLOAD_BATCH.with(|slot| {
+    let present = slot.with(|slot| slot.borrow().is_some());
+    if present {
+        slot.with(|slot| {
             let taken = slot.borrow_mut().take();
             if let Some(hook) = taken {
                 hook(batch);
