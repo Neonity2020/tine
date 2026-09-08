@@ -5,14 +5,15 @@ import { Block } from "./Block";
 import { ContextMenu } from "./ContextMenu";
 import { initParser } from "../render/parse";
 import { backend } from "../backend";
-import { blockProperty, doc, resetStore, setDoc, setBlockProperty, undo, type FeedPage, type Node as StoreNode } from "../store";
+import { blockProperty, doc, resetStore, setDoc, setBlockProperty, setRaw, undo, type FeedPage, type Node as StoreNode } from "../store";
 import { route } from "../router";
 import type { QueryExecution, QueryHit, RefGroup } from "../types";
 import type { QueryReport, QueryResult } from "../editor/queryIr";
-import { bumpDataRev, bumpGraphEpoch } from "../ui";
+import { bumpDataRev, bumpGraphEpoch, setWorkflow } from "../ui";
 import { queryMacroExtent } from "../editor/queryMacro";
 import { backendReadsQueries } from "../queryReadingsTestkit";
 import { searchFilter } from "../editor/queryBuilder";
+import { editingId, endEdit } from "../editorController";
 
 beforeAll(async () => {
   await initParser();
@@ -21,6 +22,7 @@ beforeAll(async () => {
 afterEach(() => {
   vi.restoreAllMocks();
   resetStore();
+  setWorkflow("now");
   localStorage.clear();
   document.body.innerHTML = "";
 });
@@ -193,42 +195,183 @@ function loadAdvancedQueryDoc(queryRaw: string) {
 }
 
 describe("QueryMacro sheet integration", () => {
-  it("keeps sorted result nodes mounted when another result disappears", async () => {
+  it("keeps a completed task mounted for the two-second UI grace, then removes the departed row coherently", async () => {
+    setWorkflow("todo");
+    loadQueryDoc("{{query (task TODO)}}");
+    let ids = ["todo"];
+    const run = vi.spyOn(backend(), "queryRun").mockImplementation(async () => blockResult(queryGroups(ids)));
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(root.querySelector('[data-block-id="todo"]')).not.toBeNull());
+      const row = root.querySelector<HTMLElement>('[data-block-id="todo"]')!;
+      const checkbox = row.querySelector<HTMLElement>(".block-task-checkbox")!;
+
+      ids = [];
+      checkbox.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      expect(doc.byId.todo.raw).toMatch(/^DONE /);
+      expect(row.querySelector(".block-marker")?.textContent).toBe("DONE");
+      bumpDataRev();
+
+      await tick();
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(root.querySelector('[data-block-id="todo"]')).toBe(row);
+      expect(root.querySelector(".query-count")?.textContent).toBe("1");
+
+      await new Promise((resolve) => setTimeout(resolve, 2_050));
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(root.querySelector('[data-block-id="todo"]')).toBeNull());
+      expect(root.querySelector(".query-count")?.textContent).toBe("0");
+
+      // A later projection/change notification is a fresh demand, not part of
+      // the expired hold, so the coherent row can return without another wait.
+      undo();
+      ids = ["todo"];
+      bumpDataRev();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() => expect(root.querySelector('[data-block-id="todo"]')).not.toBeNull());
+      expect(root.querySelector(".query-count")?.textContent).toBe("1");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("coalesces checkbox reversal and Undo into the latest grace refresh", async () => {
+    setWorkflow("todo");
+    loadQueryDoc("{{query (task TODO)}}");
+    let ids = ["todo"];
+    const run = vi.spyOn(backend(), "queryRun").mockImplementation(async () => blockResult(queryGroups(ids)));
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      const row = await vi.waitFor(() => {
+        const found = root.querySelector<HTMLElement>('[data-block-id="todo"]');
+        expect(found).not.toBeNull();
+        return found!;
+      });
+      const toggle = () => row.querySelector<HTMLElement>(".block-task-checkbox")!
+        .dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+
+      ids = [];
+      toggle();
+      bumpDataRev();
+      expect(doc.byId.todo.raw).toMatch(/^DONE /);
+      ids = ["todo"];
+      toggle();
+      bumpDataRev();
+      expect(doc.byId.todo.raw).toMatch(/^TODO /);
+      ids = [];
+      toggle();
+      bumpDataRev();
+      expect(doc.byId.todo.raw).toMatch(/^DONE /);
+      undo();
+      ids = ["todo"];
+      bumpDataRev();
+      expect(doc.byId.todo.raw).toMatch(/^TODO /);
+
+      await tick();
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(root.querySelector('[data-block-id="todo"]')).toBe(row);
+      await new Promise((resolve) => setTimeout(resolve, 2_050));
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+      expect(root.querySelector('[data-block-id="todo"]')).toBe(row);
+      expect(root.querySelector(".query-count")?.textContent).toBe("1");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps a focused result editor and its coherent snapshot until editing ends", async () => {
     const form = "(task TODO) (sort-by page asc)";
     setDoc({
       byId: {
         query: node("query", `{{query ${form}}}`, null),
-        "hit-a": node("hit-a", "TODO First\nMultiline first detail", null),
-        "hit-b": node("hit-b", "TODO Second\nMultiline second detail", null),
-        "hit-c": node("hit-c", "TODO Third\nMultiline third detail", null),
+        "hit-a": node("hit-a", "TODO First\nMultiline detail", null),
+        "hit-b": node("hit-b", "TODO Second", null),
       },
-      pages: [page(["query", "hit-a", "hit-b", "hit-c"])],
+      pages: [page(["query", "hit-a", "hit-b"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    backendReadsQueries({ [form]: { form, view: { sort: [["page", "asc"]] } } });
+    let finishRefresh!: (value: QueryResult) => void;
+    const run = vi.spyOn(backend(), "queryRun")
+      .mockResolvedValueOnce(blockResult(queryGroups(["hit-a", "hit-b"])))
+      .mockImplementationOnce(() => new Promise<QueryResult>((resolve) => { finishRefresh = resolve; }));
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      const row = await vi.waitFor(() => {
+        const found = root.querySelector<HTMLElement>('[data-block-id="hit-a"]');
+        expect(found).not.toBeNull();
+        return found!;
+      });
+      bumpDataRev();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+
+      const content = row.querySelector<HTMLElement>(".block-content")!;
+      content.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+      const editor = await vi.waitFor(() => {
+        const found = row.querySelector<HTMLTextAreaElement>("textarea.block-editor");
+        expect(found).not.toBeNull();
+        return found!;
+      });
+      editor.focus();
+      editor.setSelectionRange(5, 5);
+      setRaw("hit-a", "TODO First edited\nMultiline detail");
+      expect(doc.byId["hit-a"].raw).toContain("First edited");
+      expect(editingId()).toBe("hit-a");
+
+      finishRefresh(blockResult(queryGroups(["hit-b"])));
+      await tick();
+      expect(row.isConnected).toBe(true);
+      expect(row.querySelector("textarea.block-editor")).toBe(editor);
+      expect(root.querySelector(".query-count")?.textContent).toBe("2");
+
+      endEdit("blur");
+      await vi.waitFor(() => expect(root.querySelector('[data-block-id="hit-a"]')).toBeNull());
+      expect(root.querySelector(".query-count")?.textContent).toBe("1");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps sorted result nodes mounted when another result disappears", async () => {
+    const form = "(task TODO) (sort-by page asc)";
+    const hitIds = Array.from({ length: 30 }, (_, index) => `hit-${index + 1}`);
+    setDoc({
+      byId: {
+        query: node("query", `{{query ${form}}}`, null),
+        ...Object.fromEntries(hitIds.map((id, index) => [
+          id,
+          node(id, `TODO Result ${index + 1}\nMultiline detail ${index + 1}`, null),
+        ])),
+      },
+      pages: [page(["query", ...hitIds])],
       feed: ["Sheet"], loaded: true,
     });
     backendReadsQueries({ [form]: { form, view: { sort: [["page", "asc"]] } } });
-    let ids = ["hit-a", "hit-b", "hit-c"];
+    let ids = [...hitIds];
     const run = vi.spyOn(backend(), "queryRun").mockImplementation(async () => blockResult(queryGroups(ids)));
     const { root, dispose } = mount(() => <Block id="query" />);
     const result = (id: string) => root.querySelector(`.query-group [data-block-id="${id}"]`);
     try {
-      await vi.waitFor(() => expect(result("hit-c")).not.toBeNull());
-      const first = result("hit-a")!;
-      const last = result("hit-c")!;
+      await vi.waitFor(() => expect(result("hit-30")).not.toBeNull());
+      const first = result("hit-1")!;
+      const last = result("hit-30")!;
       expect(root.querySelectorAll(".query-crumb")).toHaveLength(1);
-      ids = ["hit-a", "hit-c"];
+      ids = ids.filter((id) => id !== "hit-2");
       bumpDataRev();
       await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
-      await vi.waitFor(() => expect(result("hit-b")).toBeNull());
+      await vi.waitFor(() => expect(result("hit-2")).toBeNull());
       expect(first.isConnected).toBe(true);
-      expect(result("hit-a")).toBe(first);
-      expect(result("hit-c")).toBe(last);
+      expect(result("hit-1")).toBe(first);
+      expect(result("hit-30")).toBe(last);
       // Removing the first member must not just transfer the unstable group
       // key to the next member and recreate the rest of the page again.
-      ids = ["hit-c"];
+      ids = ids.filter((id) => id !== "hit-1");
       bumpDataRev();
       await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
-      await vi.waitFor(() => expect(result("hit-a")).toBeNull());
-      expect(result("hit-c")).toBe(last);
+      await vi.waitFor(() => expect(result("hit-1")).toBeNull());
+      expect(result("hit-30")).toBe(last);
       expect(last.isConnected).toBe(true);
       expect(root.querySelectorAll(".query-crumb")).toHaveLength(1);
     } finally { dispose(); }
@@ -357,6 +500,74 @@ describe("QueryMacro sheet integration", () => {
     expect(route()).toMatchObject({ kind: "page", name: "Sheet", pageKind: "page" });
 
     dispose();
+  });
+
+  it("keeps friendly-search hits and count coherent while their live block is being edited", async () => {
+    setDoc({
+      byId: {
+        query: node("query", '{{query (search "Result")}}\ntine.view:: search', null),
+        "hit-a": node("hit-a", "TODO Result A\nMultiline edit", null),
+        "hit-b": node("hit-b", "TODO Result B", null),
+      },
+      pages: [page(["query", "hit-a", "hit-b"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    backendReadsQueries({
+      '(search "Result")': { form: '(search "Result")', filter: searchFilter("Result") },
+    });
+    const hit = (id: "hit-a" | "hit-b"): QueryHit => ({
+      entity: "block",
+      page: "Sheet",
+      kind: "page",
+      block: {
+        id,
+        raw: doc.byId[id].raw,
+        collapsed: false,
+        children: [],
+        breadcrumb: [],
+        properties: [],
+      },
+      display_text: doc.byId[id].raw,
+      evidence: [],
+    });
+    const execution = (ids: ("hit-a" | "hit-b")[]): QueryExecution => ({
+      hits: ids.map(hit),
+      diagnostics: [],
+      explanation: { branches: [] },
+      cancelled: false,
+    });
+    let finishRefresh!: (value: QueryExecution) => void;
+    const graphSearch = vi.spyOn(backend(), "runGraphSearch")
+      .mockResolvedValueOnce(execution(["hit-a", "hit-b"]))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve; }));
+
+    const { root, dispose } = mount(() => <><Block id="query" /><Block id="hit-a" /></>);
+    try {
+      await vi.waitFor(() => expect(root.querySelectorAll(".query-search-hit")).toHaveLength(2));
+      const sourceRow = root.querySelector<HTMLElement>('.ls-block[data-block-id="hit-a"]')!;
+      sourceRow.querySelector<HTMLElement>(".block-content")!
+        .dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+      await vi.waitFor(() => expect(editingId()).toBe("hit-a"));
+
+      bumpDataRev();
+      await vi.waitFor(() => expect(graphSearch).toHaveBeenCalledTimes(2));
+      finishRefresh(execution(["hit-b"]));
+      await tick();
+
+      expect(root.querySelectorAll(".query-search-hit")).toHaveLength(2);
+      expect(root.querySelector(".query-count")?.textContent).toBe("2");
+      expect(root.querySelector(".query-search-results")?.textContent).toContain("Result A");
+      expect(sourceRow.querySelector("textarea.block-editor")).not.toBeNull();
+
+      endEdit("blur");
+      await vi.waitFor(() => expect(root.querySelectorAll(".query-search-hit")).toHaveLength(1));
+      expect(root.querySelector(".query-count")?.textContent).toBe("1");
+      expect(root.querySelector(".query-search-results")?.textContent).not.toContain("Result A");
+    } finally {
+      dispose();
+    }
   });
 
   it("keeps ordinary DSL query membership across Search, List, Table, and Board presentations", async () => {

@@ -1,4 +1,4 @@
-import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
 import { backend, QueryPrintRefusedError } from "../backend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
@@ -69,6 +69,8 @@ import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
 import { blockDtoExternalId } from "../blockIdentity";
 import { ExternalLink } from "./ExternalLink";
+import { editingId } from "../editorController";
+import { createQueryRefreshRevision } from "../queryResultGrace";
 
 // Recognize the typed Logseq input without treating an example in a string or
 // `;;` comment as live. Only a direct token in the :inputs vector makes query
@@ -817,17 +819,16 @@ export function QueryMacro(props: {
   // explicitly out of scope (§4.3.1, Q13); an advanced block stays editable as
   // raw text by clicking it, with the ran/ignored note above saying what took.
   const currentPage = () => props.currentPage ?? (props.blockId ? doc.byId[props.blockId]?.page : undefined);
-  const [advInfo, setAdvInfo] = createSignal<{ ran: string[]; ignored: string[]; supported: boolean } | null>(
-    null
-  );
-  // `@page`-anchored rows (K16): a page result needs no document load, so it is
-  // NOT a degenerate `RefGroup` with one empty block — it is the page itself.
-  const [pageRows, setPageRows] = createSignal<PageRow[] | null>(null);
-  // The engine's own diagnostics for the run. An INVALID query returns zero rows
-  // plus these (§3.5), which is why they are rendered next to the empty state
-  // rather than swallowed into it.
-  const [diagnostics, setDiagnostics] = createSignal<Diagnostic[]>([]);
-  const [searchExecution, setSearchExecution] = createSignal<QueryExecution | null>(null);
+  interface QueryOperationResult {
+    groups: RefGroup[];
+    advInfo: { ran: string[]; ignored: string[]; supported: boolean } | null;
+    // `@page`-anchored rows (K16) are pages rather than degenerate empty groups.
+    pageRows: PageRow[] | null;
+    // Search hits carry evidence used only by the Search presentation.
+    searchExecution: QueryExecution | null;
+    // An INVALID query returns zero rows plus the engine's own diagnostics.
+    diagnostics: Diagnostic[];
+  }
   const collapseKey = () => JSON.stringify([
     graphMeta()?.root ?? "",
     props.blockId ?? currentPage() ?? "global",
@@ -863,7 +864,7 @@ export function QueryMacro(props: {
   // only the raw argument, which still carries the options map. Returning
   // `undefined` keeps `createResource` from fetching at all, rather than running
   // a query nobody authored.
-  const queryRequestKey = (): string | undefined => {
+  const queryMembershipIdentity = (): string | undefined => {
     const reading = runnable();
     if (!reading) return undefined;
     // The IR, not the text, is what runs — so it is what identifies the run. Two
@@ -877,19 +878,36 @@ export function QueryMacro(props: {
     // key that moved first would run the OLD query under the NEW page: one extra
     // execution of a state the user was never in.
     const binding = currentPageInput() ? `\0cp:${executionPage() ?? ""}` : "";
-    return `${graphEpoch()}\0${collapsed() ? `collapsed ${identity}` : `${identity} ${dataRev()}`}${binding}`;
+    return `${graphEpoch()}\0${collapsed() ? "collapsed\0" : "expanded\0"}${identity}${binding}`;
+  };
+  interface DisplayedQueryOperation extends QueryOperationResult {
+    identity: string;
+  }
+  const [displayedOperation, setDisplayedOperation] = createSignal<DisplayedQueryOperation>();
+  const refreshRevision = createQueryRefreshRevision({
+    revision: dataRev,
+    identity: queryMembershipIdentity,
+    containsDisplayedBlock: (blockId) => displayedOperation()?.groups.some((group) =>
+      group.blocks.some((block) => block.id === blockId)
+    ) ?? false,
+  });
+  const queryRequestKey = (): string | undefined => {
+    const identity = queryMembershipIdentity();
+    if (!identity) return undefined;
+    return collapsed() ? identity : `${identity}\0revision:${refreshRevision()}`;
   };
   /** The page an execution binds `?current-page` to (§4.4). `:inputs
    *  [:current-page]` is a focused-pane binding; an advanced form without it
    *  retains the owner page for `:query-page` compatibility. */
   const executionPage = () => (currentPageInput() ? focusedQueryPage() : currentPage());
-  const fetchGroups = async (requestKey: string, signal: AbortSignal): Promise<RefGroup[]> => {
+  const fetchQueryOperation = async (
+    requestKey: string,
+    signal: AbortSignal,
+  ): Promise<QueryOperationResult> => {
     {
       const scope = sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
       const searchSource = friendlySearch();
       if (searchSource !== null) {
-        setAdvInfo(null);
-        setPageRows(null);
         const execution = await sharedQueryResult(
           scope,
           `friendly-search\0${requestKey}`,
@@ -902,7 +920,9 @@ export function QueryMacro(props: {
           ),
           signal,
         );
-        if (queryRequestKey() !== requestKey) return [];
+        if (queryRequestKey() !== requestKey) {
+          return { groups: [], advInfo: null, pageRows: null, searchExecution: null, diagnostics: [] };
+        }
         // The Search presentation renders these hits directly rather than the
         // RefGroups below, so the host block has to come out here too — the same
         // exclusion `withoutHostBlock` makes, at the other place membership is
@@ -911,7 +931,7 @@ export function QueryMacro(props: {
         const hits = props.blockId
           ? execution.hits.filter((hit) => !(hit.entity === "block" && hit.block.id === props.blockId))
           : execution.hits;
-        setSearchExecution(hits.length === execution.hits.length ? execution : { ...execution, hits });
+        const visibleExecution = hits.length === execution.hits.length ? execution : { ...execution, hits };
         const grouped = new Map<string, RefGroup>();
         for (const hit of hits) {
           if (hit.entity !== "block") continue;
@@ -920,9 +940,14 @@ export function QueryMacro(props: {
           group.blocks.push(hit.block);
           grouped.set(key, group);
         }
-        return [...grouped.values()];
+        return {
+          groups: [...grouped.values()],
+          advInfo: null,
+          pageRows: null,
+          searchExecution: visibleExecution,
+          diagnostics: [],
+        };
       }
-      setSearchExecution(null);
       // **One evaluator (§7.1, B1).** `run_query` re-parsed the OG text and
       // `run_advanced_query` re-parsed the datalog; both are now the same
       // `query_run` over an IR the engine already read, which is also the only
@@ -931,7 +956,9 @@ export function QueryMacro(props: {
       // then, and the advanced ran/ignored report rides on the result rather than
       // on a separate command.
       const reading = runnable();
-      if (!reading) return [];
+      if (!reading) {
+        return { groups: [], advInfo: null, pageRows: null, searchExecution: null, diagnostics: [] };
+      }
       const page = executionPage();
       const result = await sharedQueryResult(
         scope,
@@ -941,15 +968,25 @@ export function QueryMacro(props: {
       );
       // I-20: the user has edited since this run started; its answer is about a
       // query that is no longer on screen.
-      if (queryRequestKey() !== requestKey) return [];
-      setAdvInfo(isAdvanced() ? reportInfo(result.report) : null);
-      setDiagnostics(result.diagnostics ?? []);
-      if (result.anchor === "page") {
-        setPageRows(result.pages);
-        return [];
+      if (queryRequestKey() !== requestKey) {
+        return { groups: [], advInfo: null, pageRows: null, searchExecution: null, diagnostics: [] };
       }
-      setPageRows(null);
-      return result.groups;
+      if (result.anchor === "page") {
+        return {
+          groups: [],
+          advInfo: isAdvanced() ? reportInfo(result.report) : null,
+          pageRows: result.pages,
+          searchExecution: null,
+          diagnostics: result.diagnostics ?? [],
+        };
+      }
+      return {
+        groups: result.groups,
+        advInfo: isAdvanced() ? reportInfo(result.report) : null,
+        pageRows: null,
+        searchExecution: null,
+        diagnostics: result.diagnostics ?? [],
+      };
     }
   };
   // A query must not return the block it is written in. `{{query "xyz"}}`
@@ -962,9 +999,58 @@ export function QueryMacro(props: {
   // every fetch path, rather than in each of the three (GH #469).
   const [groupResource, groupsPending] = createReadyQueryResource(
     queryRequestKey,
-    async (requestKey, signal) => withoutHostBlock(await fetchGroups(requestKey, signal), props.blockId),
+    async (requestKey, signal) => {
+      const identity = queryMembershipIdentity() ?? "";
+      const operation = await fetchQueryOperation(requestKey, signal);
+      return {
+        ...operation,
+        identity,
+        groups: withoutHostBlock(operation.groups, props.blockId),
+      };
+    },
   );
-  const groups = () => groupResource.error ? undefined : groupResource();
+  // A membership answer that removes the actively edited result would destroy
+  // its mounted textarea and DOM-local selection. Keep the whole previous
+  // operation — groups/page rows, search evidence, diagnostics, report, and
+  // therefore count/order — coherent while that editor is active. Only the
+  // newest completed operation waits here, and it publishes as soon as the
+  // ordinary editor lifecycle ends. A changed query/graph/view identity never
+  // inherits deferred metadata from this hold.
+  let pendingFocusedOperation: DisplayedQueryOperation | undefined;
+  createEffect(() => {
+    const candidate = groupResource.error ? undefined : groupResource();
+    if (!candidate) {
+      pendingFocusedOperation = undefined;
+      setDisplayedOperation(undefined);
+      return;
+    }
+    const current = untrack(displayedOperation);
+    const focused = editingId();
+    const focusedWasDisplayed = !!focused && current?.identity === candidate.identity
+      && current.groups.some((group) => group.blocks.some((block) => block.id === focused));
+    const focusedStillPresent = !!focused
+      && candidate.groups.some((group) => group.blocks.some((block) => block.id === focused));
+    if (focusedWasDisplayed && !focusedStillPresent) {
+      pendingFocusedOperation = candidate;
+      return;
+    }
+    pendingFocusedOperation = undefined;
+    setDisplayedOperation(candidate);
+  });
+  createEffect(on(editingId, (focused) => {
+    if (focused !== null || !pendingFocusedOperation) return;
+    const candidate = pendingFocusedOperation;
+    pendingFocusedOperation = undefined;
+    if (candidate.identity === queryMembershipIdentity()) setDisplayedOperation(candidate);
+  }));
+  createEffect(on(queryMembershipIdentity, (identity, previous) => {
+    if (previous !== undefined && identity !== previous) pendingFocusedOperation = undefined;
+  }));
+  const groups = () => displayedOperation()?.groups;
+  const advInfo = () => displayedOperation()?.advInfo ?? null;
+  const pageRows = () => displayedOperation()?.pageRows ?? null;
+  const searchExecution = () => displayedOperation()?.searchExecution ?? null;
+  const diagnostics = () => displayedOperation()?.diagnostics ?? [];
   const emptyResultsMessage = () => groupsPending()?.message
     ?? (groupResource.error ? "Query results unavailable" : groupResource.loading ? "Loading query results…" : "No results");
   const groupsError = () => {

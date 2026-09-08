@@ -165,7 +165,8 @@ import { cycleMarkerSmart, markerLabelClickable, toggleMarkerLabel, toggleTaskDo
 import { setMarker } from "../editor/marker";
 import { registerTransientLayer } from "../transientLayers";
 
-import { taskCheckboxState } from "../markers";
+import { leadingMarker, taskCheckboxState } from "../markers";
+import { noteQueryCompletionInteraction } from "../queryResultGrace";
 import { applyTemplateVars, prepareTemplateVars } from "../editor/templateVars";
 import {
   caretAtFirstRow,
@@ -1102,24 +1103,35 @@ function Rendered(props: {
 // Marker-label clicks follow OG's separate two-state toggle. Keyboard marker
 // cycling remains cycleMarkerSmart and may still reach DONE / no marker.
 function toggleBlockMarkerLabel(id: string) {
-  const raw = toggleMarkerLabel(doc.byId[id].raw, {
+  const before = doc.byId[id].raw;
+  const raw = toggleMarkerLabel(before, {
     format: formatForBlockId(id),
     enabled: timetrackingEnabled(),
     withSeconds: logbookWithSecondSupport(),
   });
   if (raw === null) return;
   setRaw(id, raw, { timetracking: false });
+  noteCompletionBoundaryChange(id, before, raw);
 }
 
 // Toggle the task checkbox (OG check/uncheck): open → DONE (rolling a repeater
 // forward instead), DONE → the workflow's open marker. Used by the block checkbox.
 function toggleBlockCheckbox(id: string) {
-  const raw = toggleTaskDone(doc.byId[id].raw, workflow(), {
+  const before = doc.byId[id].raw;
+  const raw = toggleTaskDone(before, workflow(), {
     format: formatForBlockId(id),
     enabled: timetrackingEnabled(),
     withSeconds: logbookWithSecondSupport(),
   });
-  if (raw !== null) setRaw(id, raw, { timetracking: false });
+  if (raw === null) return;
+  setRaw(id, raw, { timetracking: false });
+  noteCompletionBoundaryChange(id, before, raw);
+}
+
+function noteCompletionBoundaryChange(id: string, before: string, after: string): void {
+  if (taskCheckboxState(leadingMarker(before)) !== taskCheckboxState(leadingMarker(after))) {
+    noteQueryCompletionInteraction(id);
+  }
 }
 
 function formatForBlockId(id: string): "md" | "org" {
@@ -2888,8 +2900,10 @@ export function Editor(props: { id: string }): JSX.Element {
   };
   const cycleTodoCmd = () => {
     const start = ref.selectionStart;
+    const before = ref.value;
     const { raw: newRaw, delta } = cycleMarkerSmart(ref.value, workflow());
     commit(newRaw);
+    noteCompletionBoundaryChange(props.id, before, newRaw);
     const pos = Math.max(0, start + delta);
     queueMicrotask(() => {
       ref.value = newRaw;

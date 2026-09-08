@@ -867,3 +867,28 @@ Tests: `src/components/QueryWorkspace.test.tsx` — the materializer's three
 guard points, the org drawer and markdown line forms, and the component
 fixtures that hold one real await open while the source, view, title, graph
 format, graph root or active route changes underneath it.
+
+## 14. Live result editing and refresh retention
+
+Query result blocks use the ordinary editor, save path and Undo stack. Crossing
+the open/completed task boundary updates live block content immediately.
+`QUERY_COMPLETION_GRACE_MS` is 2,000 milliseconds: a query displaying the
+interacted block defers membership reads during this presentation grace, retaining
+only the latest demanded data revision. Repeated completion interactions extend
+the deadline. Query, graph, view, binding or expanded/collapsed identity changes
+cancel the hold; unmount cancels its timer. Later database-change notifications
+remain ordinary refresh demands, including when an earlier read saw an older
+coherent projection.
+
+If a completed read would remove an actively edited result, retain the entire
+previous same-identity displayed operation until the ordinary editor ends. Groups,
+page rows, Friendly/Search hits and evidence, diagnostics, report metadata, count
+and order publish together. Only the latest pending operation is retained; an
+identity change discards incompatible pending output. Surviving groups and blocks
+continue to reconcile by stable keys, preserving mounted editors and revealed
+depth. This UI state does not retain backend answers between operations or require
+a saved-edit freshness token.
+
+Tests: `src/queryResultGrace.test.tsx` and
+`src/components/QueryMacro.test.tsx`; native scroll and mounted-row geometry:
+`scripts/e2e-query-result-scroll.mjs`.

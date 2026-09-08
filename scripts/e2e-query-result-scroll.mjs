@@ -109,6 +109,17 @@ try {
   // The real control owns mousedown (to avoid entering the block editor).
   // HTMLElement.click() omits that event and does not toggle a task.
   await browser.$(`.query-group .ls-block[data-block-id="${before.targetId}"] .block-task-checkbox`).click();
+  await browser.waitUntil(async()=>browser.execute((targetId) => {
+    const row=[...document.querySelectorAll(".query-group .ls-block")].find(row=>row.dataset.blockId===targetId);
+    return row===window.__queryScrollTarget?.closest(".ls-block")
+      && row?.querySelector(".block-marker")?.textContent?.trim()==="DONE"
+      && document.querySelector(".query-count")?.textContent?.trim()==="120";
+  },before.targetId),{timeout:1500,timeoutMsg:"completed query row did not remain live during UI grace"});
+  const duringGrace=await browser.execute(() => ({
+    targetConnected:window.__queryScrollTarget?.isConnected??false,
+    targetMarker:window.__queryScrollTarget?.closest(".ls-block")?.querySelector(".block-marker")?.textContent?.trim(),
+    count:document.querySelector(".query-count")?.textContent,
+  }));
   await browser.waitUntil(async()=>Number(await browser.$(".query-count").getText())===119,{timeout:15000});
   await sleep(1500);
   const after=await browser.execute(() => {
@@ -120,7 +131,7 @@ try {
       count:document.querySelector(".query-count")?.textContent};
   });
   await browser.saveScreenshot(path.join(tmp,"after.png"));
-  const report={app,hostPage,queryText,flatQuery,before,after,anchorDrift:after.anchorTop-before.anchorTop};
+  const report={app,hostPage,queryText,flatQuery,before,duringGrace,after,anchorDrift:after.anchorTop-before.anchorTop};
   fs.writeFileSync(path.join(tmp,"report.json"),JSON.stringify(report,null,2));
   console.log(JSON.stringify(report));
   if(!after.anchorConnected || Math.abs(report.anchorDrift)>24) throw new Error("Unchanged result anchor moved or remounted after task completion");

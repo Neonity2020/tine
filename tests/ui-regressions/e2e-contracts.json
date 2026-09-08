@@ -5,7 +5,7 @@
    "contracts": [
     {
      "class": "stateful-ux",
-     "userOutcome": "Completing a TODO in a long multiline query removes that result while preserving surviving result components and the reader's visible place.",
+     "userOutcome": "Completing a TODO in a long multiline query shows DONE immediately, briefly keeps that live row available for reversal, then removes it while preserving surviving result components and the reader's visible place.",
      "blocking": true
     }
    ],
